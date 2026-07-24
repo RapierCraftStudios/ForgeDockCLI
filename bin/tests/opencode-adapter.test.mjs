@@ -470,6 +470,30 @@ describe("OpenCode adapter", () => {
     assert.equal(migrated.command, undefined);
   });
 
+  it("does not rewrite opencode.jsonc during install or uninstall", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    const configPath = join(config, "opencode.jsonc");
+    mkdirSync(config, { recursive: true });
+    const original = `{
+      // User-owned JSONC config
+      "model": "test/model",
+      "command": {
+        "work-on": {
+          "description": "Run the ForgeDock pipeline",
+          "template": "Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md",
+        },
+      },
+    }\n`;
+    writeFileSync(configPath, original);
+
+    await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(readFileSync(configPath, "utf8"), original);
+
+    await uninstallOpenCodeAdapter({ home, env: {} });
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
   it("preserves legacy artifacts when JSONC migration cannot parse a config", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
