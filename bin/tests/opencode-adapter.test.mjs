@@ -402,8 +402,8 @@ describe("OpenCode adapter", () => {
         instructions: [legacyInstructions, "keep.md"],
         command: {
           "work-on": {
-            description: "Run the ForgeDock full issue pipeline",
-            template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and run it`,
+            description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+            template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
           },
           mine: { description: "User command", template: "Keep me" },
         },
@@ -441,6 +441,78 @@ describe("OpenCode adapter", () => {
     assert.deepEqual(migrated.command["work-on"], customCommand);
   });
 
+  it("preserves two-key customized legacy-named commands", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    mkdirSync(config, { recursive: true });
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline with my confirmation step",
+      template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and ask for confirmation first`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
+  it("preserves exact-looking legacy commands pointing at another absolute home", async () => {
+    const { forgeHome, home } = fixture();
+    const otherForgeHome = temp("fd-opencode-other-source-");
+    const config = join(home, ".config", "opencode");
+    mkdirSync(config, { recursive: true });
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+      template: `Read ${otherForgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
+  it("preserves exact legacy commands without the managed instructions marker", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    mkdirSync(config, { recursive: true });
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+      template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
+  it("does not turn foreign mixed-separator paths into POSIX ForgeDock paths", async () => {
+    if (process.platform === "win32") return;
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    mkdirSync(config, { recursive: true });
+    const separator = forgeHome.lastIndexOf("/");
+    const foreignPath = `${forgeHome.slice(0, separator)}\\${forgeHome.slice(separator + 1)}`;
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+      template: `Read ${foreignPath}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
   it("migrates JSONC configs before removing the managed instructions file", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
@@ -454,8 +526,8 @@ describe("OpenCode adapter", () => {
         "instructions": ["${legacyInstructions.replaceAll("\\", "\\\\")}"],
         "command": {
           "work-on": {
-            "description": "Run the ForgeDock pipeline",
-            "template": "Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md",
+            "description": "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+            "template": "Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.",
           },
         },
       }\n`,
