@@ -357,6 +357,93 @@ describe("router", () => {
     return { forgeHome, branch, headBefore };
   }
 
+  function makeCleanNonMainClone(prefix) {
+    const remoteRepo = mkdtempSync(join(os.tmpdir(), `${prefix}remote-`));
+    const forgeHome = mkdtempSync(join(os.tmpdir(), `${prefix}clone-`));
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "ForgeDock Test",
+      GIT_AUTHOR_EMAIL: "test@forgedock.test",
+      GIT_COMMITTER_NAME: "ForgeDock Test",
+      GIT_COMMITTER_EMAIL: "test@forgedock.test",
+    };
+
+    cpSync(dirname(CLI), join(forgeHome, "bin"), {
+      recursive: true,
+      filter: (src) => !src.includes("tests"),
+    });
+    mkdirSync(join(forgeHome, "commands"), { recursive: true });
+    writeFileSync(join(forgeHome, "commands", "feature-only.md"), "# Feature source\n", "utf-8");
+    writeFileSync(
+      join(forgeHome, "package.json"),
+      JSON.stringify({ name: "forgedock", version: "1.0.0" }) + "\n",
+      "utf-8",
+    );
+
+    spawnSync("git", ["init", "--bare", "-b", "main", remoteRepo], { stdio: "pipe" });
+    spawnSync("git", ["init", "-b", "main", forgeHome], { stdio: "pipe" });
+    spawnSync("git", ["-C", forgeHome, "remote", "add", "origin", remoteRepo], { stdio: "pipe" });
+    spawnSync("git", ["-C", forgeHome, "add", "-A"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "commit", "-m", "initial source"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "push", "origin", "main"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "checkout", "-b", "feature/source-test"], { stdio: "pipe", env: gitEnv });
+
+    // Put newer source only on main. The feature branch must remain untouched
+    // when update() refuses to switch away from the source it will execute.
+    spawnSync("git", ["-C", forgeHome, "checkout", "main"], { stdio: "pipe", env: gitEnv });
+    writeFileSync(
+      join(forgeHome, "package.json"),
+      JSON.stringify({ name: "forgedock", version: "2.0.0" }) + "\n",
+      "utf-8",
+    );
+    writeFileSync(join(forgeHome, "commands", "main-only.md"), "# Main source\n", "utf-8");
+    spawnSync("git", ["-C", forgeHome, "add", "-A"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "commit", "-m", "new main source"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "push", "origin", "main"], { stdio: "pipe", env: gitEnv });
+    spawnSync("git", ["-C", forgeHome, "checkout", "feature/source-test"], { stdio: "pipe", env: gitEnv });
+
+    const branch = spawnSync("git", ["-C", forgeHome, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf-8",
+    }).stdout.trim();
+    const headBefore = spawnSync("git", ["-C", forgeHome, "rev-parse", "HEAD"], {
+      encoding: "utf-8",
+    }).stdout.trim();
+
+    return { forgeHome, branch, headBefore };
+  }
+
+  it("does not switch or relink a clean non-main source checkout", () => {
+    const { forgeHome, branch, headBefore } = makeCleanNonMainClone("fd-clean-non-main-");
+    const home = mkdtempSync(join(os.tmpdir(), "fd-clean-non-main-home-"));
+
+    const res = spawnSync(process.execPath, [join(forgeHome, "bin", "forgedock.mjs"), "update"], {
+      cwd: forgeHome,
+      env: { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1" },
+      encoding: "utf-8",
+      timeout: 30000,
+    });
+
+    assert.equal(res.status, 0, `update exited non-zero:\n${res.stdout}\n${res.stderr}`);
+    assert.match(res.stdout, /Source: .*\(v1\.0\.0, branch feature\/source-test\)/);
+    assert.match(res.stdout, /Source checkout is on feature\/source-test, not main; skipping update/i);
+    assert.match(res.stdout, /main-branch checkout/);
+    assert.doesNotMatch(res.stdout, /switching to main|Updated to latest|Already up to date|slash commands/i);
+
+    const branchAfter = spawnSync("git", ["-C", forgeHome, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf-8",
+    }).stdout.trim();
+    const headAfter = spawnSync("git", ["-C", forgeHome, "rev-parse", "HEAD"], {
+      encoding: "utf-8",
+    }).stdout.trim();
+    assert.equal(branchAfter, branch, "must remain on the feature branch");
+    assert.equal(headAfter, headBefore, "feature HEAD must not move");
+    assert.equal(JSON.parse(readFileSync(join(forgeHome, "package.json"), "utf-8")).version, "1.0.0");
+    assert.ok(
+      !existsSync(join(home, ".claude", "commands", "main-only.md")),
+      "must not relink command files from the temporary main source",
+    );
+  });
+
   it("update on a dirty, non-main branch run from INSIDE the source repo itself relinks commands/hooks and prints the npm fallback hint, HEAD unmoved (forge#2460)", () => {
     const { forgeHome, branch, headBefore } = makeDirtyNonMainClone("fd-selfrepo-");
     const home = mkdtempSync(join(os.tmpdir(), "fd-selfrepo-home-"));
@@ -518,6 +605,7 @@ describe("router", () => {
 
     const doctorRes = runCli(["doctor"], { cwd, home, extraEnv: stubEnv });
     assert.equal(doctorRes.status, 0, doctorRes.stdout + doctorRes.stderr);
+    assert.match(doctorRes.stdout, /Source:/i);
     // forge#1895: the new hook-script-path-integrity check must PASS here —
     // FORGE_HOME in this test is the real, on-disk repo location, so the
     // baked-in hook script path genuinely exists.
