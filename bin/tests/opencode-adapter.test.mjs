@@ -7,10 +7,11 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import {
   getOpenCodeAdapterStatus,
   installOpenCodeAdapter,
@@ -254,6 +255,26 @@ describe("OpenCode adapter", () => {
     assert.equal(readFileSync(plugin, "utf8"), "export const UserPlugin = async () => ({})\n");
   });
 
+  it("refuses to write through symlinked managed directories", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    const outside = temp("fd-opencode-symlink-target-");
+    mkdirSync(config, { recursive: true });
+    try {
+      symlinkSync(outside, join(config, "skills"), process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EACCES", "EPERM", "ENOTSUP"].includes(error.code)) return;
+      throw error;
+    }
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /symlinked OpenCode path/,
+    );
+    assert.deepEqual(readdirSync(outside), []);
+    assert.ok(!existsSync(join(config, "commands")));
+  });
+
   it("migrates only ForgeDock-managed legacy adapter entries", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
@@ -394,6 +415,24 @@ describe("OpenCode adapter", () => {
     assert.equal(status.integrity, "invalid-manifest");
     const uninstall = await uninstallOpenCodeAdapter({ home, env: {} });
     assert.equal(uninstall.removed, 0);
+  });
+
+  it("does not inspect manifest entries outside the config directory", async () => {
+    const home = temp("fd-opencode-status-home-");
+    const outside = temp("fd-opencode-status-outside-");
+    const config = join(home, ".config", "opencode");
+    const outsideFile = join(outside, "managed.md");
+    const rel = relative(config, outsideFile).replaceAll("\\", "/");
+    mkdirSync(join(config, "forgedock"), { recursive: true });
+    writeFileSync(outsideFile, "<!-- forgedock:managed-opencode-skill -->\n");
+    writeFileSync(
+      join(config, "forgedock", "manifest.json"),
+      `${JSON.stringify({ version: 1, files: [rel], digest: "bad" })}\n`,
+    );
+
+    const status = await getOpenCodeAdapterStatus({ home, env: {} });
+    assert.equal(status.healthy, false);
+    assert.deepEqual(status.missing, [rel]);
   });
 
   it("reports health and uninstalls only managed files", async () => {

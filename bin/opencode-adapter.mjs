@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) RapierCraft Studios
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { findMarkdownFiles } from "./journey.mjs";
@@ -210,9 +210,52 @@ export const ForgeDockPlugin = async () => ({
 `;
 }
 
-async function atomicWrite(path, content) {
+function pathInside(root, candidate) {
+  const rel = relative(resolve(root), resolve(candidate));
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+async function assertSafePath(root, candidate) {
+  const resolvedRoot = resolve(root);
+  const resolvedCandidate = resolve(candidate);
+  if (!pathInside(resolvedRoot, resolvedCandidate)) {
+    throw new Error(`Refusing to access path outside OpenCode config directory: ${candidate}`);
+  }
+
+  let current = resolvedCandidate;
+  while (true) {
+    let stat;
+    try {
+      stat = await lstat(current);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (stat?.isSymbolicLink()) {
+      throw new Error(`Refusing to access symlinked OpenCode path: ${current}`);
+    }
+    if (current === resolvedRoot) return;
+    const parent = dirname(current);
+    if (parent === current || !pathInside(resolvedRoot, parent)) {
+      throw new Error(`Refusing to access path outside OpenCode config directory: ${candidate}`);
+    }
+    current = parent;
+  }
+}
+
+async function isSafePath(root, candidate) {
+  try {
+    await assertSafePath(root, candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function atomicWrite(path, content, root) {
+  if (root) await assertSafePath(root, path);
   await mkdir(dirname(path), { recursive: true });
-  const tmp = `${path}.forgedock.tmp-${process.pid}`;
+  if (root) await assertSafePath(root, path);
+  const tmp = `${path}.forgedock.tmp-${process.pid}-${randomUUID()}`;
   try {
     await writeFile(tmp, content, "utf8");
     await rename(tmp, path);
@@ -222,7 +265,8 @@ async function atomicWrite(path, content) {
   }
 }
 
-async function readManifest(path) {
+async function readManifest(path, root) {
+  if (root && !(await isSafePath(root, path))) return null;
   try {
     const value = JSON.parse(await readFile(path, "utf8"));
     if (
@@ -246,11 +290,6 @@ function digestFiles(files) {
         .join("\0"),
     )
     .digest("hex");
-}
-
-function pathInside(root, candidate) {
-  const rel = relative(resolve(root), resolve(candidate));
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
 async function isManagedFile(path) {
@@ -277,7 +316,7 @@ async function removeOwnedFiles(configDir, files) {
   let removed = 0;
   for (const rel of files) {
     const path = join(configDir, rel);
-    if (!pathInside(configDir, path) || !(await isManagedFile(path))) continue;
+    if (!(await isSafePath(configDir, path)) || !(await isManagedFile(path))) continue;
     await unlink(path).catch((error) => {
       if (error.code !== "ENOENT") throw error;
     });
@@ -382,11 +421,13 @@ async function migrateLegacyAdapter({ configDir, home }) {
   const written = [];
   try {
     for (const item of staged) {
-      await atomicWrite(item.path, item.content);
+      await atomicWrite(item.path, item.content, dirname(item.path));
       written.push(item);
     }
   } catch (error) {
-    for (const item of written) await atomicWrite(item.path, item.original).catch(() => {});
+    for (const item of written) {
+      await atomicWrite(item.path, item.original, dirname(item.path)).catch(() => {});
+    }
     result.warnings.push(`Could not write legacy migration: ${error.message}`);
     return result;
   }
@@ -410,7 +451,7 @@ export async function installOpenCodeAdapter({
 
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
-  const previous = (await readManifest(manifestPath)) || { files: [] };
+  const previous = (await readManifest(manifestPath, configDir)) || { files: [] };
   const workflows = await discoverEntrypoints(forgeHome, includeExtras);
   const commands = workflows.filter((workflow) => workflow.topLevel);
   const rendered = [];
@@ -439,15 +480,19 @@ export async function installOpenCodeAdapter({
   const pluginContent = renderOpenCodePlugin(forgeHome);
   rendered.push({ rel: pluginRel, content: pluginContent });
 
+  await assertSafePath(configDir, manifestPath);
   // Preflight every collision before the first write so a rejected install
   // cannot leave unmanifested command files behind.
   for (const item of rendered) {
     const path = join(configDir, item.rel);
+    await assertSafePath(configDir, path);
     if (existsSync(path) && !(await isManagedFile(path))) {
       throw new Error(`Refusing to overwrite user-owned OpenCode file: ${path}`);
     }
   }
-  for (const item of rendered) await atomicWrite(join(configDir, item.rel), item.content);
+  for (const item of rendered) {
+    await atomicWrite(join(configDir, item.rel), item.content, configDir);
+  }
 
   const nextFiles = rendered.map((item) => item.rel).sort();
   const stale = previous.files.filter((file) => !nextFiles.includes(file));
@@ -462,7 +507,7 @@ export async function installOpenCodeAdapter({
     files: nextFiles,
     digest,
   };
-  await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, configDir);
   const migration = await migrateLegacyAdapter({ configDir, home });
 
   return {
@@ -480,7 +525,10 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
   if (!existsSync(manifestPath)) return { installed: false, healthy: false, configDir, missing: [] };
-  const manifest = await readManifest(manifestPath);
+  if (!(await isSafePath(configDir, manifestPath))) {
+    return { installed: true, healthy: false, configDir, missing: [], integrity: "invalid-manifest" };
+  }
+  const manifest = await readManifest(manifestPath, configDir);
   if (!manifest) {
     return { installed: true, healthy: false, configDir, missing: [], integrity: "invalid-manifest" };
   }
@@ -488,7 +536,7 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
   const current = [];
   for (const rel of manifest.files) {
     const path = join(configDir, rel);
-    if (!existsSync(path) || !(await isManagedFile(path))) {
+    if (!(await isSafePath(configDir, path)) || !existsSync(path) || !(await isManagedFile(path))) {
       missing.push(rel);
       continue;
     }
@@ -508,14 +556,19 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
 export async function uninstallOpenCodeAdapter({ home, env = process.env } = {}) {
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
-  const manifest = (await readManifest(manifestPath)) || { files: [] };
+  const manifest = (await readManifest(manifestPath, configDir)) || { files: [] };
   const removed = await removeOwnedFiles(configDir, manifest.files);
-  await unlink(manifestPath).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-  });
-  await rmdir(join(configDir, "forgedock")).catch((error) => {
-    if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
-  });
+  if (await isSafePath(configDir, manifestPath)) {
+    await unlink(manifestPath).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+  const manifestDir = join(configDir, "forgedock");
+  if (await isSafePath(configDir, manifestDir)) {
+    await rmdir(manifestDir).catch((error) => {
+      if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
+    });
+  }
   const migration = await migrateLegacyAdapter({ configDir, home });
   return { configDir, removed, migration };
 }
