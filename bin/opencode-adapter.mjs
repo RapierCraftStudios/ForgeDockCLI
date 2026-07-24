@@ -644,7 +644,12 @@ async function migrateLegacyAdapter({ configDir, home, forgeHome }) {
       changed ||= removed > 0;
       if (config.instructions.length === 0) delete config.instructions;
     }
-    if (config.command && typeof config.command === "object" && !Array.isArray(config.command)) {
+    if (
+      legacyInstructionsOwned &&
+      config.command &&
+      typeof config.command === "object" &&
+      !Array.isArray(config.command)
+    ) {
       for (const name of legacyCommands) {
         const definition = config.command[name];
         if (isLegacyCommandDefinition(name, definition, forgeHome)) {

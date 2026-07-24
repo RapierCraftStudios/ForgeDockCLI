@@ -471,6 +471,23 @@ describe("OpenCode adapter", () => {
     assert.equal(readFileSync(configPath, "utf8"), original);
   });
 
+  it("preserves exact legacy commands without the managed instructions marker", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    mkdirSync(config, { recursive: true });
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+      template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+  });
+
   it("does not turn foreign mixed-separator paths into POSIX ForgeDock paths", async () => {
     if (process.platform === "win32") return;
     const { forgeHome, home } = fixture();

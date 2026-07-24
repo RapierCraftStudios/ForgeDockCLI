@@ -147,11 +147,13 @@ For backward compatibility, install and uninstall may rewrite `opencode.json`
 only to remove legacy entries whose two-key `description` and `template` still
 exactly match one of the definitions emitted by the retired adapter and point to
 the active ForgeDock home (or the home recorded in the ownership manifest during
-uninstall), plus references to the managed `~/.opencode-forge.md` instructions
-file. The migration does not rewrite `opencode.jsonc`. User-owned settings and
-customized commands are preserved; definitions with extra keys, edited fields,
-different paths, or ambiguous ownership are left in place. If a legacy config
-cannot be parsed or written, the migration leaves the legacy artifacts in place.
+uninstall), and the sentinel-marked legacy instructions file is present. It also
+removes references to that managed `~/.opencode-forge.md` instructions file. The
+migration does not rewrite `opencode.jsonc`. User-owned settings and customized commands are preserved;
+definitions with extra keys, edited fields, different
+paths, a missing ownership marker, or ambiguous ownership are left in place. If
+a legacy config cannot be parsed or written, the migration leaves the legacy
+artifacts in place.
 
 ## Locations
 
