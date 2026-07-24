@@ -21,7 +21,7 @@ import { findMarkdownFiles } from "./journey.mjs";
 const COMMAND_SENTINEL = "<!-- forgedock:managed-opencode-command -->";
 const SKILL_SENTINEL = "<!-- forgedock:managed-opencode-skill -->";
 const PLUGIN_SENTINEL = "// forgedock:managed-opencode-plugin";
-const LEGACY_SENTINEL = "<!-- ForgeDock managed";
+const LEGACY_SENTINEL = "<!-- ForgeDock managed — do not remove this line -->";
 const MANIFEST_VERSION = 1;
 const ADAPTER_LOCK_STALE_AGE_MS = 30_000;
 const ADAPTER_LOCK_HEARTBEAT_MS = 10_000;
@@ -177,10 +177,14 @@ function isLegacyCommandDefinition(name, definition, forgeHome) {
   const template = portablePath(definition.template);
   const suffix = `/commands/${name}.md${contract.templateSuffix}`;
   if (!template.startsWith("Read ") || !template.endsWith(suffix)) return false;
+  const pathFlavor = legacyPathFlavor(forgeHome);
+  if (!pathFlavor) return false;
+  const rawSuffix = definition.template.slice(-suffix.length);
+  if (portablePath(rawSuffix) !== suffix || (pathFlavor === "posix" && rawSuffix !== suffix)) return false;
   const expectedHome = normalizeLegacyPath(forgeHome);
   if (!expectedHome) return false;
   const templateHome = definition.template.slice("Read ".length, -suffix.length);
-  return normalizeLegacyPath(templateHome, legacyPathFlavor(forgeHome)) === expectedHome;
+  return normalizeLegacyPath(templateHome, pathFlavor) === expectedHome;
 }
 
 export function resolveOpenCodeConfigDir({ home, env = process.env } = {}) {
@@ -604,7 +608,7 @@ async function migrateLegacyAdapter({ configDir, home, forgeHome }) {
   if (safeLegacyInstructions) {
     try {
       const content = await readRegularFile(safeLegacyInstructions.path);
-      if (content?.includes(LEGACY_SENTINEL)) {
+      if (content?.split(/\r?\n/).some((line) => line.trim() === LEGACY_SENTINEL)) {
         legacyInstructionsOwned = true;
       }
     } catch (error) {
