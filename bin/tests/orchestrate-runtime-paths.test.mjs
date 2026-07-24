@@ -10,6 +10,7 @@ const opencodeDocs = readFileSync(
   new URL("../../docs/OPENCODE.md", import.meta.url),
   "utf8",
 );
+const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
 
 describe("orchestrate runtime helper paths", () => {
   it("resolves lane classification without replacing Claude support", () => {
@@ -40,5 +41,13 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(opencodeDocs, /install and uninstall may rewrite `opencode\.json`\s+only/);
     assert.match(opencodeDocs, /migration does not\s+rewrite `opencode\.jsonc`/);
     assert.match(opencodeDocs, /customized commands are\s+preserved/);
+  });
+
+  it("keeps README OpenCode install guidance aligned with migration ownership", () => {
+    assert.match(
+      readme,
+      /without changing your provider\s+or user-owned settings\.\s+When migrating an older ForgeDock adapter, it removes\s+only exact ForgeDock-managed legacy entries from `opencode\.json`:/,
+    );
+    assert.doesNotMatch(readme, /without changing your provider\s+or `opencode\.json`/);
   });
 });
