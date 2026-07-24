@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   getOpenCodeAdapterStatus,
   installOpenCodeAdapter,
@@ -100,8 +100,10 @@ describe("OpenCode adapter", () => {
     assert.match(output, /do not preload sibling specs/i);
     assert.match(output, /C:\/Forge Dock\/commands\/work-on\.md/);
     assert.match(output, /OpenCode's `task` tool/);
-    assert.match(output, /top-level argument object shaped like/);
+    assert.match(output, /DISPATCH_TOOL=task/);
     assert.match(output, /subagent_type: "general"\|"explore"/);
+    assert.match(output, /genuinely absent.*FORGE:REVIEW_BLOCKED/s);
+    assert.match(output, /top-level argument object shaped like/);
     assert.match(output, /general-purpose.*general.*codebase-explorer.*explore/s);
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
   });
@@ -131,10 +133,33 @@ describe("OpenCode adapter", () => {
       () => normalizeOpenCodeSkillName(`${"a".repeat(65)}.md`),
       /exceeds 64 characters/,
     );
-    assert.match(
-      renderOpenCodeSkill({ description: "Nested phase", forgeHome: "/forge", command: "work-on/build" }),
-      /name: work-on-build/,
-    );
+    const skillOutput = renderOpenCodeSkill({
+      description: "Nested phase",
+      forgeHome: "/forge",
+      command: "work-on/build",
+    });
+    assert.match(skillOutput, /name: work-on-build/);
+    assert.match(skillOutput, /DISPATCH_TOOL=task/);
+    assert.match(skillOutput, /subagent_type: "general"\|"explore"/);
+    assert.match(skillOutput, /native `task` is genuinely absent/);
+  });
+
+  it("keeps native review dispatch ahead of Claude availability checks", () => {
+    const root = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+    for (const sourcePath of [
+      "commands/review-pr.md",
+      "commands/review-pr-staging.md",
+      "commands/review-pr-agents.md",
+    ]) {
+      const source = readFileSync(join(root, sourcePath), "utf8");
+      const nativeOverride = source.search(/OpenCode (Runtime )?Override|OpenCode override/);
+      const hardStop = source.indexOf("Neither tool is available");
+      assert.ok(nativeOverride >= 0, `${sourcePath} must document the native override`);
+      assert.ok(hardStop < 0 || nativeOverride < hardStop, `${sourcePath} checks native dispatch before the hard stop`);
+      assert.match(source, /DISPATCH_TOOL\s*[=:]\s*task/);
+      assert.match(source, /subagent_type[^\n]+general/);
+      assert.match(source, /subagent_type[^\n]+explore/);
+    }
   });
 
   it("installs top-level commands and every eligible workflow as native skills", async () => {

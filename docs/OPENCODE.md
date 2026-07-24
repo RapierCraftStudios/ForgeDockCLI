@@ -102,9 +102,14 @@ The adapter follows these rules:
 The generated adapter preamble is intentionally small. It maps Claude Code's
 in-conversation `Skill(...)` loading to the normalized native skill name and
 authoritative shared spec. It maps isolated `Task(...)` and permitted
-`Agent(...)` calls to OpenCode's native `task` tool. Every native task call must
-include the schema-required `subagent_type` at the top level alongside its
-`description` and `prompt`:
+`Agent(...)` calls to OpenCode's native `task` tool. Before the shared review
+specs evaluate Claude's literal `Task`/`Agent` names, an OpenCode runtime marker
+selects `DISPATCH_TOOL=task`; the absence of those Claude names must not produce
+a false `FORGE:REVIEW_BLOCKED` result.
+
+Every isolated review dispatch uses the explicit native argument shape. Every
+native task call must include the schema-required `subagent_type` at the top
+level alongside its `description` and `prompt`:
 
 ```js
 { description: "...", prompt: "...", subagent_type: "general" }
@@ -115,6 +120,9 @@ Implementation and review work uses `general`; read-only discovery uses
 `codebase-explorer` maps to `explore`. When a source task omits its type, the
 generated adapter safely defaults it to `general`; unsupported types stop with
 `FORGE_OPENCODE_CAPABILITY_ERROR` instead of reaching schema validation.
+If the native `task` capability itself is unavailable, the workflow posts
+`FORGE:REVIEW_BLOCKED` and stops rather than falling back to inline review or
+another pipeline controller.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,

@@ -130,6 +130,15 @@ export function resolveOpenCodeConfigDir({ home, env = process.env } = {}) {
   return join(resolvedHome, ".config", "opencode");
 }
 
+function openCodeReviewDispatchContract() {
+  return [
+    "OpenCode review-dispatch override:",
+    "Before applying the workflow's Claude-specific Task/Agent availability check, treat an OpenCode runtime marker (`FORGE_RUNTIME=opencode`, `OPENCODE_SESSION_ID`, `OPENCODE_PID`, or `OPENCODE`) as native capability context and set `DISPATCH_TOOL=task`.",
+    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\" }`; use `general` for implementation/review and `explore` for read-only discovery.",
+    "If lowercase native `task` is genuinely absent from the current tool registry, post `FORGE:REVIEW_BLOCKED` and stop; never replace the required isolated review with inline work or another controller.",
+  ].join("\n");
+}
+
 export function renderOpenCodeCommand({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
@@ -151,6 +160,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
     "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\" }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
+    openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
     "- If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.",
@@ -173,6 +183,8 @@ ${SKILL_SENTINEL}
 Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.
 
 The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: read only this workflow and the next spec explicitly reached by its dispatcher.
+
+${openCodeReviewDispatchContract()}
 
 If the workflow source or a required native capability is unavailable, stop and report exactly:
 \`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.

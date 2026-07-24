@@ -23,6 +23,24 @@ Performs comprehensive review of `staging` before merging to `main`. Handles lar
 
 This spec dispatches Bug Hunter and domain review agents via a sub-agent-spawning tool. Different runtimes expose different tools for this — resolve deterministically, once per invocation, and use the same tool for every dispatch call in this run:
 
+### OpenCode Runtime Override
+
+When the workflow is running under OpenCode, resolve the native tool before applying the Claude-specific availability order above:
+
+```bash
+IS_OPENCODE_RUNTIME=false
+if [ "${FORGE_RUNTIME:-}" = "opencode" ] ||
+   [ -n "${OPENCODE_SESSION_ID:-}" ] ||
+   [ -n "${OPENCODE_PID:-}" ] ||
+   [ -n "${OPENCODE:-}" ]; then
+  IS_OPENCODE_RUNTIME=true
+  DISPATCH_TOOL=task
+  DISPATCH_SUBAGENT_TYPE=general
+fi
+```
+
+When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
+
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping. (Identical resolution logic to `/review-pr` Phase 3C — do not diverge.)
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected agent (Bug Hunters in Phase 3, Code Quality in Phase 4, domain agents in Phase 5), same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
 3. **Neither tool is available**: this is a genuine setup defect, not a routing decision — HARD STOP, post a PR/issue comment explaining that no sub-agent dispatch tool is available, add `needs-human`, and exit without posting a verdict. Do NOT fall back to reviewing inline in the orchestrator's own context.
