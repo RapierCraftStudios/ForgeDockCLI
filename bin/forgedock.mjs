@@ -417,6 +417,40 @@ function getVersion() {
 }
 
 /**
+ * Read the branch that owns the source currently being executed.
+ *
+ * This is deliberately best-effort: diagnostics should still identify the
+ * source path and version when the checkout has no readable branch ref.
+ *
+ * @param {string} [dir]
+ * @returns {string|null}
+ */
+function getGitBranch(dir = FORGE_HOME) {
+  try {
+    const branch = execFileSync(
+      "git",
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      { cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return branch || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Describe the source path the current CLI process resolves from.
+ *
+ * @param {string|null} [branch]
+ * @returns {string}
+ */
+function formatSourceIdentity(branch = null) {
+  const version = getVersion() || "unknown";
+  const branchLabel = branch ? `, branch ${branch}` : "";
+  return `${FORGE_HOME} (v${version}${branchLabel})`;
+}
+
+/**
  * Compare two dotted version strings component-wise (numeric, not
  * lexicographic — "1.9.0" must compare as older than "1.10.0").
  * Each component's leading numeric prefix is used (e.g. a prerelease-suffixed
@@ -1808,24 +1842,18 @@ async function update() {
     const separateGlobalInstall = findSeparateGlobalInstall();
     if (separateGlobalInstall) {
       console.log(
-        `  ${YELLOW}Note: this updates the git clone above. Your global npm install at ${separateGlobalInstall} was NOT touched.${RESET}`,
+        `  ${YELLOW}Note: this command resolves to the git clone above. Your global npm install at ${separateGlobalInstall} is NOT touched.${RESET}`,
       );
       console.log(
         `  ${YELLOW}Run 'npm update -g forgedock', or 'npx forgedock update' from outside a clone, to update it.${RESET}`,
       );
     }
     try {
-      const branch = execSync("git rev-parse --abbrev-ref HEAD", {
-        cwd: FORGE_HOME,
-        encoding: "utf-8",
-      }).trim();
+      const branch = getGitBranch();
+      const branchLabel = branch || "unknown branch";
+      console.log(`  Source: ${formatSourceIdentity(branch)}`);
 
-      // If on a non-main branch, switch to main for the update then restore.
-      // Detached HEAD ("HEAD") is treated as non-restorable — we leave on main
-      // after the update and warn the user.
-      const isDetached = branch === "HEAD";
-      const needsCheckout = branch !== "main";
-      if (needsCheckout) {
+      if (branch !== "main") {
         // Dirty-tree guard: refuse to move HEAD in this clone if there are
         // uncommitted TRACKED changes. Untracked files are intentionally
         // excluded (--untracked-files=no) so a clean checkout with stray
@@ -1837,7 +1865,7 @@ async function update() {
         ).trim();
         if (porcelain) {
           console.log(
-            `  ${YELLOW}Working tree has uncommitted changes on branch ${branch} — skipping git-based update.${RESET}`,
+            `  ${YELLOW}Working tree has uncommitted changes on branch ${branchLabel} — skipping git-based update.${RESET}`,
           );
 
           // forge#2460 — distinguish "developing on this checkout" from a
@@ -1882,16 +1910,13 @@ async function update() {
           return;
         }
 
-        if (isDetached) {
-          console.log(
-            `  ${YELLOW}Detached HEAD state — switching to main for update.${RESET}`,
-          );
-        } else {
-          console.log(
-            `  On branch ${CYAN}${branch}${RESET} — switching to ${CYAN}main${RESET} for update...`,
-          );
-        }
-        execFileSync("git", ["checkout", "main", "--quiet"], { cwd: FORGE_HOME });
+        console.log(
+          `  ${YELLOW}Source checkout is on ${branchLabel}, not main; skipping update to preserve this source.${RESET}`,
+        );
+        console.log(
+          `  Run 'npx forgedock update' from a main-branch checkout (or use 'npx forgedock@latest') to refresh ForgeDock.`,
+        );
+        return;
       }
 
       const before = execSync("git rev-parse HEAD", {
@@ -1914,20 +1939,6 @@ async function update() {
         printGitCloneChangelogSummary(before, after);
       }
       await relinkAndHint();
-
-      // Restore original branch after a successful update.
-      if (needsCheckout && !isDetached) {
-        try {
-          execFileSync("git", ["checkout", branch, "--quiet"], { cwd: FORGE_HOME });
-          console.log(
-            `  Restored branch ${CYAN}${branch}${RESET}.`,
-          );
-        } catch {
-          console.log(
-            `  ${YELLOW}⚠  Could not restore branch ${branch} — you are now on main.${RESET}`,
-          );
-        }
-      }
     } catch (err) {
       console.log(
         `  ${YELLOW}Cannot fast-forward — local changes exist. Skipping.${RESET}`,
@@ -2190,7 +2201,14 @@ async function doctor(fix = false) {
   console.log("");
 
   const { targetDir: TARGET_DIR } = detectInstallPaths();
-  console.log(`  Mode: global (~/.claude)`);
+  const isGitCloneInstall = existsSync(join(FORGE_HOME, ".git"));
+  const sourceBranch = isGitCloneInstall ? getGitBranch() : null;
+  console.log(
+    isGitCloneInstall
+      ? `  Mode: git clone at ${CYAN}${FORGE_HOME}${RESET}`
+      : `  Mode: global (~/.claude)`,
+  );
+  console.log(`  Source: ${formatSourceIdentity(sourceBranch)}`);
   console.log("");
 
   let failures = 0;
@@ -2717,7 +2735,6 @@ async function doctor(fix = false) {
   // absence that isn't a problem should not read as one.
   {
     try {
-      const isGitCloneInstall = existsSync(join(FORGE_HOME, ".git"));
       if (isGitCloneInstall) {
         pass("Persisted toolset home (~/.forge)", "skipped — git-clone install links directly from the clone");
       } else {

@@ -927,7 +927,7 @@ The hook entry is registered idempotently: re-installing (`npx forgedock update`
 | Command | Action |
 |---------|--------|
 | `npx forgedock` / `npx forgedock install` | Registers the SessionStart hook (along with installing commands and writing `forge.yaml`) |
-| `npx forgedock update` | Re-registers the hook (relink only — does not touch `forge.yaml`) |
+| `npx forgedock update` | Re-registers the hook when the resolved source can be safely refreshed (relink only — does not touch `forge.yaml`) |
 | `npx forgedock uninstall` | Removes the hook entry from `settings.json` |
 
 ### Opting Out
@@ -948,7 +948,7 @@ See [Per-Directory State Registry](#per-directory-state-registry) below for how 
 
 `npx`/`npm` never installs `forgedock` to a stable location on your machine — it resolves to wherever `npx`'s cache (or a global npm install, or a git clone) happens to physically live. Historically, `~/.claude/commands/` and the SessionStart hook's script path were symlinked **directly** from that ephemeral location. When npm/npx (or the OS) later evicted its cache, those symlinks silently dangled — Claude Code sessions stopped getting ForgeDock context with no error shown.
 
-As of this feature, every `npx forgedock` (or `npx forgedock update`) run copies ForgeDock's own installable payload into a stable, version-independent home:
+For npm/npx sources, every `npx forgedock` (or `npx forgedock update`) run copies ForgeDock's own installable payload into a stable, version-independent home:
 
 ```
 ~/.forge/
@@ -968,8 +968,8 @@ As of this feature, every `npx forgedock` (or `npx forgedock update`) run copies
 | `npx forgedock` / `npx forgedock install` | Copies the resolved package's payload into `~/.forge/` (content-compared — unchanged files are never rewritten) before linking commands, then links from `~/.forge/`, not the original source |
 | `npx forgedock init` | Does not touch `~/.forge/` — `init` only writes `forge.yaml`, it never installs commands |
 | `npx forgedock update` (npm/npx install) | Refreshes `~/.forge/` from whatever the currently-resolved package looks like, then relinks |
-| `npx forgedock update` (git-clone install) | **Does not** touch `~/.forge/` at all — see the exemption below |
-| `npx forgedock doctor` | Reports `~/.forge/version` and confirms `~/.forge/{bin,commands,scripts,templates}` exist |
+| `npx forgedock update` (git-clone install) | Updates and relinks a `main` checkout; a non-main checkout is left untouched and gets actionable guidance because the current source must remain the source used after the command returns |
+| `npx forgedock doctor` | Reports the effective source path, version, and git branch, then reports `~/.forge/version` and confirms `~/.forge/{bin,commands,scripts,templates}` for npm installs |
 
 The copy is idempotent: files whose content is already byte-identical are never rewritten, so steady-state re-runs are fast and don't generate false "updated" noise.
 
@@ -979,6 +979,7 @@ If you run ForgeDock from a git clone (or a git worktree) of the repo itself —
 
 - `~/.claude/commands/` continues to symlink directly from the clone, exactly as before this feature.
 - `~/.forge/{bin,commands,scripts,templates}` correctly does **not** exist for this install mode — `npx forgedock doctor` treats that absence as healthy, not a warning.
+- `npx forgedock update` never switches a non-main checkout to `main` and then restores it. That transient update would leave the next invocation running the old branch source, so the command reports the effective path, branch, and version and tells you to run from a main checkout instead.
 
 ### Not the Same as `~/.forge/{runs,index}`
 
@@ -1086,7 +1087,7 @@ The directory (`~/.forge/`) is created automatically on first write with `mkdir(
 ### When It's Written
 
 - After every successful `npx forgedock install` (end of the onboarding journey, right after the "Forged." celebration screen).
-- After every `npx forgedock update` — both the git-clone branch (fast-forward pull) and the npm branch (version-check advisory) route through the same repair step (`relinkAndHint()`), so the receipt is refreshed either way.
+- After every successful `npx forgedock update` — the main git-clone branch and npm branch route through the same repair step (`relinkAndHint()`), so the receipt is refreshed either way. A non-main git-clone advisory intentionally does not relink or rewrite the receipt.
 
 The write is best-effort and never blocks or fails the install/update it records: any error (permission denied, disk full, unusual `FORGE_HOME` layout) degrades silently to a no-op, matching the fail-open contract already used by the command-manifest and hook-registration steps.
 
