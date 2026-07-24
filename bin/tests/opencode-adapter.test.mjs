@@ -471,12 +471,13 @@ describe("OpenCode adapter", () => {
     assert.equal(readFileSync(configPath, "utf8"), original);
   });
 
-  it("does not turn foreign Windows-style paths into POSIX ForgeDock paths", async () => {
+  it("does not turn foreign mixed-separator paths into POSIX ForgeDock paths", async () => {
     if (process.platform === "win32") return;
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
     mkdirSync(config, { recursive: true });
-    const foreignPath = forgeHome.replaceAll("/", "\\");
+    const separator = forgeHome.lastIndexOf("/");
+    const foreignPath = `${forgeHome.slice(0, separator)}\\${forgeHome.slice(separator + 1)}`;
     const customCommand = {
       description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
       template: `Read ${foreignPath}/commands/work-on.md and execute the pipeline for issue {{args}}.`,

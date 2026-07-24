@@ -62,8 +62,10 @@ function normalizeLegacyPath(path, flavor) {
   const pathApi = pathFlavor === "win32" ? win32 : posix;
   if (!pathApi.isAbsolute(path)) return null;
 
-  let normalized = portablePath(pathApi.normalize(path));
-  if (pathFlavor === "win32") normalized = normalized.toLowerCase();
+  let normalized = pathApi.normalize(path);
+  if (pathFlavor === "win32") {
+    normalized = portablePath(normalized).toLowerCase();
+  }
   if (normalized !== "/" && !/^[a-z]:\/$/i.test(normalized)) {
     normalized = normalized.replace(/\/+$/, "");
   }
