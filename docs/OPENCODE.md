@@ -145,13 +145,13 @@ the `forgedock/` namespace are never removed; that namespace is pruned only
 when it is empty.
 For backward compatibility, install and uninstall may rewrite `opencode.json`
 only to remove legacy entries whose two-key `description` and `template` still
-exactly match one of the definitions emitted by the retired adapter, plus
-references to the managed `~/.opencode-forge.md` instructions file. Only the
-absolute ForgeDock home path in those templates may vary. The migration does not
-rewrite `opencode.jsonc`. User-owned settings and customized commands are
-preserved; definitions with extra keys, edited fields, or ambiguous ownership
-are left in place. If a legacy config cannot be parsed or written, the
-migration leaves the legacy artifacts in place.
+exactly match one of the definitions emitted by the retired adapter and point to
+the active ForgeDock home (or the home recorded in the ownership manifest during
+uninstall), plus references to the managed `~/.opencode-forge.md` instructions
+file. The migration does not rewrite `opencode.jsonc`. User-owned settings and
+customized commands are preserved; definitions with extra keys, edited fields,
+different paths, or ambiguous ownership are left in place. If a legacy config
+cannot be parsed or written, the migration leaves the legacy artifacts in place.
 
 ## Locations
 

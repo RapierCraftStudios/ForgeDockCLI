@@ -5,7 +5,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  posix,
+  relative,
+  resolve,
+  sep,
+  win32,
+} from "node:path";
 import { findMarkdownFiles } from "./journey.mjs";
 
 const COMMAND_SENTINEL = "<!-- forgedock:managed-opencode-command -->";
@@ -37,6 +47,27 @@ const LEGACY_COMMAND_CONTRACTS = {
 
 function portablePath(path) {
   return path.replaceAll("\\", "/");
+}
+
+function legacyPathFlavor(path) {
+  if (typeof path !== "string") return null;
+  if (posix.isAbsolute(path)) return "posix";
+  if (win32.isAbsolute(path)) return "win32";
+  return null;
+}
+
+function normalizeLegacyPath(path, flavor) {
+  const pathFlavor = flavor || legacyPathFlavor(path);
+  if (!pathFlavor) return null;
+  const pathApi = pathFlavor === "win32" ? win32 : posix;
+  if (!pathApi.isAbsolute(path)) return null;
+
+  let normalized = portablePath(pathApi.normalize(path));
+  if (pathFlavor === "win32") normalized = normalized.toLowerCase();
+  if (normalized !== "/" && !/^[a-z]:\/$/i.test(normalized)) {
+    normalized = normalized.replace(/\/+$/, "");
+  }
+  return normalized;
 }
 
 function stripJsonc(raw) {
@@ -128,7 +159,7 @@ export function normalizeOpenCodeSkillName(command) {
   return name;
 }
 
-function isLegacyCommandDefinition(name, definition) {
+function isLegacyCommandDefinition(name, definition, forgeHome) {
   if (!definition || typeof definition !== "object" || Array.isArray(definition)) return false;
   const keys = Object.keys(definition).sort();
   const contract = LEGACY_COMMAND_CONTRACTS[name];
@@ -144,8 +175,10 @@ function isLegacyCommandDefinition(name, definition) {
   const template = portablePath(definition.template);
   const suffix = `/commands/${name}.md${contract.templateSuffix}`;
   if (!template.startsWith("Read ") || !template.endsWith(suffix)) return false;
-  const forgeHome = template.slice("Read ".length, -suffix.length);
-  return forgeHome.length > 0 && isAbsolute(forgeHome);
+  const expectedHome = normalizeLegacyPath(forgeHome);
+  if (!expectedHome) return false;
+  const templateHome = definition.template.slice("Read ".length, -suffix.length);
+  return normalizeLegacyPath(templateHome, legacyPathFlavor(forgeHome)) === expectedHome;
 }
 
 export function resolveOpenCodeConfigDir({ home, env = process.env } = {}) {
@@ -560,7 +593,7 @@ async function discoverEntrypoints(forgeHome, includeExtras) {
   return commands.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function migrateLegacyAdapter({ configDir, home }) {
+async function migrateLegacyAdapter({ configDir, home, forgeHome }) {
   const resolvedHome = home || process.env.HOME || process.env.USERPROFILE || homedir();
   const legacyInstructions = join(resolvedHome, ".opencode-forge.md");
   const result = { removedInstructionsFile: false, removedConfigEntries: 0, warnings: [] };
@@ -612,7 +645,7 @@ async function migrateLegacyAdapter({ configDir, home }) {
     if (config.command && typeof config.command === "object" && !Array.isArray(config.command)) {
       for (const name of legacyCommands) {
         const definition = config.command[name];
-        if (isLegacyCommandDefinition(name, definition)) {
+        if (isLegacyCommandDefinition(name, definition, forgeHome)) {
           delete config.command[name];
           result.removedConfigEntries++;
           changed = true;
@@ -776,7 +809,7 @@ async function installOpenCodeAdapterLocked({ forgeHome, home, includeExtras, co
       digest,
     };
     await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, configDir);
-    migration = await migrateLegacyAdapter({ configDir, home });
+    migration = await migrateLegacyAdapter({ configDir, home, forgeHome });
   } catch (error) {
     await restoreAdapterState({
       configDir,
@@ -857,6 +890,10 @@ async function uninstallOpenCodeAdapterLocked({ home, env, configDir }) {
       if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
     });
   }
-  const migration = await migrateLegacyAdapter({ configDir, home });
+  const migration = await migrateLegacyAdapter({
+    configDir,
+    home,
+    forgeHome: typeof manifest.forgeHome === "string" ? manifest.forgeHome : undefined,
+  });
   return { configDir, removed, migration };
 }
