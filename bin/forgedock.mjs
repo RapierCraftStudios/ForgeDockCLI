@@ -3825,7 +3825,7 @@ switch (command) {
         includeExtras: restArgs.includes("--extras"),
       });
       process.stdout.write(
-        `Installed ${result.commandCount} OpenCode commands under ${result.configDir}.\n` +
+        `Installed ${result.commandCount} OpenCode commands and ${result.skillCount} skills under ${result.configDir}.\n` +
           "Restart OpenCode, then run /forge/work-on <issue>.\n",
       );
       if (result.migration.removedInstructionsFile || result.migration.removedConfigEntries > 0) {
@@ -3847,7 +3847,7 @@ switch (command) {
         exitCode = 1;
       } else {
         process.stdout.write(
-          `OpenCode adapter is healthy (${result.manifest.commandCount} commands) under ${result.configDir}.\n`,
+          `OpenCode adapter is healthy (${result.manifest.commandCount} commands, ${result.manifest.skillCount ?? 0} skills) under ${result.configDir}.\n`,
         );
       }
     } else if (action === "uninstall") {

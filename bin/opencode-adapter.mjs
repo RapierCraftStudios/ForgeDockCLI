@@ -3,12 +3,13 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { parseInstallTier } from "./journey.mjs";
+import { findMarkdownFiles } from "./journey.mjs";
 
 const COMMAND_SENTINEL = "<!-- forgedock:managed-opencode-command -->";
+const SKILL_SENTINEL = "<!-- forgedock:managed-opencode-skill -->";
 const PLUGIN_SENTINEL = "// forgedock:managed-opencode-plugin";
 const LEGACY_SENTINEL = "<!-- ForgeDock managed";
 const MANIFEST_VERSION = 1;
@@ -85,6 +86,27 @@ function parseDescription(content) {
   return "";
 }
 
+/**
+ * Map a source workflow path to OpenCode's native skill-name contract.
+ * OpenCode skill names cannot contain path separators, so nested source paths
+ * use a stable hyphen separator (for example, work-on/investigate).
+ */
+export function normalizeOpenCodeSkillName(command) {
+  const name = portablePath(command)
+    .replace(/\.md$/i, "")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""))
+    .filter(Boolean)
+    .join("-")
+    .replace(/-{2,}/g, "-");
+  if (!name) throw new Error(`Cannot register empty OpenCode skill name for workflow: ${command}`);
+  if (name.length > 64) {
+    throw new Error(`OpenCode skill name exceeds 64 characters for workflow: ${command}`);
+  }
+  return name;
+}
+
 function isLegacyCommandDefinition(name, definition) {
   if (!definition || typeof definition !== "object" || Array.isArray(definition)) return false;
   const keys = Object.keys(definition).sort();
@@ -108,25 +130,50 @@ export function resolveOpenCodeConfigDir({ home, env = process.env } = {}) {
 export function renderOpenCodeCommand({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
+  const nativeSkillExpression = '${x.replaceAll(":", "-").replaceAll("/", "-")}';
+  return [
+    "---",
+    `description: ${yamlString(`ForgeDock: ${description}`)}`,
+    "agent: build",
+    "---",
+    COMMAND_SENTINEL,
+    "",
+    "Run the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:",
+    "",
+    "$ARGUMENTS",
+    "",
+    "Use `read` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation.",
+    "",
+    "OpenCode runtime mapping:",
+    "",
+    "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool. Preserve requested isolation and parallelism, use `general` for implementation/review and `explore` for read-only discovery, and resume by task ID when requested. If background tasks are unavailable, launch independent foreground tasks concurrently where possible and use the workflow's GitHub-label polling fallback; never inline a required isolated review.",
+    "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
+    "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
+    "- If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.",
+  ].join("\n") + "\n";
+}
+
+export function renderOpenCodeSkill({ description, forgeHome, command }) {
+  const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
+  const name = normalizeOpenCodeSkillName(command);
   return `---
+name: ${name}
 description: ${yamlString(`ForgeDock: ${description}`)}
-agent: build
+compatibility: opencode
+metadata:
+  forgedock: "managed"
+  source: ${yamlString(command)}
 ---
-${COMMAND_SENTINEL}
+${SKILL_SENTINEL}
 
-Run the authoritative ForgeDock workflow at \`${specPath}\` with these exact arguments:
+Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.
 
-$ARGUMENTS
+The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: read only this workflow and the next spec explicitly reached by its dispatcher.
 
-Use \`read\` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation.
-
-OpenCode runtime mapping:
-
-- \`Skill(skill="x", args="y")\` means lazily read \`${commandsPath}/\${x.replaceAll(":", "/")}.md\` and execute that workflow in the current context with the exact arguments. Colon separators become slash separators; existing slash separators remain unchanged. This matches Claude Code Skill's in-conversation loading; it is not a reason to spawn a subagent.
-- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool. Preserve requested isolation and parallelism, use \`general\` for implementation/review and \`explore\` for read-only discovery, and resume by task ID when requested. If background tasks are unavailable, launch independent foreground tasks concurrently where possible and use the workflow's GitHub-label polling fallback; never inline a required isolated review.
-- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.
-- OpenCode injects \`FORGE_HOME\` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.
-- If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.
+If the workflow source or a required native capability is unavailable, stop and report exactly:
+\`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.
+Do not invoke \`forgedock run-issue\`, \`npx forgedock run-issue\`, or recursive \`opencode run\` to recover.
 `;
 }
 
@@ -209,9 +256,20 @@ function pathInside(root, candidate) {
 async function isManagedFile(path) {
   try {
     const content = await readFile(path, "utf8");
-    return content.includes(COMMAND_SENTINEL) || content.includes(PLUGIN_SENTINEL);
+    return content.includes(COMMAND_SENTINEL) || content.includes(SKILL_SENTINEL) || content.includes(PLUGIN_SENTINEL);
   } catch {
     return false;
+  }
+}
+
+async function removeEmptyParentDirs(configDir, filePath) {
+  const root = resolve(configDir);
+  let directory = dirname(filePath);
+  while (resolve(directory) !== root && pathInside(root, directory)) {
+    await rmdir(directory).catch((error) => {
+      if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
+    });
+    directory = dirname(directory);
   }
 }
 
@@ -223,6 +281,7 @@ async function removeOwnedFiles(configDir, files) {
     await unlink(path).catch((error) => {
       if (error.code !== "ENOENT") throw error;
     });
+    await removeEmptyParentDirs(configDir, path);
     removed++;
   }
   return removed;
@@ -230,20 +289,27 @@ async function removeOwnedFiles(configDir, files) {
 
 async function discoverEntrypoints(forgeHome, includeExtras) {
   const commandsDir = join(forgeHome, "commands");
-  const entries = await readdir(commandsDir, { withFileTypes: true });
+  const sources = await findMarkdownFiles(commandsDir, { includeExtras });
   const commands = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-    const source = join(commandsDir, entry.name);
-    const tier = parseInstallTier(source);
-    if (tier === "internal" || (tier === "extras" && !includeExtras)) continue;
+  const skillNames = new Map();
+  for (const source of sources) {
+    const sourcePath = portablePath(relative(commandsDir, source)).replace(/\.md$/i, "");
     const content = await readFile(source, "utf8");
     const description = parseDescription(content);
     if (!description) continue;
+    const nativeName = normalizeOpenCodeSkillName(sourcePath);
+    const existing = skillNames.get(nativeName);
+    if (existing && existing !== sourcePath) {
+      throw new Error(
+        `OpenCode skill name collision: ${nativeName} maps both ${existing} and ${sourcePath}`,
+      );
+    }
+    skillNames.set(nativeName, sourcePath);
     commands.push({
-      name: entry.name.slice(0, -3),
+      name: sourcePath,
+      nativeName,
       description,
-      tier,
+      topLevel: !sourcePath.includes("/"),
     });
   }
   return commands.sort((a, b) => a.name.localeCompare(b.name));
@@ -345,7 +411,8 @@ export async function installOpenCodeAdapter({
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
   const previous = (await readManifest(manifestPath)) || { files: [] };
-  const commands = await discoverEntrypoints(forgeHome, includeExtras);
+  const workflows = await discoverEntrypoints(forgeHome, includeExtras);
+  const commands = workflows.filter((workflow) => workflow.topLevel);
   const rendered = [];
 
   for (const command of commands) {
@@ -353,6 +420,16 @@ export async function installOpenCodeAdapter({
     const content = renderOpenCodeCommand({
       command: command.name,
       description: command.description,
+      forgeHome,
+    });
+    rendered.push({ rel, content });
+  }
+
+  for (const workflow of workflows) {
+    const rel = portablePath(join("skills", workflow.nativeName, "SKILL.md"));
+    const content = renderOpenCodeSkill({
+      command: workflow.name,
+      description: workflow.description,
       forgeHome,
     });
     rendered.push({ rel, content });
@@ -381,13 +458,22 @@ export async function installOpenCodeAdapter({
     forgeHome,
     includeExtras,
     commandCount: commands.length,
+    skillCount: workflows.length,
     files: nextFiles,
     digest,
   };
   await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   const migration = await migrateLegacyAdapter({ configDir, home });
 
-  return { configDir, manifestPath, commandCount: commands.length, removed, digest, migration };
+  return {
+    configDir,
+    manifestPath,
+    commandCount: commands.length,
+    skillCount: workflows.length,
+    removed,
+    digest,
+    migration,
+  };
 }
 
 export async function getOpenCodeAdapterStatus({ home, env = process.env } = {}) {
