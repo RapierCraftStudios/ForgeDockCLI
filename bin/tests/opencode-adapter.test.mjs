@@ -275,6 +275,18 @@ describe("OpenCode adapter", () => {
     assert.ok(!existsSync(join(config, "commands")));
   });
 
+  it("rejects an active concurrent adapter operation", async () => {
+    const { forgeHome, home } = fixture();
+    const lockDir = join(home, ".config", "opencode", "forgedock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "install.lock"), "active\n");
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /Another OpenCode adapter operation is in progress/,
+    );
+  });
+
   it("migrates only ForgeDock-managed legacy adapter entries", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
@@ -455,6 +467,7 @@ describe("OpenCode adapter", () => {
     assert.ok(existsSync(userFile));
     assert.ok(!existsSync(join(config, "commands", "forge", "work-on.md")));
     assert.ok(!existsSync(join(config, "plugins", "forgedock.js")));
+    assert.ok(!existsSync(join(config, "forgedock")));
   });
 
   it("preserves unmanifested files in the ForgeDock namespace", async () => {

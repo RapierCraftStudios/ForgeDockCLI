@@ -3,7 +3,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { findMarkdownFiles } from "./journey.mjs";
@@ -13,6 +13,9 @@ const SKILL_SENTINEL = "<!-- forgedock:managed-opencode-skill -->";
 const PLUGIN_SENTINEL = "// forgedock:managed-opencode-plugin";
 const LEGACY_SENTINEL = "<!-- ForgeDock managed";
 const MANIFEST_VERSION = 1;
+const ADAPTER_LOCK_STALE_AGE_MS = 30_000;
+const ADAPTER_LOCK_HEARTBEAT_MS = 10_000;
+const ADAPTER_LOCK_RETRY_DELAYS_MS = [10, 20, 40, 80, 150];
 
 function portablePath(path) {
   return path.replaceAll("\\", "/");
@@ -290,6 +293,53 @@ async function tryResolveSafePath(root, candidate) {
   }
 }
 
+async function acquireAdapterLock(configDir) {
+  const lockPath = join(configDir, "forgedock", "install.lock");
+  const safeLock = await resolveSafePath(configDir, lockPath, { createParent: true });
+  if (!safeLock) throw new Error(`Unable to resolve safe OpenCode lock path: ${lockPath}`);
+
+  for (let attempt = 0; attempt <= ADAPTER_LOCK_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return { handle: await open(safeLock.path, "wx"), path: safeLock.path };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let reclaimed = false;
+      try {
+        const stat = await lstat(safeLock.path);
+        if (Date.now() - stat.mtimeMs >= ADAPTER_LOCK_STALE_AGE_MS) {
+          const current = await lstat(safeLock.path);
+          if (current.ino === stat.ino && current.mtimeMs === stat.mtimeMs) {
+            await unlink(safeLock.path);
+            reclaimed = true;
+          }
+        }
+      } catch {
+        // The lock may have been released or replaced between checks.
+      }
+      if (reclaimed) continue;
+      if (attempt === ADAPTER_LOCK_RETRY_DELAYS_MS.length) break;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, ADAPTER_LOCK_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  throw new Error("Another OpenCode adapter operation is in progress; try again shortly");
+}
+
+async function withAdapterLock(configDir, operation) {
+  const lock = await acquireAdapterLock(configDir);
+  const heartbeat = setInterval(() => {
+    lock.handle.utimes(new Date(), new Date()).catch(() => {});
+  }, ADAPTER_LOCK_HEARTBEAT_MS);
+  heartbeat.unref?.();
+  try {
+    return await operation();
+  } finally {
+    clearInterval(heartbeat);
+    await lock.handle.close().catch(() => {});
+    await unlink(lock.path).catch(() => {});
+    await rmdir(dirname(lock.path)).catch(() => {});
+  }
+}
+
 async function atomicWrite(path, content, root) {
   const safe = root ? await resolveSafePath(root, path, { createParent: true }) : null;
   if (root && !safe) throw new Error(`Unable to resolve safe OpenCode path: ${path}`);
@@ -499,10 +549,48 @@ async function migrateLegacyAdapter({ configDir, home }) {
     return result;
   }
   if (legacyInstructionsOwned && safeLegacyInstructions) {
-    await unlink(safeLegacyInstructions.path);
-    result.removedInstructionsFile = true;
+    try {
+      await unlink(safeLegacyInstructions.path);
+      result.removedInstructionsFile = true;
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        result.warnings.push(`Could not remove legacy instructions file ${legacyInstructions}: ${error.message}`);
+      }
+    }
   }
   return result;
+}
+
+async function snapshotAdapterFiles(configDir, files) {
+  const snapshots = new Map();
+  for (const rel of files) {
+    const path = join(configDir, rel);
+    const safe = await tryResolveSafePath(configDir, path);
+    const content = safe ? await readRegularFile(safe.path) : null;
+    snapshots.set(rel, content !== null && hasManagedSentinel(content) ? content : null);
+  }
+  return snapshots;
+}
+
+async function restoreAdapterState({ configDir, manifestPath, files, manifestContent }) {
+  for (const [rel, content] of files) {
+    const path = join(configDir, rel);
+    if (content !== null) {
+      await atomicWrite(path, content, configDir).catch(() => {});
+      continue;
+    }
+    const safe = await tryResolveSafePath(configDir, path);
+    if (!safe || !(await isManagedFile(safe.path))) continue;
+    await unlink(safe.path).catch(() => {});
+    await removeEmptyParentDirs(safe.root, safe.path).catch(() => {});
+  }
+
+  if (manifestContent !== null) {
+    await atomicWrite(manifestPath, manifestContent, configDir).catch(() => {});
+  } else {
+    const safeManifest = await tryResolveSafePath(configDir, manifestPath);
+    if (safeManifest) await unlink(safeManifest.path).catch(() => {});
+  }
 }
 
 export async function installOpenCodeAdapter({
@@ -518,6 +606,16 @@ export async function installOpenCodeAdapter({
 
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
+  return withAdapterLock(configDir, () => installOpenCodeAdapterLocked({
+    forgeHome,
+    home,
+    includeExtras,
+    configDir,
+    manifestPath,
+  }));
+}
+
+async function installOpenCodeAdapterLocked({ forgeHome, home, includeExtras, configDir, manifestPath }) {
   const previous = (await readManifest(manifestPath, configDir)) || { files: [] };
   const workflows = await discoverEntrypoints(forgeHome, includeExtras);
   const commands = workflows.filter((workflow) => workflow.topLevel);
@@ -558,25 +656,42 @@ export async function installOpenCodeAdapter({
       throw new Error(`Refusing to overwrite user-owned OpenCode file: ${safe.path}`);
     }
   }
-  for (const item of rendered) {
-    await atomicWrite(join(configDir, item.rel), item.content, configDir);
-  }
-
   const nextFiles = rendered.map((item) => item.rel).sort();
-  const stale = previous.files.filter((file) => !nextFiles.includes(file));
-  const removed = await removeOwnedFiles(configDir, stale);
-  const digest = digestFiles(rendered);
-  const manifest = {
-    version: MANIFEST_VERSION,
-    forgeHome,
-    includeExtras,
-    commandCount: commands.length,
-    skillCount: workflows.length,
-    files: nextFiles,
-    digest,
-  };
-  await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, configDir);
-  const migration = await migrateLegacyAdapter({ configDir, home });
+  const trackedFiles = [...new Set([...previous.files, ...nextFiles])];
+  const snapshots = await snapshotAdapterFiles(configDir, trackedFiles);
+  const safeManifest = await tryResolveSafePath(configDir, manifestPath);
+  const previousManifestContent = safeManifest ? await readRegularFile(safeManifest.path) : null;
+  let removed;
+  let digest;
+  let migration;
+  try {
+    for (const item of rendered) {
+      await atomicWrite(join(configDir, item.rel), item.content, configDir);
+    }
+
+    const stale = previous.files.filter((file) => !nextFiles.includes(file));
+    removed = await removeOwnedFiles(configDir, stale);
+    digest = digestFiles(rendered);
+    const manifest = {
+      version: MANIFEST_VERSION,
+      forgeHome,
+      includeExtras,
+      commandCount: commands.length,
+      skillCount: workflows.length,
+      files: nextFiles,
+      digest,
+    };
+    await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, configDir);
+    migration = await migrateLegacyAdapter({ configDir, home });
+  } catch (error) {
+    await restoreAdapterState({
+      configDir,
+      manifestPath,
+      files: snapshots,
+      manifestContent: previousManifestContent,
+    });
+    throw error;
+  }
 
   return {
     configDir,
@@ -628,6 +743,10 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
 
 export async function uninstallOpenCodeAdapter({ home, env = process.env } = {}) {
   const configDir = resolveOpenCodeConfigDir({ home, env });
+  return withAdapterLock(configDir, () => uninstallOpenCodeAdapterLocked({ home, env, configDir }));
+}
+
+async function uninstallOpenCodeAdapterLocked({ home, env, configDir }) {
   const manifestPath = join(configDir, "forgedock", "manifest.json");
   const manifest = (await readManifest(manifestPath, configDir)) || { files: [] };
   const removed = await removeOwnedFiles(configDir, manifest.files);
