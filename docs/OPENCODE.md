@@ -150,10 +150,10 @@ The separate `forgedock run` and `forgedock run-issue` backend still supports
 only Claude CLI and the Anthropic API. An OpenCode engine backend must be added
 and validated before ForgeDock can claim provider-neutral headless parity.
 
-Claude's `PreToolUse` safety hook has not yet been ported to an OpenCode plugin.
-The shared workflow rules and deterministic scripts still apply, but equivalent
-mechanical enforcement must be implemented and tested before claiming complete
-Claude-runtime safety parity.
+The ForgeDock plugin provides the OpenCode-specific runtime boundary for shell
+execution. Its `tool.execute.before` hook rejects Claude-backed and recursive
+ForgeDock controller commands; the shared workflow rules and deterministic
+scripts remain the source of truth for all other behavior.
 
 OpenCode 1.18.4 keeps background subagents experimental. When they are not
 enabled, the command adapter requires independent foreground tasks to be
@@ -188,6 +188,12 @@ stop with an actionable `FORGE_OPENCODE_CAPABILITY_ERROR`. It must not recover
 by invoking `forgedock run-issue`, `npx forgedock run-issue`, or a recursive
 `opencode run`; those paths select a competing controller or Claude-backed
 backend.
+
+The same boundary is enforced below the plugin for direct CLI callers. With
+`FORGE_RUNTIME=opencode`, `forgedock run`, `forgedock run-issue`, and Claude
+backend preflight fail before selecting a provider. The stable error is
+`FORGE_OPENCODE_CAPABILITY_ERROR`; continue by using the registered native
+Skill and Task workflow instead.
 
 This runtime branch is additive. Claude keeps its existing engine and
 background-agent paths, and Codex keeps its installed namespaced skills and

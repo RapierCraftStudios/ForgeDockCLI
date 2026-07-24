@@ -12,10 +12,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   getOpenCodeAdapterStatus,
   installOpenCodeAdapter,
   renderOpenCodeCommand,
+  renderOpenCodePlugin,
   renderOpenCodeSkill,
   normalizeOpenCodeSkillName,
   resolveOpenCodeConfigDir,
@@ -178,6 +180,38 @@ describe("OpenCode adapter", () => {
     assert.doesNotMatch(plugin, /current < 2/);
     assert.match(plugin, /\/.*fd-opencode-source-/);
     assert.match(plugin, /Git.*bin.*bash\.exe/);
+  });
+
+  it("enforces the OpenCode fallback guard in the generated plugin", async () => {
+    const { forgeHome, home } = fixture();
+    const pluginPath = join(home, "forgedock-plugin.mjs");
+    writeFileSync(pluginPath, renderOpenCodePlugin(forgeHome));
+    const plugin = await import(`${pathToFileURL(pluginPath).href}?test=${Date.now()}`);
+    const hooks = await plugin.ForgeDockPlugin();
+    const blocked = [
+      "claude --print workflow",
+      "forgedock run-issue 42 --lane staging",
+      "npx --yes forgedock run-issue 42 --lane staging",
+      "FORGE_RUNTIME=opencode opencode run --command forge/work-on 42",
+      "echo ready && npx forgedock run-issue 42 --lane staging",
+      "C:\\tools\\claude.exe --print workflow",
+    ];
+
+    for (const command of blocked) {
+      await assert.rejects(
+        hooks["tool.execute.before"]({ tool: "bash" }, { args: { command } }),
+        (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
+          error.message.startsWith("FORGE_OPENCODE_CAPABILITY_ERROR:"),
+        command,
+      );
+    }
+
+    await hooks["tool.execute.before"]({ tool: "bash" }, { args: { command: "git status --short" } });
+    await hooks["tool.execute.before"]({ tool: "read" }, { args: { command: "claude --print workflow" } });
+
+    const shellOutput = { env: {} };
+    await hooks["shell.env"]({}, shellOutput);
+    assert.equal(shellOutput.env.FORGE_RUNTIME, "opencode");
   });
 
   it("installs extras only when requested and prunes them on downgrade", async () => {

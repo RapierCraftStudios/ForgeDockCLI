@@ -567,6 +567,13 @@ fi
 This branch is additive. When OpenCode is not selected, continue through the
 existing engine-first and Claude Agent-spawn paths below without modification.
 
+The generated OpenCode plugin is an executable boundary, not just prompt
+guidance: its `tool.execute.before` hook rejects `claude`, `forgedock
+run-issue`, `npx forgedock run-issue`, and recursive `opencode run` shell
+commands with `FORGE_OPENCODE_CAPABILITY_ERROR`. If a native Skill or Task is
+unavailable, stop with that bounded error and preserve the GitHub label state;
+never compensate by starting a second controller or the Claude-backed engine.
+
 **CRITICAL — never background via shell `&`/`wait`** (fixed forge#2466): A single `forgedock run-issue` invocation drives an issue through investigate → build → review → close and routinely runs 30+ minutes. Backgrounding the process at the *shell* level (`cmd &` … `wait`) does not escape the Bash tool's own per-invocation ceiling — `wait` is itself the foreground command the tool watches, and it blocks for the combined duration of every process in the chunk. This made engine-first dispatch effectively dead code: any chunk running longer than the ceiling was always killed, so every run silently fell through to the Agent-spawn fallback below. The fix: dispatch each `forgedock run-issue` invocation as its **own `Bash` tool call with `run_in_background=true`** — the harness's native "start it, don't wait, notify me on completion" primitive — never with shell-level `&`/`wait`. This is exactly the same async model the Agent-spawn-fallback path already uses (and Step 4B's notification-driven completion loop already expects), so one monitoring loop now covers both dispatch styles.
 
 ```bash

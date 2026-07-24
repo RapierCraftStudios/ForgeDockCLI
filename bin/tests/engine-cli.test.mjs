@@ -384,6 +384,27 @@ describe("runFromCli --repo targeting guard", () => {
   });
 });
 
+describe("runFromCli OpenCode runtime guard", () => {
+  it("refuses before repo checks, run-log output, or engine dispatch", async () => {
+    const previousRuntime = process.env.FORGE_RUNTIME;
+    process.env.FORGE_RUNTIME = "opencode";
+    const gh = mock.fn(async () => "unexpected");
+    const runIssue = mock.fn(async () => ({ terminalReason: "workflow:merged" }));
+    try {
+      await assert.rejects(
+        runFromCli(["42", "--lane", "staging"], { io: { gh }, runIssue }),
+        (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
+          error.message.startsWith("FORGE_OPENCODE_CAPABILITY_ERROR: forgedock run-issue"),
+      );
+    } finally {
+      if (previousRuntime === undefined) delete process.env.FORGE_RUNTIME;
+      else process.env.FORGE_RUNTIME = previousRuntime;
+    }
+    assert.equal(gh.mock.callCount(), 0);
+    assert.equal(runIssue.mock.callCount(), 0);
+  });
+});
+
 describe("runFromCli phase progress output (forge#2240)", () => {
   it("prints the run-log path at start, before runIssue is even invoked", async () => {
     const dir = mkdtempSync(join(os.tmpdir(), "engine-cli-test-"));
