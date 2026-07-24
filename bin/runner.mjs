@@ -127,6 +127,35 @@ function readOnlySet(values) {
  * simultaneously. Treat it as immutable; mutation attempts throw.
  */
 export const VALID_BACKENDS = readOnlySet(["cli", "api", "auto"]);
+
+export const FORGE_OPENCODE_CAPABILITY_ERROR = "FORGE_OPENCODE_CAPABILITY_ERROR";
+
+/**
+ * Whether the caller is an OpenCode session. The adapter sets this marker on
+ * every shell environment; keeping the predicate small makes all Claude
+ * backend entrypoints agree on the same runtime boundary.
+ */
+export function isOpenCodeRuntime(env = process.env) {
+  return String(env?.FORGE_RUNTIME || "").toLowerCase() === "opencode";
+}
+
+/**
+ * Refuse Claude-backed execution from an OpenCode workflow. OpenCode has its
+ * own Skill/Task execution path; falling through to this runner would create a
+ * competing controller and may consume Claude credentials or quota.
+ */
+export function assertOpenCodeNativeRuntime({
+  env = process.env,
+  operation = "Claude-backed ForgeDock execution",
+} = {}) {
+  if (!isOpenCodeRuntime(env)) return;
+  const error = new Error(
+    `${FORGE_OPENCODE_CAPABILITY_ERROR}: ${operation} is unavailable when FORGE_RUNTIME=opencode. Use native ForgeDock Skill/Task dispatch instead.`,
+  );
+  error.code = FORGE_OPENCODE_CAPABILITY_ERROR;
+  throw error;
+}
+
 // Per-process memoization for isClaudeCliAvailable(), keyed by `cwd` (issue
 // #2011). `runCommand()` calls resolveBackend() — and therefore, for the
 // default "auto" backend, isClaudeCliAvailable() — unconditionally on every
@@ -491,9 +520,10 @@ export function runCliWithStalePathRecovery({
  * API checks verify that a key is configured, not that the key is accepted.
  */
 export function checkExecutionBackend({
-  requested = process.env.FORGEDOCK_BACKEND || "auto",
+  env = process.env,
+  requested = env.FORGEDOCK_BACKEND || "auto",
   cwd = process.cwd(),
-  apiKey = process.env.ANTHROPIC_API_KEY,
+  apiKey = env.ANTHROPIC_API_KEY,
   resolveCliFn = resolveClaudeCliBinary,
   spawnImpl = spawnSync,
   sdkAvailableFn = () => {
@@ -507,6 +537,10 @@ export function checkExecutionBackend({
 } = {}) {
   if (!VALID_BACKENDS.has(requested)) {
     return { ready: false, backend: requested, reason: "invalid-backend" };
+  }
+
+  if (isOpenCodeRuntime(env)) {
+    return { ready: false, backend: "opencode", reason: "native-opencode-required" };
   }
 
   if (requested !== "api") {
@@ -606,14 +640,16 @@ export function resolveBackendLadder({
  * @param {object} [opts]
  * @param {string} [opts.requested] - "cli" | "api" | "auto" (default "auto").
  * @param {string} [opts.cwd]       - Working directory for the CLI probe.
+ * @param {object} [opts.env]       - Runtime environment used for capability checks.
  * @returns {"cli"|"api"}
  */
-export function resolveBackend({ requested = "auto", cwd = process.cwd() } = {}) {
+export function resolveBackend({ requested = "auto", cwd = process.cwd(), env = process.env } = {}) {
   if (!VALID_BACKENDS.has(requested)) {
     throw new Error(
       `Invalid backend "${requested}". Must be one of: ${[...VALID_BACKENDS].join(", ")}.`,
     );
   }
+  assertOpenCodeNativeRuntime({ env, operation: "Claude-backed backend resolution" });
   return resolveBackendLadder({
     override: requested === "auto" ? undefined : requested,
     validOverrides: new Set(["cli", "api"]),
@@ -2086,8 +2122,14 @@ export async function runCommand(opts = {}) {
     maxIterations = DEFAULT_MAX_ITERATIONS,
     dryRun = false,
     backend = process.env.FORGEDOCK_BACKEND || "auto",
+    runtimeEnv = process.env,
     logger = console,
   } = opts;
+
+  assertOpenCodeNativeRuntime({
+    env: runtimeEnv,
+    operation: "Claude-backed ForgeDock runner",
+  });
 
   const spec = loadCommandSpec(commandsDir, commandName);
   const systemPrompt = buildSystemPrompt(spec, { repoRoot: cwd });
@@ -2104,10 +2146,10 @@ export async function runCommand(opts = {}) {
   // misbehaving. An explicitly invalid `backend` value DOES throw here —
   // surfacing a bad --backend/FORGEDOCK_BACKEND value immediately, before any
   // work is attempted, rather than silently ignoring it.
-  let resolvedBackend = resolveBackend({ requested: backend, cwd });
+  let resolvedBackend = resolveBackend({ requested: backend, cwd, env: runtimeEnv });
 
   if (resolvedBackend === "cli" && backend === "auto") {
-    const readiness = checkExecutionBackend({ requested: "auto", cwd, apiKey });
+    const readiness = checkExecutionBackend({ requested: "auto", cwd, apiKey, env: runtimeEnv });
     if (readiness.backend === "api") resolvedBackend = "api";
   }
 

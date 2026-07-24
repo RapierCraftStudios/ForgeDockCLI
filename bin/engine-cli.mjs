@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { runIssue, DEFAULT_MAX_ATTEMPTS } from "./engine.mjs";
 import { makeProjector } from "./engine/projector.mjs";
 import { readLog, deriveState } from "./engine/runlog.mjs";
+import { assertOpenCodeNativeRuntime } from "./runner.mjs";
 
 /**
  * Workflow labels that mark an issue as "in the pipeline" (not yet terminal).
@@ -340,6 +341,7 @@ export function lastLocalRun(dir) {
 export async function runFromCli(argv, deps = {}) {
   const issue = parseInt(argv[0], 10);
   if (!Number.isInteger(issue)) throw new Error("usage: forgedock run-issue <issue-number> --lane <lane>");
+  assertOpenCodeNativeRuntime({ operation: "forgedock run-issue" });
   const lane = flag(argv, "--lane");
   if (!lane) throw new Error("--lane is required: e.g. --lane main or --lane staging. No default to prevent accidental production targeting.");
   const repo = flag(argv, "--repo");

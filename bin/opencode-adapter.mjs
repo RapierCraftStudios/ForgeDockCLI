@@ -182,6 +182,32 @@ Do not invoke \`forgedock run-issue\`, \`npx forgedock run-issue\`, or recursive
 
 export function renderOpenCodePlugin(forgeHome) {
   const gitBashHome = shellPath(forgeHome, "win32");
+  const runtimeGuard = String.raw`
+const FORGE_OPENCODE_CAPABILITY_ERROR = "FORGE_OPENCODE_CAPABILITY_ERROR"
+
+function commandPattern(executable, subcommand) {
+  const assignments = "(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:\"[^\"]*\"|'[^']*'|[^\\s;&|]+)\\s+)*"
+  const wrappers = "(?:(?:env|command|exec)\\s+)*"
+  const npx = "(?:npx(?:\\s+--[^\\s;&|]+)*\\s+)?"
+  const path = "(?:(?:[^\\s;&|/\\\\]+[/\\\\])+)?"
+  const suffix = subcommand ? "\\s+" + subcommand + "(?:\\s|$)" : "(?:\\s|$)"
+  return new RegExp("(?:^|[;&|]\\s*)" + assignments + wrappers + npx + path + executable + "(?:\\.cmd|\\.exe)?" + suffix, "i")
+}
+
+function blockedOperation(command) {
+  const normalized = String(command || "").replace(/\\r?\\n/g, " ")
+  if (commandPattern("claude", "").test(normalized)) return "claude"
+  if (commandPattern("forgedock", "run-issue").test(normalized)) return "forgedock run-issue"
+  if (commandPattern("opencode", "run").test(normalized)) return "opencode run"
+  return ""
+}
+
+function capabilityError(operation) {
+  const error = new Error(FORGE_OPENCODE_CAPABILITY_ERROR + ": " + operation + " is unavailable in an OpenCode ForgeDock workflow. Use native Skill/Task dispatch instead.")
+  error.code = FORGE_OPENCODE_CAPABILITY_ERROR
+  return error
+}
+`;
   return `${PLUGIN_SENTINEL}
 import { existsSync } from "node:fs"
 import { join } from "node:path"
@@ -189,6 +215,7 @@ import { join } from "node:path"
 const NATIVE_FORGE_HOME = ${JSON.stringify(forgeHome)}
 const GIT_BASH_FORGE_HOME = ${JSON.stringify(gitBashHome)}
 let shellForgeHome = NATIVE_FORGE_HOME
+${runtimeGuard}
 
 export const ForgeDockPlugin = async () => ({
   config: async (config) => {
@@ -204,6 +231,11 @@ export const ForgeDockPlugin = async () => ({
     if (/bash(?:\.exe)?$/i.test(String(config.shell || ""))) {
       shellForgeHome = GIT_BASH_FORGE_HOME
     }
+  },
+  "tool.execute.before": async (input, output) => {
+    if (input.tool !== "bash") return
+    const operation = blockedOperation(output?.args?.command)
+    if (operation) throw capabilityError(operation)
   },
   "shell.env": async (_input, output) => {
     output.env.FORGE_HOME = shellForgeHome
