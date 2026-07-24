@@ -433,6 +433,10 @@ describe("OpenCode adapter", () => {
     const status = await getOpenCodeAdapterStatus({ home, env: {} });
     assert.equal(status.healthy, false);
     assert.deepEqual(status.missing, [rel]);
+
+    const uninstall = await uninstallOpenCodeAdapter({ home, env: {} });
+    assert.equal(uninstall.removed, 0);
+    assert.ok(existsSync(outsideFile));
   });
 
   it("reports health and uninstalls only managed files", async () => {

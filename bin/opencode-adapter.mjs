@@ -3,9 +3,9 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { findMarkdownFiles } from "./journey.mjs";
 
 const COMMAND_SENTINEL = "<!-- forgedock:managed-opencode-command -->";
@@ -251,14 +251,54 @@ async function isSafePath(root, candidate) {
   }
 }
 
+async function resolveSafePath(root, candidate, { createParent = false } = {}) {
+  await assertSafePath(root, candidate);
+  if (createParent) await mkdir(dirname(candidate), { recursive: true });
+  await assertSafePath(root, candidate);
+
+  let resolvedRoot;
+  let resolvedParent;
+  try {
+    resolvedRoot = await realpath(resolve(root));
+    resolvedParent = await realpath(dirname(candidate));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!pathInside(resolvedRoot, resolvedParent)) {
+    throw new Error(`Refusing to access symlinked OpenCode path: ${dirname(candidate)}`);
+  }
+
+  const safeCandidate = join(resolvedParent, basename(candidate));
+  let stat;
+  try {
+    stat = await lstat(safeCandidate);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (stat?.isSymbolicLink()) {
+    throw new Error(`Refusing to access symlinked OpenCode path: ${safeCandidate}`);
+  }
+  return { path: safeCandidate, root: resolvedRoot };
+}
+
+async function tryResolveSafePath(root, candidate) {
+  try {
+    return await resolveSafePath(root, candidate);
+  } catch {
+    return null;
+  }
+}
+
 async function atomicWrite(path, content, root) {
-  if (root) await assertSafePath(root, path);
-  await mkdir(dirname(path), { recursive: true });
-  if (root) await assertSafePath(root, path);
-  const tmp = `${path}.forgedock.tmp-${process.pid}-${randomUUID()}`;
+  const safe = root ? await resolveSafePath(root, path, { createParent: true }) : null;
+  if (root && !safe) throw new Error(`Unable to resolve safe OpenCode path: ${path}`);
+  const target = safe?.path || path;
+  if (!root) await mkdir(dirname(target), { recursive: true });
+  const tmp = `${target}.forgedock.tmp-${process.pid}-${randomUUID()}`;
   try {
     await writeFile(tmp, content, "utf8");
-    await rename(tmp, path);
+    await rename(tmp, target);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {});
     throw error;
@@ -266,9 +306,20 @@ async function atomicWrite(path, content, root) {
 }
 
 async function readManifest(path, root) {
-  if (root && !(await isSafePath(root, path))) return null;
+  let target = path;
+  if (root) {
+    try {
+      const safe = await resolveSafePath(root, path);
+      if (!safe) return null;
+      target = safe.path;
+    } catch {
+      return null;
+    }
+  }
   try {
-    const value = JSON.parse(await readFile(path, "utf8"));
+    const raw = await readRegularFile(target);
+    if (raw === null) return null;
+    const value = JSON.parse(raw);
     if (
       value?.version === MANIFEST_VERSION &&
       Array.isArray(value.files) &&
@@ -292,13 +343,23 @@ function digestFiles(files) {
     .digest("hex");
 }
 
-async function isManagedFile(path) {
+async function readRegularFile(path) {
   try {
-    const content = await readFile(path, "utf8");
-    return content.includes(COMMAND_SENTINEL) || content.includes(SKILL_SENTINEL) || content.includes(PLUGIN_SENTINEL);
+    const stat = await lstat(path);
+    if (!stat.isFile()) return null;
+    return await readFile(path, "utf8");
   } catch {
-    return false;
+    return null;
   }
+}
+
+function hasManagedSentinel(content) {
+  return content.includes(COMMAND_SENTINEL) || content.includes(SKILL_SENTINEL) || content.includes(PLUGIN_SENTINEL);
+}
+
+async function isManagedFile(path) {
+  const content = await readRegularFile(path);
+  return content !== null && hasManagedSentinel(content);
 }
 
 async function removeEmptyParentDirs(configDir, filePath) {
@@ -316,11 +377,12 @@ async function removeOwnedFiles(configDir, files) {
   let removed = 0;
   for (const rel of files) {
     const path = join(configDir, rel);
-    if (!(await isSafePath(configDir, path)) || !(await isManagedFile(path))) continue;
-    await unlink(path).catch((error) => {
+    const safe = await tryResolveSafePath(configDir, path);
+    if (!safe || !(await isManagedFile(safe.path))) continue;
+    await unlink(safe.path).catch((error) => {
       if (error.code !== "ENOENT") throw error;
     });
-    await removeEmptyParentDirs(configDir, path);
+    await removeEmptyParentDirs(safe.root, safe.path);
     removed++;
   }
   return removed;
@@ -358,14 +420,17 @@ async function migrateLegacyAdapter({ configDir, home }) {
   const resolvedHome = home || process.env.HOME || process.env.USERPROFILE || homedir();
   const legacyInstructions = join(resolvedHome, ".opencode-forge.md");
   const result = { removedInstructionsFile: false, removedConfigEntries: 0, warnings: [] };
+  const safeLegacyInstructions = await tryResolveSafePath(dirname(legacyInstructions), legacyInstructions);
   let legacyInstructionsOwned = false;
-  try {
-    const content = await readFile(legacyInstructions, "utf8");
-    if (content.includes(LEGACY_SENTINEL)) {
-      legacyInstructionsOwned = true;
+  if (safeLegacyInstructions) {
+    try {
+      const content = await readRegularFile(safeLegacyInstructions.path);
+      if (content?.includes(LEGACY_SENTINEL)) {
+        legacyInstructionsOwned = true;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") result.warnings.push(`Could not inspect ${legacyInstructions}: ${error.message}`);
     }
-  } catch (error) {
-    if (error.code !== "ENOENT") result.warnings.push(`Could not inspect ${legacyInstructions}: ${error.message}`);
   }
 
   const configPaths = new Set([
@@ -376,12 +441,14 @@ async function migrateLegacyAdapter({ configDir, home }) {
   const staged = [];
   let parseFailed = false;
   for (const configPath of configPaths) {
-    if (!existsSync(configPath)) continue;
+    const safeConfig = await tryResolveSafePath(dirname(configPath), configPath);
+    if (!safeConfig || !existsSync(safeConfig.path)) continue;
+    const path = safeConfig.path;
     let config;
     try {
-      config = JSON.parse(stripJsonc(await readFile(configPath, "utf8")));
+      config = JSON.parse(stripJsonc(await readFile(path, "utf8")));
     } catch (error) {
-      result.warnings.push(`Could not migrate legacy entries in ${configPath}: ${error.message}`);
+      result.warnings.push(`Could not migrate legacy entries in ${path}: ${error.message}`);
       parseFailed = true;
       continue;
     }
@@ -411,8 +478,8 @@ async function migrateLegacyAdapter({ configDir, home }) {
     }
     if (changed) {
       staged.push({
-        path: configPath,
-        original: await readFile(configPath, "utf8"),
+        path,
+        original: await readFile(path, "utf8"),
         content: `${JSON.stringify(config, null, 2)}\n`,
       });
     }
@@ -431,8 +498,8 @@ async function migrateLegacyAdapter({ configDir, home }) {
     result.warnings.push(`Could not write legacy migration: ${error.message}`);
     return result;
   }
-  if (legacyInstructionsOwned) {
-    await unlink(legacyInstructions);
+  if (legacyInstructionsOwned && safeLegacyInstructions) {
+    await unlink(safeLegacyInstructions.path);
     result.removedInstructionsFile = true;
   }
   return result;
@@ -486,8 +553,9 @@ export async function installOpenCodeAdapter({
   for (const item of rendered) {
     const path = join(configDir, item.rel);
     await assertSafePath(configDir, path);
-    if (existsSync(path) && !(await isManagedFile(path))) {
-      throw new Error(`Refusing to overwrite user-owned OpenCode file: ${path}`);
+    const safe = await tryResolveSafePath(configDir, path);
+    if (safe && existsSync(safe.path) && !(await isManagedFile(safe.path))) {
+      throw new Error(`Refusing to overwrite user-owned OpenCode file: ${safe.path}`);
     }
   }
   for (const item of rendered) {
@@ -524,7 +592,10 @@ export async function installOpenCodeAdapter({
 export async function getOpenCodeAdapterStatus({ home, env = process.env } = {}) {
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
-  if (!existsSync(manifestPath)) return { installed: false, healthy: false, configDir, missing: [] };
+  const safeManifest = await tryResolveSafePath(configDir, manifestPath);
+  if (!safeManifest || !existsSync(safeManifest.path)) {
+    return { installed: false, healthy: false, configDir, missing: [] };
+  }
   if (!(await isSafePath(configDir, manifestPath))) {
     return { installed: true, healthy: false, configDir, missing: [], integrity: "invalid-manifest" };
   }
@@ -536,11 +607,13 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
   const current = [];
   for (const rel of manifest.files) {
     const path = join(configDir, rel);
-    if (!(await isSafePath(configDir, path)) || !existsSync(path) || !(await isManagedFile(path))) {
+    const safe = await tryResolveSafePath(configDir, path);
+    const content = safe ? await readRegularFile(safe.path) : null;
+    if (!safe || content === null || !hasManagedSentinel(content)) {
       missing.push(rel);
       continue;
     }
-    current.push({ rel, content: await readFile(path, "utf8") });
+    current.push({ rel, content });
   }
   const integrity = missing.length === 0 && digestFiles(current) === manifest.digest;
   return {
@@ -558,14 +631,16 @@ export async function uninstallOpenCodeAdapter({ home, env = process.env } = {})
   const manifestPath = join(configDir, "forgedock", "manifest.json");
   const manifest = (await readManifest(manifestPath, configDir)) || { files: [] };
   const removed = await removeOwnedFiles(configDir, manifest.files);
-  if (await isSafePath(configDir, manifestPath)) {
-    await unlink(manifestPath).catch((error) => {
+  const safeManifest = await tryResolveSafePath(configDir, manifestPath);
+  if (safeManifest) {
+    await unlink(safeManifest.path).catch((error) => {
       if (error.code !== "ENOENT") throw error;
     });
   }
   const manifestDir = join(configDir, "forgedock");
-  if (await isSafePath(configDir, manifestDir)) {
-    await rmdir(manifestDir).catch((error) => {
+  const safeManifestDir = await tryResolveSafePath(configDir, manifestDir);
+  if (safeManifestDir) {
+    await rmdir(safeManifestDir.path).catch((error) => {
       if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
     });
   }
