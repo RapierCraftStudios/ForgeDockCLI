@@ -493,16 +493,35 @@ describe("OpenCode adapter", () => {
     assert.equal(readFileSync(configPath, "utf8"), original);
   });
 
+  it("preserves exact legacy commands with a malformed instructions marker", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    const legacyInstructions = join(home, ".opencode-forge.md");
+    mkdirSync(config, { recursive: true });
+    const malformedMarker = "<!-- ForgeDock managed by another tool -->\nuser content\n";
+    writeFileSync(legacyInstructions, malformedMarker);
+    const customCommand = {
+      description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+      template: `Read ${forgeHome.replaceAll("\\", "/")}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+    };
+    const configPath = join(config, "opencode.json");
+    const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
+    writeFileSync(configPath, original);
+
+    const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
+    assert.equal(result.migration.removedConfigEntries, 0);
+    assert.equal(readFileSync(configPath, "utf8"), original);
+    assert.equal(readFileSync(legacyInstructions, "utf8"), malformedMarker);
+  });
+
   it("does not turn foreign mixed-separator paths into POSIX ForgeDock paths", async () => {
     if (process.platform === "win32") return;
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
     mkdirSync(config, { recursive: true });
-    const separator = forgeHome.lastIndexOf("/");
-    const foreignPath = `${forgeHome.slice(0, separator)}\\${forgeHome.slice(separator + 1)}`;
     const customCommand = {
       description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
-      template: `Read ${foreignPath}/commands/work-on.md and execute the pipeline for issue {{args}}.`,
+      template: `Read ${forgeHome}\\commands/work-on.md and execute the pipeline for issue {{args}}.`,
     };
     const configPath = join(config, "opencode.json");
     const original = `${JSON.stringify({ command: { "work-on": customCommand } }, null, 2)}\n`;
@@ -518,7 +537,7 @@ describe("OpenCode adapter", () => {
     const config = join(home, ".config", "opencode");
     const legacyInstructions = join(home, ".opencode-forge.md");
     mkdirSync(config, { recursive: true });
-    writeFileSync(legacyInstructions, "<!-- ForgeDock managed -->\nlegacy\n");
+    writeFileSync(legacyInstructions, "<!-- ForgeDock managed — do not remove this line -->\nlegacy\n");
     writeFileSync(
       join(config, "opencode.json"),
       `{
@@ -572,7 +591,7 @@ describe("OpenCode adapter", () => {
     const legacyInstructions = join(home, ".opencode-forge.md");
     const configPath = join(config, "opencode.json");
     mkdirSync(config, { recursive: true });
-    writeFileSync(legacyInstructions, "<!-- ForgeDock managed -->\nlegacy\n");
+    writeFileSync(legacyInstructions, "<!-- ForgeDock managed — do not remove this line -->\nlegacy\n");
     const original = "{\n  // unterminated config\n  \"instructions\": [\n";
     writeFileSync(configPath, original);
 
