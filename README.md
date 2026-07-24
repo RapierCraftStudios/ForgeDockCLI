@@ -231,7 +231,8 @@ npx forgedock # checks your environment, installs commands into ~/.claude/comman
 ```
 
 For OpenCode, install namespaced native commands without changing your provider
-or `opencode.json`:
+or user-owned settings. When migrating an older ForgeDock adapter, it removes
+only exact ForgeDock-managed legacy entries from `opencode.json`:
 
 ```bash
 npx forgedock opencode install
