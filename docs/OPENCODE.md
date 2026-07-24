@@ -22,9 +22,9 @@ npx forgedock opencode install --extras
 Restart OpenCode after install or update. OpenCode loads commands, skills, and
 plugins at startup.
 
-The installer does not edit `opencode.json` or `opencode.jsonc`. It writes only
-ForgeDock-owned files under OpenCode's config directory and records them in
-`forgedock/manifest.json` for safe updates and removal.
+The native adapter does not add or modify user-owned OpenCode settings. It
+writes only ForgeDock-owned files under OpenCode's config directory and records
+them in `forgedock/manifest.json` for safe updates and removal.
 
 ## Usage
 
@@ -135,8 +135,12 @@ Uninstall removes only files listed in the ownership manifest and still marked
 with a ForgeDock sentinel. User-owned commands, plugins, and files placed in
 the `forgedock/` namespace are never removed; that namespace is pruned only
 when it is empty.
-Install also removes the previous ForgeDock-managed `~/.opencode-forge.md`
-instructions file and its exact legacy config entries when they are present.
+For backward compatibility, install and uninstall may rewrite `opencode.json`
+only to remove exact ForgeDock-managed legacy entries and references to the
+managed `~/.opencode-forge.md` instructions file. The migration does not
+rewrite `opencode.jsonc`. User-owned settings and customized commands are
+preserved; if a legacy config cannot be parsed or written, the migration leaves
+the legacy artifacts in place.
 
 ## Locations
 

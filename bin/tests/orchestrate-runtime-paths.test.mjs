@@ -36,5 +36,9 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(opencodeDocs, /\.opencode\/worktrees/);
     assert.match(opencodeDocs, /~\/\.opencode\/scripts/);
     assert.match(opencodeDocs, /Claude keeps its existing engine/);
+    assert.match(opencodeDocs, /does not add or modify user-owned OpenCode settings/);
+    assert.match(opencodeDocs, /install and uninstall may rewrite `opencode\.json`\s+only/);
+    assert.match(opencodeDocs, /migration does not\s+rewrite `opencode\.jsonc`/);
+    assert.match(opencodeDocs, /customized commands are\s+preserved/);
   });
 });
