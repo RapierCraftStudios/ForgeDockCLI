@@ -134,7 +134,8 @@ function openCodeReviewDispatchContract() {
   return [
     "OpenCode review-dispatch override:",
     "Before applying the workflow's Claude-specific Task/Agent availability check, treat an OpenCode runtime marker (`FORGE_RUNTIME=opencode`, `OPENCODE_SESSION_ID`, `OPENCODE_PID`, or `OPENCODE`) as native capability context and set `DISPATCH_TOOL=task`.",
-    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\" }`; use `general` for implementation/review and `explore` for read-only discovery.",
+    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`; use `general` for implementation/review and `explore` for read-only discovery.",
+    "Use `background: true` for independent orchestration and review work. OpenCode returns a running task marker immediately and injects a later task-result event into the parent; process each event immediately instead of waiting for the slowest sibling.",
     "If lowercase native `task` is genuinely absent from the current tool registry, post `FORGE:REVIEW_BLOCKED` and stop; never replace the required isolated review with inline work or another controller.",
   ].join("\n");
 }
@@ -169,6 +170,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
 
 export function renderOpenCodeSkill({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
+  const commandsPath = portablePath(join(forgeHome, "commands"));
   const name = normalizeOpenCodeSkillName(command);
   return `---
 name: ${name}
@@ -189,6 +191,13 @@ ${openCodeReviewDispatchContract()}
 If the workflow source or a required native capability is unavailable, stop and report exactly:
 \`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.
 Do not invoke \`forgedock run-issue\`, \`npx forgedock run-issue\`, or recursive \`opencode run\` to recover.
+OpenCode runtime mapping:
+
+- \`Skill(skill="x", args="y")\` means lazily read \`${commandsPath}/\${x.replaceAll(":", "/")}.md\` and execute that workflow in the current context with the exact arguments. Colon separators become slash separators; existing slash separators remain unchanged. This matches Claude Code Skill's in-conversation loading; it is not a reason to spawn a subagent.
+- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool with \`{ description, prompt, subagent_type, background }\`. Translate \`general-purpose\` to \`general\` and \`codebase-explorer\` to \`explore\`; never omit \`subagent_type\`. Resume by task ID when requested. A successful background call returns \`<task id=... state="running">\`; a later \`state="completed"\` or \`state="error"\` task result is the completion event for that one issue. Do not wait for all tasks before processing an event.
+- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.
+- OpenCode injects \`FORGE_HOME\` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.
+- If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.
 `;
 }
 
@@ -247,12 +256,26 @@ import { join } from "node:path"
 
 const NATIVE_FORGE_HOME = ${JSON.stringify(forgeHome)}
 const GIT_BASH_FORGE_HOME = ${JSON.stringify(gitBashHome)}
+const BACKGROUND_FLAG = "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+
+// ForgeDock orchestration relies on per-task completion events rather than wave barriers.
+// Keep an explicit false opt-out for users who need the experimental feature disabled.
+if (process.env[BACKGROUND_FLAG] === undefined) process.env[BACKGROUND_FLAG] = "true"
+
 let shellForgeHome = NATIVE_FORGE_HOME
 ${runtimeGuard}
 
 export const ForgeDockPlugin = async () => ({
   config: async (config) => {
-    if (config.subagent_depth === undefined) config.subagent_depth = 2
+    if (config.subagent_depth === undefined) config.subagent_depth = 4
+    // OpenCode otherwise adds task: deny to every subagent session, which prevents
+    // an orchestrated work-on child from spawning its isolated review agents.
+    config.agent ??= {}
+    config.agent.general ??= {}
+    config.agent.general.permission ??= {}
+    if (config.agent.general.permission.task === undefined && config.permission?.task === undefined) {
+      config.agent.general.permission.task = "allow"
+    }
     if (process.platform === "win32" && !config.shell) {
       const candidates = [
         process.env.ProgramFiles && join(process.env.ProgramFiles, "Git", "bin", "bash.exe"),
@@ -277,6 +300,8 @@ export const ForgeDockPlugin = async () => ({
   "shell.env": async (_input, output) => {
     output.env.FORGE_HOME = shellForgeHome
     output.env.FORGE_RUNTIME = "opencode"
+    output.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS =
+      process.env[BACKGROUND_FLAG] ?? "true"
   },
 })
 `;

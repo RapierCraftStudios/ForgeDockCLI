@@ -105,6 +105,8 @@ describe("OpenCode adapter", () => {
     assert.match(output, /genuinely absent.*FORGE:REVIEW_BLOCKED/s);
     assert.match(output, /top-level argument object shaped like/);
     assert.match(output, /general-purpose.*general.*codebase-explorer.*explore/s);
+    assert.match(output, /background[:=] true/);
+    assert.match(output, /task-result event/i);
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
   });
 
@@ -205,6 +207,9 @@ describe("OpenCode adapter", () => {
     assert.match(plugin, /output\.env\.FORGE_HOME = shellForgeHome/);
     assert.match(plugin, /output\.env\.FORGE_RUNTIME = "opencode"/);
     assert.match(plugin, /subagent_depth === undefined/);
+    assert.match(plugin, /OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS/);
+    assert.match(plugin, /config\.agent\.general\.permission\.task/);
+    assert.match(plugin, /normalizeTaskArgs\(output\?\.args\)/);
     assert.doesNotMatch(plugin, /current < 2/);
     assert.match(plugin, /\/.*fd-opencode-source-/);
     assert.match(plugin, /Git.*bin.*bash\.exe/);

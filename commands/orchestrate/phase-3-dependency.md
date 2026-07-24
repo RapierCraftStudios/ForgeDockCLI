@@ -1145,8 +1145,15 @@ if [ -n "${OPENCODE_SESSION_ID:-}" ] || [ -n "${OPENCODE_PID:-}" ] || [ -n "${OP
 fi
 
 if [ "$FORGE_RUNTIME" = "opencode" ]; then
-  echo "OpenCode runtime detected: native task dispatch selected; Claude background dispatch is not required."
-  BACKGROUND_DISPATCH_ENABLED=false
+  echo "OpenCode runtime detected: native task dispatch selected."
+  # ForgeDock's OpenCode plugin opts into background task events by default so
+  # each completed DAG node can wake this parent without a wave barrier.
+  if [ "${OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS:-true}" = "false" ]; then
+    echo "OpenCode background subagents explicitly disabled: orchestration is degraded to foreground task dispatch."
+    BACKGROUND_DISPATCH_ENABLED=false
+  else
+    BACKGROUND_DISPATCH_ENABLED=true
+  fi
 fi
 
 # Feature gate check — run once before Phase 4 dispatch begins
@@ -1176,13 +1183,23 @@ fi
 
 When `FORGE_RUNTIME=opencode` (or an OpenCode runtime marker is present), do not
 interpret a missing `claude` executable as an environment failure. The Phase 4
-dispatcher must use OpenCode's inline continuation contract instead of the
-Claude `Agent(...)` fallback. Claude remains the default when no runtime marker
-is present, preserving the existing Claude behavior.
+dispatcher must use OpenCode's native `task` contract instead of the Claude
+`Agent(...)` fallback. With background subagents enabled, each task is launched
+with `background=true` and its injected task-result event immediately drives
+predecessor classification and newly-ready dispatch. Claude remains the default
+when no runtime marker is present, preserving the existing Claude behavior.
 
-**When `BACKGROUND_DISPATCH_ENABLED=false`**: fall back to the current streaming dispatch behavior — `run_in_background=true` is still set on each `Agent()` call (existing behavior, already correct), but treat completions as synchronous and do not rely on `agent_completed` notifications. Poll issue labels for terminal state instead.
+**When `BACKGROUND_DISPATCH_ENABLED=false`**: Claude falls back to its existing
+synchronous/polling behavior. OpenCode reaches this branch only after an
+explicit `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false`; use independent
+foreground `task` calls where the host can execute them concurrently, and
+report that per-completion streaming is unavailable. Do not use Claude's
+`Agent(...)` fallback and do not claim the event-driven DAG guarantee.
 
-**When `BACKGROUND_DISPATCH_ENABLED=true`**: use `run_in_background=true` (already in the Step 4A Agent() template) and react to `agent_completed` notifications as documented in Step 4B. Do NOT poll.
+**When `BACKGROUND_DISPATCH_ENABLED=true`**: Claude uses
+`run_in_background=true` and reacts to `agent_completed` notifications. OpenCode
+uses `task(..., background=true)` and reacts to each injected task-result event.
+Do NOT poll or wait for a whole wave in either enabled path.
 
 ### Orchestrator state reconstruction on wake / after compaction
 

@@ -60,8 +60,13 @@ OpenCode /forge/work-on
 The generated plugin has no prompt text. It:
 
 - injects `FORGE_HOME` into OpenCode shell environments;
-- defaults `subagent_depth` to 2 when the user has not configured it, while
+- defaults `subagent_depth` to 4 when the user has not configured it, while
   preserving explicit lower limits;
+- grants the built-in `general` subagent permission to invoke native `task`
+  unless the user explicitly configured a task permission;
+- opts into OpenCode background subagents by default so each completed issue can
+  wake the parent orchestrator independently; set
+  `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` to opt out;
 - selects Git Bash on Windows only when the user has not explicitly configured
   an OpenCode shell, because the shared workflows and helper scripts use Bash.
 
@@ -96,6 +101,9 @@ The adapter follows these rules:
 - Nested phase specs are loaded only when their dispatcher reaches them.
 - Task/Agent work uses OpenCode subagents only for the parallelism, isolation,
   or context-pressure cases required by the shared workflow.
+- Orchestration dispatches independent issues with `task(background=true)` and
+  processes each injected task-result event immediately; it does not wait for a
+  wave or the slowest sibling.
 - GitHub state and the durable engine remain the recovery source instead of
   replaying prior prompt context.
 
@@ -180,11 +188,19 @@ recursive ForgeDock controller commands, and normalizes native task arguments
 before execution; the shared workflow rules and deterministic scripts remain
 the source of truth for all other behavior.
 
-OpenCode 1.18.4 keeps background subagents experimental. When they are not
-enabled, the command adapter requires independent foreground tasks to be
-launched concurrently where supported and uses ForgeDock's GitHub-label polling
-fallback. This preserves isolated review contexts but does not yet prove equal
-wall-clock behavior for `/forge/orchestrate`.
+OpenCode 1.18.4 keeps background subagents experimental. ForgeDock opts into
+that feature by default because the streaming DAG depends on the parent session
+receiving one completion event per child. A native background task returns a
+`<task id="..." state="running">` marker immediately and later injects a
+`state="completed"` or `state="error"` result into the parent session. The
+orchestrator maps that id to the issue, re-reads GitHub state, and dispatches
+newly unlocked successors in the same response.
+
+If `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` is explicitly set,
+ForgeDock uses independent foreground tasks where OpenCode can execute them
+concurrently and labels the run as degraded. Foreground tasks cannot provide
+the same per-completion wake behavior, so this opt-out intentionally restores a
+wave-like fallback rather than silently claiming Claude-equivalent throughput.
 
 Commands that inspect Claude-specific transcripts or Claude installation state
 remain runtime-specific and should not be represented as portable until they
@@ -193,7 +209,10 @@ receive dedicated implementations.
 ## Orchestration Runtime
 
 OpenCode orchestration uses the native OpenCode `task` tool for isolated issue
-work and follows the shared `commands/work-on.md` state machine. It must not
+work and follows the shared `commands/work-on.md` state machine. Each ready
+issue is launched as `task(subagent_type="general", background=true)` and its
+task-result event is treated as the completion notification for that issue. It
+must not
 route through `forgedock run-issue` when that would select the Claude CLI or
 Anthropic API backend. If the host does not expose an OpenCode runtime marker,
 set the runtime explicitly before launching a headless command:
@@ -204,7 +223,10 @@ FORGE_RUNTIME=opencode opencode run --command forge/orchestrate "fast-lane"
 
 Each task re-reads GitHub labels and `FORGE:*` comments after every phase and
 continues until `workflow:merged`, `workflow:invalid`, `needs-human`, or
-`workflow:awaiting-merge`. If native task dispatch is unavailable, post a
+`workflow:awaiting-merge`. The parent orchestrator processes every child
+completion independently, so a completed predecessor can unlock and dispatch
+its successors while unrelated issues continue running. If native task
+dispatch is unavailable, post a
 `FORGE:OPENCODE_BLOCKED` diagnostic naming the missing capability and add
 `needs-human`; do not leave an issue stranded at `workflow:engine-error`.
 

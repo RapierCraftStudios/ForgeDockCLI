@@ -6,6 +6,10 @@ const phase4 = readFileSync(
   new URL("../../commands/orchestrate/phase-4-execution.md", import.meta.url),
   "utf8",
 );
+const phase3 = readFileSync(
+  new URL("../../commands/orchestrate/phase-3-dependency.md", import.meta.url),
+  "utf8",
+);
 const opencodeDocs = readFileSync(
   new URL("../../docs/OPENCODE.md", import.meta.url),
   "utf8",
@@ -49,5 +53,16 @@ describe("orchestrate runtime helper paths", () => {
       /without changing your provider\s+or user-owned settings\.\s+When migrating an older ForgeDock adapter, it removes\s+only exact ForgeDock-managed legacy entries from `opencode\.json`:/,
     );
     assert.doesNotMatch(readme, /without changing your provider\s+or `opencode\.json`/);
+  });
+
+  it("documents event-driven OpenCode DAG dispatch", () => {
+    assert.match(phase3, /OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS/);
+    assert.match(phase3, /task\(\.\.\., background=true\)/);
+    assert.match(phase3, /each injected task-result event/i);
+    assert.match(phase4, /OPENCODE_DISPATCH_MAP/);
+    assert.match(phase4, /task-result event/i);
+    assert.match(phase4, /state="running"/);
+    assert.match(phase4, /background=true/);
+    assert.match(phase4, /do not wait for the slowest sibling/i);
   });
 });
