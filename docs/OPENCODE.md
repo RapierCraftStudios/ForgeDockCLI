@@ -19,8 +19,8 @@ For the optional command tier:
 npx forgedock opencode install --extras
 ```
 
-Restart OpenCode after install or update. OpenCode loads commands and plugins
-at startup.
+Restart OpenCode after install or update. OpenCode loads commands, skills, and
+plugins at startup.
 
 The installer does not edit `opencode.json` or `opencode.jsonc`. It writes only
 ForgeDock-owned files under OpenCode's config directory and records them in
@@ -65,6 +65,21 @@ The generated plugin has no prompt text. It:
 - selects Git Bash on Windows only when the user has not explicitly configured
   an OpenCode shell, because the shared workflows and helper scripts use Bash.
 
+The adapter also registers every eligible ForgeDock workflow as a native
+OpenCode skill. Top-level and nested source paths are normalized to valid
+hyphenated skill names while the wrapper continues to point at the authoritative
+source file:
+
+```text
+commands/work-on.md             -> skills/work-on/SKILL.md
+commands/work-on/investigate.md -> skills/work-on-investigate/SKILL.md
+commands/review-pr.md           -> skills/review-pr/SKILL.md
+```
+
+The wrapper is intentionally thin. It carries the workflow's `name` and
+`description` frontmatter, preserves the current-context arguments, and loads
+only the referenced `commands/**/*.md` spec.
+
 OpenCode's provider configuration remains entirely user-owned. ForgeDock does
 not require Anthropic when invoked through OpenCode; any provider and model
 supported by the user's OpenCode configuration can execute the commands.
@@ -74,9 +89,10 @@ supported by the user's OpenCode configuration can execute the commands.
 The adapter follows these rules:
 
 - No global ForgeDock `instructions` entry.
-- No generated skill for every source file. Large skill catalogs add metadata
-  to every session even when ForgeDock is unused.
-- Only top-level user entry commands are registered.
+- Top-level user entry commands are registered under `/forge/*`.
+- Every eligible workflow is registered as a native skill so nested
+  `Skill(...)` dispatch resolves through OpenCode's `skill` tool instead of
+  filesystem guessing.
 - Nested phase specs are loaded only when their dispatcher reaches them.
 - Task/Agent work uses OpenCode subagents only for the parallelism, isolation,
   or context-pressure cases required by the shared workflow.
@@ -84,9 +100,9 @@ The adapter follows these rules:
   replaying prior prompt context.
 
 The generated adapter preamble is intentionally small. It maps Claude Code's
-in-conversation `Skill(...)` loading to a lazy read of the corresponding shared
-spec. It maps isolated `Task(...)` and permitted `Agent(...)` calls to
-OpenCode's native `task` tool.
+in-conversation `Skill(...)` loading to the normalized native skill name and
+authoritative shared spec. It maps isolated `Task(...)` and permitted
+`Agent(...)` calls to OpenCode's native `task` tool.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,
@@ -117,6 +133,7 @@ Default global location:
 ```text
 ~/.config/opencode/
   commands/forge/*.md
+  skills/<workflow-name>/SKILL.md
   plugins/forgedock.js
   forgedock/manifest.json
 ```
@@ -165,6 +182,12 @@ continues until `workflow:merged`, `workflow:invalid`, `needs-human`, or
 `workflow:awaiting-merge`. If native task dispatch is unavailable, post a
 `FORGE:OPENCODE_BLOCKED` diagnostic naming the missing capability and add
 `needs-human`; do not leave an issue stranded at `workflow:engine-error`.
+
+If a generated command or skill cannot load its authoritative workflow, it must
+stop with an actionable `FORGE_OPENCODE_CAPABILITY_ERROR`. It must not recover
+by invoking `forgedock run-issue`, `npx forgedock run-issue`, or a recursive
+`opencode run`; those paths select a competing controller or Claude-backed
+backend.
 
 This runtime branch is additive. Claude keeps its existing engine and
 background-agent paths, and Codex keeps its installed namespaced skills and

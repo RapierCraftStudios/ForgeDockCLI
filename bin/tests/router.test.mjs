@@ -64,13 +64,15 @@ describe("router", () => {
 
     const install = runCli(["opencode", "install"], { home, extraEnv });
     assert.equal(install.status, 0, install.stderr || install.stdout);
-    assert.match(install.stdout, /Installed \d+ OpenCode commands/);
+    assert.match(install.stdout, /Installed \d+ OpenCode commands and \d+ skills/);
     assert.ok(existsSync(join(configDir, "commands", "forge", "work-on.md")));
+    assert.ok(existsSync(join(configDir, "skills", "work-on", "SKILL.md")));
     assert.ok(!existsSync(join(configDir, "opencode.json")));
 
     const status = runCli(["opencode", "status"], { home, extraEnv });
     assert.equal(status.status, 0, status.stderr || status.stdout);
     assert.match(status.stdout, /adapter is healthy/i);
+    assert.match(status.stdout, /\d+ skills/);
 
     const uninstall = runCli(["opencode", "uninstall"], { home, extraEnv });
     assert.equal(uninstall.status, 0, uninstall.stderr || uninstall.stdout);

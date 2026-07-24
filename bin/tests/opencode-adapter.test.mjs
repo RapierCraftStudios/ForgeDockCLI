@@ -4,16 +4,20 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import {
   getOpenCodeAdapterStatus,
   installOpenCodeAdapter,
   renderOpenCodeCommand,
+  renderOpenCodeSkill,
+  normalizeOpenCodeSkillName,
   resolveOpenCodeConfigDir,
   shellPath,
   uninstallOpenCodeAdapter,
@@ -29,6 +33,26 @@ function temp(prefix) {
 
 function command(description, install = "core") {
   return `---\ndescription: ${description}\ninstall: ${install}\n---\n\n# Workflow\n`;
+}
+
+function discoverOpenCodeSkills(config) {
+  const root = join(config, "skills");
+  const skills = new Map();
+  const visit = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(path);
+        continue;
+      }
+      if (entry.name !== "SKILL.md") continue;
+      const content = readFileSync(path, "utf8");
+      const match = content.match(/^name:\s*(.+)$/m);
+      if (match) skills.set(match[1].trim(), content);
+    }
+  };
+  visit(root);
+  return skills;
 }
 
 function fixture() {
@@ -85,8 +109,9 @@ describe("OpenCode adapter", () => {
     });
 
     assert.match(output, /commands\/\$\{x\.replaceAll\(\":\", \"\/\"\)\}\.md/);
+    assert.match(output, /native OpenCode skill named/);
+    assert.match(output, /\$\{x\.replaceAll\(\":\", \"-\"\)\.replaceAll\(\"\/\", \"-\"\)\}/);
     assert.match(output, /Skill\(skill="x", args="y"\)/);
-    assert.match(output, /slash separators remain unchanged/i);
 
     for (const [skill, expected] of [
       ["work-on:close", "work-on/close"],
@@ -96,21 +121,40 @@ describe("OpenCode adapter", () => {
     ]) {
       assert.equal(skill.replaceAll(":", "/"), expected);
     }
+    assert.equal(normalizeOpenCodeSkillName("work-on/investigate"), "work-on-investigate");
+    assert.throws(
+      () => normalizeOpenCodeSkillName(`${"a".repeat(65)}.md`),
+      /exceeds 64 characters/,
+    );
+    assert.match(
+      renderOpenCodeSkill({ description: "Nested phase", forgeHome: "/forge", command: "work-on/build" }),
+      /name: work-on-build/,
+    );
   });
 
-  it("installs only top-level core entrypoints by default", async () => {
+  it("installs top-level commands and every eligible workflow as native skills", async () => {
     const { forgeHome, home } = fixture();
     const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
     const config = join(home, ".config", "opencode");
 
     assert.equal(result.commandCount, 1);
+    assert.equal(result.skillCount, 2);
     assert.ok(existsSync(join(config, "commands", "forge", "work-on.md")));
     assert.ok(!existsSync(join(config, "commands", "forge", "cleanup.md")));
     assert.ok(!existsSync(join(config, "commands", "forge", "internal.md")));
     assert.ok(!existsSync(join(config, "commands", "forge", "build.md")));
+    assert.ok(existsSync(join(config, "skills", "work-on", "SKILL.md")));
+    assert.ok(existsSync(join(config, "skills", "work-on-build", "SKILL.md")));
+    assert.ok(!existsSync(join(config, "skills", "cleanup", "SKILL.md")));
+    assert.ok(!existsSync(join(config, "skills", "internal", "SKILL.md")));
     assert.ok(existsSync(join(config, "plugins", "forgedock.js")));
     assert.ok(existsSync(join(config, "forgedock", "manifest.json")));
     assert.ok(!existsSync(join(config, "opencode.json")));
+    const manifest = JSON.parse(readFileSync(join(config, "forgedock", "manifest.json"), "utf8"));
+    assert.equal(manifest.commandCount, 1);
+    assert.equal(manifest.skillCount, 2);
+    assert.ok(manifest.files.includes("skills/work-on/SKILL.md"));
+    assert.ok(manifest.files.includes("skills/work-on-build/SKILL.md"));
 
     const installedCommand = readFileSync(
       join(config, "commands", "forge", "work-on.md"),
@@ -118,6 +162,12 @@ describe("OpenCode adapter", () => {
     );
     assert.match(installedCommand, /commands\/work-on\.md/);
     assert.doesNotMatch(installedCommand, /undefined\.md/);
+
+    const skills = discoverOpenCodeSkills(config);
+    assert.deepEqual([...skills.keys()].sort(), ["work-on", "work-on-build"]);
+    assert.match(skills.get("work-on-build"), /source: "work-on\/build"/);
+    assert.match(skills.get("work-on-build"), /FORGE_OPENCODE_CAPABILITY_ERROR/);
+    assert.match(skills.get("work-on-build"), /Do not invoke .*npx forgedock run-issue/);
 
     const plugin = readFileSync(join(config, "plugins", "forgedock.js"), "utf8");
     assert.match(plugin, /NATIVE_FORGE_HOME/);
@@ -136,12 +186,16 @@ describe("OpenCode adapter", () => {
 
     const extras = await installOpenCodeAdapter({ forgeHome, home, env: {}, includeExtras: true });
     assert.equal(extras.commandCount, 2);
+    assert.equal(extras.skillCount, 3);
     assert.ok(existsSync(join(config, "commands", "forge", "cleanup.md")));
+    assert.ok(existsSync(join(config, "skills", "cleanup", "SKILL.md")));
 
     const core = await installOpenCodeAdapter({ forgeHome, home, env: {} });
     assert.equal(core.commandCount, 1);
-    assert.equal(core.removed, 1);
+    assert.equal(core.skillCount, 2);
+    assert.equal(core.removed, 2);
     assert.ok(!existsSync(join(config, "commands", "forge", "cleanup.md")));
+    assert.ok(!existsSync(join(config, "skills", "cleanup", "SKILL.md")));
   });
 
   it("refuses to overwrite user-owned files", async () => {
@@ -157,6 +211,35 @@ describe("OpenCode adapter", () => {
     assert.equal(readFileSync(target, "utf8"), "user command\n");
   });
 
+  it("refuses to overwrite a user-owned native skill", async () => {
+    const { forgeHome, home } = fixture();
+    const target = join(home, ".config", "opencode", "skills", "work-on", "SKILL.md");
+    mkdirSync(join(target, ".."), { recursive: true });
+    writeFileSync(target, "user skill\n");
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /Refusing to overwrite user-owned OpenCode file/,
+    );
+    assert.equal(readFileSync(target, "utf8"), "user skill\n");
+    assert.ok(!existsSync(join(home, ".config", "opencode", "commands", "forge", "work-on.md")));
+  });
+
+  it("rejects normalized skill-name collisions before writing", async () => {
+    const forgeHome = temp("fd-opencode-collision-source-");
+    const home = temp("fd-opencode-collision-home-");
+    mkdirSync(join(forgeHome, "commands"), { recursive: true });
+    writeFileSync(join(forgeHome, "commands", "a-b.md"), command("First"));
+    writeFileSync(join(forgeHome, "commands", "a_b.md"), command("Second"));
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /OpenCode skill name collision: a-b maps both/,
+    );
+    assert.ok(!existsSync(join(home, ".config", "opencode", "commands")));
+    assert.ok(!existsSync(join(home, ".config", "opencode", "skills")));
+  });
+
   it("preflights plugin collisions before writing commands", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
@@ -170,6 +253,38 @@ describe("OpenCode adapter", () => {
     );
     assert.ok(!existsSync(join(config, "commands", "forge", "work-on.md")));
     assert.equal(readFileSync(plugin, "utf8"), "export const UserPlugin = async () => ({})\n");
+  });
+
+  it("refuses to write through symlinked managed directories", async () => {
+    const { forgeHome, home } = fixture();
+    const config = join(home, ".config", "opencode");
+    const outside = temp("fd-opencode-symlink-target-");
+    mkdirSync(config, { recursive: true });
+    try {
+      symlinkSync(outside, join(config, "skills"), process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EACCES", "EPERM", "ENOTSUP"].includes(error.code)) return;
+      throw error;
+    }
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /symlinked OpenCode path/,
+    );
+    assert.deepEqual(readdirSync(outside), []);
+    assert.ok(!existsSync(join(config, "commands")));
+  });
+
+  it("rejects an active concurrent adapter operation", async () => {
+    const { forgeHome, home } = fixture();
+    const lockDir = join(home, ".config", "opencode", "forgedock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "install.lock"), "active\n");
+
+    await assert.rejects(
+      installOpenCodeAdapter({ forgeHome, home, env: {} }),
+      /Another OpenCode adapter operation is in progress/,
+    );
   });
 
   it("migrates only ForgeDock-managed legacy adapter entries", async () => {
@@ -314,6 +429,28 @@ describe("OpenCode adapter", () => {
     assert.equal(uninstall.removed, 0);
   });
 
+  it("does not inspect manifest entries outside the config directory", async () => {
+    const home = temp("fd-opencode-status-home-");
+    const outside = temp("fd-opencode-status-outside-");
+    const config = join(home, ".config", "opencode");
+    const outsideFile = join(outside, "managed.md");
+    const rel = relative(config, outsideFile).replaceAll("\\", "/");
+    mkdirSync(join(config, "forgedock"), { recursive: true });
+    writeFileSync(outsideFile, "<!-- forgedock:managed-opencode-skill -->\n");
+    writeFileSync(
+      join(config, "forgedock", "manifest.json"),
+      `${JSON.stringify({ version: 1, files: [rel], digest: "bad" })}\n`,
+    );
+
+    const status = await getOpenCodeAdapterStatus({ home, env: {} });
+    assert.equal(status.healthy, false);
+    assert.deepEqual(status.missing, [rel]);
+
+    const uninstall = await uninstallOpenCodeAdapter({ home, env: {} });
+    assert.equal(uninstall.removed, 0);
+    assert.ok(existsSync(outsideFile));
+  });
+
   it("reports health and uninstalls only managed files", async () => {
     const { forgeHome, home } = fixture();
     const config = join(home, ".config", "opencode");
@@ -326,10 +463,11 @@ describe("OpenCode adapter", () => {
     assert.equal(status.healthy, true);
 
     const result = await uninstallOpenCodeAdapter({ home, env: {} });
-    assert.equal(result.removed, 2);
+    assert.equal(result.removed, 4);
     assert.ok(existsSync(userFile));
     assert.ok(!existsSync(join(config, "commands", "forge", "work-on.md")));
     assert.ok(!existsSync(join(config, "plugins", "forgedock.js")));
+    assert.ok(!existsSync(join(config, "forgedock")));
   });
 
   it("preserves unmanifested files in the ForgeDock namespace", async () => {
