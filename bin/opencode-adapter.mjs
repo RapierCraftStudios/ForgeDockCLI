@@ -16,6 +16,24 @@ const MANIFEST_VERSION = 1;
 const ADAPTER_LOCK_STALE_AGE_MS = 30_000;
 const ADAPTER_LOCK_HEARTBEAT_MS = 10_000;
 const ADAPTER_LOCK_RETRY_DELAYS_MS = [10, 20, 40, 80, 150];
+const LEGACY_COMMAND_CONTRACTS = {
+  "work-on": {
+    description: "Run the ForgeDock full issue pipeline (investigate \u2192 build \u2192 review \u2192 merge)",
+    templateSuffix: " and execute the pipeline for issue {{args}}.",
+  },
+  "review-pr": {
+    description: "Run the ForgeDock PR review pipeline",
+    templateSuffix: " and execute the PR review for PR {{args}}.",
+  },
+  "quality-gate": {
+    description: "Run ForgeDock pre-commit quality checks",
+    templateSuffix: " and run all quality gate checks.",
+  },
+  orchestrate: {
+    description: "Run ForgeDock parallel multi-issue orchestration",
+    templateSuffix: " and orchestrate the issues: {{args}}.",
+  },
+};
 
 function portablePath(path) {
   return path.replaceAll("\\", "/");
@@ -113,14 +131,21 @@ export function normalizeOpenCodeSkillName(command) {
 function isLegacyCommandDefinition(name, definition) {
   if (!definition || typeof definition !== "object" || Array.isArray(definition)) return false;
   const keys = Object.keys(definition).sort();
-  return (
-    keys.length === 2 &&
-    keys[0] === "description" &&
-    keys[1] === "template" &&
-    typeof definition.template === "string" &&
-    definition.template.includes(`/commands/${name}.md`) &&
-    String(definition.description || "").includes("ForgeDock")
-  );
+  const contract = LEGACY_COMMAND_CONTRACTS[name];
+  if (
+    !contract ||
+    keys.length !== 2 ||
+    keys[0] !== "description" ||
+    keys[1] !== "template" ||
+    definition.description !== contract.description ||
+    typeof definition.template !== "string"
+  ) return false;
+
+  const template = portablePath(definition.template);
+  const suffix = `/commands/${name}.md${contract.templateSuffix}`;
+  if (!template.startsWith("Read ") || !template.endsWith(suffix)) return false;
+  const forgeHome = template.slice("Read ".length, -suffix.length);
+  return forgeHome.length > 0 && isAbsolute(forgeHome);
 }
 
 export function resolveOpenCodeConfigDir({ home, env = process.env } = {}) {
