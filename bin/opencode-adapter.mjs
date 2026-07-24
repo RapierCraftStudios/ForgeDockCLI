@@ -159,7 +159,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "OpenCode runtime mapping:",
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
-    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool. Preserve requested isolation and parallelism, use `general` for implementation/review and `explore` for read-only discovery, and resume by task ID when requested. If background tasks are unavailable, launch independent foreground tasks concurrently where possible and use the workflow's GitHub-label polling fallback; never inline a required isolated review.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\" }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
     openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
@@ -219,6 +219,27 @@ function capabilityError(operation) {
   error.code = FORGE_OPENCODE_CAPABILITY_ERROR
   return error
 }
+
+function normalizeTaskArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw capabilityError("task arguments are invalid")
+  }
+
+  const sourceType = args.subagent_type
+  const subagentType = sourceType === undefined || sourceType === null || sourceType === ""
+    ? "general"
+    : sourceType === "general-purpose"
+      ? "general"
+      : sourceType === "codebase-explorer"
+        ? "explore"
+        : sourceType
+
+  if (subagentType !== "general" && subagentType !== "explore") {
+    throw capabilityError("task subagent_type " + String(sourceType) + " is unsupported")
+  }
+
+  args.subagent_type = subagentType
+}
 `;
   return `${PLUGIN_SENTINEL}
 import { existsSync } from "node:fs"
@@ -245,6 +266,10 @@ export const ForgeDockPlugin = async () => ({
     }
   },
   "tool.execute.before": async (input, output) => {
+    if (input.tool === "task") {
+      normalizeTaskArgs(output?.args)
+      return
+    }
     if (input.tool !== "bash") return
     const operation = blockedOperation(output?.args?.command)
     if (operation) throw capabilityError(operation)

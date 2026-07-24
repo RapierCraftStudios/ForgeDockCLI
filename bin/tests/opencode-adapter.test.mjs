@@ -103,6 +103,8 @@ describe("OpenCode adapter", () => {
     assert.match(output, /DISPATCH_TOOL=task/);
     assert.match(output, /subagent_type: "general"\|"explore"/);
     assert.match(output, /genuinely absent.*FORGE:REVIEW_BLOCKED/s);
+    assert.match(output, /top-level argument object shaped like/);
+    assert.match(output, /general-purpose.*general.*codebase-explorer.*explore/s);
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
   });
 
@@ -238,6 +240,42 @@ describe("OpenCode adapter", () => {
     const shellOutput = { env: {} };
     await hooks["shell.env"]({}, shellOutput);
     assert.equal(shellOutput.env.FORGE_RUNTIME, "opencode");
+  });
+
+  it("requires and normalizes native task subagent types", async () => {
+    const { forgeHome, home } = fixture();
+    const pluginPath = join(home, "forgedock-task-plugin.mjs");
+    writeFileSync(pluginPath, renderOpenCodePlugin(forgeHome));
+    const plugin = await import(`${pathToFileURL(pluginPath).href}?task-test=${Date.now()}`);
+    const hooks = await plugin.ForgeDockPlugin();
+    const dispatch = (args) => hooks["tool.execute.before"]({ tool: "task" }, { args });
+
+    const implementation = { description: "implementation", prompt: "implement the fix", subagent_type: "general-purpose" };
+    await dispatch(implementation);
+    assert.equal(implementation.subagent_type, "general");
+
+    const review = { description: "review", prompt: "review the change", subagent_type: "general" };
+    await dispatch(review);
+    assert.equal(review.subagent_type, "general");
+
+    const discovery = { description: "discovery", prompt: "inspect callers", subagent_type: "codebase-explorer" };
+    await dispatch(discovery);
+    assert.equal(discovery.subagent_type, "explore");
+
+    const missing = { description: "default", prompt: "use the safe default" };
+    await dispatch(missing);
+    assert.equal(missing.subagent_type, "general");
+
+    await assert.rejects(
+      dispatch({ description: "invalid", prompt: "do not run", subagent_type: "unknown" }),
+      (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
+        error.message.includes("task subagent_type unknown is unsupported"),
+    );
+    await assert.rejects(
+      dispatch(undefined),
+      (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
+        error.message.includes("task arguments are invalid"),
+    );
   });
 
   it("installs extras only when requested and prunes them on downgrade", async () => {

@@ -107,16 +107,22 @@ specs evaluate Claude's literal `Task`/`Agent` names, an OpenCode runtime marker
 selects `DISPATCH_TOOL=task`; the absence of those Claude names must not produce
 a false `FORGE:REVIEW_BLOCKED` result.
 
-Every isolated review dispatch uses the explicit native argument shape:
+Every isolated review dispatch uses the explicit native argument shape. Every
+native task call must include the schema-required `subagent_type` at the top
+level alongside its `description` and `prompt`:
 
 ```js
 { description: "...", prompt: "...", subagent_type: "general" }
 ```
 
-Use `general` for implementation and review work, and `explore` for read-only
-discovery. If the native `task` capability itself is unavailable, the workflow
-posts `FORGE:REVIEW_BLOCKED` and stops rather than falling back to inline review
-or another pipeline controller.
+Implementation and review work uses `general`; read-only discovery uses
+`explore`. Claude `general-purpose` maps to `general` and
+`codebase-explorer` maps to `explore`. When a source task omits its type, the
+generated adapter safely defaults it to `general`; unsupported types stop with
+`FORGE_OPENCODE_CAPABILITY_ERROR` instead of reaching schema validation.
+If the native `task` capability itself is unavailable, the workflow posts
+`FORGE:REVIEW_BLOCKED` and stops rather than falling back to inline review or
+another pipeline controller.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,
@@ -165,9 +171,10 @@ only Claude CLI and the Anthropic API. An OpenCode engine backend must be added
 and validated before ForgeDock can claim provider-neutral headless parity.
 
 The ForgeDock plugin provides the OpenCode-specific runtime boundary for shell
-execution. Its `tool.execute.before` hook rejects Claude-backed and recursive
-ForgeDock controller commands; the shared workflow rules and deterministic
-scripts remain the source of truth for all other behavior.
+and task execution. Its `tool.execute.before` hook rejects Claude-backed and
+recursive ForgeDock controller commands, and normalizes native task arguments
+before execution; the shared workflow rules and deterministic scripts remain
+the source of truth for all other behavior.
 
 OpenCode 1.18.4 keeps background subagents experimental. When they are not
 enabled, the command adapter requires independent foreground tasks to be
