@@ -102,7 +102,19 @@ The adapter follows these rules:
 The generated adapter preamble is intentionally small. It maps Claude Code's
 in-conversation `Skill(...)` loading to the normalized native skill name and
 authoritative shared spec. It maps isolated `Task(...)` and permitted
-`Agent(...)` calls to OpenCode's native `task` tool.
+`Agent(...)` calls to OpenCode's native `task` tool. Every native task call must
+include the schema-required `subagent_type` at the top level alongside its
+`description` and `prompt`:
+
+```js
+{ description: "...", prompt: "...", subagent_type: "general" }
+```
+
+Implementation and review work uses `general`; read-only discovery uses
+`explore`. Claude `general-purpose` maps to `general` and
+`codebase-explorer` maps to `explore`. When a source task omits its type, the
+generated adapter safely defaults it to `general`; unsupported types stop with
+`FORGE_OPENCODE_CAPABILITY_ERROR` instead of reaching schema validation.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,
@@ -151,9 +163,10 @@ only Claude CLI and the Anthropic API. An OpenCode engine backend must be added
 and validated before ForgeDock can claim provider-neutral headless parity.
 
 The ForgeDock plugin provides the OpenCode-specific runtime boundary for shell
-execution. Its `tool.execute.before` hook rejects Claude-backed and recursive
-ForgeDock controller commands; the shared workflow rules and deterministic
-scripts remain the source of truth for all other behavior.
+and task execution. Its `tool.execute.before` hook rejects Claude-backed and
+recursive ForgeDock controller commands, and normalizes native task arguments
+before execution; the shared workflow rules and deterministic scripts remain
+the source of truth for all other behavior.
 
 OpenCode 1.18.4 keeps background subagents experimental. When they are not
 enabled, the command adapter requires independent foreground tasks to be
