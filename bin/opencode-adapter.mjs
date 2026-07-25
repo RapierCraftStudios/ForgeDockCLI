@@ -312,6 +312,10 @@ function normalizeTaskArgs(args) {
   }
 
   args.subagent_type = subagentType
+  // The shared OpenCode workflow requires streaming task completions. The only
+  // supported opt-out is the explicit environment flag, so an omitted or
+  // false per-call value cannot silently reintroduce a wave barrier.
+  if (process.env[BACKGROUND_FLAG] !== "false") args.background = true
 }
 `;
   return `${PLUGIN_SENTINEL}

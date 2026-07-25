@@ -1364,11 +1364,51 @@ async function uninstall() {
   console.log("");
 }
 
-// Reinstall = relink commands + re-register the hook. Never the full
-// journey: update must not reach read/review, which could overwrite a
-// curated forge.yaml (and re-runs AI enrichment on every update). Also
-// idempotent, so it's the repair path for a configured repo whose
-// symlinks or hook registration got out of sync.
+// Reinstall = relink commands + re-register the hook + refresh an already
+// installed OpenCode adapter. Never the full journey: update must not reach
+// read/review, which could overwrite a curated forge.yaml (and re-runs AI
+// enrichment on every update). Also idempotent, so it's the repair path for a
+// configured repo whose symlinks, hook registration, or managed OpenCode files
+// got out of sync.
+async function refreshManagedOpenCodeAdapter() {
+  try {
+    const { getOpenCodeAdapterStatus, installOpenCodeAdapter } = await import("./opencode-adapter.mjs");
+    const status = await getOpenCodeAdapterStatus({ home: HOME, env: process.env });
+    if (!status.installed) return;
+
+    // npm/npx payloads must be persisted before the generated adapter points at
+    // them; git-clone installs are already stable and persistHome returns them
+    // unchanged.
+    const persisted = await persistHome(ctx());
+    const adapterForgeHome = persisted.forgeHome || FORGE_HOME;
+    if (adapterForgeHome === FORGE_HOME && isEphemeralCachePath(FORGE_HOME)) {
+      console.log(
+        `  ${YELLOW}OpenCode adapter refresh skipped: the current ForgeDock payload is ephemeral.${RESET}`,
+      );
+      return;
+    }
+
+    const result = await installOpenCodeAdapter({
+      forgeHome: adapterForgeHome,
+      home: HOME,
+      env: process.env,
+      includeExtras: status.manifest?.includeExtras === true,
+    });
+    console.log(
+      `  ${GREEN}Refreshed managed OpenCode adapter (${result.commandCount} commands, ${result.skillCount} skills).${RESET}`,
+    );
+    for (const warning of result.migration.warnings) {
+      console.log(`  ${YELLOW}OpenCode adapter warning: ${warning}${RESET}`);
+    }
+  } catch (error) {
+    // OpenCode refresh is best-effort, matching the existing update/relink
+    // behavior: a permissions or ownership problem must not block Claude users.
+    console.log(
+      `  ${YELLOW}Could not refresh the managed OpenCode adapter: ${error?.message || String(error)}${RESET}`,
+    );
+  }
+}
+
 async function relinkAndHint() {
   const c = ctx();
   const forged = await forge(c);
@@ -1380,6 +1420,7 @@ async function relinkAndHint() {
   // (that path calls statusScreen(), never relinkAndHint()) — see the
   // writeInstallReceipt() JSDoc in journey.mjs for the full picture.
   await writeInstallReceipt(c, { forged });
+  await refreshManagedOpenCodeAdapter();
   if (!existsSync(join(c.cwd, "forge.yaml"))) {
     const dim = (s) => (c.mode === "none" ? s : `\x1b[2m${s}\x1b[22m`);
     c.stdout.write("  " + dim("Configure this repo: npx forgedock init") + "\n");

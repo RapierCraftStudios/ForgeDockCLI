@@ -221,6 +221,19 @@ describe("OpenCode adapter", () => {
     writeFileSync(pluginPath, renderOpenCodePlugin(forgeHome));
     const plugin = await import(`${pathToFileURL(pluginPath).href}?test=${Date.now()}`);
     const hooks = await plugin.ForgeDockPlugin();
+    const defaultConfig = {};
+    await hooks.config(defaultConfig);
+    assert.equal(defaultConfig.subagent_depth, 4);
+    assert.equal(defaultConfig.agent.general.permission.task, "allow");
+
+    const explicitConfig = {
+      subagent_depth: 2,
+      permission: { task: "deny" },
+    };
+    await hooks.config(explicitConfig);
+    assert.equal(explicitConfig.subagent_depth, 2);
+    assert.equal(explicitConfig.permission.task, "deny");
+
     const blocked = [
       "claude --print workflow",
       "forgedock run-issue 42 --lane staging",
@@ -258,10 +271,12 @@ describe("OpenCode adapter", () => {
     const implementation = { description: "implementation", prompt: "implement the fix", subagent_type: "general-purpose" };
     await dispatch(implementation);
     assert.equal(implementation.subagent_type, "general");
+    assert.equal(implementation.background, true);
 
-    const review = { description: "review", prompt: "review the change", subagent_type: "general" };
+    const review = { description: "review", prompt: "review the change", subagent_type: "general", background: false };
     await dispatch(review);
     assert.equal(review.subagent_type, "general");
+    assert.equal(review.background, true);
 
     const discovery = { description: "discovery", prompt: "inspect callers", subagent_type: "codebase-explorer" };
     await dispatch(discovery);
@@ -270,6 +285,7 @@ describe("OpenCode adapter", () => {
     const missing = { description: "default", prompt: "use the safe default" };
     await dispatch(missing);
     assert.equal(missing.subagent_type, "general");
+    assert.equal(missing.background, true);
 
     await assert.rejects(
       dispatch({ description: "invalid", prompt: "do not run", subagent_type: "unknown" }),
@@ -281,6 +297,29 @@ describe("OpenCode adapter", () => {
       (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
         error.message.includes("task arguments are invalid"),
     );
+  });
+
+  it("preserves the explicit foreground opt-out", async () => {
+    const { forgeHome, home } = fixture();
+    const previous = process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
+    process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "false";
+    try {
+      const pluginPath = join(home, "forgedock-foreground-plugin.mjs");
+      writeFileSync(pluginPath, renderOpenCodePlugin(forgeHome));
+      const plugin = await import(`${pathToFileURL(pluginPath).href}?foreground-test=${Date.now()}`);
+      const hooks = await plugin.ForgeDockPlugin();
+      const args = { description: "foreground", prompt: "run in degraded mode" };
+      await hooks["tool.execute.before"]({ tool: "task" }, { args });
+      assert.equal(args.subagent_type, "general");
+      assert.equal(args.background, undefined);
+
+      const shellOutput = { env: {} };
+      await hooks["shell.env"]({}, shellOutput);
+      assert.equal(shellOutput.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS, "false");
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS;
+      else process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = previous;
+    }
   });
 
   it("installs extras only when requested and prunes them on downgrade", async () => {

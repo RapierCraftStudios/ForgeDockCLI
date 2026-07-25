@@ -82,6 +82,65 @@ describe("router", () => {
     rmSync(configDir, { recursive: true, force: true });
   });
 
+  it("refreshes an existing managed OpenCode adapter during generic update", () => {
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-opencode-update-source-"));
+    const home = mkdtempSync(join(os.tmpdir(), "fd-opencode-update-home-"));
+    const cwd = mkdtempSync(join(os.tmpdir(), "fd-opencode-update-cwd-"));
+    const configDir = mkdtempSync(join(os.tmpdir(), "fd-opencode-update-config-"));
+
+    try {
+      cpSync(dirname(CLI), join(forgeHome, "bin"), {
+        recursive: true,
+        filter: (src) => !src.includes("tests"),
+      });
+      mkdirSync(join(forgeHome, "commands"), { recursive: true });
+      writeFileSync(
+        join(forgeHome, "commands", "one.md"),
+        "---\ndescription: One\n---\n\n# One\n",
+        "utf-8",
+      );
+      writeFileSync(
+        join(forgeHome, "package.json"),
+        JSON.stringify({ name: "forgedock", version: "1.0.0" }) + "\n",
+        "utf-8",
+      );
+
+      const env = {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        NO_COLOR: "1",
+        OPENCODE_CONFIG_DIR: configDir,
+      };
+      const install = spawnSync(
+        process.execPath,
+        [join(forgeHome, "bin", "forgedock.mjs"), "opencode", "install"],
+        { cwd, env, encoding: "utf-8", timeout: 30000 },
+      );
+      assert.equal(install.status, 0, install.stdout + install.stderr);
+
+      const pluginPath = join(configDir, "plugins", "forgedock.js");
+      writeFileSync(pluginPath, `${readFileSync(pluginPath, "utf-8")}\n// stale adapter\n`, "utf-8");
+
+      const update = spawnSync(
+        process.execPath,
+        [join(forgeHome, "bin", "forgedock.mjs"), "update"],
+        { cwd, env, encoding: "utf-8", timeout: 30000 },
+      );
+      assert.equal(update.status, 0, update.stdout + update.stderr);
+      assert.match(update.stdout, /Refreshed managed OpenCode adapter/);
+
+      const refreshed = readFileSync(pluginPath, "utf-8");
+      assert.match(refreshed, /subagent_depth === undefined/);
+      assert.doesNotMatch(refreshed, /stale adapter/);
+    } finally {
+      rmSync(forgeHome, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("status reports unmanaged in a fresh directory", () => {
     const res = runCli(["status"], { home: mkdtempSync(join(os.tmpdir(), "fd-s-")) });
     assert.equal(res.status, 0);

@@ -146,6 +146,11 @@ npx forgedock opencode install --extras
 npx forgedock opencode uninstall
 ```
 
+`npx forgedock update` also refreshes an existing managed OpenCode adapter,
+including its plugin and generated skills. It preserves the installed core vs.
+`--extras` tier and does not install OpenCode files when no ForgeDock adapter
+is already registered.
+
 Updates are deterministic and prune stale ForgeDock-owned command files.
 Uninstall removes only files listed in the ownership manifest and still marked
 with a ForgeDock sentinel. User-owned commands, plugins, and files placed in
