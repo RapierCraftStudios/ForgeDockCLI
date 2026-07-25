@@ -110,6 +110,26 @@ describe("OpenCode adapter", () => {
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
   });
 
+  it("adds the compact preflight only to orchestration entrypoints", () => {
+    const orchestrate = renderOpenCodeCommand({
+      description: "Run orchestration",
+      forgeHome: "/forge",
+      command: "orchestrate",
+    });
+    assert.match(orchestrate, /orchestrate-preflight\.mjs/);
+    assert.match(orchestrate, /dispatchNow/);
+    assert.match(orchestrate, /requiresDeepPlan is false/);
+    assert.match(orchestrate, /do not load the full phase-3 or phase-4 files just to ask that question/i);
+
+    const skill = renderOpenCodeSkill({
+      description: "Run orchestration",
+      forgeHome: "/forge",
+      command: "orchestrate",
+    });
+    assert.match(skill, /node "\$FORGE_HOME\/bin\/orchestrate-preflight\.mjs"/);
+    assert.match(skill, /task-result events/);
+  });
+
   it("normalizes colon-qualified nested skill paths without changing other names", () => {
     const output = renderOpenCodeCommand({
       description: "Run one issue",

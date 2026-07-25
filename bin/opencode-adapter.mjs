@@ -204,10 +204,23 @@ function openCodeReviewDispatchContract() {
   ].join("\n");
 }
 
+function openCodeOrchestrateContract(forgeHome) {
+  const preflightPath = portablePath(join(forgeHome, "bin", "orchestrate-preflight.mjs"));
+  return [
+    "OpenCode orchestration fast path:",
+    `Before reading config.md, the authoritative workflow, or any phase file, run node "$FORGE_HOME/bin/orchestrate-preflight.mjs" --repo "$GH_REPO" --args "$ARGUMENTS" from the target repository and parse its JSON output. The installed implementation is ${preflightPath}. The helper resolves the repository from forge.yaml when GH_REPO is empty.`,
+    "The preflight is deterministic and only handles issue resolution, eligibility filtering, explicit dependencies, scoped issue-body file overlap, database serialization, and the initial ready queue.",
+    "When supported is true, requiresDeepPlan is false, and confirmed is true, launch dispatchNow immediately with native task calls using the exact work-on skill contract. Without explicit --auto or --confirm, present the compact plan and ask for one confirmation; after the user confirms, launch the plan's ready queue without re-reading the large phase files. Do not load the full phase-3 or phase-4 files just to ask that question.",
+    "If requiresDeepPlan is true, the input is unsupported, preflight fails, or a task completion needs recovery, continue from the authoritative shared phase files. The fast path never closes, deduplicates, or edits issue bodies.",
+    "Treat queued as deferred by the concurrency cap and use task-result events to dispatch the next ready issue. Keep the full shared workflow's labels, annotations, leases, and terminal-state rules.",
+  ].join("\n");
+}
+
 export function renderOpenCodeCommand({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
   const nativeSkillExpression = '${x.replaceAll(":", "-").replaceAll("/", "-")}';
+  const isOrchestrate = command === "orchestrate";
   return [
     "---",
     `description: ${yamlString(`ForgeDock: ${description}`)}`,
@@ -215,11 +228,15 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "---",
     COMMAND_SENTINEL,
     "",
-    "Run the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:",
+    (isOrchestrate
+      ? "Run the OpenCode preflight before loading the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:"
+      : "Run the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:"),
     "",
     "$ARGUMENTS",
     "",
-    "Use `read` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation.",
+    ...(isOrchestrate
+      ? ["Do not use `read` to load the authoritative spec yet. Run the deterministic preflight first; only load the shared spec if the preflight requires the full workflow.", "", openCodeOrchestrateContract(forgeHome)]
+      : ["Use `read` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation."]),
     "",
     "OpenCode runtime mapping:",
     "",
@@ -236,6 +253,7 @@ export function renderOpenCodeSkill({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
   const name = normalizeOpenCodeSkillName(command);
+  const isOrchestrate = command === "orchestrate";
   return `---
 name: ${name}
 description: ${yamlString(`ForgeDock: ${description}`)}
@@ -246,11 +264,13 @@ metadata:
 ---
 ${SKILL_SENTINEL}
 
-Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.
+${isOrchestrate
+  ? `Run the deterministic OpenCode preflight before loading the authoritative ForgeDock workflow at \`${specPath}\` in the current context.`
+  : `Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.`}
 
-The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: read only this workflow and the next spec explicitly reached by its dispatcher.
+The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: ${isOrchestrate ? "do not read the shared orchestrate spec until preflight routes to the full workflow." : "read only this workflow and the next spec explicitly reached by its dispatcher."}
 
-${openCodeReviewDispatchContract()}
+${command === "orchestrate" ? `${openCodeOrchestrateContract(forgeHome)}\n\n` : ""}${openCodeReviewDispatchContract()}
 
 If the workflow source or a required native capability is unavailable, stop and report exactly:
 \`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.

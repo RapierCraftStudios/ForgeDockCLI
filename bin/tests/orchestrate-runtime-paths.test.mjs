@@ -36,6 +36,17 @@ describe("orchestrate runtime helper paths", () => {
     assert.ok(directCalls.length >= resolverCalls.length);
   });
 
+  it("resolves affected-file extraction from ForgeDock before the target repo", () => {
+    assert.match(phase3, /resolve_extract_affected_files\(\)/);
+    assert.match(phase3, /\$FORGE_HOME\/scripts\/extract-affected-files\.sh/);
+    assert.match(phase3, /\$REPO_PATH\/scripts\/extract-affected-files\.sh/);
+    assert.match(phase3, /AFFECTED_FILES_SCRIPT=\$\(resolve_extract_affected_files\)/);
+    assert.match(phase3, /bash "\$AFFECTED_FILES_SCRIPT"/);
+    assert.match(phase3, /FILE_SOURCE\[\$NUM\].*=.*error/);
+    assert.match(phase3, /affected-file extraction for #\$NUM was inconclusive/);
+    assert.doesNotMatch(phase3, /bash scripts\/extract-affected-files\.sh/);
+  });
+
   it("documents OpenCode helper and worktree locations", () => {
     assert.match(opencodeDocs, /FORGE_RUNTIME=opencode/);
     assert.match(opencodeDocs, /\.opencode\/worktrees/);
@@ -64,5 +75,14 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(phase4, /state="running"/);
     assert.match(phase4, /background=true/);
     assert.match(phase4, /do not wait for the slowest sibling/i);
+  });
+
+  it("documents the compact OpenCode preflight", () => {
+    const orchestrate = readFileSync(
+      new URL("../../commands/orchestrate.md", import.meta.url),
+      "utf8",
+    );
+    assert.match(orchestrate, /orchestrate-preflight\.mjs/);
+    assert.match(orchestrate, /do not load the full\s+Phase 3 or Phase 4 prose just\s+to ask that\s+question/i);
   });
 });

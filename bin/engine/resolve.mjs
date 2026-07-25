@@ -94,7 +94,14 @@
  * @returns {ClassifiedInput}
  */
 export function classifyInputPattern(input) {
-  const trimmed = (input ?? "").trim();
+  // Orchestration control flags authorize or tune the dispatcher; they are not
+  // part of the issue-set predicate. Strip them here so a confirmed OpenCode
+  // fast path and the full shared resolver classify the same query.
+  const trimmed = String(input ?? "")
+    .replace(/(?:^|\s)(?:--auto|--confirm|--deep-plan)(?=\s|$)/gi, " ")
+    .replace(/(?:^|\s)--max-concurrent(?:=|\s+)[1-9]\d*(?=\s|$)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   const tokens = trimmed.length > 0 ? trimmed.split(/\s+/) : [];
 
   // literal-numbers: every token is a bare integer or a (optionally
