@@ -224,7 +224,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "OpenCode runtime mapping:",
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
-    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\" }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
     openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
@@ -875,7 +875,27 @@ export async function getOpenCodeAdapterStatus({ home, env = process.env } = {})
   const configDir = resolveOpenCodeConfigDir({ home, env });
   const manifestPath = join(configDir, "forgedock", "manifest.json");
   const safeManifest = await tryResolveSafePath(configDir, manifestPath);
+  const resolvedHome = home || env.HOME || env.USERPROFILE || homedir();
+  const legacyInstructions = join(resolvedHome, ".opencode-forge.md");
+  const safeLegacyInstructions = await tryResolveSafePath(dirname(legacyInstructions), legacyInstructions);
+  const legacyContent = safeLegacyInstructions
+    ? await readRegularFile(safeLegacyInstructions.path)
+    : null;
+  const legacyInstalled = legacyContent?.split(/\r?\n/).some(
+    (line) => line.trim() === LEGACY_SENTINEL,
+  ) === true;
+
   if (!safeManifest || !existsSync(safeManifest.path)) {
+    if (legacyInstalled) {
+      return {
+        installed: true,
+        healthy: false,
+        legacy: true,
+        configDir,
+        missing: [],
+        integrity: "legacy-adapter",
+      };
+    }
     return { installed: false, healthy: false, configDir, missing: [] };
   }
   if (!(await isSafePath(configDir, manifestPath))) {

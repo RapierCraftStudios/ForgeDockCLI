@@ -669,6 +669,20 @@ describe("OpenCode adapter", () => {
     assert.equal(status.integrity, "digest-mismatch");
   });
 
+  it("recognizes the sentinel-marked legacy adapter for generic update migration", async () => {
+    const { home } = fixture();
+    writeFileSync(
+      join(home, ".opencode-forge.md"),
+      "<!-- ForgeDock managed — do not remove this line -->\nlegacy adapter\n",
+    );
+
+    const status = await getOpenCodeAdapterStatus({ home, env: {} });
+    assert.equal(status.installed, true);
+    assert.equal(status.healthy, false);
+    assert.equal(status.legacy, true);
+    assert.equal(status.integrity, "legacy-adapter");
+  });
+
   it("reports malformed manifest file entries without crashing", async () => {
     const home = temp("fd-opencode-bad-manifest-");
     const manifestPath = join(home, ".config", "opencode", "forgedock", "manifest.json");

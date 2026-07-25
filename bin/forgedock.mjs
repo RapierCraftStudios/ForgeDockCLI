@@ -3894,7 +3894,12 @@ switch (command) {
       for (const warning of result.migration.warnings) process.stderr.write(`Warning: ${warning}\n`);
     } else if (action === "status") {
       const result = await getOpenCodeAdapterStatus({ home: HOME });
-      if (!result.installed) {
+      if (result.legacy) {
+        process.stdout.write(
+          "A legacy ForgeDock OpenCode adapter is installed. Re-run: npx forgedock opencode install\n",
+        );
+        exitCode = 1;
+      } else if (!result.installed) {
         process.stdout.write(`OpenCode adapter is not installed under ${result.configDir}.\n`);
         exitCode = 1;
       } else if (!result.healthy) {
