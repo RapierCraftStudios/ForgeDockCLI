@@ -1,6 +1,6 @@
 ---
 description: Orchestrate parallel work on multiple issues or an entire milestone — spawns sub-agents that each run the full /work-on pipeline
-argument-hint: "[milestone <slug> | #1 #2 #3 | next <N> | fast-lane | priority:P0]"
+argument-hint: "[milestone <slug> | #1 #2 #3 | next <N> | fast-lane | priority:P0] [--auto|--confirm]"
 ---
 <!-- SPDX-FileCopyrightText: Copyright (c) RapierCraft Studios -->
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
@@ -9,7 +9,45 @@ argument-hint: "[milestone <slug> | #1 #2 #3 | next <N> | fast-lane | priority:P
 
 **Input**: $ARGUMENTS
 
+`--auto` and `--confirm` authorize the dispatch checkpoint; they are control
+flags, not part of the issue-set query. `--deep-plan` requests the full analysis
+path, and `--max-concurrent N` only tunes the dispatch cap.
+
 This file is the slim dispatcher. Detailed phase content lives in `commands/orchestrate/`.
+
+## OpenCode Preflight
+
+When `FORGE_RUNTIME=opencode` (or an OpenCode runtime marker is present), run the
+deterministic preflight at `$FORGE_HOME/bin/orchestrate-preflight.mjs` immediately,
+before reading `orchestrate/config.md`, this workflow, or any phase spec. The helper
+resolves the repository from `forge.yaml`, including a parent config when the target
+is a nested Git worktree:
+
+```bash
+node "$FORGE_HOME/bin/orchestrate-preflight.mjs" \
+  --repo "$GH_REPO" \
+  --args "$ARGUMENTS"
+```
+
+The preflight is a compact mechanical adapter for issue resolution, eligibility,
+explicit dependencies, scoped issue-body file overlap, database serialization, and
+the initial ready queue. If it returns a supported plan with `requiresDeepPlan: false`
+and `confirmed: true`, launch `dispatchNow` with native background `task` calls
+immediately. Without an explicit `--auto` or `--confirm` argument, present the
+compact plan and ask for one confirmation; after the user confirms, launch the
+plan's ready queue without re-reading the large phase files. Do not load the full
+Phase 3 or Phase 4 prose just to ask that question.
+
+Continue through the phase files when the plan says `requiresDeepPlan`, the input is
+unsupported, preflight fails, or a task-result event requires recovery. This adapter
+never closes, deduplicates, or edits issues; the full shared workflow remains the
+authority for investigations, review-finding cascade handling, recovery, cleanup,
+and reporting.
+
+For a supported compact OpenCode plan, stop after the fast-path dispatch. The phase
+execution order below is the fallback path for deep plans, unsupported inputs,
+preflight failures, and task-result recovery; do not read it merely to confirm or
+dispatch a compact plan.
 
 ## Execution Order
 

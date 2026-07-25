@@ -76,11 +76,46 @@ LAYER1_FILES=()
 declare -A EDGE_KIND    # "{PRED}:{SUCCESSOR}" → same-file | directory | shared-module (forge#1860)
 declare -A EDGE_FILES   # "{PRED}:{SUCCESSOR}" → the specific file(s) that triggered the edge (forge#1860)
 declare -A FILE_SOURCE  # {NUM} → affected-files-section | body-fallback | none (forge#2436)
+
+# Resolve ForgeDock's helper from the runtime installation before falling back to
+# the target repository. The orchestrator runs inside the project being worked on,
+# so a bare `scripts/extract-affected-files.sh` silently fails when that project
+# has not copied ForgeDock's helper scripts into its own repository (observed in
+# OpenCode runs against installed ForgeDock). Keep the precedence aligned with
+# phase-4-execution.md's classify-lane resolver.
+resolve_extract_affected_files() {
+  local candidates=()
+  [ -n "${FORGE_HOME:-}" ] && candidates+=("$FORGE_HOME/scripts/extract-affected-files.sh")
+  [ -n "${REPO_PATH:-}" ] && candidates+=("$REPO_PATH/scripts/extract-affected-files.sh")
+  candidates+=("$PWD/scripts/extract-affected-files.sh")
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "ERROR: extract-affected-files.sh is not installed in any configured runtime path." >&2
+  return 1
+}
+
+AFFECTED_FILES_SCRIPT=$(resolve_extract_affected_files) || {
+  echo "ERROR: cannot build file-overlap edges without extract-affected-files.sh" >&2
+  exit 1
+}
+
 for NUM in {issue_numbers}; do
   echo "=== #$NUM ==="
-  EXTRACT_OUT=$(bash scripts/extract-affected-files.sh "$NUM" -R "{GH_REPO}")
+  EXTRACT_OUT=$(bash "$AFFECTED_FILES_SCRIPT" "$NUM" -R "{GH_REPO}")
   FILE_SOURCE[$NUM]=$(echo "$EXTRACT_OUT" | head -1 | sed 's/^PROVENANCE=//')
   FILES_FOR_NUM=$(echo "$EXTRACT_OUT" | tail -n +2)
+
+  if [ "${FILE_SOURCE[$NUM]}" = "error" ]; then
+    echo "ERROR: affected-file extraction for #$NUM was inconclusive after a GitHub/API failure." >&2
+    echo "       Do not treat the issue as file-independent; retry the extraction or rerun /orchestrate." >&2
+    exit 1
+  fi
 
   echo "$FILES_FOR_NUM"
   echo "  (source: ${FILE_SOURCE[$NUM]})"
@@ -1043,9 +1078,9 @@ The following issues form a circular dependency chain and **cannot be dispatched
 Proceed? (yes / adjust / pick specific issues)
 ```
 
-**Wait for user confirmation before spawning agents.** This is the checkpoint — once agents launch, they run autonomously.
+**Wait for user confirmation before spawning agents unless the caller explicitly passed `--auto` or `--confirm`.** Those flags are machine-readable authorization for headless callers such as `/autopilot`; they do not change the plan or bypass any eligibility, dependency, or safety checks. Once the checkpoint is authorized, agents launch and run autonomously.
 
-**After confirmation**: If investigations exist, execute Phase 2B-E first. Then re-present the expanded plan (with newly spawned issues added to the dependency graph) for a quick confirmation before launching implementation.
+**After confirmation**: If investigations exist, execute Phase 2B-E first. Interactive callers then re-present the expanded plan (with newly spawned issues added to the dependency graph) for a quick confirmation before launching implementation. An explicit `--auto`/`--confirm` caller proceeds through that second checkpoint without prompting, while still rebuilding the graph.
 
 ---
 

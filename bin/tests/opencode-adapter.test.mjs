@@ -105,9 +105,29 @@ describe("OpenCode adapter", () => {
     assert.match(output, /genuinely absent.*FORGE:REVIEW_BLOCKED/s);
     assert.match(output, /top-level argument object shaped like/);
     assert.match(output, /general-purpose.*general.*codebase-explorer.*explore/s);
-    assert.match(output, /background[:=] true/);
+    assert.match(output, /preserve explicit `background: false`/i);
     assert.match(output, /task-result event/i);
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
+  });
+
+  it("adds the compact preflight only to orchestration entrypoints", () => {
+    const orchestrate = renderOpenCodeCommand({
+      description: "Run orchestration",
+      forgeHome: "/forge",
+      command: "orchestrate",
+    });
+    assert.match(orchestrate, /orchestrate-preflight\.mjs/);
+    assert.match(orchestrate, /dispatchNow/);
+    assert.match(orchestrate, /requiresDeepPlan is false/);
+    assert.match(orchestrate, /do not load the full phase-3 or phase-4 files just to ask that question/i);
+
+    const skill = renderOpenCodeSkill({
+      description: "Run orchestration",
+      forgeHome: "/forge",
+      command: "orchestrate",
+    });
+    assert.match(skill, /node "\$FORGE_HOME\/bin\/orchestrate-preflight\.mjs"/);
+    assert.match(skill, /task-result events/);
   });
 
   it("normalizes colon-qualified nested skill paths without changing other names", () => {
@@ -144,6 +164,11 @@ describe("OpenCode adapter", () => {
     assert.match(skillOutput, /DISPATCH_TOOL=task/);
     assert.match(skillOutput, /subagent_type: "general"\|"explore"/);
     assert.match(skillOutput, /native `task` is genuinely absent/);
+    assert.match(skillOutput, /OpenCode sequential build dispatch/);
+    assert.match(skillOutput, /Do not load either stage with the native `skill` tool/);
+    assert.match(skillOutput, /background: false/);
+    assert.match(skillOutput, /IMPLEMENT_RESULT/);
+    assert.match(skillOutput, /VALIDATE_RESULT/);
   });
 
   it("keeps native review dispatch ahead of Claude availability checks", () => {
@@ -277,7 +302,7 @@ describe("OpenCode adapter", () => {
     const review = { description: "review", prompt: "review the change", subagent_type: "general", background: false };
     await dispatch(review);
     assert.equal(review.subagent_type, "general");
-    assert.equal(review.background, true);
+    assert.equal(review.background, false);
 
     const discovery = { description: "discovery", prompt: "inspect callers", subagent_type: "codebase-explorer" };
     await dispatch(discovery);

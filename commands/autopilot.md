@@ -858,7 +858,7 @@ To approve: remove \`needs-human\` label from #${ISSUE_NUM} and re-run \`/autopi
         2>/dev/null || echo '')
       for N in $PRE_DISPATCH_ISSUES; do DISPATCHED_ISSUES+=("$N"); done
 
-      Skill("orchestrate", args="fast-lane")
+      Skill("orchestrate", args="fast-lane --auto")
 
       # Terminal-state verification after orchestrate (fallback path).
       # Re-query GitHub state for each pre-dispatch issue.
@@ -883,7 +883,7 @@ To approve: remove \`needs-human\` label from #${ISSUE_NUM} and re-run \`/autopi
     if [ "$FORGEDOCK_AVAILABLE" = "true" ]; then
       echo "[DRY-RUN] Would dispatch each fast-lane issue via: forgedock run-issue <issue> --lane staging"
     else
-      echo "[DRY-RUN] Would invoke: Skill(orchestrate, fast-lane)"
+      echo "[DRY-RUN] Would invoke: Skill(orchestrate, fast-lane --auto)"
     fi
   fi
 
@@ -1112,7 +1112,7 @@ To approve: remove \`needs-human\` label from #${ISSUE_NUM} and re-run \`/autopi
           2>/dev/null || echo '')
         for N in $MS_PRE_DISPATCH; do DISPATCHED_ISSUES+=("$N"); done
 
-        Skill("orchestrate", args="milestone $MS_SLUG")
+        Skill("orchestrate", args="milestone $MS_SLUG --auto")
 
         # Terminal-state verification after orchestrate fallback.
         echo "Verifying terminal state for $( echo "$MS_PRE_DISPATCH" | wc -w | tr -d ' ') dispatched milestone issue(s) (orchestrate path)..."
@@ -1136,7 +1136,7 @@ To approve: remove \`needs-human\` label from #${ISSUE_NUM} and re-run \`/autopi
       if [ "$FORGEDOCK_AVAILABLE" = "true" ]; then
         echo "[DRY-RUN] Would dispatch each milestone issue via: forgedock run-issue <issue> --lane milestone/$MS_SLUG"
       else
-        echo "[DRY-RUN] Would invoke: Skill(orchestrate, milestone $MS_SLUG)"
+        echo "[DRY-RUN] Would invoke: Skill(orchestrate, milestone $MS_SLUG --auto)"
       fi
     fi
   else

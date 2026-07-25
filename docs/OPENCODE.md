@@ -104,6 +104,14 @@ The adapter follows these rules:
 - Orchestration dispatches independent issues with `task(background=true)` and
   processes each injected task-result event immediately; it does not wait for a
   wave or the slowest sibling.
+- The `/orchestrate` entrypoint reads only runtime config, then runs
+  `bin/orchestrate-preflight.mjs` before loading the phase specs. The helper batches the initial GitHub
+  snapshot and emits only the compact ready queue needed for the first native task.
+  Interactive runs keep the confirmation gate; `--auto` or `--confirm` is the
+  explicit headless authorization.
+- The full Phase 3/4 prose is reserved for investigations, unsupported or multi-repo
+  queries, explicit deep planning, and recovery after a task-result event. It remains
+  authoritative for cascade handling, leases, cleanup, and reporting.
 - GitHub state and the durable engine remain the recovery source instead of
   replaying prior prompt context.
 
@@ -217,6 +225,12 @@ wave-like fallback rather than silently claiming Claude-equivalent throughput.
 Commands that inspect Claude-specific transcripts or Claude installation state
 remain runtime-specific and should not be represented as portable until they
 receive dedicated implementations.
+
+The preflight is intentionally bounded. It handles explicit issue sets and the
+common single-repository `fast-lane`, `milestone`, `next`, `priority`, and
+`no:milestone` queries, plus explicit dependencies and scoped issue-body file
+overlap. Unsupported or complex inputs fall back to the shared phase specs rather
+than silently weakening their safety rules.
 
 ## Orchestration Runtime
 
