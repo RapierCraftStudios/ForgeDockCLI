@@ -207,6 +207,7 @@ describe("OpenCode adapter", () => {
     assert.match(plugin, /output\.env\.FORGE_HOME = shellForgeHome/);
     assert.match(plugin, /output\.env\.FORGE_RUNTIME = "opencode"/);
     assert.match(plugin, /subagent_depth === undefined/);
+    assert.match(plugin, /subagent_depth = 2/);
     assert.match(plugin, /OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS/);
     assert.match(plugin, /config\.agent\.general\.permission\.task/);
     assert.match(plugin, /normalizeTaskArgs\(output\?\.args\)/);
@@ -223,7 +224,7 @@ describe("OpenCode adapter", () => {
     const hooks = await plugin.ForgeDockPlugin();
     const defaultConfig = {};
     await hooks.config(defaultConfig);
-    assert.equal(defaultConfig.subagent_depth, 4);
+    assert.equal(defaultConfig.subagent_depth, 2);
     assert.equal(defaultConfig.agent.general.permission.task, "allow");
 
     const explicitConfig = {

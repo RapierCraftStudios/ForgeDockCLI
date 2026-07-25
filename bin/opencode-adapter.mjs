@@ -335,7 +335,9 @@ ${runtimeGuard}
 
 export const ForgeDockPlugin = async () => ({
   config: async (config) => {
-    if (config.subagent_depth === undefined) config.subagent_depth = 4
+    // Two nested subagent levels cover orchestrate -> work-on -> review/gate
+    // without enabling unnecessary recursive fan-out.
+    if (config.subagent_depth === undefined) config.subagent_depth = 2
     // OpenCode otherwise adds task: deny to every subagent session, which prevents
     // an orchestrated work-on child from spawning its isolated review agents.
     config.agent ??= {}

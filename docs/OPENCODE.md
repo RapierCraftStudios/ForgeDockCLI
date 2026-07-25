@@ -60,7 +60,7 @@ OpenCode /forge/work-on
 The generated plugin has no prompt text. It:
 
 - injects `FORGE_HOME` into OpenCode shell environments;
-- defaults `subagent_depth` to 4 when the user has not configured it, while
+- defaults `subagent_depth` to 2 when the user has not configured it, while
   preserving explicit lower limits;
 - grants the built-in `general` subagent permission to invoke native `task`
   unless the user explicitly configured a task permission;
