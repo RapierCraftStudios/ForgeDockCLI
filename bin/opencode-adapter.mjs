@@ -216,6 +216,19 @@ function openCodeOrchestrateContract(forgeHome) {
   ].join("\n");
 }
 
+function openCodeBuildStageContract(forgeHome) {
+  const implementPath = portablePath(join(forgeHome, "commands", "work-on", "build", "implement.md"));
+  const validatePath = portablePath(join(forgeHome, "commands", "work-on", "build", "validate.md"));
+  return [
+    "OpenCode sequential build dispatch:",
+    "The B5 and B6 calls in the authoritative workflow are serialized control-flow boundaries. Do not load either stage with the native `skill` tool: that tool only injects instructions and does not return a child-session result to this dispatcher.",
+    "For B5, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + implementPath + "` with the exact build arguments, stage changes, and return only `IMPLEMENT_RESULT`. Wait for the completed task result before continuing.",
+    "Parse `IMPLEMENT_RESULT` from the completed B5 task. Continue to B6 only for `COMPLETE` or `ALREADY_DONE`; preserve the workflow's existing terminal handling for every other status.",
+    "For B6, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + validatePath + "` with the worktree and B5 changed-file list, then return only `VALIDATE_RESULT`. Wait for completion before the acceptance gate.",
+    "This foreground requirement applies only to these serialized build stages. Keep independent orchestration, discovery, and review tasks at `background: true`.",
+  ].join("\n");
+}
+
 export function renderOpenCodeCommand({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
@@ -241,7 +254,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "OpenCode runtime mapping:",
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
-    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Use `background: true` for independent work; preserve explicit `background: false` when the workflow must await a child result. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
     openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
@@ -270,7 +283,7 @@ ${isOrchestrate
 
 The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: ${isOrchestrate ? "do not read the shared orchestrate spec until preflight routes to the full workflow." : "read only this workflow and the next spec explicitly reached by its dispatcher."}
 
-${command === "orchestrate" ? `${openCodeOrchestrateContract(forgeHome)}\n\n` : ""}${openCodeReviewDispatchContract()}
+${command === "orchestrate" ? `${openCodeOrchestrateContract(forgeHome)}\n\n` : ""}${command === "work-on/build" ? `${openCodeBuildStageContract(forgeHome)}\n\n` : ""}${openCodeReviewDispatchContract()}
 
 If the workflow source or a required native capability is unavailable, stop and report exactly:
 \`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.
@@ -332,10 +345,9 @@ function normalizeTaskArgs(args) {
   }
 
   args.subagent_type = subagentType
-  // The shared OpenCode workflow requires streaming task completions. The only
-  // supported opt-out is the explicit environment flag, so an omitted or
-  // false per-call value cannot silently reintroduce a wave barrier.
-  if (process.env[BACKGROUND_FLAG] !== "false") args.background = true
+  // Serialized phases use an awaited child task. Preserve their explicit
+  // foreground request; independent calls retain the background default.
+  if (args.background !== false && process.env[BACKGROUND_FLAG] !== "false") args.background = true
 }
 `;
   return `${PLUGIN_SENTINEL}
