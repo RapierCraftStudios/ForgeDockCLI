@@ -416,6 +416,9 @@ declare -A AGENT_ISSUE_MAP
 # this map to identify which issue a background-Bash completion notification belongs to,
 # the same role AGENT_ISSUE_MAP plays for Agent-tool `agent_completed` notifications.
 declare -A ENGINE_DISPATCH_MAP
+# OpenCode native task equivalent of ENGINE_DISPATCH_MAP. Keys are issue numbers;
+# values are the session ids returned by task(background=true).
+declare -A OPENCODE_DISPATCH_MAP
 
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
 # dispatch loop below (Step 4B) whenever a Layer 1/2/3 structural predecessor edge (see
@@ -556,16 +559,46 @@ and continue until it reaches
 `workflow:merged`, `workflow:invalid`, `needs-human`, or
 `workflow:awaiting-merge`.
 
+The native call is asynchronous and must be issued once per issue in
+`DISPATCH_NOW`, in the same assistant message where the batch is dispatched:
+
+```
+task(
+  description="Work on {PROJECT_PREFIX}#{NUMBER}",
+  subagent_type="general",
+  background=true,
+  prompt="Use the same Phase 4A work-on template below. Invoke Skill(skill='work-on', args='{PROJECT_PREFIX}{NUMBER} --under-orchestration') and continue until a terminal workflow state."
+)
+```
+
+Capture the returned `<task id="..." state="running">` id in
+`OPENCODE_DISPATCH_MAP[{NUMBER}]`. `background=true` is required for streaming
+DAG behavior; a foreground task makes the orchestrator wait for that issue and
+reintroduces a wave barrier. The ForgeDock OpenCode plugin opts into
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` by default. An explicit
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` is a supported degraded mode,
+but it must be reported as non-streaming rather than treated as equivalent to
+Claude background dispatch. Do not wait for the slowest sibling before handling
+an earlier task-result event.
+
 ```bash
 if [ "${FORGE_RUNTIME:-}" = "opencode" ]; then
   echo "OpenCode native task dispatch selected — load commands/work-on.md for each ready issue."
   echo "Do not call forgedock run-issue or the Claude Agent(...) fallback in this branch."
+  echo "Use task(subagent_type=general, background=true) once per ready issue and process each task-result event immediately."
   echo "If native task dispatch cannot run, post FORGE:OPENCODE_BLOCKED with the missing capability and add needs-human."
 fi
 ```
 
 This branch is additive. When OpenCode is not selected, continue through the
 existing engine-first and Claude Agent-spawn paths below without modification.
+
+The generated OpenCode plugin is an executable boundary, not just prompt
+guidance: its `tool.execute.before` hook rejects `claude`, `forgedock
+run-issue`, `npx forgedock run-issue`, and recursive `opencode run` shell
+commands with `FORGE_OPENCODE_CAPABILITY_ERROR`. If a native Skill or Task is
+unavailable, stop with that bounded error and preserve the GitHub label state;
+never compensate by starting a second controller or the Claude-backed engine.
 
 **CRITICAL — never background via shell `&`/`wait`** (fixed forge#2466): A single `forgedock run-issue` invocation drives an issue through investigate → build → review → close and routinely runs 30+ minutes. Backgrounding the process at the *shell* level (`cmd &` … `wait`) does not escape the Bash tool's own per-invocation ceiling — `wait` is itself the foreground command the tool watches, and it blocks for the combined duration of every process in the chunk. This made engine-first dispatch effectively dead code: any chunk running longer than the ceiling was always killed, so every run silently fell through to the Agent-spawn fallback below. The fix: dispatch each `forgedock run-issue` invocation as its **own `Bash` tool call with `run_in_background=true`** — the harness's native "start it, don't wait, notify me on completion" primitive — never with shell-level `&`/`wait`. This is exactly the same async model the Agent-spawn-fallback path already uses (and Step 4B's notification-driven completion loop already expects), so one monitoring loop now covers both dispatch styles.
 
@@ -687,7 +720,13 @@ ENGINE_DISPATCH_MAP[{NUM}] = <task_id returned by Bash(run_in_background=true, .
 
 If `DISPATCH_NOW` is empty (headroom is 0), do not dispatch any issues this cycle — wait for the next completion notification, exactly like the Agent-spawn path.
 
-**Agent-spawn path (fallback when forgedock CLI unavailable)**: When `FORGEDOCK_AVAILABLE=false`, spawn Agent sub-agents per issue using the template below. This preserves engine state via the SubagentStop hook even without the CLI.
+**Agent-spawn path (Claude fallback when forgedock CLI unavailable)**: When `FORGEDOCK_AVAILABLE=false` and the runtime is not OpenCode, spawn Agent sub-agents per issue using the template below. This preserves engine state via the SubagentStop hook even without the CLI.
+
+When the runtime is OpenCode, skip this Claude-only `Agent(...)` path entirely.
+Use the native `task` call above for initial, newly-ready, remediation, and
+stall-resume dispatches. Translate every later `Agent(...)` reference in this
+phase to `task(...)` with `subagent_type="general"`; preserve `background=true`
+and use `task_id=OPENCODE_DISPATCH_MAP[{NUMBER}]` when resuming a child.
 
 **REMINDER: You MUST use the template below verbatim when on the Agent-spawn fallback path. Only fill in `{VARIABLES}`. Do NOT rewrite the agent prompt. Do NOT write custom implementation instructions. The agent MUST invoke `/work-on` via the Skill tool — this is the HARD RULE from the top of this file.**
 
@@ -917,9 +956,9 @@ If `DISPATCH_NOW` is empty (headroom is 0), do not spawn any agents this cycle �
 
 ### Step 4B: Monitor completions and dispatch newly ready issues
 
-You will be automatically notified when each background agent completes — or, for an engine-first dispatch (Step 4A, `FORGEDOCK_AVAILABLE=true`), when a backgrounded `Bash(run_in_background=true, command="forgedock run-issue ...")` call completes. Both are the same underlying "background task finished" notification the harness delivers; treat them identically for the purposes of this step. **Do NOT use `sleep` loops to poll for completion.** Instead, wait for the automatic notification. When one arrives, look up which issue it belongs to — `AGENT_ISSUE_MAP` for an `agent_completed` notification, `ENGINE_DISPATCH_MAP` (fixed forge#2466) for a background-Bash notification from the engine-first path — and immediately process it exactly the same way regardless of which map resolved it; every check below (`classify_predecessor_state()`, dependent dispatch, stall/staging checks) keys off GitHub labels/state, not which dispatch mechanism produced them. **Fallback**: if a runtime ever fails to deliver a background-Bash completion notification, poll `gh issue view --json labels` for the in-flight engine-dispatched issue's workflow label instead of blocking — the same degrade-gracefully behavior already used when `BACKGROUND_DISPATCH_ENABLED=false` for the Agent-spawn path (see `phase-3-dependency.md` → Background Dispatch Mode).
+You will be automatically notified when each background agent completes — or, for an engine-first dispatch (Step 4A, `FORGEDOCK_AVAILABLE=true`), when a backgrounded `Bash(run_in_background=true, command="forgedock run-issue ...")` call completes. In OpenCode, a native background `task` first returns a `state="running"` result and later injects a synthetic `<task id="..." state="completed">` or `state="error"` result into this same parent session. The later result is the completion event; the initial running result is not completion. Both Claude notifications and OpenCode task-result events must trigger the same per-issue handling immediately. **Do NOT use `sleep` loops, wait for the slowest sibling, or poll before processing an event.** When one arrives, look up which issue it belongs to — `AGENT_ISSUE_MAP` for a Claude `agent_completed` notification, `ENGINE_DISPATCH_MAP` for a background-Bash notification, or `OPENCODE_DISPATCH_MAP` for an OpenCode task result — and immediately process it exactly the same way regardless of which map resolved it; every check below (`classify_predecessor_state()`, dependent dispatch, stall/staging checks) keys off GitHub labels/state, not which dispatch mechanism produced them. **Fallback**: if a runtime ever fails to deliver a background completion notification, use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
 
-**Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, or a background-Bash completion for an engine-dispatched issue — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` (or, per item 2b below, the fresh `Agent(...)` fallback dispatch) call is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains `Agent(resume=...)`-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete, at `workflow:engine-error` with empty committed state — is now auto-fallen-back to Agent-spawn by item 2b below, fixed forge#2743.)
+**Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, a background-Bash completion, or an OpenCode `task` result with `state="completed"`/`state="error"` — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` or OpenCode `task(task_id=..., background=true)` call is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains resume-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete at `workflow:engine-error` with empty committed state — is still auto-fallen-back by item 2b below, fixed forge#2743.)
 
 **Ordering requirement (MANDATORY — prevents transient over-cap)**: For every agent that completed in this notification batch, finish its terminal-state check and, if applicable, its resume re-increment (items 1-2 below) BEFORE computing `dispatch_headroom` for item 5's newly-ready-issue dispatch. Computing headroom before a to-be-resumed agent's re-increment would let a genuinely-still-running agent's freed slot be double-booked — once by a fresh dispatch, once by the resume itself — transiently exceeding `MAX_CONCURRENT`. Process every completed agent's items 1-2 to a decision (terminal vs. resumed) first; only then compute headroom once for the batch's item 5 dispatch.
 

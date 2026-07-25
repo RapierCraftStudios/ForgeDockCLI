@@ -54,6 +54,8 @@ import {
   resolveClaudeCliBinary,
   runCliWithStalePathRecovery,
   checkExecutionBackend,
+  assertOpenCodeNativeRuntime,
+  isOpenCodeRuntime,
   resolveBackend,
   resolveBackendLadder,
   runCliBackend,
@@ -956,6 +958,49 @@ describe("runCommand", () => {
     });
     assert.equal(result.status, "dry-run");
     assert.equal(result.model, "claude-test-model", "dry-run result must include model field");
+  });
+});
+
+describe("OpenCode runtime guard", () => {
+  it("recognizes only the OpenCode runtime marker", () => {
+    assert.equal(isOpenCodeRuntime({ FORGE_RUNTIME: "opencode" }), true);
+    assert.equal(isOpenCodeRuntime({ FORGE_RUNTIME: "claude" }), false);
+    assert.equal(isOpenCodeRuntime({}), false);
+  });
+
+  it("throws the bounded capability error for Claude-backed execution", () => {
+    assert.throws(
+      () => assertOpenCodeNativeRuntime({ env: { FORGE_RUNTIME: "opencode" }, operation: "forgedock run-issue" }),
+      (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR" &&
+        error.message === "FORGE_OPENCODE_CAPABILITY_ERROR: forgedock run-issue is unavailable when FORGE_RUNTIME=opencode. Use native ForgeDock Skill/Task dispatch instead.",
+    );
+    assert.doesNotThrow(() => assertOpenCodeNativeRuntime({ env: {} }));
+  });
+
+  it("refuses backend preflight without probing Claude", () => {
+    let probed = false;
+    const result = checkExecutionBackend({
+      env: { FORGE_RUNTIME: "opencode" },
+      resolveCliFn: () => {
+        probed = true;
+        return "claude";
+      },
+    });
+    assert.deepEqual(result, { ready: false, backend: "opencode", reason: "native-opencode-required" });
+    assert.equal(probed, false);
+  });
+
+  it("refuses runCommand before loading or resolving a backend", async () => {
+    await assert.rejects(
+      runCommand({
+        commandsDir: COMMANDS_DIR,
+        commandName: "work-on",
+        runtimeEnv: { FORGE_RUNTIME: "opencode" },
+        dryRun: true,
+        logger: { log() {} },
+      }),
+      (error) => error.code === "FORGE_OPENCODE_CAPABILITY_ERROR",
+    );
   });
 });
 

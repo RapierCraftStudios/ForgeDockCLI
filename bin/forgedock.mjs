@@ -417,6 +417,40 @@ function getVersion() {
 }
 
 /**
+ * Read the branch that owns the source currently being executed.
+ *
+ * This is deliberately best-effort: diagnostics should still identify the
+ * source path and version when the checkout has no readable branch ref.
+ *
+ * @param {string} [dir]
+ * @returns {string|null}
+ */
+function getGitBranch(dir = FORGE_HOME) {
+  try {
+    const branch = execFileSync(
+      "git",
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      { cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return branch || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Describe the source path the current CLI process resolves from.
+ *
+ * @param {string|null} [branch]
+ * @returns {string}
+ */
+function formatSourceIdentity(branch = null) {
+  const version = getVersion() || "unknown";
+  const branchLabel = branch ? `, branch ${branch}` : "";
+  return `${FORGE_HOME} (v${version}${branchLabel})`;
+}
+
+/**
  * Compare two dotted version strings component-wise (numeric, not
  * lexicographic — "1.9.0" must compare as older than "1.10.0").
  * Each component's leading numeric prefix is used (e.g. a prerelease-suffixed
@@ -1330,11 +1364,51 @@ async function uninstall() {
   console.log("");
 }
 
-// Reinstall = relink commands + re-register the hook. Never the full
-// journey: update must not reach read/review, which could overwrite a
-// curated forge.yaml (and re-runs AI enrichment on every update). Also
-// idempotent, so it's the repair path for a configured repo whose
-// symlinks or hook registration got out of sync.
+// Reinstall = relink commands + re-register the hook + refresh an already
+// installed OpenCode adapter. Never the full journey: update must not reach
+// read/review, which could overwrite a curated forge.yaml (and re-runs AI
+// enrichment on every update). Also idempotent, so it's the repair path for a
+// configured repo whose symlinks, hook registration, or managed OpenCode files
+// got out of sync.
+async function refreshManagedOpenCodeAdapter() {
+  try {
+    const { getOpenCodeAdapterStatus, installOpenCodeAdapter } = await import("./opencode-adapter.mjs");
+    const status = await getOpenCodeAdapterStatus({ home: HOME, env: process.env });
+    if (!status.installed) return;
+
+    // npm/npx payloads must be persisted before the generated adapter points at
+    // them; git-clone installs are already stable and persistHome returns them
+    // unchanged.
+    const persisted = await persistHome(ctx());
+    const adapterForgeHome = persisted.forgeHome || FORGE_HOME;
+    if (adapterForgeHome === FORGE_HOME && isEphemeralCachePath(FORGE_HOME)) {
+      console.log(
+        `  ${YELLOW}OpenCode adapter refresh skipped: the current ForgeDock payload is ephemeral.${RESET}`,
+      );
+      return;
+    }
+
+    const result = await installOpenCodeAdapter({
+      forgeHome: adapterForgeHome,
+      home: HOME,
+      env: process.env,
+      includeExtras: status.manifest?.includeExtras === true,
+    });
+    console.log(
+      `  ${GREEN}Refreshed managed OpenCode adapter (${result.commandCount} commands, ${result.skillCount} skills).${RESET}`,
+    );
+    for (const warning of result.migration.warnings) {
+      console.log(`  ${YELLOW}OpenCode adapter warning: ${warning}${RESET}`);
+    }
+  } catch (error) {
+    // OpenCode refresh is best-effort, matching the existing update/relink
+    // behavior: a permissions or ownership problem must not block Claude users.
+    console.log(
+      `  ${YELLOW}Could not refresh the managed OpenCode adapter: ${error?.message || String(error)}${RESET}`,
+    );
+  }
+}
+
 async function relinkAndHint() {
   const c = ctx();
   const forged = await forge(c);
@@ -1346,6 +1420,7 @@ async function relinkAndHint() {
   // (that path calls statusScreen(), never relinkAndHint()) — see the
   // writeInstallReceipt() JSDoc in journey.mjs for the full picture.
   await writeInstallReceipt(c, { forged });
+  await refreshManagedOpenCodeAdapter();
   if (!existsSync(join(c.cwd, "forge.yaml"))) {
     const dim = (s) => (c.mode === "none" ? s : `\x1b[2m${s}\x1b[22m`);
     c.stdout.write("  " + dim("Configure this repo: npx forgedock init") + "\n");
@@ -1808,24 +1883,18 @@ async function update() {
     const separateGlobalInstall = findSeparateGlobalInstall();
     if (separateGlobalInstall) {
       console.log(
-        `  ${YELLOW}Note: this updates the git clone above. Your global npm install at ${separateGlobalInstall} was NOT touched.${RESET}`,
+        `  ${YELLOW}Note: this command resolves to the git clone above. Your global npm install at ${separateGlobalInstall} is NOT touched.${RESET}`,
       );
       console.log(
         `  ${YELLOW}Run 'npm update -g forgedock', or 'npx forgedock update' from outside a clone, to update it.${RESET}`,
       );
     }
     try {
-      const branch = execSync("git rev-parse --abbrev-ref HEAD", {
-        cwd: FORGE_HOME,
-        encoding: "utf-8",
-      }).trim();
+      const branch = getGitBranch();
+      const branchLabel = branch || "unknown branch";
+      console.log(`  Source: ${formatSourceIdentity(branch)}`);
 
-      // If on a non-main branch, switch to main for the update then restore.
-      // Detached HEAD ("HEAD") is treated as non-restorable — we leave on main
-      // after the update and warn the user.
-      const isDetached = branch === "HEAD";
-      const needsCheckout = branch !== "main";
-      if (needsCheckout) {
+      if (branch !== "main") {
         // Dirty-tree guard: refuse to move HEAD in this clone if there are
         // uncommitted TRACKED changes. Untracked files are intentionally
         // excluded (--untracked-files=no) so a clean checkout with stray
@@ -1837,7 +1906,7 @@ async function update() {
         ).trim();
         if (porcelain) {
           console.log(
-            `  ${YELLOW}Working tree has uncommitted changes on branch ${branch} — skipping git-based update.${RESET}`,
+            `  ${YELLOW}Working tree has uncommitted changes on branch ${branchLabel} — skipping git-based update.${RESET}`,
           );
 
           // forge#2460 — distinguish "developing on this checkout" from a
@@ -1882,16 +1951,13 @@ async function update() {
           return;
         }
 
-        if (isDetached) {
-          console.log(
-            `  ${YELLOW}Detached HEAD state — switching to main for update.${RESET}`,
-          );
-        } else {
-          console.log(
-            `  On branch ${CYAN}${branch}${RESET} — switching to ${CYAN}main${RESET} for update...`,
-          );
-        }
-        execFileSync("git", ["checkout", "main", "--quiet"], { cwd: FORGE_HOME });
+        console.log(
+          `  ${YELLOW}Source checkout is on ${branchLabel}, not main; skipping update to preserve this source.${RESET}`,
+        );
+        console.log(
+          `  Run 'npx forgedock update' from a main-branch checkout (or use 'npx forgedock@latest') to refresh ForgeDock.`,
+        );
+        return;
       }
 
       const before = execSync("git rev-parse HEAD", {
@@ -1914,20 +1980,6 @@ async function update() {
         printGitCloneChangelogSummary(before, after);
       }
       await relinkAndHint();
-
-      // Restore original branch after a successful update.
-      if (needsCheckout && !isDetached) {
-        try {
-          execFileSync("git", ["checkout", branch, "--quiet"], { cwd: FORGE_HOME });
-          console.log(
-            `  Restored branch ${CYAN}${branch}${RESET}.`,
-          );
-        } catch {
-          console.log(
-            `  ${YELLOW}⚠  Could not restore branch ${branch} — you are now on main.${RESET}`,
-          );
-        }
-      }
     } catch (err) {
       console.log(
         `  ${YELLOW}Cannot fast-forward — local changes exist. Skipping.${RESET}`,
@@ -2190,7 +2242,14 @@ async function doctor(fix = false) {
   console.log("");
 
   const { targetDir: TARGET_DIR } = detectInstallPaths();
-  console.log(`  Mode: global (~/.claude)`);
+  const isGitCloneInstall = existsSync(join(FORGE_HOME, ".git"));
+  const sourceBranch = isGitCloneInstall ? getGitBranch() : null;
+  console.log(
+    isGitCloneInstall
+      ? `  Mode: git clone at ${CYAN}${FORGE_HOME}${RESET}`
+      : `  Mode: global (~/.claude)`,
+  );
+  console.log(`  Source: ${formatSourceIdentity(sourceBranch)}`);
   console.log("");
 
   let failures = 0;
@@ -2717,7 +2776,6 @@ async function doctor(fix = false) {
   // absence that isn't a problem should not read as one.
   {
     try {
-      const isGitCloneInstall = existsSync(join(FORGE_HOME, ".git"));
       if (isGitCloneInstall) {
         pass("Persisted toolset home (~/.forge)", "skipped — git-clone install links directly from the clone");
       } else {
@@ -3825,7 +3883,7 @@ switch (command) {
         includeExtras: restArgs.includes("--extras"),
       });
       process.stdout.write(
-        `Installed ${result.commandCount} OpenCode commands under ${result.configDir}.\n` +
+        `Installed ${result.commandCount} OpenCode commands and ${result.skillCount} skills under ${result.configDir}.\n` +
           "Restart OpenCode, then run /forge/work-on <issue>.\n",
       );
       if (result.migration.removedInstructionsFile || result.migration.removedConfigEntries > 0) {
@@ -3836,7 +3894,12 @@ switch (command) {
       for (const warning of result.migration.warnings) process.stderr.write(`Warning: ${warning}\n`);
     } else if (action === "status") {
       const result = await getOpenCodeAdapterStatus({ home: HOME });
-      if (!result.installed) {
+      if (result.legacy) {
+        process.stdout.write(
+          "A legacy ForgeDock OpenCode adapter is installed. Re-run: npx forgedock opencode install\n",
+        );
+        exitCode = 1;
+      } else if (!result.installed) {
         process.stdout.write(`OpenCode adapter is not installed under ${result.configDir}.\n`);
         exitCode = 1;
       } else if (!result.healthy) {
@@ -3847,7 +3910,7 @@ switch (command) {
         exitCode = 1;
       } else {
         process.stdout.write(
-          `OpenCode adapter is healthy (${result.manifest.commandCount} commands) under ${result.configDir}.\n`,
+          `OpenCode adapter is healthy (${result.manifest.commandCount} commands, ${result.manifest.skillCount ?? 0} skills) under ${result.configDir}.\n`,
         );
       }
     } else if (action === "uninstall") {

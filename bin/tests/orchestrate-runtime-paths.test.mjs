@@ -6,10 +6,15 @@ const phase4 = readFileSync(
   new URL("../../commands/orchestrate/phase-4-execution.md", import.meta.url),
   "utf8",
 );
+const phase3 = readFileSync(
+  new URL("../../commands/orchestrate/phase-3-dependency.md", import.meta.url),
+  "utf8",
+);
 const opencodeDocs = readFileSync(
   new URL("../../docs/OPENCODE.md", import.meta.url),
   "utf8",
 );
+const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
 
 describe("orchestrate runtime helper paths", () => {
   it("resolves lane classification without replacing Claude support", () => {
@@ -36,5 +41,28 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(opencodeDocs, /\.opencode\/worktrees/);
     assert.match(opencodeDocs, /~\/\.opencode\/scripts/);
     assert.match(opencodeDocs, /Claude keeps its existing engine/);
+    assert.match(opencodeDocs, /does not add or modify user-owned OpenCode settings/);
+    assert.match(opencodeDocs, /install and uninstall may rewrite `opencode\.json`\s+only/);
+    assert.match(opencodeDocs, /migration does not\s+rewrite `opencode\.jsonc`/);
+    assert.match(opencodeDocs, /customized commands are\s+preserved/);
+  });
+
+  it("keeps README OpenCode install guidance aligned with migration ownership", () => {
+    assert.match(
+      readme,
+      /without changing your provider\s+or user-owned settings\.\s+When migrating an older ForgeDock adapter, it removes\s+only exact ForgeDock-managed legacy entries from `opencode\.json`:/,
+    );
+    assert.doesNotMatch(readme, /without changing your provider\s+or `opencode\.json`/);
+  });
+
+  it("documents event-driven OpenCode DAG dispatch", () => {
+    assert.match(phase3, /OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS/);
+    assert.match(phase3, /task\(\.\.\., background=true\)/);
+    assert.match(phase3, /each injected task-result event/i);
+    assert.match(phase4, /OPENCODE_DISPATCH_MAP/);
+    assert.match(phase4, /task-result event/i);
+    assert.match(phase4, /state="running"/);
+    assert.match(phase4, /background=true/);
+    assert.match(phase4, /do not wait for the slowest sibling/i);
   });
 });

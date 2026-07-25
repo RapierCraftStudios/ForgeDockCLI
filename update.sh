@@ -35,7 +35,14 @@ LOG="$FORGE_HOME/.update.log"
     else
         echo "Updated: $(git log --oneline ${BEFORE}..${AFTER})"
 
-        # Reinstall to pick up any new commands
-        "$FORGE_HOME/install.sh" 2>&1
+        # Use the maintained updater so managed OpenCode adapters are refreshed
+        # alongside Claude commands. Fall back to the legacy shell installer
+        # only when Node.js is unavailable.
+        if command -v node >/dev/null 2>&1; then
+            node "$FORGE_HOME/bin/forgedock.mjs" update 2>&1
+        else
+            echo "Node.js is unavailable; refreshing Claude commands only"
+            "$FORGE_HOME/install.sh" 2>&1
+        fi
     fi
 } >> "$LOG" 2>&1
