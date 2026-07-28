@@ -349,6 +349,22 @@ describe("pickPhase", () => {
       const r = await context.reconcile(base, ioWith("nothing here"));
       assert.equal(r.satisfied, false);
     });
+
+    it("latest TRIVIAL fast-path annotation skips context and records the reason", async () => {
+      const r = await context.reconcile(base, ioWith(JSON.stringify([
+        { body: "<!-- FORGE:FAST_PATH -->\n**COMPLEXITY_BAND**: STANDARD" },
+        { body: "<!-- FORGE:FAST_PATH -->\n**COMPLEXITY_BAND**: TRIVIAL" },
+      ])));
+      assert.deepEqual(r, {
+        satisfied: true,
+        outputs: { skipped: "trivial-complexity-band", phase: "context" },
+      });
+    });
+
+    it("missing or malformed fast-path annotations retain the full pipeline", async () => {
+      const r = await context.reconcile(base, ioWith("<!-- FORGE:FAST_PATH -->\n**COMPLEXITY_BAND**: trivial"));
+      assert.equal(r.satisfied, false);
+    });
   });
 
   describe("architect.reconcile — requires FORGE:ARCHITECT:COMPLETE (not bare FORGE:ARCHITECT)", () => {
@@ -368,6 +384,16 @@ describe("pickPhase", () => {
     it("no marker at all -> not satisfied", async () => {
       const r = await architect.reconcile(base, ioWith("nothing here"));
       assert.equal(r.satisfied, false);
+    });
+
+    it("TRIVIAL fast-path annotation skips architect and records the reason", async () => {
+      const r = await architect.reconcile(base, ioWith(JSON.stringify([
+        { body: "<!-- FORGE:FAST_PATH -->\n**COMPLEXITY_BAND**: TRIVIAL" },
+      ])));
+      assert.deepEqual(r, {
+        satisfied: true,
+        outputs: { skipped: "trivial-complexity-band", phase: "architect" },
+      });
     });
   });
 
