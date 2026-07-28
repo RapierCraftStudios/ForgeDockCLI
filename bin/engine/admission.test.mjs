@@ -8,6 +8,7 @@ import {
   parseOptionalPositiveNumber,
   resolveCascadePolicy,
   admitsGeneration,
+  admitsBatchGeneration,
   admitsTokenSpend,
   evaluateCascadeFinding,
   classifyBatchSafety,
@@ -95,6 +96,7 @@ describe("resolveCascadePolicy — presets", () => {
   it("policy: all removes both caps and disables every heuristic", () => {
     const { policy, warnings } = resolveCascadePolicy({ policy: "all" });
     assert.equal(policy.maxGeneration, UNLIMITED);
+    assert.equal(policy.batchMaxGeneration, 2);
     assert.equal(policy.tokenBudget, UNLIMITED);
     assert.equal(policy.deferOnBatchGated, false);
     assert.equal(policy.keywordHeuristic, false);
@@ -110,6 +112,7 @@ describe("resolveCascadePolicy — presets", () => {
   it("policy: conservative keeps balanced's shape but lowers the token budget", () => {
     const { policy } = resolveCascadePolicy({ policy: "conservative" });
     assert.equal(policy.maxGeneration, 1);
+    assert.equal(policy.batchMaxGeneration, 2);
     assert.equal(policy.tokenBudget, 450000);
     assert.equal(policy.deferOnBatchGated, true);
   });
@@ -154,6 +157,19 @@ describe("resolveCascadePolicy — granular overrides compose with a preset", ()
     assert.equal(admitsGeneration(2, policy), true);
     assert.equal(admitsGeneration(3, policy), true);
     assert.equal(admitsGeneration(4, policy), false);
+  });
+
+  it("keeps batching finite even when explicit cascade admission is unlimited", () => {
+    const { policy } = resolveCascadePolicy({ policy: "all" });
+    assert.equal(admitsBatchGeneration(2, policy), true);
+    assert.equal(admitsBatchGeneration(3, policy), false);
+  });
+
+  it("allows a repository to set a different finite batching ceiling", () => {
+    const { policy } = resolveCascadePolicy({ batch_max_generation: 3 });
+    assert.equal(policy.batchMaxGeneration, 3);
+    assert.equal(admitsBatchGeneration(3, policy), true);
+    assert.equal(admitsBatchGeneration(4, policy), false);
   });
 });
 

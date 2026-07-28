@@ -520,7 +520,7 @@ echo "$DIR_ISSUES" | while IFS=: read -r dir issue_list; do
 done
 ```
 
-**Batch creation** uses the same template as `orchestrate.md Phase 1 → P3 Review-Finding Batching`, including its surface-area path sanitization (`tr -cd 'A-Za-z0-9._/-'` on the file/directory value before interpolating it into the batch issue's `--title`/`--body`). After creating the batch issue, add the `batch` label to each member issue to prevent re-batching on the next sweep.
+**Batch creation** uses the same template and bounded generation policy as `orchestrate.md Phase 1 → P3 Review-Finding Batching`, including its surface-area path sanitization (`tr -cd 'A-Za-z0-9._/-'` on the file/directory value before interpolating it into the batch issue's `--title`/`--body`). Compute every member's generation, exclude members above `orchestration.cascade.batch_max_generation` (default `2`), and record the retained maximum with `FORGE:BATCH_MAX_GENERATION`; list every generation-2-or-higher member in the body. After creating the batch issue, add the `batch` label to each member issue to prevent re-batching on the next sweep.
 
 ### Step 4B.4: Report
 

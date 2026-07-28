@@ -209,6 +209,7 @@ Sweep (Step 4F.2.5) once the batch is no longer fully gated.
 | #{F} | {title} | original | ⏸ Awaiting Merge | #{PR} | staging |
 | #{E} | {title} | original | ⏭ Skipped (dep) | — | — |
 | #{G} | {title} | original | 🔗 Blocked-on-Merge (gated by #{PRED}) | — | — |
+| #{H} | {title} | original | ⚠ Review Panel Degraded | #{PR} | {target} |
 
 `⏸ Awaiting Merge` (`workflow:awaiting-merge`) is structurally distinct from `⚠ Blocked`
 (`needs-human`): a Blocked row means the pipeline hit something it cannot resolve on its own
@@ -223,6 +224,17 @@ also distinct from `⏭ Skipped (dep)`, which means the predecessor `FAILED` out
 was abandoned. A Blocked-on-Merge row means the work is queued and will auto-dispatch the instant
 the gating predecessor's PR merges — no manual `/orchestrate` re-run required. Never render a
 blocked-on-human-merge dependent as `⏭ Skipped (dep)`.
+
+### Degraded Review Panels
+
+{IF any PR reviewed during this batch has the `review-degraded` label:}
+| Issue | PR | Target | Required action |
+|-------|----|--------|-----------------|
+| #{NUM} | #{PR} | {target} | Re-run the complete isolated review panel in a fresh session |
+
+These PRs are not eligible to merge or deploy. A dispatch-pool failure produced an incomplete panel, so no inline or partial-panel verdict is accepted.
+
+{ELSE: omit this section entirely.}
 
 {IF `MERGE_READY_PRS` (Step 6A.5) is non-empty:}
 
@@ -294,6 +306,7 @@ current session's live wake pick them up automatically if it is still running).
 - **Failed**: {N} issues need attention
 - **Merge-ready**: {#MERGE_READY_PRS[@]:-0} PRs awaiting only a human merge (see "Merge-Ready" section above)
 - **Blocked-on-merge**: {#BLOCKED_ON_MERGE[@]:-0} issues queued behind a human-gated predecessor, will auto-dispatch on merge (see "Blocked-on-Merge" section above)
+- **Degraded review panels**: {N} PRs require a fresh full-panel re-review before merge/deploy
 - **Skipped**: {N} issues (dependency failures)
 
 ### Post-Batch Cleanup
