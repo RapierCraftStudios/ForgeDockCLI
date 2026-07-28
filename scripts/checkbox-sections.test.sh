@@ -33,6 +33,12 @@ INLINE_CLASSIFIER=$(extract_classifier "$ROOT/commands/work-on.md")
   exit 1
 }
 
+if grep -q 'echo "\$BODY\|echo "\$BODY_STRIPPED' \
+  "$ROOT/commands/work-on/close.md" "$ROOT/commands/work-on.md"; then
+  printf 'FAIL: arbitrary issue bodies must be piped with printf, not echo\n' >&2
+  exit 1
+fi
+
 grep -Fq 'Keep the structural computation above and its consuming multi-phase guard' "$ROOT/commands/work-on.md" || {
   printf 'FAIL: Phase 6A sync invariant must cover the consuming guard\n' >&2
   exit 1

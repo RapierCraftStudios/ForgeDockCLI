@@ -139,7 +139,7 @@ The `INVARIANT_ANOMALIES` variable is read in Phase C4.5 (trajectory post) and w
 BODY=$(gh issue view {NUMBER} {GH_FLAG} --json body --jq '.body')
 
 # Count remaining unchecked items BEFORE any edit
-REMAINING_BEFORE=$(echo "$BODY" | grep -cE '^[-*+] \[ \]' || true)
+REMAINING_BEFORE=$(printf '%s\n' "$BODY" | grep -cE '^[-*+] \[ \]' || true)
 ```
 
 **If `REMAINING_BEFORE == 0`** (no unchecked items): skip body edit — all items already checked, proceed to add PR reference only:
@@ -164,14 +164,14 @@ Multi-phase issues have **two or more checkbox-bearing sections** — that is, t
 # - ATX headings and setext underlines both delimit sections. The ATX pattern
 #   avoids awk interval-quantifier variance across awk implementations.
 # - grep -E / awk only — no PCRE. '^#+ ' needs none.
-FENCE_COUNT=$(echo "$BODY" | grep -cE '^(```+|~~~+)' || true)
+FENCE_COUNT=$(printf '%s\n' "$BODY" | grep -cE '^(```+|~~~+)' || true)
 if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
   BODY_STRIPPED="$BODY"
 else
-  BODY_STRIPPED=$(echo "$BODY" | awk '/^(```+|~~~+)/{f=!f; next} !f')
+  BODY_STRIPPED=$(printf '%s\n' "$BODY" | awk '/^(```+|~~~+)/{f=!f; next} !f')
 fi
 
-CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
+CHECKBOX_SECTIONS=$(printf '%s\n' "$BODY_STRIPPED" | awk '
   /^#+ / { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
   /^(=+|-+)$/ && previous != "" { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
   { if (in_section && /^[-*+] \[[ xX]\]/) has=1; previous=$0 }
@@ -182,7 +182,7 @@ CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
 # '## Sub-Issue Tracker' counts 1 section. Checking those off would mark open
 # sub-issues done and close the tracker, so any unchecked GFM task item for an
 # issue forces multi-phase.
-SUBISSUE_ITEMS=$(echo "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
+SUBISSUE_ITEMS=$(printf '%s\n' "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
 
 # Keep this consuming guard synchronized with Phase 6A's Sync invariant in
 # commands/work-on.md.
@@ -196,7 +196,7 @@ if [ "${CHECKBOX_SECTIONS:-0}" -ge 2 ] || [ "${SUBISSUE_ITEMS:-0}" -gt 0 ]; then
   REMAINING_AFTER="$REMAINING_BEFORE"
 else
   # Single-phase issue: check off all remaining GFM task items
-  UPDATED_BODY=$(echo "$BODY" | sed 's/^\([-*+]\) \[ \]/\1 [x]/g')
+  UPDATED_BODY=$(printf '%s\n' "$BODY" | sed 's/^\([-*+]\) \[ \]/\1 [x]/g')
   UPDATED_BODY="${UPDATED_BODY}"$'\n\n'"**PR**: #{PR_NUMBER} → merged to \`{PR_BASE}\`"
   gh issue edit {NUMBER} {GH_FLAG} --body "{UPDATED_BODY}"
   REMAINING_AFTER=0
