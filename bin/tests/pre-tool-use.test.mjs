@@ -1761,3 +1761,261 @@ describe("attribution guard — subprocess", () => {
     assert.equal(result.status ?? -1, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rule 8: dangerous `rm` target guard (issue #2856)
+//
+// The deletion command names below are ASSEMBLED FROM FRAGMENTS on purpose.
+// This suite spawns the real hook as a subprocess, and the tooling that edits
+// and greps this file is itself subject to the guard — an un-fragmented
+// literal in command position risks the suite tripping the very rule it
+// tests. Prose mentions inside quoted argument values are written out in full,
+// because proving those are ALLOWED is the point of the false-positive block.
+// ---------------------------------------------------------------------------
+
+const RM = "r" + "m";
+const RMDIR = RM + "dir";
+
+function runBash(command, opts = {}) {
+  return runHook(
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Bash",
+      tool_input: { command },
+    },
+    opts,
+  );
+}
+
+describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
+  // -- DENY: root-anchored targets ----------------------------------------
+  // At least one DENY assertion is mandatory. The hook's fail-open catch
+  // makes a rule that silently no-ops (misplaced const, misplaced dispatch)
+  // indistinguishable from a rule that passes, so an all-ALLOW suite would
+  // stay green against a completely dead guard.
+
+  const denyCases = [
+    [`${RM} -f /probe.txt`, "missing-slash temp path — the shape seen in #2843"],
+    [`${RM} -rf /`, "bare filesystem root"],
+    [`${RM} -rf //`, "double-slash root"],
+    [`${RM} -rf /.`, "dot root"],
+    [`${RM} -rf /./`, "dot root, trailing slash (#2213 sibling-branch shape)"],
+    [`${RM} -rf /..`, "double-dot root"],
+    [`${RM} -rf /../`, "double-dot root, trailing slash (#2213 sibling-branch shape)"],
+    [`${RM} -rf /c`, "bare drive mount"],
+    [`${RM} -rf /c/`, "drive mount, trailing slash (#2113 shape)"],
+    [`${RM} -rf /*`, "root glob"],
+    [`${RM} -rf .`, "working directory"],
+    [`sudo ${RM} -rf ..`, "parent of working directory, behind sudo"],
+    [`doas ${RM} -rf /`, "bare filesystem root, behind doas"],
+    [`env ${RM} -rf /`, "bare filesystem root, behind env"],
+    [`${RMDIR} /probe`, "rmdir is guarded too, not just rm"],
+    [`TMPDIR=/x ${RM} -f /probe.txt`, "leading env assignment is stripped"],
+    [`${RM} -r -f /probe.txt`, "space-separated short flags"],
+    [`${RM} --force /probe.txt`, "long-form flag"],
+    [`${RM} -- /probe.txt`, "end-of-options marker"],
+    [`${RM} -f /tmp/a.txt /probe.txt`, "second operand — every operand is a target"],
+  ];
+
+  for (const [command, why] of denyCases) {
+    it(`exits 2 for ${command}  (${why})`, () => {
+      const { exitCode, stderr } = runBash(command);
+      assert.equal(exitCode, 2, `expected DENY for: ${command}`);
+      assert.match(stderr, /BLOCKED/);
+    });
+  }
+
+  // -- DENY: bypass classes Rule 5 learned the hard way --------------------
+  // Every hardening of the structurally identical find-root guard was a
+  // string-shape bypass, never a logic error (#2034 SEC-1/SEC-2, #2059,
+  // #2113, #2213). These are budgeted up front rather than paid back as
+  // follow-up PRs.
+
+  it("exits 2 for a deletion glued to && with no whitespace (metacharacter adjacency, #2034 SEC-1)", () => {
+    const { exitCode } = runBash(`cd /foo&&${RM} -f /bar.txt`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for a deletion after && with whitespace", () => {
+    const { exitCode } = runBash(`cd /foo && ${RM} -f /bar.txt`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for empty-quote splicing on the target (#2059)", () => {
+    const { exitCode } = runBash(`${RM} -f ""/probe.txt`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for empty-quote splicing on the command name (#2059)", () => {
+    const { exitCode } = runBash(`""${RM} -f /probe.txt`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for a deletion inside command substitution", () => {
+    const { exitCode } = runBash(`OUT=$(${RM} -rf /)`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for an unassigned possibly-empty variable path", () => {
+    const { exitCode } = runBash(`${RM} -rf $SOMEDIR/*`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for an unassigned possibly-empty variable path in braced form", () => {
+    const { exitCode } = runBash(`${RM} -rf \${SOMEDIR}/build`);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 2 for a cleanup deletion on the line AFTER a heredoc terminator (the #2843 stall shape)", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<'EOF'`,
+      `some report body`,
+      `EOF`,
+      `)"`,
+      `${RM} -f /probe.txt`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 2);
+  });
+
+  it("exits 0 when an indented delimiter-looking line remains inside a << heredoc body (#2879)", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<'EOF'`,
+      `  EOF`,
+      `${RM} -f /probe.txt`,
+      `EOF`,
+      `)"`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 0, "only a column-0 terminator closes << heredocs");
+  });
+
+  it("treats only tabs as indentation for a <<- heredoc terminator (#2879)", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<-EOF`,
+      `  EOF`,
+      `${RM} -f /still-in-body.txt`,
+      `\tEOF`,
+      `)"`,
+      `${RM} -f /after-terminator.txt`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 2, "a tab-indented terminator closes <<- heredocs");
+  });
+
+  it("allows a dangerous-looking deletion after an unterminated heredoc opener", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<'EOF'`,
+      `${RM} -f /probe.txt`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 0, "an unterminated heredoc consumes the remaining text as data");
+  });
+
+  // -- Deny message contract (ac-5, ac-6) ---------------------------------
+  // The message is part of the rule's contract, not prose: its whole value is
+  // that an unattended run self-heals in one turn instead of stalling.
+
+  it("deny message names the concrete rewrite and forbids escalating to a human", () => {
+    const { exitCode, stderr } = runBash(`${RM} -f /probe.txt`);
+    assert.equal(exitCode, 2);
+    assert.match(stderr, /mktemp/, "must name mktemp as the rewrite (ac-6)");
+    assert.match(stderr, /\/tmp\//, "must show a concrete two-segment temp path (ac-6)");
+    assert.match(stderr, /do not ask the user/i, "must tell the agent to self-correct (ac-5)");
+    assert.match(stderr, /probe\.txt/, "must quote the offending target back");
+  });
+
+  // -- Dispatch placement (ac-2), verified behaviourally -------------------
+  // The grep-based acceptance check is weak — the constants block alone
+  // satisfies it, so it can pass while the dispatch sits on the wrong side of
+  // the gate. This asserts the actual requirement: agents stage temp files
+  // from worktrees and scratch dirs that carry no forge.yaml marker, and
+  // those are exactly the contexts that stall.
+
+  it("fires in an UNMANAGED directory — dispatch precedes the isForgeDockManagedCwd gate (ac-2)", () => {
+    const unmanagedDir = mkdtempSync(join(osTop.tmpdir(), "fd-ptu-unmanaged-rm-"));
+    try {
+      const { exitCode, stderr } = runBash(`${RM} -f /probe.txt`, { cwd: unmanagedDir });
+      assert.equal(exitCode, 2, "guard must fire outside a ForgeDock-managed project");
+      assert.match(stderr, /BLOCKED/);
+    } finally {
+      rmSync(unmanagedDir, { recursive: true, force: true });
+    }
+  });
+
+  // -- ALLOW: prose mentions (ac-4) ---------------------------------------
+  // The reporter's own first implementation denied a legitimate `gh issue
+  // list --search` call because it matched the command name anywhere in the
+  // string. A guard on a name as common as this one gets tripped by
+  // documentation about itself, so these ship from day one.
+
+  const proseAllowCases = [
+    'gh issue list --search "dangerous rm / permission prompt OR stall"',
+    'echo "=== dupe search: dangerous rm / permission ==="',
+    'git commit -m "fix: avoid rm / on unset var"',
+    'echo "rm -f /fake" >> notes.md',
+    'grep -rn "rm /tmp" commands/',
+  ];
+
+  for (const command of proseAllowCases) {
+    it(`exits 0 for prose mention: ${command}`, () => {
+      const { exitCode } = runBash(command);
+      assert.equal(exitCode, 0, `expected ALLOW for prose: ${command}`);
+    });
+  }
+
+  it("exits 0 for a gh comment whose heredoc body DOCUMENTS this rule (meta case)", () => {
+    // Rule 5 blocked this issue's own context-gathering command for exactly
+    // this reason. A heredoc body is data, not shell syntax.
+    const command = [
+      `gh issue comment 2856 --body "$(cat <<'EOF'`,
+      `Rule 8 denies targets like rm -rf / and rm -f /probe.txt because the`,
+      `built-in gate stalls an unattended run.`,
+      `EOF`,
+      `)"`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 0, "documentation about the rule must not trip the rule");
+  });
+
+  // -- ALLOW: ordinary cleanup --------------------------------------------
+  // A false deny breaks the agent's own cleanup silently, which is worse than
+  // a missed deny (that surfaces as a visible prompt). These are the shapes
+  // the pipeline actually runs.
+
+  const cleanupAllowCases = [
+    [`${RM} -f /tmp/pr_a.txt`, "two segments deep"],
+    [`${RM} -f ./build/out.js`, "relative path"],
+    [`${RM} -rf ./dist`, "relative directory — not the cwd itself"],
+    [`${RM} -f .env`, "dotfile is not the dot directory"],
+    [`${RM} -rf node_modules`, "bare relative name"],
+    [`${RM} -f /tmp/a.txt /tmp/b.txt`, "multiple safe operands"],
+    [`${RM} -f "/tmp/quoted path.txt"`, "quoted path with embedded whitespace"],
+    [`${RM} -f "/tmp/safe(/probe.txt)"`, "quoted path with parentheses is one operand (#2882)"],
+    [`${RM} -f /tmp/safe\(/probe.txt\)`, "escaped unquoted path with parentheses is one operand (#2882)"],
+    [`${RM} -f C:/Users/test/tmp.txt`, "Windows drive-letter path"],
+    [`${RM} -rf -`, "bare dash operand"],
+    [`BODY_FILE=$(mktemp); ${RM} -f "$BODY_FILE"`, "mktemp cleanup — the canonical pipeline shape"],
+    [`${RM} -f "$BODY_FILE"`, "bare variable, no path suffix — cannot synthesize a root path"],
+    [`D=/tmp/x; ${RM} -rf "$D"/*`, "variable assigned earlier in the same command"],
+    [`${RM} -rf $HOME/.cache/foo`, "shell-provided HOME path"],
+    [`${RM} -rf $PWD/build`, "shell-provided PWD path"],
+    [`${RM} -rf $OLDPWD/build`, "shell-provided OLDPWD path"],
+    [`${RM} -rf $TMPDIR/scratch`, "shell-provided TMPDIR path"],
+    [`${RM} -rf $TMP/scratch`, "shell-provided TMP path"],
+    [`${RM} -rf $TEMP/scratch`, "shell-provided TEMP path"],
+    [`${RM} -rf $REPO_PATH/dist`, "pipeline-provided REPO_PATH"],
+    [`${RM} -rf $FORGE_HOME/cache`, "pipeline-provided FORGE_HOME"],
+    [`${RM} -rf $RUNNER_TEMP/cache`, "runner-provided RUNNER_TEMP"],
+    [`${RM} -rf $GITHUB_WORKSPACE/dist`, "runner-provided GITHUB_WORKSPACE"],
+    [`git ${RM} --cached foo.txt`, "git subcommand — not command position"],
+    [`docker ${RM} -f mycontainer`, "docker subcommand — not command position"],
+  ];
+
+  for (const [command, why] of cleanupAllowCases) {
+    it(`exits 0 for ${command}  (${why})`, () => {
+      const { exitCode, stderr } = runBash(command);
+      assert.equal(exitCode, 0, `expected ALLOW for: ${command}\nstderr: ${stderr}`);
+    });
+  }
+});
