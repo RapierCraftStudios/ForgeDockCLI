@@ -298,9 +298,10 @@ Concurrency limits and cascade admission policy for `/orchestrate`'s batch engin
 
 ```yaml
 orchestration:
-  # Maximum number of /work-on sub-agents dispatched concurrently. Guards against
-  # saturating the Anthropic API rate limit in one burst on a large ready set.
-  # Default: 12.
+  # Maximum number of top-level /work-on agents dispatched concurrently. Each
+  # worker normally fans out to about 8 total subagent spawns (build, quality
+  # gate, and review included), so set this to no more than session_budget / 8.
+  # Default: 12; use 25 or fewer for a 200-spawn session budget.
   max_concurrent: 12
 
   cascade:
@@ -353,17 +354,28 @@ orchestration:
     # (avoids serializing agents on same-file predecessor edges). Default:
     # true (from "balanced"); false under "all".
     p3_same_file_defer: true
+
+    # Running findings-spawned / merged-units ceiling. "off" (the default)
+    # only reports amplification; a positive decimal defers further
+    # same-lineage refinements to the completion sweep once exceeded.
+    max_amplification: "off"
+
+    # Number of consecutive merged-unit observations at ratio >= 1.0 before
+    # printing a convergence warning. Default: 3.
+    convergence_window: 3
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `max_concurrent` | integer | No | Max concurrent `/work-on` sub-agent dispatch. Default: 12 |
+| `max_concurrent` | integer | No | Max concurrent top-level `/work-on` dispatches. Plan for roughly 8 total subagent spawns per worker; default: 12. |
 | `cascade.policy` | string | No | `all` \| `balanced` \| `conservative`. Default: `balanced` |
 | `cascade.max_generation` | integer or `"unlimited"` | No | Max cascade generation admitted at Phase 1 resolve time. Default: 1 |
 | `cascade.token_budget` | integer or `"unlimited"` | No | Per-batch token ceiling for Step 4C cascade dispatch. Default: 900000 (deprecated alias: `pipeline.token_budget_per_batch`) |
 | `cascade.defer_on_batch_gated` | boolean | No | Suppress cascade dispatch when the original batch is fully human-gated. Default: `true` |
 | `cascade.keyword_heuristic` | boolean | No | Defer P3-and-below comment/typo-titled findings. Default: `true` |
 | `cascade.p3_same_file_defer` | boolean | No | Defer P3 findings sharing a file with the active batch. Default: `true` |
+| `cascade.max_amplification` | positive number or `"off"` | No | Opt-in ceiling for same-lineage refinement dispatch. Default: `"off"` |
+| `cascade.convergence_window` | positive integer | No | Consecutive ratio observations at or above 1.0 before warning. Default: 3 |
 
 **Hard invariant — not configurable**: safety exclusions (findings whose `## Problem` section indicates security/billing/anti-bot/auth concerns) are never batched and never auto-admitted by any `cascade.policy`, including `all`. That exclusion is enforced upstream of this section (the P3 batching eligibility check) and has no corresponding key here by design.
 

@@ -1167,7 +1167,7 @@ scripts/worktree-lifecycle.sh cleanup <issue-number>
 
 **Concurrency cap** (`forge.yaml → orchestration.max_concurrent`): <!-- Updated: forge#1912 -->
 - Default: **12** — the dispatch loop holds at most 12 in-flight workers unless overridden. This is an enforced default, not opt-in: earlier revisions defaulted to uncapped, which let a large ready set (e.g. 40+ issues) dispatch in one burst and saturate the Anthropic API rate limit.
-- When `max_concurrent: N` is set, the dispatch loop holds at most N in-flight workers instead of the default 12. Newly ready issues queue and start as running workers complete.
+- When `max_concurrent: N` is set, the dispatch loop holds at most N in-flight workers instead of the default 12. Newly ready issues queue and start as running workers complete. It is a top-level worker cap only: each worker normally consumes roughly **8 total subagent spawns** across `/work-on`, build, quality-gate, and review. Set `N <= session_subagent_budget / 8`; for a 200-spawn session budget, use 25 or fewer.
 - Prevents wave-triggered rate-limit storms on large batches (e.g., 40-issue milestone dispatches).
 - See `phase-4-execution.md` Step 4A-pre.0.2 for the concrete initialization and headroom-gated dispatch logic that enforces this cap on both the engine-first and Agent-spawn-fallback dispatch paths.
 
@@ -1189,6 +1189,7 @@ fi
 - `FORGE_RATE_LIMIT_FLOOR` defaults to 200 remaining requests. Override in `forge.yaml → orchestration.rate_limit_floor`.
 - Already-in-flight workers are **never interrupted** by the backpressure gate — only new dispatches pause.
 - The gate is re-checked after each worker completion, not on a timer, so dispatch resumes immediately once the floor is cleared.
+- This core-quota check cannot detect GitHub secondary content-creation throttles. A `403` response containing `secondary rate limit` is a separate first-class signal: stop new dispatch, retain the queues, and require an operator resume rather than retrying or polling. In-flight workers must stop their GitHub write/create retry loops and report the error (see Phase 4 Step 4A-pre.0.3).
 
 **Configuration reference** (`forge.yaml`):
 ```yaml
