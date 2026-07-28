@@ -476,8 +476,8 @@ ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"fix(batch): P3 review 
 **Consume `/issue`'s explicit result contract** (see `commands/issue.md` Phases 2D and 4C). A dedup STOP is an expected, named outcome; any output without either result marker is a hard create failure:
 
 ```bash
-BATCH_ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
-DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+BATCH_ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
 
 if [ -n "$DEDUP_NUMBER" ]; then
   echo "Batch dedup STOP: existing non-member issue #${DEDUP_NUMBER}; members remain on the standard individual pipeline."

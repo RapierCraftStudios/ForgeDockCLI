@@ -356,7 +356,7 @@ if [ "$DEDUP_EXIT" -eq 1 ]; then
   echo "Existing issue found — do NOT create a new one."
   DEDUP_NUMBER=$(printf '%s\n' "$DEDUP_RESULT" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
   [ -n "$DEDUP_NUMBER" ] || { echo "ERROR: dedup STOP returned no issue number." >&2; exit 2; }
-  echo "FORGE:ISSUE_CREATE:DEDUP number=${DEDUP_NUMBER}"
+  echo "ISSUE_CREATE_RESULT:DEDUP number=${DEDUP_NUMBER}"
   exit 1  # STOP here and report the explicit dedup result to the caller
 elif [ "$DEDUP_EXIT" -eq 2 ]; then
   echo "Dedup check usage error: $DEDUP_RESULT"
@@ -708,7 +708,7 @@ ISSUE_URL=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json url --jq '.url')
 LABELS=$(gh issue view {NEW_NUMBER} {GH_FLAG} --json labels --jq '[.labels[].name] | join(", ")')
 echo "Created: ${ISSUE_URL}"
 echo "Labels: ${LABELS}"
-echo "FORGE:ISSUE_CREATE:CREATED number=${NEW_NUMBER} url=${ISSUE_URL}"
+echo "ISSUE_CREATE_RESULT:CREATED number=${NEW_NUMBER} url=${ISSUE_URL}"
 ```
 
 ### Content-Creation Rule

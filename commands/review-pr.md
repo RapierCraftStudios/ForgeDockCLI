@@ -1850,8 +1850,8 @@ rm -f "$FINDING_ISSUE_BODY_FILE"
 # /issue succeeds only after its API create-token read-back (Phase 4B). Its
 # explicit result marker distinguishes a verified create from an intentional
 # dedup STOP; never use title search to mask a swallowed 403.
-ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
-DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
 if [ -n "$DEDUP_NUMBER" ]; then
   ISSUE_NUM="$DEDUP_NUMBER"
   echo "Review finding deduped against existing issue #${ISSUE_NUM}."
