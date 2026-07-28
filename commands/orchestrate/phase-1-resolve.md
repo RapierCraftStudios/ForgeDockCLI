@@ -363,6 +363,7 @@ The `<!-- FORGE:BATCHABLE -->` marker (still appended by `review-pr.md` at findi
 **Safety exclusions — NEVER batch, at any priority** (override all trigger conditions):
 - Issue body contains the word "security", "billing", "anti-bot", or "auth" anywhere in the title or `## Problem` section
 - Issue has a `security`, `billing`, `anti-bot`, or `auth` label
+- Issue has a `needs-human`, `blocked`, or `operator-only` label, or explicitly states `operator-only`, `manual action required`, or `human action required` in its title or `## Problem` section
 
 These exclusions apply regardless of priority: P1/P2 findings are already never batched (see Important limits), and P3 findings in these domains are excluded even though they would otherwise qualify for default-batchable treatment. <!-- Added: forge#1818 -->
 
@@ -384,7 +385,7 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
   --limit 500 \
   --json number,title,body,labels \
   --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
-         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i")) | not)
+         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i")) | not)
          # Strip the review-finding template's attribution boilerplate
          # (**Confidence**/**Severity**/**Review comment** — see forge#2477
          # note below for why **Source**/**Agent** are deliberately excluded
@@ -410,8 +411,8 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
          # is not auto-batched) for closing a real bypass — the safe direction
          # for a security-relevant exclusion. <!-- forge#2477 -->
          | (.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) as $stripped_body
-         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i") | not)
-         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth")) | not)')
+         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i") | not)
+         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth" or . == "needs-human" or . == "blocked" or . == "operator-only")) | not)')
 
 # Surface area = the exact affected file path listed first under "## Affected Files" (primary grouping key).
 # Leaf directory = dirname of that file (broader fallback grouping key, formerly called "domain").
@@ -496,6 +497,7 @@ fi
 - Max **8** members per batch issue — if more than 8 batchable P3s exist in a surface-area cluster, create multiple batch issues of ≤ 8 each <!-- Changed: forge#1818 — was 10 -->
 - P1 and P2 issues are NEVER batched — they keep the standard one-issue-one-PR path
 - Security/billing/anti-bot/auth findings are NEVER batched at any priority (see Safety exclusions above) <!-- Added: forge#1818 -->
+- Human-gated findings are NEVER batched: `needs-human`, `blocked`, `operator-only`, and explicit operator-action requests remain independently tracked
 - Batch issues themselves are never nested inside other batch issues
 
 If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a leaf directory, AND none exceed 72h, skip batch creation entirely — individual P3s run through the standard pipeline.
@@ -518,4 +520,3 @@ If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a lea
 **Why**: Surface-level similarity hides critical differences. #3842 (api_key.id lazy load) and #4039 (user.id lazy load) had identical error messages but targeted completely different ORM objects. Closing #4039 as a "duplicate" would have left a customer-impacting P0 bug unfixed.
 
 ---
-

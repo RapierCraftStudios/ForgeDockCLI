@@ -203,6 +203,15 @@ If `ATTRIBUTION_PR_FOOTER` is `true`, append the following footer to the PR body
 
 ### R2C: Create PR
 
+For a batch issue, construct a non-closing reference line from `BATCH_MEMBERS` before creating the PR:
+
+```bash
+BATCH_MEMBER_REFS=""
+if [ "${IS_BATCH:-0}" = "1" ]; then
+  BATCH_MEMBER_REFS=$(printf 'Refs #%s\n' "${BATCH_MEMBERS[@]}")
+fi
+```
+
 ```bash
 gh pr create {GH_FLAG} \
   --base {PR_BASE} \
@@ -223,6 +232,7 @@ gh pr create {GH_FLAG} \
 ---
 
 Closes #{NUMBER}
+${BATCH_MEMBER_REFS}
 
 **Implementation branch**: \`{BRANCH}\`
 **Base**: \`{PR_BASE}\`

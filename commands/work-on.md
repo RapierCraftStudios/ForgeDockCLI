@@ -358,9 +358,21 @@ fi
 
 **Batch issue pipeline rules** (when `IS_BATCH=true`):
 - Build phases execute exactly as normal (the batch issue body IS the spec for what to fix)
-- After successful merge, auto-close all member issues with a cross-reference:
+- Batch members are referenced in the PR body with `Refs #N`, never `Closes #N`; the batch issue is the only issue the PR may close.
+- After successful merge, re-read every member's live state and labels before closing it. A member that is `needs-human`, `blocked`, or `operator-only` remains open and is reported as a split outcome:
   ```bash
   for MEMBER in "${BATCH_MEMBERS[@]}"; do
+    MEMBER_SNAPSHOT=$(gh issue view "$MEMBER" {GH_FLAG} --json state,labels \
+      --jq '{state: .state, labels: [.labels[].name]}' 2>/dev/null) || {
+      echo "WARNING: could not verify batch member #${MEMBER}; leaving it open"
+      continue
+    }
+    MEMBER_GATED=$(echo "$MEMBER_SNAPSHOT" | jq -r \
+      '(.state != "OPEN") or ([.labels[] | select(. == "needs-human" or . == "blocked" or . == "operator-only")] | length > 0)')
+    if [ "$MEMBER_GATED" = "true" ]; then
+      gh issue comment "$MEMBER" {GH_FLAG} --body "Code shipped in batch PR #{PR_NUMBER}, but this issue remains open because it requires a human or operator action."
+      continue
+    fi
     gh issue close "$MEMBER" {GH_FLAG} \
       --comment "Resolved as part of batch PR #{PR_NUMBER} (#{ISSUE_NUMBER}). See batch issue for details."
     gh issue edit "$MEMBER" {GH_FLAG} --add-label "workflow:merged" 2>/dev/null || true
