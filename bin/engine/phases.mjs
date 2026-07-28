@@ -117,6 +117,23 @@ async function commitsAhead(lane, branch, io) {
 function has(blob, marker) { return blob.includes(marker); }
 
 /**
+ * The interactive workflow persists its conservative complexity decision in a
+ * FORGE:FAST_PATH comment. The engine must consume that decision too; otherwise
+ * its separate context/architect phases negate the documented trivial path.
+ * Only an exact TRIVIAL value is eligible to skip work, so malformed or absent
+ * annotations continue through the full pipeline.
+ */
+function complexityBand(comments) {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i];
+    if (!body?.includes("FORGE:FAST_PATH")) continue;
+    const match = body.match(/\*\*COMPLEXITY_BAND\*\*:\s*([A-Z_]+)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
  * Fetch the issue's live `state` (OPEN/CLOSED) and `labels` in one call.
  *
  * This is the single data source for two consumers (forge#2352):
@@ -254,10 +271,13 @@ export const PHASES = [
     command: "work-on/build/context",
     entryCondition: (s) => s.committed.includes("investigate"),
     async reconcile(state, io) {
+      const markers = await issueMarkers(state.issue, io);
+      if (complexityBand(markers.comments) === "TRIVIAL") {
+        return { satisfied: true, outputs: { skipped: "trivial-complexity-band", phase: "context" } };
+      }
       // Idempotent resume: FORGE:CONTEXT:COMPLETE present → skip the LLM re-run.
       // Bare FORGE:CONTEXT matches a partial/interrupted annotation — require :COMPLETE.
-      const { blob } = await issueMarkers(state.issue, io);
-      return has(blob, PHASE_MARKERS.context.completionMarker) ? { satisfied: true } : { satisfied: false };
+      return has(markers.blob, PHASE_MARKERS.context.completionMarker) ? { satisfied: true } : { satisfied: false };
     },
     async detectOutcome(state, io) {
       const { blob } = await issueMarkers(state.issue, io);
@@ -271,10 +291,13 @@ export const PHASES = [
     command: "work-on/build/architect",
     entryCondition: (s) => s.committed.includes("context"),
     async reconcile(state, io) {
+      const markers = await issueMarkers(state.issue, io);
+      if (complexityBand(markers.comments) === "TRIVIAL") {
+        return { satisfied: true, outputs: { skipped: "trivial-complexity-band", phase: "architect" } };
+      }
       // Idempotent resume: FORGE:ARCHITECT:COMPLETE present → skip the LLM re-run.
       // Bare FORGE:ARCHITECT matches a partial/interrupted annotation — require :COMPLETE.
-      const { blob } = await issueMarkers(state.issue, io);
-      return has(blob, PHASE_MARKERS.architect.completionMarker) ? { satisfied: true } : { satisfied: false };
+      return has(markers.blob, PHASE_MARKERS.architect.completionMarker) ? { satisfied: true } : { satisfied: false };
     },
     async detectOutcome(state, io) {
       const { blob } = await issueMarkers(state.issue, io);
