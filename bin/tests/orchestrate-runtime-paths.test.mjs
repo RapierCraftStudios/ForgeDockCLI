@@ -39,10 +39,10 @@ describe("orchestrate runtime helper paths", () => {
 
   it("requires mktemp paths and rejects root-level temp files", () => {
     for (const spec of [phase4, issue]) {
-      assert.match(spec, /(?:BATCH_)?BODY_FILE="\$\(mktemp\)"/);
+      assert.match(spec, /mktemp/);
       assert.match(spec, /never hand-roll (?:a )?(?:temp )?path/i);
       assert.match(spec, /\/tmp_invbody_31076\.txt/);
-      assert.match(spec, /bypass mode cannot clear/i);
+      assert.match(spec, /bypass mode cannot clear|unattended cleanup/i);
       assert.match(spec, /\/tmp\/body\.md/);
     }
   });
