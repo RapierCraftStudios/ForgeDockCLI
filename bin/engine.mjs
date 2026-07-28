@@ -331,7 +331,9 @@ export async function runIssue(opts) {
         // the same reason composes with that existing contract instead of
         // conflating "paused pending a human" with "dead". Deliberately does
         // NOT check `workflow:invalid`/CLOSED here — those are handled above.
-        if (snap.labels.includes("needs-human")) {
+        // A blocked review is deliberately handed to remediation in this same
+        // run. All other needs-human states remain paused for human action.
+        if (snap.labels.includes("needs-human") && phase.id !== "remediate") {
           const detail = `issue ${issue} carries needs-human — pausing before phase ${phase.id}`;
           return await terminate(state, "needs-human", detail);
         }
@@ -520,21 +522,24 @@ export async function runIssue(opts) {
       }
     }
 
+    const isRemediationHandoff = outcome.status === "blocked" &&
+      phase.id === "review" && (outcome.reason || "needs-human") === "needs-human";
     if (outcome.status === "blocked") {
       emitProgress({ event: "phase_exit", phase: phase.id, status: "blocked", detail: outcome.detail });
-      return await terminate(state, outcome.reason || "needs-human", outcome.detail);
+      if (!isRemediationHandoff)
+        return await terminate(state, outcome.reason || "needs-human", outcome.detail);
+    } else {
+      // committed
+      // forge#2321: only report a phase_exit if a matching phase_enter was
+      // actually emitted for this phase this iteration. A reconcile-satisfied
+      // phase (short-circuited above without ever entering the `else` branch)
+      // never "started" this run — emitting phase_exit for it produced a
+      // dangling exit with no preceding enter (bin/engine-cli.mjs prints
+      // "✓ phase X committed" with no prior "→ phase X started" line).
+      // Suppressing the unmatched exit is correct here rather than fabricating
+      // a synthetic phase_enter, since the phase's runner genuinely never ran.
+      if (phaseEntered) emitProgress({ event: "phase_exit", phase: phase.id, status: "committed" });
     }
-
-    // committed
-    // forge#2321: only report a phase_exit if a matching phase_enter was
-    // actually emitted for this phase this iteration. A reconcile-satisfied
-    // phase (short-circuited above without ever entering the `else` branch)
-    // never "started" this run — emitting phase_exit for it produced a
-    // dangling exit with no preceding enter (bin/engine-cli.mjs prints
-    // "✓ phase X committed" with no prior "→ phase X started" line).
-    // Suppressing the unmatched exit is correct here rather than fabricating
-    // a synthetic phase_enter, since the phase's runner genuinely never ran.
-    if (phaseEntered) emitProgress({ event: "phase_exit", phase: phase.id, status: "committed" });
     // forge#2377: `outcome.usage` is populated by runPhaseWithRetry() below
     // from the injected runner()'s (== bin/runner.mjs's runCommand()) return
     // value — null when the backend doesn't report usage (CLI backend today)
@@ -544,7 +549,10 @@ export async function runIssue(opts) {
     // owned by phase.detectOutcome() (bin/engine/phases.mjs).
     appendEvent(dir, issue, { event: "PHASE_COMMIT", phase: phase.id, outputs: outcome.outputs || {}, usage: outcome.usage ?? null });
     state = deriveState(readLog(dir, issue));
-    if (outcome.terminalReason) state.terminalReason = outcome.terminalReason;
+    const terminalReason = outcome.status === "blocked"
+      ? (outcome.reason || "needs-human")
+      : outcome.terminalReason;
+    if (terminalReason) state.terminalReason = terminalReason;
     await projector.writeState(issue, { ...state, lease: { by: agentId, until: now() + leaseTtlMs } });
 
     // forge#2379: the "investigate" phase reporting terminalReason "decomposed"
@@ -564,9 +572,10 @@ export async function runIssue(opts) {
     // is seen), phase.id is "decompose" — not "investigate" — so this
     // exemption does not apply and the normal terminate() path below fires,
     // ending the run for real.
-    const isDecomposeHandoff = phase.id === "investigate" && outcome.terminalReason === "decomposed";
-    if (outcome.terminalReason && TERMINAL_REASONS.includes(outcome.terminalReason) && !isDecomposeHandoff)
-      return await terminate(state, outcome.terminalReason);
+    const isDecomposeHandoff = phase.id === "investigate" && terminalReason === "decomposed";
+    if (terminalReason && TERMINAL_REASONS.includes(terminalReason) &&
+        !isDecomposeHandoff && !isRemediationHandoff)
+      return await terminate(state, terminalReason, outcome.detail);
     if (phase.isTerminalAfter && phase.isTerminalAfter(state))
       return await terminate(state, state.terminalReason || "merged");
   }

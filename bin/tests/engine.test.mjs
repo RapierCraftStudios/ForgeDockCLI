@@ -209,26 +209,28 @@ describe("runIssue", () => {
     assert.deepEqual(architectEvents, ["phase_enter", "phase_exit"]);
   });
 
-  it("stops at needs-human when a phase reports blocked (no silent merge)", async () => {
+  it("forge#2889: commits a blocked review and hands it to remediation in the same run", async () => {
     const { w, io } = fakeWorld();
     const script = {
       "work-on/investigate": () => { w.markers += " INVESTIGATION:COMPLETE"; },
       "work-on/build/context": () => { w.markers += " FORGE:CONTEXT:COMPLETE"; },
       "work-on/build/architect": () => { w.markers += " FORGE:ARCHITECT:COMPLETE"; },
       "work-on/build": () => { w.markers += " FORGE:BUILDER:COMPLETE **Branch**: `fix/real-branch-42`"; w.commitsAhead = 1; },
-      "work-on/review": () => { w.pr = 7; w.prNeedsHuman = true; },
+      "work-on/review": () => { w.pr = 7; w.prNeedsHuman = true; w.labels.push("needs-human"); },
+      "work-on/remediate": () => { w.markers += " FORGE:REMEDIATION:COMPLETE **Re-gate outcome**: HELD-AWAITING-MERGE"; },
     };
     const runner = async ({ commandName }) => { script[commandName]?.(); return { status: "complete" }; };
     const events = [];
     const res = await runIssue({ issue: 42, dir, agentId: "a1", lane: "staging",
       io, runner, now: () => 1000, maxAttempts: 1, onProgress: (e) => events.push(e) });
-    assert.equal(res.terminalReason, "needs-human");
+    assert.equal(res.terminalReason, "awaiting-merge");
     assert.ok(w.labels.includes("needs-human"));
     // forge#2240: the phase that ultimately blocks must report a phase_exit
     // with status "blocked" — not silently omitted.
-    const lastExit = events.filter((e) => e.event === "phase_exit").at(-1);
-    assert.equal(lastExit.phase, "review");
-    assert.equal(lastExit.status, "blocked");
+    const reviewExit = events.find((e) => e.event === "phase_exit" && e.phase === "review");
+    assert.equal(reviewExit.status, "blocked");
+    assert.deepEqual(deriveState(readLog(dir, 42)).committed,
+      ["investigate", "context", "architect", "build", "review", "remediate"]);
   });
 
   it("C1: commitsAhead swallows a git rejection on first build (no ref yet) and still drives build to merged", async () => {
@@ -431,11 +433,7 @@ describe("runIssue", () => {
     assert.equal(buildFailures.length, 3, "all 3 attempts must be logged — unresolved branch keeps retrying");
   });
 
-  it("forge#2176 (AC4): a phase that does not opt into retryable:false still retries to maxAttempts (transient failures unaffected)", async () => {
-    // Guard against over-generalizing the retryable mechanism: the review
-    // phase's "PR open, not merged" detail can legitimately repeat identically
-    // across attempts while a merge is still in flight — it must keep retrying
-    // exactly as before, since its detectOutcome never sets retryable: false.
+  it("forge#2889: an open PR without a blocking finding does not consume the full retry budget", async () => {
     const { w, io } = fakeWorld();
     let reviewRunnerCalls = 0;
     const script = {
@@ -443,9 +441,7 @@ describe("runIssue", () => {
       "work-on/build/context": () => { w.markers += " FORGE:CONTEXT:COMPLETE"; },
       "work-on/build/architect": () => { w.markers += " FORGE:ARCHITECT:COMPLETE"; },
       "work-on/build": () => { w.markers += " FORGE:BUILDER:COMPLETE **Branch**: `fix/real-branch-42`"; w.commitsAhead = 2; },
-      // PR exists but never merges — "PR open, not merged" repeats identically
-      // on every attempt, exactly like the pre-#2176 build-phase symptom, but
-      // this phase has NOT opted into retryable:false so it must keep retrying.
+      // An unchanged open PR cannot become merged by repeating review.
       "work-on/review": () => { reviewRunnerCalls++; w.pr = 7; w.prMerged = false; },
     };
     const runner = async ({ commandName }) => { script[commandName]?.(); return { status: "complete" }; };
@@ -453,12 +449,12 @@ describe("runIssue", () => {
     const res = await runIssue({ issue: 42, dir, agentId: "a1", lane: "staging",
       io, runner, now: () => 1000, maxAttempts: 3 });
 
-    assert.equal(res.terminalReason, "needs-human", "unmerged PR after exhausting attempts still escalates");
-    assert.equal(reviewRunnerCalls, 3,
-      "the review runner must be invoked for all 3 attempts — no retryable:false signal means unchanged behavior");
+    assert.equal(res.terminalReason, "needs-human", "an unmerged PR still escalates");
+    assert.equal(reviewRunnerCalls, 1,
+      "the review runner must stop after the first unchanged open-PR result");
     const events = readLog(dir, 42);
     const reviewFailures = events.filter((e) => e.event === "PHASE_FAILED" && e.phase === "review");
-    assert.equal(reviewFailures.length, 3, "all 3 attempts must be logged — transient retry behavior unchanged");
+    assert.equal(reviewFailures.length, 1, "the fixed-point failure must be logged once");
   });
 
   it("forge#2259/#2261: CLI_BACKEND_FAILED thrown by the runner fails fast on attempt 1, not retried to maxAttempts", async () => {
@@ -594,14 +590,10 @@ describe("runIssue", () => {
     assert.equal(architectFailures.length, 3, "all 3 attempts must be logged for a genuinely retryable error");
   });
 
-  it("forge#2261: a genuine content-level block (detectOutcome reached, phase just isn't done) still escalates to needs-human, not engine-error", async () => {
+  it("forge#2889: a fixed-point review failure still escalates to needs-human, not engine-error", async () => {
     // Guards the "mixed" case: the runner succeeds (the tool works) on every
-    // attempt, but the review phase's own detectOutcome() keeps reporting
-    // "PR open, not merged" — a real content-level state, not a tool crash.
-    // This must stay needs-human even though retries are exhausted, exactly
-    // like the pre-existing "forge#2176 (AC4)" test above — this test
-    // exists to explicitly pin the reason value now that engine-error exists
-    // as an alternative outcome.
+    // attempt, but the review phase's own detectOutcome() reports an open PR.
+    // This fixed point must stay needs-human, not engine-error.
     const { w, io } = fakeWorld();
     let reviewRunnerCalls = 0;
     const script = {
@@ -620,7 +612,7 @@ describe("runIssue", () => {
       "a genuine content-level block (unmerged PR) must stay needs-human, not engine-error");
     assert.ok(w.labels.includes("needs-human"));
     assert.ok(!w.labels.includes("workflow:engine-error"));
-    assert.equal(reviewRunnerCalls, 3);
+    assert.equal(reviewRunnerCalls, 1);
   });
 
   it("forge#2338 (review finding): a slow in-flight lease-renewal write must not resurrect the lease after terminate()'s lease:null write on the engine-error catch path", async () => {
