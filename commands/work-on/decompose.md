@@ -97,12 +97,44 @@ From the Decomposition Assessment in the investigation report, extract:
 3. Brief description for each sub-issue body
 
 For each sub-issue, prepare:
-- **Title**: from investigation report's proposed sub-issue title
+- **Title**: from investigation report's proposed sub-issue title, including the final `{fix|feat|refactor}: ` prefix used in Phase D3
 - **Body**: brief description of scope + `**Parent**: #{NUMBER}` + dependency note if applicable
 - **Labels**: inherit priority label (P0/P1/P2) from parent; do NOT copy workflow labels
 - **Milestone**: same milestone title as parent (if parent has one)
 
 **Ordering rule**: Create independent sub-issues first. If sub-issue B depends on A, create A first so its issue number can be referenced in B's body.
+
+---
+
+## Phase D2.5: Equivalent Set Check
+
+Before creating any sub-issue, check whether the complete planned title set already exists for this parent. This covers an interrupted earlier decomposition: its child issues may exist even though it never reached the `FORGE:DECOMPOSED` comment checked in D1.
+
+```bash
+# SUB_TITLES contains the final, ordered titles prepared in D2.
+EXPECTED_TITLES=$(printf '%s\n' "${SUB_TITLES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')
+PARENT_SUB_ISSUES=$(gh issue list {GH_FLAG} --state all \
+  --search "\"**Parent**: #{NUMBER}\" in:body" --limit 100 --json number,title,body)
+
+# Keep the earliest child for each title as canonical. This also collapses a
+# previously duplicated set without creating a third copy.
+CANONICAL_SUB_ISSUES=$(jq --arg parent "**Parent**: #{NUMBER}" --argjson expected "$EXPECTED_TITLES" '
+  ([.[] | select(.body | contains($parent)) | {number, title}]
+    | sort_by(.number) | group_by(.title) | map(.[0])) as $canonical
+  | ($canonical | map(.title) | sort) as $actual
+  | if $actual == $expected then $canonical else empty end
+' <<< "$PARENT_SUB_ISSUES")
+```
+
+If `CANONICAL_SUB_ISSUES` is non-empty, the decomposition has already created an equivalent set. Do **not** create issues, edit the parent body, or post another decomposition comment. Preserve those original sub-issues and EXIT with:
+
+```
+DECOMPOSE_RESULT:
+  status: ALREADY_DONE
+  sub_issues: {CANONICAL_SUB_ISSUES}
+```
+
+If no exact title-set match exists, continue. A partial set is not equivalent: let `/issue` dedup protect its existing children while creating only the missing work.
 
 ---
 
