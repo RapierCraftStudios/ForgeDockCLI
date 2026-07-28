@@ -474,6 +474,13 @@ for NUM in "${ISSUES[@]}"; do
   fi
 done
 
+# Full-repository intake is intentionally separate from Step 4C's T0-scoped
+# review-finding cascade. It is enabled only for an operator-authorised
+# policy: all run; records every open issue already observed so CI-created
+# actionable work is admitted once rather than rediscovered every cycle.
+declare -A SEEN_OPEN_ISSUES
+FULL_REPO_SWEEP_COUNT=0
+
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
 # dispatch loop below (Step 4B) whenever a Layer 1/2/3 structural predecessor edge (see
 # EDGE_KIND/EDGE_FILES from phase-3-dependency.md Step 3C) resolves; consumed by Step 4A's
@@ -2105,6 +2112,56 @@ that mode only exists as the explicit, one-shot `--include-backlog` opt-in at Ph
 (a human directly asking for it); Step 4C runs autonomously on every completion cycle and must
 never silently widen to the full backlog regardless of any flag, since nothing here is a
 human-in-the-loop request. <!-- Added: forge#2628 -->
+
+### Step 4C.0: Full-repository actionable-issue intake (`policy: all` only)
+
+An operator-authorised `orchestration.cascade.policy: all` run must also check for newly-created
+open issues that its own agents did not report and that lack `review-finding`. Run this sweep
+after every five terminal completions, before the next dispatch cycle. It is not a cascade
+replacement: Step 4C's `BATCH_T0` filter still governs review-finding recursion.
+
+At batch start, seed `SEEN_OPEN_ISSUES` with the initial resolved issue set. On each sweep, list
+the complete open set (`gh issue list --state open --limit 500 --json number,title,labels`), diff
+it against `SEEN_OPEN_ISSUES`, then mark every returned number seen whether or not it is admitted.
+For each newly-seen issue, add it to the normal Phase 3 DAG intake only when it has no terminal or
+in-progress workflow label, `needs-human`, or `workflow:decomposed`; preserve its labels and
+record why every excluded issue was skipped. Do not filter on `review-finding`, author, creation
+time, or agent trajectory. This is how CI-created issues enter an all-policy run without silently
+adopting pre-existing work in other policies.
+
+```bash
+if [ "$CASCADE_POLICY_NAME" = "all" ] && [ "$((TERMINAL_COMPLETIONS % 5))" -eq 0 ] && \
+   [ "$TERMINAL_COMPLETIONS" -gt "$FULL_REPO_SWEEP_COUNT" ]; then
+  FULL_REPO_SWEEP_COUNT=$TERMINAL_COMPLETIONS
+  FULL_REPO_OPEN=$(gh issue list -R {GH_REPO} --state open --limit 500 --json number,title,labels)
+  while IFS= read -r ISSUE; do
+    NUM=$(echo "$ISSUE" | jq -r '.number')
+    [ -n "${SEEN_OPEN_ISSUES[$NUM]:-}" ] && continue
+    SEEN_OPEN_ISSUES[$NUM]=1
+    LABELS=$(echo "$ISSUE" | jq -r '[.labels[].name] | join(",")')
+    if echo "$LABELS" | grep -qE '(^|,)(workflow:(merged|invalid|awaiting-merge|building|in-review|decomposed)|needs-human)(,|$)'; then
+      echo "Full-repo intake: #${NUM} seen but not admitted (terminal, in-progress, or human-gated)"
+      continue
+    fi
+    FULL_REPO_INTAKE+=("$NUM")
+    echo "Full-repo intake: admitted newly-seen actionable issue #${NUM}"
+  done < <(echo "$FULL_REPO_OPEN" | jq -c '.[]')
+  # Feed FULL_REPO_INTAKE through the existing Phase 3 extraction/DAG/claims gates.
+fi
+```
+
+### Step 4C.1: Mechanical automated-alert deduplication (`policy: all` opt-in)
+
+`orchestration.cascade.dedup_automated: true` permits a narrow exception to the normal
+no-dedup rule for newly-seen automated alerts. Select one lowest-numbered canonical issue and
+close another issue only when all of these are true: both authors are bot/app accounts; normalized
+titles are identical; the generator identity is identical; the triggering condition is identical;
+and the closing comment links the retained canonical issue. Never apply title similarity to a
+human-authored report, or when generator/trigger provenance is absent or differs. The reference
+predicate is `canDeduplicateAutomatedAlert()` in `bin/engine/admission.mjs`.
+
+This opt-in handles mechanically identical alerts, not substantive bug adjudication. All other
+possible duplicates remain separate and go through investigation.
 
 ```bash
 # Method 1: Read TRAJECTORY comments from completed issues for "Finding issues" row

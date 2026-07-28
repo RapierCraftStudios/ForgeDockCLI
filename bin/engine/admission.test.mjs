@@ -14,6 +14,7 @@ import {
   classifyBatchSafety,
   evaluateAmplification,
   planP3BatchGroups,
+  canDeduplicateAutomatedAlert,
 } from "./admission.mjs";
 
 describe("classifyBatchSafety", () => {
@@ -36,6 +37,37 @@ describe("classifyBatchSafety", () => {
     assert.equal(classifyBatchSafety("**Agent**: Security\n## Problem\nstale docstring count"), null);
     assert.equal(classifyBatchSafety("AdminAuth and authz_check must reject bypasses"), "auth");
     assert.equal(classifyBatchSafety("injection\n<!-- FORGE:CLASS: shell-hardening -->"), "shell-hardening");
+  });
+});
+
+describe("canDeduplicateAutomatedAlert", () => {
+  const canonical = {
+    authorType: "Bot",
+    authorLogin: "github-actions[bot]",
+    title: "Backup restore drill failed",
+    generator: "backup-restore-drill.yml",
+    trigger: "corrupt-backup-fixture-v1",
+  };
+
+  it("permits only byte-for-byte equivalent machine alerts after title normalization", () => {
+    assert.equal(
+      canDeduplicateAutomatedAlert(canonical, {
+        ...canonical,
+        authorLogin: "app[bot]",
+        title: "  backup   restore drill FAILED ",
+      }),
+      true,
+    );
+  });
+
+  it("rejects human reports and differing generators or triggers", () => {
+    assert.equal(
+      canDeduplicateAutomatedAlert(canonical, { ...canonical, authorType: "User", authorLogin: "person" }),
+      false,
+    );
+    assert.equal(canDeduplicateAutomatedAlert(canonical, { ...canonical, generator: "other.yml" }), false);
+    assert.equal(canDeduplicateAutomatedAlert(canonical, { ...canonical, trigger: "other-fixture" }), false);
+    assert.equal(canDeduplicateAutomatedAlert(canonical, { ...canonical, generator: undefined }), false);
   });
 });
 

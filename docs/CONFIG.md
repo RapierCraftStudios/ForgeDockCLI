@@ -301,7 +301,10 @@ orchestration:
   # Maximum number of top-level /work-on agents dispatched concurrently. Each
   # worker normally fans out to about 8 total subagent spawns (build, quality
   # gate, and review included), so set this to no more than session_budget / 8.
-  # Default: 12; use 25 or fewer for a 200-spawn session budget.
+  # Default: 12; use 25 or fewer for a 200-spawn session budget. This limits
+  # in-flight workers only: under cascade.policy: all, raising it increases
+  # both completion and finding-spawn throughput and does not itself bound or
+  # shrink cascade queue growth.
   max_concurrent: 12
 
   cascade:
@@ -325,10 +328,11 @@ orchestration:
     # spawned from a review-finding. Accepts a positive integer or the literal
     # string "unlimited". Governs Phase 1 resolve-time admission only (the
     # `cascade`/`review-findings`/`findings` resolution in phase-1-resolve.md)
-    # — it does NOT relax Step 4C's absolute autonomous-cascade defer, which
-    # stays hardcoded regardless of this value (see phase-4-execution.md Step
-    # 4C rule 1). This is what makes "admit gen-2, stop at gen-3" expressible,
-    # which the pre-#2234 --allow-gen2 flag (all-or-nothing) could not say.
+    # — it does NOT individually dispatch deferred generation-2+ findings in
+    # Step 4C. Bounded P3 batching is the sole automated exception: it may
+    # aggregate a finite generation-2 member set under batch_max_generation,
+    # as implemented by #2849. This is what makes "admit gen-2, stop at gen-3"
+    # expressible, which the pre-#2234 --allow-gen2 flag could not say.
     # Default: 1 (from the "balanced" preset); "unlimited" under "all".
     max_generation: 1
 
@@ -340,6 +344,10 @@ orchestration:
     # finite, even under policy: all. Default: 2.
     batch_max_generation: 2
 
+    # Permit closure only of mechanically identical bot/app alerts: same
+    # normalized title, generator, and trigger condition, while retaining one
+    # canonical issue. Human reports are never included. Default: false.
+    dedup_automated: false
     # Per-batch token ceiling for Step 4C's review-finding cascade dispatch.
     # New home for the same lever previously read only as
     # `pipeline.token_budget_per_batch` (kept working as a deprecated alias —
@@ -375,10 +383,11 @@ orchestration:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `max_concurrent` | integer | No | Max concurrent top-level `/work-on` dispatches. Plan for roughly 8 total subagent spawns per worker; default: 12. |
+| `max_concurrent` | integer | No | Max concurrent top-level `/work-on` dispatches. It does not bound cascade growth; under `policy: all` it raises drain and spawn throughput together. Default: 12. |
 | `cascade.policy` | string | No | `all` \| `balanced` \| `conservative`. Default: `balanced` |
 | `cascade.max_generation` | integer or `"unlimited"` | No | Max cascade generation admitted at Phase 1 resolve time. Default: 1 |
 | `cascade.batch_max_generation` | integer | No | Finite maximum member generation that an automated P3 batch may aggregate. Default: 2 |
+| `cascade.dedup_automated` | boolean | No | Allow only mechanically identical bot/app alerts to be closed with a retained canonical issue. Default: `false` |
 | `cascade.token_budget` | integer or `"unlimited"` | No | Per-batch token ceiling for Step 4C cascade dispatch. Default: 900000 (deprecated alias: `pipeline.token_budget_per_batch`) |
 | `cascade.defer_on_batch_gated` | boolean | No | Suppress cascade dispatch when the original batch is fully human-gated. Default: `true` |
 | `cascade.keyword_heuristic` | boolean | No | Defer P3-and-below comment/typo-titled findings. Default: `true` |
