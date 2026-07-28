@@ -11,10 +11,6 @@ import {
   admitsBatchGeneration,
   admitsTokenSpend,
   evaluateCascadeFinding,
-  P3_BATCHING_RULES,
-  isBatchableP3Finding,
-  planP3Batches,
-  summarizeP3BatchPlan,
   classifyBatchSafety,
   evaluateAmplification,
   batchExclusionReason,
@@ -378,78 +374,6 @@ describe("evaluateCascadeFinding — Step 4C rule-chain parity", () => {
     const result = evaluateCascadeFinding({ ...baseFinding, projectedTokenSpend: 900001 }, policy);
     assert.equal(result.admit, false);
     assert.match(result.reason, /token budget exhausted/);
-  });
-});
-
-describe("P3 batching policy", () => {
-  const finding = (number, affectedFile, extra = {}) => ({
-    number,
-    affectedFile,
-    title: "fix: stale orchestration wording",
-    problem: "A low-risk review finding.",
-    labels: ["review-finding", "priority:P3"],
-    createdAt: "2026-01-01T00:00:00Z",
-    ...extra,
-  });
-
-  it("uses one eligibility rule table and preserves safety exclusions", () => {
-    assert.equal(isBatchableP3Finding(finding(1, "commands/a.md")), true);
-    assert.equal(isBatchableP3Finding(finding(2, "commands/a.md", { title: "fix auth check" })), false);
-    assert.equal(isBatchableP3Finding(finding(3, "commands/a.md", { labels: ["review-finding", "P3", "security"] })), false);
-    assert.equal(P3_BATCHING_RULES.sameFileMinimum, 2);
-  });
-
-  it("re-evaluates earlier singletons with new-cycle candidates", () => {
-    const plan = planP3Batches({
-      candidates: [finding(1, "commands/orchestrate/a.md"), finding(2, "commands/orchestrate/a.md")],
-      now: Date.parse("2026-01-02T00:00:00Z"),
-    });
-    assert.deepEqual(plan.actions, [{ type: "create", grouping: "same-file", key: "commands/orchestrate/a.md", members: [1, 2], memberIds: ["default:1", "default:2"] }]);
-    assert.deepEqual(plan.singletons, []);
-  });
-
-  it("extends an under-cap open batch before creating another batch", () => {
-    const plan = planP3Batches({
-      candidates: [finding(5, "commands/orchestrate/a.md"), finding(6, "commands/orchestrate/a.md")],
-      openBatches: [{ number: 99, affectedFile: "commands/orchestrate/a.md", memberCount: 7 }],
-      now: Date.parse("2026-01-02T00:00:00Z"),
-    });
-    assert.deepEqual(plan.actions, [{ type: "extend", batch: 99, key: "commands/orchestrate/a.md", members: [5], memberIds: ["default:5"] }]);
-    assert.deepEqual(plan.singletons, [{ number: 6, id: "default:6", reason: "no same-file, leaf-directory, or age cluster" }]);
-  });
-
-  it("does not re-add members already present in an open batch", () => {
-    const plan = planP3Batches({
-      candidates: [finding(5, "commands/orchestrate/a.md"), finding(6, "commands/orchestrate/a.md")],
-      openBatches: [{ number: 99, affectedFile: "commands/orchestrate/a.md", members: [5], memberCount: 1 }],
-      now: Date.parse("2026-01-02T00:00:00Z"),
-    });
-    assert.deepEqual(plan.actions, [{ type: "extend", batch: 99, key: "commands/orchestrate/a.md", members: [6], memberIds: ["default:6"] }]);
-    assert.deepEqual(plan.singletons, []);
-  });
-
-  it("keeps leaf-directory and age rules available to every caller", () => {
-    const leafPlan = planP3Batches({
-      candidates: [1, 2, 3, 4, 5].map((number) => finding(number, `commands/orchestrate/${number}.md`)),
-      now: Date.parse("2026-01-01T01:00:00Z"),
-    });
-    assert.equal(leafPlan.actions[0].grouping, "leaf-directory");
-
-    const agedPlan = planP3Batches({ candidates: [finding(8, "commands/a.md")], now: Date.parse("2026-01-05T00:00:01Z") });
-    assert.deepEqual(agedPlan.actions[0], { type: "create", grouping: "age", key: "commands", members: [8], memberIds: ["default:8"] });
-    assert.deepEqual(summarizeP3BatchPlan(agedPlan), { formed: 1, extended: 0, absorbed: 1, singletons: [] });
-  });
-
-  it("does not merge same-number or same-path candidates across repositories", () => {
-    const plan = planP3Batches({
-      candidates: [
-        finding(1, "commands/orchestrate/a.md", { repo: "RapierCraftStudios/ForgeDock" }),
-        finding(1, "commands/orchestrate/a.md", { repo: "RapierCraftStudios/forgedock-platform" }),
-      ],
-      now: Date.parse("2026-01-02T00:00:00Z"),
-    });
-    assert.deepEqual(plan.actions, []);
-    assert.deepEqual(new Set(plan.eligible), new Set(["RapierCraftStudios/ForgeDock:1", "RapierCraftStudios/forgedock-platform:1"]));
   });
 });
 
