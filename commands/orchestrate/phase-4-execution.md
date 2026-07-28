@@ -584,6 +584,34 @@ Use `${ISSUE_LANE[$NUM]}` and `${ISSUE_PR_BASE[$NUM]}` to populate `{LANE}` and 
 
 ### Step 4A: Dispatch ready issues
 
+### Step 4A.0: Probe Knowledge Gist capability once
+
+Probe the authenticated identity once for this orchestration run before any engine, Agent, or
+OpenCode worker is dispatched. A GitHub App installation token identifies as `Bot` and cannot use
+the Gists API; cache that fact rather than letting every worker rediscover it by attempting a
+write. An unavailable identity probe preserves existing behavior for PAT-authenticated runs.
+
+```bash
+if [ -z "${FORGE_GIST_CAPABLE+x}" ]; then
+  GIST_AUTH_TYPE=$(gh api user --jq '.type' 2>/dev/null || true)
+  if [ "$GIST_AUTH_TYPE" = "Bot" ]; then
+    FORGE_GIST_CAPABLE=false
+  else
+    FORGE_GIST_CAPABLE=true
+  fi
+  export FORGE_GIST_CAPABLE
+fi
+
+if [ "$FORGE_GIST_CAPABLE" = "true" ]; then
+  echo "Knowledge Gist capability available"
+else
+  echo "INFO: Knowledge Gist subsystem unavailable for this authentication; workers will skip it"
+fi
+```
+
+Carry `FORGE_GIST_CAPABLE` unchanged through every dispatch path. Do not probe it in individual
+workers dispatched by this run. Phase 6 reports a false value once at batch level.
+
 **Claims-board dispatch gate (MANDATORY, before every individual dispatch)** <!-- Added: forge#2844 -->: The coordination issue is the durable authority for file ownership. Do not use `EDGE_FILES`, `ISSUE_FILES`, or a remembered prior read as evidence that a claim is free. Immediately before dispatching each issue, re-read the full claims board and refuse that dispatch when the issue's declared file set intersects a live claim held by another issue. This applies equally to engine, Claude Agent, and OpenCode task dispatches, including newly-ready issues and wake reconstruction.
 
 ```bash
@@ -667,7 +695,7 @@ task(
   description="Work on {PROJECT_PREFIX}#{NUMBER}",
   subagent_type="general",
   background=true,
-  prompt="Use the same Phase 4A work-on template below. Invoke Skill(skill='work-on', args='{PROJECT_PREFIX}{NUMBER} --under-orchestration') and continue until a terminal workflow state."
+  prompt="Use the same Phase 4A work-on template below. Before invoking it, run `export FORGE_GIST_CAPABLE={FORGE_GIST_CAPABLE}` so the cached orchestration capability is preserved. Invoke Skill(skill='work-on', args='{PROJECT_PREFIX}{NUMBER} --under-orchestration') and continue until a terminal workflow state."
 )
 ```
 
@@ -828,7 +856,7 @@ fi
 **Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Immediately before each call, run `claim_conflicts_with_live_holder "{NUM}"`; if it returns success, defer that issue rather than dispatching it. Issue one `Bash(...)` call per remaining issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
 
 ```
-Bash(command="forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
+Bash(command="FORGE_GIST_CAPABLE=${FORGE_GIST_CAPABLE} forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
 ```
 
 Capture the task id each call returns into `ENGINE_DISPATCH_MAP[{NUM}]` (declared alongside `AGENT_ISSUE_MAP` below — Step 4B's completion handler uses this map to identify which issue a backgrounded engine-mode `Bash` completion notification belongs to, the same role `AGENT_ISSUE_MAP` plays for `agent_completed` notifications):
@@ -872,6 +900,8 @@ Agent(
 **Project**: {PROJECT_NAME}
 **Repository**: {GH_REPO}
 **Repo path**: {REPO_PATH}
+
+**KNOWLEDGE GIST CAPABILITY**: This orchestration already probed it: `{FORGE_GIST_CAPABLE}`. Before invoking `/work-on`, run `export FORGE_GIST_CAPABLE={FORGE_GIST_CAPABLE}`. Do not re-probe or attempt Gist creation when it is `false`.
 
 **YOUR MISSION**: Invoke `/work-on` via the Skill tool and let it run to completion. `/work-on` is a self-contained routing loop that handles the ENTIRE pipeline: investigate → build (context → architect → implement → validate) → review (push → PR → /review-pr --auto-merge) → close (project board → trajectory log → worktree cleanup). Do NOT intervene, compensate, or manually close issues — `/work-on` handles everything including issue closure and label updates in its close phase.
 
@@ -2887,6 +2917,8 @@ The context-gathering phase can fetch this index to discover all investigation G
 **Project**: {PROJECT_NAME}
 **Repository**: {GH_REPO}
 **Repo path**: {REPO_PATH}
+
+**KNOWLEDGE GIST CAPABILITY**: This orchestration already probed it: `${FORGE_GIST_CAPABLE}`. Before invoking `/work-on`, run `export FORGE_GIST_CAPABLE=${FORGE_GIST_CAPABLE}`. Do not re-probe or attempt Gist creation when it is `false`.
 
 **YOUR MISSION**: Invoke \`/work-on\` via the Skill tool and let it run to completion. \`/work-on\` is a self-contained routing loop that handles the ENTIRE pipeline: investigate → build (context → architect → implement → validate) → review (push → PR → /review-pr --auto-merge) → close (project board → trajectory log → worktree cleanup). Do NOT intervene, compensate, or manually close issues — \`/work-on\` handles everything including issue closure and label updates in its close phase.
 

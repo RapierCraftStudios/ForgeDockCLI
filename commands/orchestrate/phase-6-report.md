@@ -286,6 +286,7 @@ current session's live wake pick them up automatically if it is still running).
 {list of cosmetic deferred issue numbers and titles}
 
 ### Summary
+- **Knowledge Gists**: {IF FORGE_GIST_CAPABLE == "false": "Skipped - unavailable for the batch authentication (informational)." ELSE: "Available."}
 - **Investigations**: {N} completed, spawned {M} new issues
 - **Review findings**: {N} spawned, {M} resolved in-batch, {K} swept, {J} deferred (cosmetic), {L} deferred (gen2), {IDLE_POLICY_DEFERRED_COUNT} deferred (idle policy, forge#1814)
 - **Succeeded**: {N} issues resolved (implementation + sweep)
@@ -433,4 +434,3 @@ the Summary section above. `BATCH_ELAPSED` is the wall-clock duration of the orc
 (Step 6B `Duration`), not the sum of per-issue elapsed times.
 
 ---
-

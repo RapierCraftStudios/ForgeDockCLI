@@ -481,6 +481,36 @@ After the FORGE:INVESTIGATOR comment is posted, create a structured GitHub Gist 
 
 **This phase is non-blocking** — if Gist creation fails (auth error, rate limit, network), log the failure and continue to Phase 1D. Do NOT stall the pipeline for a knowledge artifact.
 
+### Step 0: Check cached Gist capability
+
+`FORGE_GIST_CAPABLE` is set once by `/orchestrate` before it dispatches workers. A standalone
+`/work-on` run has no parent cache, so it performs the same read-only identity probe once for its
+own process. GitHub App installation identities are `Bot` users and cannot use the Gists API.
+
+```bash
+if [ -z "${FORGE_GIST_CAPABLE+x}" ]; then
+  GIST_AUTH_TYPE=$(gh api user --jq '.type' 2>/dev/null || true)
+  if [ "$GIST_AUTH_TYPE" = "Bot" ]; then
+    FORGE_GIST_CAPABLE=false
+  else
+    # Preserve the existing behavior when the identity probe is unavailable or is a PAT user.
+    FORGE_GIST_CAPABLE=true
+  fi
+  export FORGE_GIST_CAPABLE
+fi
+
+if [ "$FORGE_GIST_CAPABLE" != "true" ]; then
+  echo "INFO: Knowledge Gist subsystem unavailable for this authentication — skipping Gist phases"
+  GIST_URL=""
+  INDEX_URL=""
+  # Skip every remaining step in Phases 1C.5 and 1C.6; continue directly to Phase 1D.
+fi
+```
+
+When `FORGE_GIST_CAPABLE` is not `true`, do not call `gh gist create`, `gh gist view`,
+`gh gist edit`, or any other Gist command in either Phase 1C.5 or Phase 1C.6. This is an
+informational skip, not a warning, retry, or escalation.
+
 ### Step 1: Check for existing Gist annotation
 
 ```bash
@@ -583,6 +613,9 @@ fi
 ## Phase 1C.6: Update Milestone Index Gist
 
 **Skip if**: The issue has no milestone (`MILESTONE` is `"none"` or empty).
+
+**Also skip if**: `FORGE_GIST_CAPABLE` from Phase 1C.5 is not `true`. Do not independently
+re-probe capability here; the cached result covers both Gist phases.
 
 After the per-issue Knowledge Gist is created (Phase 1C.5), update the milestone-level index Gist. The index aggregates all investigation Gist URLs for a milestone into a single reference document. Any agent working on a milestone issue can fetch one index URL to get full context across all investigations.
 
