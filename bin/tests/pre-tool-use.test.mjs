@@ -1540,6 +1540,31 @@ describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
     assert.equal(exitCode, 2);
   });
 
+  it("exits 0 when an indented delimiter-looking line remains inside a << heredoc body (#2879)", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<'EOF'`,
+      `  EOF`,
+      `${RM} -f /probe.txt`,
+      `EOF`,
+      `)"`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 0, "only a column-0 terminator closes << heredocs");
+  });
+
+  it("treats only tabs as indentation for a <<- heredoc terminator (#2879)", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<-EOF`,
+      `  EOF`,
+      `${RM} -f /still-in-body.txt`,
+      `\tEOF`,
+      `)"`,
+      `${RM} -f /after-terminator.txt`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 2, "a tab-indented terminator closes <<- heredocs");
+  });
+
   // -- Deny message contract (ac-5, ac-6) ---------------------------------
   // The message is part of the rule's contract, not prose: its whole value is
   // that an unattended run self-heals in one turn instead of stalling.

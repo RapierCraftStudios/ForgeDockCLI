@@ -424,7 +424,7 @@ const RM_SEGMENT_SPLIT_RE = /[;&|()`]+/;
  * The command line AFTER the heredoc terminator is still scanned, which is
  * exactly the stall shape reported in #2843.
  */
-const HEREDOC_OPEN_RE = /<<-?\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/;
+const HEREDOC_OPEN_RE = /(<<-?)\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/;
 
 // ---------------------------------------------------------------------------
 // Attribution guard constants (Rule 6)
@@ -1142,17 +1142,23 @@ function checkFindRoot(command) {
 function stripHeredocBodies(command) {
   const lines = command.split(/\r?\n/);
   const kept = [];
-  let delimiter = null;
+  let heredoc = null;
 
   for (const line of lines) {
-    if (delimiter !== null) {
-      // Inside a heredoc body — drop the line. A terminator line closes it.
-      if (line.trim() === delimiter) delimiter = null;
+    if (heredoc !== null) {
+      // Bash requires terminators at column 0 for <<, or after tabs only for <<-.
+      const terminator = heredoc.stripTabs ? line.replace(/^\t*/, "") : line;
+      if (terminator === heredoc.delimiter) heredoc = null;
       continue;
     }
     kept.push(line);
     const opened = HEREDOC_OPEN_RE.exec(line);
-    if (opened) delimiter = opened[1] || opened[2] || opened[3] || null;
+    if (opened) {
+      heredoc = {
+        delimiter: opened[2] || opened[3] || opened[4],
+        stripTabs: opened[1] === "<<-",
+      };
+    }
   }
 
   return kept;
