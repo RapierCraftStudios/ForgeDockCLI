@@ -147,6 +147,22 @@ describe("router", () => {
     assert.match(res.stdout, /unmanaged|not active/i);
   });
 
+  it("install restores commands in an already managed directory", () => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-managed-install-home-"));
+    const cwd = mkdtempSync(join(os.tmpdir(), "fd-managed-install-cwd-"));
+    writeFileSync(join(cwd, "forge.yaml"), "project:\n", "utf-8");
+
+    try {
+      const res = runCli(["install", "--fast"], { cwd, home });
+      assert.equal(res.status, 0, res.stdout + res.stderr);
+      assert.match(res.stdout, /Forging commands/);
+      assert.ok(existsSync(join(home, ".claude", "commands", "work-on.md")));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("disable then status reports opted out", () => {
     const home = mkdtempSync(join(os.tmpdir(), "fd-d-"));
     const cwd = mkdtempSync(join(os.tmpdir(), "fd-d-cwd-"));
