@@ -1795,7 +1795,11 @@ FINDING_ISSUE_TITLE="fix: [summary] (review finding — PR #${PR_NUMBER})"
 # so the raw title stays readable if it round-trips through any other
 # eval-based consumer.
 FINDING_ISSUE_TITLE=$(printf '%s' "$FINDING_ISSUE_TITLE" | tr '`' "'" | sed 's/\$(/$ (/g')
-FINDING_ISSUE_BODY_FILE=$(mktemp)
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+REVIEW_AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-reviewer}-$$}"
+mkdir -p "$SCRATCHPAD"
+FINDING_BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}"
+FINDING_ISSUE_BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}.XXXXXX.md")
 cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 ## Problem
 
@@ -1865,6 +1869,7 @@ Files that need changes:
 - [ ] Reproduce or construct proof-of-concept
 [BATCHABLE_ANNOTATION]
 ISSUE_EOF
+printf '\n<!-- %s -->\n' "$FINDING_BODY_MARKER" >> "$FINDING_ISSUE_BODY_FILE"
 
 # FINDING_SEVERITY is extracted from the finding's own **Severity** body field
 # (set above in the heredoc) — example assignment shown here for clarity, same
@@ -1889,19 +1894,22 @@ if [ "$FINDING_PRIORITY_EXIT" -ne 0 ]; then
 else
 
 # --label is repeatable (not comma-joined) per the /issue programmatic contract.
-Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}")
+ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}"))
+# /issue re-reads the created issue and hard-fails unless this exact marker is present.
 rm -f "$FINDING_ISSUE_BODY_FILE"
 
-# /issue has no machine-readable return contract (it's a user-facing command, not a work-on
-# subcommand) — resolve the created issue's number by exact-title search immediately after
-# the call. The title embeds ${PR_NUMBER} and the finding summary, making it unique enough
-# for a reliable single-match lookup. Retry to absorb GitHub Search API indexing lag.
-ISSUE_NUM=""
-for _resolve_attempt in 1 2 3; do
-  ISSUE_NUM=$(gh issue list -R ${REPO} --search "in:title \"${FINDING_ISSUE_TITLE}\"" --state open --limit 1 --json number --jq '.[0].number // empty')
-  [ -n "$ISSUE_NUM" ] && break
-  sleep 2
-done
+# /issue succeeds only after its API create-token read-back (Phase 4B). Its
+# explicit result marker distinguishes a verified create from an intentional
+# dedup STOP; never use title search to mask a swallowed 403.
+ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ -n "$DEDUP_NUMBER" ]; then
+  ISSUE_NUM="$DEDUP_NUMBER"
+  echo "Review finding deduped against existing issue #${ISSUE_NUM}."
+elif [ -z "$ISSUE_NUM" ]; then
+  echo "ERROR: /issue did not report a verified review-finding number; stopping review instead of silently dropping the finding." >&2
+  exit 1
+fi
 fi
 ```
 

@@ -462,6 +462,18 @@ declare -A ENGINE_DISPATCH_MAP
 # cache only; every entry must also be persisted as a FORGE:DISPATCH comment.
 declare -A OPENCODE_DISPATCH_MAP
 
+# Reconstruct the live map after compaction/restart from the durable dispatch
+# records. The issue association is the map key; only the latest running record
+# is restored, because a later completed/error record has already released it.
+for NUM in "${ISSUES[@]}"; do
+  DISPATCH_BODY=$(gh api repos/{GH_REPO}/issues/"$NUM"/comments \
+    --jq '[.[] | select(.body | contains("FORGE:DISPATCH")) | .body] | last // ""' 2>/dev/null || true)
+  TASK_ID=$(printf '%s' "$DISPATCH_BODY" | jq -Rr 'try capture("\\\"runtime\\\":\\\"opencode\\\",\\\"child_session_id\\\":\\\"(?<id>[^\\\"]+)\\\".*\\\"state\\\":\\\"running\\\"").id catch ""')
+  if [ -n "$TASK_ID" ]; then
+    OPENCODE_DISPATCH_MAP["$NUM"]="$TASK_ID"
+  fi
+done
+
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
 # dispatch loop below (Step 4B) whenever a Layer 1/2/3 structural predecessor edge (see
 # EDGE_KIND/EDGE_FILES from phase-3-dependency.md Step 3C) resolves; consumed by Step 4A's
@@ -530,15 +542,15 @@ CASCADE_POLICY_NAME=$(yq '.orchestration.cascade.policy // "balanced"' forge.yam
 
 case "$CASCADE_POLICY_NAME" in
   all)
-    PRESET_MAX_GEN="unlimited"; PRESET_TOKEN_BUDGET="unlimited"; PRESET_DEFER_GATED="false"; PRESET_KEYWORD="false"; PRESET_P3_SAME_FILE="false" ;;
+    PRESET_MAX_GEN="unlimited"; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET="unlimited"; PRESET_DEFER_GATED="false"; PRESET_KEYWORD="false"; PRESET_P3_SAME_FILE="false" ;;
   conservative)
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=450000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=450000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
   balanced)
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
   *)
     echo "WARNING: forge.yaml → orchestration.cascade.policy \"${CASCADE_POLICY_NAME}\" is not one of: all, balanced, conservative — falling back to \"balanced\""
     CASCADE_POLICY_NAME="balanced"
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
 esac
 
 # max_generation is authoritatively resolved in phase-1-resolve.md (it only governs
@@ -549,6 +561,14 @@ MAX_GENERATION_FOR_NOTICE=$(yq ".orchestration.cascade.max_generation // \"${PRE
 [ "$MAX_GENERATION_FOR_NOTICE" = "null" ] && MAX_GENERATION_FOR_NOTICE="$PRESET_MAX_GEN"
 if [ "$MAX_GENERATION_FOR_NOTICE" != "unlimited" ] && ! echo "$MAX_GENERATION_FOR_NOTICE" | grep -qE '^[1-9][0-9]*$'; then
   MAX_GENERATION_FOR_NOTICE="$PRESET_MAX_GEN"
+fi
+
+# P3 batching is a distinct, bounded aggregation exception to autonomous cascade
+# admission. Unlike max_generation, it must always be finite, including policy: all.
+BATCH_MAX_GENERATION=$(yq ".orchestration.cascade.batch_max_generation // ${PRESET_BATCH_MAX_GEN}" forge.yaml 2>/dev/null || echo "$PRESET_BATCH_MAX_GEN")
+if ! echo "$BATCH_MAX_GENERATION" | grep -qE '^[1-9][0-9]*$'; then
+  echo "WARNING: forge.yaml → orchestration.cascade.batch_max_generation is not a positive integer (\"${BATCH_MAX_GENERATION}\") — falling back to default ${PRESET_BATCH_MAX_GEN}"
+  BATCH_MAX_GENERATION="$PRESET_BATCH_MAX_GEN"
 fi
 
 # token_budget precedence: orchestration.cascade.token_budget (new home) >
@@ -592,7 +612,7 @@ CASCADE_DEFER_ON_BATCH_GATED=$(yq ".orchestration.cascade.defer_on_batch_gated /
 CASCADE_KEYWORD_HEURISTIC=$(yq ".orchestration.cascade.keyword_heuristic // ${PRESET_KEYWORD}" forge.yaml 2>/dev/null || echo "$PRESET_KEYWORD")
 CASCADE_P3_SAME_FILE_DEFER=$(yq ".orchestration.cascade.p3_same_file_defer // ${PRESET_P3_SAME_FILE}" forge.yaml 2>/dev/null || echo "$PRESET_P3_SAME_FILE")
 
-echo "Cascade admission policy resolved: policy=${CASCADE_POLICY_NAME} token_budget=${TOKEN_BUDGET} defer_on_batch_gated=${CASCADE_DEFER_ON_BATCH_GATED} keyword_heuristic=${CASCADE_KEYWORD_HEURISTIC} p3_same_file_defer=${CASCADE_P3_SAME_FILE_DEFER} (forge.yaml → orchestration.cascade; see docs/CONFIG.md)"
+echo "Cascade admission policy resolved: policy=${CASCADE_POLICY_NAME} token_budget=${TOKEN_BUDGET} batch_max_generation=${BATCH_MAX_GENERATION} defer_on_batch_gated=${CASCADE_DEFER_ON_BATCH_GATED} keyword_heuristic=${CASCADE_KEYWORD_HEURISTIC} p3_same_file_defer=${CASCADE_P3_SAME_FILE_DEFER} (forge.yaml → orchestration.cascade; see docs/CONFIG.md)"
 
 # Both-uncapped notice (loud, one-time, printed once per orchestrate invocation since
 # this resolution block itself runs once at Step 4A.pre) — never a preset default except
@@ -619,6 +639,8 @@ TOKEN_DEFERRED=()   # findings deferred by the token-budget rule this run (re-ev
 # alone. <!-- Added: forge#1909 -->
 SURFACE_BATCHED_FINDINGS=()   # all member issue numbers absorbed into a batch across the run
 SURFACE_BATCH_COUNT=0         # count of batch issues created across the run
+BATCHABLE_DEFERRED_P3=()      # gen-2+ P3s eligible only for bounded P3 aggregation (forge#2849)
+declare -A FINDING_GENERATIONS
 
 for NUM in {ready_issue_numbers}; do
   PR_BASE=$(bash "$CLASSIFY_LANE_SCRIPT" "$NUM" -R {GH_REPO}) || {
@@ -973,6 +995,7 @@ Agent(
   - For satellite repo issues: `Skill(skill='work-on', args='{SATELLITE_PREFIX}:{NUMBER} --under-orchestration')` (prefix from forge.yaml → repos.satellites)
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
+- **File-backed GitHub bodies — entity scope plus read-back is mandatory**: Never stage a `gh --body-file` body at a generic shared `/tmp` path, including one made by bare `mktemp`, and never hand-roll a root-level path such as `/tmp_invbody_31076.txt`, which can hang unattended cleanup. Prefer the session scratchpad or a repo-relative scratch directory on Windows: a native Windows `gh` may not resolve Git Bash `/tmp` reliably. Create a filename that contains the target issue/PR number and an agent-unique token, then use `mktemp` for its random suffix. Put one caller-chosen marker such as `<!-- FORGE:BODY-INTEGRITY:${NUMBER}_investigator_${AGENT_TOKEN} -->` in the body. After every `gh issue create|edit` or `gh pr create|comment` using `--body-file`, re-read the target object and assert the exact marker is present; a mismatch is a hard error. Unique names reduce collisions, but only read-back detects a collision that substitutes plausible-looking content from another agent. Do not rely on eyeballing. (forge#2843, forge#2855) <!-- allowlist:check-command-side-effects -->
 - **GitHub secondary rate limit**: If a GitHub API call returns HTTP 403 with `secondary rate limit` in its response, do NOT retry it or start a polling loop. Stop GitHub content creation for this phase, report the status and response body to the orchestrator in your final result, and wait for a later batch resume. Retrying extends the throttle for every sibling.
 - **Temp files — ALWAYS use `mktemp`, NEVER hand-roll a path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`). Never write a temp file to a single-segment root path such as `/tmp_invbody_31076.txt`: Claude Code treats removing it as dangerous and requires an explicit approval that bypass mode cannot clear, hanging unattended runs. Also never use a fixed literal such as `/tmp/body.md` or `/tmp/issue.json`: a fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back. Safe: `BODY_FILE="$(mktemp)"`. Unsafe: `/tmp_invbody_31076.txt` (a missing slash that creates a root-level path) and `/tmp/body.md` (a fixed path). `mktemp` costs nothing and prevents both failures. (forge#2198, forge#2855)
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
@@ -1180,6 +1203,8 @@ gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
 ```
 
 **Fallback**: if a runtime ever fails to deliver a background completion notification, read the latest `FORGE:DISPATCH` record and use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
+
+For an OpenCode completion, retain `OPENCODE_DISPATCH_MAP[{NUMBER}]` until the terminal `FORGE:DISPATCH` record above has been posted successfully. Then remove that map entry and release capacity. This makes a restart deterministic: a latest `running` record restores the task-to-issue association, while a latest `completed` or `error` record cannot release the same slot twice.
 
 **Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, a background-Bash completion, or an OpenCode `task` result with `state="completed"`/`state="error"` — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` or a fresh OpenCode `task(background=true)` continuation is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains resume-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete at `workflow:engine-error` with empty committed state — is still auto-fallen-back by item 2b below, fixed forge#2743.)
 
@@ -2132,7 +2157,7 @@ For each spawned finding, determine whether it should be **executed** or **defer
 
 **Evaluation order** (first matching rule wins):
 0. **Batch fully human-gated** (`BATCH_FULLY_GATED == true`, always defer, even for P1/P2) <!-- Added: forge#1814 -->: The original batch (see Step 4B item 6.7) has exhausted into DONE/FAILED/GATED with nothing left `IN_PROGRESS` — the real blockers are the GATED issues, not a lack of dispatchable findings. Dispatching a new review-finding here cannot produce net batch progress; it only inflates the open-issue count while the productive path waits on a human merge. Always defer, checked before generation and priority. Rationale: this is the idle/backpressure policy this issue adds — without it, rule 2 (below) unconditionally executes P1/P2 findings regardless of how gated the rest of the batch is, which is the root cause of the net-negative churn this policy exists to stop. **Configurable** via `orchestration.cascade.defer_on_batch_gated` (default `true`; `false` under `policy: all` — forge#2234).
-1. **Generation ≥ 2** (always defer, even for P1/P2, for autonomous mid-run cascade — see scope note below): Finding was spawned by an issue that was itself a review-finding. Check the source issue's labels for `review-finding` — if the source has that label, the new finding is generation 2. Always defer within this Step 4C triage pass. Rationale: gen-2+ cascade is theoretically unbounded — cap it here. **Scope**: this rule caps *autonomous* cascade — findings discovered and re-triaged automatically during an unattended run. It is not a cap on what a human can explicitly request. When an operator directly asks for cascade/review-finding work via `phase-1-resolve.md`'s dedicated `cascade`/`review-findings`/`findings` resolution (with `--include-deferred`/`--allow-gen2`, or the `orchestration.cascade.max_generation` config lever from #2234), those findings enter the DAG through Phase 1 resolution, not through this Step 4C mid-run triage — this rule still defers anything Step 4C itself discovers mid-run, including inside a human-requested gen≥2 batch (see recursion safety below). **Not configurable here** — `orchestration.cascade.max_generation` governs Phase 1 resolve-time admission only (see `phase-1-resolve.md` "Cascade / Review-Finding Resolution"); this Step 4C rule stays an absolute autonomous-cascade cap regardless of policy, including `policy: all`. <!-- Added: forge#2231 -->
+1. **Generation ≥ 2** (always defer from individual autonomous dispatch, even for P1/P2, for mid-run cascade — see scope note below): Finding was spawned by an issue that was itself a review-finding. A P3 finding at or below the finite `orchestration.cascade.batch_max_generation` ceiling (default 2) is retained only as a candidate for the bounded P3 batch pass; it remains deferred if no batch forms. A formed batch records `FORGE:BATCH_MAX_GENERATION` and its generation-2+ members. No P1/P2, or finding above that ceiling, takes this exception. Rationale: gen-2+ individual cascade is theoretically unbounded — cap it here while permitting one auditable aggregation unit. **Scope**: this rule caps *autonomous* cascade — findings discovered and re-triaged automatically during an unattended run. It is not a cap on what a human can explicitly request. When an operator directly asks for cascade/review-finding work via `phase-1-resolve.md`'s dedicated `cascade`/`review-findings`/`findings` resolution (with `--include-deferred`/`--allow-gen2`, or the `orchestration.cascade.max_generation` config lever from #2234), those findings enter the DAG through Phase 1 resolution, not through this Step 4C mid-run triage. `batch_max_generation` is separate from `max_generation`, and remains finite even under `policy: all`. <!-- Added: forge#2231, forge#2849 -->
 2. **Priority override** (P1 or P2 → always execute): If the finding is labeled P1 or P2, skip all remaining heuristics and execute. Rationale: high-priority findings must never be suppressed by keyword matching.
 3. **Comment/typo heuristic** (P3 and below only): Finding title contains the word "comment" or "typo" (case-insensitive). These are 1-line cosmetic fixes that do not block other work. **Configurable** via `orchestration.cascade.keyword_heuristic` (default `true`; `false` under `policy: all` — forge#2234).
 4. **P3 + same-file overlap**: Finding is labeled `P3` AND the file it targets overlaps with ANY file already in the current batch (active or queued in the DAG). Rationale: same-file P3 findings add predecessor edges that serialize agents — one finding per original issue increases wall-clock time with no proportional value. **Configurable** via `orchestration.cascade.p3_same_file_defer` (default `true`; `false` under `policy: all` — forge#2234).
@@ -2168,6 +2193,22 @@ ALL_BATCH_FILES=$(echo "$ALL_BATCH_FILES" | sort -u | grep -v '^$')
 ```
 
 ```bash
+# Use the same bounded ancestor walk as Phase 1 so batching records actual depth,
+# not just whether the immediate source is a review finding.
+compute_finding_generation() {
+  local body="$1" generation=1 hops=0 source_num source_data
+  while [ "$hops" -lt 10 ]; do
+    source_num=$(echo "$body" | grep -ioE 'spawned from issue #[0-9]+|source issue[: #]+[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    [ -z "$source_num" ] && break
+    source_data=$(gh issue view "$source_num" -R {GH_REPO} --json labels,body 2>/dev/null) || break
+    echo "$source_data" | jq -e '[.labels[].name] | index("review-finding")' >/dev/null 2>&1 || break
+    generation=$((generation + 1))
+    body=$(echo "$source_data" | jq -r '.body')
+    hops=$((hops + 1))
+  done
+  echo "$generation"
+}
+
 # For each finding, check its priority label and generation
 # NOTE: DEFERRED_FINDINGS, QUEUED_FINDINGS, and DEFERRED_REASONS are declared at
 # batch scope in Step 4A.pre — do NOT re-initialize them here (Step 4C runs per-agent).
@@ -2278,30 +2319,33 @@ for FINDING_NUM in {spawned_finding_numbers}; do
           # as its own outcome and fail closed, mirroring the concurrent-edit branch below
           # rather than silently falling through to the unprotected write.
           echo "REPAIR: #${FINDING_NUM} skipped — freshness re-fetch failed (network error or API rate limit); cannot verify no concurrent edit occurred, failing closed instead of risking a silent clobber"
-          # forge#2584: stage the body in a mktemp file and deliver it via --body-file
-          # instead of interpolating finding-derived variables (${FINDING_NUM},
-          # ${REPAIR_SOURCE_PR}, ${REPAIR_PARENT_BASE}, ${FINDING_UPDATED_AT_SNAPSHOT})
-          # directly into a double-quoted --body argument at the gh call site — mirrors
-          # REPAIRED_BODY's existing printf-into-variable approach and the repo-wide
-          # mktemp + --body-file convention (forge#2198). mktemp avoids /tmp path
-          # collisions with other concurrently-running orchestrated agents.
-          GATE_BODY_TMPFILE="$(mktemp)"
+          # Scope the scratch name to both this finding and this orchestrator process.
+          # The marker read-back below detects a plausible-looking body substitution.
+          SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+          AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-orchestrator}-$$}"
+          mkdir -p "$SCRATCHPAD"
+          GATE_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}"
+          GATE_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Freshness Re-fetch Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->" > "$GATE_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->
+<!-- ${GATE_BODY_MARKER} -->" > "$GATE_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$GATE_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${GATE_BODY_MARKER} -->" || { echo "ERROR: freshness-gate comment marker missing" >&2; exit 1; }
           rm -f "$GATE_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # freshness-recheck-failure path
         elif [ "$FINDING_UPDATED_AT_CURRENT" != "$FINDING_UPDATED_AT_SNAPSHOT" ]; then
           echo "REPAIR: #${FINDING_NUM} skipped — concurrent edit detected (updatedAt changed from ${FINDING_UPDATED_AT_SNAPSHOT} to ${FINDING_UPDATED_AT_CURRENT} since this iteration's initial read); flagging instead of repairing"
-          # forge#2584: mktemp + --body-file, same rationale as the freshness-recheck-failure path above.
-          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp)"
+          CONCURRENT_EDIT_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}"
+          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Concurrent Edit Detected
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->
+<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$CONCURRENT_EDIT_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" || { echo "ERROR: concurrent-edit comment marker missing" >&2; exit 1; }
           rm -f "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # concurrent-edit path
         else
@@ -2312,13 +2356,15 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
           FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
             --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
         else
-          # forge#2584: mktemp + --body-file, same rationale as the two failure paths above.
-          REPAIR_FAILED_BODY_TMPFILE="$(mktemp)"
+          REPAIR_FAILED_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_repair-failure_${AGENT_TOKEN}"
+          REPAIR_FAILED_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_repair-failure_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->" > "$REPAIR_FAILED_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->
+<!-- ${REPAIR_FAILED_BODY_MARKER} -->" > "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$REPAIR_FAILED_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${REPAIR_FAILED_BODY_MARKER} -->" || { echo "ERROR: repair-failure comment marker missing" >&2; exit 1; }
           rm -f "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # repair-failure path
         fi
@@ -2355,7 +2401,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   # all" sets this to false so an operator draining a backlog is never idle-gated.
   if [ "$CASCADE_DEFER_ON_BATCH_GATED" = "true" ] && [ "${BATCH_FULLY_GATED:-false}" = "true" ]; then
     DEFER=true; DEFER_REASON="batch fully human-gated — idle policy"
-  # Heuristic 1: Generation check — source issue has review-finding label (always defer, even for P1/P2)
+  # Heuristic 1: Generation check — source issue has review-finding label. Always defer
+  # individual dispatch; only bounded P3 aggregation can consume an eligible member.
   # NOT gated by orchestration.cascade.max_generation — this is Step 4C's autonomous
   # mid-run cascade cap, which stays absolute regardless of config (see forge#2231's
   # scope note above and phase-1-resolve.md's Cascade / Review-Finding Resolution
@@ -2364,8 +2411,16 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   elif SOURCE_NUM=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '(?i)spawned from issue #\K\d+|source issue[: #]+\K\d+' | head -1) && \
        [ -n "$SOURCE_NUM" ] && \
        gh issue view $SOURCE_NUM -R {GH_REPO} --json labels --jq '[.labels[].name]' 2>/dev/null | grep -q "review-finding"; then
-    DEFER=true; DEFER_REASON="generation >= 2 (source #${SOURCE_NUM} is also a review-finding)"
-   # Priority override: P0/P1 always execute — P2 remains eligible for batching.
+    FINDING_GENERATION=$(compute_finding_generation "$(echo "$FINDING_DATA" | jq -r '.body')")
+    FINDING_GENERATIONS[$FINDING_NUM]="$FINDING_GENERATION"
+    DEFER=true; DEFER_REASON="generation ${FINDING_GENERATION} (source #${SOURCE_NUM} is also a review-finding)"
+    if [ "$PRIORITY" = "P3" ] && [ "$FINDING_GENERATION" -le "$BATCH_MAX_GENERATION" ]; then
+      # Keep this out of individual cascade dispatch, but offer it to the P3 batching
+      # pass below. A singleton remains deferred; only a formed batch is admitted.
+      BATCHABLE_DEFERRED_P3+=("$FINDING_NUM")
+      DEFER_REASON="generation ${FINDING_GENERATION} — eligible for bounded P3 batching only"
+    fi
+   # Priority override: P0/P1 always execute; P2 is eligible for batch planning.
    elif [ "$PRIORITY" = "P0" ] || [ "$PRIORITY" = "P1" ]; then
     DEFER=false
   # Heuristic 2: Comment/typo keyword (only applies to P3 and below)
@@ -2385,6 +2440,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   else
     DEFER=false
   fi
+
+  [ -n "${FINDING_GENERATIONS[$FINDING_NUM]:-}" ] || FINDING_GENERATIONS[$FINDING_NUM]=1
 
   # Opt-in only: never defer a new-surface or P1/P2 finding because another
   # lineage is noisy. Step 4F re-evaluates this explicit deferral after drain.
@@ -2428,13 +2485,17 @@ The per-cycle `QUEUED_FINDINGS` loop below remains the action-creation mechanism
 unset SURFACE_FILE_MEMBERS
 declare -A SURFACE_FILE_MEMBERS
 
-# Defensive cap on gh issue view fan-out. QUEUED_FINDINGS is already bounded by
+# Include generation-2 P3 findings only as batch candidates. They remain deferred
+# unless this pass actually forms a bounded batch; no member is individually queued.
+BATCHING_CANDIDATES=("${QUEUED_FINDINGS[@]}" "${BATCHABLE_DEFERRED_P3[@]}")
+
+# Defensive cap on gh issue view fan-out. BATCHING_CANDIDATES is already bounded by
 # upstream cascade control; this cap holds even if that bound is later loosened,
 # so the loop can never scale API calls linearly with cascade-seeded findings. <!-- forge#1836 -->
 MAX_BATCH_SCAN=50
 SCANNED=0
 
-for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
+for FINDING_NUM in "${BATCHING_CANDIDATES[@]}"; do
   SCANNED=$((SCANNED + 1))
   if [ "$SCANNED" -gt "$MAX_BATCH_SCAN" ]; then
     echo "Surface-area batching: reached MAX_BATCH_SCAN=$MAX_BATCH_SCAN — remaining findings stay individually queued"
@@ -2520,9 +2581,18 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
     [ "${#CHUNK[@]}" -ge 2 ] || continue
 
     MEMBER_LINES=""
+    BATCH_MEMBER_GENERATION=1
+    GEN2_MEMBER_LINES=""
     for M in "${CHUNK[@]}"; do
       MTITLE=$(gh issue view "$M" -R {GH_REPO} --json title --jq '.title' 2>/dev/null || echo "")
       MEMBER_LINES="${MEMBER_LINES}- [ ] #${M}: ${MTITLE}"$'\n'
+      MEMBER_GENERATION="${FINDING_GENERATIONS[$M]:-1}"
+      if [ "$MEMBER_GENERATION" -gt "$BATCH_MEMBER_GENERATION" ]; then
+        BATCH_MEMBER_GENERATION="$MEMBER_GENERATION"
+      fi
+      if [ "$MEMBER_GENERATION" -ge 2 ]; then
+        GEN2_MEMBER_LINES="${GEN2_MEMBER_LINES}- #${M}: generation ${MEMBER_GENERATION}"$'\n'
+      fi
       [ "$SAFETY_CLASS" = "routine" ] || MEMBER_LINES="${MEMBER_LINES}  - **Verdict**: [ ] live vector  [ ] defence-in-depth"$'\n'
     done
 
@@ -2549,10 +2619,8 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
       continue
     fi
 
-    BATCH_ISSUE_NUM=$(gh issue create {GH_FLAG} \
-      --title "$PROPOSED_BATCH_TITLE" \
-      --label "review-finding,priority:P3,batch" \
-      --body "$(cat <<BATCH_EOF
+    CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    CREATE_BODY="$(cat <<BATCH_EOF
 ## Problem
 
 Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered mid-run by phase-4-execution.md to reduce per-finding pipeline overhead.
@@ -2562,6 +2630,12 @@ Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered m
 <!-- FORGE:BATCH_MEMBERS -->
 ${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
 
+**Maximum member generation**: ${BATCH_MEMBER_GENERATION}
+<!-- FORGE:BATCH_MAX_GENERATION: ${BATCH_MEMBER_GENERATION} --> <!-- allowlist:check-spec-markers -->
+
+**Generation >= 2 members admitted by bounded batching**:
+${GEN2_MEMBER_LINES:-none}
+
 ## Acceptance Criteria
 
 - [ ] All member findings addressed or closed as false-positive
@@ -2570,7 +2644,26 @@ ${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
 
 <!-- FORGE:BATCHABLE -->
 BATCH_EOF
-)" --json number --jq '.number')
+    )"
+    CREATE_BODY="${CREATE_BODY}
+
+<!-- issue-create-token:${CREATE_TOKEN} -->"
+    CREATE_RESPONSE=$(gh api "repos/{GH_REPO}/issues" --method POST \
+      -f title="$PROPOSED_BATCH_TITLE" -f body="$CREATE_BODY" \
+      -f 'labels[]=review-finding' -f 'labels[]=priority:P3' -f 'labels[]=batch') || {
+      echo "ERROR: GitHub rejected same-run batch creation; members remain queued." >&2
+      continue
+    }
+    BATCH_ISSUE_NUM=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
+    if [ -z "$BATCH_ISSUE_NUM" ]; then
+      echo "ERROR: same-run batch creation returned no issue number; members remain queued." >&2
+      continue
+    fi
+    CREATED_BODY=$(gh issue view "$BATCH_ISSUE_NUM" -R {GH_REPO} --json body --jq '.body') || continue
+    if ! printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}"; then
+      echo "ERROR: batch issue #${BATCH_ISSUE_NUM} failed create-token read-back; members remain queued." >&2
+      continue
+    fi
 
     # Consume the cluster: record members and REPLACE them in QUEUED_FINDINGS
     # with the single batch issue, so the dispatch step below operates on the

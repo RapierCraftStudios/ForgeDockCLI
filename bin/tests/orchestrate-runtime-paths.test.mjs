@@ -37,6 +37,16 @@ describe("orchestrate runtime helper paths", () => {
     assert.ok(directCalls.length >= resolverCalls.length);
   });
 
+  it("requires mktemp paths and rejects root-level temp files", () => {
+    for (const spec of [phase4, issue]) {
+      assert.match(spec, /BODY_FILE="\$\(mktemp\)"/);
+      assert.match(spec, /never hand-roll (?:a )?(?:temp )?path/i);
+      assert.match(spec, /\/tmp_invbody_31076\.txt/);
+      assert.match(spec, /bypass mode cannot clear/i);
+      assert.match(spec, /\/tmp\/body\.md/);
+    }
+  });
+
   it("resolves affected-file extraction from ForgeDock before the target repo", () => {
     assert.match(phase3, /resolve_extract_affected_files\(\)/);
     assert.match(phase3, /\$FORGE_HOME\/scripts\/extract-affected-files\.sh/);
