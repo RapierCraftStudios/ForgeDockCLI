@@ -70,6 +70,35 @@ export function classifyBatchSafety(text) {
 }
 
 /**
+ * True only for the narrow automated-alert duplicate case. Human-authored
+ * reports and alerts without a stable generator/trigger identity always stay
+ * for investigation.
+ *
+ * @param {Object} canonical
+ * @param {Object} candidate
+ * @returns {boolean}
+ */
+export function canDeduplicateAutomatedAlert(canonical, candidate) {
+  const isAutomated = (issue) =>
+    issue?.authorType === "Bot" || /\[bot\]$/i.test(issue?.authorLogin || "");
+  const normalizeTitle = (title) => String(title || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const hasIdentity = (value) => typeof value === "string" && value.trim() !== "";
+
+  return (
+    isAutomated(canonical) &&
+    isAutomated(candidate) &&
+    normalizeTitle(canonical.title) !== "" &&
+    normalizeTitle(canonical.title) === normalizeTitle(candidate.title) &&
+    hasIdentity(canonical.generator) &&
+    hasIdentity(candidate.generator) &&
+    canonical.generator === candidate.generator &&
+    hasIdentity(canonical.trigger) &&
+    hasIdentity(candidate.trigger) &&
+    canonical.trigger === candidate.trigger
+  );
+}
+
+/**
  * @typedef {Object} CascadePolicy
  * @property {number|typeof UNLIMITED} maxGeneration - Max cascade generation depth
  *   admitted. 1 = only original (non-review-finding-spawned) issues; a
@@ -404,27 +433,34 @@ export function evaluateCascadeFinding(finding, policy) {
   return { admit: true, reason: null };
 }
 
-/** Shared, deterministic policy for every P3 review-finding batching admission point. */
+/**
+ * Deterministic P3 batching rules mirrored by the orchestration specs.
+ * Grouping order is deliberately strongest-context first: a finding can only
+ * belong to one group, so earlier rules claim it before broader rules run.
+ */
 export const P3_BATCHING_RULES = Object.freeze({
   maxMembers: 8,
   sameFileMinimum: 2,
   sourcePrMinimum: 2,
   defectClassMinimum: 2,
   leafDirectoryMinimum: 3,
-  staleAfterHours: 72,
 });
 
-const BATCH_EXCLUSION = /\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\b/i;
-const BATCH_EXCLUSION_LABELS = new Set(["security", "billing", "anti-bot", "auth"]);
+const HIGH_BLAST_RADIUS = /(?:^|\/)(?:\.env\.example|docker-compose[^/]*|compose[^/]*|index\.[^/]+|main\.[^/]+)$/i;
 
-function priorityOf(labels = []) {
-  const names = labels.map((label) => (typeof label === "string" ? label : label?.name)).filter(Boolean);
-  return names.find((label) => /^priority:P3$/.test(label)) ? "P3" : names.find((label) => /^P3$/.test(label)) ? "P3" : null;
+function priorityOf(finding) {
+  const labels = (finding.labels || []).map((label) => typeof label === "string" ? label : label?.name);
+  return labels.find((label) => /^priority:P[0-3]$/.test(label))?.slice(-2) || labels.find((label) => /^P[0-3]$/.test(label)) || "P3";
 }
 
-function leafDirectory(file) {
-  const slash = String(file || "").lastIndexOf("/");
-  return slash > 0 ? file.slice(0, slash) : "";
+/** Priority is urgency, not risk: only P0/P1 stay individual for latency. */
+export function batchExclusionReason(finding, dangerZones = []) {
+  if (["P0", "P1"].includes(priorityOf(finding))) return "urgency";
+  const file = finding.affectedFile || "";
+  if (/^infra\/migrations\/.*credit_balance/i.test(file) || /^services\/api\/app\/billing\//i.test(file)) return "domain";
+  if (dangerZones.some((zone) => file === zone || file.startsWith(`${zone}/`))) return "domain";
+  if (/\/migrations?\//i.test(file) || HIGH_BLAST_RADIUS.test(file)) return "high-blast-radius";
+  return classifyBatchSafety(`${finding.title || ""}\n${finding.body || ""}`) === "billing" ? "domain" : null;
 }
 
 function sourcePr(body = "") {
@@ -435,141 +471,59 @@ function defectClass(body = "") {
   return body.match(/<!-- FORGE:CLASS: ([a-z0-9]+(?:-[a-z0-9]+)*) -->/)?.[1] || null;
 }
 
-/**
- * Determine whether a finding is eligible before it is admitted to the shared batching pool.
- * Callers pass the full title/body/labels so this rule cannot drift by admission point.
- */
-export function isBatchableP3Finding(finding) {
-  if (!finding || finding.isBatch || priorityOf(finding.labels) !== "P3" || !finding.affectedFile) return false;
-  const labels = new Set((finding.labels || []).map((label) => (typeof label === "string" ? label : label?.name)));
-  if ([...BATCH_EXCLUSION_LABELS].some((label) => labels.has(label))) return false;
-  return !BATCH_EXCLUSION.test(`${finding.title || ""}\n${finding.problem || finding.body || ""}`);
-}
-
-function chunk(members, size, minimum) {
-  const chunks = [];
-  for (let offset = 0; offset < members.length; offset += size) {
-    const next = members.slice(offset, offset + size);
-    if (next.length >= minimum) chunks.push(next);
-  }
-  return chunks;
+function leafDirectory(file = "") {
+  const slash = file.lastIndexOf("/");
+  return slash > 0 ? file.slice(0, slash) : null;
 }
 
 /**
- * Plan batching over the complete current candidate set, not only this cycle's arrivals.
- * Open batches are extended before a new batch is created; callers execute the returned
- * actions with GitHub and retain the returned singleton reasons for the run summary.
+ * Plan P3 batches from already safety-filtered, open, unbatched, undispatched
+ * findings. The caller executes these groups and preserves unclaimed findings
+ * for a later full-queue sweep.
  */
-export function planP3Batches({ candidates = [], openBatches = [], now = Date.now(), rules = P3_BATCHING_RULES } = {}) {
-  const repoOf = (item) => item.repo || "default";
-  const candidateId = (finding) => finding.id || `${repoOf(finding)}:${finding.number}`;
-  const action = (details, members) => ({
-    ...details,
-    members: members.map((finding) => finding.number),
-    memberIds: members.map(candidateId),
-  });
-  const eligible = [...new Map(candidates.filter(isBatchableP3Finding).map((finding) => [candidateId(finding), finding])).values()]
-    .sort((a, b) => `${repoOf(a)}:${a.number}`.localeCompare(`${repoOf(b)}:${b.number}`, undefined, { numeric: true }));
-  const remaining = new Map(eligible.map((finding) => [candidateId(finding), finding]));
-  const actions = [];
+export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES, { openBatches = [], dangerZones = [] } = {}) {
+  const remaining = new Map(
+    findings
+      .filter((finding) => finding?.number && finding.affectedFile && !batchExclusionReason(finding, dangerZones))
+      .map((finding) => [finding.number, finding]),
+  );
+  const groups = [];
+  const extensions = [];
 
-  for (const batch of [...openBatches].sort((a, b) => `${repoOf(a)}:${a.number}`.localeCompare(`${repoOf(b)}:${b.number}`, undefined, { numeric: true }))) {
-    // Persistent registries retain every candidate, including members already absorbed by a batch.
-    // Remove those members before planning so repeated admission events can only add new findings.
-    for (const member of batch.members || []) {
-      const memberId = typeof member === "object" ? candidateId(member) : `${repoOf(batch)}:${member}`;
-      remaining.delete(memberId);
-    }
+  for (const batch of openBatches) {
     const key = batch.affectedFile || batch.key;
-    const headroom = rules.maxMembers - Number(batch.memberCount ?? batch.members?.length ?? 0);
+    const headroom = rules.maxMembers - (batch.memberCount ?? batch.members?.length ?? 0);
     if (!key || headroom <= 0) continue;
-    const members = [...remaining.values()].filter((finding) => repoOf(finding) === repoOf(batch) && finding.affectedFile === key).slice(0, headroom);
+    for (const member of batch.members || []) remaining.delete(typeof member === "object" ? member.number : member);
+    const members = [...remaining.values()].filter((finding) => finding.affectedFile === key).slice(0, headroom);
     if (members.length) {
-      actions.push(action({ type: "extend", batch: batch.number, key, ...(repoOf(batch) === "default" ? {} : { repo: repoOf(batch) }) }, members));
-      members.forEach((finding) => remaining.delete(candidateId(finding)));
+      extensions.push({ batch: batch.number, key, members: members.map((finding) => finding.number) });
+      members.forEach((finding) => remaining.delete(finding.number));
     }
   }
 
-  const byFile = new Map();
-  for (const finding of remaining.values()) {
-    const key = `${repoOf(finding)} ${finding.affectedFile}`;
-    const group = byFile.get(key) || [];
-    group.push(finding);
-    byFile.set(key, group);
-  }
-  for (const [compositeKey, members] of [...byFile].sort(([a], [b]) => a.localeCompare(b))) {
-    const [repo, key] = compositeKey.split(" ");
-    for (const membersChunk of chunk(members, rules.maxMembers, rules.sameFileMinimum)) {
-      actions.push(action({ type: "create", grouping: "same-file", key, ...(repo === "default" ? {} : { repo }) }, membersChunk));
-      membersChunk.forEach((finding) => remaining.delete(candidateId(finding)));
-    }
-  }
-
-  const claimBy = (grouping, keyOf, minimum) => {
-    const groups = new Map();
+  const claim = (kind, key, minimum) => {
+    const byKey = new Map();
     for (const finding of remaining.values()) {
-      const key = keyOf(finding);
-      if (!key) continue;
-      const compositeKey = `${repoOf(finding)}\0${key}`;
-      const group = groups.get(compositeKey) || [];
-      group.push(finding);
-      groups.set(compositeKey, group);
+      const groupKey = key(finding);
+      if (!groupKey) continue;
+      const members = byKey.get(groupKey) || [];
+      members.push(finding);
+      byKey.set(groupKey, members);
     }
-    for (const [compositeKey, members] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
-      const [repo, key] = compositeKey.split("\0");
-      for (const membersChunk of chunk(members, rules.maxMembers, minimum)) {
-        actions.push(action({ type: "create", grouping, key, ...(repo === "default" ? {} : { repo }) }, membersChunk));
-        membersChunk.forEach((finding) => remaining.delete(candidateId(finding)));
+    for (const [groupKey, members] of [...byKey].sort(([a], [b]) => a.localeCompare(b))) {
+      while (members.length >= minimum) {
+        const chunk = members.splice(0, rules.maxMembers);
+        groups.push({ kind, key: groupKey, members: chunk.map((finding) => finding.number) });
+        chunk.forEach((finding) => remaining.delete(finding.number));
       }
     }
   };
 
-  claimBy("source-pr", (finding) => sourcePr(finding.body), rules.sourcePrMinimum);
-  claimBy("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
+  claim("same-file", (finding) => finding.affectedFile, rules.sameFileMinimum);
+  claim("source-pr", (finding) => sourcePr(finding.body), rules.sourcePrMinimum);
+  claim("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
+  claim("leaf-directory", (finding) => leafDirectory(finding.affectedFile), rules.leafDirectoryMinimum);
 
-  const byDirectory = new Map();
-  for (const finding of remaining.values()) {
-    const directory = leafDirectory(finding.affectedFile);
-    if (!directory) continue;
-    const key = `${repoOf(finding)} ${directory}`;
-    const group = byDirectory.get(key) || [];
-    group.push(finding);
-    byDirectory.set(key, group);
-  }
-  for (const [compositeKey, members] of [...byDirectory].sort(([a], [b]) => a.localeCompare(b))) {
-    const [repo, key] = compositeKey.split(" ");
-    const oldest = Math.min(...members.map((finding) => new Date(finding.createdAt || now).getTime()));
-    const stale = now - oldest > rules.staleAfterHours * 60 * 60 * 1000;
-    const minimum = stale ? 1 : rules.leafDirectoryMinimum;
-    for (const membersChunk of chunk(members, rules.maxMembers, minimum)) {
-      actions.push(action({ type: "create", grouping: stale ? "age" : "leaf-directory", key, ...(repo === "default" ? {} : { repo }) }, membersChunk));
-      membersChunk.forEach((finding) => remaining.delete(candidateId(finding)));
-    }
-  }
-
-  const singletons = [...remaining.values()].map((finding) => ({ number: finding.number, id: candidateId(finding), reason: "no same-file, leaf-directory, or age cluster" }));
-  return { actions, singletons, eligible: eligible.map(candidateId) };
-}
-
-/** Format policy output for the per-run audit record required by the orchestrator. */
-export function summarizeP3BatchPlan(plan) {
-  const formed = plan.actions.filter((action) => action.type === "create").length;
-  const absorbed = plan.actions.reduce((total, action) => total + action.members.length, 0);
-  const extended = plan.actions.filter((action) => action.type === "extend").length;
-  return { formed, extended, absorbed, singletons: plan.singletons };
-}
-
-/**
- * Compatibility adapter for callers that already performed P3 safety filtering.
- * Grouping decisions remain in planP3Batches so every admission point shares one planner.
- */
-export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES) {
-  const plan = planP3Batches({
-    candidates: findings.map((finding) => ({ ...finding, labels: ["priority:P3"] })),
-    rules,
-  });
-  return {
-    groups: plan.actions.map(({ grouping: kind, key, members }) => ({ kind, key, members })),
-    ungrouped: plan.singletons.map(({ number }) => number),
-  };
+  return { groups, extensions, ungrouped: [...remaining.keys()] };
 }

@@ -474,6 +474,13 @@ for NUM in "${ISSUES[@]}"; do
   fi
 done
 
+# Full-repository intake is intentionally separate from Step 4C's T0-scoped
+# review-finding cascade. It is enabled only for an operator-authorised
+# policy: all run; records every open issue already observed so CI-created
+# actionable work is admitted once rather than rediscovered every cycle.
+declare -A SEEN_OPEN_ISSUES
+FULL_REPO_SWEEP_COUNT=0
+
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
 # dispatch loop below (Step 4B) whenever a Layer 1/2/3 structural predecessor edge (see
 # EDGE_KIND/EDGE_FILES from phase-3-dependency.md Step 3C) resolves; consumed by Step 4A's
@@ -995,8 +1002,9 @@ Agent(
   - For satellite repo issues: `Skill(skill='work-on', args='{SATELLITE_PREFIX}:{NUMBER} --under-orchestration')` (prefix from forge.yaml → repos.satellites)
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
-- **Temp files — ALWAYS use `mktemp`, NEVER hand-roll a path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`). Never write a temp file to a single-segment root path such as `/tmp_invbody_31076.txt`: Claude Code treats removing it as dangerous and requires an explicit approval that bypass mode cannot clear, hanging unattended runs. Also never use a fixed literal such as `/tmp/body.md` or `/tmp/issue.json`: a fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back. Safe: `BODY_FILE="$(mktemp)"`. Unsafe: `/tmp_invbody_31076.txt` (a missing slash that creates a root-level path) and `/tmp/body.md` (a fixed path). `mktemp` costs nothing and prevents both failures. (forge#2198, forge#2855)
+- **File-backed GitHub bodies — entity scope plus read-back is mandatory**: Never stage a `gh --body-file` body at a generic shared `/tmp` path, including one made by bare `mktemp`, and never hand-roll a root-level path such as `/tmp_invbody_31076.txt`, which can hang unattended cleanup. Prefer the session scratchpad or a repo-relative scratch directory on Windows: a native Windows `gh` may not resolve Git Bash `/tmp` reliably. Create a filename that contains the target issue/PR number and an agent-unique token, then use `mktemp` for its random suffix. Put one caller-chosen marker such as `<!-- FORGE:BODY-INTEGRITY:${NUMBER}_investigator_${AGENT_TOKEN} -->` in the body. After every `gh issue create|edit` or `gh pr create|comment` using `--body-file`, re-read the target object and assert the exact marker is present; a mismatch is a hard error. Unique names reduce collisions, but only read-back detects a collision that substitutes plausible-looking content from another agent. Do not rely on eyeballing. (forge#2843, forge#2855) <!-- allowlist:check-command-side-effects -->
 - **GitHub secondary rate limit**: If a GitHub API call returns HTTP 403 with `secondary rate limit` in its response, do NOT retry it or start a polling loop. Stop GitHub content creation for this phase, report the status and response body to the orchestrator in your final result, and wait for a later batch resume. Retrying extends the throttle for every sibling.
+- **Temp files — ALWAYS use `mktemp`, NEVER hand-roll a path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`). Never write a temp file to a single-segment root path such as `/tmp_invbody_31076.txt`: Claude Code treats removing it as dangerous and requires an explicit approval that bypass mode cannot clear, hanging unattended runs. Also never use a fixed literal such as `/tmp/body.md` or `/tmp/issue.json`: a fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back. Safe: `BODY_FILE="$(mktemp)"`. Unsafe: `/tmp_invbody_31076.txt` (a missing slash that creates a root-level path) and `/tmp/body.md` (a fixed path). `mktemp` costs nothing and prevents both failures. (forge#2198, forge#2855)
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
 - NEVER target `main` for PRs targeting the default repo. Use `{STAGING_BRANCH}` for fast-lane issues, or `milestone/{slug}` for milestone issues.
 - Satellite repos (MCP, n8n) have no staging branch — fast-lane PRs go to `main` for those.
@@ -2002,8 +2010,6 @@ import("{REPO_PATH}/bin/engine/resolve.mjs").then(({ foldNewMatches }) => {
 
 `newMatches` from `foldNewMatches` are candidate issues, not admitted ones. Each one MUST be dispatched through the exact same path a T0-resolved issue takes — DAG dependency analysis (`phase-3-dependency.md`), then Step 4A/4B's standard `dispatch_headroom`-gated dispatch — **not** through Step 4C's review-finding-specific `evaluateCascadeFinding` chain (that gate's rules, e.g. the comment/typo keyword heuristic, are shaped for cascade-spawned findings, not arbitrary re-resolved issues). This is the same non-bypass requirement Step 4C already satisfies for its own admission stream; this step must not become a second, ungated entry point into the DAG. Add every `newMatch` to `ALL_BATCH_ISSUE_NUMBERS` (so a later re-resolution round or Step 4C sees it as already processed) and to `SORTED_READY_SET`/the DAG exactly as Step 4A.pre.0 processes a T0-resolved issue.
 
-Also add every new match to `BATCH_CANDIDATE_REGISTRY` and invoke `planP3Batches()` before dispatch. The registry includes prior-cycle singletons and original batch candidates, so predicate re-resolution can extend an existing under-cap batch or form a newly eligible cluster instead of dispatching a matching finding alone. <!-- Added: forge#2851 -->
-
 **Reporting (mandatory — do not let this become an alert-only dead-code path, per forge#1832)**: track which issues were T0-resolved vs. admitted via re-resolution, and which round each entered in. Surface this distinction in the final report (`phase-6-report.md`) rather than only in a log line — a run whose predicate still matches unadmitted work at exit (round cap or config disabled mid-run) must say so explicitly, not report a silent clean drain.
 
 **Multi-repo**: for `all-repos`/satellite-scoped queries (`next <N> all-repos`, `mcp:fast`, etc.), re-run the query against every repo the original resolution covered — not just the default repo.
@@ -2107,6 +2113,56 @@ that mode only exists as the explicit, one-shot `--include-backlog` opt-in at Ph
 (a human directly asking for it); Step 4C runs autonomously on every completion cycle and must
 never silently widen to the full backlog regardless of any flag, since nothing here is a
 human-in-the-loop request. <!-- Added: forge#2628 -->
+
+### Step 4C.0: Full-repository actionable-issue intake (`policy: all` only)
+
+An operator-authorised `orchestration.cascade.policy: all` run must also check for newly-created
+open issues that its own agents did not report and that lack `review-finding`. Run this sweep
+after every five terminal completions, before the next dispatch cycle. It is not a cascade
+replacement: Step 4C's `BATCH_T0` filter still governs review-finding recursion.
+
+At batch start, seed `SEEN_OPEN_ISSUES` with the initial resolved issue set. On each sweep, list
+the complete open set (`gh issue list --state open --limit 500 --json number,title,labels`), diff
+it against `SEEN_OPEN_ISSUES`, then mark every returned number seen whether or not it is admitted.
+For each newly-seen issue, add it to the normal Phase 3 DAG intake only when it has no terminal or
+in-progress workflow label, `needs-human`, or `workflow:decomposed`; preserve its labels and
+record why every excluded issue was skipped. Do not filter on `review-finding`, author, creation
+time, or agent trajectory. This is how CI-created issues enter an all-policy run without silently
+adopting pre-existing work in other policies.
+
+```bash
+if [ "$CASCADE_POLICY_NAME" = "all" ] && [ "$((TERMINAL_COMPLETIONS % 5))" -eq 0 ] && \
+   [ "$TERMINAL_COMPLETIONS" -gt "$FULL_REPO_SWEEP_COUNT" ]; then
+  FULL_REPO_SWEEP_COUNT=$TERMINAL_COMPLETIONS
+  FULL_REPO_OPEN=$(gh issue list -R {GH_REPO} --state open --limit 500 --json number,title,labels)
+  while IFS= read -r ISSUE; do
+    NUM=$(echo "$ISSUE" | jq -r '.number')
+    [ -n "${SEEN_OPEN_ISSUES[$NUM]:-}" ] && continue
+    SEEN_OPEN_ISSUES[$NUM]=1
+    LABELS=$(echo "$ISSUE" | jq -r '[.labels[].name] | join(",")')
+    if echo "$LABELS" | grep -qE '(^|,)(workflow:(merged|invalid|awaiting-merge|building|in-review|decomposed)|needs-human)(,|$)'; then
+      echo "Full-repo intake: #${NUM} seen but not admitted (terminal, in-progress, or human-gated)"
+      continue
+    fi
+    FULL_REPO_INTAKE+=("$NUM")
+    echo "Full-repo intake: admitted newly-seen actionable issue #${NUM}"
+  done < <(echo "$FULL_REPO_OPEN" | jq -c '.[]')
+  # Feed FULL_REPO_INTAKE through the existing Phase 3 extraction/DAG/claims gates.
+fi
+```
+
+### Step 4C.1: Mechanical automated-alert deduplication (`policy: all` opt-in)
+
+`orchestration.cascade.dedup_automated: true` permits a narrow exception to the normal
+no-dedup rule for newly-seen automated alerts. Select one lowest-numbered canonical issue and
+close another issue only when all of these are true: both authors are bot/app accounts; normalized
+titles are identical; the generator identity is identical; the triggering condition is identical;
+and the closing comment links the retained canonical issue. Never apply title similarity to a
+human-authored report, or when generator/trigger provenance is absent or differs. The reference
+predicate is `canDeduplicateAutomatedAlert()` in `bin/engine/admission.mjs`.
+
+This opt-in handles mechanically identical alerts, not substantive bug adjudication. All other
+possible duplicates remain separate and go through investigation.
 
 ```bash
 # Method 1: Read TRAJECTORY comments from completed issues for "Finding issues" row
@@ -2320,30 +2376,33 @@ for FINDING_NUM in {spawned_finding_numbers}; do
           # as its own outcome and fail closed, mirroring the concurrent-edit branch below
           # rather than silently falling through to the unprotected write.
           echo "REPAIR: #${FINDING_NUM} skipped — freshness re-fetch failed (network error or API rate limit); cannot verify no concurrent edit occurred, failing closed instead of risking a silent clobber"
-          # forge#2584: stage the body in a mktemp file and deliver it via --body-file
-          # instead of interpolating finding-derived variables (${FINDING_NUM},
-          # ${REPAIR_SOURCE_PR}, ${REPAIR_PARENT_BASE}, ${FINDING_UPDATED_AT_SNAPSHOT})
-          # directly into a double-quoted --body argument at the gh call site — mirrors
-          # REPAIRED_BODY's existing printf-into-variable approach and the repo-wide
-          # mktemp + --body-file convention (forge#2198). mktemp avoids /tmp path
-          # collisions with other concurrently-running orchestrated agents.
-          GATE_BODY_TMPFILE="$(mktemp)"
+          # Scope the scratch name to both this finding and this orchestrator process.
+          # The marker read-back below detects a plausible-looking body substitution.
+          SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+          AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-orchestrator}-$$}"
+          mkdir -p "$SCRATCHPAD"
+          GATE_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}"
+          GATE_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Freshness Re-fetch Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->" > "$GATE_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->
+<!-- ${GATE_BODY_MARKER} -->" > "$GATE_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$GATE_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${GATE_BODY_MARKER} -->" || { echo "ERROR: freshness-gate comment marker missing" >&2; exit 1; }
           rm -f "$GATE_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # freshness-recheck-failure path
         elif [ "$FINDING_UPDATED_AT_CURRENT" != "$FINDING_UPDATED_AT_SNAPSHOT" ]; then
           echo "REPAIR: #${FINDING_NUM} skipped — concurrent edit detected (updatedAt changed from ${FINDING_UPDATED_AT_SNAPSHOT} to ${FINDING_UPDATED_AT_CURRENT} since this iteration's initial read); flagging instead of repairing"
-          # forge#2584: mktemp + --body-file, same rationale as the freshness-recheck-failure path above.
-          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp)"
+          CONCURRENT_EDIT_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}"
+          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Concurrent Edit Detected
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->
+<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$CONCURRENT_EDIT_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" || { echo "ERROR: concurrent-edit comment marker missing" >&2; exit 1; }
           rm -f "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # concurrent-edit path
         else
@@ -2354,13 +2413,15 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
           FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
             --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
         else
-          # forge#2584: mktemp + --body-file, same rationale as the two failure paths above.
-          REPAIR_FAILED_BODY_TMPFILE="$(mktemp)"
+          REPAIR_FAILED_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_repair-failure_${AGENT_TOKEN}"
+          REPAIR_FAILED_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_repair-failure_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->" > "$REPAIR_FAILED_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->
+<!-- ${REPAIR_FAILED_BODY_MARKER} -->" > "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$REPAIR_FAILED_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${REPAIR_FAILED_BODY_MARKER} -->" || { echo "ERROR: repair-failure comment marker missing" >&2; exit 1; }
           rm -f "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # repair-failure path
         fi
@@ -2416,8 +2477,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
       BATCHABLE_DEFERRED_P3+=("$FINDING_NUM")
       DEFER_REASON="generation ${FINDING_GENERATION} — eligible for bounded P3 batching only"
     fi
-  # Priority override: P1 or P2 always execute — skip remaining heuristics
-  elif [ "$PRIORITY" = "P1" ] || [ "$PRIORITY" = "P2" ]; then
+   # Priority override: P0/P1 always execute; P2 is eligible for batch planning.
+   elif [ "$PRIORITY" = "P0" ] || [ "$PRIORITY" = "P1" ]; then
     DEFER=false
   # Heuristic 2: Comment/typo keyword (only applies to P3 and below)
   # Gated by CASCADE_KEYWORD_HEURISTIC (orchestration.cascade, forge#2234).
@@ -2463,88 +2524,11 @@ done
 
 **Concern-level batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
-Cascade-spawned findings collected within a single `/orchestrate` run must be evaluated by the same implementation as initial resolution. Maintain `BATCH_CANDIDATE_REGISTRY` for the whole run: initial resolved issues, every `QUEUED_FINDINGS` admission, predicate re-resolution matches, completion-sweep candidates, and prior-cycle singletons. Parse open batch issues and pass both collections to `planP3Batches()` from `bin/engine/admission.mjs` after every admission event; execute its `create` and `extend` actions, retain its singletons, and append `summarizeP3BatchPlan()` to the per-run audit summary. The shared ordered policy groups same-file, source-PR cohort, defect-class, then leaf-directory candidates; do not rebuild a per-cycle-only `SURFACE_FILE_MEMBERS` map or impose a separate scan cap. <!-- Added: forge#2851, forge#2858 -->
+Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched candidate registry, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates, new findings, and open batch membership; call `planP3BatchGroups()` with that registry and `batchExclusionReason()` danger-zone inputs. Execute returned `extensions` before new groups, retain `ungrouped` members for the next sweep, and record group kinds or exclusion predicates in the run summary. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
 
-The legacy shell block below is retained only for action execution details. Its duplicate eligibility/grouping logic must not be used to make batching decisions; the typed evaluator is authoritative.
-
-```bash
-# BATCH_CANDIDATE_REGISTRY_JSON and OPEN_BATCHES_JSON persist at batch scope. Recompute
-# the plan after Step 4B.6, Step 4C, and Step 4F; action.memberIds are repo-qualified.
-BATCH_PLAN=$(node -e '
-  import("{REPO_PATH}/bin/engine/admission.mjs").then(({ planP3Batches, summarizeP3BatchPlan }) => {
-    const plan = planP3Batches({ candidates: JSON.parse(process.argv[1]), openBatches: JSON.parse(process.argv[2]) });
-    console.log(JSON.stringify({ plan, summary: summarizeP3BatchPlan(plan) }));
-  });
-' "$BATCH_CANDIDATE_REGISTRY_JSON" "$OPEN_BATCHES_JSON")
-
-# The evaluator is the only batching decision-maker. Execute every returned action before
-# dispatching: remove absorbed members from QUEUED_FINDINGS, retain only its singletons in
-# the registry, and refresh OPEN_BATCHES_JSON after mutations for the next admission event.
-while IFS= read -r ACTION; do
-  ACTION_TYPE=$(echo "$ACTION" | jq -r '.type')
-  ACTION_REPO=$(echo "$ACTION" | jq -r '.repo // "{GH_REPO}"')
-  ACTION_MEMBERS=($(echo "$ACTION" | jq -r '.members[]'))
-  [ "${#ACTION_MEMBERS[@]}" -gt 0 ] || continue
-
-  if [ "${DRY_RUN:-false}" = "true" ]; then
-    echo "DRY_RUN: would ${ACTION_TYPE} P3 batch members: ${ACTION_MEMBERS[*]}"
-    continue
-  fi
-
-  if [ "$ACTION_TYPE" = "extend" ]; then
-    BATCH_NUMBER=$(echo "$ACTION" | jq -r '.batch')
-    BATCH_BODY=$(gh issue view "$BATCH_NUMBER" -R "$ACTION_REPO" --json body --jq '.body')
-    MEMBER_LINES=""
-    for MEMBER in "${ACTION_MEMBERS[@]}"; do
-      MEMBER_TITLE=$(gh issue view "$MEMBER" -R "$ACTION_REPO" --json title --jq '.title')
-      MEMBER_LINES="${MEMBER_LINES}- [ ] #${MEMBER}: ${MEMBER_TITLE}"$'\n'
-    done
-    UPDATED_BATCH_BODY=$(printf '%s' "$BATCH_BODY" | sed "/<!-- \/FORGE:BATCH_MEMBERS -->/i\\${MEMBER_LINES}")
-    gh issue edit "$BATCH_NUMBER" -R "$ACTION_REPO" --body "$UPDATED_BATCH_BODY"
-    BATCH_ISSUE_NUM="$BATCH_NUMBER"
-  else
-    ACTION_KEY=$(echo "$ACTION" | jq -r '.key' | tr -cd 'A-Za-z0-9._/-')
-    MEMBER_LINES=""
-    for MEMBER in "${ACTION_MEMBERS[@]}"; do
-      MEMBER_TITLE=$(gh issue view "$MEMBER" -R "$ACTION_REPO" --json title --jq '.title')
-      MEMBER_LINES="${MEMBER_LINES}- [ ] #${MEMBER}: ${MEMBER_TITLE}"$'\n'
-    done
-    BATCH_ISSUE_NUM=$(gh issue create -R "$ACTION_REPO" \
-      --title "fix(batch): P3 review findings - ${ACTION_KEY} (batch)" \
-      --label "review-finding,priority:P3,batch" \
-      --body "## Problem
-
-Batch of P3 review findings grouped by the shared ${ACTION_TYPE} policy.
-
-## Member Findings
-
-<!-- FORGE:BATCH_MEMBERS -->
-${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
-
-## Acceptance Criteria
-
-- [ ] All member findings addressed or closed as false-positive
-- [ ] Member issues auto-closed with reference to this batch PR on merge
-
-<!-- FORGE:BATCHABLE -->" --json number --jq '.number')
-  fi
-
-  SURFACE_BATCHED_FINDINGS+=("${ACTION_MEMBERS[@]}")
-  QUEUED_FINDINGS=($(printf '%s\n' "${QUEUED_FINDINGS[@]}" | grep -vxF -f <(printf '%s\n' "${ACTION_MEMBERS[@]}") || true))
-  [ -n "$BATCH_ISSUE_NUM" ] && QUEUED_FINDINGS+=("$BATCH_ISSUE_NUM")
-done < <(echo "$BATCH_PLAN" | jq -c '.plan.actions[]')
-
-BATCH_CANDIDATE_REGISTRY_JSON=$(echo "$BATCH_PLAN" | jq -c --argjson candidates "$BATCH_CANDIDATE_REGISTRY_JSON" \
-  '.plan.singletons as $singletons | $candidates | map(select(.id as $id | $singletons | any(.id == $id)))')
-OPEN_BATCHES_JSON=$(gh issue list {GH_FLAG} --state open --label batch --limit 500 --json number,body \
-  --jq '[.[] | {number, affectedFile: (.body | capture("Batch of P3 review findings in \*\*(?<file>[^*]+)\*\*").file? // ""), members: [.body | scan("- \\[ \\] #(?<number>[0-9]+)") | .number | tonumber]}]')
-P3_BATCH_SUMMARIES+=("$(echo "$BATCH_PLAN" | jq -c '.summary')")
-```
-
-The retired same-file-only loop below is historical reference for issue-body formatting only. It is not executable policy: it must remain disabled so it cannot override evaluator actions or reintroduce the per-cycle scan cap.
+The per-cycle `QUEUED_FINDINGS` loop below remains the action-creation mechanism, but it MUST consume the complete-sweep planner output rather than decide groups from its local same-file map. Do not dispatch a locally ungrouped member until the next periodic sweep has considered it against the retained candidate set.
 
 ```bash
-if false; then
 # Group QUEUED_FINDINGS by exact affected file, reusing the SAME safety
 # exclusions as phase-1-resolve.md. Both sites go through jq test() (Oniguruma)
 # with identical patterns — NOT grep ERE — so the two batching checks cannot
@@ -2748,7 +2732,6 @@ BATCH_EOF
     echo "Batched ${#CHUNK[@]} findings into #${BATCH_ISSUE_NUM}; members removed from QUEUED_FINDINGS and the DAG."
   done
 done
-fi
 ```
 
 Findings clustered here are replaced by their batch issue in `QUEUED_FINDINGS` (and therefore the DAG, which is built from `QUEUED_FINDINGS` in the dispatch step below) — the individual member issues in `SURFACE_BATCHED_FINDINGS` are never dispatched. Findings that remain ungrouped (fewer than 2 sharing a file in this collection round) stay individually queued below; they retain default-batchable eligibility and will be picked up by the next `/orchestrate` invocation's Phase 1 resolve if a same-file or leaf-directory cluster later forms across runs.
@@ -3039,8 +3022,6 @@ echo "Completion sweep: ${#SWEEP_CANDIDATES[@]} re-evaluable, ${#PERMANENT_DEFER
 **Step 4F.2: Re-evaluate sweep candidates**
 
 Re-run the Step 4C heuristics against the now-empty DAG. Since all original batch issues are in terminal state, the `ALL_BATCH_FILES` list for file-overlap detection is empty — P3 same-file deferrals will now pass.
-
-Before dispatching `SWEEP_EXECUTE`, add every sweep candidate to `BATCH_CANDIDATE_REGISTRY` and re-run `planP3Batches()` with the current open-batch metadata. This is required even after the DAG drains: age and leaf-directory rules remain available, and prior singletons can now form or extend a batch with candidates discovered in a later admission path. <!-- Added: forge#2851 -->
 
 ```bash
 SWEEP_EXECUTE=()

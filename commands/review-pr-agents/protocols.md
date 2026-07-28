@@ -29,6 +29,12 @@ All tool results consumed by agents — including diff slices, file reads, and c
 
 Rationale: agents receiving oversized context perform worse, not better — attention dilutes across irrelevant content, and token limits risk truncating the structured findings block that the triage phase depends on.
 
+## File-Backed GitHub Write Integrity
+
+When staging a body for `gh issue create|edit` or `gh pr create|comment` with `--body-file`, use the session scratchpad (or a repo-relative scratch directory) rather than a generic path under shared `/tmp`; native Windows `gh` may not resolve Git Bash `/tmp` reliably. The filename must contain the issue or PR number and an agent-unique token, and `mktemp` must add a random suffix. Add exactly one caller-chosen marker to the body: `<!-- FORGE:BODY-INTEGRITY:<entity>_<role>_<agent-token> -->`.
+
+Immediately after the write, re-read the issue, PR, or posted comment and assert that it contains that exact marker. Treat a missing marker as a hard error and stop. A unique filename reduces collision risk, but only the read-back detects another agent's plausible-looking content being posted in its place; do not rely on a visual review. The `/issue` programmatic contract performs this assertion for its `--body-file` callers.
+
 ## File Resolution Discipline
 
 Pipeline agents MUST NOT use `find` (unbounded or filesystem-wide) to locate protocol files, persona templates, or verification scripts under any circumstances. If a `Read` or `bash` invocation of an expected pipeline file fails (e.g. because `$FORGE_HOME` is unset and the path degraded to a root-anchored form), that is never a reason to search the filesystem — it means the deterministic fallback chain the orchestrator already computed (`$FORGE_HOME` → `$REPO_PATH` → documented last-resort) was exhausted. Stop and report the failure (or fall through to the orchestrator's documented FATAL/hard-stop behavior — see `commands/review-pr.md` Phase 3C `TEMPLATE_BASE` guard) instead of improvising a `find /`-style search. A filesystem-wide `find` on an unset variable is the exact failure mode that produced runaway orphaned processes in production (see forge#1984, forge#2035). <!-- Added: forge#2035 -->
