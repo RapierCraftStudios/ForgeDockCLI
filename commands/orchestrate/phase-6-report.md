@@ -1,4 +1,5 @@
 ---
+
 install: core
 ---
 <!-- SPDX-FileCopyrightText: Copyright (c) RapierCraft Studios -->
@@ -338,6 +339,9 @@ current session's live wake pick them up automatically if it is still running).
 | Actual spend (best-effort telemetry) | ${ACTUAL_SPEND:-—} |
 | Issues deferred (budget ceiling) | {#DEFERRED_BUDGET_ISSUES[@]:-0} |
 | ε-reserve issued (no-prior dispatch) | {EPSILON_DISPATCHED:-no} |
+| Top-level workers dispatched | ${TOP_LEVEL_DISPATCH_TOTAL:-0} |
+| Subagent spawns planned (8 per worker) | ${PLANNED_SUBAGENT_SPAWNS:-0} |
+| Subagent spawns observed | ${OBSERVED_SUBAGENT_SPAWNS:-unavailable} |
 | **Value-weighted throughput** | **{VALUE_THROUGHPUT:-—} value-pts/USD** |
 
 `value-weighted throughput` = Σ(priority_weight × danger_zone_weight) for **merged** issues ÷ actual spend (USD). A higher value means more high-priority issues were resolved per dollar. Trend this across runs via `/pipeline-health` to measure the economic scheduling ROI. <!-- Added: forge#1743 -->
