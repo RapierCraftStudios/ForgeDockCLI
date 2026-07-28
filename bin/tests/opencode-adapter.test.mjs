@@ -105,8 +105,8 @@ describe("OpenCode adapter", () => {
     assert.match(output, /genuinely absent.*FORGE:REVIEW_BLOCKED/s);
     assert.match(output, /top-level argument object shaped like/);
     assert.match(output, /general-purpose.*general.*codebase-explorer.*explore/s);
-    assert.match(output, /preserve explicit `background: false`/i);
-    assert.match(output, /task-result event/i);
+    assert.match(output, /Omitted `background` means foreground/i);
+    assert.match(output, /child-session id/i);
     assert.equal(shellPath("C:\\Forge Dock\\commands", "win32"), "/c/Forge Dock/commands");
   });
 
@@ -186,6 +186,8 @@ describe("OpenCode adapter", () => {
       assert.match(source, /DISPATCH_TOOL\s*[=:]\s*task/);
       assert.match(source, /subagent_type[^\n]+general/);
       assert.match(source, /subagent_type[^\n]+explore/);
+      assert.match(source, /foreground|background: false/i);
+      assert.doesNotMatch(source, /Use `background: true` for independent reviewers/);
     }
   });
 
@@ -297,12 +299,16 @@ describe("OpenCode adapter", () => {
     const implementation = { description: "implementation", prompt: "implement the fix", subagent_type: "general-purpose" };
     await dispatch(implementation);
     assert.equal(implementation.subagent_type, "general");
-    assert.equal(implementation.background, true);
+    assert.equal(implementation.background, false);
 
     const review = { description: "review", prompt: "review the change", subagent_type: "general", background: false };
     await dispatch(review);
     assert.equal(review.subagent_type, "general");
     assert.equal(review.background, false);
+
+    const orchestration = { description: "orchestration", prompt: "dispatch an issue", subagent_type: "general", background: true };
+    await dispatch(orchestration);
+    assert.equal(orchestration.background, true);
 
     const discovery = { description: "discovery", prompt: "inspect callers", subagent_type: "codebase-explorer" };
     await dispatch(discovery);
@@ -311,7 +317,7 @@ describe("OpenCode adapter", () => {
     const missing = { description: "default", prompt: "use the safe default" };
     await dispatch(missing);
     assert.equal(missing.subagent_type, "general");
-    assert.equal(missing.background, true);
+    assert.equal(missing.background, false);
 
     await assert.rejects(
       dispatch({ description: "invalid", prompt: "do not run", subagent_type: "unknown" }),
@@ -337,7 +343,11 @@ describe("OpenCode adapter", () => {
       const args = { description: "foreground", prompt: "run in degraded mode" };
       await hooks["tool.execute.before"]({ tool: "task" }, { args });
       assert.equal(args.subagent_type, "general");
-      assert.equal(args.background, undefined);
+      assert.equal(args.background, false);
+
+      const explicitBackground = { description: "background", prompt: "must remain foreground", background: true };
+      await hooks["tool.execute.before"]({ tool: "task" }, { args: explicitBackground });
+      assert.equal(explicitBackground.background, false);
 
       const shellOutput = { env: {} };
       await hooks["shell.env"]({}, shellOutput);

@@ -49,7 +49,7 @@ if [ "${FORGE_RUNTIME:-}" = "opencode" ] ||
 fi
 ```
 
-When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Use `background: true` for independent reviewers so the parent can process each completion event without a wave barrier. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
+When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Review tasks are foreground: wait for their completed result before synthesis. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
 
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping.
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected domain agent, same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
@@ -1538,9 +1538,9 @@ The `protocols.md` file contains the Evidence-Based Review Protocol, Structured 
 6. Substitute code index slice: `[INDEX_SLICE]` → the matching `$INDEX_SLICE_{DOMAIN}` variable for this agent (e.g., `$INDEX_SLICE_AUTH` for the auth agent). Agents MUST query index data first; fall back to grep only when index slice is empty or unavailable.
 7. Substitute per-agent diff slice: `[DOMAIN_DIFF_SLICE]` → the matching `$DIFF_SLICE_*` variable (e.g., `$DIFF_SLICE_AUTH` for the auth agent, `$DIFF_SLICE_SECURITY` for the security agent). This replaces any `gh pr diff [PR_NUMBER]` call inside the agent template — the agent works from the pre-computed slice, not the full changeset.
 8. If Phase 2.5 found broken assumptions, append them to the agent's prompt as "Pre-found integration issues to verify"
-9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: true` for each independent reviewer.
+9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: false` for each reviewer.
 
-**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent posts findings directly to the PR via `gh pr comment`.
+**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent must persist its finalized body before posting it with `gh pr comment --body-file`, include `<!-- FORGE:REVIEW-AGENT:{lowercase-domain} -->`, and return its verdict and findings to the orchestrator independently of GitHub delivery.
 
 #### Domain Diff Slicing
 
@@ -1569,9 +1569,29 @@ When substituting `[FILE_LIST]` in each agent's template:
 ```bash
 gh pr view $ARGUMENTS --json comments --jq '.comments | length'
 gh api repos/{owner}/{repo}/issues/$ARGUMENTS/comments --jq '.[-10:] | .[].body[:100]'
+
+# Every dispatched agent must have delivered its own persisted review to GitHub.
+# Do not infer a clean review from a missing comment: its return text may contain
+# findings that could not be posted because GitHub writes were throttled.
+MISSING_AGENT_COMMENTS=""
+for AGENT in $SELECTED_AGENTS; do
+    AGENT_DOMAIN=$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')
+    AGENT_COMMENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+        --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+        2>/dev/null || printf '0')
+    if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+        MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+    fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+    echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+    echo "Use each agent's returned verdict, findings, and durable body path to recover the review."
+    exit 1
+fi
 ```
 
-**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, the initial `task(..., background: true)` result with `state="running"` is not completion; wait for and process each injected `task` result event, then verify the corresponding structured PR comment before continuing.
+**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing. A missing comment is an explicit delivery failure: do not synthesize a verdict or treat it as a clean result.
 
 ---
 

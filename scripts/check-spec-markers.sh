@@ -100,6 +100,7 @@ MARKER_REGISTRY="
   DECISION_RECORD
   DECOMPOSED
   DESIGN
+  DISPATCH
   DISPATCHER
   DOSSIER_UPDATED
   ENGINE_FALLBACK
@@ -187,28 +188,29 @@ while IFS= read -r file; do
     content="${markerline#*:}"
 
     # Skip allowlisted lines
-    if echo "$content" | grep -qF "$ALLOWLIST_TOKEN"; then
+    if [[ "$content" == *"$ALLOWLIST_TOKEN"* ]]; then
       continue
     fi
 
     # Skip markers that are inside code spans (backtick-quoted) — those are docs examples
     # Heuristic: if the FORGE:TYPE appears between backticks on the same line, skip it
     # We check for backtick on either side of the FORGE: marker
-    if echo "$content" | grep -qE "\`[^\`]*FORGE:[A-Z_]"; then
+    if [[ "$content" =~ \`[^\`]*FORGE:[A-Z_] ]]; then
       continue
     fi
 
     # Extract the full marker string after FORGE: — everything up to a space, -->, or end
     # This captures compound markers like REVIEW-AGENT:material-change
-    full_marker=$(echo "$content" | grep -oE 'FORGE:[A-Z][A-Z0-9_:-]*' | head -1 | sed 's/^FORGE://')
+    [[ "$content" =~ FORGE:([A-Z][A-Z0-9_:-]*) ]] || continue
+    full_marker="${BASH_REMATCH[1]}"
 
     [ -z "$full_marker" ] && continue
 
     # Extract PRIMARY type: part before the first - or : separator
-    primary_type=$(echo "$full_marker" | sed 's/[-:].*//')
+    primary_type="${full_marker%%[-:]*}"
 
     # Validate primary type against registry
-    if ! echo "$primary_type" | grep -qE "$REGISTRY_PATTERN"; then
+    if ! [[ "$primary_type" =~ $REGISTRY_PATTERN ]]; then
       echo "HIGH | $file:$lineno | unknown FORGE: marker 'FORGE:${full_marker}' (primary type '${primary_type}') — not in registry" >&2
       VIOLATIONS=$((VIOLATIONS + 1))
     fi
@@ -242,21 +244,27 @@ if [ -d "$WORKFLOWS_DIR" ]; then
       LINENO=$((LINENO + 1))
 
       # Skip allowlisted lines
-      if echo "$line" | grep -qF "$ALLOWLIST_TOKEN"; then
+      if [[ "$line" == *"$ALLOWLIST_TOKEN"* ]]; then
         continue
       fi
 
       # Skip comment lines
-      if echo "$line" | grep -qE '^[[:space:]]*#'; then
+      if [[ "$line" =~ ^[[:space:]]*# ]]; then
         continue
       fi
 
       # Strip bash ${VAR} and $VAR patterns before checking for template placeholders
       # so that ELAPSED in "${ELAPSED}s" doesn't false-positive as {ELAPSED}
-      stripped=$(echo "$line" | sed 's/\${\([^}]*\)}/BASH_VAR/g; s/\$[A-Za-z_][A-Za-z0-9_]*/BASH_VAR/g')
+      stripped="$line"
+      while [[ "$stripped" =~ \$\{[^}]*\} ]]; do
+        stripped="${stripped/"${BASH_REMATCH[0]}"/BASH_VAR}"
+      done
+      while [[ "$stripped" =~ \$[A-Za-z_][A-Za-z0-9_]* ]]; do
+        stripped="${stripped/"${BASH_REMATCH[0]}"/BASH_VAR}"
+      done
 
-      if echo "$stripped" | grep -qE "$PLACEHOLDER_PATTERN"; then
-        placeholder=$(echo "$stripped" | grep -oE "$PLACEHOLDER_PATTERN" | head -1)
+      if [[ "$stripped" =~ $PLACEHOLDER_PATTERN ]]; then
+        placeholder="${BASH_REMATCH[0]}"
         echo "HIGH | $wf_file:$LINENO | unsubstituted placeholder '$placeholder' in workflow" >&2
         VIOLATIONS=$((VIOLATIONS + 1))
       fi

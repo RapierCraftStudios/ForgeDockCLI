@@ -427,6 +427,26 @@ const RM_SEGMENT_SPLIT_RE = /[;&|`]+|\$\(/;
 const HEREDOC_OPEN_RE = /(<<-?)\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/;
 
 // ---------------------------------------------------------------------------
+// Rule 7 constants (issue #2686) — content-staging temp-path (mktemp) guard.
+// ---------------------------------------------------------------------------
+
+const CONTENT_STAGING_FLAGS = new Set(["--body-file", "--notes-file"]);
+const CONTENT_STAGING_SHORT_FLAG = "-F";
+const COLLISION_SAFE_MARKERS = [
+  /mktemp/i,
+  /\$\$/,
+  /\$\{?RANDOM\b/,
+  /X{3,}/,
+  /\$\(\s*date\b/i,
+  /%date%/i,
+];
+const SAFE_TEMP_ROOT_RE =
+  /(^|[/\\])\.forgedock[/\\]tmp(?:[/\\]|$)|[/\\][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[/\\]scratchpad(?:[/\\]|$)/i;
+const SYSTEM_TMP_POSIX_RE = /^\/tmp\//;
+const SYSTEM_TMP_ENV_RE = /^\$\{?TMPDIR\b[^/\\]*[/\\]/i;
+const SYSTEM_TMP_WIN_RE = /^%(?:TEMP|TMP)%[/\\]/i;
+
+// ---------------------------------------------------------------------------
 // Attribution guard constants (Rule 6)
 // Declared here — above the top-level `await main()` call — so they are
 // initialized before the hook runs, for the same temporal-dead-zone reason
@@ -511,6 +531,14 @@ async function main() {
   const findRootViolation = checkFindRoot(command);
   if (findRootViolation) {
     process.stderr.write(findRootViolation);
+    process.exit(2);
+    return;
+  }
+
+  // --- Rule 7: content-staging temp-path (mktemp) guard ---
+  const tempStagingViolation = checkTempPathStaging(command);
+  if (tempStagingViolation) {
+    process.stderr.write(tempStagingViolation);
     process.exit(2);
     return;
   }
@@ -1112,6 +1140,81 @@ function checkFindRoot(command) {
         `No override exists for this rule — a root-anchored \`find\` has no`,
         `legitimate use in any ForgeDock pipeline.`,
       ].join("\n");
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7: Content-staging temp-path (mktemp) guard (issue #2686)
+// ---------------------------------------------------------------------------
+
+function isFixedSystemTempPath(value) {
+  if (!value) return false;
+  const v = String(value);
+  if (COLLISION_SAFE_MARKERS.some((re) => re.test(v))) return false;
+  if (SAFE_TEMP_ROOT_RE.test(v)) return false;
+  return SYSTEM_TMP_POSIX_RE.test(v) || SYSTEM_TMP_ENV_RE.test(v) || SYSTEM_TMP_WIN_RE.test(v);
+}
+
+function tempStagingMessage(path, where) {
+  return [
+    `[ForgeDock] BLOCKED: fixed temp path "${path}" staged for a gh body (${where}).`,
+    ``,
+    `Concurrent orchestrated agents share this host's system temp dir. A fixed`,
+    `literal path like this is clobbered mid-flight when a second agent writes`,
+    `the same path — the wrong body is then posted to the PR/issue (the #2672`,
+    `cross-agent content collision; the prose mktemp mandate from forge#2198`,
+    `degraded, so this rule makes it deterministic).`,
+    ``,
+    `Fix: stage the body to a mktemp-created path instead, e.g.:`,
+    `  BODY=$(mktemp); printf '%s' "$content" > "$BODY"; gh ... --body-file "$BODY"`,
+    ``,
+    `Exception: set FORGE_ALLOW_FIXED_TMP=1 in your shell environment BEFORE`,
+    `starting Claude Code if you intentionally need a fixed temp path.`,
+  ].join("\n");
+}
+
+function checkTempPathStaging(command) {
+  if (!command) return null;
+  if (process.env.FORGE_ALLOW_FIXED_TMP === "1") return null;
+
+  const bare = command.replace(/["'\\]/g, "");
+  if (!/\/tmp\/|\$\{?TMPDIR|%TE?MP%/i.test(bare)) return null;
+
+  const tokens = tokenizeCommand(command);
+  for (let i = 0; i < tokens.length; i++) {
+    const { value: tok } = tokens[i];
+    let val = null;
+    let where = tok;
+    if (CONTENT_STAGING_FLAGS.has(tok) || tok === CONTENT_STAGING_SHORT_FLAG) {
+      val = i + 1 < tokens.length ? tokens[i + 1].value : null;
+    } else if (!/\s/.test(tok)) {
+      for (const flag of CONTENT_STAGING_FLAGS) {
+        const eq = `${flag}=`;
+        if (tok.startsWith(eq)) { val = tok.slice(eq.length); where = flag; break; }
+      }
+      if (val === null && tok.startsWith(CONTENT_STAGING_SHORT_FLAG) && tok.length > CONTENT_STAGING_SHORT_FLAG.length) {
+        val = tok.slice(CONTENT_STAGING_SHORT_FLAG.length);
+        where = CONTENT_STAGING_SHORT_FLAG;
+      }
+    }
+    if (val && isFixedSystemTempPath(val)) return tempStagingMessage(val, where);
+  }
+
+  const invokesGh = tokens.some(({ value }) => value === "gh");
+  if (invokesGh) {
+    for (let i = 0; i < tokens.length; i++) {
+      const { value: tok, quoted } = tokens[i];
+      if (quoted && /\s/.test(tok)) continue;
+      let target = null;
+      if (tok === ">" || tok === ">>") {
+        target = i + 1 < tokens.length ? tokens[i + 1].value : null;
+      } else if (/^>>?[^>&]/.test(tok)) {
+        target = tok.replace(/^>>?/, "");
+      }
+      if (target && isFixedSystemTempPath(target)) return tempStagingMessage(target, "redirect");
     }
   }
 

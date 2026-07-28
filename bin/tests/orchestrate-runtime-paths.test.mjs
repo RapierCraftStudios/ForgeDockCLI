@@ -74,7 +74,22 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(phase4, /task-result event/i);
     assert.match(phase4, /state="running"/);
     assert.match(phase4, /background=true/);
+    assert.match(phase4, /FORGE:DISPATCH/);
+    assert.match(phase4, /child_session_id/);
+    assert.match(phase4, /fresh OpenCode `task\(background=true\)` continuation/);
+    assert.doesNotMatch(phase4, /task\(task_id=.*background=true\)/);
     assert.match(phase4, /do not wait for the slowest sibling/i);
+  });
+
+  it("re-reads durable claims before dispatch and pairs release comments by holder", () => {
+    assert.match(phase4, /read_active_claims\(\)/);
+    assert.match(phase4, /gh api --paginate --slurp/);
+    assert.match(phase4, /select\(\.created_at > \$claim\.created_at\)/);
+    assert.match(phase4, /capture\("\\\\\*\\\\\*Holder/);
+    assert.match(phase4, /claim_conflicts_with_live_holder/);
+    assert.match(phase4, /before each engine Bash, Agent\(\), or OpenCode task call/);
+    assert.match(phase3, /Rebuild the durable file-claim map/);
+    assert.match(phase3, /ACTIVE_CLAIM_FILES/);
   });
 
   it("documents the compact OpenCode preflight", () => {

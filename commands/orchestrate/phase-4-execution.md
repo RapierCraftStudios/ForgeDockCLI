@@ -417,7 +417,8 @@ declare -A AGENT_ISSUE_MAP
 # the same role AGENT_ISSUE_MAP plays for Agent-tool `agent_completed` notifications.
 declare -A ENGINE_DISPATCH_MAP
 # OpenCode native task equivalent of ENGINE_DISPATCH_MAP. Keys are issue numbers;
-# values are the session ids returned by task(background=true).
+# values are the session ids returned by task(background=true). This is a live
+# cache only; every entry must also be persisted as a FORGE:DISPATCH comment.
 declare -A OPENCODE_DISPATCH_MAP
 
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
@@ -547,6 +548,69 @@ Use `${ISSUE_LANE[$NUM]}` and `${ISSUE_PR_BASE[$NUM]}` to populate `{LANE}` and 
 
 ### Step 4A: Dispatch ready issues
 
+**Claims-board dispatch gate (MANDATORY, before every individual dispatch)** <!-- Added: forge#2844 -->: The coordination issue is the durable authority for file ownership. Do not use `EDGE_FILES`, `ISSUE_FILES`, or a remembered prior read as evidence that a claim is free. Immediately before dispatching each issue, re-read the full claims board and refuse that dispatch when the issue's declared file set intersects a live claim held by another issue. This applies equally to engine, Claude Agent, and OpenCode task dispatches, including newly-ready issues and wake reconstruction.
+
+```bash
+# Returns unreleased claims as [{holder: "123", files: "..."}]. A release is a separate,
+# later comment, so it must be paired with its claim by holder rather than searched for in the
+# claim comment itself. Terminal holder states also self-heal claims left behind by dead agents.
+read_active_claims() {
+  local COORD_NUM="$1"
+  local CLAIMS HOLDER TERMINAL
+  CLAIMS=$(gh api --paginate --slurp "repos/{GH_REPO}/issues/${COORD_NUM}/comments" 2>/dev/null \
+    | jq -c '
+        flatten as $comments |
+        [$comments[]
+         | select(.body | contains("<!-- FORGE:CLAIM -->"))
+         | . as $claim
+         | ($claim.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) as $holder
+         | select([$comments[]
+                   | select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->"))
+                   | select((.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) == $holder)
+                   | select(.created_at > $claim.created_at)] | length == 0)
+         | {holder: $holder,
+            files: ($claim.body | capture("\\*\\*Files\\*\\*: (?<files>[\\s\\S]*?)(?:\\n\\*\\*Interfaces\\*\\*:|$)").files)}]') || return 1
+
+  for HOLDER in $(echo "$CLAIMS" | jq -r '.[].holder'); do
+    TERMINAL=$(gh issue view "$HOLDER" -R {GH_REPO} --json labels --jq \
+      '[.labels[].name | select(. == "workflow:merged" or . == "workflow:invalid" or . == "workflow:awaiting-merge" or . == "needs-human")] | length > 0' 2>/dev/null)
+    [ "$TERMINAL" = "true" ] && CLAIMS=$(echo "$CLAIMS" | jq --arg holder "$HOLDER" '[.[] | select(.holder != $holder)]')
+  done
+  echo "$CLAIMS"
+}
+
+claim_conflicts_with_live_holder() {
+  local NUM="$1" TARGET_FILES CLAIM HOLDER CLAIM_FILES OVERLAP
+  TARGET_FILES=$(printf '%s\n' "${ISSUE_FILES[$NUM]:-}" | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+  [ -z "$TARGET_FILES" ] && return 1  # No declared paths: normal conservative DAG rules still apply.
+
+  ACTIVE_CLAIMS=$(read_active_claims "$COORD_ISSUE_NUMBER") || {
+    echo "REFUSING TO DISPATCH #${NUM}: could not read the durable claims board." >&2
+    return 0
+  }
+  while IFS= read -r CLAIM; do
+    HOLDER=$(echo "$CLAIM" | jq -r '.holder')
+    [ "$HOLDER" = "$NUM" ] && continue
+    CLAIM_FILES=$(echo "$CLAIM" | jq -r '.files' | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+    OVERLAP=$(comm -12 <(printf '%s\n' "$TARGET_FILES") <(printf '%s\n' "$CLAIM_FILES"))
+    if [ -n "$OVERLAP" ]; then
+      echo "DEFERRING #${NUM}: declared files overlap live claim held by #${HOLDER}: ${OVERLAP//$'\n'/, }"
+      return 0
+    fi
+  done < <(echo "$ACTIVE_CLAIMS" | jq -c '.[]')
+  return 1
+}
+
+# Run this immediately before each engine Bash, Agent(), or OpenCode task call. Do not batch the
+# board read: another worker can claim a file between two dispatches in the same ready set.
+if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ]; then
+  if claim_conflicts_with_live_holder "$NUM"; then
+    DEFERRED_CLAIM_ISSUES+=("$NUM")
+    continue
+  fi
+fi
+```
+
 **Engine-first dispatch (default)**: When `forgedock` is in PATH, dispatch each ready issue via the durable engine rather than spawning prose Agent sub-agents. The engine's phase table enforces gate semantics in code — its fail-closed review gate and deterministic phase ordering are not subject to LLM interpretation.
 
 **OpenCode dispatch (runtime-neutral adapter)**: When `FORGE_RUNTIME=opencode` or
@@ -572,9 +636,19 @@ task(
 ```
 
 Capture the returned `<task id="..." state="running">` id in
-`OPENCODE_DISPATCH_MAP[{NUMBER}]`. `background=true` is required for streaming
-DAG behavior; a foreground task makes the orchestrator wait for that issue and
-reintroduces a wave barrier. The ForgeDock OpenCode plugin opts into
+`OPENCODE_DISPATCH_MAP[{NUMBER}]` and immediately persist it to the issue:
+
+```bash
+ATTEMPT=$(gh api repos/{GH_REPO}/issues/{NUMBER}/comments \
+  --jq '[.[] | select(.body | contains("FORGE:DISPATCH") and contains("\"state\":\"running\""))] | length + 1')
+gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
+\`\`\`json
+{\"runtime\":\"opencode\",\"child_session_id\":\"{TASK_ID}\",\"attempt\":${ATTEMPT},\"state\":\"running\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
+\`\`\`"
+```
+
+`background=true` is required for streaming DAG behavior; a foreground task
+makes the orchestrator wait for that issue and reintroduces a wave barrier. The ForgeDock OpenCode plugin opts into
 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` by default. An explicit
 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` is a supported degraded mode,
 but it must be reported as non-streaming rather than treated as equivalent to
@@ -667,6 +741,18 @@ if [ "$FORGEDOCK_AVAILABLE" = "true" ]; then
   if [ "${#DEFERRED_CONCURRENCY_ISSUES[@]}" -gt 0 ]; then
     echo "CONCURRENCY DEFER: ${#DEFERRED_CONCURRENCY_ISSUES[@]} ready issue(s) held back — ${ACTIVE_DISPATCH_COUNT}/${MAX_CONCURRENT} already in flight. Will dispatch as slots free up: ${DEFERRED_CONCURRENCY_ISSUES[*]}"
   fi
+  # Filter against the durable board once while forming this engine batch. The tool-call
+  # instruction below re-checks immediately before each launch to close the remaining TOCTOU gap.
+  CLAIM_SAFE_DISPATCH=()
+  for NUM in "${DISPATCH_NOW[@]}"; do
+    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ] && claim_conflicts_with_live_holder "$NUM"; then
+      DEFERRED_CLAIM_ISSUES+=("$NUM")
+      continue
+    fi
+    CLAIM_SAFE_DISPATCH+=("$NUM")
+  done
+  DISPATCH_NOW=("${CLAIM_SAFE_DISPATCH[@]}")
+
   echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message via forgedock run-issue (headroom was ${HEADROOM})"
 
   for NUM in "${DISPATCH_NOW[@]}"; do
@@ -703,7 +789,7 @@ fi
 fi
 ```
 
-**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Issue one `Bash(...)` call per issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
+**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Immediately before each call, run `claim_conflicts_with_live_holder "{NUM}"`; if it returns success, defer that issue rather than dispatching it. Issue one `Bash(...)` call per remaining issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
 
 ```
 Bash(command="forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
@@ -723,10 +809,13 @@ If `DISPATCH_NOW` is empty (headroom is 0), do not dispatch any issues this cycl
 **Agent-spawn path (Claude fallback when forgedock CLI unavailable)**: When `FORGEDOCK_AVAILABLE=false` and the runtime is not OpenCode, spawn Agent sub-agents per issue using the template below. This preserves engine state via the SubagentStop hook even without the CLI.
 
 When the runtime is OpenCode, skip this Claude-only `Agent(...)` path entirely.
-Use the native `task` call above for initial, newly-ready, remediation, and
-stall-resume dispatches. Translate every later `Agent(...)` reference in this
-phase to `task(...)` with `subagent_type="general"`; preserve `background=true`
-and use `task_id=OPENCODE_DISPATCH_MAP[{NUMBER}]` when resuming a child.
+Use the native `task` call above for initial and newly-ready issue dispatches.
+Translate only those OpenCode orchestration dispatches to `task(...)` with
+`subagent_type="general"` and `background=true`. Review and remediation are
+load-bearing child operations and must run foreground. Do not claim task-id
+resume support: after a restart, reconcile the latest `FORGE:DISPATCH` record
+with durable GitHub workflow state, then dispatch a fresh work-on continuation
+only when the issue is still non-terminal.
 
 **REMINDER: You MUST use the template below verbatim when on the Agent-spawn fallback path. Only fill in `{VARIABLES}`. Do NOT rewrite the agent prompt. Do NOT write custom implementation instructions. The agent MUST invoke `/work-on` via the Skill tool — this is the HARD RULE from the top of this file.**
 
@@ -950,15 +1039,24 @@ fi
 echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message (headroom was ${HEADROOM})"
 ```
 
-Spawn `Agent()` for every issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by `${#DISPATCH_NOW[@]}` — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
+Immediately before every Claude `Agent()` or OpenCode `task()` call, run `claim_conflicts_with_live_holder "{NUM}"`; when it returns success, append the issue to `DEFERRED_CLAIM_ISSUES[]` and do not make that call. Spawn `Agent()` for every remaining issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by the number actually dispatched — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
 
 If `DISPATCH_NOW` is empty (headroom is 0), do not spawn any agents this cycle — wait for the next `agent_completed` notification, which frees a slot and re-triggers this dispatch computation (Step 4B).
 
 ### Step 4B: Monitor completions and dispatch newly ready issues
 
-You will be automatically notified when each background agent completes — or, for an engine-first dispatch (Step 4A, `FORGEDOCK_AVAILABLE=true`), when a backgrounded `Bash(run_in_background=true, command="forgedock run-issue ...")` call completes. In OpenCode, a native background `task` first returns a `state="running"` result and later injects a synthetic `<task id="..." state="completed">` or `state="error"` result into this same parent session. The later result is the completion event; the initial running result is not completion. Both Claude notifications and OpenCode task-result events must trigger the same per-issue handling immediately. **Do NOT use `sleep` loops, wait for the slowest sibling, or poll before processing an event.** When one arrives, look up which issue it belongs to — `AGENT_ISSUE_MAP` for a Claude `agent_completed` notification, `ENGINE_DISPATCH_MAP` for a background-Bash notification, or `OPENCODE_DISPATCH_MAP` for an OpenCode task result — and immediately process it exactly the same way regardless of which map resolved it; every check below (`classify_predecessor_state()`, dependent dispatch, stall/staging checks) keys off GitHub labels/state, not which dispatch mechanism produced them. **Fallback**: if a runtime ever fails to deliver a background completion notification, use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
+You will be automatically notified when each background agent completes — or, for an engine-first dispatch (Step 4A, `FORGEDOCK_AVAILABLE=true`), when a backgrounded `Bash(run_in_background=true, command="forgedock run-issue ...")` call completes. In OpenCode, a native background `task` first returns a `state="running"` result and later injects a synthetic `<task id="..." state="completed">` or `state="error"` result into this same parent session. The later result is the completion event; the initial running result is not completion. Both Claude notifications and OpenCode task-result events must trigger the same per-issue handling immediately. **Do NOT use `sleep` loops, wait for the slowest sibling, or poll before processing an event.** When one arrives, look up which issue it belongs to — `AGENT_ISSUE_MAP` for a Claude `agent_completed` notification, `ENGINE_DISPATCH_MAP` for a background-Bash notification, or `OPENCODE_DISPATCH_MAP` for an OpenCode task result — and immediately process it exactly the same way regardless of which map resolved it; every check below (`classify_predecessor_state()`, dependent dispatch, stall/staging checks) keys off GitHub labels/state, not which dispatch mechanism produced them. For an OpenCode completion, append this terminal record before releasing capacity:
 
-**Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, a background-Bash completion, or an OpenCode `task` result with `state="completed"`/`state="error"` — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` or OpenCode `task(task_id=..., background=true)` call is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains resume-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete at `workflow:engine-error` with empty committed state — is still auto-fallen-back by item 2b below, fixed forge#2743.)
+```bash
+gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
+\`\`\`json
+{\"runtime\":\"opencode\",\"child_session_id\":\"{TASK_ID}\",\"attempt\":${ATTEMPT},\"state\":\"{completed|error}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
+\`\`\`"
+```
+
+**Fallback**: if a runtime ever fails to deliver a background completion notification, read the latest `FORGE:DISPATCH` record and use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
+
+**Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, a background-Bash completion, or an OpenCode `task` result with `state="completed"`/`state="error"` — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` or a fresh OpenCode `task(background=true)` continuation is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains resume-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete at `workflow:engine-error` with empty committed state — is still auto-fallen-back by item 2b below, fixed forge#2743.)
 
 **Ordering requirement (MANDATORY — prevents transient over-cap)**: For every agent that completed in this notification batch, finish its terminal-state check and, if applicable, its resume re-increment (items 1-2 below) BEFORE computing `dispatch_headroom` for item 5's newly-ready-issue dispatch. Computing headroom before a to-be-resumed agent's re-increment would let a genuinely-still-running agent's freed slot be double-booked — once by a fresh dispatch, once by the resume itself — transiently exceeding `MAX_CONCURRENT`. Process every completed agent's items 1-2 to a decision (terminal vs. resumed) first; only then compute headroom once for the batch's item 5 dispatch.
 
@@ -1338,11 +1436,7 @@ done
    # After CLAIM_RELEASED for issue NUM:
    # Read all active FORGE:CLAIM annotations from coordination issue
    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_NUM:-}" ]; then
-     ACTIVE_CLAIMS=$(gh api repos/{GH_REPO}/issues/${COORD_NUM}/comments \
-       --jq '[.[] | select(.body | contains("<!-- FORGE:CLAIM -->")) |
-              select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->") | not)] |
-             map({holder: (.body | capture("\\*\\*Holder\\*\\*: (?P<h>[^\\n]+)").h),
-                  files: (.body | capture("\\*\\*Files\\*\\*: (?P<f>[^\\n]+)").f)})' 2>/dev/null || echo '[]')
+      ACTIVE_CLAIMS=$(read_active_claims "$COORD_NUM" 2>/dev/null || echo '[]')
      # For each still-blocked issue in a Layer-2/4 pair: check if its claim's file set
      # is disjoint from all remaining active claims. If so, mark it ready.
      # (Layer-1 and Layer-3 edges are never relaxed — this check is Layer-2/4 only.)
