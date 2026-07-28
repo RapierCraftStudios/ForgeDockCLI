@@ -305,6 +305,112 @@ const FIND_ROOT_TOKEN_RE = /^\/(?:[a-zA-Z]\/?|\.{1,2}\/?|\/)?$/;
 const SHELL_METACHAR_SPLIT_RE = /[;&|()$`]+/;
 
 // ---------------------------------------------------------------------------
+// Rule 8 constants (issue #2856)
+//
+// Rule 7 is intentionally reserved for the mktemp-discipline guard from
+// issue #2686, which exists on milestone/engine-v2-harness but has not yet
+// reached staging (tracked by #2857). That guard is already written, reviewed,
+// and hardened by a follow-up fix on that branch; taking its number here would
+// force #2857 to renumber already-reviewed code during a cross-branch
+// recovery. The gap on staging is deliberate — do not reuse the number.
+//
+// Declared here — above the top-level `await main()` call — for the same
+// temporal-dead-zone reason documented for the Rule 5 constants above: a
+// `const` declared textually after that `await` is still in its TDZ when
+// `main()` first runs, and reading it from `checkRmDangerousTarget()` would
+// throw a ReferenceError straight into main()'s fail-open catch, silently
+// defeating the rule while every test still passes.
+// ---------------------------------------------------------------------------
+
+/**
+ * Match an `rm`/`rmdir` target that Claude Code's built-in "Dangerous rm
+ * operation" gate hard-stops on as being "on critical path" (at most one
+ * path segment below the filesystem root) or "on working directory or its
+ * ancestor" (`.` / `..`).
+ *
+ * Branch 1 — root-anchored, at most one segment deep: `/`, `//`, `/probe.txt`,
+ * `/c`, `/tmp/`, `/*`. In practice this is overwhelmingly a missing slash —
+ * `/probe.txt` written where `/tmp/probe.txt` was meant.
+ *
+ * Branch 2 — the working directory or its parent: `.`, `..`.
+ *
+ * BOTH branches carry their optional trailing-slash form, added here in the
+ * same commit. Rule 5's analogous regex needed two separate follow-up PRs
+ * (#2113, then P1 #2213) precisely because a trailing-slash variant was added
+ * to one alternative and not its sibling — `/c/` and then `/./`, `/../` each
+ * reached the identical dangerous shape while being wrongly ALLOWED. Any
+ * future widening of one branch must be applied to the other in the same
+ * change.
+ *
+ * Deliberately does NOT match anything two or more segments deep:
+ * `/tmp/pr_a.txt`, `./build/out.js`, and `/c/Users/.../repo` are ordinary
+ * targets and must be allowed.
+ */
+const RM_DANGEROUS_TARGET_RE = /^(?:\/[^/]*\/?|\.{1,2}\/?)$/;
+
+/**
+ * Match an `rm`/`rmdir` target of the form `$VAR/<suffix>` or `${VAR}/<suffix>`
+ * — the shape the built-in gate reports as "on possibly-empty variable path".
+ * If `VAR` is unset the target expands to a root-anchored path (`$UNSET/*`
+ * becomes `/*`), which is the critical-path case with an extra step.
+ *
+ * Capture group 1 is the variable name, used to check whether it was assigned
+ * earlier in the same command string (see `isVariableAssignedInCommand()`).
+ *
+ * The trailing `/` is load-bearing and is what keeps this branch narrow: a
+ * bare `rm -f "$BODY_FILE"` expands to `rm -f ""` when unset, which is
+ * harmless, and is the single most common cleanup shape in this pipeline.
+ * Only a variable followed by a path separator can synthesize a root path.
+ */
+const RM_VARIABLE_ROOT_TARGET_RE = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\/.+$/;
+
+/**
+ * Command names this rule anchors on, in command position only.
+ */
+const RM_COMMAND_NAMES = new Set(["rm", "rmdir"]);
+
+/**
+ * Leading tokens that precede the real command name and must be stripped
+ * before command-position anchoring: `sudo`, `doas`, and `env`.
+ */
+const RM_COMMAND_PREFIXES = new Set(["sudo", "doas", "env"]);
+
+/**
+ * `sudo` short flags that consume the following token as their value, so the
+ * value is not mistaken for the command name (`sudo -u root rm ...`).
+ */
+const SUDO_VALUE_FLAGS = new Set(["-u", "-g", "-p", "-C", "-h", "-r", "-t"]);
+
+/**
+ * A leading `NAME=value` environment assignment in command position.
+ */
+const ENV_ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Shell characters that separate one command from the next. Unlike
+ * `SHELL_METACHAR_SPLIT_RE` this deliberately EXCLUDES `$`, because Rule 8
+ * has to read `$SOMEDIR/*` as an intact target token — splitting on `$` would
+ * destroy the variable branch entirely. A trailing `$` left over from a
+ * command-substitution opener (`$(`) is stripped separately by
+ * `extractCommandSegments()`.
+ */
+const RM_SEGMENT_SPLIT_RE = /[;&|()`]+/;
+
+/**
+ * Match a heredoc redirection and capture its delimiter, so heredoc BODIES can
+ * be excluded from command-position scanning. Handles `<<EOF`, `<<-EOF`,
+ * `<<'EOF'`, and `<<"EOF"`.
+ *
+ * This matters more for this rule than it did for Rule 5: `rm` appears in far
+ * more prose than `find` does — issue bodies, PR comments, and the
+ * documentation of this very rule are routinely piped to `gh` through a
+ * heredoc. Scanning a heredoc body would deny the pipeline's own reporting.
+ * The command line AFTER the heredoc terminator is still scanned, which is
+ * exactly the stall shape reported in #2843.
+ */
+const HEREDOC_OPEN_RE = /<<-?\s*(?:'([^']+)'|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))/;
+
+// ---------------------------------------------------------------------------
 // Attribution guard constants (Rule 6)
 // Declared here — above the top-level `await main()` call — so they are
 // initialized before the hook runs, for the same temporal-dead-zone reason
@@ -389,6 +495,21 @@ async function main() {
   const findRootViolation = checkFindRoot(command);
   if (findRootViolation) {
     process.stderr.write(findRootViolation);
+    process.exit(2);
+    return;
+  }
+
+  // --- Rule 8: Dangerous `rm` target guard ---
+  // Deliberately checked BEFORE the isForgeDockManagedCwd() gate below, for
+  // the same reason as Rule 5 — and more acutely. Agents stage temp files
+  // from git worktrees and scratch directories that carry no
+  // forge.yaml/.forgedock marker, and those are exactly the contexts where
+  // the built-in "Dangerous rm operation" gate stalls an unattended run. A
+  // dispatch placed after the gate would guard nothing where it matters
+  // (issue #2856).
+  const rmTargetViolation = checkRmDangerousTarget(command);
+  if (rmTargetViolation) {
+    process.stderr.write(rmTargetViolation);
     process.exit(2);
     return;
   }
@@ -853,11 +974,36 @@ function checkGistVisibility(command) {
  * @param {string} command
  * @returns {string[]} Flattened list of logical token strings, in order.
  */
+/**
+ * The embedded-whitespace discriminator shared by `extractLogicalTokens()`
+ * (Rule 5) and `extractCommandSegments()` (Rule 8).
+ *
+ * A token counts as INERT argument text — text that must be passed through
+ * unsplit, because its quoting proves it was meant as one opaque argument
+ * rather than as shell syntax — only when the quoting actually spans embedded
+ * whitespace. `quoted` alone is NOT sufficient: `tokenizeCommand()` sets it
+ * the moment ANY quote character appears, including a degenerate empty pair
+ * (`""`, `''`) glued onto otherwise-unquoted text, which is how `cd /tmp;""find /`
+ * bypassed Rule 5 (issue #2059).
+ *
+ * Deliberately defined ONCE and called from both extractors. Two
+ * independently-derived copies of this predicate is the exact failure mode of
+ * issue #2213 (P1), where a regex alternation was widened on one branch and
+ * not on its sibling, leaving a live bypass behind an apparently-fixed guard.
+ *
+ * @param {{value: string, quoted: boolean}} token
+ * @returns {boolean}
+ */
+function isInertQuotedToken({ value, quoted }) {
+  return Boolean(quoted) && /\s/.test(value);
+}
+
 function extractLogicalTokens(command) {
   const raw = tokenizeCommand(command);
   const logical = [];
-  for (const { value, quoted } of raw) {
-    if (quoted && /\s/.test(value)) {
+  for (const token of raw) {
+    const { value } = token;
+    if (isInertQuotedToken(token)) {
       logical.push(value);
       continue;
     }
@@ -954,6 +1100,303 @@ function checkFindRoot(command) {
   }
 
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8: Dangerous `rm` target guard (issue #2856)
+//
+// See the Rule 8 constants block above for why this is Rule 8 and not Rule 7.
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip heredoc BODIES from a command, returning only the lines that are
+ * really command text.
+ *
+ * A heredoc body is data, not shell syntax — the pipeline routinely pipes
+ * issue bodies, PR comments, and review findings to `gh` through one. Because
+ * `rm` appears in prose far more often than `find` ever did, scanning those
+ * bodies would deny the pipeline's own reporting, including any comment that
+ * documents this rule. The line AFTER the heredoc terminator is retained,
+ * which is precisely the stall shape reported in #2843: a `gh` comment
+ * followed by a cleanup `rm` of a root-level path.
+ *
+ * @param {string} command
+ * @returns {string[]} Command lines with heredoc bodies and terminators removed.
+ */
+function stripHeredocBodies(command) {
+  const lines = command.split(/\r?\n/);
+  const kept = [];
+  let delimiter = null;
+
+  for (const line of lines) {
+    if (delimiter !== null) {
+      // Inside a heredoc body — drop the line. A terminator line closes it.
+      if (line.trim() === delimiter) delimiter = null;
+      continue;
+    }
+    kept.push(line);
+    const opened = HEREDOC_OPEN_RE.exec(line);
+    if (opened) delimiter = opened[1] || opened[2] || opened[3] || null;
+  }
+
+  return kept;
+}
+
+/**
+ * Split a command into per-segment token arrays, preserving both the segment
+ * boundaries and any `$` inside tokens.
+ *
+ * This is a deliberate sibling of `extractLogicalTokens()` rather than a reuse
+ * of it, because that function is wrong for this rule in two independent ways:
+ *
+ *  1. It splits on `$` (via `SHELL_METACHAR_SPLIT_RE`), so `$SOMEDIR/*` would
+ *     arrive as `SOMEDIR/*` and the possibly-empty-variable branch could never
+ *     see that a variable was involved at all. Rule 5 never cared, because
+ *     `find` roots are literal paths.
+ *  2. It flattens the entire command into one token stream, discarding the
+ *     segment boundaries that command-position anchoring depends on. Without
+ *     them there is no way to tell `rm -f /x` (first token of a segment) from
+ *     `git rm --cached x` or `docker rm -f c` (second token).
+ *
+ * Segmentation is done at three levels so a command name glued to a separator
+ * with no whitespace is still recovered (the metacharacter-adjacency bypass of
+ * issue #2034, review findings SEC-1/SEC-2): newlines, then `;`/`&`/`|`/
+ * parens/backticks inside unquoted tokens.
+ *
+ * Inert quoted tokens (see `isInertQuotedToken()`) are passed through unsplit
+ * and kept in place, so `rm -f "/tmp/quoted path.txt"` still resolves a target
+ * while `--search "dangerous rm / permission prompt"` stays a single opaque
+ * argument that can never be read as a command.
+ *
+ * @param {string} command
+ * @returns {string[][]} One token array per shell segment, in order.
+ */
+function extractCommandSegments(command) {
+  const segments = [];
+  let current = [];
+
+  const flush = () => {
+    if (current.length > 0) segments.push(current);
+    current = [];
+  };
+
+  for (const line of stripHeredocBodies(command)) {
+    // Each physical line starts a new command segment.
+    flush();
+
+    for (const token of tokenizeCommand(line)) {
+      if (isInertQuotedToken(token)) {
+        current.push(token.value);
+        continue;
+      }
+
+      const pieces = token.value.split(RM_SEGMENT_SPLIT_RE);
+      for (let i = 0; i < pieces.length; i++) {
+        // Anything after the first piece followed a separator, so it begins a
+        // new segment (`cd /foo&&rm -f /bar.txt`, `$(rm -rf /)`).
+        if (i > 0) flush();
+        // A trailing `$` is the remains of a command-substitution opener
+        // (`$(rm ...` splits to `$` + `rm`). Strip it so the command name is
+        // recovered in command position. A LEADING `$` is preserved — that is
+        // the variable branch's whole signal.
+        const piece = pieces[i].replace(/\$+$/, "");
+        if (piece.length > 0) current.push(piece);
+      }
+    }
+  }
+
+  flush();
+  return segments;
+}
+
+/**
+ * Whether `name` is assigned somewhere in the command string, as a shell
+ * variable assignment in command or prefix position (`NAME=`, `export NAME=`).
+ *
+ * Used to keep the possibly-empty-variable branch narrow. `rm -rf $SOMEDIR/*`
+ * with `SOMEDIR` never assigned expands to a root-level wipe; the same shape
+ * with `D=/tmp/x` earlier in the command is ordinary, correct cleanup and must
+ * be allowed. When in doubt this rule ALLOWS: a missed deny surfaces as a
+ * visible approval prompt the operator can act on, whereas a false deny breaks
+ * the agent's own cleanup silently.
+ *
+ * @param {string} command
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isVariableAssignedInCommand(command, name) {
+  return new RegExp(`(?:^|[\\s;&|(])${name}=`).test(command);
+}
+
+/**
+ * Resolve the `rm`/`rmdir` operands in a single command segment, or null if
+ * the segment is not an `rm` invocation in COMMAND POSITION.
+ *
+ * Command-position anchoring is mandatory, not an optimization. Matching `rm`
+ * anywhere in the command is what produced the reporter's own false positive —
+ * a legitimate `gh issue list --search "dangerous rm / permission prompt"` was
+ * denied because a token after `rm` happened to be `/`. It is also the only
+ * thing separating this rule from `git rm --cached` and `docker rm -f`.
+ *
+ * Leading environment assignments (`TMPDIR=/x rm ...`) and privilege/prefix
+ * wrappers (`sudo`, `doas`, `env`) are stripped first, including `sudo` flags
+ * and the values of the `sudo` short flags that take one.
+ *
+ * Flag handling covers space-separated, clustered, and long forms uniformly
+ * (`-f`, `-rf`, `-r -f`, `--force`), and honours the `--` end-of-options
+ * marker. Assuming flags are space-separated is what required the follow-up
+ * fix `0109b53f` on #2686's detector.
+ *
+ * ALL positional operands are returned, not just the first: every operand of
+ * `rm` is a deletion target, so `rm -f /tmp/a.txt /probe.txt` must be caught
+ * on its second operand.
+ *
+ * @param {string[]} segment
+ * @returns {string[]|null} Positional targets, or null if not an `rm` command.
+ */
+function resolveRmTargets(segment) {
+  let i = 0;
+
+  // Strip leading `NAME=value` assignments and prefix wrappers, in any order
+  // (`TMPDIR=/x sudo rm ...`, `sudo TMPDIR=/x rm ...`).
+  for (;;) {
+    const token = segment[i];
+    if (token === undefined) return null;
+
+    if (ENV_ASSIGNMENT_TOKEN_RE.test(token)) { i++; continue; }
+
+    if (RM_COMMAND_PREFIXES.has(token.toLowerCase())) {
+      i++;
+      // Consume the wrapper's own flags, and the value of any short flag that
+      // takes one, so `sudo -u root rm ...` still anchors on `rm`.
+      while (segment[i] !== undefined && segment[i].startsWith("-")) {
+        const flag = segment[i];
+        i++;
+        if (SUDO_VALUE_FLAGS.has(flag) && segment[i] !== undefined) i++;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  // Command-position anchor. Case-insensitive on the command NAME only
+  // (Windows resolves `RM` to the same binary), never on the path operands —
+  // POSIX paths are case-sensitive. This mirrors Rule 5's split exactly.
+  const name = segment[i];
+  if (name === undefined || !RM_COMMAND_NAMES.has(name.toLowerCase())) return null;
+  i++;
+
+  const targets = [];
+  let optionsEnded = false;
+  for (; i < segment.length; i++) {
+    const token = segment[i];
+    if (!optionsEnded) {
+      if (token === "--") { optionsEnded = true; continue; }
+      // Covers `-f`, `-rf` (clustered), and `--force` (long) uniformly.
+      if (token.startsWith("-") && token.length > 1) continue;
+    }
+    targets.push(token);
+  }
+
+  return targets;
+}
+
+/**
+ * Check whether a Bash command deletes a target whose SHAPE trips Claude
+ * Code's built-in "Dangerous rm operation" gate.
+ *
+ * That gate sits ABOVE the permission layer: a `Bash(rm:*)` allow rule,
+ * `--dangerously-skip-permissions`, and a hook returning
+ * `permissionDecision: "allow"` all fail to clear it. A hook DENY does clear
+ * it, because the agent never reaches the built-in check. That asymmetry is
+ * the entire reason this rule exists. In an unattended run — headless, cron,
+ * or an orchestrated sub-agent — the gate renders a prompt nobody can answer
+ * and the run hangs indefinitely rather than failing. Denying early is
+ * strictly better: identical outcome for a genuinely dangerous command, but a
+ * recoverable, self-describing error instead of a silent overnight stall.
+ *
+ * In practice the trigger is almost never a real attempt to delete the root —
+ * it is a missing slash, `/probe.txt` written where `/tmp/probe.txt` was
+ * meant. Guidance-only mitigations were attempted twice (#2198, then #2843)
+ * and both failed, because guidance cannot bind a probabilistic
+ * path-construction slip. Hence a mechanical guard (#2856).
+ *
+ * Like Rule 5, this rule is checked BEFORE the `isForgeDockManagedCwd()` gate
+ * and has NO operator override.
+ *
+ * @param {string} command
+ * @returns {string|null} Error message to show, or null if allowed.
+ */
+function checkRmDangerousTarget(command) {
+  if (!command) return null;
+
+  // Cheap pre-filter, mirroring checkFindRoot(): skip tokenization entirely
+  // for the overwhelming majority of commands that mention no deletion at
+  // all. Quotes and backslashes are stripped first so an empty quote pair
+  // (`"r"m`) or a backslash-escape (`r\m` — real bash for the plain word)
+  // cannot cause a false "nothing here" short-circuit (issue #2059).
+  if (!/rm/i.test(command.replace(/["'\\]/g, ""))) return null;
+
+  for (const segment of extractCommandSegments(command)) {
+    const targets = resolveRmTargets(segment);
+    if (!targets) continue;
+
+    for (const target of targets) {
+      const variable = RM_VARIABLE_ROOT_TARGET_RE.exec(target);
+      if (variable && !isVariableAssignedInCommand(command, variable[1])) {
+        return rmDenyMessage(
+          target,
+          `"$${variable[1]}" is never assigned in this command, so if it is unset the`,
+          `target expands to a root-level path and deletes the wrong tree.`,
+        );
+      }
+
+      if (RM_DANGEROUS_TARGET_RE.test(target)) {
+        return rmDenyMessage(
+          target,
+          `"${target}" is at most one path segment below the filesystem root (or is`,
+          `the working directory / its parent).`,
+        );
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Build the Rule 8 deny message.
+ *
+ * The message is part of the rule's contract, not prose. Its whole value is
+ * that an unattended run self-heals in one turn instead of stalling, so it
+ * MUST name the concrete rewrite (`mktemp` / a `/tmp/<name>` path) and MUST
+ * tell the agent not to escalate to a human — there is no human to escalate to
+ * in the runs this rule protects. A message that only refuses reproduces the
+ * original stall with extra steps.
+ *
+ * @param {string} target
+ * @param {...string} reason Lines explaining why this specific target matched.
+ * @returns {string}
+ */
+function rmDenyMessage(target, ...reason) {
+  return [
+    `[ForgeDock] BLOCKED: dangerous \`rm\` target "${target}".`,
+    ``,
+    ...reason,
+    ``,
+    `Claude Code enforces this shape above the permission layer, so no allow`,
+    `rule or bypass flag clears it — it renders an approval prompt that an`,
+    `unattended run can never answer, and the run hangs indefinitely. This`,
+    `hook denies it instead, so you get a recoverable error (issue #2856).`,
+    ``,
+    `Fix: put the file at least two segments deep. If this was meant to be a`,
+    `temp file, the path is almost certainly missing a slash — use "/tmp/<name>"`,
+    `(or better, a path created by mktemp) instead of "${target}".`,
+    `Then re-run the command. Do not ask the user to approve this.`,
+    ``,
+    `No override exists for this rule.`,
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
