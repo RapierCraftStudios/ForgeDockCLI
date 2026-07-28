@@ -2088,11 +2088,17 @@ REMAINING_BEFORE=$(echo "$BODY" | grep -c '^- \[ \]' || true)
 # single-phase regardless of how many prose headings surround it.
 #
 # - Fenced code blocks are stripped first: issue bodies routinely embed fenced
-#   blocks whose lines start with '#' or contain a literal '- [ ]'.
+#   blocks whose lines start with '#' or contain a literal '- [ ]'. An
+#   unterminated fence keeps the original body so later work is never hidden.
 # - '^#+ ' (not '^#{2,3} ') matches every heading depth and avoids awk
 #   interval-quantifier variance across awk implementations.
 # - grep -E / awk only — no PCRE. '^#+ ' needs none.
-BODY_STRIPPED=$(echo "$BODY" | awk '/^```/{f=!f; next} !f')
+FENCE_COUNT=$(echo "$BODY" | grep -c '^```' || true)
+if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
+  BODY_STRIPPED="$BODY"
+else
+  BODY_STRIPPED=$(echo "$BODY" | awk '/^```/{f=!f; next} !f')
+fi
 
 CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
   /^#+ /         { if (has) { n++; has=0 }; next }
