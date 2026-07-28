@@ -2441,7 +2441,8 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json title,body,labels \
     --jq '{title: .title, body: .body, labels: [.labels[].name]}')
 
-  # Safety exclusions — never batch, at any priority. Same jq test() engine and
+  # Billing is never batched. Security findings are classified below and may
+  # batch only with their exact same class. Same jq test() engine and
   # patterns as phase-1-resolve.md's batching rule (single shared mechanism).
   # Word-boundary anchored (not bare substrings) and attribution-boilerplate
   # (**Confidence**/**Severity**/**Review comment** — see forge#2477 note below
@@ -2469,9 +2470,9 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   # keyword is not auto-batched) for closing a real bypass — the safe
   # direction for a security-relevant exclusion. <!-- forge#2477 -->
   echo "$FINDING_DATA" | jq -e '
-    (.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i"))
-    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i"))
-    or ([.labels[]] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth" or . == "needs-human" or . == "blocked" or . == "operator-only"))
+    (.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ([.labels[]] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only"))
   ' >/dev/null && continue
 
   # Only P3 findings are eligible (P1/P2 already dispatched individually above).
@@ -2481,7 +2482,11 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   FINDING_FILE=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
   [ -z "$FINDING_FILE" ] && continue
 
-  SURFACE_FILE_MEMBERS["$FINDING_FILE"]="${SURFACE_FILE_MEMBERS[$FINDING_FILE]} $FINDING_NUM"
+  SAFETY_CLASS=$(node -e 'import("./bin/engine/admission.mjs").then(({ classifyBatchSafety }) => process.stdout.write(classifyBatchSafety(process.argv[1]) || "routine"))' "$(echo "$FINDING_DATA" | jq -r '.title + "\n" + .body + "\n" + (.labels | join(" "))')")
+  # Same file is not enough for security work: the class key prevents a
+  # credential finding from sharing a batch with injection/auth hardening.
+  SURFACE_KEY="${SAFETY_CLASS}:${FINDING_FILE}"
+  SURFACE_FILE_MEMBERS["$SURFACE_KEY"]="${SURFACE_FILE_MEMBERS[$SURFACE_KEY]} $FINDING_NUM"
 done
 
 # For each same-file cluster of 2+, actually CREATE the batch issue (executable —
@@ -2492,23 +2497,30 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
   MEMBERS=(${SURFACE_FILE_MEMBERS[$FILE]})
   [ "${#MEMBERS[@]}" -ge 2 ] || continue
 
+  SAFETY_CLASS=${FILE%%:*}
+  SURFACE_FILE=${FILE#*:}
+
   # Sanitize the affected-file path before interpolating it into the issue title/body.
   # Git filenames can legally carry shell metacharacters (`$()`, backticks, quotes);
   # restrict to a validated charset so the value cannot break the gh argument
   # boundary from an untrusted issue body. Shared guard with phase-1-resolve.md. <!-- forge#1833, forge#1835 -->
-  SAFE_SURFACE_AREA=$(printf '%s' "$FILE" | tr -cd 'A-Za-z0-9._/-')
+  SAFE_SURFACE_AREA=$(printf '%s' "$SURFACE_FILE" | tr -cd 'A-Za-z0-9._/-')
 
-  echo "Same-run surface-area cluster: ${#MEMBERS[@]} P3 findings share $FILE — creating batch issue(s)"
+  echo "Same-run surface-area cluster: ${#MEMBERS[@]} ${SAFETY_CLASS} findings share $SURFACE_FILE — creating batch issue(s)"
 
-  # Cap at 8 members per batch (phase-1-resolve.md limit); split into batches of <=8.
-  for START in $(seq 0 8 $(( ${#MEMBERS[@]} - 1 ))); do
-    CHUNK=("${MEMBERS[@]:$START:8}")
+  # Routine batches cap at 8; security-class batches cap at 3 and their body
+  # must state a live-vector or defence-in-depth verdict for every member.
+  BATCH_CAP=8
+  [ "$SAFETY_CLASS" != "routine" ] && BATCH_CAP=3
+  for START in $(seq 0 "$BATCH_CAP" $(( ${#MEMBERS[@]} - 1 ))); do
+    CHUNK=("${MEMBERS[@]:$START:$BATCH_CAP}")
     [ "${#CHUNK[@]}" -ge 2 ] || continue
 
     MEMBER_LINES=""
     for M in "${CHUNK[@]}"; do
       MTITLE=$(gh issue view "$M" -R {GH_REPO} --json title --jq '.title' 2>/dev/null || echo "")
       MEMBER_LINES="${MEMBER_LINES}- [ ] #${M}: ${MTITLE}"$'\n'
+      [ "$SAFETY_CLASS" = "routine" ] || MEMBER_LINES="${MEMBER_LINES}  - **Verdict**: [ ] live vector  [ ] defence-in-depth"$'\n'
     done
 
     # Dedup-check with member exclusion (MANDATORY — forge#2432, identical mechanism to
