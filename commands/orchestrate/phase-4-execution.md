@@ -189,6 +189,8 @@ should_dispatch() {
 
 **WHY THIS EXISTS** <!-- Added: forge#1912 -->: Phase 4's dispatch loops previously launched every DAG-ready issue in one shot — the engine-first bash loop backgrounded every `should_dispatch()`-passing issue with no count limit, and the Agent-spawn-fallback path was explicitly instructed to "launch all ready agents simultaneously." On a large ready set this saturates the Anthropic API rate limit in one burst, causing cascading failures across most of the batch. This is a distinct, count-denominated gate from the dollar-denominated `--budget` gate above (Step 4A-pre.0) — an issue can be deferred for budget reasons, concurrency reasons, or both; each gate accumulates its own deferred list independently.
 
+`MAX_CONCURRENT` caps top-level `/work-on` dispatches, not the total number of harness subagents. A normal worker can spawn context, architect, implement, validate, quality-gate, and review children. Budget **8 total subagent spawns per worker** when choosing this value: `max_concurrent <= session_subagent_budget / 8`. This is a conservative planning multiplier, not a second runtime semaphore; the harness does not expose a reliable cross-agent spawn counter to this shell-level dispatcher.
+
 Initialize the concurrency cap and its batch-scope tracking state before the first dispatch:
 
 ```bash
@@ -209,8 +211,12 @@ fi
 
 ACTIVE_DISPATCH_COUNT=0             # in-flight dispatched-but-not-yet-completed agents, this batch
 DEFERRED_CONCURRENCY_ISSUES=()      # ready issues held back because no headroom was available
+SUBAGENT_SPAWN_BUDGET_PER_WORKER=8  # /work-on + build/review fan-out planning estimate
+TOP_LEVEL_DISPATCH_TOTAL=0
+PLANNED_SUBAGENT_SPAWNS=0
+OBSERVED_SUBAGENT_SPAWNS="unavailable" # replace only with harness telemetry; never infer
 
-echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT} (forge.yaml → orchestration.max_concurrent; default 12 when unset or invalid)"
+echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT}; plan for up to $((MAX_CONCURRENT * SUBAGENT_SPAWN_BUDGET_PER_WORKER)) subagent spawns in flight (8 per worker)"
 # --- End concurrency gate initialization ---
 ```
 
@@ -225,6 +231,31 @@ dispatch_headroom() {
 ```
 
 **This is a hard cap, not a suggestion.** No dispatch site in Phase 4 may background/spawn more than `dispatch_headroom` new agents without first waiting for in-flight agents to complete. Issues that cannot be dispatched due to the cap go into `DEFERRED_CONCURRENCY_ISSUES[]` and are released — in the order they were deferred — as running agents complete (Step 4B), the same event-driven model (no sleep/poll loops) the file already uses for DAG-readiness and budget gating.
+
+**Dispatch accounting**: Immediately after each successful top-level dispatch, increment `TOP_LEVEL_DISPATCH_TOTAL` and add `SUBAGENT_SPAWN_BUDGET_PER_WORKER` to `PLANNED_SUBAGENT_SPAWNS`. When the runtime reports child-spawn telemetry, replace `OBSERVED_SUBAGENT_SPAWNS` with that measured total; otherwise leave it `unavailable` rather than fabricating a measured value.
+
+### Step 4A-pre.0.3: Secondary content-creation backpressure (MANDATORY)
+
+GitHub's `resources.core` quota does not report secondary content-creation throttles. Treat any GitHub API response with HTTP `403` whose body contains `secondary rate limit` as a batch-wide backpressure signal.
+
+```bash
+# Call from every dispatcher-owned gh write/create wrapper and from a child completion
+# report that includes its final GitHub API error. Do not retry the failed request here.
+SECONDARY_RATE_LIMITED=false
+SECONDARY_RATE_LIMIT_MESSAGE=""
+
+record_secondary_rate_limit() {
+  local STATUS="$1"
+  local BODY="$2"
+  if [ "$STATUS" = "403" ] && echo "$BODY" | grep -qi 'secondary rate limit'; then
+    SECONDARY_RATE_LIMITED=true
+    SECONDARY_RATE_LIMIT_MESSAGE="$BODY"
+    echo "SECONDARY RATE LIMIT: pausing all new dispatch. Do not retry GitHub content creation until an operator resumes the batch." >&2
+  fi
+}
+```
+
+Before every dispatch site computes headroom or launches a worker, check `SECONDARY_RATE_LIMITED`. When true, preserve the ready/deferred queues, launch no more workers, and end the active dispatch cycle. Do not poll or retry GitHub calls to discover recovery: an operator resumes the batch after the throttle clears. In-flight agents receive this contract in the dispatch prompt: on a secondary-limit 403, they must stop their GitHub write/create retry loop, report the response to the orchestrator, and exit their current phase without creating replacement work.
 
 ### Step 4A-pre: Staging baseline tracking (MANDATORY — continuous)
 
@@ -409,6 +440,16 @@ echo "Step 4A.pre: using BATCH_T0=${BATCH_T0} for Step 4C's run-spawned cascade 
 DEFERRED_FINDINGS=()
 QUEUED_FINDINGS=()
 declare -A DEFERRED_REASONS
+# Count every finding regardless of admission, so a deferred refinement never
+# makes the reported amplification ratio look better than it was.
+FINDINGS_SPAWNED=0
+MERGED_UNITS=0
+AMPLIFICATION_RATIO_HISTORY=()
+AMPLIFICATION_DEFERRED=()
+declare -A FINDINGS_BY_SOURCE_PR
+declare -A REFINEMENT_FINDINGS
+declare -A NEW_SURFACE_FINDINGS
+declare -A AMPLIFICATION_FINDING_SEEN
 declare -A AGENT_ISSUE_MAP
 # Engine-first dispatch equivalent of AGENT_ISSUE_MAP (fixed forge#2466): keyed by issue
 # number, holds the task id returned by each backgrounded `Bash(run_in_background=true,
@@ -527,6 +568,23 @@ if [ "$TOKEN_BUDGET" != "unlimited" ] && ! echo "$TOKEN_BUDGET" | grep -qE '^[1-
 fi
 
 TOKEN_ESTIMATE_PER_FINDING=$(yq '.pipeline.token_estimate_per_finding // 150000' forge.yaml 2>/dev/null || echo 150000)
+
+# Amplification is observational by default. The optional ceiling is evaluated
+# only against same-lineage refinements in Step 4C, never against new surface.
+CASCADE_MAX_AMPLIFICATION=$(yq '.orchestration.cascade.max_amplification // "off"' forge.yaml 2>/dev/null || echo "off")
+if [ "$CASCADE_MAX_AMPLIFICATION" != "off" ]; then
+  if ! echo "$CASCADE_MAX_AMPLIFICATION" | grep -qE '^[0-9]+(\.[0-9]+)?$' || \
+     ! awk "BEGIN { exit !($CASCADE_MAX_AMPLIFICATION > 0) }"; then
+    echo "WARNING: forge.yaml → orchestration.cascade.max_amplification must be a positive number or off — disabling the bound"
+    CASCADE_MAX_AMPLIFICATION="off"
+  fi
+fi
+CONVERGENCE_WINDOW=$(yq '.orchestration.cascade.convergence_window // 3' forge.yaml 2>/dev/null || echo 3)
+if ! echo "$CONVERGENCE_WINDOW" | grep -qE '^[1-9][0-9]*$'; then
+  echo "WARNING: forge.yaml → orchestration.cascade.convergence_window must be a positive integer — falling back to 3"
+  CONVERGENCE_WINDOW=3
+fi
+echo "Cascade amplification: max_amplification=${CASCADE_MAX_AMPLIFICATION} convergence_window=${CONVERGENCE_WINDOW} (off preserves current admission behavior)"
 
 # Independent boolean levers — each accepts an explicit granular override on
 # top of the resolved preset (preset supplies the default, not a hard value).
@@ -916,6 +974,7 @@ Agent(
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
 - **Temp files — ALWAYS use `mktemp`, NEVER a fixed path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`) — never a fixed literal like `/tmp/body.md` or `/tmp/issue.json`. A fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back — this has caused real cross-agent GitHub issue-body corruption. `mktemp` costs nothing and eliminates the collision. (forge#2198)
+- **GitHub secondary rate limit**: If a GitHub API call returns HTTP 403 with `secondary rate limit` in its response, do NOT retry it or start a polling loop. Stop GitHub content creation for this phase, report the status and response body to the orchestrator in your final result, and wait for a later batch resume. Retrying extends the throttle for every sibling.
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
 - NEVER target `main` for PRs targeting the default repo. Use `{STAGING_BRANCH}` for fast-lane issues, or `milestone/{slug}` for milestone issues.
 - Satellite repos (MCP, n8n) have no staging branch — fast-lane PRs go to `main` for those.
@@ -2040,6 +2099,30 @@ gh issue list -R {GH_REPO} --state open --search "label:review-finding created:>
 
 **If review-finding issues were spawned:**
 
+**Amplification accounting (MANDATORY, before cascade admission):** Count every finding created by this batch, including findings later deferred by any cascade rule. After each merged unit, compute `FINDINGS_SPAWNED / MERGED_UNITS`, append the value to `AMPLIFICATION_RATIO_HISTORY`, and print a convergence warning when the latest `CONVERGENCE_WINDOW` observations are all `>= 1.0`. A high ratio is a signal, not a failure: valuable deep review findings can legitimately raise it.
+
+For each finding, extract its source PR from `**Source**: PR #N` and increment `FINDINGS_BY_SOURCE_PR[N]`. Classify it as a **same-lineage refinement** only when that source PR closes a `review-finding` issue and both that parent finding and this finding name the same affected file; otherwise classify it as **new surface**. Record the finding number in `REFINEMENT_FINDINGS` or `NEW_SURFACE_FINDINGS` respectively. If provenance or a file path cannot be established, classify as new surface conservatively; never suppress it as a refinement.
+
+When `CASCADE_MAX_AMPLIFICATION` is not `off`, and the current ratio is greater than that ceiling, defer only newly discovered entries in `REFINEMENT_FINDINGS` with reason `amplification bound exceeded (same-lineage refinement)`. Add them to `DEFERRED_FINDINGS` and `DEFERRED_REASONS` so Step 4F re-evaluates them after the batch drains. Do not apply this bound to new-surface findings, P1/P2 findings, or any finding when the option is `off`.
+
+```bash
+# Run once for each completed issue before collecting its findings. Only merged
+# units advance the denominator; invalid/skipped units do not imply delivered work.
+if gh issue view "$NUM" -R {GH_REPO} --json labels \
+  --jq '[.labels[].name | select(. == "workflow:merged")] | length' | grep -qx '1'; then
+  MERGED_UNITS=$((MERGED_UNITS + 1))
+  AMPLIFICATION_RATIO=$(awk "BEGIN { printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS }")
+  AMPLIFICATION_RATIO_HISTORY+=("$AMPLIFICATION_RATIO")
+  if [ "${#AMPLIFICATION_RATIO_HISTORY[@]}" -ge "$CONVERGENCE_WINDOW" ]; then
+    RECENT_RATIOS=("${AMPLIFICATION_RATIO_HISTORY[@]: -$CONVERGENCE_WINDOW}")
+    if printf '%s\n' "${RECENT_RATIOS[@]}" | awk '$1 < 1 { exit 1 }'; then
+      echo "CONVERGENCE WARNING: amplification has remained >= 1.0 for ${CONVERGENCE_WINDOW} merged units (${AMPLIFICATION_RATIO} current). This can be productive review refinement, but the batch is not shrinking."
+    fi
+  fi
+fi
+
+```
+
 **Cascade control (MANDATORY — run before folding findings into the DAG):**
 
 For each spawned finding, determine whether it should be **executed** or **deferred**:
@@ -2088,6 +2171,45 @@ ALL_BATCH_FILES=$(echo "$ALL_BATCH_FILES" | sort -u | grep -v '^$')
 for FINDING_NUM in {spawned_finding_numbers}; do
   FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
     --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
+
+  # Count each finding once and retain source provenance for the final per-PR
+  # breakdown. Missing source/file evidence fails open as new surface.
+  FINDING_BODY=$(echo "$FINDING_DATA" | jq -r '.body')
+  SOURCE_PR=""
+  if [[ "$FINDING_BODY" =~ \*\*[Ss]ource\*\*:[[:space:]]*[Pp][Rr][[:space:]]*\#([0-9]+) ]]; then
+    SOURCE_PR="${BASH_REMATCH[1]}"
+  fi
+  if [ -z "${AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]:-}" ]; then
+    AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]=1
+    FINDINGS_SPAWNED=$((FINDINGS_SPAWNED + 1))
+    [ -n "$SOURCE_PR" ] && FINDINGS_BY_SOURCE_PR[$SOURCE_PR]=$(( ${FINDINGS_BY_SOURCE_PR[$SOURCE_PR]:-0} + 1 ))
+  fi
+  FINDING_IS_REFINEMENT=false
+  FINDING_FILE_FOR_LINEAGE=$(echo "$FINDING_BODY" | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+  if [ -n "$SOURCE_PR" ] && [ -n "$FINDING_FILE_FOR_LINEAGE" ]; then
+    SOURCE_ISSUE=""
+    SOURCE_PR_BODY=$(gh pr view "$SOURCE_PR" -R {GH_REPO} --json body --jq '.body' 2>/dev/null || echo "")
+    SOURCE_PR_BODY_LOWER=$(echo "$SOURCE_PR_BODY" | tr '[:upper:]' '[:lower:]')
+    if [[ "$SOURCE_PR_BODY_LOWER" =~ (close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+\#([0-9]+) ]]; then
+      SOURCE_ISSUE="${BASH_REMATCH[3]}"
+    fi
+    if [ -n "$SOURCE_ISSUE" ]; then
+      PARENT_DATA=$(gh issue view "$SOURCE_ISSUE" -R {GH_REPO} --json labels,body \
+        --jq '{labels: [.labels[].name], body: .body}' 2>/dev/null || echo '{}')
+      PARENT_FILE=$(echo "$PARENT_DATA" | jq -r '.body // ""' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+      if echo "$PARENT_DATA" | jq -e '[.labels[] | select(. == "review-finding")] | length > 0' >/dev/null && \
+         [ "$PARENT_FILE" = "$FINDING_FILE_FOR_LINEAGE" ]; then
+        FINDING_IS_REFINEMENT=true
+        REFINEMENT_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      else
+        NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      fi
+    else
+      NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+    fi
+  else
+    NEW_SURFACE_FINDINGS[$FINDING_NUM]="${SOURCE_PR:-unknown}"
+  fi
 
   # Code-branch repair guard (MANDATORY — before priority/defer heuristics below).
   # A review-finding with no **Code branch** annotation, whose parent PR's base is
@@ -2261,6 +2383,18 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
     DEFER=false
   fi
 
+  # Opt-in only: never defer a new-surface or P1/P2 finding because another
+  # lineage is noisy. Step 4F re-evaluates this explicit deferral after drain.
+  AMPLIFICATION_RATIO=$(awk "BEGIN { if ($MERGED_UNITS) printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS; else print 0 }")
+  if [ "$DEFER" = "false" ] && [ "$FINDING_IS_REFINEMENT" = "true" ] && \
+     [ "$PRIORITY" != "P1" ] && [ "$PRIORITY" != "P2" ] && \
+     [ "$CASCADE_MAX_AMPLIFICATION" != "off" ] && \
+     awk "BEGIN { exit !($AMPLIFICATION_RATIO > $CASCADE_MAX_AMPLIFICATION) }"; then
+    DEFER=true
+    DEFER_REASON="amplification bound exceeded (same-lineage refinement; ${AMPLIFICATION_RATIO} > ${CASCADE_MAX_AMPLIFICATION})"
+    AMPLIFICATION_DEFERRED+=("$FINDING_NUM")
+  fi
+
   if [ "$DEFER" = "true" ]; then
     DEFERRED_FINDINGS+=($FINDING_NUM)
     DEFERRED_REASONS[$FINDING_NUM]="$DEFER_REASON"
@@ -2334,9 +2468,9 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   # keyword is not auto-batched) for closing a real bypass — the safe
   # direction for a security-relevant exclusion. <!-- forge#2477 -->
   echo "$FINDING_DATA" | jq -e '
-    (.title | test("\\bbilling\\b"; "i"))
-    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\bbilling\\b"; "i"))
-    or ([.labels[]] | any(. == "billing"))
+    (.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ([.labels[]] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only"))
   ' >/dev/null && continue
 
   # Only P3 findings are eligible (P1/P2 already dispatched individually above).

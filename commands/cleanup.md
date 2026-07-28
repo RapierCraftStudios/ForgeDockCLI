@@ -423,10 +423,10 @@ UNBATCHED_P3=$(gh issue list {GH_FLAG} \
   --json number,title,body,labels,createdAt \
   --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
          | select(([.labels[].name] | any(. == "batch")) | not)
-          | select((.title | test("\\bbilling\\b"; "i")) | not)
+         | select((.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i")) | not)
          | (.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) as $stripped_body
-          | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\bbilling\\b"; "i") | not)
-          | select(([.labels[].name] | any(. == "billing")) | not)')
+         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i") | not)
+         | select(([.labels[].name] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only")) | not)')
 
 # Classify each remaining finding with admission.mjs's classifyBatchSafety(). A
 # non-null, non-billing class may share a batch only with that exact class, has
