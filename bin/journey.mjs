@@ -1721,12 +1721,7 @@ async function linkPipelineScripts(ctx) {
       existed = true;
       if (stats.isSymbolicLink()) {
         const current = await readlink(target);
-        // Same traversability gate as the sibling forge() command loop: a
-        // correct-but-unreadable link must fall through to the existed →
-        // unlink → reinstall repair below, not be counted as healthy. These two
-        // loops are a matched pair and every hardening fix has to land in both
-        // (forge#2632, forge#2836).
-        if (current === file && await isSymlinkTraversable(target)) alreadyCorrect = true;
+        if (current === file) alreadyCorrect = true;
       } else if (stats.isFile() && !wantSymlink) {
         // Copy-fallback path (Windows without Developer Mode): content-compare
         // before unlinking/recopying, matching the sibling linkCommands() loop

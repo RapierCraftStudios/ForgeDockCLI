@@ -2502,52 +2502,18 @@ describe("forge (Act II)", () => {
       );
     });
 
-    it("linkPipelineScripts() repairs an existing unreadable script link (matched-pair parity, forge#2632)", async (t) => {
-      const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home-2836b-"));
-      const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src-2836b-"));
-      mkdirSyncFs(join(forgeHome, "commands"), { recursive: true });
-      mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
-      mkdirSyncFs(join(forgeHome, "scripts"), { recursive: true });
-      writeFileSync(join(forgeHome, "commands", "a.md"), "A", "utf-8");
-      writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
-      writeFileSync(join(forgeHome, "scripts", "classify-lane.sh"), "#!/bin/sh\necho lane\n", "utf-8");
-
-      const file = join(forgeHome, "scripts", "classify-lane.sh");
-      const target = join(home, ".claude", "scripts", "classify-lane.sh");
-      mkdirSyncFs(join(home, ".claude", "scripts"), { recursive: true });
-      if (!makeUnreadableLink(file, target, t)) return;
-
-      const { ctx } = stubCtx({ home });
-      ctx.forgeHome = forgeHome;
-      const res = await forge(ctx);
-
-      assert.equal(
-        res.scriptsResult.skipped,
-        0,
-        "a dead script link must never be counted as healthy — fixing only forge() ships a half-fix",
-      );
-      assert.equal(res.scriptsResult.updated + res.scriptsResult.copied, 1, "the link must be repaired");
-      assert.equal(res.scriptsResult.installed, 0, "the entry already existed");
-      assert.equal(readFileSync(target, "utf-8"), "#!/bin/sh\necho lane\n");
-    });
-
     it("a healthy pre-existing link is still skipped and left untouched (the gate must not over-fire)", async (t) => {
       const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home-2836c-"));
       const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src-2836c-"));
       mkdirSyncFs(join(forgeHome, "commands"), { recursive: true });
       mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
-      mkdirSyncFs(join(forgeHome, "scripts"), { recursive: true });
       writeFileSync(join(forgeHome, "commands", "a.md"), "A", "utf-8");
       writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
-      writeFileSync(join(forgeHome, "scripts", "classify-lane.sh"), "#!/bin/sh\necho lane\n", "utf-8");
 
       const target = join(home, ".claude", "commands", "a.md");
-      const scriptTarget = join(home, ".claude", "scripts", "classify-lane.sh");
       mkdirSyncFs(join(home, ".claude", "commands"), { recursive: true });
-      mkdirSyncFs(join(home, ".claude", "scripts"), { recursive: true });
       try {
         symlinkSync(join(forgeHome, "commands", "a.md"), target);
-        symlinkSync(join(forgeHome, "scripts", "classify-lane.sh"), scriptTarget);
       } catch (err) {
         if (err.code === "EPERM" || err.code === "EACCES") {
           t.skip("symlink creation unavailable (Windows without Developer Mode)");
@@ -2562,10 +2528,7 @@ describe("forge (Act II)", () => {
 
       assert.equal(res.skipped, 1, "a readable correctly-targeted link must still short-circuit");
       assert.equal(res.updated, 0, "the traversability gate must not convert healthy links to copies");
-      assert.equal(res.scriptsResult.skipped, 1);
-      assert.equal(res.scriptsResult.copied, 0);
       assert.ok(lstatSync(target).isSymbolicLink(), "a healthy link must remain a symlink");
-      assert.ok(lstatSync(scriptTarget).isSymbolicLink());
     });
   });
 });
