@@ -21,7 +21,7 @@ describe("review pool exhaustion", () => {
   it("fails closed rather than substituting an inline or partial review", () => {
     for (const spec of [review, stagingReview]) {
       assert.match(spec, /Dispatch pool exhausted or dispatch call fails/);
-      assert.match(spec, /FORGE:REVIEW_BLOCKED reason=dispatch-pool-exhausted/);
+      assert.match(spec, /FORGE:GATE_FAILURE:TYPE=review-panel-integrity/);
       assert.match(spec, /review-degraded/);
       assert.match(spec, /ACTUAL_AGENT_COUNT/);
       assert.match(spec, /SELECTED_AGENT_COUNT/);

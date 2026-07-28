@@ -44,7 +44,7 @@ When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolat
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping. (Identical resolution logic to `/review-pr` Phase 3C — do not diverge.)
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected agent (Bug Hunters in Phase 3, Code Quality in Phase 4, domain agents in Phase 5), same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
 3. **Neither tool is available**: this is a genuine setup defect, not a routing decision — HARD STOP, post a PR/issue comment explaining that no sub-agent dispatch tool is available, add `needs-human`, and exit without posting a verdict. Do NOT fall back to reviewing inline in the orchestrator's own context.
-4. **Dispatch pool exhausted or dispatch call fails**: this is not tool absence. If any Bug Hunter, quality, domain, material-change, or regression reviewer cannot be launched because the sub-agent pool/session limit is exhausted (or any dispatch call fails), HARD STOP. Do not substitute inline review or silently continue with a partial panel. Mark the PR `review-degraded`, post `<!-- FORGE:REVIEW_BLOCKED reason=dispatch-pool-exhausted -->` with the selected and completed counts, and exit without a deploy verdict. A fresh session must re-run the full panel.
+4. **Dispatch pool exhausted or dispatch call fails**: this is not tool absence. If any Bug Hunter, quality, domain, material-change, or regression reviewer cannot be launched because the sub-agent pool/session limit is exhausted (or any dispatch call fails), HARD STOP. Do not substitute inline review or silently continue with a partial panel. Mark the PR `review-degraded`, post `<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->` with the selected and completed counts, and exit without a deploy verdict. A fresh session must re-run the full panel.
 
 **Do not halt to ask the operator which tool to use.** Steps 1–2 are deterministic and fully resolve the common case; only step 3 (both absent) requires a stop, and even then the action is HARD STOP + `needs-human`, not a question back to the operator.
 
@@ -712,15 +712,15 @@ If the gate exits with `RESULT: BLOCK DEPLOY` → **STOP**. A `<!-- FORGE:GATE_F
 
 ---
 
-**Incomplete-panel guard (MANDATORY):** Increment `SELECTED_AGENT_COUNT` for every reviewer selected across Phases 2–6 before launching it. If any dispatch fails, set `DISPATCH_FAILED=true`. Before Phase 7, count unique `FORGE:REVIEW-AGENT` markers. If the completed count is lower than selected, follow the same hard-stop path as pool exhaustion: create `review-degraded` if needed, label the PR, post `FORGE:REVIEW_BLOCKED`, and exit. Do not create a deploy verdict from partial reviewer output.
+**Incomplete-panel guard (MANDATORY):** Increment `SELECTED_AGENT_COUNT` for every reviewer selected across Phases 2–6 before launching it. If any dispatch fails, set `DISPATCH_FAILED=true`. Before Phase 7, count unique `FORGE:REVIEW-AGENT` markers. If the completed count is lower than selected, follow the same hard-stop path as pool exhaustion: create `review-degraded` if needed, label the PR, post `FORGE:GATE_FAILURE`, and exit. Do not create a deploy verdict from partial reviewer output.
 
 ```bash
 ACTUAL_AGENT_COUNT=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
   --jq '[.[].body | scan("<!-- FORGE:REVIEW-AGENT:([a-z-]+) -->") | .[0]] | unique | length' 2>/dev/null || echo 0)
 if [ "$DISPATCH_FAILED" = "true" ] || [ "$ACTUAL_AGENT_COUNT" -lt "$SELECTED_AGENT_COUNT" ]; then
   gh label create "review-degraded" --color "E4E669" --description "PR review panel was incomplete; re-review required before deployment. Managed by ForgeDock." --force -R "$GH_REPO" 2>/dev/null || true
-  gh pr edit "$PR_NUMBER" -R "$GH_REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true
-  gh pr comment "$PR_NUMBER" -R "$GH_REPO" --body "<!-- FORGE:REVIEW_BLOCKED reason=dispatch-pool-exhausted -->
+  gh pr edit "$PR_NUMBER" -R "$GH_REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
+  gh pr comment "$PR_NUMBER" -R "$GH_REPO" --body "<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->
 ## Deploy Review Blocked: Incomplete Isolated Review Panel
 
 **Selected isolated reviewers**: ${SELECTED_AGENT_COUNT}

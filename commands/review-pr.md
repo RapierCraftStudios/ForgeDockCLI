@@ -54,7 +54,7 @@ When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolat
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping.
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected domain agent, same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
 3. **Neither tool is available**: this is a genuine setup defect, not a routing decision — HARD STOP, post a PR/issue comment explaining that no sub-agent dispatch tool is available, add `needs-human`, and exit without posting a verdict. Do NOT fall back to reviewing inline in the orchestrator's own context — inline self-review is strictly weaker than an isolated fresh-context reviewer and is never a substitute for a missing dispatch tool.
-4. **Dispatch pool exhausted or dispatch call fails**: this is distinct from tool absence. If any selected reviewer cannot be launched because the runtime reports a sub-agent/session/pool limit (or any dispatch call fails), HARD STOP immediately. Do not review that domain inline, do not silently reduce the panel, and do not merge. Mark the PR `review-degraded`, add `needs-human` to the linked issue, post `<!-- FORGE:REVIEW_BLOCKED reason=dispatch-pool-exhausted -->` with the selected and completed reviewer counts, then exit without a `FORGE:REVIEW` verdict. A later fresh session must re-run the full selected panel.
+4. **Dispatch pool exhausted or dispatch call fails**: this is distinct from tool absence. If any selected reviewer cannot be launched because the runtime reports a sub-agent/session/pool limit (or any dispatch call fails), HARD STOP immediately. Do not review that domain inline, do not silently reduce the panel, and do not merge. Mark the PR `review-degraded`, add `needs-human` to the linked issue, post `<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->` with the selected and completed reviewer counts, then exit without a `FORGE:REVIEW` verdict. A later fresh session must re-run the full selected panel.
 
 **Do not halt to ask the operator which tool to use.** Steps 1–2 are deterministic and fully resolve the common case; only step 3 (both absent) requires a stop, and even then the action is HARD STOP + `needs-human`, not a question back to the operator.
 
@@ -1543,7 +1543,7 @@ The `protocols.md` file contains the Evidence-Based Review Protocol, Structured 
 
 **CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent must persist its finalized body before posting it with `gh pr comment --body-file`, include `<!-- FORGE:REVIEW-AGENT:{lowercase-domain} -->`, and return its verdict and findings to the orchestrator independently of GitHub delivery.
 
-**Dispatch failure and partial-panel guard (MANDATORY):** Count the selected roster before dispatch. If any launch fails, including from pool exhaustion, do not continue with the agents that did launch as a sufficient panel. Immediately create the managed label if necessary, label the PR `review-degraded`, add `needs-human` to the linked issue, post `FORGE:REVIEW_BLOCKED`, and exit without a verdict. After all foreground reviewers return, independently compare their posted `FORGE:REVIEW-AGENT` markers with the selected count; a smaller count is the same hard stop. This catches a reviewer that accepted dispatch but failed before posting.
+**Dispatch failure and partial-panel guard (MANDATORY):** Count the selected roster before dispatch. If any launch fails, including from pool exhaustion, do not continue with the agents that did launch as a sufficient panel. Immediately create the managed label if necessary, label the PR `review-degraded`, add `needs-human` to the linked issue, post `FORGE:GATE_FAILURE`, and exit without a verdict. After all foreground reviewers return, independently compare their posted `FORGE:REVIEW-AGENT` markers with the selected count; a smaller count is the same hard stop. This catches a reviewer that accepted dispatch but failed before posting.
 
 ```bash
 SELECTED_AGENT_COUNT=$(echo "$SELECTED_AGENTS" | tr ' ' '\n' | grep -c '.')
@@ -1552,15 +1552,15 @@ ACTUAL_AGENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
 
 if [ "$DISPATCH_FAILED" = "true" ] || [ "$ACTUAL_AGENT_COUNT" -lt "$SELECTED_AGENT_COUNT" ]; then
   gh label create "review-degraded" --color "E4E669" --description "PR review panel was incomplete; re-review required before deployment. Managed by ForgeDock." --force -R "$REPO" 2>/dev/null || true
-  gh pr edit "$PR_NUMBER" -R "$REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true
-  gh pr comment "$PR_NUMBER" -R "$REPO" --body "<!-- FORGE:REVIEW_BLOCKED reason=dispatch-pool-exhausted -->
+  gh pr edit "$PR_NUMBER" -R "$REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
+  gh pr comment "$PR_NUMBER" -R "$REPO" --body "<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->
 ## Review Blocked: Incomplete Isolated Review Panel
 
 **Selected isolated reviewers**: ${SELECTED_AGENT_COUNT}
 **Completed isolated reviewers**: ${ACTUAL_AGENT_COUNT}
 
 At least one reviewer could not be dispatched or complete, commonly because the per-session sub-agent pool was exhausted. No inline substitution was performed. Re-run the full panel in a fresh session before merging."
-  [ -n "${MERGE_ISSUE:-}" ] && gh issue edit "$MERGE_ISSUE" {MERGE_GH_FLAG} --add-label "needs-human" 2>/dev/null || true
+  [ -n "${MERGE_ISSUE:-}" ] && gh issue edit "$MERGE_ISSUE" {MERGE_GH_FLAG} --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
   exit 1
 fi
 ```
