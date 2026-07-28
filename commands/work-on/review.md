@@ -233,6 +233,7 @@ gh pr create {GH_FLAG} \
 
 Closes #{NUMBER}
 ${BATCH_MEMBER_REFS}
+**Batch member disposition**: The batch issue is the code unit being closed. Referenced members that require human or operator action remain open as a split outcome.
 
 **Implementation branch**: \`{BRANCH}\`
 **Base**: \`{PR_BASE}\`

@@ -370,7 +370,7 @@ fi
     MEMBER_GATED=$(echo "$MEMBER_SNAPSHOT" | jq -r \
       '(.state != "OPEN") or ([.labels[] | select(. == "needs-human" or . == "blocked" or . == "operator-only")] | length > 0)')
     if [ "$MEMBER_GATED" = "true" ]; then
-      gh issue comment "$MEMBER" {GH_FLAG} --body "Code shipped in batch PR #{PR_NUMBER}, but this issue remains open because it requires a human or operator action."
+      echo "SPLIT OUTCOME: #${MEMBER} remains open because it requires a human or operator action."
       continue
     fi
     gh issue close "$MEMBER" {GH_FLAG} \

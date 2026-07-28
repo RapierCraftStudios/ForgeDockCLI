@@ -25,8 +25,9 @@ describe("batch human-member safety", () => {
 
     assert.match(workOn, /MEMBER_SNAPSHOT=.*--json state,labels/);
     assert.match(workOn, /MEMBER_GATED=/);
-    assert.match(workOn, /remains open because it requires a human or operator action/);
+    assert.match(workOn, /SPLIT OUTCOME:.*remains open because it requires a human or operator action/);
     assert.match(review, /BATCH_MEMBER_REFS/);
     assert.match(review, /Refs #%s/);
+    assert.match(review, /Batch member disposition/);
   });
 });
