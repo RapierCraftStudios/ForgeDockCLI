@@ -113,9 +113,13 @@ BLOCK_COMMENTS=$(gh api repos/{GH_REPO}/issues/{ISSUE_NUMBER}/comments \
 **If at least one FIXABLE item exists**: transition the issue out of its terminal gate before proceeding to Phase M2. `needs-human` represents the prior review result, not an active automated remediation run; retaining it would make the dispatcher and recovery paths stop while remediation is in progress. Keep exactly one active workflow state:
 
 ```bash
-gh issue edit {ISSUE_NUMBER} {GH_FLAG} \
-  --add-label "workflow:in-review" \
-  --remove-label "needs-human" 2>/dev/null || true # <!-- allowlist:check-command-side-effects -->
+if [ "${DRY_RUN:-false}" = "true" ]; then
+  echo "DRY_RUN: would replace needs-human with workflow:in-review on issue #{ISSUE_NUMBER}"
+else
+  gh issue edit {ISSUE_NUMBER} {GH_FLAG} \
+    --add-label "workflow:in-review" \
+    --remove-label "needs-human" 2>/dev/null || true # <!-- allowlist:check-command-side-effects -->
+fi
 ```
 
 Do not perform this transition for an UNFIXABLE policy escalation. Any later quality-gate, push, or re-review block re-adds `needs-human`; after re-review, remove `workflow:in-review` whenever that terminal label is present.
