@@ -430,10 +430,10 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
 
 **Batch creation rule (ordered grouping keys):** <!-- Changed: forge#1818 — added lower same-file tier -->
 - **Same-file cluster** (primary, low threshold): When **2+** batchable P3 issues share the exact same affected file, create a batch issue for that file cluster. Same-file P3 findings are the dominant low-value token sink (dead imports, stale comments, style nits) and already conflict with each other if built individually — the low threshold reflects that they'd otherwise serialize into slow one-at-a-time chains regardless of count.
-- **Source-PR + subsystem cluster**: When **2+** remaining findings cite the same `**Source**: PR #N` and their affected files share a top-level subsystem (for example `infra/monitoring`, `services/api`, `web`, `scripts`, or `.github`), create a batch. The source citation is parsed mechanically; a source PR that closed unmerged remains eligible.
+- **Source-PR cohort**: When **2+** remaining findings cite the same `**Source**: PR #N`, create a batch regardless of their affected paths. The source citation is parsed mechanically; a source PR that closed unmerged remains eligible.
 - **Defect-class cluster**: When **2+** remaining findings have the same `<!-- FORGE:CLASS: <slug> -->` annotation, create a batch. This is opt-in and uses only the emitted machine-readable slug; do not infer a class from prose.
 - **Leaf-directory cluster** (broader fallback): When **3+** remaining batchable P3 issues share the same leaf directory but are not already claimed, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
-- Form groups in this order: same-file, source-PR + subsystem, defect-class, leaf-directory. A finding is claimed by at most one batch.
+- Form groups in this order: same-file, source-PR, defect-class, leaf-directory. A finding is claimed by at most one batch.
 
 **Reference implementation and periodic sweep (MANDATORY):** `bin/engine/admission.mjs` exports `planP3BatchGroups()`, the deterministic reference for the four ordered keys, the 3-member leaf threshold, and the eight-member cap. Every pass supplies only open, unbatched, undispatched findings that already passed the safety exclusions, executes its returned groups, and retains `ungrouped` findings. Run it at initial resolution and again after every five completions or whenever the deferred queue reaches the concurrency cap. Each re-sweep covers the entire open retained candidate set, not merely findings from the most recent completion cycle. Log each group's `kind` (`same-file`, `source-pr`, `defect-class`, or `leaf-directory`) for auditability. <!-- Added: forge#2858 -->
 
@@ -483,7 +483,7 @@ Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory),
 
 ## Context
 
-**Batch policy**: 2+ same file, 2+ same source PR + subsystem, 2+ same explicit defect class, or 3+ same leaf directory (or oldest > 72h).
+**Batch policy**: 2+ same file, 2+ same source PR cohort, 2+ same explicit defect class, or 3+ same leaf directory (or oldest > 72h).
 **Member issues**: #{N1}, #{N2}, #{N3}, ...
 
 <!-- FORGE:BATCHABLE -->

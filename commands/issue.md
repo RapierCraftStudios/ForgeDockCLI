@@ -184,7 +184,7 @@ For callers that have already composed a title, body, labels, and (optionally) a
 
 If `--title` is present but neither `--body` nor `--body-file` is supplied, or both are supplied, this is a usage error: print `ERROR: programmatic mode requires exactly one of --body or --body-file` and STOP — do not fall through to Phase 2D or Phase 4B.
 
-**`--body-file` integrity contract (MANDATORY for the caller)**: Do not use a generic name under shared `/tmp`, even with `mktemp`. Prefer the session scratchpad (or a repo-relative scratch directory) because a Windows-native `gh` may not resolve Git Bash `/tmp` as expected. Create the directory if needed, make the filename include the target issue or PR number and an agent-unique token, then let `mktemp` add its random suffix:
+**`--body-file` integrity contract (MANDATORY for the caller)**: Do not use a generic name under shared `/tmp`, even with `mktemp`. Prefer the session scratchpad (or a repo-relative scratch directory) because a Windows-native `gh` may not resolve Git Bash `/tmp` as expected. Never hand-roll a temporary path or use a single-segment root path such as `/tmp_invbody_31076.txt`, which can require interactive deletion approval and hang unattended runs. Create the directory if needed, make the filename include the target issue or PR number and an agent-unique token, then let `mktemp` add its random suffix:
 
 ```bash
 SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"

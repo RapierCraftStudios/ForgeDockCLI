@@ -412,7 +412,7 @@ export function evaluateCascadeFinding(finding, policy) {
 export const P3_BATCHING_RULES = Object.freeze({
   maxMembers: 8,
   sameFileMinimum: 2,
-  sourcePrSubsystemMinimum: 2,
+  sourcePrMinimum: 2,
   defectClassMinimum: 2,
   leafDirectoryMinimum: 3,
 });
@@ -423,13 +423,6 @@ function sourcePr(body = "") {
 
 function defectClass(body = "") {
   return body.match(/<!-- FORGE:CLASS: ([a-z0-9]+(?:-[a-z0-9]+)*) -->/)?.[1] || null;
-}
-
-function topLevelSubsystem(file = "") {
-  const [topLevel, secondLevel] = file.split("/");
-  if (!topLevel) return null;
-  // A root-level file has no subsystem cohort; named top-level areas do.
-  return secondLevel ? `${topLevel}/${secondLevel}` : null;
 }
 
 function leafDirectory(file = "") {
@@ -469,11 +462,7 @@ export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES) {
   };
 
   claim("same-file", (finding) => finding.affectedFile, rules.sameFileMinimum);
-  claim("source-pr", (finding) => {
-    const pr = sourcePr(finding.body);
-    const subsystem = topLevelSubsystem(finding.affectedFile);
-    return pr && subsystem ? `PR #${pr} + ${subsystem}` : null;
-  }, rules.sourcePrSubsystemMinimum);
+  claim("source-pr", (finding) => sourcePr(finding.body), rules.sourcePrMinimum);
   claim("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
   claim("leaf-directory", (finding) => leafDirectory(finding.affectedFile), rules.leafDirectoryMinimum);
 
