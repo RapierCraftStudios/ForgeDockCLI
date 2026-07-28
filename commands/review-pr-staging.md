@@ -734,7 +734,11 @@ STAGING_FINDING_TITLE="chore: [summary] (staging review — PR #${PR_NUMBER})"
 # this is no longer required for safety — but strip it anyway so the raw title
 # stays readable if it round-trips through any other eval-based consumer.
 STAGING_FINDING_TITLE=$(printf '%s' "$STAGING_FINDING_TITLE" | tr '`' "'" | sed 's/\$(/$ (/g')
-STAGING_FINDING_BODY_FILE=$(mktemp)
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+REVIEW_AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-reviewer}-$$}"
+mkdir -p "$SCRATCHPAD"
+STAGING_FINDING_BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_staging-review_${REVIEW_AGENT_TOKEN}"
+STAGING_FINDING_BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_staging-review_${REVIEW_AGENT_TOKEN}.XXXXXX.md")
 cat <<'ISSUE_EOF' > "$STAGING_FINDING_BODY_FILE"
 ## Problem
 
@@ -768,6 +772,7 @@ Files that need changes:
 - [ ] Finding validated: VALIDATED / FALSE_POSITIVE / INCONCLUSIVE
 - [ ] If VALIDATED: fix implemented and tested on correct branch
 ISSUE_EOF
+printf '\n<!-- %s -->\n' "$STAGING_FINDING_BODY_MARKER" >> "$STAGING_FINDING_BODY_FILE"
 
 # STAGING_FINDING_SEVERITY is extracted from the finding's own **Severity**
 # body field (set above in the heredoc) — example assignment shown here for
@@ -795,6 +800,7 @@ else
 # ${MILESTONE_FLAG} carries the Phase 7D derivation through — empty string is
 # a no-op arg when the reviewed branch has no milestone (plain staging→main).
 Skill(skill="issue", args="--title \"$STAGING_FINDING_TITLE\" --body-file \"$STAGING_FINDING_BODY_FILE\" --label review-finding --label needs-validation --label staging-review --label \"$STAGING_FINDING_PRIORITY\" ${MILESTONE_FLAG}")
+# /issue re-reads the created issue and hard-fails unless this exact marker is present.
 rm -f "$STAGING_FINDING_BODY_FILE"
 
 # /issue has no machine-readable return contract — resolve the created issue's number by

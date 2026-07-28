@@ -774,7 +774,7 @@ Agent(
   - For satellite repo issues: `Skill(skill='work-on', args='{SATELLITE_PREFIX}:{NUMBER} --under-orchestration')` (prefix from forge.yaml → repos.satellites)
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
-- **Temp files — ALWAYS use `mktemp`, NEVER a fixed path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`) — never a fixed literal like `/tmp/body.md` or `/tmp/issue.json`. A fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back — this has caused real cross-agent GitHub issue-body corruption. `mktemp` costs nothing and eliminates the collision. (forge#2198)
+- **File-backed GitHub bodies — entity scope plus read-back is mandatory**: Never stage a `gh --body-file` body at a generic shared `/tmp` path, including one made by bare `mktemp`. Prefer the session scratchpad or a repo-relative scratch directory on Windows: a native Windows `gh` may not resolve Git Bash `/tmp` reliably. Create a filename that contains the target issue/PR number and an agent-unique token, then use `mktemp` for its random suffix. Put one caller-chosen marker such as `<!-- FORGE:BODY-INTEGRITY:${NUMBER}_investigator_${AGENT_TOKEN} -->` in the body. After every `gh issue create|edit` or `gh pr create|comment` using `--body-file`, re-read the target object and assert the exact marker is present; a mismatch is a hard error. Unique names reduce collisions, but only read-back detects a collision that substitutes plausible-looking content from another agent. Do not rely on eyeballing. (forge#2843)
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
 - NEVER target `main` for PRs targeting the default repo. Use `{STAGING_BRANCH}` for fast-lane issues, or `milestone/{slug}` for milestone issues.
 - Satellite repos (MCP, n8n) have no staging branch — fast-lane PRs go to `main` for those.
@@ -1893,30 +1893,33 @@ for FINDING_NUM in {spawned_finding_numbers}; do
           # as its own outcome and fail closed, mirroring the concurrent-edit branch below
           # rather than silently falling through to the unprotected write.
           echo "REPAIR: #${FINDING_NUM} skipped — freshness re-fetch failed (network error or API rate limit); cannot verify no concurrent edit occurred, failing closed instead of risking a silent clobber"
-          # forge#2584: stage the body in a mktemp file and deliver it via --body-file
-          # instead of interpolating finding-derived variables (${FINDING_NUM},
-          # ${REPAIR_SOURCE_PR}, ${REPAIR_PARENT_BASE}, ${FINDING_UPDATED_AT_SNAPSHOT})
-          # directly into a double-quoted --body argument at the gh call site — mirrors
-          # REPAIRED_BODY's existing printf-into-variable approach and the repo-wide
-          # mktemp + --body-file convention (forge#2198). mktemp avoids /tmp path
-          # collisions with other concurrently-running orchestrated agents.
-          GATE_BODY_TMPFILE="$(mktemp)"
+          # Scope the scratch name to both this finding and this orchestrator process.
+          # The marker read-back below detects a plausible-looking body substitution.
+          SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+          AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-orchestrator}-$$}"
+          mkdir -p "$SCRATCHPAD"
+          GATE_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}"
+          GATE_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_freshness-gate_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Freshness Re-fetch Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->" > "$GATE_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the freshness re-fetch (\`gh issue view --json updatedAt\`) failed, so the concurrency guard could not confirm the issue body is still at the snapshot captured earlier in this iteration (\`${FINDING_UPDATED_AT_SNAPSHOT}\`). Proceeding with the write here would risk silently clobbering a concurrent edit with no way to verify. Human review required to confirm the current body state and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2565 -->
+<!-- ${GATE_BODY_MARKER} -->" > "$GATE_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$GATE_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${GATE_BODY_MARKER} -->" || { echo "ERROR: freshness-gate comment marker missing" >&2; exit 1; }
           rm -f "$GATE_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # freshness-recheck-failure path
         elif [ "$FINDING_UPDATED_AT_CURRENT" != "$FINDING_UPDATED_AT_SNAPSHOT" ]; then
           echo "REPAIR: #${FINDING_NUM} skipped — concurrent edit detected (updatedAt changed from ${FINDING_UPDATED_AT_SNAPSHOT} to ${FINDING_UPDATED_AT_CURRENT} since this iteration's initial read); flagging instead of repairing"
-          # forge#2584: mktemp + --body-file, same rationale as the freshness-recheck-failure path above.
-          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp)"
+          CONCURRENT_EDIT_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}"
+          CONCURRENT_EDIT_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_concurrent-edit_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Skipped — Concurrent Edit Detected
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair was skipped because the issue body was edited concurrently (\`updatedAt\` changed from \`${FINDING_UPDATED_AT_SNAPSHOT}\` to \`${FINDING_UPDATED_AT_CURRENT}\` between this run's initial read and the repair write). Overwriting the body now would have silently discarded that concurrent edit. Human review required to reconcile and, if still needed, re-apply the Code branch stamp manually. <!-- forge#2512 -->
+<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" > "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$CONCURRENT_EDIT_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${CONCURRENT_EDIT_BODY_MARKER} -->" || { echo "ERROR: concurrent-edit comment marker missing" >&2; exit 1; }
           rm -f "$CONCURRENT_EDIT_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # concurrent-edit path
         else
@@ -1927,13 +1930,15 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
           FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
             --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
         else
-          # forge#2584: mktemp + --body-file, same rationale as the two failure paths above.
-          REPAIR_FAILED_BODY_TMPFILE="$(mktemp)"
+          REPAIR_FAILED_BODY_MARKER="FORGE:BODY-INTEGRITY:${FINDING_NUM}_repair-failure_${AGENT_TOKEN}"
+          REPAIR_FAILED_BODY_TMPFILE="$(mktemp "$SCRATCHPAD/${FINDING_NUM}_repair-failure_${AGENT_TOKEN}.XXXXXX.md")"
           printf '%s' "<!-- FORGE:GATE_FAILURE -->
 ## Code Branch Repair Failed
 
-Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->" > "$REPAIR_FAILED_BODY_TMPFILE"
+Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${REPAIR_SOURCE_PR} bases on \`${REPAIR_PARENT_BASE}\` — not the staging fast lane. Automatic repair (\`gh issue edit --body\`) failed. Without this annotation, \`/work-on\`'s investigation phase may look for the code on the wrong branch (staging, where it is absent) and misclassify this confirmed finding as invalid. Human review required. <!-- forge#2443 -->
+<!-- ${REPAIR_FAILED_BODY_MARKER} -->" > "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue comment "$FINDING_NUM" -R {GH_REPO} --body-file "$REPAIR_FAILED_BODY_TMPFILE" 2>/dev/null || true
+          gh api "repos/{GH_REPO}/issues/${FINDING_NUM}/comments" --jq '.[].body' | grep -Fqx "<!-- ${REPAIR_FAILED_BODY_MARKER} -->" || { echo "ERROR: repair-failure comment marker missing" >&2; exit 1; }
           rm -f "$REPAIR_FAILED_BODY_TMPFILE"
           gh issue edit "$FINDING_NUM" -R {GH_REPO} --add-label needs-human 2>/dev/null || true  # repair-failure path
         fi
