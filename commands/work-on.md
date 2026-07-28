@@ -2114,9 +2114,9 @@ CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
 SUBISSUE_ITEMS=$(echo "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
 ```
 
-This block is character-identical to the one in `commands/work-on/close.md` Phase C1 — keep them in sync. <!-- Fixed: forge#2840 -->
+**Sync invariant:** Keep the structural computation above and its consuming multi-phase guard in `commands/work-on/close.md` Phase C1 synchronized. The guard is `CHECKBOX_SECTIONS >= 2 OR SUBISSUE_ITEMS > 0`; this Phase 6A path is reached only when `REMAINING_BEFORE > 0`. <!-- Fixed: forge#2840, #2874 -->
 
-If multi-phase (`CHECKBOX_SECTIONS >= 2` OR a `- [ ] #NNN` sub-issue item is present, AND `REMAINING_BEFORE > 0`): do NOT check off future phase items. Add PR reference only. A heading count is **not** the test — every templated issue carries `## Problem`/`## Evidence`/`## Context`, so it is `> 0` universally.
+If multi-phase (`CHECKBOX_SECTIONS >= 2` OR a `- [ ] #NNN` sub-issue item is present): do NOT check off future phase items. Add PR reference only. A heading count is **not** the test — every templated issue carries `## Problem`/`## Evidence`/`## Context`, so it is `> 0` universally.
 
 If single-phase or final phase: check off all `[ ]` items, add PR reference.
 

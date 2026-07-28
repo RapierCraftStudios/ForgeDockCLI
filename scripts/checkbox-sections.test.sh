@@ -33,6 +33,19 @@ INLINE_CLASSIFIER=$(extract_classifier "$ROOT/commands/work-on.md")
   exit 1
 }
 
+grep -Fq 'Keep the structural computation above and its consuming multi-phase guard' "$ROOT/commands/work-on.md" || {
+  printf 'FAIL: Phase 6A sync invariant must cover the consuming guard\n' >&2
+  exit 1
+}
+grep -Fq 'The guard is `CHECKBOX_SECTIONS >= 2 OR SUBISSUE_ITEMS > 0`' "$ROOT/commands/work-on.md" || {
+  printf 'FAIL: Phase 6A must document the Phase C1 guard\n' >&2
+  exit 1
+}
+grep -Fq 'if [ "${CHECKBOX_SECTIONS:-0}" -ge 2 ] || [ "${SUBISSUE_ITEMS:-0}" -gt 0 ]; then' "$ROOT/commands/work-on/close.md" || {
+  printf 'FAIL: Phase C1 multi-phase guard changed unexpectedly\n' >&2
+  exit 1
+}
+
 SETEXT_BODY=$'Phase One\n=========\n- [x] complete\n\nPhase Two\n---------\n- [ ] remaining'
 [[ "$(printf '%s\n' "$SETEXT_BODY" | awk "$CLOSE_CLASSIFIER")" == "2" ]] || {
   printf 'FAIL: setext phases must count as two sections\n' >&2

@@ -184,6 +184,8 @@ CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
 # issue forces multi-phase.
 SUBISSUE_ITEMS=$(echo "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
 
+# Keep this consuming guard synchronized with Phase 6A's Sync invariant in
+# commands/work-on.md.
 # Both counters are default-expanded: a failed extraction yields an empty string,
 # not 0, which would make the integer test error out rather than evaluate false.
 if [ "${CHECKBOX_SECTIONS:-0}" -ge 2 ] || [ "${SUBISSUE_ITEMS:-0}" -gt 0 ]; then
