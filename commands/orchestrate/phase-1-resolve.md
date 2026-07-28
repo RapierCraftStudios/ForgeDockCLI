@@ -466,7 +466,7 @@ Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory),
 <!-- /FORGE:BATCH_MEMBERS -->
 
 **Maximum member generation**: {BATCH_MAX_GENERATION}
-<!-- FORGE:BATCH_MAX_GENERATION: {BATCH_MAX_GENERATION} -->
+<!-- FORGE:BATCH_MAX_GENERATION: {BATCH_MAX_GENERATION} --> <!-- allowlist:check-spec-markers -->
 
 **Generation >= 2 members admitted by bounded batching**: {#{NUM} (generation N), or "none"}
 

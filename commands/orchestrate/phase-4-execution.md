@@ -489,15 +489,15 @@ CASCADE_POLICY_NAME=$(yq '.orchestration.cascade.policy // "balanced"' forge.yam
 
 case "$CASCADE_POLICY_NAME" in
   all)
-    PRESET_MAX_GEN="unlimited"; PRESET_TOKEN_BUDGET="unlimited"; PRESET_DEFER_GATED="false"; PRESET_KEYWORD="false"; PRESET_P3_SAME_FILE="false" ;;
+    PRESET_MAX_GEN="unlimited"; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET="unlimited"; PRESET_DEFER_GATED="false"; PRESET_KEYWORD="false"; PRESET_P3_SAME_FILE="false" ;;
   conservative)
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=450000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=450000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
   balanced)
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
   *)
     echo "WARNING: forge.yaml → orchestration.cascade.policy \"${CASCADE_POLICY_NAME}\" is not one of: all, balanced, conservative — falling back to \"balanced\""
     CASCADE_POLICY_NAME="balanced"
-    PRESET_MAX_GEN=1; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
+    PRESET_MAX_GEN=1; PRESET_BATCH_MAX_GEN=2; PRESET_TOKEN_BUDGET=900000; PRESET_DEFER_GATED="true"; PRESET_KEYWORD="true"; PRESET_P3_SAME_FILE="true" ;;
 esac
 
 # max_generation is authoritatively resolved in phase-1-resolve.md (it only governs
@@ -512,10 +512,10 @@ fi
 
 # P3 batching is a distinct, bounded aggregation exception to autonomous cascade
 # admission. Unlike max_generation, it must always be finite, including policy: all.
-BATCH_MAX_GENERATION=$(yq '.orchestration.cascade.batch_max_generation // 2' forge.yaml 2>/dev/null || echo 2)
+BATCH_MAX_GENERATION=$(yq ".orchestration.cascade.batch_max_generation // ${PRESET_BATCH_MAX_GEN}" forge.yaml 2>/dev/null || echo "$PRESET_BATCH_MAX_GEN")
 if ! echo "$BATCH_MAX_GENERATION" | grep -qE '^[1-9][0-9]*$'; then
-  echo "WARNING: forge.yaml → orchestration.cascade.batch_max_generation is not a positive integer (\"${BATCH_MAX_GENERATION}\") — falling back to default 2"
-  BATCH_MAX_GENERATION=2
+  echo "WARNING: forge.yaml → orchestration.cascade.batch_max_generation is not a positive integer (\"${BATCH_MAX_GENERATION}\") — falling back to default ${PRESET_BATCH_MAX_GEN}"
+  BATCH_MAX_GENERATION="$PRESET_BATCH_MAX_GEN"
 fi
 
 # token_budget precedence: orchestration.cascade.token_budget (new home) >
@@ -2432,7 +2432,7 @@ Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered m
 ${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
 
 **Maximum member generation**: ${BATCH_MEMBER_GENERATION}
-<!-- FORGE:BATCH_MAX_GENERATION: ${BATCH_MEMBER_GENERATION} -->
+<!-- FORGE:BATCH_MAX_GENERATION: ${BATCH_MEMBER_GENERATION} --> <!-- allowlist:check-spec-markers -->
 
 **Generation >= 2 members admitted by bounded batching**:
 ${GEN2_MEMBER_LINES:-none}

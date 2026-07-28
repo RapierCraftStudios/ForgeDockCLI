@@ -47,6 +47,7 @@ function parseArmBody(body) {
   };
   return {
     maxGeneration: get("PRESET_MAX_GEN"),
+    batchMaxGeneration: get("PRESET_BATCH_MAX_GEN"),
     tokenBudget: get("PRESET_TOKEN_BUDGET"),
     deferOnBatchGated: get("PRESET_DEFER_GATED"),
     keywordHeuristic: get("PRESET_KEYWORD"),
