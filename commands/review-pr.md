@@ -1795,7 +1795,11 @@ FINDING_ISSUE_TITLE="fix: [summary] (review finding — PR #${PR_NUMBER})"
 # so the raw title stays readable if it round-trips through any other
 # eval-based consumer.
 FINDING_ISSUE_TITLE=$(printf '%s' "$FINDING_ISSUE_TITLE" | tr '`' "'" | sed 's/\$(/$ (/g')
-FINDING_ISSUE_BODY_FILE=$(mktemp)
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+REVIEW_AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-reviewer}-$$}"
+mkdir -p "$SCRATCHPAD"
+FINDING_BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}"
+FINDING_ISSUE_BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}.XXXXXX.md")
 cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 ## Problem
 
@@ -1865,6 +1869,7 @@ Files that need changes:
 - [ ] Reproduce or construct proof-of-concept
 [BATCHABLE_ANNOTATION]
 ISSUE_EOF
+printf '\n<!-- %s -->\n' "$FINDING_BODY_MARKER" >> "$FINDING_ISSUE_BODY_FILE"
 
 # FINDING_SEVERITY is extracted from the finding's own **Severity** body field
 # (set above in the heredoc) — example assignment shown here for clarity, same
@@ -1890,6 +1895,7 @@ else
 
 # --label is repeatable (not comma-joined) per the /issue programmatic contract.
 ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}"))
+# /issue re-reads the created issue and hard-fails unless this exact marker is present.
 rm -f "$FINDING_ISSUE_BODY_FILE"
 
 # /issue succeeds only after its API create-token read-back (Phase 4B). Its

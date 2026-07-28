@@ -13,7 +13,7 @@ You create GitHub issues with the exact structure the `/work-on` pipeline expect
 
 `/issue` is the structured create-hook for issue creation across the pipeline — it enforces the canonical template, reads code before drafting, runs dedup, and validates mandatory sections. Because those checks are deterministic, `/issue` **creates the issue by default once they pass** — it does not wait for a human to approve the draft. Pass `--dry-run` to review the draft without creating anything (see Argument Parsing below).
 
-`/issue` also accepts a **programmatic invocation form** for callers that have already composed a title, body, labels, and (optionally) a milestone — e.g. `Skill(skill="issue", args="--title \"fix: ...\" --body-file \"$(mktemp)\" --label bug --label P2")` (the caller writes the body to that path before invoking). This form skips the free-text parsing (Phase 1) and LLM drafting (Phase 3) entirely, but still runs the same dedup and body-validation correctness gates as the interactive path. See **Programmatic Invocation Contract** below — in particular, `--body-file` callers MUST use a `mktemp`-created path, never hand-roll a path or use a fixed literal like `/tmp/body.md`; concurrent orchestrated agents share this host's `/tmp`, and a fixed path can be clobbered mid-flight by another agent (forge#2198).
+`/issue` also accepts a **programmatic invocation form** for callers that have already composed a title, body, labels, and (optionally) a milestone — e.g. `Skill(skill="issue", args="--title \"fix: ...\" --body-file \"$BODY_FILE\" --label bug --label P2")` (the caller writes the body to that path before invoking). This form skips the free-text parsing (Phase 1) and LLM drafting (Phase 3) entirely, but still runs the same dedup and body-validation correctness gates as the interactive path. See **Programmatic Invocation Contract** below — every `--body-file` caller must use an entity- and agent-scoped scratch path and include a unique integrity marker which `/issue` verifies after creation. This is required because a collision can substitute plausible but unrelated content, not just produce an obvious file error (forge#2843).
 
 **Agent model policy**: `model: "{DEFAULT_MODEL}"` — resolved from forge.yaml `agents.default_model`, else "sonnet" (standard tier). Fallback: `model: "opus"` if rate-limited. Feature gate: pass `effort` in Task/Skill spawns only on Claude Code >= 2.1.154.
 **NEVER use plan mode (EnterPlanMode).**
@@ -184,9 +184,20 @@ For callers that have already composed a title, body, labels, and (optionally) a
 
 If `--title` is present but neither `--body` nor `--body-file` is supplied, or both are supplied, this is a usage error: print `ERROR: programmatic mode requires exactly one of --body or --body-file` and STOP — do not fall through to Phase 2D or Phase 4B.
 
-**`--body-file` path requirement (MANDATORY for the caller)**: The path passed to `--body-file` MUST come from `mktemp` (e.g. `BODY_FILE="$(mktemp)"`); never hand-roll a temp path. Never write a temp file to a single-segment root path such as `/tmp_invbody_31076.txt`: Claude Code treats removing it as dangerous and requires an explicit approval that bypass mode cannot clear, hanging unattended runs. Do not use fixed literals such as `/tmp/body.md` or `/tmp/issue.json`, either. Concurrent orchestrated agents (`/orchestrate` dispatches up to `orchestration.max_concurrent` agents, default 12) share this host's `/tmp` — a fixed filename collides across agents, and a second agent's write to the same path can silently corrupt the first agent's staged content before it is read. `mktemp` gives every caller a collision-free path at effectively zero cost. Safe: `BODY_FILE="$(mktemp)"`. Unsafe: `/tmp_invbody_31076.txt` (a missing slash that creates a root-level path) and `/tmp/body.md` (a fixed path). This applies to every `--body-file` caller across the pipeline (`commands/work-on.md`, `commands/work-on/decompose.md`, `commands/review-pr*.md`, `commands/orchestrate/phase-1-resolve.md`, and all others) — all current callers already comply; this is the stated contract that keeps it that way (forge#2198, forge#2855).
+**`--body-file` integrity contract (MANDATORY for the caller)**: Do not use a generic name under shared `/tmp`, even with `mktemp`. Prefer the session scratchpad (or a repo-relative scratch directory) because a Windows-native `gh` may not resolve Git Bash `/tmp` as expected. Never hand-roll a temporary path or use a single-segment root path such as `/tmp_invbody_31076.txt`, which can require interactive deletion approval and hang unattended runs. Create the directory if needed, make the filename include the target issue or PR number and an agent-unique token, then let `mktemp` add its random suffix:
 
-**Fail-loud read ordering (the defensive mechanism against a clobbered body-file)**: `/issue` reads `$PROGRAMMATIC_BODY_FILE` exactly once, into memory, immediately below — it never re-reads the file later in the pipeline. This is deliberate: combined with a `mktemp`-unique path, it minimizes the window in which another process could overwrite the file between the caller's write and this read to effectively nil (no other agent has any reason to target a `mktemp`-generated path). If the file is missing or unreadable at read time, the check below fails loudly (`exit 1`) rather than silently proceeding with an empty or partial body — a clobbered/missing body-file is surfaced as an error, not pushed to GitHub.
+```bash
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-agent}-$$}"
+mkdir -p "$SCRATCHPAD"
+BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_review_${AGENT_TOKEN}"
+BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_review_${AGENT_TOKEN}.XXXXXX.md")
+printf '%s\n<!-- %s -->\n' "$BODY" "$BODY_MARKER" > "$BODY_FILE"
+```
+
+The body MUST contain exactly one caller-chosen marker in the form `<!-- FORGE:BODY-INTEGRITY:<entity>_<role>_<agent-token> -->`. A unique path reduces collisions; it does not prove that the intended content reached GitHub. The caller must retain the marker until the write is verified. A collision can substitute plausible-looking content from another agent, so an eyeball check is not a sufficient backstop.
+
+**Fail-loud read and verification**: `/issue` reads `$PROGRAMMATIC_BODY_FILE` once into memory below. For `--body-file`, it also extracts the required marker and, after `gh issue create`, re-reads the created issue and requires that exact marker. Missing, unreadable, absent, or ambiguous markers are hard errors; do not create or report success with unverified content.
 
 ```bash
 if [ "$PROGRAMMATIC_MODE" = "true" ]; then
@@ -208,6 +219,12 @@ if [ "$PROGRAMMATIC_MODE" = "true" ]; then
       exit 1
     fi
     PROGRAMMATIC_BODY=$(cat "$PROGRAMMATIC_BODY_FILE")
+    mapfile -t PROGRAMMATIC_BODY_MARKERS < <(printf '%s' "$PROGRAMMATIC_BODY" | grep -oE '<!-- FORGE:BODY-INTEGRITY:[^>]+ -->')
+    if [ "${#PROGRAMMATIC_BODY_MARKERS[@]}" -ne 1 ]; then
+      echo "ERROR: --body-file must contain exactly one FORGE:BODY-INTEGRITY marker"
+      exit 1
+    fi
+    PROGRAMMATIC_BODY_MARKER="${PROGRAMMATIC_BODY_MARKERS[0]}"
   fi
 fi
 ```
@@ -711,6 +728,18 @@ LABELS=$(gh issue view {NEW_NUMBER} {GH_FLAG} --json labels --jq '[.labels[].nam
 echo "Created: ${ISSUE_URL}"
 echo "Labels: ${LABELS}"
 echo "ISSUE_CREATE_RESULT:CREATED number=${NEW_NUMBER} url=${ISSUE_URL}"
+```
+
+**`--body-file` integrity read-back (MANDATORY)**: Immediately after every programmatic creation sourced from `--body-file`, re-read the issue body and assert the caller's exact marker is present. This is a hard error, not a warning: a missing marker means the write may have received another agent's plausible-looking body.
+
+```bash
+if [ -n "$PROGRAMMATIC_BODY_FILE" ]; then
+  CREATED_BODY=$(gh issue view {NEW_NUMBER} {GH_FLAG} --json body --jq '.body') || exit 1
+  if ! printf '%s' "$CREATED_BODY" | grep -Fqx "$PROGRAMMATIC_BODY_MARKER"; then
+    echo "ERROR: created issue body is missing expected integrity marker $PROGRAMMATIC_BODY_MARKER" >&2
+    exit 1
+  fi
+fi
 ```
 
 ### Content-Creation Rule
