@@ -2416,6 +2416,16 @@ async function doctor(fix = false) {
                 broken++;
                 brokenLinks.push(rel);
                 symlinkOk = false;
+              } else {
+                try {
+                  // readlink() only validates the stored target. Opening the
+                  // link also catches platform-specific traversal failures.
+                  readFileSync(tgt);
+                } catch {
+                  broken++;
+                  brokenLinks.push(`${rel} (unreadable — link resolves but cannot be traversed)`);
+                  symlinkOk = false;
+                }
               }
             } else {
               // Regular file — copy-mode install (Windows without Developer Mode).
