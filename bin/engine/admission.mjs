@@ -63,6 +63,10 @@ export const UNLIMITED = "unlimited";
  *   heuristic defers P3-and-below findings.
  * @property {boolean} p3SameFileDefer - Whether a P3 finding sharing a file with
  *   the active batch is deferred.
+ * @property {number|null} maxAmplification - Maximum findings spawned per merged
+ *   unit before same-lineage refinements are deferred. `null` disables the bound.
+ * @property {number} convergenceWindow - Merged-unit window used to warn when
+ *   amplification remains at or above 1.0.
  */
 
 /**
@@ -107,6 +111,19 @@ export const CASCADE_PRESETS = Object.freeze({
 });
 
 export const DEFAULT_CASCADE_POLICY_NAME = "balanced";
+
+/** Parse an optional positive decimal used for an opt-in ratio ceiling. */
+export function parseOptionalPositiveNumber(raw) {
+  if (raw === undefined || raw === null || raw === "null" || raw === "" || raw === "off") {
+    return { value: null, warning: null };
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (Number.isFinite(n) && n > 0) return { value: n, warning: null };
+  return {
+    value: null,
+    warning: `not a positive number or "off" ("${raw}") — disabling the bound`,
+  };
+}
 
 /**
  * Parse a raw config value that may be a positive integer, the literal
@@ -156,6 +173,8 @@ export function parseIntOrUnlimited(raw, fallback) {
  * @param {boolean} [config.defer_on_batch_gated]
  * @param {boolean} [config.keyword_heuristic]
  * @param {boolean} [config.p3_same_file_defer]
+ * @param {number|string} [config.max_amplification]
+ * @param {number|string} [config.convergence_window]
  * @param {number|string} [legacyTokenBudgetPerBatch] - Deprecated-alias fallback:
  *   `pipeline.token_budget_per_batch`, read when `config.token_budget` is absent
  *   so existing configs keep working unchanged (see forge#1858).
@@ -224,6 +243,16 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
     typeof config.keyword_heuristic === "boolean" ? config.keyword_heuristic : preset.keywordHeuristic;
   const p3SameFileDefer =
     typeof config.p3_same_file_defer === "boolean" ? config.p3_same_file_defer : preset.p3SameFileDefer;
+  const maxAmplification = parseOptionalPositiveNumber(config.max_amplification);
+  if (maxAmplification.warning) warnings.push(`orchestration.cascade.max_amplification ${maxAmplification.warning}`);
+  const convergenceWindow = parseIntOrUnlimited(config.convergence_window, 3);
+  if (convergenceWindow.warning || convergenceWindow.value === UNLIMITED) {
+    warnings.push(
+      convergenceWindow.warning
+        ? `orchestration.cascade.convergence_window ${convergenceWindow.warning}`
+        : 'orchestration.cascade.convergence_window cannot be "unlimited" — falling back to default 3',
+    );
+  }
 
   // Both-uncapped notice: neither generation depth nor token spend is bounded this
   // run. This is never a preset default (no preset in CASCADE_PRESETS sets both to
@@ -247,6 +276,8 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
       deferOnBatchGated,
       keywordHeuristic,
       p3SameFileDefer,
+      maxAmplification: maxAmplification.value,
+      convergenceWindow: convergenceWindow.value === UNLIMITED ? 3 : convergenceWindow.value,
     },
     policyName,
     bothUncapped,
@@ -287,6 +318,19 @@ export function admitsBatchGeneration(generation, policy) {
 export function admitsTokenSpend(projectedSpend, policy) {
   if (policy.tokenBudget === UNLIMITED) return true;
   return projectedSpend <= policy.tokenBudget;
+}
+
+/**
+ * Compute the observable cascade amplification signal and opt-in bound state.
+ * The bound is deliberately not an admission decision: callers only apply it
+ * to same-lineage refinements, never to unrelated or high-value findings.
+ */
+export function evaluateAmplification(mergedUnits, findingsSpawned, policy) {
+  const ratio = mergedUnits > 0 ? findingsSpawned / mergedUnits : 0;
+  return {
+    ratio,
+    exceedsBound: policy.maxAmplification !== null && ratio > policy.maxAmplification,
+  };
 }
 
 /**

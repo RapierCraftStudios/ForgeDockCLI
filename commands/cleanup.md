@@ -423,10 +423,10 @@ UNBATCHED_P3=$(gh issue list {GH_FLAG} \
   --json number,title,body,labels,createdAt \
   --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
          | select(([.labels[].name] | any(. == "batch")) | not)
-         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i")) | not)
+         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i")) | not)
          | (.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) as $stripped_body
-         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i") | not)
-         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth")) | not)')
+         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i") | not)
+         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth" or . == "needs-human" or . == "blocked" or . == "operator-only")) | not)')
 
 echo "Unbatched batchable P3 findings: $(echo "$UNBATCHED_P3" | jq -s 'length')"
 ```

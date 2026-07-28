@@ -167,9 +167,21 @@ def parse_agent(filepath, agent_id):
     skill_invocations = []  # unique (ts, skill) pairs
     skill_set = set()
     tool_counts = defaultdict(int)
-    resume_count = 0
     first_ts = last_ts = None
     end_turn_points = []
+    event_timestamps = []
+    operator_resume_cycles = 0
+    pending_end_turn = False
+
+    def is_terminal_skill(skill):
+        return skill.lower() in {'close', 'work-on/close', 'work-on:close'}
+
+    def is_terminal_text(text):
+        text = text.lower()
+        return any(marker in text for marker in (
+            'verdict: invalid', 'status: invalid', 'state: invalid',
+            'status: merged', 'state: merged', 'status: closed', 'state: closed',
+        ))
 
     for line in lines:
         data = json.loads(line)
@@ -181,10 +193,17 @@ def parse_agent(filepath, agent_id):
         if first_ts is None:
             first_ts = ts
         last_ts = ts
+        event_timestamps.append(ts)
 
         msg = data.get('message', {})
         stop_reason = msg.get('stop_reason', '')
         content = msg.get('content', [])
+
+        # A user turn after an assistant end_turn is an operator-style resume,
+        # even when the transcript is appended rather than replayed.
+        if data.get('type') == 'user' and pending_end_turn:
+            operator_resume_cycles += 1
+            pending_end_turn = False
 
         if stop_reason == 'end_turn':
             # Find the text content of this end_turn message
@@ -194,7 +213,15 @@ def parse_agent(filepath, agent_id):
                     if c.get('type') == 'text':
                         text = c.get('text', '')[:100]
                         break
-            end_turn_points.append({'ts': ts, 'text': text})
+            terminal = is_terminal_text(text) or any(
+                is_terminal_skill(si['skill']) for si in skill_invocations
+            )
+            end_turn_points.append({
+                'ts': ts,
+                'text': text,
+                'terminal': terminal,
+            })
+            pending_end_turn = not terminal
 
         if isinstance(content, list):
             for c in content:
@@ -217,17 +244,6 @@ def parse_agent(filepath, agent_id):
                             # Duplicate = resume replay
                             pass
 
-        # Detect resume points: user messages that contain resume instructions
-        if data.get('type') == 'user':
-            if isinstance(content, str) and any(kw in content.lower() for kw in ['continue', 'resume', 'you need to']):
-                resume_count += 1
-            elif isinstance(content, list):
-                for c in content:
-                    if c.get('type') == 'text':
-                        t = c.get('text', '').lower()
-                        if any(kw in t for kw in ['continue the', 'resume', 'you need to continue']):
-                            resume_count += 1
-
     # Count duplicate skill timestamps to detect resume replays
     all_skill_timestamps = []
     for line in lines:
@@ -244,7 +260,8 @@ def parse_agent(filepath, agent_id):
     for t in all_skill_timestamps:
         ts_counts[t] += 1
     max_replays = max(ts_counts.values()) if ts_counts else 1
-    resume_cycles = max_replays - 1  # first occurrence is original, rest are replays
+    replay_resume_cycles = max_replays - 1  # first occurrence is original, rest are replays
+    resume_cycles = replay_resume_cycles + operator_resume_cycles
 
     # Build phase timeline from unique skill invocations.
     # Stall detection: a gap is a TRUE STALL only when it is >120s AND contains zero
@@ -276,7 +293,17 @@ def parse_agent(filepath, agent_id):
         gap_sec = (si['ts'] - prev_ts).total_seconds()
         # Any tool_use event inside the gap window means the agent was active
         has_tool_use_in_gap = any(prev_ts < t <= si['ts'] for t in all_tool_use_ts)
-        is_stall = gap_sec > 120 and not has_tool_use_in_gap
+        # An incomplete end_turn in this gap is accounted for separately below,
+        # so the same wall-clock wait is never counted twice.
+        has_incomplete_end_turn_in_gap = any(
+            not p['terminal'] and prev_ts < p['ts'] <= si['ts']
+            for p in end_turn_points
+        )
+        is_stall = (
+            gap_sec > 120
+            and not has_tool_use_in_gap
+            and not has_incomplete_end_turn_in_gap
+        )
         phases.append({
             'ts': si['ts'],
             'skill': si['skill'],
@@ -286,9 +313,27 @@ def parse_agent(filepath, agent_id):
         })
         prev_ts = si['ts']
 
-    total_sec = (last_ts - first_ts).total_seconds() if first_ts and last_ts else 0
-    stall_sec = sum(p['gap_from_prev_sec'] for p in phases if p['is_stall'])
+    # An end_turn before a terminal phase is a stall even with no idle gap. Its
+    # wait is measured until the next transcript event; a terminal transcript
+    # has no following event, so give it the detector's 120-second floor.
+    incomplete_end_turns = [p for p in end_turn_points if not p['terminal']]
+    for point in incomplete_end_turns:
+        next_ts = next((t for t in event_timestamps if t > point['ts']), None)
+        point['stall_sec'] = (next_ts - point['ts']).total_seconds() if next_ts else 120
+        point['is_stall'] = True
+
+    observed_total_sec = (last_ts - first_ts).total_seconds() if first_ts and last_ts else 0
+    unobserved_stall_sec = sum(
+        p['stall_sec'] for p in incomplete_end_turns if p['ts'] == last_ts
+    )
+    total_sec = observed_total_sec + unobserved_stall_sec
+    phase_stall_sec = sum(p['gap_from_prev_sec'] for p in phases if p['is_stall'])
+    end_turn_stall_sec = sum(p['stall_sec'] for p in incomplete_end_turns)
+    stall_sec = phase_stall_sec + end_turn_stall_sec
     active_sec = total_sec - stall_sec
+    reached_terminal_state_unaided = (
+        any(p['terminal'] for p in end_turn_points) and resume_cycles == 0
+    )
 
     return {
         'agent_id': agent_id,
@@ -304,6 +349,8 @@ def parse_agent(filepath, agent_id):
         'phases': phases,
         'end_turn_points': end_turn_points,
         'resume_cycles': resume_cycles,
+        'operator_resume_cycles': operator_resume_cycles,
+        'reached_terminal_state_unaided': reached_terminal_state_unaided,
         'skill_count': len(skill_invocations),
     }
 ```
@@ -346,7 +393,8 @@ For each agent, display:
 ```
 ## Agent: #{ISSUE_NUMBER} — {ISSUE_TITLE}
 **Duration**: {total_min} min (active: {active_min} min, idle: {stall_min} min — {idle_pct}% idle)
-**Resume cycles**: {resume_cycles} (agent stopped and was resumed {resume_cycles} times)
+**Resume cycles**: {resume_cycles} (replay: {replay_resume_cycles}, injected user turn: {operator_resume_cycles})
+**Terminal state**: {"reached unaided" if reached_terminal_state_unaided else "required intervention or did not reach terminal state"}
 **JSONL lines**: {lines} | **Tool calls**: Bash:{N} Read:{N} Edit:{N} Skill:{N}
 
 ### Phase Timeline
@@ -376,15 +424,15 @@ For each agent, display:
 ```
 ## Wave Summary
 
-| Agent | Issue | Total | Active | Idle | Idle% | Resumes | Stall Points |
-|-------|-------|-------|--------|------|-------|---------|--------------|
-| afbc… | #14513 | 40m | 8m | 31m | 80% | 2 | investigate→build, context→architect |
-| a3b5… | #14508 | 23m | 23m | 0m | 0% | 0 | — |
-| adf5… | #14514 | 55m | 12m | 43m | 78% | 3 | investigate→build, context→architect, implement→validate |
+| Agent | Issue | Total | Active | Idle | Idle% | Resumes | Terminal unaided | Stall Points |
+|-------|-------|-------|--------|------|-------|---------|------------------|--------------|
+| afbc… | #14513 | 40m | 8m | 31m | 80% | 2 | no | investigate→build, context→architect |
+| a3b5… | #14508 | 23m | 23m | 0m | 0% | 0 | yes | — |
+| adf5… | #14514 | 55m | 12m | 43m | 78% | 3 | no | investigate→build, context→architect, implement→validate |
 
 **Wave efficiency**: {avg_idle_pct}% idle time across all agents
 **Longest stall**: {max_stall_min} min ({agent_id} between {phase_a} → {phase_b})
-**Clean agents**: {N} of {total} ran without stalls
+**Clean agents**: {N} of {total} ran without stalls or intervention
 ```
 
 ### Step 4C: Stall pattern analysis
@@ -416,6 +464,7 @@ Based on the data, output specific recommendations:
 
 - If idle% > 50% across wave → "Orchestrator polling too slow — agents spend more time waiting than working"
 - If resume_cycles > 0 for most agents → "Routing loop in work-on.md not continuing past phase boundaries"
+- If any agent did not reach a terminal state unaided → "Routing loop required operator intervention; inspect end_turn stops before declaring the wave clean"
 - If specific boundary stalls repeatedly → "Phase {X} returns text with end_turn instead of continuing loop — check work-on.md routing instructions"
 - If one agent ran clean but others didn't → "Compare clean agent (#XXXX) vs stalled agents — what differs?"
 
@@ -480,7 +529,7 @@ fi
 TOTAL_AGENTS=$(echo "${AGENT_DATA[@]}" | jq 'length')
 AVG_IDLE=$(echo "${AGENT_DATA[@]}" | jq '[.[].idle_pct] | add / length | . * 10 | round / 10')
 AVG_RESUMES=$(echo "${AGENT_DATA[@]}" | jq '[.[].resume_cycles] | add / length | . * 100 | round / 100')
-CLEAN_N=$(echo "${AGENT_DATA[@]}" | jq '[.[] | select(.idle_pct == 0 and .resume_cycles == 0)] | length')
+CLEAN_N=$(echo "${AGENT_DATA[@]}" | jq '[.[] | select(.idle_pct == 0 and .resume_cycles == 0 and .reached_terminal_state_unaided)] | length')
 
 # Top stall boundaries: aggregate gap_from_prev_sec > 120 entries by skill transition label
 # Format: "investigate→build(4), context→architect(3), implement→validate(2)"
@@ -541,4 +590,4 @@ This enables tracking whether orchestrator/prompt changes actually improved thro
 - **File format**: Agent outputs are JSONL (one JSON object per line). Each line has `type` (user/assistant), `timestamp`, `message` (with `content` array and optional `stop_reason`).
 - **Subagent files**: Located at `~/.claude/projects/{munged-project-path}/{sessionId}/subagents/agent-{agentId}.jsonl`. The munging rule: both `/` and `.` in the project path are replaced with `-` (e.g. `/home/user/projects/myapp` → `-home-user-projects-myapp`). There are no platform-specific temp paths or symlinks involved.
 - **Size filtering**: Only analyze files > 10 lines. Small files are helper/polling agents spawned by the orchestrator for status checks.
-- **Resume detection**: When an agent is resumed, the full conversation is replayed. Duplicate `(timestamp, skill_name)` pairs indicate replay cycles. `max(duplicates) - 1 = resume_cycles`.
+- **Resume detection**: Replay-dispatched resumes produce duplicate `(timestamp, skill_name)` pairs. SendMessage-style resumes append a user turn after an assistant `end_turn`. Both signals contribute to `resume_cycles`.

@@ -1417,7 +1417,7 @@ async function relinkAndHint() {
   // version-check path), so wiring it here covers "refreshed after every
   // successful update" without duplicating the call at each branch. Note:
   // this is NOT reached by install's already-managed-active short-circuit
-  // (that path calls statusScreen(), never relinkAndHint()) — see the
+  // (that path is also used by managed-active install) — see the
   // writeInstallReceipt() JSDoc in journey.mjs for the full picture.
   await writeInstallReceipt(c, { forged });
   await refreshManagedOpenCodeAdapter();
@@ -3819,7 +3819,9 @@ switch (command) {
       }
     }
     if (existsSync(join(c.cwd, "forge.yaml")) && resolveState(c.cwd) === "managed-active") {
-      await statusScreen(c);
+      // A configured directory may still have missing commands after uninstall.
+      // Refresh managed files without re-running the configuration journey.
+      await relinkAndHint();
     } else {
       exitCode = await runJourney(c);
       // Record persistHome()'s outcome (set on c.persistHomeResult inside
