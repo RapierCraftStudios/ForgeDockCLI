@@ -356,7 +356,7 @@ export const PHASES = [
       if (!pr) return { status: "failed", detail: "no PR created" };
       if (pr.merged) return { status: "committed", outputs: { pr: pr.number } };
       if (pr.needsHuman) return { status: "blocked", detail: "review escalated", outputs: { pr: pr.number } };
-      return { status: "failed", detail: "PR open, not merged" };
+      return { status: "failed", detail: "PR open, not merged", retryable: false };
     },
   },
   {
@@ -370,23 +370,9 @@ export const PHASES = [
     // phase table (closing the literal "remediate appears nowhere in the
     // engine" gap) and is fully unit-tested via `pickPhase`/`detectOutcome`.
     //
-    // KNOWN LIMITATION (documented, not fixed here — see forge#2379
-    // investigation "What We Found"): `review`'s `"blocked"` outcome (the
-    // needs-human escalation) causes `bin/engine.mjs`'s `runIssue()` to
-    // `terminate()` immediately, before `review` is ever added to
-    // `state.committed` — and the divergence guard just above that also
-    // pauses before any non-`close` phase once the issue carries
-    // `needs-human`. So a single continuous `runIssue()` walk cannot reach
-    // this phase's `entryCondition` today. In practice `remediate.md` is
-    // (correctly, per `work-on.md` Phase 0A.1) invoked as its own separate
-    // top-level entry point (`/work-on <pr> --remediate`), not as a
-    // continuation of the original run — this phase entry documents and
-    // tests the target state shape for a future run that reconstructs
-    // `committed`/`terminalReason` from live GitHub state (e.g. a dedicated
-    // remediation-run entry point) rather than from a fresh local run-log.
-    // Making that live wiring real is out of this issue's scope — it needs
-    // changes to `review`'s `"blocked"` contract and to `bin/tests/engine.test.mjs`,
-    // both outside this issue's declared file set.
+    // A blocked review is committed with terminalReason "needs-human" before
+    // the engine selects this phase, preserving the review verdict while
+    // handing the PR to remediation in the same run.
     id: "remediate",
     command: "work-on/remediate",
     entryCondition: (s) => s.committed.includes("review") && s.terminalReason === "needs-human",

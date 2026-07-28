@@ -139,7 +139,7 @@ The `INVARIANT_ANOMALIES` variable is read in Phase C4.5 (trajectory post) and w
 BODY=$(gh issue view {NUMBER} {GH_FLAG} --json body --jq '.body')
 
 # Count remaining unchecked items BEFORE any edit
-REMAINING_BEFORE=$(echo "$BODY" | grep -c '^- \[ \]' || true)
+REMAINING_BEFORE=$(printf '%s\n' "$BODY" | grep -cE '^[-*+] \[ \]' || true)
 ```
 
 **If `REMAINING_BEFORE == 0`** (no unchecked items): skip body edit — all items already checked, proceed to add PR reference only:
@@ -149,24 +149,54 @@ gh issue edit {NUMBER} {GH_FLAG} --body "{UPDATED_BODY}"
 REMAINING_AFTER=0
 ```
 
-**If `REMAINING_BEFORE > 0`**: check whether ANY `- [ ]` items will still remain after a full check-off — i.e., does the issue have multi-phase structure?
+**If `REMAINING_BEFORE > 0`**: check whether ANY unchecked GFM task items will still remain after a full check-off — i.e., does the issue have multi-phase structure?
 
-Multi-phase issues have checkbox groups separated by phase headings (lines starting with `##` or `###`) where at least one group has unchecked items. Detect this:
+Multi-phase issues have **two or more checkbox-bearing sections** — that is, two or more heading-delimited sections that each contain at least one GFM task item. Test that structure directly; do **not** infer it from the presence of headings. Every templated issue carries `## Problem`, `## Evidence`, `## Affected Files`, `## Acceptance Criteria`, and `## Context`, so a heading count is `> 0` universally and says nothing about phase structure. <!-- Fixed: forge#2840 -->
+
 ```bash
-# Conservative heuristic: if the issue body contains a phase heading (## or ###)
-# AND unchecked items remain, treat as multi-phase — do NOT check off items from
-# future phases; only add the PR reference and leave unchecked items intact.
-HAS_PHASE_HEADINGS=$(echo "$BODY" | grep -cP '^#{2,3} ' || true)
+# Structural test: count heading-delimited sections that contain checkbox items.
+# Multi-phase == 2+ checkbox-bearing sections. A single checkbox group is
+# single-phase regardless of how many prose headings surround it.
+#
+# - Fenced code blocks are stripped first: issue bodies routinely embed fenced
+#   blocks whose lines start with '#' or contain a literal '- [ ]'. An
+#   unterminated fence keeps the original body so later work is never hidden.
+# - ATX headings and setext underlines both delimit sections. The ATX pattern
+#   avoids awk interval-quantifier variance across awk implementations.
+# - grep -E / awk only — no PCRE. '^#+ ' needs none.
+FENCE_COUNT=$(printf '%s\n' "$BODY" | grep -cE '^(```+|~~~+)' || true)
+if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
+  BODY_STRIPPED="$BODY"
+else
+  BODY_STRIPPED=$(printf '%s\n' "$BODY" | awk '/^(```+|~~~+)/{f=!f; next} !f')
+fi
 
-if [ "$HAS_PHASE_HEADINGS" -gt 0 ]; then
+CHECKBOX_SECTIONS=$(printf '%s\n' "$BODY_STRIPPED" | awk '
+  /^#+ / { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  /^(=+|-+)$/ && previous != "" { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  { if (in_section && /^[-*+] \[[ xX]\]/) has=1; previous=$0 }
+  END { if (in_section && has) n++; print n+0 }
+')
+
+# Sub-issue-tracker guard: a decompose parent whose only checkbox group is
+# '## Sub-Issue Tracker' counts 1 section. Checking those off would mark open
+# sub-issues done and close the tracker, so any unchecked GFM task item for an
+# issue forces multi-phase.
+SUBISSUE_ITEMS=$(printf '%s\n' "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
+
+# Keep this consuming guard synchronized with Phase 6A's Sync invariant in
+# commands/work-on.md.
+# Both counters are default-expanded: a failed extraction yields an empty string,
+# not 0, which would make the integer test error out rather than evaluate false.
+if [ "${CHECKBOX_SECTIONS:-0}" -ge 2 ] || [ "${SUBISSUE_ITEMS:-0}" -gt 0 ]; then
   # Multi-phase issue: do NOT check off any [ ] items
   # Only add the PR reference so progress is recorded
   UPDATED_BODY="${BODY}"$'\n\n'"**PR**: #{PR_NUMBER} → merged to \`{PR_BASE}\` (phase complete — remaining phases open)"
   gh issue edit {NUMBER} {GH_FLAG} --body "{UPDATED_BODY}"
   REMAINING_AFTER="$REMAINING_BEFORE"
 else
-  # Single-phase issue: check off all remaining [ ] items
-  UPDATED_BODY=$(echo "$BODY" | sed 's/^- \[ \]/- [x]/g')
+  # Single-phase issue: check off all remaining GFM task items
+  UPDATED_BODY=$(printf '%s\n' "$BODY" | sed 's/^\([-*+]\) \[ \]/\1 [x]/g')
   UPDATED_BODY="${UPDATED_BODY}"$'\n\n'"**PR**: #{PR_NUMBER} → merged to \`{PR_BASE}\`"
   gh issue edit {NUMBER} {GH_FLAG} --body "{UPDATED_BODY}"
   REMAINING_AFTER=0

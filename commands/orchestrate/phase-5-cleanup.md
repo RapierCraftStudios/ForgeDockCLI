@@ -49,16 +49,11 @@ Include the audit summary in the final report (Phase 6). Key metrics to surface:
 
 ```bash
 if [ -n "${COORD_ISSUE_NUMBER:-}" ]; then
-  # Detect any still-active (unreleased) claims — a claim posted with no matching
-  # CLAIM_RELEASED comment on the same coordination issue. Adapted from the query
-  # phase-4-execution.md's claims-board relaxation sweep uses (Step 4B item 4),
-  # simplified to holder-only (a flat string array) since Step 5C only needs
-  # holder names for the closure note — unlike phase-4-execution.md's version,
-  # which also captures each claim's `files` into an object alongside `holder`.
-  ACTIVE_CLAIMS=$(gh api repos/{GH_REPO}/issues/${COORD_ISSUE_NUMBER}/comments \
-    --jq '[.[] | select(.body | contains("<!-- FORGE:CLAIM -->")) |
-           select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->") | not)] |
-          map(.body | capture("\\*\\*Holder\\*\\*: (?P<h>[^\\n]+)").h // "unknown")' 2>/dev/null || echo '[]')
+  # Use Step 4A's read_active_claims() helper (re-declare it verbatim here when this
+  # phase runs in a fresh context). Releases are separate later comments, so checking
+  # for CLAIM_RELEASED inside the claim body would retain every released claim.
+  ACTIVE_CLAIMS=$(read_active_claims "$COORD_ISSUE_NUMBER" 2>/dev/null \
+    | jq '[.[].holder // "unknown"]' 2>/dev/null || echo '[]')
   ACTIVE_CLAIMS_COUNT=$(echo "$ACTIVE_CLAIMS" | jq 'length' 2>/dev/null || echo 0)
 
   if [ "$ACTIVE_CLAIMS_COUNT" -gt 0 ] 2>/dev/null; then
@@ -87,4 +82,3 @@ fi
 Include the cleanup summary in the final report (Phase 6), including whether the coordination issue was closed this run (see Step 5C). If cleanup found problems, call them out — they indicate agent pipeline failures that may need investigation.
 
 ---
-
