@@ -359,16 +359,17 @@ describe("planP3BatchGroups — concern-level P3 batching", () => {
     assert.deepEqual(plan.ungrouped, [3]);
   });
 
-  it("groups a shared source PR only within one top-level subsystem", () => {
+  it("groups all remaining findings from one source PR cohort", () => {
     const plan = planP3BatchGroups([
       finding(1, "infra/monitoring/a.yml", "**Source**: PR #42"),
       finding(2, "infra/monitoring/b.yml", "**Source**: PR #42"),
       finding(3, "scripts/a.sh", "**Source**: PR #42"),
+      finding(4, "README.md", "**Source**: PR #42"),
     ]);
     assert.deepEqual(plan.groups, [
-      { kind: "source-pr", key: "PR #42 + infra/monitoring", members: [1, 2] },
+      { kind: "source-pr", key: "42", members: [1, 2, 3, 4] },
     ]);
-    assert.deepEqual(plan.ungrouped, [3]);
+    assert.deepEqual(plan.ungrouped, []);
   });
 
   it("groups explicit defect classes across files", () => {
