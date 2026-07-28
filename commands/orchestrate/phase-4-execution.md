@@ -792,10 +792,12 @@ Capture the returned `<task id="..." state="running">` id in
 ```bash
 ATTEMPT=$(gh api repos/{GH_REPO}/issues/{NUMBER}/comments \
   --jq '[.[] | select(.body | contains("FORGE:DISPATCH") and contains("\"state\":\"running\""))] | length + 1')
-gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
+if [ "${DRY_RUN:-false}" = "false" ]; then
+  gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
 \`\`\`json
 {\"runtime\":\"opencode\",\"child_session_id\":\"{TASK_ID}\",\"attempt\":${ATTEMPT},\"state\":\"running\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
 \`\`\`"
+fi
 ```
 
 `background=true` is required for streaming DAG behavior; a foreground task
@@ -1203,10 +1205,12 @@ If `DISPATCH_NOW` is empty (headroom is 0), do not spawn any agents this cycle �
 You will be automatically notified when each background agent completes — or, for an engine-first dispatch (Step 4A, `FORGEDOCK_AVAILABLE=true`), when a backgrounded `Bash(run_in_background=true, command="forgedock run-issue ...")` call completes. In OpenCode, a native background `task` first returns a `state="running"` result and later injects a synthetic `<task id="..." state="completed">` or `state="error"` result into this same parent session. The later result is the completion event; the initial running result is not completion. Both Claude notifications and OpenCode task-result events must trigger the same per-issue handling immediately. **Do NOT use `sleep` loops, wait for the slowest sibling, or poll before processing an event.** When one arrives, look up which issue it belongs to — `AGENT_ISSUE_MAP` for a Claude `agent_completed` notification, `ENGINE_DISPATCH_MAP` for a background-Bash notification, or `OPENCODE_DISPATCH_MAP` for an OpenCode task result — and immediately process it exactly the same way regardless of which map resolved it; every check below (`classify_predecessor_state()`, dependent dispatch, stall/staging checks) keys off GitHub labels/state, not which dispatch mechanism produced them. For an OpenCode completion, append this terminal record before releasing capacity:
 
 ```bash
-gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
+if [ "${DRY_RUN:-false}" = "false" ]; then
+  gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
 \`\`\`json
 {\"runtime\":\"opencode\",\"child_session_id\":\"{TASK_ID}\",\"attempt\":${ATTEMPT},\"state\":\"{completed|error}\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}
 \`\`\`"
+fi
 ```
 
 **Fallback**: if a runtime ever fails to deliver a background completion notification, read the latest `FORGE:DISPATCH` record and use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
