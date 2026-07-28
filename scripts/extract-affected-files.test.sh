@@ -28,18 +28,38 @@ trap cleanup EXIT
 
 # --------------------------------------------------------------------------- #
 # Mock `gh` — intercepts:
-#   gh api repos/<repo>/issues/<num>/comments --jq '...'   -> cat $MOCK_GH_COMMENTS (if set+exists, else empty)
-#   gh issue view <num> -R <repo> --json body --jq '...'   -> cat $MOCK_GH_BODY (if set+exists, else empty)
+#   gh api .../comments --jq '...FORGE:CONTRACT...'      -> cat $MOCK_GH_CONTRACT (if set+exists, else empty)
+#   gh api .../comments --jq '...FORGE:INVESTIGATOR...'  -> cat $MOCK_GH_COMMENTS (if set+exists, else empty)
+#   gh issue view <num> -R <repo> --json body --jq '...'  -> cat $MOCK_GH_BODY (if set+exists, else empty)
 # Any other invocation is a test setup error.
+#
+# forge#2848: the two `gh api` call sites hit the same endpoint and differ only in
+# their --jq selector, so the mock dispatches on which FORGE marker the selector
+# names. This keeps the contract source and the investigator source independently
+# fixturable — required to assert the contract-beats-investigator ordering rule.
 #
 # forge#2504: MOCK_GH_COMMENTS_FAIL=1 / MOCK_GH_BODY_FAIL=1 force the respective
 # call site to simulate a genuine `gh` failure (non-zero exit, nothing on
 # stdout) instead of a "call succeeded, empty/no-match result" — this is the
 # distinction extract-affected-files.sh must now surface as PROVENANCE=error.
+# MOCK_GH_CONTRACT_FAIL=1 does the same for the contract fetch alone; note that
+# MOCK_GH_COMMENTS_FAIL=1 fails BOTH `gh api` call sites, which is the faithful
+# simulation of a real network/auth/rate-limit outage (a real outage does not
+# selectively spare one of two calls to the same endpoint).
 # --------------------------------------------------------------------------- #
 cat > "$TMP_BIN/gh" <<'MOCK'
 #!/usr/bin/env bash
 if [[ "$1" == "api" ]]; then
+  if [[ "$*" == *"FORGE:CONTRACT"* ]]; then
+    if [[ "${MOCK_GH_CONTRACT_FAIL:-}" == "1" || "${MOCK_GH_COMMENTS_FAIL:-}" == "1" ]]; then
+      echo "mock gh api: simulated failure (network error / rate limit)" >&2
+      exit 1
+    fi
+    if [[ -n "${MOCK_GH_CONTRACT:-}" && -f "${MOCK_GH_CONTRACT:-}" ]]; then
+      cat "$MOCK_GH_CONTRACT"
+    fi
+    exit 0
+  fi
   if [[ "${MOCK_GH_COMMENTS_FAIL:-}" == "1" ]]; then
     echo "mock gh api: simulated failure (network error / rate limit)" >&2
     exit 1
@@ -319,6 +339,138 @@ unset MOCK_GH_BODY_FAIL
 MOCK_GH_COMMENTS_FAIL=1 MOCK_GH_BODY="$BODY_SCOPED" assert_output \
   "forge#2504: primary gh api call fails but fallback succeeds with real files -> body-fallback, not error" \
   "body-fallback" "bin/engine.mjs,bin/engine/phases.mjs" 2506 -R test/repo
+
+# --------------------------------------------------------------------------- #
+# Scenario 12 (forge#2848): FORGE:CONTRACT comment present with a real
+# "### Deliverables" table -> PROVENANCE=contract-deliverables. Paths named in
+# the contract's OTHER sections ("### Proposed Approach", "### Out of Scope")
+# must be ignored — same heading-scoping guarantee the investigator path has.
+# --------------------------------------------------------------------------- #
+CONTRACT_FULL="$TMP_FIXTURES/contract_full.txt"
+cat > "$CONTRACT_FULL" <<'EOF'
+<!-- FORGE:CONTRACT -->
+## Builder Contract
+
+**Task type**: Bug Fix
+
+### Proposed Approach
+
+Mirrors the approach already taken in `bin/approach-only-context.mjs`.
+
+### Deliverables
+
+| File | Change | Why |
+|------|--------|-----|
+| `scripts/real-target.sh` | rewrite the parser | the actual defect |
+| `bin/real-target.mjs` | update the caller | keeps the pair in sync |
+
+### Out of Scope
+
+Anything under `bin/out-of-scope-file.mjs`.
+EOF
+
+unset MOCK_GH_COMMENTS MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT="$CONTRACT_FULL" assert_output \
+  "forge#2848: FORGE:CONTRACT ### Deliverables -> contract-deliverables, ignores Approach/Out-of-Scope paths" \
+  "contract-deliverables" "bin/real-target.mjs,scripts/real-target.sh" 2848 -R test/repo
+
+# --------------------------------------------------------------------------- #
+# Scenario 13 (forge#2848 ORDERING rule): both a FORGE:CONTRACT and a
+# FORGE:INVESTIGATOR comment exist, and they name DIFFERENT files. The contract
+# must win — a deliverables table states intent to change, while an Affected
+# Files list may name files that are merely relevant. This is the assertion that
+# pins the provenance precedence order; without it the two sources could silently
+# swap with no test failure.
+# --------------------------------------------------------------------------- #
+INV_DIFFERENT="$TMP_FIXTURES/inv_different.txt"
+cat > "$INV_DIFFERENT" <<'EOF'
+<!-- FORGE:INVESTIGATOR -->
+## Investigation Report
+
+### Affected Files
+
+1. `scripts/investigator-guess.sh` — suspected
+2. `bin/investigator-guess.mjs` — suspected
+EOF
+
+unset MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT="$CONTRACT_FULL" MOCK_GH_COMMENTS="$INV_DIFFERENT" assert_output \
+  "forge#2848 ordering: contract beats investigator when both exist and disagree" \
+  "contract-deliverables" "bin/real-target.mjs,scripts/real-target.sh" 2849 -R test/repo
+
+# --------------------------------------------------------------------------- #
+# Scenario 14 (forge#2848 FALL-THROUGH rule — load-bearing): a FORGE:CONTRACT
+# exists but yields ZERO paths. It must fall through to the INVESTIGATOR path,
+# NOT blackhole to PROVENANCE=none. Blackholing here would fire Layer 4's
+# conservative serialization for exactly the mid-batch issues this change exists
+# to un-serialize (the bug being fixed, inverted — see the forge#2848 risk table).
+# Two zero-yield shapes are covered: no "### Deliverables" heading at all, and a
+# Deliverables section that names no recognized file path.
+# --------------------------------------------------------------------------- #
+CONTRACT_NO_DELIV="$TMP_FIXTURES/contract_no_deliv.txt"
+cat > "$CONTRACT_NO_DELIV" <<'EOF'
+<!-- FORGE:CONTRACT -->
+## Builder Contract
+
+### Proposed Approach
+
+Prose only, mentioning `bin/should-not-be-extracted.mjs` as context.
+
+### Out of Scope
+
+Everything else.
+EOF
+
+unset MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT="$CONTRACT_NO_DELIV" MOCK_GH_COMMENTS="$INV_DIFFERENT" assert_output \
+  "forge#2848 fall-through: contract with no ### Deliverables section -> falls through to affected-files-section" \
+  "affected-files-section" "bin/investigator-guess.mjs,scripts/investigator-guess.sh" 2850 -R test/repo
+
+CONTRACT_EMPTY_DELIV="$TMP_FIXTURES/contract_empty_deliv.txt"
+cat > "$CONTRACT_EMPTY_DELIV" <<'EOF'
+<!-- FORGE:CONTRACT -->
+## Builder Contract
+
+### Deliverables
+
+| File | Change | Why |
+|------|--------|-----|
+| (documentation-only, no code paths) | n/a | n/a |
+
+### Out of Scope
+
+Everything else.
+EOF
+
+unset MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT="$CONTRACT_EMPTY_DELIV" MOCK_GH_COMMENTS="$INV_DIFFERENT" assert_output \
+  "forge#2848 fall-through: contract Deliverables naming no recognized path -> falls through to affected-files-section" \
+  "affected-files-section" "bin/investigator-guess.mjs,scripts/investigator-guess.sh" 2851 -R test/repo
+
+# --------------------------------------------------------------------------- #
+# Scenario 15 (forge#2848 x forge#2504): the CONTRACT fetch specifically fails
+# while every other source is legitimately empty. Must yield PROVENANCE=error,
+# not none — the new call site doubles the gh failure surface, so its own
+# GH_CALL_FAILED wiring needs its own assertion rather than riding on the
+# investigator call's coverage.
+# --------------------------------------------------------------------------- #
+unset MOCK_GH_CONTRACT MOCK_GH_COMMENTS MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT_FAIL=1 assert_output \
+  "forge#2848: contract gh api call fails, no other usable source -> PROVENANCE=error, not none" \
+  "error" "" 2852 -R test/repo
+
+# --------------------------------------------------------------------------- #
+# Scenario 16 (forge#2848 x forge#2504): the CONTRACT fetch fails but the
+# investigator path succeeds with real files. A gh failure must never suppress
+# or overwrite data actually recovered by a subsequent successful call — same
+# invariant Scenario 11 asserts for the primary/fallback pair.
+# --------------------------------------------------------------------------- #
+unset MOCK_GH_CONTRACT MOCK_GH_BODY MOCK_GH_COMMENTS_FAIL MOCK_GH_BODY_FAIL
+MOCK_GH_CONTRACT_FAIL=1 MOCK_GH_COMMENTS="$INV_DIFFERENT" assert_output \
+  "forge#2848: contract fetch fails but investigator succeeds with real files -> affected-files-section, not error" \
+  "affected-files-section" "bin/investigator-guess.mjs,scripts/investigator-guess.sh" 2853 -R test/repo
+
+unset MOCK_GH_CONTRACT_FAIL
 
 # --------------------------------------------------------------------------- #
 # Summary
