@@ -120,7 +120,7 @@ class_a_scan() {
   # accumulated violation silently. (forge#2289 added the equivalent
   # end-of-file flush for Class B only; this closes the same gap in Class A.)
   flush_a_block() {
-    if [ "$HAS_GIST" -eq 1 ] && echo "$BLOCK_LINES" | grep -qE '^[[:space:]]*--public([[:space:]]|$)'; then
+    if [ "$HAS_GIST" -eq 1 ] && [[ "$BLOCK_LINES" =~ (^|$'\n')[[:space:]]*--public([[:space:]]|$) ]]; then
       # Find the line number of --public within the block
       PUBLIC_LN=$(echo "$BLOCK_LINES" | grep -n '^[[:space:]]*--public' | head -1 | cut -d: -f1)
       ACTUAL_LINE=$((BLOCK_START + PUBLIC_LN))
@@ -149,9 +149,9 @@ class_a_scan() {
     # content; forge#2288 adds true depth so 2+ nesting levels close correctly.)
     IS_FENCE=0
     IS_BARE=0
-    if echo "$line" | grep -qE "^[[:space:]]*${FENCE}"; then
+    if [[ "$line" =~ ^[[:space:]]*${FENCE} ]]; then
       IS_FENCE=1
-      if echo "$line" | grep -qE "^[[:space:]]*${FENCE}[[:space:]]*\$"; then
+      if [[ "$line" =~ ^[[:space:]]*${FENCE}[[:space:]]*$ ]]; then
         IS_BARE=1
       fi
     fi
@@ -188,7 +188,7 @@ class_a_scan() {
     BLOCK_LINES="${BLOCK_LINES}${line}
 "
     # Check if this line has gh gist create/edit (even with line continuation \)
-    if echo "$line" | grep -qE 'gh[[:space:]]+gist[[:space:]]+(create|edit)'; then
+    if [[ "$line" =~ gh[[:space:]]+gist[[:space:]]+(create|edit) ]]; then
       HAS_GIST=1
     fi
   done < "$file"
@@ -296,9 +296,9 @@ else
         # 2+ nesting levels close correctly.)
         IS_FENCE=0
         IS_BARE=0
-        if echo "$line" | grep -qE "^[[:space:]]*${FENCE}"; then
+        if [[ "$line" =~ ^[[:space:]]*${FENCE} ]]; then
           IS_FENCE=1
-          if echo "$line" | grep -qE "^[[:space:]]*${FENCE}[[:space:]]*\$"; then
+          if [[ "$line" =~ ^[[:space:]]*${FENCE}[[:space:]]*$ ]]; then
             IS_BARE=1
           fi
         fi
@@ -314,8 +314,9 @@ else
           # (forge#2289) and is always already at rest here, since this branch
           # is only reached when IN_CB is 0 — i.e. any block that was open has
           # already been closed and flushed at its own fence-close below.
-          if echo "$line" | grep -qE '^#{1,6}[[:space:]]+'; then
-            heading=$(echo "$line" | sed 's/^#*[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          if [[ "$line" =~ ^#{1,6}[[:space:]]+(.*)$ ]]; then
+            heading="${BASH_REMATCH[1]}"
+            heading="${heading%"${heading##*[![:space:]]}"}"
             SECTION="$heading"
             continue
           fi
@@ -338,18 +339,18 @@ else
         fi
 
         # Content line while inside (at any depth).
-        if echo "$line" | grep -qF "$ALLOWLIST_TOKEN"; then continue; fi
+        if [[ "$line" == *"$ALLOWLIST_TOKEN"* ]]; then continue; fi
 
         # Check for guard — scoped to THIS code block only (forge#2289)
-        echo "$line" | grep -qE "$GUARD_PATTERN" && BLOCK_HAS_GUARD=1
+        [[ "$line" =~ $GUARD_PATTERN ]] && BLOCK_HAS_GUARD=1
 
         # Check if this line is in the diff's added lines AND has a side-effect verb
-        if [ "$BLOCK_HAS_ADDED_SE" -eq 0 ] && echo "$line" | grep -qE "$SIDE_EFFECT_PATTERN"; then
+        if [ "$BLOCK_HAS_ADDED_SE" -eq 0 ] && [[ "$line" =~ $SIDE_EFFECT_PATTERN ]]; then
           # Is this specific line in the added content?
-          if echo "$ADDED_CONTENT" | grep -qF "${line:0:80}" 2>/dev/null; then
+          if [[ "$ADDED_CONTENT" == *"${line:0:80}"* ]]; then
             BLOCK_HAS_ADDED_SE=1
             BLOCK_SE_LINE=$LN
-            BLOCK_SE_VERB=$(echo "$line" | grep -oE "$SIDE_EFFECT_PATTERN" | head -1 || echo "side-effect")
+            BLOCK_SE_VERB="${BASH_REMATCH[0]:-side-effect}"
           fi
         fi
       done < "$file"

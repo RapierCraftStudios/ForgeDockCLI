@@ -74,6 +74,10 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(phase4, /task-result event/i);
     assert.match(phase4, /state="running"/);
     assert.match(phase4, /background=true/);
+    assert.match(phase4, /FORGE:DISPATCH/);
+    assert.match(phase4, /child_session_id/);
+    assert.match(phase4, /fresh OpenCode `task\(background=true\)` continuation/);
+    assert.doesNotMatch(phase4, /task\(task_id=.*background=true\)/);
     assert.match(phase4, /do not wait for the slowest sibling/i);
   });
 

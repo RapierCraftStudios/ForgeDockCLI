@@ -64,8 +64,8 @@ The generated plugin has no prompt text. It:
   preserving explicit lower limits;
 - grants the built-in `general` subagent permission to invoke native `task`
   unless the user explicitly configured a task permission;
-- opts into OpenCode background subagents by default so each completed issue can
-  wake the parent orchestrator independently; set
+- opts into OpenCode background subagents for the orchestrator's explicit
+  ready-issue dispatches so each completed issue can wake the parent independently; set
   `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` to opt out;
 - selects Git Bash on Windows only when the user has not explicitly configured
   an OpenCode shell, because the shared workflows and helper scripts use Bash.
@@ -123,12 +123,12 @@ specs evaluate Claude's literal `Task`/`Agent` names, an OpenCode runtime marker
 selects `DISPATCH_TOOL=task`; the absence of those Claude names must not produce
 a false `FORGE:REVIEW_BLOCKED` result.
 
-Every isolated review dispatch uses the explicit native argument shape. Every
+Every isolated review dispatch uses a foreground native task. Every
 native task call must include the schema-required `subagent_type` at the top
 level alongside its `description` and `prompt`:
 
 ```js
-{ description: "...", prompt: "...", subagent_type: "general", background: true }
+{ description: "...", prompt: "...", subagent_type: "general", background: false }
 ```
 
 Implementation and review work uses `general`; read-only discovery uses
@@ -139,8 +139,9 @@ generated adapter safely defaults it to `general`; unsupported types stop with
 If the native `task` capability itself is unavailable, the workflow posts
 `FORGE:REVIEW_BLOCKED` and stops rather than falling back to inline review or
 another pipeline controller.
-The generated plugin adds `background: true` unless
-`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` is explicitly set.
+The generated plugin defaults omitted `background` to `false`. Only the
+orchestrator's ready-issue dispatcher sets `background: true`; setting
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` forces foreground execution.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,
