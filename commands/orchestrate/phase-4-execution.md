@@ -428,12 +428,12 @@ declare -A OPENCODE_DISPATCH_MAP
 declare -A SAME_FILE_BRIEF
 declare -A EDGE_BRIEFED
 
-# DONE-path edge re-verification memo (forge#2848). EDGE_REDERIVED guards the cohort
-# re-derivation sub-block in Step 4B's DONE arm so each still-blocked descendant is
-# re-extracted at most ONCE per batch. Without it, every subsequent DONE completion
-# would re-run extraction for every descendant — O(descendants) `gh` calls per
-# completion, inside the hot dispatch loop.
+# DONE-path edge re-verification memo (forge#2848). A conclusive re-derivation is
+# memoized in EDGE_REDERIVED; inconclusive results get one retry, capped by
+# EDGE_REDERIVE_ATTEMPTS. This avoids caching a transient failure while bounding
+# extraction to two attempts per descendant per batch.
 declare -A EDGE_REDERIVED
+declare -A EDGE_REDERIVE_ATTEMPTS
 
 # Affected-file extraction helper, resolved for the DONE-path cohort re-derivation
 # (forge#2848). Same resolver precedence as phase-3-dependency.md Step 3C Layer 1 —
@@ -1212,12 +1212,14 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
             # is suspect (see phase-3-dependency.md Layer 4's cohort-confidence guidance).
             if [ "${FILE_SOURCE[$PRED]:-}" = "body-fallback" ] && [ -n "$AFFECTED_FILES_SCRIPT" ]; then
               for DESC in {still_blocked_descendants}; do
-                # Memoize per descendant per batch — this loop sits inside the hot
-                # dispatch loop, so without the guard it would be O(descendants) `gh`
-                # calls on EVERY subsequent DONE completion. At most one re-derivation
-                # per descendant per batch.
+                # Memoize conclusive results per descendant per batch. An inconclusive
+                # extraction gets one retry so a transient failure or pre-contract
+                # attempt does not permanently foreclose re-derivation. The two-attempt
+                # cap preserves an O(descendants) API budget for the hot dispatch loop.
                 [ -n "${EDGE_REDERIVED[$DESC]:-}" ] && continue
-                EDGE_REDERIVED[$DESC]=1
+                REDERIVE_ATTEMPTS=${EDGE_REDERIVE_ATTEMPTS[$DESC]:-0}
+                [ "$REDERIVE_ATTEMPTS" -ge 2 ] && continue
+                EDGE_REDERIVE_ATTEMPTS[$DESC]=$((REDERIVE_ATTEMPTS + 1))
 
                 # Re-run Layer 1 extraction. By now DESC has been investigated and
                 # possibly contracted, so this typically returns a higher-provenance
@@ -1233,7 +1235,7 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
                 # `none`/`body-fallback` mean we learned nothing better than what we
                 # already had. In all three cases keep every edge untouched.
                 case "$REDERIVE_PROV" in
-                  contract-deliverables|affected-files-section) ;;
+                  contract-deliverables|affected-files-section) EDGE_REDERIVED[$DESC]=1 ;;
                   *) echo "  re-derivation for #${DESC} inconclusive (provenance: ${REDERIVE_PROV}) — keeping all edges"; continue ;;
                 esac
 

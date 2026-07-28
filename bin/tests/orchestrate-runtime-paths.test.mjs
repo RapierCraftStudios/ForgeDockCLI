@@ -94,6 +94,22 @@ describe("orchestrate runtime helper paths", () => {
     );
   });
 
+  it("retries an inconclusive cohort re-derivation once without memoizing it", () => {
+    assert.match(phase4, /declare -A EDGE_REDERIVE_ATTEMPTS/);
+    assert.match(
+      phase4,
+      /REDERIVE_ATTEMPTS=\$\{EDGE_REDERIVE_ATTEMPTS\[\$DESC\]:-0\}[\s\S]*?\[ "\$REDERIVE_ATTEMPTS" -ge 2 \] && continue[\s\S]*?EDGE_REDERIVE_ATTEMPTS\[\$DESC\]=\$\(\(REDERIVE_ATTEMPTS \+ 1\)\)/,
+    );
+    assert.match(
+      phase4,
+      /case "\$REDERIVE_PROV" in[\s\S]*?contract-deliverables\|affected-files-section\) EDGE_REDERIVED\[\$DESC\]=1 ;;/,
+    );
+    assert.doesNotMatch(
+      phase4,
+      /\[ -n "\$\{EDGE_REDERIVED\[\$DESC\]:-\}" \] && continue\s*EDGE_REDERIVED\[\$DESC\]=1/,
+    );
+  });
+
   it("documents the compact OpenCode preflight", () => {
     const orchestrate = readFileSync(
       new URL("../../commands/orchestrate.md", import.meta.url),
