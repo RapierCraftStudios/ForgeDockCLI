@@ -246,6 +246,12 @@ echo "Applicable domains: $DOMAINS"
 
 Run ONLY the checks whose domain was identified in Step 1.5. Skip checks for domains not present in the `DOMAINS` list.
 
+**Execution budget**: Set `FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS` to configure the
+per-check budget (default: 30 seconds). Set `FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS`
+to configure formatter, typecheck, and build commands (default: 120 seconds). Both
+values must be positive integers. A timeout emits a structured HIGH finding and fails
+the gate rather than leaving the workflow blocked.
+
 - **2A (Security)**: Run if `SECURITY` in DOMAINS *(always — included for all code files)*
 - **2B (Auth)**: Run if `AUTH` in DOMAINS
 - **2C (Deploy chain)**: Run if `DEPLOY` in DOMAINS
@@ -1302,6 +1308,11 @@ done < <(echo {CHANGED_FILES} | tr ' ' '\n' | grep -E '\.py$')
 ```bash
 REGISTRY_FILE="{WORKTREE_PATH}/scripts/check-registry/manifest.json"
 REGISTRY_FINDINGS=""
+QUALITY_GATE_TIMEOUT_SECONDS="${FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS:-30}"
+if ! [[ "$QUALITY_GATE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "QUALITY-GATE-CONFIG | HIGH | timeout | FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS must be a positive integer (got '$QUALITY_GATE_TIMEOUT_SECONDS')"
+    QUALITY_GATE_TIMEOUT_SECONDS=30
+fi
 
 if [ ! -f "$REGISTRY_FILE" ]; then
     echo "2R: No check registry found at $REGISTRY_FILE — skipping registry checks."
@@ -1333,13 +1344,13 @@ else
             fi
 
             # Bound every third-party check. Exit 124 is timeout's documented code.
-            CHECK_OUTPUT=$(timeout 30 "$SCRIPT_PATH" "{CHANGED_FILES}" "{WORKTREE_PATH}" 2>/dev/null)
+            CHECK_OUTPUT=$(timeout "$QUALITY_GATE_TIMEOUT_SECONDS" "$SCRIPT_PATH" "{CHANGED_FILES}" "{WORKTREE_PATH}" 2>/dev/null)
             CHECK_EXIT=$?
 
             if [ "$CHECK_EXIT" -eq 124 ]; then
                 REGISTRY_FINDINGS="${REGISTRY_FINDINGS}
-REGISTRY-${SLUG}-timeout | HIGH | (check-registry) | Registry check '$SLUG' timed out after 30s — failing closed. Investigate and optimize the script before proceeding."
-                echo "2R: TIMEOUT — $SLUG (30s) — fail-closed HIGH finding added"
+REGISTRY-${SLUG}-timeout | HIGH | (check-registry) | Registry check '$SLUG' timed out after ${QUALITY_GATE_TIMEOUT_SECONDS}s — failing closed. Investigate and optimize the script before proceeding."
+                echo "2R: TIMEOUT — $SLUG (${QUALITY_GATE_TIMEOUT_SECONDS}s) — fail-closed HIGH finding added"
             elif [ "$CHECK_EXIT" -eq 1 ]; then
                 # Check fired — append to findings
                 while IFS= read -r line; do
@@ -1387,6 +1398,11 @@ if [[ "$ADAPTIVE_DIR_NORM" != "${WORKTREE_NORM}/"* ]]; then
 fi
 
 GATED_FINDINGS=""
+QUALITY_GATE_TIMEOUT_SECONDS="${FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS:-30}"
+if ! [[ "$QUALITY_GATE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "QUALITY-GATE-CONFIG | HIGH | timeout | FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS must be a positive integer (got '$QUALITY_GATE_TIMEOUT_SECONDS')"
+    QUALITY_GATE_TIMEOUT_SECONDS=30
+fi
 
 if [ "$ADAPTIVE_ENABLED" != "false" ]; then
     GATE_D_DIR="${ADAPTIVE_DIR}/gate.d"
@@ -1415,17 +1431,17 @@ if [ "$ADAPTIVE_ENABLED" != "false" ]; then
                     continue
                 fi
 
-                # Run with per-script 30s timeout; pass diff path and worktree root
+                # Run with the configured per-script timeout; pass diff path and worktree root
                 # timeout exit code 124 = timed out; treat as fail-closed (HIGH finding)
-                GATE_OUTPUT=$(timeout 30 bash "$script" "$DIFF_PATH" "{WORKTREE_PATH}" 2>/dev/null)
+                GATE_OUTPUT=$(timeout "$QUALITY_GATE_TIMEOUT_SECONDS" bash "$script" "$DIFF_PATH" "{WORKTREE_PATH}" 2>/dev/null)
                 GATE_EXIT=$?
 
                 if [ "$GATE_EXIT" -eq 124 ]; then
                     # Timeout — fail closed: block the gate with HIGH finding
-                    TIMEOUT_FINDING="GATD-${SLUG}-timeout | HIGH | (gate.d) | gate.d script '$SLUG' timed out after 30s — failing closed. Investigate and optimize the script or increase timeout via gate.d contract."
+                    TIMEOUT_FINDING="GATD-${SLUG}-timeout | HIGH | (gate.d) | gate.d script '$SLUG' timed out after ${QUALITY_GATE_TIMEOUT_SECONDS}s — failing closed. Investigate and optimize the script or increase the configured timeout."
                     GATED_FINDINGS="${GATED_FINDINGS}
 ${TIMEOUT_FINDING}"
-                    echo "2R.5: TIMEOUT — $SLUG (30s) — fail-closed HIGH finding added"
+                    echo "2R.5: TIMEOUT — $SLUG (${QUALITY_GATE_TIMEOUT_SECONDS}s) — fail-closed HIGH finding added"
                 elif [ "$GATE_EXIT" -eq 1 ]; then
                     # Script fired — findings on stdout
                     while IFS= read -r line; do
@@ -1457,7 +1473,7 @@ If any gate.d check produces findings, include them in the Step 3 findings list 
 - `$2` = absolute path to the worktree root
 - stdout = findings lines, one per line: `SLUG | HIGH|MEDIUM|LOW | FILE | MESSAGE`
 - Exit 0 = no findings / passed; Exit 1 = findings emitted; Exit 2 = inapplicable (diff has no relevant content)
-- 30-second wall-time budget enforced by quality-gate; timeout = fail-closed HIGH finding
+- `FORGEDOCK_QUALITY_GATE_TIMEOUT_SECONDS` wall-time budget (30 seconds by default) enforced by quality-gate; timeout = fail-closed HIGH finding
 - Do NOT write to disk, do NOT make network requests, do NOT modify any files
 
 ---
