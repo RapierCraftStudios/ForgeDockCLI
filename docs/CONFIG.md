@@ -353,6 +353,15 @@ orchestration:
     # (avoids serializing agents on same-file predecessor edges). Default:
     # true (from "balanced"); false under "all".
     p3_same_file_defer: true
+
+    # Running findings-spawned / merged-units ceiling. "off" (the default)
+    # only reports amplification; a positive decimal defers further
+    # same-lineage refinements to the completion sweep once exceeded.
+    max_amplification: "off"
+
+    # Number of consecutive merged-unit observations at ratio >= 1.0 before
+    # printing a convergence warning. Default: 3.
+    convergence_window: 3
 ```
 
 | Field | Type | Required | Description |
@@ -364,6 +373,8 @@ orchestration:
 | `cascade.defer_on_batch_gated` | boolean | No | Suppress cascade dispatch when the original batch is fully human-gated. Default: `true` |
 | `cascade.keyword_heuristic` | boolean | No | Defer P3-and-below comment/typo-titled findings. Default: `true` |
 | `cascade.p3_same_file_defer` | boolean | No | Defer P3 findings sharing a file with the active batch. Default: `true` |
+| `cascade.max_amplification` | positive number or `"off"` | No | Opt-in ceiling for same-lineage refinement dispatch. Default: `"off"` |
+| `cascade.convergence_window` | positive integer | No | Consecutive ratio observations at or above 1.0 before warning. Default: 3 |
 
 **Hard invariant — not configurable**: safety exclusions (findings whose `## Problem` section indicates security/billing/anti-bot/auth concerns) are never batched and never auto-admitted by any `cascade.policy`, including `all`. That exclusion is enforced upstream of this section (the P3 batching eligibility check) and has no corresponding key here by design.
 

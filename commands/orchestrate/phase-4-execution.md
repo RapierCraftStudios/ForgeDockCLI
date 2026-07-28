@@ -409,6 +409,16 @@ echo "Step 4A.pre: using BATCH_T0=${BATCH_T0} for Step 4C's run-spawned cascade 
 DEFERRED_FINDINGS=()
 QUEUED_FINDINGS=()
 declare -A DEFERRED_REASONS
+# Count every finding regardless of admission, so a deferred refinement never
+# makes the reported amplification ratio look better than it was.
+FINDINGS_SPAWNED=0
+MERGED_UNITS=0
+AMPLIFICATION_RATIO_HISTORY=()
+AMPLIFICATION_DEFERRED=()
+declare -A FINDINGS_BY_SOURCE_PR
+declare -A REFINEMENT_FINDINGS
+declare -A NEW_SURFACE_FINDINGS
+declare -A AMPLIFICATION_FINDING_SEEN
 declare -A AGENT_ISSUE_MAP
 # Engine-first dispatch equivalent of AGENT_ISSUE_MAP (fixed forge#2466): keyed by issue
 # number, holds the task id returned by each backgrounded `Bash(run_in_background=true,
@@ -527,6 +537,23 @@ if [ "$TOKEN_BUDGET" != "unlimited" ] && ! echo "$TOKEN_BUDGET" | grep -qE '^[1-
 fi
 
 TOKEN_ESTIMATE_PER_FINDING=$(yq '.pipeline.token_estimate_per_finding // 150000' forge.yaml 2>/dev/null || echo 150000)
+
+# Amplification is observational by default. The optional ceiling is evaluated
+# only against same-lineage refinements in Step 4C, never against new surface.
+CASCADE_MAX_AMPLIFICATION=$(yq '.orchestration.cascade.max_amplification // "off"' forge.yaml 2>/dev/null || echo "off")
+if [ "$CASCADE_MAX_AMPLIFICATION" != "off" ]; then
+  if ! echo "$CASCADE_MAX_AMPLIFICATION" | grep -qE '^[0-9]+(\.[0-9]+)?$' || \
+     ! awk "BEGIN { exit !($CASCADE_MAX_AMPLIFICATION > 0) }"; then
+    echo "WARNING: forge.yaml → orchestration.cascade.max_amplification must be a positive number or off — disabling the bound"
+    CASCADE_MAX_AMPLIFICATION="off"
+  fi
+fi
+CONVERGENCE_WINDOW=$(yq '.orchestration.cascade.convergence_window // 3' forge.yaml 2>/dev/null || echo 3)
+if ! echo "$CONVERGENCE_WINDOW" | grep -qE '^[1-9][0-9]*$'; then
+  echo "WARNING: forge.yaml → orchestration.cascade.convergence_window must be a positive integer — falling back to 3"
+  CONVERGENCE_WINDOW=3
+fi
+echo "Cascade amplification: max_amplification=${CASCADE_MAX_AMPLIFICATION} convergence_window=${CONVERGENCE_WINDOW} (off preserves current admission behavior)"
 
 # Independent boolean levers — each accepts an explicit granular override on
 # top of the resolved preset (preset supplies the default, not a hard value).
@@ -2010,6 +2037,30 @@ gh issue list -R {GH_REPO} --state open --search "label:review-finding created:>
 
 **If review-finding issues were spawned:**
 
+**Amplification accounting (MANDATORY, before cascade admission):** Count every finding created by this batch, including findings later deferred by any cascade rule. After each merged unit, compute `FINDINGS_SPAWNED / MERGED_UNITS`, append the value to `AMPLIFICATION_RATIO_HISTORY`, and print a convergence warning when the latest `CONVERGENCE_WINDOW` observations are all `>= 1.0`. A high ratio is a signal, not a failure: valuable deep review findings can legitimately raise it.
+
+For each finding, extract its source PR from `**Source**: PR #N` and increment `FINDINGS_BY_SOURCE_PR[N]`. Classify it as a **same-lineage refinement** only when that source PR closes a `review-finding` issue and both that parent finding and this finding name the same affected file; otherwise classify it as **new surface**. Record the finding number in `REFINEMENT_FINDINGS` or `NEW_SURFACE_FINDINGS` respectively. If provenance or a file path cannot be established, classify as new surface conservatively; never suppress it as a refinement.
+
+When `CASCADE_MAX_AMPLIFICATION` is not `off`, and the current ratio is greater than that ceiling, defer only newly discovered entries in `REFINEMENT_FINDINGS` with reason `amplification bound exceeded (same-lineage refinement)`. Add them to `DEFERRED_FINDINGS` and `DEFERRED_REASONS` so Step 4F re-evaluates them after the batch drains. Do not apply this bound to new-surface findings, P1/P2 findings, or any finding when the option is `off`.
+
+```bash
+# Run once for each completed issue before collecting its findings. Only merged
+# units advance the denominator; invalid/skipped units do not imply delivered work.
+if gh issue view "$NUM" -R {GH_REPO} --json labels \
+  --jq '[.labels[].name | select(. == "workflow:merged")] | length' | grep -qx '1'; then
+  MERGED_UNITS=$((MERGED_UNITS + 1))
+  AMPLIFICATION_RATIO=$(awk "BEGIN { printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS }")
+  AMPLIFICATION_RATIO_HISTORY+=("$AMPLIFICATION_RATIO")
+  if [ "${#AMPLIFICATION_RATIO_HISTORY[@]}" -ge "$CONVERGENCE_WINDOW" ]; then
+    RECENT_RATIOS=("${AMPLIFICATION_RATIO_HISTORY[@]: -$CONVERGENCE_WINDOW}")
+    if printf '%s\n' "${RECENT_RATIOS[@]}" | awk '$1 < 1 { exit 1 }'; then
+      echo "CONVERGENCE WARNING: amplification has remained >= 1.0 for ${CONVERGENCE_WINDOW} merged units (${AMPLIFICATION_RATIO} current). This can be productive review refinement, but the batch is not shrinking."
+    fi
+  fi
+fi
+
+```
+
 **Cascade control (MANDATORY — run before folding findings into the DAG):**
 
 For each spawned finding, determine whether it should be **executed** or **deferred**:
@@ -2058,6 +2109,37 @@ ALL_BATCH_FILES=$(echo "$ALL_BATCH_FILES" | sort -u | grep -v '^$')
 for FINDING_NUM in {spawned_finding_numbers}; do
   FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
     --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
+
+  # Count each finding once and retain source provenance for the final per-PR
+  # breakdown. Missing source/file evidence fails open as new surface.
+  SOURCE_PR=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '(?i)\*\*source\*\*:\s*pr\s*#\K[0-9]+' | head -1)
+  if [ -z "${AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]:-}" ]; then
+    AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]=1
+    FINDINGS_SPAWNED=$((FINDINGS_SPAWNED + 1))
+    [ -n "$SOURCE_PR" ] && FINDINGS_BY_SOURCE_PR[$SOURCE_PR]=$(( ${FINDINGS_BY_SOURCE_PR[$SOURCE_PR]:-0} + 1 ))
+  fi
+  FINDING_IS_REFINEMENT=false
+  FINDING_FILE_FOR_LINEAGE=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+  if [ -n "$SOURCE_PR" ] && [ -n "$FINDING_FILE_FOR_LINEAGE" ]; then
+    SOURCE_ISSUE=$(gh pr view "$SOURCE_PR" -R {GH_REPO} --json body --jq '.body' 2>/dev/null \
+      | grep -oP '(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\K[0-9]+' | head -1)
+    if [ -n "$SOURCE_ISSUE" ]; then
+      PARENT_DATA=$(gh issue view "$SOURCE_ISSUE" -R {GH_REPO} --json labels,body \
+        --jq '{labels: [.labels[].name], body: .body}' 2>/dev/null || echo '{}')
+      PARENT_FILE=$(echo "$PARENT_DATA" | jq -r '.body // ""' | grep -oP '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+      if echo "$PARENT_DATA" | jq -e '[.labels[] | select(. == "review-finding")] | length > 0' >/dev/null && \
+         [ "$PARENT_FILE" = "$FINDING_FILE_FOR_LINEAGE" ]; then
+        FINDING_IS_REFINEMENT=true
+        REFINEMENT_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      else
+        NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      fi
+    else
+      NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+    fi
+  else
+    NEW_SURFACE_FINDINGS[$FINDING_NUM]="${SOURCE_PR:-unknown}"
+  fi
 
   # Code-branch repair guard (MANDATORY — before priority/defer heuristics below).
   # A review-finding with no **Code branch** annotation, whose parent PR's base is
@@ -2229,6 +2311,18 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
     fi
   else
     DEFER=false
+  fi
+
+  # Opt-in only: never defer a new-surface or P1/P2 finding because another
+  # lineage is noisy. Step 4F re-evaluates this explicit deferral after drain.
+  AMPLIFICATION_RATIO=$(awk "BEGIN { if ($MERGED_UNITS) printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS; else print 0 }")
+  if [ "$DEFER" = "false" ] && [ "$FINDING_IS_REFINEMENT" = "true" ] && \
+     [ "$PRIORITY" != "P1" ] && [ "$PRIORITY" != "P2" ] && \
+     [ "$CASCADE_MAX_AMPLIFICATION" != "off" ] && \
+     awk "BEGIN { exit !($AMPLIFICATION_RATIO > $CASCADE_MAX_AMPLIFICATION) }"; then
+    DEFER=true
+    DEFER_REASON="amplification bound exceeded (same-lineage refinement; ${AMPLIFICATION_RATIO} > ${CASCADE_MAX_AMPLIFICATION})"
+    AMPLIFICATION_DEFERRED+=("$FINDING_NUM")
   fi
 
   if [ "$DEFER" = "true" ]; then

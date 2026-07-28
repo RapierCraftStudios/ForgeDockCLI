@@ -5,10 +5,12 @@ import {
   CASCADE_PRESETS,
   DEFAULT_CASCADE_POLICY_NAME,
   parseIntOrUnlimited,
+  parseOptionalPositiveNumber,
   resolveCascadePolicy,
   admitsGeneration,
   admitsTokenSpend,
   evaluateCascadeFinding,
+  evaluateAmplification,
 } from "./admission.mjs";
 
 describe("parseIntOrUnlimited", () => {
@@ -39,11 +41,29 @@ describe("parseIntOrUnlimited", () => {
   });
 });
 
+describe("parseOptionalPositiveNumber", () => {
+  it("defaults to disabled and accepts a positive decimal", () => {
+    assert.deepEqual(parseOptionalPositiveNumber(undefined), { value: null, warning: null });
+    assert.deepEqual(parseOptionalPositiveNumber("off"), { value: null, warning: null });
+    assert.deepEqual(parseOptionalPositiveNumber("1.5"), { value: 1.5, warning: null });
+  });
+
+  it("disables invalid values with a warning", () => {
+    const result = parseOptionalPositiveNumber("0");
+    assert.equal(result.value, null);
+    assert.match(result.warning, /disabling the bound/);
+  });
+});
+
 describe("resolveCascadePolicy — presets", () => {
   it("defaults to balanced when no config is given (no-op, matches pre-#2234 hardcoded behavior)", () => {
     const { policy, policyName, warnings } = resolveCascadePolicy();
     assert.equal(policyName, DEFAULT_CASCADE_POLICY_NAME);
-    assert.deepEqual(policy, CASCADE_PRESETS.balanced);
+    assert.deepEqual(policy, {
+      ...CASCADE_PRESETS.balanced,
+      maxAmplification: null,
+      convergenceWindow: 3,
+    });
     assert.deepEqual(warnings, []);
   });
 
@@ -72,7 +92,11 @@ describe("resolveCascadePolicy — presets", () => {
   it("unrecognized policy name falls back to balanced with a warning", () => {
     const { policy, policyName, warnings } = resolveCascadePolicy({ policy: "yolo" });
     assert.equal(policyName, "balanced");
-    assert.deepEqual(policy, CASCADE_PRESETS.balanced);
+    assert.deepEqual(policy, {
+      ...CASCADE_PRESETS.balanced,
+      maxAmplification: null,
+      convergenceWindow: 3,
+    });
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /not one of/);
   });
@@ -87,6 +111,8 @@ describe("resolveCascadePolicy — granular overrides compose with a preset", ()
     assert.equal(policy.deferOnBatchGated, true);
     assert.equal(policy.keywordHeuristic, true);
     assert.equal(policy.p3SameFileDefer, true);
+    assert.equal(policy.maxAmplification, null);
+    assert.equal(policy.convergenceWindow, 3);
   });
 
   it("granular boolean overrides on top of the all preset", () => {
@@ -103,6 +129,19 @@ describe("resolveCascadePolicy — granular overrides compose with a preset", ()
     assert.equal(admitsGeneration(2, policy), true);
     assert.equal(admitsGeneration(3, policy), true);
     assert.equal(admitsGeneration(4, policy), false);
+  });
+});
+
+describe("evaluateAmplification", () => {
+  it("reports the running ratio without bounding the default policy", () => {
+    const { policy } = resolveCascadePolicy();
+    assert.deepEqual(evaluateAmplification(2, 3, policy), { ratio: 1.5, exceedsBound: false });
+  });
+
+  it("flags an opt-in bound only after the ratio exceeds it", () => {
+    const { policy } = resolveCascadePolicy({ max_amplification: 1 });
+    assert.equal(evaluateAmplification(2, 2, policy).exceedsBound, false);
+    assert.equal(evaluateAmplification(2, 3, policy).exceedsBound, true);
   });
 });
 
