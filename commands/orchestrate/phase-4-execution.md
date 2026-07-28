@@ -2599,10 +2599,8 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
       continue
     fi
 
-    BATCH_ISSUE_NUM=$(gh issue create {GH_FLAG} \
-      --title "$PROPOSED_BATCH_TITLE" \
-      --label "review-finding,priority:P3,batch" \
-      --body "$(cat <<BATCH_EOF
+    CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+    CREATE_BODY="$(cat <<BATCH_EOF
 ## Problem
 
 Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered mid-run by phase-4-execution.md to reduce per-finding pipeline overhead.
@@ -2626,7 +2624,26 @@ ${GEN2_MEMBER_LINES:-none}
 
 <!-- FORGE:BATCHABLE -->
 BATCH_EOF
-)" --json number --jq '.number')
+    )"
+    CREATE_BODY="${CREATE_BODY}
+
+<!-- issue-create-token:${CREATE_TOKEN} -->"
+    CREATE_RESPONSE=$(gh api "repos/{GH_REPO}/issues" --method POST \
+      -f title="$PROPOSED_BATCH_TITLE" -f body="$CREATE_BODY" \
+      -f 'labels[]=review-finding' -f 'labels[]=priority:P3' -f 'labels[]=batch') || {
+      echo "ERROR: GitHub rejected same-run batch creation; members remain queued." >&2
+      continue
+    }
+    BATCH_ISSUE_NUM=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
+    if [ -z "$BATCH_ISSUE_NUM" ]; then
+      echo "ERROR: same-run batch creation returned no issue number; members remain queued." >&2
+      continue
+    fi
+    CREATED_BODY=$(gh issue view "$BATCH_ISSUE_NUM" -R {GH_REPO} --json body --jq '.body') || continue
+    if ! printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}"; then
+      echo "ERROR: batch issue #${BATCH_ISSUE_NUM} failed create-token read-back; members remain queued." >&2
+      continue
+    fi
 
     # Consume the cluster: record members and REPLACE them in QUEUED_FINDINGS
     # with the single batch issue, so the dispatch step below operates on the
