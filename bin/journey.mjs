@@ -1721,7 +1721,12 @@ async function linkPipelineScripts(ctx) {
       existed = true;
       if (stats.isSymbolicLink()) {
         const current = await readlink(target);
-        if (current === file) alreadyCorrect = true;
+        // Same traversability gate as the sibling forge() command loop: a
+        // correct-but-unreadable link must fall through to the existed →
+        // unlink → reinstall repair below, not be counted as healthy. These two
+        // loops are a matched pair and every hardening fix has to land in both
+        // (forge#2632, forge#2836).
+        if (current === file && await isSymlinkTraversable(target)) alreadyCorrect = true;
       } else if (stats.isFile() && !wantSymlink) {
         // Copy-fallback path (Windows without Developer Mode): content-compare
         // before unlinking/recopying, matching the sibling linkCommands() loop
@@ -2313,7 +2318,14 @@ export async function forge(ctx) {
       const stats = await lstat(target);
       if (stats.isSymbolicLink()) {
         const current = await readlink(target);
-        if (current === file) {
+        // Target-string equality is not proof of link health: readlink() returns
+        // the bytes stored at creation time and carries no readability guarantee.
+        // An MSYS-provenance link on Windows stores the byte-identical correct
+        // target while a native Windows process cannot traverse it (forge#2620).
+        // Without the traversability probe those dead links land in skipped++ and
+        // the repair branch below — which handles exactly this case — is
+        // unreachable for every already-installed link (forge#2836).
+        if (current === file && await isSymlinkTraversable(target)) {
           skipped++;
         } else {
           let relinked = false;
