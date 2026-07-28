@@ -1471,6 +1471,8 @@ describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
     [`${RM} -rf /*`, "root glob"],
     [`${RM} -rf .`, "working directory"],
     [`sudo ${RM} -rf ..`, "parent of working directory, behind sudo"],
+    [`doas ${RM} -rf /`, "bare filesystem root, behind doas"],
+    [`env ${RM} -rf /`, "bare filesystem root, behind env"],
     [`${RMDIR} /probe`, "rmdir is guarded too, not just rm"],
     [`TMPDIR=/x ${RM} -f /probe.txt`, "leading env assignment is stripped"],
     [`${RM} -r -f /probe.txt`, "space-separated short flags"],
@@ -1565,6 +1567,15 @@ describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
     assert.equal(exitCode, 2, "a tab-indented terminator closes <<- heredocs");
   });
 
+  it("allows a dangerous-looking deletion after an unterminated heredoc opener", () => {
+    const command = [
+      `gh issue comment 1 --body "$(cat <<'EOF'`,
+      `${RM} -f /probe.txt`,
+    ].join("\n");
+    const { exitCode } = runBash(command);
+    assert.equal(exitCode, 0, "an unterminated heredoc consumes the remaining text as data");
+  });
+
   // -- Deny message contract (ac-5, ac-6) ---------------------------------
   // The message is part of the rule's contract, not prose: its whole value is
   // that an unattended run self-heals in one turn instead of stalling.
@@ -1646,6 +1657,8 @@ describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
     [`${RM} -f "/tmp/quoted path.txt"`, "quoted path with embedded whitespace"],
     [`${RM} -f "/tmp/safe(/probe.txt)"`, "quoted path with parentheses is one operand (#2882)"],
     [`${RM} -f /tmp/safe\(/probe.txt\)`, "escaped unquoted path with parentheses is one operand (#2882)"],
+    [`${RM} -f C:/Users/test/tmp.txt`, "Windows drive-letter path"],
+    [`${RM} -rf -`, "bare dash operand"],
     [`BODY_FILE=$(mktemp); ${RM} -f "$BODY_FILE"`, "mktemp cleanup — the canonical pipeline shape"],
     [`${RM} -f "$BODY_FILE"`, "bare variable, no path suffix — cannot synthesize a root path"],
     [`D=/tmp/x; ${RM} -rf "$D"/*`, "variable assigned earlier in the same command"],
