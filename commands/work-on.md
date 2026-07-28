@@ -2081,7 +2081,7 @@ gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:CHECKPOINT -->
 
 ```bash
 BODY=$(gh issue view {NUMBER} {GH_FLAG} --json body --jq '.body')
-REMAINING_BEFORE=$(echo "$BODY" | grep -c '^- \[ \]' || true)
+REMAINING_BEFORE=$(echo "$BODY" | grep -cE '^[-*+] \[ \]' || true)
 
 # Structural test: count sections that actually contain checkbox items.
 # Multi-phase == 2+ checkbox-bearing sections. A single checkbox group is
@@ -2102,14 +2102,15 @@ fi
 
 CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
   /^#+ /         { if (has) { n++; has=0 }; next }
-  /^- \[[ xX]\]/ { has=1 }
+  /^[-*+] \[[ xX]\]/ { has=1 }
   END            { if (has) n++; print n+0 }
 ')
 
 # Sub-issue-tracker guard: a decompose parent whose only checkbox group is
 # '## Sub-Issue Tracker' counts 1 section. Checking those off would mark open
-# sub-issues done and close the tracker, so any '- [ ] #NNN' forces multi-phase.
-SUBISSUE_ITEMS=$(echo "$BODY_STRIPPED" | grep -cE '^- \[ \] #[0-9]+' || true)
+# sub-issues done and close the tracker, so any unchecked GFM task item for an
+# issue forces multi-phase.
+SUBISSUE_ITEMS=$(echo "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
 ```
 
 This block is character-identical to the one in `commands/work-on/close.md` Phase C1 — keep them in sync. <!-- Fixed: forge#2840 -->
