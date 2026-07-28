@@ -32,17 +32,42 @@
  * cascade until N tokens spent" — `max_generation` and `token_budget` below
  * are independent levers precisely so that shape of policy is expressible.
  *
- * Hard invariant (NOT configurable by design): safety exclusions — findings
- * whose `## Problem` section indicates security/billing/anti-bot/auth
- * concerns — are never batched and never auto-admitted by ANY policy,
- * including `all`. That exclusion lives upstream of this module (the P3
- * batching eligibility check in `phase-1-resolve.md` / the surface-area
- * batching check in `phase-4-execution.md`) and is intentionally absent
- * from the levers this module resolves.
+ * Billing findings are never batched. Security-relevant P3 findings may only
+ * batch with findings in the same coarse class, with a maximum of three
+ * members. The prose mirrors use `classifyBatchSafety` as their reference.
  */
 
 /** Sentinel string accepted anywhere an "int | unlimited" lever is read. */
 export const UNLIMITED = "unlimited";
+
+const BATCH_SAFETY_CLASSES = [
+  ["billing", /\bbilling\b/i],
+  ["auth", /\b(?:[A-Za-z0-9]*[A-Z][A-Za-z0-9]*[Aa][Uu][Tt][Hh][A-Za-z0-9]*|[Aa][Uu][Tt][Hh](?:[NnZz]?_|[A-Z]))\b|\b(?:authentication|authorization|authn|authz)\b/i],
+  ["injection", /\b(?:inject|injection|xss|csrf|ssrf|deserializ|rce)\w*/i],
+  ["access-control", /\b(?:bypass|escalat|privilege)\w*/i],
+  ["credential", /\b(?:credential|secret|token|password|pgpassword|htpasswd)\w*/i],
+  ["redaction", /\b(?:redact|sanitiz)\w*/i],
+  ["scheme", /\bscheme\b/i],
+  ["traversal", /\btraversal\b/i],
+  ["security", /\b(?:security|anti-bot)\b/i],
+];
+
+/**
+ * Return the batching safety class for title/Problem text. `null` is routine
+ * work; `billing` is an absolute exclusion; every other value is eligible only
+ * for a same-class, maximum-three-member security batch.
+ *
+ * `auth` deliberately matches camelCase/PascalCase and underscore identifiers
+ * (MaintenanceAuth, AdminAuth, authz_check) without matching authority_source.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function classifyBatchSafety(text) {
+  const findingText = text.replace(/^\*\*Agent\*\*:.*$/gim, "");
+  const explicitClass = findingText.match(/<!--\s*FORGE:CLASS:\s*([a-z0-9-]+)\s*-->/i)?.[1];
+  if (explicitClass) return explicitClass.toLowerCase();
+  return BATCH_SAFETY_CLASSES.find(([, pattern]) => pattern.test(findingText))?.[0] ?? null;
+}
 
 /**
  * @typedef {Object} CascadePolicy
@@ -377,4 +402,80 @@ export function evaluateCascadeFinding(finding, policy) {
     return { admit: false, reason: `per-batch token budget exhausted (orchestration.cascade.token_budget=${policy.tokenBudget})` };
   }
   return { admit: true, reason: null };
+}
+
+/**
+ * Deterministic P3 batching rules mirrored by the orchestration specs.
+ * Grouping order is deliberately strongest-context first: a finding can only
+ * belong to one group, so earlier rules claim it before broader rules run.
+ */
+export const P3_BATCHING_RULES = Object.freeze({
+  maxMembers: 8,
+  sameFileMinimum: 2,
+  sourcePrSubsystemMinimum: 2,
+  defectClassMinimum: 2,
+  leafDirectoryMinimum: 3,
+});
+
+function sourcePr(body = "") {
+  return body.match(/^\*\*Source\*\*: PR #(\d+)\b/m)?.[1] || null;
+}
+
+function defectClass(body = "") {
+  return body.match(/<!-- FORGE:CLASS: ([a-z0-9]+(?:-[a-z0-9]+)*) -->/)?.[1] || null;
+}
+
+function topLevelSubsystem(file = "") {
+  const [topLevel, secondLevel] = file.split("/");
+  if (!topLevel) return null;
+  // A root-level file has no subsystem cohort; named top-level areas do.
+  return secondLevel ? `${topLevel}/${secondLevel}` : null;
+}
+
+function leafDirectory(file = "") {
+  const slash = file.lastIndexOf("/");
+  return slash > 0 ? file.slice(0, slash) : null;
+}
+
+/**
+ * Plan P3 batches from already safety-filtered, open, unbatched, undispatched
+ * findings. The caller executes these groups and preserves unclaimed findings
+ * for a later full-queue sweep.
+ */
+export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES) {
+  const remaining = new Map(
+    findings
+      .filter((finding) => finding?.number && finding.affectedFile)
+      .map((finding) => [finding.number, finding]),
+  );
+  const groups = [];
+
+  const claim = (kind, key, minimum) => {
+    const byKey = new Map();
+    for (const finding of remaining.values()) {
+      const groupKey = key(finding);
+      if (!groupKey) continue;
+      const members = byKey.get(groupKey) || [];
+      members.push(finding);
+      byKey.set(groupKey, members);
+    }
+    for (const [groupKey, members] of [...byKey].sort(([a], [b]) => a.localeCompare(b))) {
+      while (members.length >= minimum) {
+        const chunk = members.splice(0, rules.maxMembers);
+        groups.push({ kind, key: groupKey, members: chunk.map((finding) => finding.number) });
+        chunk.forEach((finding) => remaining.delete(finding.number));
+      }
+    }
+  };
+
+  claim("same-file", (finding) => finding.affectedFile, rules.sameFileMinimum);
+  claim("source-pr", (finding) => {
+    const pr = sourcePr(finding.body);
+    const subsystem = topLevelSubsystem(finding.affectedFile);
+    return pr && subsystem ? `PR #${pr} + ${subsystem}` : null;
+  }, rules.sourcePrSubsystemMinimum);
+  claim("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
+  claim("leaf-directory", (finding) => leafDirectory(finding.affectedFile), rules.leafDirectoryMinimum);
+
+  return { groups, ungrouped: [...remaining.keys()] };
 }
