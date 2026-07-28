@@ -421,6 +421,18 @@ declare -A ENGINE_DISPATCH_MAP
 # cache only; every entry must also be persisted as a FORGE:DISPATCH comment.
 declare -A OPENCODE_DISPATCH_MAP
 
+# Reconstruct the live map after compaction/restart from the durable dispatch
+# records. The issue association is the map key; only the latest running record
+# is restored, because a later completed/error record has already released it.
+for NUM in "${ISSUES[@]}"; do
+  DISPATCH_BODY=$(gh api repos/{GH_REPO}/issues/"$NUM"/comments \
+    --jq '[.[] | select(.body | contains("FORGE:DISPATCH")) | .body] | last // ""' 2>/dev/null || true)
+  TASK_ID=$(printf '%s' "$DISPATCH_BODY" | jq -Rr 'try capture("\\\"runtime\\\":\\\"opencode\\\",\\\"child_session_id\\\":\\\"(?<id>[^\\\"]+)\\\".*\\\"state\\\":\\\"running\\\"").id catch ""')
+  if [ -n "$TASK_ID" ]; then
+    OPENCODE_DISPATCH_MAP["$NUM"]="$TASK_ID"
+  fi
+done
+
 # Same-file current-state brief forwarding (forge#1860). Populated by the core streaming
 # dispatch loop below (Step 4B) whenever a Layer 1/2/3 structural predecessor edge (see
 # EDGE_KIND/EDGE_FILES from phase-3-dependency.md Step 3C) resolves; consumed by Step 4A's
@@ -980,6 +992,8 @@ gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:DISPATCH -->
 ```
 
 **Fallback**: if a runtime ever fails to deliver a background completion notification, read the latest `FORGE:DISPATCH` record and use the documented label-state recovery path, but do not convert the normal OpenCode path to foreground tasks or a wave barrier.
+
+For an OpenCode completion, retain `OPENCODE_DISPATCH_MAP[{NUMBER}]` until the terminal `FORGE:DISPATCH` record above has been posted successfully. Then remove that map entry and release capacity. This makes a restart deterministic: a latest `running` record restores the task-to-issue association, while a latest `completed` or `error` record cannot release the same slot twice.
 
 **Concurrency slot release (MANDATORY — first action on every completion)** <!-- Added: forge#1912 -->: The instant a completion notification arrives — `agent_completed`, a background-Bash completion, or an OpenCode `task` result with `state="completed"`/`state="error"` — decrement `ACTIVE_DISPATCH_COUNT` by 1 — a worker slot has just freed, regardless of what terminal state the issue ended up in. Do this before any stall-recovery/resume logic below. If that agent is then resumed or fallback-dispatched (item 2 below, or Step 4B.5's stall recovery) because it stalled mid-pipeline rather than truly finishing, re-increment `ACTIVE_DISPATCH_COUNT` when the `Agent(resume=...)` or a fresh OpenCode `task(background=true)` continuation is issued — either re-occupies a worker slot exactly like a fresh dispatch does. (Step 4B.5's TIME-BASED hang detector — an agent that never completes at all, as opposed to one that completes at `workflow:engine-error` — remains resume-specific and out of scope for this fix: an engine-dispatched issue that silently hangs still surfaces only via the standard stall-detection alert, and `forgedock resume-stalled` remains available as a separate manual/scripted recovery path for that case. The completion-triggered case — an engine-dispatched issue that DOES complete at `workflow:engine-error` with empty committed state — is still auto-fallen-back by item 2b below, fixed forge#2743.)
 

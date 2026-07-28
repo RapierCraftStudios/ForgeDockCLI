@@ -191,6 +191,28 @@ describe("OpenCode adapter", () => {
     }
   });
 
+  it("requires OpenCode review and remediation children to return joined results", () => {
+    const root = resolve(fileURLToPath(new URL("../../", import.meta.url)));
+    const review = readFileSync(join(root, "commands/work-on/review.md"), "utf8");
+    const remediate = readFileSync(join(root, "commands/work-on/remediate.md"), "utf8");
+    const execution = readFileSync(join(root, "commands/orchestrate/phase-4-execution.md"), "utf8");
+
+    for (const [sourcePath, source] of [
+      ["commands/work-on/review.md", review],
+      ["commands/work-on/remediate.md", remediate],
+    ]) {
+      assert.match(source, /OpenCode joined-child contract/);
+      assert.match(source, /background=false/);
+      assert.match(source, /structured REVIEW_RESULT block/);
+      assert.match(source, /Wait for (that task's completed|the completed child) result/);
+      assert.match(source, /parseable `REVIEW_RESULT`/);
+    }
+
+    assert.match(execution, /Reconstruct the live map after compaction\/restart/);
+    assert.match(execution, /OPENCODE_DISPATCH_MAP\["\$NUM"\]="\$TASK_ID"/);
+    assert.match(execution, /until the terminal `FORGE:DISPATCH` record.*release capacity/s);
+  });
+
   it("installs top-level commands and every eligible workflow as native skills", async () => {
     const { forgeHome, home } = fixture();
     const result = await installOpenCodeAdapter({ forgeHome, home, env: {} });
