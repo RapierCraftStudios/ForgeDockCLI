@@ -167,7 +167,7 @@ done
 
 **Two independent filters apply, in sequence**: first the T0-vs-backlog *time* filter (`CASCADE_SEARCH` above — which issues are even fetched), then the generation *depth* filter below (which of the fetched issues are admitted). They answer different questions — "how far back in time" vs. "how many cascade hops deep" — and either can be widened independently of the other.
 
-**Generation > `max_generation` findings are excluded by default** by the loop above — a `review-finding` issue whose *source* chain is deeper than `orchestration.cascade.max_generation` (default: 1, i.e. generation ≥ 2 excluded — the pre-#2234 behavior, unchanged when the section is absent) is normally deferred permanently (`PERMANENT_DEFERRED`) by Step 4C's own absolute check. That cap is an **autonomy guard**, not a human-request guard: it exists to stop an unattended run from cascading forever, not to block an operator who explicitly asked for this exact bucket of work. See `phase-4-execution.md` Step 4C rule 1 and the reworded anti-pattern note for the full rationale.
+**Generation > `max_generation` findings are excluded by default** by the loop above — a `review-finding` issue whose *source* chain is deeper than `orchestration.cascade.max_generation` (default: 1, i.e. generation ≥ 2 excluded — the pre-#2234 behavior, unchanged when the section is absent) is normally deferred by Step 4C's autonomous check. The only automated exception is bounded P3 aggregation: a generation-2 P3 may become part of one auditable batch under `batch_max_generation`; it is never individually re-dispatched. That cap is an **autonomy guard**, not a human-request guard: it exists to stop an unattended run from cascading forever, not to block an operator who explicitly asked for this exact bucket of work. See `phase-4-execution.md` Step 4C rule 1 and the reworded anti-pattern note for the full rationale.
 
 This resolve step is a human-requested entry point (the operator typed `cascade`/`review-findings`/`findings` directly), so it honors explicit overrides for both filters:
 
@@ -433,6 +433,17 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
 - **Leaf-directory cluster** (broader grouping, existing threshold preserved): When **5+** batchable P3 issues share the same leaf directory but are not already covered by a same-file cluster above, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
 - Form same-file clusters first; evaluate any remaining ungrouped findings for leaf-directory clustering. A finding is claimed by at most one batch.
 
+**Generation-cap exception (sanctioned, bounded, and auditable):** P3 batching may aggregate a
+deferred generation-2 finding without `--allow-gen2`: aggregation replaces several low-priority
+pipelines with one reviewed unit and is therefore a bounded alternative to recursively dispatching
+each finding. It is not an implicit unlimited override. Before forming each cluster, use
+`compute_generation` above for every member, retain only members at or below the finite
+`orchestration.cascade.batch_max_generation` ceiling (default `2`), and leave higher-generation
+members deferred. Record the maximum retained member generation as `{BATCH_MAX_GENERATION}` and
+list every retained generation-2-or-higher member in the batch body. This makes the exception
+visible to operators and ensures a generation-6 finding cannot become dispatchable merely by being
+grouped. `policy: all` does not remove this batching ceiling. <!-- Added: forge#2849 -->
+
 **Sanitize the surface-area path before interpolation (MANDATORY):** `{SURFACE_AREA}` is an affected-file path derived from an issue body, and git filenames can legally carry shell metacharacters (`` ` ``, `$()`, quotes). Restrict it to a validated `[A-Za-z0-9._/-]` charset before templating it into `--title` / `--body`, so an untrusted issue body cannot break the `gh` argument boundary. The same guard is applied at the mirror site in `phase-4-execution.md`. <!-- forge#1833, forge#1835 -->
 
 **Route batch issue creation through `/issue`'s programmatic invocation contract** (`commands/issue.md`, added #2085) instead of calling `gh issue create` directly — this gets dedup (Phase 2D) and mandatory-section body validation (Phase 3F) for free. <!-- Changed: forge#2086 — route through /issue create-hook -->
@@ -453,6 +464,11 @@ Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory),
 <!-- FORGE:BATCH_MEMBERS -->
 {for each member issue: "- [ ] #{NUM}: {TITLE}"}
 <!-- /FORGE:BATCH_MEMBERS -->
+
+**Maximum member generation**: {BATCH_MAX_GENERATION}
+<!-- FORGE:BATCH_MAX_GENERATION: {BATCH_MAX_GENERATION} -->
+
+**Generation >= 2 members admitted by bounded batching**: {#{NUM} (generation N), or "none"}
 
 ## Acceptance Criteria
 
@@ -518,4 +534,3 @@ If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a lea
 **Why**: Surface-level similarity hides critical differences. #3842 (api_key.id lazy load) and #4039 (user.id lazy load) had identical error messages but targeted completely different ORM objects. Closing #4039 as a "duplicate" would have left a customer-impacting P0 bug unfixed.
 
 ---
-

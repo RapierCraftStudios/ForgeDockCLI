@@ -510,6 +510,14 @@ if [ "$MAX_GENERATION_FOR_NOTICE" != "unlimited" ] && ! echo "$MAX_GENERATION_FO
   MAX_GENERATION_FOR_NOTICE="$PRESET_MAX_GEN"
 fi
 
+# P3 batching is a distinct, bounded aggregation exception to autonomous cascade
+# admission. Unlike max_generation, it must always be finite, including policy: all.
+BATCH_MAX_GENERATION=$(yq '.orchestration.cascade.batch_max_generation // 2' forge.yaml 2>/dev/null || echo 2)
+if ! echo "$BATCH_MAX_GENERATION" | grep -qE '^[1-9][0-9]*$'; then
+  echo "WARNING: forge.yaml → orchestration.cascade.batch_max_generation is not a positive integer (\"${BATCH_MAX_GENERATION}\") — falling back to default 2"
+  BATCH_MAX_GENERATION=2
+fi
+
 # token_budget precedence: orchestration.cascade.token_budget (new home) >
 # pipeline.token_budget_per_batch (deprecated alias, forge#1858, kept working
 # unchanged) > the resolved preset default. Accepts the "unlimited" sentinel —
@@ -534,7 +542,7 @@ CASCADE_DEFER_ON_BATCH_GATED=$(yq ".orchestration.cascade.defer_on_batch_gated /
 CASCADE_KEYWORD_HEURISTIC=$(yq ".orchestration.cascade.keyword_heuristic // ${PRESET_KEYWORD}" forge.yaml 2>/dev/null || echo "$PRESET_KEYWORD")
 CASCADE_P3_SAME_FILE_DEFER=$(yq ".orchestration.cascade.p3_same_file_defer // ${PRESET_P3_SAME_FILE}" forge.yaml 2>/dev/null || echo "$PRESET_P3_SAME_FILE")
 
-echo "Cascade admission policy resolved: policy=${CASCADE_POLICY_NAME} token_budget=${TOKEN_BUDGET} defer_on_batch_gated=${CASCADE_DEFER_ON_BATCH_GATED} keyword_heuristic=${CASCADE_KEYWORD_HEURISTIC} p3_same_file_defer=${CASCADE_P3_SAME_FILE_DEFER} (forge.yaml → orchestration.cascade; see docs/CONFIG.md)"
+echo "Cascade admission policy resolved: policy=${CASCADE_POLICY_NAME} token_budget=${TOKEN_BUDGET} batch_max_generation=${BATCH_MAX_GENERATION} defer_on_batch_gated=${CASCADE_DEFER_ON_BATCH_GATED} keyword_heuristic=${CASCADE_KEYWORD_HEURISTIC} p3_same_file_defer=${CASCADE_P3_SAME_FILE_DEFER} (forge.yaml → orchestration.cascade; see docs/CONFIG.md)"
 
 # Both-uncapped notice (loud, one-time, printed once per orchestrate invocation since
 # this resolution block itself runs once at Step 4A.pre) — never a preset default except
@@ -561,6 +569,8 @@ TOKEN_DEFERRED=()   # findings deferred by the token-budget rule this run (re-ev
 # alone. <!-- Added: forge#1909 -->
 SURFACE_BATCHED_FINDINGS=()   # all member issue numbers absorbed into a batch across the run
 SURFACE_BATCH_COUNT=0         # count of batch issues created across the run
+BATCHABLE_DEFERRED_P3=()      # gen-2+ P3s eligible only for bounded P3 aggregation (forge#2849)
+declare -A FINDING_GENERATIONS
 
 for NUM in {ready_issue_numbers}; do
   PR_BASE=$(bash "$CLASSIFY_LANE_SCRIPT" "$NUM" -R {GH_REPO}) || {
@@ -2016,7 +2026,7 @@ For each spawned finding, determine whether it should be **executed** or **defer
 
 **Evaluation order** (first matching rule wins):
 0. **Batch fully human-gated** (`BATCH_FULLY_GATED == true`, always defer, even for P1/P2) <!-- Added: forge#1814 -->: The original batch (see Step 4B item 6.7) has exhausted into DONE/FAILED/GATED with nothing left `IN_PROGRESS` — the real blockers are the GATED issues, not a lack of dispatchable findings. Dispatching a new review-finding here cannot produce net batch progress; it only inflates the open-issue count while the productive path waits on a human merge. Always defer, checked before generation and priority. Rationale: this is the idle/backpressure policy this issue adds — without it, rule 2 (below) unconditionally executes P1/P2 findings regardless of how gated the rest of the batch is, which is the root cause of the net-negative churn this policy exists to stop. **Configurable** via `orchestration.cascade.defer_on_batch_gated` (default `true`; `false` under `policy: all` — forge#2234).
-1. **Generation ≥ 2** (always defer, even for P1/P2, for autonomous mid-run cascade — see scope note below): Finding was spawned by an issue that was itself a review-finding. Check the source issue's labels for `review-finding` — if the source has that label, the new finding is generation 2. Always defer within this Step 4C triage pass. Rationale: gen-2+ cascade is theoretically unbounded — cap it here. **Scope**: this rule caps *autonomous* cascade — findings discovered and re-triaged automatically during an unattended run. It is not a cap on what a human can explicitly request. When an operator directly asks for cascade/review-finding work via `phase-1-resolve.md`'s dedicated `cascade`/`review-findings`/`findings` resolution (with `--include-deferred`/`--allow-gen2`, or the `orchestration.cascade.max_generation` config lever from #2234), those findings enter the DAG through Phase 1 resolution, not through this Step 4C mid-run triage — this rule still defers anything Step 4C itself discovers mid-run, including inside a human-requested gen≥2 batch (see recursion safety below). **Not configurable here** — `orchestration.cascade.max_generation` governs Phase 1 resolve-time admission only (see `phase-1-resolve.md` "Cascade / Review-Finding Resolution"); this Step 4C rule stays an absolute autonomous-cascade cap regardless of policy, including `policy: all`. <!-- Added: forge#2231 -->
+1. **Generation ≥ 2** (always defer from individual autonomous dispatch, even for P1/P2, for mid-run cascade — see scope note below): Finding was spawned by an issue that was itself a review-finding. A P3 finding at or below the finite `orchestration.cascade.batch_max_generation` ceiling (default 2) is retained only as a candidate for the bounded P3 batch pass; it remains deferred if no batch forms. A formed batch records `FORGE:BATCH_MAX_GENERATION` and its generation-2+ members. No P1/P2, or finding above that ceiling, takes this exception. Rationale: gen-2+ individual cascade is theoretically unbounded — cap it here while permitting one auditable aggregation unit. **Scope**: this rule caps *autonomous* cascade — findings discovered and re-triaged automatically during an unattended run. It is not a cap on what a human can explicitly request. When an operator directly asks for cascade/review-finding work via `phase-1-resolve.md`'s dedicated `cascade`/`review-findings`/`findings` resolution (with `--include-deferred`/`--allow-gen2`, or the `orchestration.cascade.max_generation` config lever from #2234), those findings enter the DAG through Phase 1 resolution, not through this Step 4C mid-run triage. `batch_max_generation` is separate from `max_generation`, and remains finite even under `policy: all`. <!-- Added: forge#2231, forge#2849 -->
 2. **Priority override** (P1 or P2 → always execute): If the finding is labeled P1 or P2, skip all remaining heuristics and execute. Rationale: high-priority findings must never be suppressed by keyword matching.
 3. **Comment/typo heuristic** (P3 and below only): Finding title contains the word "comment" or "typo" (case-insensitive). These are 1-line cosmetic fixes that do not block other work. **Configurable** via `orchestration.cascade.keyword_heuristic` (default `true`; `false` under `policy: all` — forge#2234).
 4. **P3 + same-file overlap**: Finding is labeled `P3` AND the file it targets overlaps with ANY file already in the current batch (active or queued in the DAG). Rationale: same-file P3 findings add predecessor edges that serialize agents — one finding per original issue increases wall-clock time with no proportional value. **Configurable** via `orchestration.cascade.p3_same_file_defer` (default `true`; `false` under `policy: all` — forge#2234).
@@ -2052,6 +2062,22 @@ ALL_BATCH_FILES=$(echo "$ALL_BATCH_FILES" | sort -u | grep -v '^$')
 ```
 
 ```bash
+# Use the same bounded ancestor walk as Phase 1 so batching records actual depth,
+# not just whether the immediate source is a review finding.
+compute_finding_generation() {
+  local body="$1" generation=1 hops=0 source_num source_data
+  while [ "$hops" -lt 10 ]; do
+    source_num=$(echo "$body" | grep -ioE 'spawned from issue #[0-9]+|source issue[: #]+[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    [ -z "$source_num" ] && break
+    source_data=$(gh issue view "$source_num" -R {GH_REPO} --json labels,body 2>/dev/null) || break
+    echo "$source_data" | jq -e '[.labels[].name] | index("review-finding")' >/dev/null 2>&1 || break
+    generation=$((generation + 1))
+    body=$(echo "$source_data" | jq -r '.body')
+    hops=$((hops + 1))
+  done
+  echo "$generation"
+}
+
 # For each finding, check its priority label and generation
 # NOTE: DEFERRED_FINDINGS, QUEUED_FINDINGS, and DEFERRED_REASONS are declared at
 # batch scope in Step 4A.pre — do NOT re-initialize them here (Step 4C runs per-agent).
@@ -2200,7 +2226,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   # all" sets this to false so an operator draining a backlog is never idle-gated.
   if [ "$CASCADE_DEFER_ON_BATCH_GATED" = "true" ] && [ "${BATCH_FULLY_GATED:-false}" = "true" ]; then
     DEFER=true; DEFER_REASON="batch fully human-gated — idle policy"
-  # Heuristic 1: Generation check — source issue has review-finding label (always defer, even for P1/P2)
+  # Heuristic 1: Generation check — source issue has review-finding label. Always defer
+  # individual dispatch; only bounded P3 aggregation can consume an eligible member.
   # NOT gated by orchestration.cascade.max_generation — this is Step 4C's autonomous
   # mid-run cascade cap, which stays absolute regardless of config (see forge#2231's
   # scope note above and phase-1-resolve.md's Cascade / Review-Finding Resolution
@@ -2209,7 +2236,15 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   elif SOURCE_NUM=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '(?i)spawned from issue #\K\d+|source issue[: #]+\K\d+' | head -1) && \
        [ -n "$SOURCE_NUM" ] && \
        gh issue view $SOURCE_NUM -R {GH_REPO} --json labels --jq '[.labels[].name]' 2>/dev/null | grep -q "review-finding"; then
-    DEFER=true; DEFER_REASON="generation >= 2 (source #${SOURCE_NUM} is also a review-finding)"
+    FINDING_GENERATION=$(compute_finding_generation "$(echo "$FINDING_DATA" | jq -r '.body')")
+    FINDING_GENERATIONS[$FINDING_NUM]="$FINDING_GENERATION"
+    DEFER=true; DEFER_REASON="generation ${FINDING_GENERATION} (source #${SOURCE_NUM} is also a review-finding)"
+    if [ "$PRIORITY" = "P3" ] && [ "$FINDING_GENERATION" -le "$BATCH_MAX_GENERATION" ]; then
+      # Keep this out of individual cascade dispatch, but offer it to the P3 batching
+      # pass below. A singleton remains deferred; only a formed batch is admitted.
+      BATCHABLE_DEFERRED_P3+=("$FINDING_NUM")
+      DEFER_REASON="generation ${FINDING_GENERATION} — eligible for bounded P3 batching only"
+    fi
   # Priority override: P1 or P2 always execute — skip remaining heuristics
   elif [ "$PRIORITY" = "P1" ] || [ "$PRIORITY" = "P2" ]; then
     DEFER=false
@@ -2230,6 +2265,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
   else
     DEFER=false
   fi
+
+  [ -n "${FINDING_GENERATIONS[$FINDING_NUM]:-}" ] || FINDING_GENERATIONS[$FINDING_NUM]=1
 
   if [ "$DEFER" = "true" ]; then
     DEFERRED_FINDINGS+=($FINDING_NUM)
@@ -2259,13 +2296,17 @@ Cascade-spawned findings collected within a single `/orchestrate` run never pass
 unset SURFACE_FILE_MEMBERS
 declare -A SURFACE_FILE_MEMBERS
 
-# Defensive cap on gh issue view fan-out. QUEUED_FINDINGS is already bounded by
+# Include generation-2 P3 findings only as batch candidates. They remain deferred
+# unless this pass actually forms a bounded batch; no member is individually queued.
+BATCHING_CANDIDATES=("${QUEUED_FINDINGS[@]}" "${BATCHABLE_DEFERRED_P3[@]}")
+
+# Defensive cap on gh issue view fan-out. BATCHING_CANDIDATES is already bounded by
 # upstream cascade control; this cap holds even if that bound is later loosened,
 # so the loop can never scale API calls linearly with cascade-seeded findings. <!-- forge#1836 -->
 MAX_BATCH_SCAN=50
 SCANNED=0
 
-for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
+for FINDING_NUM in "${BATCHING_CANDIDATES[@]}"; do
   SCANNED=$((SCANNED + 1))
   if [ "$SCANNED" -gt "$MAX_BATCH_SCAN" ]; then
     echo "Surface-area batching: reached MAX_BATCH_SCAN=$MAX_BATCH_SCAN — remaining findings stay individually queued"
@@ -2340,9 +2381,18 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
     [ "${#CHUNK[@]}" -ge 2 ] || continue
 
     MEMBER_LINES=""
+    BATCH_MEMBER_GENERATION=1
+    GEN2_MEMBER_LINES=""
     for M in "${CHUNK[@]}"; do
       MTITLE=$(gh issue view "$M" -R {GH_REPO} --json title --jq '.title' 2>/dev/null || echo "")
       MEMBER_LINES="${MEMBER_LINES}- [ ] #${M}: ${MTITLE}"$'\n'
+      MEMBER_GENERATION="${FINDING_GENERATIONS[$M]:-1}"
+      if [ "$MEMBER_GENERATION" -gt "$BATCH_MEMBER_GENERATION" ]; then
+        BATCH_MEMBER_GENERATION="$MEMBER_GENERATION"
+      fi
+      if [ "$MEMBER_GENERATION" -ge 2 ]; then
+        GEN2_MEMBER_LINES="${GEN2_MEMBER_LINES}- #${M}: generation ${MEMBER_GENERATION}"$'\n'
+      fi
     done
 
     # Dedup-check with member exclusion (MANDATORY — forge#2432, identical mechanism to
@@ -2380,6 +2430,12 @@ Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered m
 
 <!-- FORGE:BATCH_MEMBERS -->
 ${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
+
+**Maximum member generation**: ${BATCH_MEMBER_GENERATION}
+<!-- FORGE:BATCH_MAX_GENERATION: ${BATCH_MEMBER_GENERATION} -->
+
+**Generation >= 2 members admitted by bounded batching**:
+${GEN2_MEMBER_LINES:-none}
 
 ## Acceptance Criteria
 

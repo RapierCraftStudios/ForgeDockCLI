@@ -50,6 +50,10 @@ export const UNLIMITED = "unlimited";
  *   admitted. 1 = only original (non-review-finding-spawned) issues; a
  *   review-finding whose source is itself a review-finding is generation 2,
  *   and so on up the chain. `unlimited` removes the cap entirely.
+ * @property {number} batchMaxGeneration - Deepest review-finding generation that
+ *   may be absorbed into a P3 batch. This is deliberately always finite: batching
+ *   is a bounded aggregation exception to autonomous cascade admission, not an
+ *   alternate path to unlimited recursion.
  * @property {number|typeof UNLIMITED} tokenBudget - Per-batch token ceiling for
  *   Step 4C's review-finding cascade dispatch (mirrors, and by default reads
  *   through to, `pipeline.token_budget_per_batch`). `unlimited` removes the cap.
@@ -78,6 +82,7 @@ export const UNLIMITED = "unlimited";
 export const CASCADE_PRESETS = Object.freeze({
   all: Object.freeze({
     maxGeneration: UNLIMITED,
+    batchMaxGeneration: 2,
     tokenBudget: UNLIMITED,
     deferOnBatchGated: false,
     keywordHeuristic: false,
@@ -85,6 +90,7 @@ export const CASCADE_PRESETS = Object.freeze({
   }),
   balanced: Object.freeze({
     maxGeneration: 1,
+    batchMaxGeneration: 2,
     tokenBudget: 900000,
     deferOnBatchGated: true,
     keywordHeuristic: true,
@@ -92,6 +98,7 @@ export const CASCADE_PRESETS = Object.freeze({
   }),
   conservative: Object.freeze({
     maxGeneration: 1,
+    batchMaxGeneration: 2,
     tokenBudget: 450000,
     deferOnBatchGated: true,
     keywordHeuristic: true,
@@ -144,6 +151,7 @@ export function parseIntOrUnlimited(raw, fallback) {
  *   that resolves to `balanced` exactly like today's hardcoded behavior).
  * @param {string} [config.policy]
  * @param {number|string} [config.max_generation]
+ * @param {number|string} [config.batch_max_generation]
  * @param {number|string} [config.token_budget]
  * @param {boolean} [config.defer_on_batch_gated]
  * @param {boolean} [config.keyword_heuristic]
@@ -172,6 +180,27 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
 
   const maxGen = parseIntOrUnlimited(config.max_generation, preset.maxGeneration);
   if (maxGen.warning) warnings.push(`orchestration.cascade.max_generation ${maxGen.warning}`);
+
+  // Unlike explicit Phase 1 admission, automated batching must retain a finite
+  // recursion bound even under policy: all. Do not accept the unlimited sentinel.
+  const rawBatchMaxGeneration = config.batch_max_generation;
+  const parsedBatchMaxGeneration = Number(rawBatchMaxGeneration);
+  const batchMaxGeneration =
+    rawBatchMaxGeneration === undefined || rawBatchMaxGeneration === null || rawBatchMaxGeneration === ""
+      ? preset.batchMaxGeneration
+      : Number.isInteger(parsedBatchMaxGeneration) && parsedBatchMaxGeneration > 0
+        ? parsedBatchMaxGeneration
+        : preset.batchMaxGeneration;
+  if (
+    rawBatchMaxGeneration !== undefined &&
+    rawBatchMaxGeneration !== null &&
+    rawBatchMaxGeneration !== "" &&
+    !(Number.isInteger(parsedBatchMaxGeneration) && parsedBatchMaxGeneration > 0)
+  ) {
+    warnings.push(
+      `orchestration.cascade.batch_max_generation is not a positive integer ("${rawBatchMaxGeneration}") — falling back to default ${preset.batchMaxGeneration}`,
+    );
+  }
 
   // token_budget precedence: orchestration.cascade.token_budget (new home) >
   // pipeline.token_budget_per_batch (deprecated alias, forge#1858) > preset default.
@@ -213,6 +242,7 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
   return {
     policy: {
       maxGeneration: maxGen.value,
+      batchMaxGeneration,
       tokenBudget: tokenBudget.value,
       deferOnBatchGated,
       keywordHeuristic,
@@ -235,6 +265,18 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
 export function admitsGeneration(generation, policy) {
   if (policy.maxGeneration === UNLIMITED) return true;
   return generation <= policy.maxGeneration;
+}
+
+/**
+ * P3 batches may aggregate deferred findings only through this finite ceiling.
+ * The resulting batch must record its maximum member generation for auditability.
+ *
+ * @param {number} generation
+ * @param {CascadePolicy} policy
+ * @returns {boolean}
+ */
+export function admitsBatchGeneration(generation, policy) {
+  return generation <= policy.batchMaxGeneration;
 }
 
 /**

@@ -331,6 +331,14 @@ orchestration:
     # Default: 1 (from the "balanced" preset); "unlimited" under "all".
     max_generation: 1
 
+    # Maximum generation a P3 batch may aggregate. Batching is a sanctioned,
+    # auditable exception to Step 4C's autonomous cascade cap: it can fold
+    # several deferred low-priority findings into one reviewed unit, but it
+    # must never make recursion unbounded. Every batch records the maximum
+    # member generation in FORGE:BATCH_MAX_GENERATION. This value is always
+    # finite, even under policy: all. Default: 2.
+    batch_max_generation: 2
+
     # Per-batch token ceiling for Step 4C's review-finding cascade dispatch.
     # New home for the same lever previously read only as
     # `pipeline.token_budget_per_batch` (kept working as a deprecated alias —
@@ -360,6 +368,7 @@ orchestration:
 | `max_concurrent` | integer | No | Max concurrent `/work-on` sub-agent dispatch. Default: 12 |
 | `cascade.policy` | string | No | `all` \| `balanced` \| `conservative`. Default: `balanced` |
 | `cascade.max_generation` | integer or `"unlimited"` | No | Max cascade generation admitted at Phase 1 resolve time. Default: 1 |
+| `cascade.batch_max_generation` | integer | No | Finite maximum member generation that an automated P3 batch may aggregate. Default: 2 |
 | `cascade.token_budget` | integer or `"unlimited"` | No | Per-batch token ceiling for Step 4C cascade dispatch. Default: 900000 (deprecated alias: `pipeline.token_budget_per_batch`) |
 | `cascade.defer_on_batch_gated` | boolean | No | Suppress cascade dispatch when the original batch is fully human-gated. Default: `true` |
 | `cascade.keyword_heuristic` | boolean | No | Defer P3-and-below comment/typo-titled findings. Default: `true` |
