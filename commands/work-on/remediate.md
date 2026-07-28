@@ -110,7 +110,19 @@ BLOCK_COMMENTS=$(gh api repos/{GH_REPO}/issues/{ISSUE_NUMBER}/comments \
 
 **If the block reason classifies as UNFIXABLE** (and no FIXABLE item accompanies it): do NOT attempt any fix. Skip directly to Phase M8 with verdict `UNFIXABLE`, re-affirm `needs-human` (it should already be present), and return `REMEDIATE_RESULT: status: UNFIXABLE`. This satisfies AC5 — "genuinely-blocked PRs still terminate at `needs-human`."
 
-**If at least one FIXABLE item exists**: proceed to Phase M2.
+**If at least one FIXABLE item exists**: transition the issue out of its terminal gate before proceeding to Phase M2. `needs-human` represents the prior review result, not an active automated remediation run; retaining it would make the dispatcher and recovery paths stop while remediation is in progress. Keep exactly one active workflow state:
+
+```bash
+if [ "${DRY_RUN:-false}" = "true" ]; then
+  echo "DRY_RUN: would replace needs-human with workflow:in-review on issue #{ISSUE_NUMBER}"
+else
+  gh issue edit {ISSUE_NUMBER} {GH_FLAG} \
+    --add-label "workflow:in-review" \
+    --remove-label "needs-human" 2>/dev/null || true # <!-- allowlist:check-command-side-effects -->
+fi
+```
+
+Do not perform this transition for an UNFIXABLE policy escalation. Any later quality-gate, push, or re-review block re-adds `needs-human`; after re-review, remove `workflow:in-review` whenever that terminal label is present.
 
 ---
 
@@ -217,10 +229,17 @@ Note the marker is `<!-- FORGE:REMEDIATION -->` with **no** `:COMPLETE` suffix y
 Skill(skill="review-pr", args="{PR_NUMBER} --auto-merge --issue {ISSUE_NUMBER} --base {PR_BASE} --gh-flag {GH_FLAG}")
 ```
 
-This re-runs the full review (domain agents → verdict → Phase 8 auto-merge gate). Because `{ISSUE_NUMBER}` still carries `needs-human` at this point, one of two things happens inside `review-pr.md`'s existing, **unedited** Phase 8:
+This re-runs the full review (domain agents → verdict → Phase 8 auto-merge gate). The FIXABLE transition above left the issue at the non-terminal `workflow:in-review` state. `review-pr.md` recognizes the in-progress `FORGE:REMEDIATION` marker posted in Phase M5 as evidence of the prior escalation, so one of two things happens inside Phase 8:
 
-- **Re-escalated**: the re-review itself trips a fresh block (`CHANGES REQUESTED`, purpose-regression, calibration, trust, or a still-`CONFLICTING` mergeability check) → `needs-human` remains set, no merge attempted.
-- **Clean re-review**: `VERDICT=APPROVED`-equivalent, mergeable, and the "Previously-escalated re-review guard" (forge#1810) fires — clearing `needs-human` and setting `workflow:awaiting-merge`, *without* auto-merging (that guard's own safe default, left untouched by this file).
+- **Re-escalated**: the re-review itself trips a fresh block (`CHANGES REQUESTED`, purpose-regression, calibration, trust, or a still-`CONFLICTING` mergeability check) → it adds `needs-human`, and this phase removes `workflow:in-review`, leaving one terminal state.
+- **Clean re-review**: `VERDICT=APPROVED`-equivalent, mergeable, and the "Previously-escalated re-review guard" (forge#1810) fires — setting `workflow:awaiting-merge` and removing `workflow:in-review`, *without* auto-merging (that guard's own safe default, left untouched by this file).
+
+```bash
+POST_REVIEW_LABELS=$(gh issue view {ISSUE_NUMBER} {GH_FLAG} --json labels --jq '[.labels[].name] | join(",")')
+if echo "$POST_REVIEW_LABELS" | grep -qE '(^|,)needs-human(,|$)'; then
+  gh issue edit {ISSUE_NUMBER} {GH_FLAG} --remove-label "workflow:in-review" 2>/dev/null || true # <!-- allowlist:check-command-side-effects -->
+fi
+```
 
 Extract the re-review verdict for the paper trail (Phase M8 reports this verbatim):
 ```bash
