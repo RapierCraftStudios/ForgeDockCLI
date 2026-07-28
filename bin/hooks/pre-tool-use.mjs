@@ -364,6 +364,22 @@ const RM_DANGEROUS_TARGET_RE = /^(?:\/[^/]*\/?|\.{1,2}\/?)$/;
  */
 const RM_VARIABLE_ROOT_TARGET_RE = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\/.+$/;
 
+// These path variables are initialized by the shell, runner, or ForgeDock
+// before an agent command runs, so they cannot be the unset-variable shape
+// this branch guards against.
+const RM_EXTERNALLY_ASSIGNED_VARIABLES = new Set([
+  "HOME",
+  "PWD",
+  "OLDPWD",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "REPO_PATH",
+  "FORGE_HOME",
+  "RUNNER_TEMP",
+  "GITHUB_WORKSPACE",
+]);
+
 /**
  * Command names this rule anchors on, in command position only.
  */
@@ -1225,7 +1241,8 @@ function extractCommandSegments(command) {
  * @returns {boolean}
  */
 function isVariableAssignedInCommand(command, name) {
-  return new RegExp(`(?:^|[\\s;&|(])${name}=`).test(command);
+  return RM_EXTERNALLY_ASSIGNED_VARIABLES.has(name)
+    || new RegExp(`(?:^|[\\s;&|(])${name}=`).test(command);
 }
 
 /**
