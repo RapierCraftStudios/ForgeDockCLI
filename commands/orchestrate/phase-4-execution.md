@@ -548,6 +548,69 @@ Use `${ISSUE_LANE[$NUM]}` and `${ISSUE_PR_BASE[$NUM]}` to populate `{LANE}` and 
 
 ### Step 4A: Dispatch ready issues
 
+**Claims-board dispatch gate (MANDATORY, before every individual dispatch)** <!-- Added: forge#2844 -->: The coordination issue is the durable authority for file ownership. Do not use `EDGE_FILES`, `ISSUE_FILES`, or a remembered prior read as evidence that a claim is free. Immediately before dispatching each issue, re-read the full claims board and refuse that dispatch when the issue's declared file set intersects a live claim held by another issue. This applies equally to engine, Claude Agent, and OpenCode task dispatches, including newly-ready issues and wake reconstruction.
+
+```bash
+# Returns unreleased claims as [{holder: "123", files: "..."}]. A release is a separate,
+# later comment, so it must be paired with its claim by holder rather than searched for in the
+# claim comment itself. Terminal holder states also self-heal claims left behind by dead agents.
+read_active_claims() {
+  local COORD_NUM="$1"
+  local CLAIMS HOLDER TERMINAL
+  CLAIMS=$(gh api --paginate --slurp "repos/{GH_REPO}/issues/${COORD_NUM}/comments" 2>/dev/null \
+    | jq -c '
+        flatten as $comments |
+        [$comments[]
+         | select(.body | contains("<!-- FORGE:CLAIM -->"))
+         | . as $claim
+         | ($claim.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) as $holder
+         | select([$comments[]
+                   | select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->"))
+                   | select((.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) == $holder)
+                   | select(.created_at > $claim.created_at)] | length == 0)
+         | {holder: $holder,
+            files: ($claim.body | capture("\\*\\*Files\\*\\*: (?<files>[\\s\\S]*?)(?:\\n\\*\\*Interfaces\\*\\*:|$)").files)}]') || return 1
+
+  for HOLDER in $(echo "$CLAIMS" | jq -r '.[].holder'); do
+    TERMINAL=$(gh issue view "$HOLDER" -R {GH_REPO} --json labels --jq \
+      '[.labels[].name | select(. == "workflow:merged" or . == "workflow:invalid" or . == "workflow:awaiting-merge" or . == "needs-human")] | length > 0' 2>/dev/null)
+    [ "$TERMINAL" = "true" ] && CLAIMS=$(echo "$CLAIMS" | jq --arg holder "$HOLDER" '[.[] | select(.holder != $holder)]')
+  done
+  echo "$CLAIMS"
+}
+
+claim_conflicts_with_live_holder() {
+  local NUM="$1" TARGET_FILES CLAIM HOLDER CLAIM_FILES OVERLAP
+  TARGET_FILES=$(printf '%s\n' "${ISSUE_FILES[$NUM]:-}" | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+  [ -z "$TARGET_FILES" ] && return 1  # No declared paths: normal conservative DAG rules still apply.
+
+  ACTIVE_CLAIMS=$(read_active_claims "$COORD_ISSUE_NUMBER") || {
+    echo "REFUSING TO DISPATCH #${NUM}: could not read the durable claims board." >&2
+    return 0
+  }
+  while IFS= read -r CLAIM; do
+    HOLDER=$(echo "$CLAIM" | jq -r '.holder')
+    [ "$HOLDER" = "$NUM" ] && continue
+    CLAIM_FILES=$(echo "$CLAIM" | jq -r '.files' | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+    OVERLAP=$(comm -12 <(printf '%s\n' "$TARGET_FILES") <(printf '%s\n' "$CLAIM_FILES"))
+    if [ -n "$OVERLAP" ]; then
+      echo "DEFERRING #${NUM}: declared files overlap live claim held by #${HOLDER}: ${OVERLAP//$'\n'/, }"
+      return 0
+    fi
+  done < <(echo "$ACTIVE_CLAIMS" | jq -c '.[]')
+  return 1
+}
+
+# Run this immediately before each engine Bash, Agent(), or OpenCode task call. Do not batch the
+# board read: another worker can claim a file between two dispatches in the same ready set.
+if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ]; then
+  if claim_conflicts_with_live_holder "$NUM"; then
+    DEFERRED_CLAIM_ISSUES+=("$NUM")
+    continue
+  fi
+fi
+```
+
 **Engine-first dispatch (default)**: When `forgedock` is in PATH, dispatch each ready issue via the durable engine rather than spawning prose Agent sub-agents. The engine's phase table enforces gate semantics in code — its fail-closed review gate and deterministic phase ordering are not subject to LLM interpretation.
 
 **OpenCode dispatch (runtime-neutral adapter)**: When `FORGE_RUNTIME=opencode` or
@@ -678,6 +741,18 @@ if [ "$FORGEDOCK_AVAILABLE" = "true" ]; then
   if [ "${#DEFERRED_CONCURRENCY_ISSUES[@]}" -gt 0 ]; then
     echo "CONCURRENCY DEFER: ${#DEFERRED_CONCURRENCY_ISSUES[@]} ready issue(s) held back — ${ACTIVE_DISPATCH_COUNT}/${MAX_CONCURRENT} already in flight. Will dispatch as slots free up: ${DEFERRED_CONCURRENCY_ISSUES[*]}"
   fi
+  # Filter against the durable board once while forming this engine batch. The tool-call
+  # instruction below re-checks immediately before each launch to close the remaining TOCTOU gap.
+  CLAIM_SAFE_DISPATCH=()
+  for NUM in "${DISPATCH_NOW[@]}"; do
+    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ] && claim_conflicts_with_live_holder "$NUM"; then
+      DEFERRED_CLAIM_ISSUES+=("$NUM")
+      continue
+    fi
+    CLAIM_SAFE_DISPATCH+=("$NUM")
+  done
+  DISPATCH_NOW=("${CLAIM_SAFE_DISPATCH[@]}")
+
   echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message via forgedock run-issue (headroom was ${HEADROOM})"
 
   for NUM in "${DISPATCH_NOW[@]}"; do
@@ -714,7 +789,7 @@ fi
 fi
 ```
 
-**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Issue one `Bash(...)` call per issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
+**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Immediately before each call, run `claim_conflicts_with_live_holder "{NUM}"`; if it returns success, defer that issue rather than dispatching it. Issue one `Bash(...)` call per remaining issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
 
 ```
 Bash(command="forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
@@ -964,7 +1039,7 @@ fi
 echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message (headroom was ${HEADROOM})"
 ```
 
-Spawn `Agent()` for every issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by `${#DISPATCH_NOW[@]}` — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
+Immediately before every Claude `Agent()` or OpenCode `task()` call, run `claim_conflicts_with_live_holder "{NUM}"`; when it returns success, append the issue to `DEFERRED_CLAIM_ISSUES[]` and do not make that call. Spawn `Agent()` for every remaining issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by the number actually dispatched — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
 
 If `DISPATCH_NOW` is empty (headroom is 0), do not spawn any agents this cycle — wait for the next `agent_completed` notification, which frees a slot and re-triggers this dispatch computation (Step 4B).
 
@@ -1361,11 +1436,7 @@ done
    # After CLAIM_RELEASED for issue NUM:
    # Read all active FORGE:CLAIM annotations from coordination issue
    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_NUM:-}" ]; then
-     ACTIVE_CLAIMS=$(gh api repos/{GH_REPO}/issues/${COORD_NUM}/comments \
-       --jq '[.[] | select(.body | contains("<!-- FORGE:CLAIM -->")) |
-              select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->") | not)] |
-             map({holder: (.body | capture("\\*\\*Holder\\*\\*: (?P<h>[^\\n]+)").h),
-                  files: (.body | capture("\\*\\*Files\\*\\*: (?P<f>[^\\n]+)").f)})' 2>/dev/null || echo '[]')
+      ACTIVE_CLAIMS=$(read_active_claims "$COORD_NUM" 2>/dev/null || echo '[]')
      # For each still-blocked issue in a Layer-2/4 pair: check if its claim's file set
      # is disjoint from all remaining active claims. If so, mark it ready.
      # (Layer-1 and Layer-3 edges are never relaxed — this check is Layer-2/4 only.)
