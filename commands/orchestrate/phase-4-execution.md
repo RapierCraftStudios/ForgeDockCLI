@@ -2365,8 +2365,8 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
        [ -n "$SOURCE_NUM" ] && \
        gh issue view $SOURCE_NUM -R {GH_REPO} --json labels --jq '[.labels[].name]' 2>/dev/null | grep -q "review-finding"; then
     DEFER=true; DEFER_REASON="generation >= 2 (source #${SOURCE_NUM} is also a review-finding)"
-  # Priority override: P1 or P2 always execute — skip remaining heuristics
-  elif [ "$PRIORITY" = "P1" ] || [ "$PRIORITY" = "P2" ]; then
+   # Priority override: P0/P1 always execute — P2 remains eligible for batching.
+   elif [ "$PRIORITY" = "P0" ] || [ "$PRIORITY" = "P1" ]; then
     DEFER=false
   # Heuristic 2: Comment/typo keyword (only applies to P3 and below)
   # Gated by CASCADE_KEYWORD_HEURISTIC (orchestration.cascade, forge#2234).
@@ -2410,7 +2410,7 @@ done
 
 **Concern-level batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
-Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched P3 candidate set, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates plus new findings, apply Phase 1's safety exclusions, and call `planP3BatchGroups()` from `bin/engine/admission.mjs`. Execute the resulting groups before dispatch, retaining its `ungrouped` members for the next sweep. This preserves the same-file, source-PR + subsystem, defect-class, leaf-directory ordering, 3-member leaf threshold, and eight-member cap defined in Phase 1. Record the selected group kind in the run summary. <!-- Added: forge#2858 -->
+Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched candidate registry, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates, new findings, and open batch membership; call `planP3BatchGroups()` with that registry and `batchExclusionReason()` danger-zone inputs. Execute returned `extensions` before new groups, retain `ungrouped` members for the next sweep, and record group kinds or exclusion predicates in the run summary. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
 
 The per-cycle `QUEUED_FINDINGS` loop below remains the action-creation mechanism, but it MUST consume the complete-sweep planner output rather than decide groups from its local same-file map. Do not dispatch a locally ungrouped member until the next periodic sweep has considered it against the retained candidate set.
 

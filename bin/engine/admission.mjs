@@ -375,6 +375,23 @@ export const P3_BATCHING_RULES = Object.freeze({
   leafDirectoryMinimum: 3,
 });
 
+const HIGH_BLAST_RADIUS = /(?:^|\/)(?:\.env\.example|docker-compose[^/]*|compose[^/]*|index\.[^/]+|main\.[^/]+)$/i;
+
+function priorityOf(finding) {
+  const labels = (finding.labels || []).map((label) => typeof label === "string" ? label : label?.name);
+  return labels.find((label) => /^priority:P[0-3]$/.test(label))?.slice(-2) || labels.find((label) => /^P[0-3]$/.test(label)) || "P3";
+}
+
+/** Priority is urgency, not risk: only P0/P1 stay individual for latency. */
+export function batchExclusionReason(finding, dangerZones = []) {
+  if (["P0", "P1"].includes(priorityOf(finding))) return "urgency";
+  const file = finding.affectedFile || "";
+  if (/^infra\/migrations\/.*credit_balance/i.test(file) || /^services\/api\/app\/billing\//i.test(file)) return "domain";
+  if (dangerZones.some((zone) => file === zone || file.startsWith(`${zone}/`))) return "domain";
+  if (/\/migrations?\//i.test(file) || HIGH_BLAST_RADIUS.test(file)) return "high-blast-radius";
+  return classifyBatchSafety(`${finding.title || ""}\n${finding.body || ""}`) === "billing" ? "domain" : null;
+}
+
 function sourcePr(body = "") {
   return body.match(/^\*\*Source\*\*: PR #(\d+)\b/m)?.[1] || null;
 }
@@ -400,13 +417,26 @@ function leafDirectory(file = "") {
  * findings. The caller executes these groups and preserves unclaimed findings
  * for a later full-queue sweep.
  */
-export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES) {
+export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES, { openBatches = [], dangerZones = [] } = {}) {
   const remaining = new Map(
     findings
-      .filter((finding) => finding?.number && finding.affectedFile)
+      .filter((finding) => finding?.number && finding.affectedFile && !batchExclusionReason(finding, dangerZones))
       .map((finding) => [finding.number, finding]),
   );
   const groups = [];
+  const extensions = [];
+
+  for (const batch of openBatches) {
+    const key = batch.affectedFile || batch.key;
+    const headroom = rules.maxMembers - (batch.memberCount ?? batch.members?.length ?? 0);
+    if (!key || headroom <= 0) continue;
+    for (const member of batch.members || []) remaining.delete(typeof member === "object" ? member.number : member);
+    const members = [...remaining.values()].filter((finding) => finding.affectedFile === key).slice(0, headroom);
+    if (members.length) {
+      extensions.push({ batch: batch.number, key, members: members.map((finding) => finding.number) });
+      members.forEach((finding) => remaining.delete(finding.number));
+    }
+  }
 
   const claim = (kind, key, minimum) => {
     const byKey = new Map();
@@ -435,5 +465,5 @@ export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES) {
   claim("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
   claim("leaf-directory", (finding) => leafDirectory(finding.affectedFile), rules.leafDirectoryMinimum);
 
-  return { groups, ungrouped: [...remaining.keys()] };
+  return { groups, extensions, ungrouped: [...remaining.keys()] };
 }

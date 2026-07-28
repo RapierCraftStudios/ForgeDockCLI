@@ -12,6 +12,7 @@ import {
   evaluateCascadeFinding,
   classifyBatchSafety,
   evaluateAmplification,
+  batchExclusionReason,
   planP3BatchGroups,
 } from "./admission.mjs";
 
@@ -374,5 +375,23 @@ describe("planP3BatchGroups — concern-level P3 batching", () => {
     const nine = planP3BatchGroups(Array.from({ length: 9 }, (_, index) => finding(index + 1, `scripts/${index}.sh`)));
     assert.deepEqual(nine.groups, [{ kind: "leaf-directory", key: "scripts", members: [1, 2, 3, 4, 5, 6, 7, 8] }]);
     assert.deepEqual(nine.ungrouped, [9]);
+  });
+
+  it("extends compatible open batches before creating another one", () => {
+    const plan = planP3BatchGroups(
+      [finding(1, "scripts/a.sh"), finding(2, "scripts/a.sh")],
+      undefined,
+      { openBatches: [{ number: 99, affectedFile: "scripts/a.sh", members: [1], memberCount: 7 }] },
+    );
+    assert.deepEqual(plan.extensions, [{ batch: 99, key: "scripts/a.sh", members: [2] }]);
+    assert.deepEqual(plan.groups, []);
+  });
+
+  it("uses urgency and path risk instead of excluding every P2 finding", () => {
+    assert.equal(batchExclusionReason({ labels: ["priority:P2"], affectedFile: "scripts/a.sh" }), null);
+    assert.equal(batchExclusionReason({ labels: ["priority:P1"], affectedFile: "scripts/a.sh" }), "urgency");
+    assert.equal(batchExclusionReason({ labels: ["priority:P2"], affectedFile: "infra/migrations/0333_credit_balance.sql" }), "domain");
+    assert.equal(batchExclusionReason({ labels: ["priority:P2"], affectedFile: "services/api/app/billing/charge.py" }), "domain");
+    assert.equal(batchExclusionReason({ labels: ["priority:P2"], affectedFile: ".env.example" }), "high-blast-radius");
   });
 });

@@ -345,13 +345,13 @@ done
 
 **MUST NOT**: This hint MUST NOT be used, anywhere in this pipeline, to auto-close an issue, auto-skip it from dispatch, exclude it from the resolved issue set, or substitute for the investigation agent's own evidence-based verdict. Every `likely-moot: yes` issue is still dispatched into a full `/work-on` pipeline exactly like every other issue in the resolved set — the "CRITICAL: No duplicate detection at orchestrator level" rule below governs this identically.
 
-### P3 Review-Finding Batching (deterministic grouping rule)
+### Review-Finding Batching (deterministic grouping rule)
 
 <!-- Added: forge#1333 -->
 <!-- Extended: forge#1818 — default-batchable eligibility, surface-area grouping, lowered same-file threshold -->
 <!-- Extended: forge#2232 — priority-label schema tolerance (bare P<n> vs priority:P<n>) -->
 
-Before finalizing the issue set, apply the P3 batching rule to reduce full-pipeline overhead on low-severity review findings.
+Before finalizing the issue set, apply the shared batching rule to reduce full-pipeline overhead on routine review findings.
 
 **Priority label schema**: ForgeDock's own issue creator (`review-pr.md`) writes only the canonical `priority:P<n>` label form. Some repos this pipeline operates against (issues opened externally, imported, or predating ForgeDock adoption) instead carry a bare `P<n>` label with no `priority:` prefix. Every priority-read check in this section — and its mirrors in `phase-4-execution.md` and `cleanup.md` — MUST accept both forms. `priority:P<n>` wins when (unusually) both are present on the same issue. Issue-*creation* call sites (the batch-issue creation below) are unaffected and keep writing canonical `priority:P<n>` only — there is no case where this pipeline needs to *write* the bare form. <!-- Added: forge#2232 -->
 
@@ -361,7 +361,7 @@ Before finalizing the issue set, apply the P3 batching rule to reduce full-pipel
 
 The `<!-- FORGE:BATCHABLE -->` marker (still appended by `review-pr.md` at finding-creation time) is honored when present but is no longer REQUIRED for eligibility — a `review-finding`+`priority:P3` issue is batchable by default unless explicitly excluded. This closes the gap where cascade-spawned findings that never carried the marker sat un-batched indefinitely. <!-- Added: forge#1818 -->
 
-**Safety classification:** P1/P2 findings are never batched. Billing is also never batched: its risk is monetary correctness, not a shared-hardening implementation. Security-relevant P3 findings may batch only with members of the same coarse class, capped at **3** members. Each such batch must record a per-member verdict: `live vector` or `defence-in-depth`.
+**Safety classification:** P0/P1 findings stay individual because batching adds urgent-work latency. P2 is an ordering signal, not a batching veto. Billing is never batched, and path-owned danger zones, migrations, high-fan-in entrypoints, compose files, and `.env.example` are excluded by `batchExclusionReason()` in `bin/engine/admission.mjs`. The default path map excludes `infra/migrations/*credit_balance*` and `services/api/app/billing/**` regardless of wording. Security-relevant findings may batch only with members of the same coarse class, capped at **3** members. Every exclusion must log its `urgency`, `domain`, or `high-blast-radius` predicate.
 - Issue has a `needs-human`, `blocked`, or `operator-only` label, or explicitly states `operator-only`, `manual action required`, or `human action required` in its title or `## Problem` section
 
 Use `bin/engine/admission.mjs`'s `classifyBatchSafety()` as the reference classifier in every mirror. It recognizes `inject`, `injection`, `xss`, `csrf`, `ssrf`, `bypass`, `escalat`, `credential`, `secret`, `token`, `password`, `pgpassword`, `htpasswd`, `redact`, `sanitiz`, `scheme`, `traversal`, `deserializ`, `rce`, and `privilege`, as well as security/anti-bot and auth. Auth matches compound identifiers (`MaintenanceAuth`, `AdminAuth`, `authz_check`) but not `authority_source`; exact `**Agent**:` attribution lines are stripped before classification. A `FORGE:CLASS` slug takes precedence when present, otherwise use this coarse class. <!-- Changed: forge#2859 -->
@@ -435,7 +435,7 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
 - **Leaf-directory cluster** (broader fallback): When **3+** remaining batchable P3 issues share the same leaf directory but are not already claimed, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
 - Form groups in this order: same-file, source-PR + subsystem, defect-class, leaf-directory. A finding is claimed by at most one batch.
 
-**Reference implementation and periodic sweep (MANDATORY):** `bin/engine/admission.mjs` exports `planP3BatchGroups()`, the deterministic reference for the four ordered keys, the 3-member leaf threshold, and the eight-member cap. Every pass supplies only open, unbatched, undispatched findings that already passed the safety exclusions, executes its returned groups, and retains `ungrouped` findings. Run it at initial resolution and again after every five completions or whenever the deferred queue reaches the concurrency cap. Each re-sweep covers the entire open retained candidate set, not merely findings from the most recent completion cycle. Log each group's `kind` (`same-file`, `source-pr`, `defect-class`, or `leaf-directory`) for auditability. <!-- Added: forge#2858 -->
+**Reference implementation and periodic sweep (MANDATORY):** `bin/engine/admission.mjs` exports `planP3BatchGroups()` and `batchExclusionReason()`, the deterministic reference for eligibility, the four ordered keys, the 3-member leaf threshold, and the eight-member cap. Every pass supplies the complete retained candidate registry plus open batches; execute `extensions` before creating new groups, retain `ungrouped` findings, and log each selected group kind or exclusion predicate. Run it at initial resolution and again after every five completions or whenever the deferred queue reaches the concurrency cap. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
 
 **Sanitize the surface-area path before interpolation (MANDATORY):** `{SURFACE_AREA}` is an affected-file path derived from an issue body, and git filenames can legally carry shell metacharacters (`` ` ``, `$()`, quotes). Restrict it to a validated `[A-Za-z0-9._/-]` charset before templating it into `--title` / `--body`, so an untrusted issue body cannot break the `gh` argument boundary. The same guard is applied at the mirror site in `phase-4-execution.md`. <!-- forge#1833, forge#1835 -->
 
