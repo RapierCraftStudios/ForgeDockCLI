@@ -1092,8 +1092,18 @@ verify_file_overlap_edge() {
   # from the API, so it keeps working after the head branch is deleted on merge. The
   # CLOSED-unmerged exclusion is unchanged and still correct for all three call sites.
   local PRED_PR
+  local PRED_PR_EXIT
   PRED_PR=$(gh pr list -R {GH_REPO} --state all --search "\"Closes #${PRED}\" in:body" \
-    --json number,state --jq '[.[] | select(.state != "CLOSED")][0].number // empty' 2>/dev/null || echo "")
+    --json number,state --jq '[.[] | select(.state != "CLOSED")][0].number // empty' 2>/dev/null)
+  PRED_PR_EXIT=$?
+
+  if [ "$PRED_PR_EXIT" -ne 0 ]; then
+    # Fail-safe: could not determine whether a live predecessor PR exists (transient API
+    # error, rate limit, or search-index lag). Keep the edge rather than conflating a failed
+    # lookup with confirmed absence of a PR and dropping a real conflict.
+    echo "KEEP"
+    return
+  fi
 
   if [ -z "$PRED_PR" ]; then
     # Predecessor reached a terminal/gated state having never opened a PR (or only ever had

@@ -82,6 +82,18 @@ describe("orchestrate runtime helper paths", () => {
     assert.doesNotMatch(phase4, /for DESC_PRED in \{predecessors_of_DESC\}; do/);
   });
 
+  it("keeps file-overlap edges when either predecessor lookup or diff fetch fails", () => {
+    assert.match(phase4, /PRED_PR_EXIT=\$\?/);
+    assert.match(
+      phase4,
+      /if \[ "\$PRED_PR_EXIT" -ne 0 \]; then[\s\S]*?echo "KEEP"[\s\S]*?return/,
+    );
+    assert.match(
+      phase4,
+      /if \[ "\$DIFF_EXIT" -ne 0 \]; then[\s\S]*?echo "KEEP"[\s\S]*?return/,
+    );
+  });
+
   it("documents the compact OpenCode preflight", () => {
     const orchestrate = readFileSync(
       new URL("../../commands/orchestrate.md", import.meta.url),
