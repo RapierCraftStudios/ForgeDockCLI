@@ -295,11 +295,11 @@ Each concurrent issue runs inside the **same engine process** but is isolated on
 
 ### Concurrency cap
 
-`forge.yaml → orchestration.max_concurrent` (optional, default uncapped). When set, the dispatch loop holds at most N in-flight workers; newly ready issues queue until a slot opens. Prevents rate-limit storms from large batches.
+`forge.yaml → orchestration.max_concurrent` defaults to 12 top-level workers. A full worker typically fans out to roughly 8 subagent spawns across `/work-on`, build, quality-gate, and review, so set the cap to no more than the session subagent budget divided by 8. Newly ready issues queue until a slot opens.
 
 ### Rate-limit backpressure
 
-Pre-dispatch gate: if `gh api rate_limit` remaining < `FORGE_RATE_LIMIT_FLOOR` (default 200, overridable via `forge.yaml → orchestration.rate_limit_floor`), the dispatch loop pauses until the quota resets. Already-running workers continue unaffected.
+Pre-dispatch gate: if `gh api rate_limit` remaining < `FORGE_RATE_LIMIT_FLOOR` (default 200, overridable via `forge.yaml → orchestration.rate_limit_floor`), the dispatch loop pauses until the quota resets. A 403 response containing `secondary rate limit` is separate from core quota: it pauses new dispatch and stops in-flight GitHub write/create retries until an operator resumes the batch. Already-running workers otherwise continue unaffected.
 
 ### Related issues
 

@@ -298,9 +298,10 @@ Concurrency limits and cascade admission policy for `/orchestrate`'s batch engin
 
 ```yaml
 orchestration:
-  # Maximum number of /work-on sub-agents dispatched concurrently. Guards against
-  # saturating the Anthropic API rate limit in one burst on a large ready set.
-  # Default: 12.
+  # Maximum number of top-level /work-on agents dispatched concurrently. Each
+  # worker normally fans out to about 8 total subagent spawns (build, quality
+  # gate, and review included), so set this to no more than session_budget / 8.
+  # Default: 12; use 25 or fewer for a 200-spawn session budget.
   max_concurrent: 12
 
   cascade:
@@ -357,7 +358,7 @@ orchestration:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `max_concurrent` | integer | No | Max concurrent `/work-on` sub-agent dispatch. Default: 12 |
+| `max_concurrent` | integer | No | Max concurrent top-level `/work-on` dispatches. Plan for roughly 8 total subagent spawns per worker; default: 12. |
 | `cascade.policy` | string | No | `all` \| `balanced` \| `conservative`. Default: `balanced` |
 | `cascade.max_generation` | integer or `"unlimited"` | No | Max cascade generation admitted at Phase 1 resolve time. Default: 1 |
 | `cascade.token_budget` | integer or `"unlimited"` | No | Per-batch token ceiling for Step 4C cascade dispatch. Default: 900000 (deprecated alias: `pipeline.token_budget_per_batch`) |

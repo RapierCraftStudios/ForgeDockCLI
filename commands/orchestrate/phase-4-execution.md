@@ -189,6 +189,8 @@ should_dispatch() {
 
 **WHY THIS EXISTS** <!-- Added: forge#1912 -->: Phase 4's dispatch loops previously launched every DAG-ready issue in one shot — the engine-first bash loop backgrounded every `should_dispatch()`-passing issue with no count limit, and the Agent-spawn-fallback path was explicitly instructed to "launch all ready agents simultaneously." On a large ready set this saturates the Anthropic API rate limit in one burst, causing cascading failures across most of the batch. This is a distinct, count-denominated gate from the dollar-denominated `--budget` gate above (Step 4A-pre.0) — an issue can be deferred for budget reasons, concurrency reasons, or both; each gate accumulates its own deferred list independently.
 
+`MAX_CONCURRENT` caps top-level `/work-on` dispatches, not the total number of harness subagents. A normal worker can spawn context, architect, implement, validate, quality-gate, and review children. Budget **8 total subagent spawns per worker** when choosing this value: `max_concurrent <= session_subagent_budget / 8`. This is a conservative planning multiplier, not a second runtime semaphore; the harness does not expose a reliable cross-agent spawn counter to this shell-level dispatcher.
+
 Initialize the concurrency cap and its batch-scope tracking state before the first dispatch:
 
 ```bash
@@ -209,8 +211,12 @@ fi
 
 ACTIVE_DISPATCH_COUNT=0             # in-flight dispatched-but-not-yet-completed agents, this batch
 DEFERRED_CONCURRENCY_ISSUES=()      # ready issues held back because no headroom was available
+SUBAGENT_SPAWN_BUDGET_PER_WORKER=8  # /work-on + build/review fan-out planning estimate
+TOP_LEVEL_DISPATCH_TOTAL=0
+PLANNED_SUBAGENT_SPAWNS=0
+OBSERVED_SUBAGENT_SPAWNS="unavailable" # replace only with harness telemetry; never infer
 
-echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT} (forge.yaml → orchestration.max_concurrent; default 12 when unset or invalid)"
+echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT}; plan for up to $((MAX_CONCURRENT * SUBAGENT_SPAWN_BUDGET_PER_WORKER)) subagent spawns in flight (8 per worker)"
 # --- End concurrency gate initialization ---
 ```
 
@@ -225,6 +231,31 @@ dispatch_headroom() {
 ```
 
 **This is a hard cap, not a suggestion.** No dispatch site in Phase 4 may background/spawn more than `dispatch_headroom` new agents without first waiting for in-flight agents to complete. Issues that cannot be dispatched due to the cap go into `DEFERRED_CONCURRENCY_ISSUES[]` and are released — in the order they were deferred — as running agents complete (Step 4B), the same event-driven model (no sleep/poll loops) the file already uses for DAG-readiness and budget gating.
+
+**Dispatch accounting**: Immediately after each successful top-level dispatch, increment `TOP_LEVEL_DISPATCH_TOTAL` and add `SUBAGENT_SPAWN_BUDGET_PER_WORKER` to `PLANNED_SUBAGENT_SPAWNS`. When the runtime reports child-spawn telemetry, replace `OBSERVED_SUBAGENT_SPAWNS` with that measured total; otherwise leave it `unavailable` rather than fabricating a measured value.
+
+### Step 4A-pre.0.3: Secondary content-creation backpressure (MANDATORY)
+
+GitHub's `resources.core` quota does not report secondary content-creation throttles. Treat any GitHub API response with HTTP `403` whose body contains `secondary rate limit` as a batch-wide backpressure signal.
+
+```bash
+# Call from every dispatcher-owned gh write/create wrapper and from a child completion
+# report that includes its final GitHub API error. Do not retry the failed request here.
+SECONDARY_RATE_LIMITED=false
+SECONDARY_RATE_LIMIT_MESSAGE=""
+
+record_secondary_rate_limit() {
+  local STATUS="$1"
+  local BODY="$2"
+  if [ "$STATUS" = "403" ] && echo "$BODY" | grep -qi 'secondary rate limit'; then
+    SECONDARY_RATE_LIMITED=true
+    SECONDARY_RATE_LIMIT_MESSAGE="$BODY"
+    echo "SECONDARY RATE LIMIT: pausing all new dispatch. Do not retry GitHub content creation until an operator resumes the batch." >&2
+  fi
+}
+```
+
+Before every dispatch site computes headroom or launches a worker, check `SECONDARY_RATE_LIMITED`. When true, preserve the ready/deferred queues, launch no more workers, and end the active dispatch cycle. Do not poll or retry GitHub calls to discover recovery: an operator resumes the batch after the throttle clears. In-flight agents receive this contract in the dispatch prompt: on a secondary-limit 403, they must stop their GitHub write/create retry loop, report the response to the orchestrator, and exit their current phase without creating replacement work.
 
 ### Step 4A-pre: Staging baseline tracking (MANDATORY — continuous)
 
@@ -886,6 +917,7 @@ Agent(
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
 - **Temp files — ALWAYS use `mktemp`, NEVER a fixed path**: You are one of several agents running concurrently on this host and you share its `/tmp` with all of them. Any time you stage content in a temp file before passing it to `gh` (e.g. `--body-file`), create that path with `mktemp` (e.g. `BODY_FILE="$(mktemp)"`) — never a fixed literal like `/tmp/body.md` or `/tmp/issue.json`. A fixed path collides with another concurrently-running agent and can silently overwrite the content you staged (or you can silently overwrite theirs) before either of you reads it back — this has caused real cross-agent GitHub issue-body corruption. `mktemp` costs nothing and eliminates the collision. (forge#2198)
+- **GitHub secondary rate limit**: If a GitHub API call returns HTTP 403 with `secondary rate limit` in its response, do NOT retry it or start a polling loop. Stop GitHub content creation for this phase, report the status and response body to the orchestrator in your final result, and wait for a later batch resume. Retrying extends the throttle for every sibling.
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
 - NEVER target `main` for PRs targeting the default repo. Use `{STAGING_BRANCH}` for fast-lane issues, or `milestone/{slug}` for milestone issues.
 - Satellite repos (MCP, n8n) have no staging branch — fast-lane PRs go to `main` for those.
