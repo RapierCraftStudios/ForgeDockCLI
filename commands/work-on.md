@@ -2090,8 +2090,8 @@ REMAINING_BEFORE=$(echo "$BODY" | grep -cE '^[-*+] \[ \]' || true)
 # - Fenced code blocks are stripped first: issue bodies routinely embed fenced
 #   blocks whose lines start with '#' or contain a literal '- [ ]'. An
 #   unterminated fence keeps the original body so later work is never hidden.
-# - '^#+ ' (not '^#{2,3} ') matches every heading depth and avoids awk
-#   interval-quantifier variance across awk implementations.
+# - ATX headings and setext underlines both delimit sections. The ATX pattern
+#   avoids awk interval-quantifier variance across awk implementations.
 # - grep -E / awk only — no PCRE. '^#+ ' needs none.
 FENCE_COUNT=$(echo "$BODY" | grep -cE '^(```+|~~~+)' || true)
 if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
@@ -2101,9 +2101,10 @@ else
 fi
 
 CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
-  /^#+ /                     { if (in_section && has) n++; in_section=1; has=0; next }
-  in_section && /^[-*+] \[[ xX]\]/ { has=1 }
-  END                        { if (in_section && has) n++; print n+0 }
+  /^#+ / { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  /^(=+|-+)$/ && previous != "" { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  { if (in_section && /^[-*+] \[[ xX]\]/) has=1; previous=$0 }
+  END { if (in_section && has) n++; print n+0 }
 ')
 
 # Sub-issue-tracker guard: a decompose parent whose only checkbox group is
