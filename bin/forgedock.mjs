@@ -2416,6 +2416,16 @@ async function doctor(fix = false) {
                 broken++;
                 brokenLinks.push(rel);
                 symlinkOk = false;
+              } else {
+                try {
+                  // readlink() only validates the stored target. Opening the
+                  // link also catches platform-specific traversal failures.
+                  readFileSync(tgt);
+                } catch {
+                  broken++;
+                  brokenLinks.push(`${rel} (unreadable — link resolves but cannot be traversed)`);
+                  symlinkOk = false;
+                }
               }
             } else {
               // Regular file — copy-mode install (Windows without Developer Mode).
@@ -3266,6 +3276,7 @@ function help() {
  *   FORGEDOCK_BACKEND      Default backend ("cli"|"api"|"auto") when --backend is omitted.
  *   FORGEDOCK_MODEL        Default model id when --model is omitted.
  *   FORGEDOCK_CLI_TIMEOUT_MS  Wall-clock timeout (ms) for the cli backend invocation.
+ *                              Overrides forge.yaml pipeline.cli_timeout_minutes.
  *   FORGEDOCK_SHELL        Override the shell used by run_bash / the cli backend.
  *                          Defaults to bash when found (Git Bash / WSL on
  *                          Windows, /bin/bash on POSIX), falling back to the

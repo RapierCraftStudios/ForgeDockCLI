@@ -64,8 +64,8 @@ The generated plugin has no prompt text. It:
   preserving explicit lower limits;
 - grants the built-in `general` subagent permission to invoke native `task`
   unless the user explicitly configured a task permission;
-- opts into OpenCode background subagents by default so each completed issue can
-  wake the parent orchestrator independently; set
+- opts into OpenCode background subagents for the orchestrator's explicit
+  ready-issue dispatches so each completed issue can wake the parent independently; set
   `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` to opt out;
 - selects Git Bash on Windows only when the user has not explicitly configured
   an OpenCode shell, because the shared workflows and helper scripts use Bash.
@@ -104,6 +104,14 @@ The adapter follows these rules:
 - Orchestration dispatches independent issues with `task(background=true)` and
   processes each injected task-result event immediately; it does not wait for a
   wave or the slowest sibling.
+- The `/orchestrate` entrypoint reads only runtime config, then runs
+  `bin/orchestrate-preflight.mjs` before loading the phase specs. The helper batches the initial GitHub
+  snapshot and emits only the compact ready queue needed for the first native task.
+  Interactive runs keep the confirmation gate; `--auto` or `--confirm` is the
+  explicit headless authorization.
+- The full Phase 3/4 prose is reserved for investigations, unsupported or multi-repo
+  queries, explicit deep planning, and recovery after a task-result event. It remains
+  authoritative for cascade handling, leases, cleanup, and reporting.
 - GitHub state and the durable engine remain the recovery source instead of
   replaying prior prompt context.
 
@@ -115,12 +123,12 @@ specs evaluate Claude's literal `Task`/`Agent` names, an OpenCode runtime marker
 selects `DISPATCH_TOOL=task`; the absence of those Claude names must not produce
 a false `FORGE:REVIEW_BLOCKED` result.
 
-Every isolated review dispatch uses the explicit native argument shape. Every
+Every isolated review dispatch uses a foreground native task. Every
 native task call must include the schema-required `subagent_type` at the top
 level alongside its `description` and `prompt`:
 
 ```js
-{ description: "...", prompt: "...", subagent_type: "general", background: true }
+{ description: "...", prompt: "...", subagent_type: "general", background: false }
 ```
 
 Implementation and review work uses `general`; read-only discovery uses
@@ -131,8 +139,9 @@ generated adapter safely defaults it to `general`; unsupported types stop with
 If the native `task` capability itself is unavailable, the workflow posts
 `FORGE:REVIEW_BLOCKED` and stops rather than falling back to inline review or
 another pipeline controller.
-The generated plugin adds `background: true` unless
-`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` is explicitly set.
+The generated plugin defaults omitted `background` to `false`. Only the
+orchestrator's ready-issue dispatcher sets `background: true`; setting
+`OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=false` forces foreground execution.
 
 `commands/work-on.md` is still a large entry dispatcher and is loaded in full,
 matching the Claude Code path. The adapter prevents additional eager loading,
@@ -217,6 +226,12 @@ wave-like fallback rather than silently claiming Claude-equivalent throughput.
 Commands that inspect Claude-specific transcripts or Claude installation state
 remain runtime-specific and should not be represented as portable until they
 receive dedicated implementations.
+
+The preflight is intentionally bounded. It handles explicit issue sets and the
+common single-repository `fast-lane`, `milestone`, `next`, `priority`, and
+`no:milestone` queries, plus explicit dependencies and scoped issue-body file
+overlap. Unsupported or complex inputs fall back to the shared phase specs rather
+than silently weakening their safety rules.
 
 ## Orchestration Runtime
 

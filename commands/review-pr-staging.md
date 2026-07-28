@@ -39,7 +39,7 @@ if [ "${FORGE_RUNTIME:-}" = "opencode" ] ||
 fi
 ```
 
-When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Use `background: true` for independent reviewers so the parent can process each completion event without a wave barrier. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
+When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Review tasks are foreground: wait for their completed result before synthesis. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
 
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping. (Identical resolution logic to `/review-pr` Phase 3C — do not diverge.)
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected agent (Bug Hunters in Phase 3, Code Quality in Phase 4, domain agents in Phase 5), same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
@@ -403,7 +403,7 @@ For fixable failures: checkout staging, apply fix, verify locally, commit as `fi
 
 Launch agent (model: {SUBAGENT_MODEL}) to analyze all commits since last deploy. Categorize as: NEW FEATURE, ENHANCEMENT, BUG FIX, REFACTOR, SECURITY, PERFORMANCE, INFRASTRUCTURE, DEPENDENCY. Separate user-facing vs internal. Document breaking changes and required pre-deploy actions.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:material-change -->
 ## Material Change Analysis
@@ -428,7 +428,7 @@ Launch Bug Hunter agents for each service with changes:
 
 **Web Bug Hunter** (web/src/): React issues (keys, closures, hydration), data fetching, security (XSS), UX, build-breaking patterns, type issues. Prefix: FE.
 
-Each reads the service diff, hunts for bugs, traces context across imports, posts findings with structured block.
+Each reads the service diff, hunts for bugs, traces context across imports, persists its finalized report before posting, and returns its verdict and findings independently of GitHub delivery.
 
 **MANDATORY — each Bug Hunter agent MUST post its findings directly to the PR immediately upon completion** (do not wait for the orchestrator to batch-post):
 ```bash
@@ -449,7 +449,7 @@ Where `{service}` is `api`, `worker`, or `web`. Post one comment per service age
 
 Agent hunts for: dead code, duplicate logic, complexity (>50 line functions), naming issues, missing abstractions, logging quality, magic numbers. Prefix: QA.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:code-quality -->
 ## Code Quality Review
@@ -506,7 +506,7 @@ fi
 
 Launch domain-specific agents based on which domains have changes. Substitute PR diff commands with staging diff commands. Agents: General Security (always), Auth, Billing, Concurrency, Scraper, API Design, Database, Infrastructure.
 
-**MANDATORY — each domain agent MUST post its findings directly to the PR immediately upon completion** (not batched by the orchestrator):
+**MANDATORY — each domain agent MUST persist its finalized body before posting its findings directly to the PR immediately upon completion** (not batched by the orchestrator). It MUST return verdict, finding count, and one line per finding to the orchestrator independently of delivery; if posting fails, return the durable file path and stop without retrying:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:{domain} -->
 ## {Domain} Review
@@ -525,7 +525,7 @@ Where `{domain}` is `security`, `auth`, `billing`, `concurrency`, `scraper`, `ap
 
 Agent maps dependencies, assesses integration points (service boundaries, env vars, Docker changes, workflow sibling drift between ci.yml and deploy-production.yml), evaluates rollback difficulty (easy/hard/destructive/state-dependent), checks test coverage. Posts risk matrix with rollback plan. Prefix: REG.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:regression-risk -->
 ## Regression Risk Assessment
@@ -683,6 +683,30 @@ If the gate exits with `RESULT: BLOCK DEPLOY` → **STOP**. A `<!-- FORGE:GATE_F
 ---
 
 ## Phase 7: Finding Triage & Issue Creation
+
+### Phase 6.75: Verify Agent Delivery
+
+Before launching every Phase 2-6 review agent, append its lowercase marker domain (for example, `security`, `bug-hunter-api`, or `regression-risk`) to `LAUNCHED_REVIEW_AGENTS`. A completed agent is accounted for only when its corresponding marker comment is present on the PR.
+
+```bash
+MISSING_AGENT_COMMENTS=""
+for AGENT_DOMAIN in $LAUNCHED_REVIEW_AGENTS; do
+  AGENT_COMMENT_COUNT=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+    --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+    2>/dev/null || printf '0')
+  if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+    MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+  fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+  echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+  echo "Recover each agent's returned verdict, findings, and durable body path before rerunning review."
+  exit 1
+fi
+```
+
+Missing comments are an explicit failure, never evidence of no findings. Do not triage or synthesize a deploy verdict while any launched agent is unaccounted for.
 
 ### 7A: Extract Findings
 From PR comments, extract structured findings (`<!-- FINDING:... -->`). If none found, scan for unstructured findings. If still 0 → skip to Phase 8.

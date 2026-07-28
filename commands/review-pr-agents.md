@@ -21,7 +21,7 @@ directly (`gh pr comment`) rather than relaying them through the orchestrator's 
 
 **OpenCode override**: When `FORGE_RUNTIME=opencode` or an equivalent OpenCode marker is present, the
 orchestrator must set `DISPATCH_TOOL=task` before checking literal Claude tool names. A native task
-argument is shaped as `{ description: "...", prompt: "...", subagent_type: "general"|"explore", background: true }`:
+argument is shaped as `{ description: "...", prompt: "...", subagent_type: "general"|"explore", background: false }`:
 use `general` for implementation/review and `explore` for read-only discovery. The `Neither tool is
 available` hard stop applies only when lowercase native `task` is genuinely absent; it must not be
 triggered by the absence of `Task` and `Agent` names in an OpenCode session. If native `task` is absent,

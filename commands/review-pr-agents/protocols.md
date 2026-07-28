@@ -145,6 +145,12 @@ Every finding must include:
 
 **All review agents MUST include a machine-readable findings block at the end of their PR comment.** This is NON-OPTIONAL. Without structured findings, the review system cannot create GitHub issues, and findings die as unread PR comments. Every finding that doesn't become a GitHub issue is a finding that will never be addressed.
 
+### Persist Before Post
+
+GitHub is a delivery channel, not the sole record of a review. Before the first `gh pr comment` attempt, write the finalized complete review body, including its `<!-- FORGE:REVIEW-AGENT:{domain} -->` marker and structured findings block, to a uniquely named durable file such as `${TMPDIR:-/tmp}/forge-review-${PR_NUMBER}-${DOMAIN}-$$.md`. Use `gh pr comment --body-file "$REVIEW_BODY_PATH"`; do not construct a retry loop around a failed write.
+
+Every agent MUST return its verdict, finding count, and one line per finding to the orchestrator even when posting succeeds. If the post fails, return the durable body path and the same finding summary, then stop. A 403 or other write failure is a failed delivery, not a clean review and not a reason to retry in the background.
+
 ### Format
 
 Append this block at the very end of your comment (after the `---` footer line, still inside the EOF heredoc). It uses HTML comments so it's invisible in rendered markdown:
@@ -163,6 +169,7 @@ Append this block at the very end of your comment (after the `---` footer line, 
 6. **Summary**: Concise one-line description (no pipe `|` characters in summary)
 7. **Empty block**: If no findings at all, include just the START/END markers
 8. **HTML comments**: The block is invisible in rendered markdown but parseable by the review system
+9. **Agent marker**: Include exactly one `<!-- FORGE:REVIEW-AGENT:{domain} -->` marker in the persisted body, where `{domain}` is the lowercase dispatched domain.
 
 ### Domain Prefixes
 

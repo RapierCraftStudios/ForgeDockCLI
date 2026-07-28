@@ -198,9 +198,35 @@ function openCodeReviewDispatchContract() {
   return [
     "OpenCode review-dispatch override:",
     "Before applying the workflow's Claude-specific Task/Agent availability check, treat an OpenCode runtime marker (`FORGE_RUNTIME=opencode`, `OPENCODE_SESSION_ID`, `OPENCODE_PID`, or `OPENCODE`) as native capability context and set `DISPATCH_TOOL=task`.",
-    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`; use `general` for implementation/review and `explore` for read-only discovery.",
-    "Use `background: true` for independent orchestration and review work. OpenCode returns a running task marker immediately and injects a later task-result event into the parent; process each event immediately instead of waiting for the slowest sibling.",
+    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`; use `general` for implementation/review and `explore` for read-only discovery.",
+    "Native tasks are foreground by default. Review, quality, remediation, and any other load-bearing child must await its completed task result. `background: true` is reserved for the Phase 4 OpenCode ready-issue dispatcher, which persists the returned child-session id before handling its completion event.",
+    "For a `work-on/remediate` task, preserve the remediation state transition: after FIXABLE classification, replace `needs-human` with `workflow:in-review`; restore `needs-human` only for a fresh block or an UNFIXABLE policy escalation. Never retain both labels during automated remediation or re-review.",
     "If lowercase native `task` is genuinely absent from the current tool registry, post `FORGE:REVIEW_BLOCKED` and stop; never replace the required isolated review with inline work or another controller.",
+  ].join("\n");
+}
+
+function openCodeOrchestrateContract(forgeHome) {
+  const preflightPath = portablePath(join(forgeHome, "bin", "orchestrate-preflight.mjs"));
+  return [
+    "OpenCode orchestration fast path:",
+    `Before reading config.md, the authoritative workflow, or any phase file, run node "$FORGE_HOME/bin/orchestrate-preflight.mjs" --repo "$GH_REPO" --args "$ARGUMENTS" from the target repository and parse its JSON output. The installed implementation is ${preflightPath}. The helper resolves the repository from forge.yaml when GH_REPO is empty.`,
+    "The preflight is deterministic and only handles issue resolution, eligibility filtering, explicit dependencies, scoped issue-body file overlap, database serialization, and the initial ready queue.",
+    "When supported is true, requiresDeepPlan is false, and confirmed is true, launch dispatchNow immediately with native task calls using the exact work-on skill contract. Without explicit --auto or --confirm, present the compact plan and ask for one confirmation; after the user confirms, launch the plan's ready queue without re-reading the large phase files. Do not load the full phase-3 or phase-4 files just to ask that question.",
+    "If requiresDeepPlan is true, the input is unsupported, preflight fails, or a task completion needs recovery, continue from the authoritative shared phase files. The fast path never closes, deduplicates, or edits issue bodies.",
+    "Treat queued as deferred by the concurrency cap and use task-result events to dispatch the next ready issue. Keep the full shared workflow's labels, annotations, leases, and terminal-state rules.",
+  ].join("\n");
+}
+
+function openCodeBuildStageContract(forgeHome) {
+  const implementPath = portablePath(join(forgeHome, "commands", "work-on", "build", "implement.md"));
+  const validatePath = portablePath(join(forgeHome, "commands", "work-on", "build", "validate.md"));
+  return [
+    "OpenCode sequential build dispatch:",
+    "The B5 and B6 calls in the authoritative workflow are serialized control-flow boundaries. Do not load either stage with the native `skill` tool: that tool only injects instructions and does not return a child-session result to this dispatcher.",
+    "For B5, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + implementPath + "` with the exact build arguments, stage changes, and return only `IMPLEMENT_RESULT`. Wait for the completed task result before continuing.",
+    "Parse `IMPLEMENT_RESULT` from the completed B5 task. Continue to B6 only for `COMPLETE` or `ALREADY_DONE`; preserve the workflow's existing terminal handling for every other status.",
+    "For B6, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + validatePath + "` with the worktree and B5 changed-file list, then return only `VALIDATE_RESULT`. Wait for completion before the acceptance gate.",
+    "Foreground is the native default for every load-bearing child. Only the Phase 4 OpenCode ready-issue dispatcher uses `background: true`.",
   ].join("\n");
 }
 
@@ -208,6 +234,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
   const nativeSkillExpression = '${x.replaceAll(":", "-").replaceAll("/", "-")}';
+  const isOrchestrate = command === "orchestrate";
   return [
     "---",
     `description: ${yamlString(`ForgeDock: ${description}`)}`,
@@ -215,16 +242,20 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "---",
     COMMAND_SENTINEL,
     "",
-    "Run the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:",
+    (isOrchestrate
+      ? "Run the OpenCode preflight before loading the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:"
+      : "Run the authoritative ForgeDock workflow at `" + specPath + "` with these exact arguments:"),
     "",
     "$ARGUMENTS",
     "",
-    "Use `read` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation.",
+    ...(isOrchestrate
+      ? ["Do not use `read` to load the authoritative spec yet. Run the deterministic preflight first; only load the shared spec if the preflight requires the full workflow.", "", openCodeOrchestrateContract(forgeHome)]
+      : ["Use `read` to load that spec, then execute it. Keep loading token-efficient: do not preload sibling specs, catalogs, adapters, or documentation."]),
     "",
     "OpenCode runtime mapping:",
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
-    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Omitted `background` means foreground and the parent must await the result. Set `background: true` only for Phase 4 OpenCode ready-issue dispatch after persisting its returned child-session id. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, and never inline a required isolated review.",
     openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
@@ -236,6 +267,7 @@ export function renderOpenCodeSkill({ description, forgeHome, command }) {
   const specPath = portablePath(join(forgeHome, "commands", `${command}.md`));
   const commandsPath = portablePath(join(forgeHome, "commands"));
   const name = normalizeOpenCodeSkillName(command);
+  const isOrchestrate = command === "orchestrate";
   return `---
 name: ${name}
 description: ${yamlString(`ForgeDock: ${description}`)}
@@ -246,11 +278,13 @@ metadata:
 ---
 ${SKILL_SENTINEL}
 
-Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.
+${isOrchestrate
+  ? `Run the deterministic OpenCode preflight before loading the authoritative ForgeDock workflow at \`${specPath}\` in the current context.`
+  : `Load and execute the authoritative ForgeDock workflow at \`${specPath}\` in the current context.`}
 
-The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: read only this workflow and the next spec explicitly reached by its dispatcher.
+The parent workflow's exact arguments are already present in the current context. Preserve them; do not invent new arguments or launch a second controller. Keep loading token-efficient: ${isOrchestrate ? "do not read the shared orchestrate spec until preflight routes to the full workflow." : "read only this workflow and the next spec explicitly reached by its dispatcher."}
 
-${openCodeReviewDispatchContract()}
+${command === "orchestrate" ? `${openCodeOrchestrateContract(forgeHome)}\n\n` : ""}${command === "work-on/build" ? `${openCodeBuildStageContract(forgeHome)}\n\n` : ""}${openCodeReviewDispatchContract()}
 
 If the workflow source or a required native capability is unavailable, stop and report exactly:
 \`FORGE_OPENCODE_CAPABILITY_ERROR\`: ForgeDock workflow \`${command}\` is unavailable at \`${specPath}\`.
@@ -258,7 +292,7 @@ Do not invoke \`forgedock run-issue\`, \`npx forgedock run-issue\`, or recursive
 OpenCode runtime mapping:
 
 - \`Skill(skill="x", args="y")\` means lazily read \`${commandsPath}/\${x.replaceAll(":", "/")}.md\` and execute that workflow in the current context with the exact arguments. Colon separators become slash separators; existing slash separators remain unchanged. This matches Claude Code Skill's in-conversation loading; it is not a reason to spawn a subagent.
-- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool with \`{ description, prompt, subagent_type, background }\`. Translate \`general-purpose\` to \`general\` and \`codebase-explorer\` to \`explore\`; never omit \`subagent_type\`. Resume by task ID when requested. A successful background call returns \`<task id=... state="running">\`; a later \`state="completed"\` or \`state="error"\` task result is the completion event for that one issue. Do not wait for all tasks before processing an event.
+- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool with \`{ description, prompt, subagent_type, background }\`. Translate \`general-purpose\` to \`general\` and \`codebase-explorer\` to \`explore\`; never omit \`subagent_type\`. Omitted \`background\` is foreground and must be awaited. Only Phase 4 OpenCode ready-issue dispatch sets \`background: true\`; it persists the returned child-session id, then processes each later \`state="completed"\` or \`state="error"\` event independently.
 - Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.
 - OpenCode injects \`FORGE_HOME\` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.
 - If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.
@@ -312,10 +346,10 @@ function normalizeTaskArgs(args) {
   }
 
   args.subagent_type = subagentType
-  // The shared OpenCode workflow requires streaming task completions. The only
-  // supported opt-out is the explicit environment flag, so an omitted or
-  // false per-call value cannot silently reintroduce a wave barrier.
-  if (process.env[BACKGROUND_FLAG] !== "false") args.background = true
+  // A parent may only complete after load-bearing child work completes. The
+  // orchestration dispatcher is the sole caller that opts into background work.
+  if (args.background === undefined || args.background === null) args.background = false
+  if (process.env[BACKGROUND_FLAG] === "false") args.background = false
 }
 `;
   return `${PLUGIN_SENTINEL}
