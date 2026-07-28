@@ -2149,9 +2149,10 @@ if [ "$PRE_MERGE_HEALTH" = "CONFLICTING" ] || [ "$PRE_MERGE_HEALTH_STATE" = "DIR
 else
 
 # Previously-escalated re-review guard <!-- Added: forge#1810; base-scoped: forge#2570 -->
-# If the linked issue currently carries needs-human, this PR was escalated at some
-# earlier point (VERDICT/purpose-regression/calibration/trust/mergeability) and has
-# now been remediated + re-reviewed back to a clean, mergeable APPROVED state above.
+# If the linked issue currently carries needs-human, or remediation has posted its
+# in-progress marker, this PR was escalated at some earlier point
+# (VERDICT/purpose-regression/calibration/trust/mergeability) and has now been
+# remediated + re-reviewed back to a clean, mergeable APPROVED state above.
 #
 # forge#2570: the hold is now scoped by the PR's target branch. This PR still transitions
 # to workflow:awaiting-merge (clearing needs-human) in BOTH cases below — the transition is
@@ -2164,8 +2165,8 @@ else
 #     uses for the same target branch — no manual click. This reconciles the asymmetry where a
 #     bot-only re-review (authorAssociation=NONE) could never satisfy the strict ≥2 verified-
 #     human bar and so stranded staging PRs the fast lane would auto-merge.
-PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels \
-  --jq '[.labels[].name] | any(. == "needs-human")' 2>/dev/null || echo "false")
+PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels,comments \
+  --jq '([.labels[].name | . == "needs-human"] + [.comments[].body | contains("FORGE:REMEDIATION")]) | any' 2>/dev/null || echo "false")
 GUARD_BASE=$(gh pr view {PR_NUMBER} {MERGE_GH_FLAG} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "")
 
 if [ "$PREVIOUSLY_ESCALATED" = "true" ]; then
