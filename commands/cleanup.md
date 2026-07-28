@@ -386,7 +386,7 @@ Eligibility is **default-batchable**: any open `review-finding` + a P3 priority 
 ```bash
 # Find all open, unbatched P3 review findings. Excludes findings already
 # claimed by a batch ("batch" label), and applies the same extended safety
-# exclusions (security, billing, anti-bot, auth) as the other two batching
+# billing exclusion and security-class batching rules as the other two batching
 # sites, using the identical jq test() (Oniguruma) patterns so classification
 # cannot diverge between the three sweep locations. <!-- Changed: forge#1828 -->
 # NOTE: "priority:P3" is intentionally NOT in the --label filter — GH label filters are
@@ -423,10 +423,15 @@ UNBATCHED_P3=$(gh issue list {GH_FLAG} \
   --json number,title,body,labels,createdAt \
   --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
          | select(([.labels[].name] | any(. == "batch")) | not)
-         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i")) | not)
+         | select((.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i")) | not)
          | (.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) as $stripped_body
-         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i") | not)
-         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth")) | not)')
+         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i") | not)
+         | select(([.labels[].name] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only")) | not)')
+
+# Classify each remaining finding with admission.mjs's classifyBatchSafety(). A
+# non-null, non-billing class may share a batch only with that exact class, has
+# a three-member cap, and requires a `live vector`/`defence-in-depth` verdict
+# beside every member in the generated batch body. <!-- Added: forge#2859 -->
 
 echo "Unbatched batchable P3 findings: $(echo "$UNBATCHED_P3" | jq -s 'length')"
 ```
@@ -515,7 +520,7 @@ echo "$DIR_ISSUES" | while IFS=: read -r dir issue_list; do
 done
 ```
 
-**Batch creation** uses the same template as `orchestrate.md Phase 1 → P3 Review-Finding Batching`, including its surface-area path sanitization (`tr -cd 'A-Za-z0-9._/-'` on the file/directory value before interpolating it into the batch issue's `--title`/`--body`). After creating the batch issue, add the `batch` label to each member issue to prevent re-batching on the next sweep.
+**Batch creation** uses the same template and bounded generation policy as `orchestrate.md Phase 1 → P3 Review-Finding Batching`, including its surface-area path sanitization (`tr -cd 'A-Za-z0-9._/-'` on the file/directory value before interpolating it into the batch issue's `--title`/`--body`). Compute every member's generation, exclude members above `orchestration.cascade.batch_max_generation` (default `2`), and record the retained maximum with `FORGE:BATCH_MAX_GENERATION`; list every generation-2-or-higher member in the body. After creating the batch issue, add the `batch` label to each member issue to prevent re-batching on the next sweep.
 
 ### Step 4B.4: Report
 

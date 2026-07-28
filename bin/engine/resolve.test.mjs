@@ -55,6 +55,11 @@ describe("classifyInputPattern — query patterns", () => {
     assert.equal(classifyInputPattern("fast-lane").kind, "query");
   });
 
+  it("ignores orchestration control flags when classifying the issue predicate", () => {
+    assert.equal(classifyInputPattern("fast-lane --auto --max-concurrent 4").pattern, "fast-lane");
+    assert.equal(classifyInputPattern("1 2 --confirm").kind, "literal");
+  });
+
   it("classifies priority:P0 / priority:P1 as a query (both label schemas, forge#2232)", () => {
     assert.equal(classifyInputPattern("priority:P0").pattern, "priority");
     assert.equal(classifyInputPattern("priority:P1").kind, "query");

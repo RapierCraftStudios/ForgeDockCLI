@@ -49,11 +49,12 @@ if [ "${FORGE_RUNTIME:-}" = "opencode" ] ||
 fi
 ```
 
-When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Use `background: true` for independent reviewers so the parent can process each completion event without a wave barrier. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
+When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Review tasks are foreground: wait for their completed result before synthesis. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
 
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping.
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected domain agent, same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
 3. **Neither tool is available**: this is a genuine setup defect, not a routing decision — HARD STOP, post a PR/issue comment explaining that no sub-agent dispatch tool is available, add `needs-human`, and exit without posting a verdict. Do NOT fall back to reviewing inline in the orchestrator's own context — inline self-review is strictly weaker than an isolated fresh-context reviewer and is never a substitute for a missing dispatch tool.
+4. **Dispatch pool exhausted or dispatch call fails**: this is distinct from tool absence. If any selected reviewer cannot be launched because the runtime reports a sub-agent/session/pool limit (or any dispatch call fails), HARD STOP immediately. Do not review that domain inline, do not silently reduce the panel, and do not merge. Mark the PR `review-degraded`, add `needs-human` to the linked issue, post `<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->` with the selected and completed reviewer counts, then exit without a `FORGE:REVIEW` verdict. A later fresh session must re-run the full selected panel.
 
 **Do not halt to ask the operator which tool to use.** Steps 1–2 are deterministic and fully resolve the common case; only step 3 (both absent) requires a stop, and even then the action is HARD STOP + `needs-human`, not a question back to the operator.
 
@@ -1538,9 +1539,31 @@ The `protocols.md` file contains the Evidence-Based Review Protocol, Structured 
 6. Substitute code index slice: `[INDEX_SLICE]` → the matching `$INDEX_SLICE_{DOMAIN}` variable for this agent (e.g., `$INDEX_SLICE_AUTH` for the auth agent). Agents MUST query index data first; fall back to grep only when index slice is empty or unavailable.
 7. Substitute per-agent diff slice: `[DOMAIN_DIFF_SLICE]` → the matching `$DIFF_SLICE_*` variable (e.g., `$DIFF_SLICE_AUTH` for the auth agent, `$DIFF_SLICE_SECURITY` for the security agent). This replaces any `gh pr diff [PR_NUMBER]` call inside the agent template — the agent works from the pre-computed slice, not the full changeset.
 8. If Phase 2.5 found broken assumptions, append them to the agent's prompt as "Pre-found integration issues to verify"
-9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: true` for each independent reviewer.
+9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: false` for each reviewer.
 
-**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent posts findings directly to the PR via `gh pr comment`.
+**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent must persist its finalized body before posting it with `gh pr comment --body-file`, include `<!-- FORGE:REVIEW-AGENT:{lowercase-domain} -->`, and return its verdict and findings to the orchestrator independently of GitHub delivery.
+
+**Dispatch failure and partial-panel guard (MANDATORY):** Count the selected roster before dispatch. If any launch fails, including from pool exhaustion, do not continue with the agents that did launch as a sufficient panel. Immediately create the managed label if necessary, label the PR `review-degraded`, add `needs-human` to the linked issue, post `FORGE:GATE_FAILURE`, and exit without a verdict. After all foreground reviewers return, independently compare their posted `FORGE:REVIEW-AGENT` markers with the selected count; a smaller count is the same hard stop. This catches a reviewer that accepted dispatch but failed before posting.
+
+```bash
+SELECTED_AGENT_COUNT=$(echo "$SELECTED_AGENTS" | tr ' ' '\n' | grep -c '.')
+ACTUAL_AGENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+  --jq '[.[].body | scan("<!-- FORGE:REVIEW-AGENT:([a-z-]+) -->") | .[0]] | unique | length' 2>/dev/null || echo 0)
+
+if [ "$DISPATCH_FAILED" = "true" ] || [ "$ACTUAL_AGENT_COUNT" -lt "$SELECTED_AGENT_COUNT" ]; then
+  gh label create "review-degraded" --color "E4E669" --description "PR review panel was incomplete; re-review required before deployment. Managed by ForgeDock." --force -R "$REPO" 2>/dev/null || true
+  gh pr edit "$PR_NUMBER" -R "$REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
+  gh pr comment "$PR_NUMBER" -R "$REPO" --body "<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->
+## Review Blocked: Incomplete Isolated Review Panel
+
+**Selected isolated reviewers**: ${SELECTED_AGENT_COUNT}
+**Completed isolated reviewers**: ${ACTUAL_AGENT_COUNT}
+
+At least one reviewer could not be dispatched or complete, commonly because the per-session sub-agent pool was exhausted. No inline substitution was performed. Re-run the full panel in a fresh session before merging."
+  [ -n "${MERGE_ISSUE:-}" ] && gh issue edit "$MERGE_ISSUE" {MERGE_GH_FLAG} --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
+  exit 1
+fi
+```
 
 #### Domain Diff Slicing
 
@@ -1569,9 +1592,29 @@ When substituting `[FILE_LIST]` in each agent's template:
 ```bash
 gh pr view $ARGUMENTS --json comments --jq '.comments | length'
 gh api repos/{owner}/{repo}/issues/$ARGUMENTS/comments --jq '.[-10:] | .[].body[:100]'
+
+# Every dispatched agent must have delivered its own persisted review to GitHub.
+# Do not infer a clean review from a missing comment: its return text may contain
+# findings that could not be posted because GitHub writes were throttled.
+MISSING_AGENT_COMMENTS=""
+for AGENT in $SELECTED_AGENTS; do
+    AGENT_DOMAIN=$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')
+    AGENT_COMMENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+        --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+        2>/dev/null || printf '0')
+    if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+        MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+    fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+    echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+    echo "Use each agent's returned verdict, findings, and durable body path to recover the review."
+    exit 1
+fi
 ```
 
-**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, the initial `task(..., background: true)` result with `state="running"` is not completion; wait for and process each injected `task` result event, then verify the corresponding structured PR comment before continuing.
+**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing. A missing comment is an explicit delivery failure: do not synthesize a verdict or treat it as a clean result.
 
 ---
 
@@ -1752,7 +1795,11 @@ FINDING_ISSUE_TITLE="fix: [summary] (review finding — PR #${PR_NUMBER})"
 # so the raw title stays readable if it round-trips through any other
 # eval-based consumer.
 FINDING_ISSUE_TITLE=$(printf '%s' "$FINDING_ISSUE_TITLE" | tr '`' "'" | sed 's/\$(/$ (/g')
-FINDING_ISSUE_BODY_FILE=$(mktemp)
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+REVIEW_AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-reviewer}-$$}"
+mkdir -p "$SCRATCHPAD"
+FINDING_BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}"
+FINDING_ISSUE_BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_review_${REVIEW_AGENT_TOKEN}.XXXXXX.md")
 cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 ## Problem
 
@@ -1772,9 +1819,11 @@ cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 **Prevention**: [one sentence — what the builder must do to avoid this class of bug]
 
 <!-- FORGE:PATTERN: [pattern-slug] -->
+<!-- FORGE:CLASS: [pattern-slug] -->
 <!-- This machine-readable tag is used by pipeline-health Phase 4A to count pattern recurrences.
-     When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
-     Keep the slug consistent across all findings for the same defect class. --> <!-- Added: forge#1331 -->
+      When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
+      Keep the slug consistent across all findings for the same defect class. FORGE:CLASS is
+      consumed by orchestrate's P3 batching rule; use a lowercase hyphenated slug. --> <!-- Added: forge#1331, forge#2858 -->
 
 ## Affected Files
 
@@ -1820,6 +1869,7 @@ Files that need changes:
 - [ ] Reproduce or construct proof-of-concept
 [BATCHABLE_ANNOTATION]
 ISSUE_EOF
+printf '\n<!-- %s -->\n' "$FINDING_BODY_MARKER" >> "$FINDING_ISSUE_BODY_FILE"
 
 # FINDING_SEVERITY is extracted from the finding's own **Severity** body field
 # (set above in the heredoc) — example assignment shown here for clarity, same
@@ -1844,19 +1894,22 @@ if [ "$FINDING_PRIORITY_EXIT" -ne 0 ]; then
 else
 
 # --label is repeatable (not comma-joined) per the /issue programmatic contract.
-Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}")
+ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}"))
+# /issue re-reads the created issue and hard-fails unless this exact marker is present.
 rm -f "$FINDING_ISSUE_BODY_FILE"
 
-# /issue has no machine-readable return contract (it's a user-facing command, not a work-on
-# subcommand) — resolve the created issue's number by exact-title search immediately after
-# the call. The title embeds ${PR_NUMBER} and the finding summary, making it unique enough
-# for a reliable single-match lookup. Retry to absorb GitHub Search API indexing lag.
-ISSUE_NUM=""
-for _resolve_attempt in 1 2 3; do
-  ISSUE_NUM=$(gh issue list -R ${REPO} --search "in:title \"${FINDING_ISSUE_TITLE}\"" --state open --limit 1 --json number --jq '.[0].number // empty')
-  [ -n "$ISSUE_NUM" ] && break
-  sleep 2
-done
+# /issue succeeds only after its API create-token read-back (Phase 4B). Its
+# explicit result marker distinguishes a verified create from an intentional
+# dedup STOP; never use title search to mask a swallowed 403.
+ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ -n "$DEDUP_NUMBER" ]; then
+  ISSUE_NUM="$DEDUP_NUMBER"
+  echo "Review finding deduped against existing issue #${ISSUE_NUM}."
+elif [ -z "$ISSUE_NUM" ]; then
+  echo "ERROR: /issue did not report a verified review-finding number; stopping review instead of silently dropping the finding." >&2
+  exit 1
+fi
 fi
 ```
 
@@ -2149,9 +2202,10 @@ if [ "$PRE_MERGE_HEALTH" = "CONFLICTING" ] || [ "$PRE_MERGE_HEALTH_STATE" = "DIR
 else
 
 # Previously-escalated re-review guard <!-- Added: forge#1810; base-scoped: forge#2570 -->
-# If the linked issue currently carries needs-human, this PR was escalated at some
-# earlier point (VERDICT/purpose-regression/calibration/trust/mergeability) and has
-# now been remediated + re-reviewed back to a clean, mergeable APPROVED state above.
+# If the linked issue currently carries needs-human, or remediation has posted its
+# in-progress marker, this PR was escalated at some earlier point
+# (VERDICT/purpose-regression/calibration/trust/mergeability) and has now been
+# remediated + re-reviewed back to a clean, mergeable APPROVED state above.
 #
 # forge#2570: the hold is now scoped by the PR's target branch. This PR still transitions
 # to workflow:awaiting-merge (clearing needs-human) in BOTH cases below — the transition is
@@ -2164,8 +2218,8 @@ else
 #     uses for the same target branch — no manual click. This reconciles the asymmetry where a
 #     bot-only re-review (authorAssociation=NONE) could never satisfy the strict ≥2 verified-
 #     human bar and so stranded staging PRs the fast lane would auto-merge.
-PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels \
-  --jq '[.labels[].name] | any(. == "needs-human")' 2>/dev/null || echo "false")
+PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels,comments \
+  --jq '([.labels[].name | . == "needs-human"] + [.comments[].body | contains("FORGE:REMEDIATION")]) | any' 2>/dev/null || echo "false")
 GUARD_BASE=$(gh pr view {PR_NUMBER} {MERGE_GH_FLAG} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "")
 
 if [ "$PREVIOUSLY_ESCALATED" = "true" ]; then
@@ -2373,7 +2427,7 @@ ACTUAL_AGENT_DOMAINS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
 ACTUAL_AGENT_COUNT=$(echo "$ACTUAL_AGENT_DOMAINS" | tr ',' '\n' | grep -c '.' 2>/dev/null)
 ```
 
-Substitute `ACTUAL_AGENT_COUNT`/`ACTUAL_AGENT_DOMAINS` into the summary's `**Agents**: [N] ([names])` field below — do NOT substitute a manually-counted or remembered figure. If the agent's own recollection of what it launched disagrees with `ACTUAL_AGENT_COUNT` (e.g. it believes it ran agents but zero `FORGE:REVIEW-AGENT` comments exist), that mismatch itself is the signal this check exists to surface: report `ACTUAL_AGENT_COUNT` as-is (it is the ground truth) and add a note in the Recommendation section flagging the discrepancy — never suppress it to make the summary look complete. If `ACTUAL_AGENT_COUNT` is `0`, the review degraded to solo/inline mode (the exact failure mode this guard exists to catch) and the verdict MUST reflect that (`NEEDS RE-REVIEW`), regardless of what analysis was performed inline.
+Substitute `ACTUAL_AGENT_COUNT`/`ACTUAL_AGENT_DOMAINS` into the summary's `**Agents**: [N] ([names])` field below — do NOT substitute a manually-counted or remembered figure. Compare it to `SELECTED_AGENT_COUNT` from Phase 3C. If it is smaller, the panel is degraded: the Phase 3C hard-stop path must already have labelled the PR `review-degraded`, added `needs-human`, and exited without a verdict. Never summarize, approve, or merge a partial panel. `ACTUAL_AGENT_COUNT=0` is the same hard stop, not a solo/inline review mode.
 
 ```bash
 gh pr comment $ARGUMENTS --body "$(cat <<'EOF'

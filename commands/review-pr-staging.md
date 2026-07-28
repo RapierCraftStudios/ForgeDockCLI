@@ -39,11 +39,12 @@ if [ "${FORGE_RUNTIME:-}" = "opencode" ] ||
 fi
 ```
 
-When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Use `background: true` for independent reviewers so the parent can process each completion event without a wave barrier. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
+When `IS_OPENCODE_RUNTIME=true`, lowercase native `task` is the preferred isolated dispatch tool. Do not enter the `Neither tool is available` branch merely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use a top-level `subagent_type`: `general` for implementation/review work and `explore` for read-only discovery (Claude `general-purpose` and `codebase-explorer` map to those values). Review tasks are foreground: wait for their completed result before synthesis. If the native `task` capability itself is absent from the current tool registry, use the existing hard-stop path and post `FORGE:REVIEW_BLOCKED`; never substitute inline review.
 
 1. **If `Task` is available in the current environment**: set `{DISPATCH_TOOL} = Task`. This is the preferred tool — tightest `allowed-tools` scoping. (Identical resolution logic to `/review-pr` Phase 3C — do not diverge.)
 2. **Else if `Agent` is available**: set `{DISPATCH_TOOL} = Agent`. This is the documented fallback, not a degraded path — use it exactly as you would `Task`: one call per selected agent (Bug Hunters in Phase 3, Code Quality in Phase 4, domain agents in Phase 5), same prompt template, `subagent_type: "general-purpose"` (or the closest equivalent the environment offers), same requirement that each agent posts its own findings directly to the PR via `gh pr comment`. Isolation and fresh-context review are preserved either way.
 3. **Neither tool is available**: this is a genuine setup defect, not a routing decision — HARD STOP, post a PR/issue comment explaining that no sub-agent dispatch tool is available, add `needs-human`, and exit without posting a verdict. Do NOT fall back to reviewing inline in the orchestrator's own context.
+4. **Dispatch pool exhausted or dispatch call fails**: this is not tool absence. If any Bug Hunter, quality, domain, material-change, or regression reviewer cannot be launched because the sub-agent pool/session limit is exhausted (or any dispatch call fails), HARD STOP. Do not substitute inline review or silently continue with a partial panel. Mark the PR `review-degraded`, post `<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->` with the selected and completed counts, and exit without a deploy verdict. A fresh session must re-run the full panel.
 
 **Do not halt to ask the operator which tool to use.** Steps 1–2 are deterministic and fully resolve the common case; only step 3 (both absent) requires a stop, and even then the action is HARD STOP + `needs-human`, not a question back to the operator.
 
@@ -198,9 +199,17 @@ ALL_PR_NUMBERS=$(echo "$BUNDLE_PRS $MERGE_PRS" | tr ' ' '\n' | sort -u | grep -E
 
 echo "PRs in staging→main bundle: $(echo $ALL_PR_NUMBERS | tr '\n' ' ')"
 
-# Step 2: For each PR in the bundle, check for open review-finding issues
+# Step 2: For each PR in the bundle, check for open review-finding issues and degraded panels
 BLOCKING_FINDINGS=""
+DEGRADED_REVIEWS=""
 for pr_num in $ALL_PR_NUMBERS; do
+  IS_REVIEW_DEGRADED=$(gh pr view "$pr_num" -R {GH_REPO} --json labels \
+    --jq '[.labels[].name] | any(. == "review-degraded")' 2>/dev/null || echo "false")
+  if [ "$IS_REVIEW_DEGRADED" = "true" ]; then
+    DEGRADED_REVIEWS="${DEGRADED_REVIEWS}
+**PR #${pr_num}** has a \`review-degraded\` label and requires a full fresh-context re-review."
+  fi
+
   # Search for open review-finding issues that reference this PR
   OPEN_FINDINGS=$(gh issue list -R {GH_REPO} \
     --label "review-finding" \
@@ -216,6 +225,27 @@ for pr_num in $ALL_PR_NUMBERS; do
 ${OPEN_FINDINGS}"
   fi
 done
+
+# A degraded panel is a review-integrity failure, not a finding that an override may waive.
+if [ -n "$DEGRADED_REVIEWS" ]; then
+  echo "⛔ DEPLOY BLOCKED — An included PR has an incomplete isolated review panel."
+  echo "$DEGRADED_REVIEWS"
+  if [ -n "$PR_NUMBER" ]; then
+    gh pr comment "$PR_NUMBER" -R {GH_REPO} --body "<!-- FORGE:GATE_FAILURE -->
+## Deploy Gate: BLOCKED
+
+**Gate**: review-panel-integrity
+
+### Degraded Review Panels
+
+${DEGRADED_REVIEWS}
+
+Re-run the complete review panel in a fresh session before deployment.
+
+<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->" 2>/dev/null || true
+  fi
+  exit 1
+fi
 
 # Step 3: Block deploy if open findings exist (unless human override present)
 if [ -n "$BLOCKING_FINDINGS" ]; then
@@ -403,7 +433,7 @@ For fixable failures: checkout staging, apply fix, verify locally, commit as `fi
 
 Launch agent (model: {SUBAGENT_MODEL}) to analyze all commits since last deploy. Categorize as: NEW FEATURE, ENHANCEMENT, BUG FIX, REFACTOR, SECURITY, PERFORMANCE, INFRASTRUCTURE, DEPENDENCY. Separate user-facing vs internal. Document breaking changes and required pre-deploy actions.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:material-change -->
 ## Material Change Analysis
@@ -428,7 +458,7 @@ Launch Bug Hunter agents for each service with changes:
 
 **Web Bug Hunter** (web/src/): React issues (keys, closures, hydration), data fetching, security (XSS), UX, build-breaking patterns, type issues. Prefix: FE.
 
-Each reads the service diff, hunts for bugs, traces context across imports, posts findings with structured block.
+Each reads the service diff, hunts for bugs, traces context across imports, persists its finalized report before posting, and returns its verdict and findings independently of GitHub delivery.
 
 **MANDATORY — each Bug Hunter agent MUST post its findings directly to the PR immediately upon completion** (do not wait for the orchestrator to batch-post):
 ```bash
@@ -449,7 +479,7 @@ Where `{service}` is `api`, `worker`, or `web`. Post one comment per service age
 
 Agent hunts for: dead code, duplicate logic, complexity (>50 line functions), naming issues, missing abstractions, logging quality, magic numbers. Prefix: QA.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:code-quality -->
 ## Code Quality Review
@@ -506,7 +536,7 @@ fi
 
 Launch domain-specific agents based on which domains have changes. Substitute PR diff commands with staging diff commands. Agents: General Security (always), Auth, Billing, Concurrency, Scraper, API Design, Database, Infrastructure.
 
-**MANDATORY — each domain agent MUST post its findings directly to the PR immediately upon completion** (not batched by the orchestrator):
+**MANDATORY — each domain agent MUST persist its finalized body before posting its findings directly to the PR immediately upon completion** (not batched by the orchestrator). It MUST return verdict, finding count, and one line per finding to the orchestrator independently of delivery; if posting fails, return the durable file path and stop without retrying:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:{domain} -->
 ## {Domain} Review
@@ -525,7 +555,7 @@ Where `{domain}` is `security`, `auth`, `billing`, `concurrency`, `scraper`, `ap
 
 Agent maps dependencies, assesses integration points (service boundaries, env vars, Docker changes, workflow sibling drift between ci.yml and deploy-production.yml), evaluates rollback difficulty (easy/hard/destructive/state-dependent), checks test coverage. Posts risk matrix with rollback plan. Prefix: REG.
 
-**MANDATORY — post findings as PR comment**: After completing analysis, the agent MUST post its full report directly to the PR:
+**MANDATORY — post findings as PR comment**: Before its first post attempt, the agent MUST persist the final report to a uniquely named durable file, then post it with `--body-file`. It MUST also return verdict, finding count, and one line per finding to the orchestrator whether the post succeeds or fails; on failure, return the file path and stop without retrying. After completing analysis, the agent posts its full report directly to the PR:
 ```bash
 gh pr comment ${PR_NUMBER} -R ${GH_REPO} --body "<!-- FORGE:REVIEW-AGENT:regression-risk -->
 ## Regression Risk Assessment
@@ -682,7 +712,50 @@ If the gate exits with `RESULT: BLOCK DEPLOY` → **STOP**. A `<!-- FORGE:GATE_F
 
 ---
 
+**Incomplete-panel guard (MANDATORY):** Increment `SELECTED_AGENT_COUNT` for every reviewer selected across Phases 2–6 before launching it. If any dispatch fails, set `DISPATCH_FAILED=true`. Before Phase 7, count unique `FORGE:REVIEW-AGENT` markers. If the completed count is lower than selected, follow the same hard-stop path as pool exhaustion: create `review-degraded` if needed, label the PR, post `FORGE:GATE_FAILURE`, and exit. Do not create a deploy verdict from partial reviewer output.
+
+```bash
+ACTUAL_AGENT_COUNT=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+  --jq '[.[].body | scan("<!-- FORGE:REVIEW-AGENT:([a-z-]+) -->") | .[0]] | unique | length' 2>/dev/null || echo 0)
+if [ "$DISPATCH_FAILED" = "true" ] || [ "$ACTUAL_AGENT_COUNT" -lt "$SELECTED_AGENT_COUNT" ]; then
+  gh label create "review-degraded" --color "E4E669" --description "PR review panel was incomplete; re-review required before deployment. Managed by ForgeDock." --force -R "$GH_REPO" 2>/dev/null || true
+  gh pr edit "$PR_NUMBER" -R "$GH_REPO" --add-label "review-degraded" --add-label "needs-human" 2>/dev/null || true # allowlist:check-command-side-effects
+  gh pr comment "$PR_NUMBER" -R "$GH_REPO" --body "<!-- FORGE:GATE_FAILURE:TYPE=review-panel-integrity -->
+## Deploy Review Blocked: Incomplete Isolated Review Panel
+
+**Selected isolated reviewers**: ${SELECTED_AGENT_COUNT}
+**Completed isolated reviewers**: ${ACTUAL_AGENT_COUNT}
+
+Re-run the full staging review in a fresh session before deployment."
+  exit 1
+fi
+```
+
 ## Phase 7: Finding Triage & Issue Creation
+
+### Phase 6.75: Verify Agent Delivery
+
+Before launching every Phase 2-6 review agent, append its lowercase marker domain (for example, `security`, `bug-hunter-api`, or `regression-risk`) to `LAUNCHED_REVIEW_AGENTS`. A completed agent is accounted for only when its corresponding marker comment is present on the PR.
+
+```bash
+MISSING_AGENT_COMMENTS=""
+for AGENT_DOMAIN in $LAUNCHED_REVIEW_AGENTS; do
+  AGENT_COMMENT_COUNT=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+    --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+    2>/dev/null || printf '0')
+  if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+    MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+  fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+  echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+  echo "Recover each agent's returned verdict, findings, and durable body path before rerunning review."
+  exit 1
+fi
+```
+
+Missing comments are an explicit failure, never evidence of no findings. Do not triage or synthesize a deploy verdict while any launched agent is unaccounted for.
 
 ### 7A: Extract Findings
 From PR comments, extract structured findings (`<!-- FINDING:... -->`). If none found, scan for unstructured findings. If still 0 → skip to Phase 8.
@@ -734,7 +807,11 @@ STAGING_FINDING_TITLE="chore: [summary] (staging review — PR #${PR_NUMBER})"
 # this is no longer required for safety — but strip it anyway so the raw title
 # stays readable if it round-trips through any other eval-based consumer.
 STAGING_FINDING_TITLE=$(printf '%s' "$STAGING_FINDING_TITLE" | tr '`' "'" | sed 's/\$(/$ (/g')
-STAGING_FINDING_BODY_FILE=$(mktemp)
+SCRATCHPAD="${FORGE_SCRATCHPAD:-$PWD/.forge-scratch}"
+REVIEW_AGENT_TOKEN="${AGENT_ID:-${HOSTNAME:-reviewer}-$$}"
+mkdir -p "$SCRATCHPAD"
+STAGING_FINDING_BODY_MARKER="FORGE:BODY-INTEGRITY:${PR_NUMBER}_staging-review_${REVIEW_AGENT_TOKEN}"
+STAGING_FINDING_BODY_FILE=$(mktemp "$SCRATCHPAD/${PR_NUMBER}_staging-review_${REVIEW_AGENT_TOKEN}.XXXXXX.md")
 cat <<'ISSUE_EOF' > "$STAGING_FINDING_BODY_FILE"
 ## Problem
 
@@ -768,6 +845,7 @@ Files that need changes:
 - [ ] Finding validated: VALIDATED / FALSE_POSITIVE / INCONCLUSIVE
 - [ ] If VALIDATED: fix implemented and tested on correct branch
 ISSUE_EOF
+printf '\n<!-- %s -->\n' "$STAGING_FINDING_BODY_MARKER" >> "$STAGING_FINDING_BODY_FILE"
 
 # STAGING_FINDING_SEVERITY is extracted from the finding's own **Severity**
 # body field (set above in the heredoc) — example assignment shown here for
@@ -794,18 +872,22 @@ else
 # --label is repeatable (not comma-joined) per the /issue programmatic contract.
 # ${MILESTONE_FLAG} carries the Phase 7D derivation through — empty string is
 # a no-op arg when the reviewed branch has no milestone (plain staging→main).
-Skill(skill="issue", args="--title \"$STAGING_FINDING_TITLE\" --body-file \"$STAGING_FINDING_BODY_FILE\" --label review-finding --label needs-validation --label staging-review --label \"$STAGING_FINDING_PRIORITY\" ${MILESTONE_FLAG}")
+ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"$STAGING_FINDING_TITLE\" --body-file \"$STAGING_FINDING_BODY_FILE\" --label review-finding --label needs-validation --label staging-review --label \"$STAGING_FINDING_PRIORITY\" ${MILESTONE_FLAG}"))
+# /issue re-reads the created issue and hard-fails unless this exact marker is present.
 rm -f "$STAGING_FINDING_BODY_FILE"
 
-# /issue has no machine-readable return contract — resolve the created issue's number by
-# exact-title search immediately after the call (title embeds ${PR_NUMBER} + summary, unique
-# enough for a reliable single-match lookup). Retry to absorb GitHub Search API indexing lag.
-ISSUE_NUM=""
-for _resolve_attempt in 1 2 3; do
-  ISSUE_NUM=$(gh issue list -R {GH_REPO} --search "in:title \"${STAGING_FINDING_TITLE}\"" --state open --limit 1 --json number --jq '.[0].number // empty')
-  [ -n "$ISSUE_NUM" ] && break
-  sleep 2
-done
+# /issue succeeds only after its API create-token read-back (Phase 4B). Its
+# explicit result marker distinguishes a verified create from an intentional
+# dedup STOP; do not use title search to mask a swallowed 403.
+ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ -n "$DEDUP_NUMBER" ]; then
+  ISSUE_NUM="$DEDUP_NUMBER"
+  echo "Staging review finding deduped against existing issue #${ISSUE_NUM}."
+elif [ -z "$ISSUE_NUM" ]; then
+  echo "ERROR: /issue did not report a verified staging review-finding number; stopping review instead of silently dropping the finding." >&2
+  exit 1
+fi
 fi
 ```
 

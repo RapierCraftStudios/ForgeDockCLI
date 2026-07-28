@@ -32,17 +32,71 @@
  * cascade until N tokens spent" — `max_generation` and `token_budget` below
  * are independent levers precisely so that shape of policy is expressible.
  *
- * Hard invariant (NOT configurable by design): safety exclusions — findings
- * whose `## Problem` section indicates security/billing/anti-bot/auth
- * concerns — are never batched and never auto-admitted by ANY policy,
- * including `all`. That exclusion lives upstream of this module (the P3
- * batching eligibility check in `phase-1-resolve.md` / the surface-area
- * batching check in `phase-4-execution.md`) and is intentionally absent
- * from the levers this module resolves.
+ * Billing findings are never batched. Security-relevant P3 findings may only
+ * batch with findings in the same coarse class, with a maximum of three
+ * members. The prose mirrors use `classifyBatchSafety` as their reference.
  */
 
 /** Sentinel string accepted anywhere an "int | unlimited" lever is read. */
 export const UNLIMITED = "unlimited";
+
+const BATCH_SAFETY_CLASSES = [
+  ["billing", /\bbilling\b/i],
+  ["auth", /\b(?:[A-Za-z0-9]*[A-Z][A-Za-z0-9]*[Aa][Uu][Tt][Hh][A-Za-z0-9]*|[Aa][Uu][Tt][Hh](?:[NnZz]?_|[A-Z]))\b|\b(?:authentication|authorization|authn|authz)\b/i],
+  ["injection", /\b(?:inject|injection|xss|csrf|ssrf|deserializ|rce)\w*/i],
+  ["access-control", /\b(?:bypass|escalat|privilege)\w*/i],
+  ["credential", /\b(?:credential|secret|token|password|pgpassword|htpasswd)\w*/i],
+  ["redaction", /\b(?:redact|sanitiz)\w*/i],
+  ["scheme", /\bscheme\b/i],
+  ["traversal", /\btraversal\b/i],
+  ["security", /\b(?:security|anti-bot)\b/i],
+];
+
+/**
+ * Return the batching safety class for title/Problem text. `null` is routine
+ * work; `billing` is an absolute exclusion; every other value is eligible only
+ * for a same-class, maximum-three-member security batch.
+ *
+ * `auth` deliberately matches camelCase/PascalCase and underscore identifiers
+ * (MaintenanceAuth, AdminAuth, authz_check) without matching authority_source.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function classifyBatchSafety(text) {
+  const findingText = text.replace(/^\*\*Agent\*\*:.*$/gim, "");
+  const explicitClass = findingText.match(/<!--\s*FORGE:CLASS:\s*([a-z0-9-]+)\s*-->/i)?.[1];
+  if (explicitClass) return explicitClass.toLowerCase();
+  return BATCH_SAFETY_CLASSES.find(([, pattern]) => pattern.test(findingText))?.[0] ?? null;
+}
+
+/**
+ * True only for the narrow automated-alert duplicate case. Human-authored
+ * reports and alerts without a stable generator/trigger identity always stay
+ * for investigation.
+ *
+ * @param {Object} canonical
+ * @param {Object} candidate
+ * @returns {boolean}
+ */
+export function canDeduplicateAutomatedAlert(canonical, candidate) {
+  const isAutomated = (issue) =>
+    issue?.authorType === "Bot" || /\[bot\]$/i.test(issue?.authorLogin || "");
+  const normalizeTitle = (title) => String(title || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const hasIdentity = (value) => typeof value === "string" && value.trim() !== "";
+
+  return (
+    isAutomated(canonical) &&
+    isAutomated(candidate) &&
+    normalizeTitle(canonical.title) !== "" &&
+    normalizeTitle(canonical.title) === normalizeTitle(candidate.title) &&
+    hasIdentity(canonical.generator) &&
+    hasIdentity(candidate.generator) &&
+    canonical.generator === candidate.generator &&
+    hasIdentity(canonical.trigger) &&
+    hasIdentity(candidate.trigger) &&
+    canonical.trigger === candidate.trigger
+  );
+}
 
 /**
  * @typedef {Object} CascadePolicy
@@ -50,6 +104,10 @@ export const UNLIMITED = "unlimited";
  *   admitted. 1 = only original (non-review-finding-spawned) issues; a
  *   review-finding whose source is itself a review-finding is generation 2,
  *   and so on up the chain. `unlimited` removes the cap entirely.
+ * @property {number} batchMaxGeneration - Deepest review-finding generation that
+ *   may be absorbed into a P3 batch. This is deliberately always finite: batching
+ *   is a bounded aggregation exception to autonomous cascade admission, not an
+ *   alternate path to unlimited recursion.
  * @property {number|typeof UNLIMITED} tokenBudget - Per-batch token ceiling for
  *   Step 4C's review-finding cascade dispatch (mirrors, and by default reads
  *   through to, `pipeline.token_budget_per_batch`). `unlimited` removes the cap.
@@ -59,6 +117,10 @@ export const UNLIMITED = "unlimited";
  *   heuristic defers P3-and-below findings.
  * @property {boolean} p3SameFileDefer - Whether a P3 finding sharing a file with
  *   the active batch is deferred.
+ * @property {number|null} maxAmplification - Maximum findings spawned per merged
+ *   unit before same-lineage refinements are deferred. `null` disables the bound.
+ * @property {number} convergenceWindow - Merged-unit window used to warn when
+ *   amplification remains at or above 1.0.
  */
 
 /**
@@ -78,6 +140,7 @@ export const UNLIMITED = "unlimited";
 export const CASCADE_PRESETS = Object.freeze({
   all: Object.freeze({
     maxGeneration: UNLIMITED,
+    batchMaxGeneration: 2,
     tokenBudget: UNLIMITED,
     deferOnBatchGated: false,
     keywordHeuristic: false,
@@ -85,6 +148,7 @@ export const CASCADE_PRESETS = Object.freeze({
   }),
   balanced: Object.freeze({
     maxGeneration: 1,
+    batchMaxGeneration: 2,
     tokenBudget: 900000,
     deferOnBatchGated: true,
     keywordHeuristic: true,
@@ -92,6 +156,7 @@ export const CASCADE_PRESETS = Object.freeze({
   }),
   conservative: Object.freeze({
     maxGeneration: 1,
+    batchMaxGeneration: 2,
     tokenBudget: 450000,
     deferOnBatchGated: true,
     keywordHeuristic: true,
@@ -100,6 +165,19 @@ export const CASCADE_PRESETS = Object.freeze({
 });
 
 export const DEFAULT_CASCADE_POLICY_NAME = "balanced";
+
+/** Parse an optional positive decimal used for an opt-in ratio ceiling. */
+export function parseOptionalPositiveNumber(raw) {
+  if (raw === undefined || raw === null || raw === "null" || raw === "" || raw === "off") {
+    return { value: null, warning: null };
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (Number.isFinite(n) && n > 0) return { value: n, warning: null };
+  return {
+    value: null,
+    warning: `not a positive number or "off" ("${raw}") — disabling the bound`,
+  };
+}
 
 /**
  * Parse a raw config value that may be a positive integer, the literal
@@ -144,10 +222,13 @@ export function parseIntOrUnlimited(raw, fallback) {
  *   that resolves to `balanced` exactly like today's hardcoded behavior).
  * @param {string} [config.policy]
  * @param {number|string} [config.max_generation]
+ * @param {number|string} [config.batch_max_generation]
  * @param {number|string} [config.token_budget]
  * @param {boolean} [config.defer_on_batch_gated]
  * @param {boolean} [config.keyword_heuristic]
  * @param {boolean} [config.p3_same_file_defer]
+ * @param {number|string} [config.max_amplification]
+ * @param {number|string} [config.convergence_window]
  * @param {number|string} [legacyTokenBudgetPerBatch] - Deprecated-alias fallback:
  *   `pipeline.token_budget_per_batch`, read when `config.token_budget` is absent
  *   so existing configs keep working unchanged (see forge#1858).
@@ -173,6 +254,27 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
   const maxGen = parseIntOrUnlimited(config.max_generation, preset.maxGeneration);
   if (maxGen.warning) warnings.push(`orchestration.cascade.max_generation ${maxGen.warning}`);
 
+  // Unlike explicit Phase 1 admission, automated batching must retain a finite
+  // recursion bound even under policy: all. Do not accept the unlimited sentinel.
+  const rawBatchMaxGeneration = config.batch_max_generation;
+  const parsedBatchMaxGeneration = Number(rawBatchMaxGeneration);
+  const batchMaxGeneration =
+    rawBatchMaxGeneration === undefined || rawBatchMaxGeneration === null || rawBatchMaxGeneration === ""
+      ? preset.batchMaxGeneration
+      : Number.isInteger(parsedBatchMaxGeneration) && parsedBatchMaxGeneration > 0
+        ? parsedBatchMaxGeneration
+        : preset.batchMaxGeneration;
+  if (
+    rawBatchMaxGeneration !== undefined &&
+    rawBatchMaxGeneration !== null &&
+    rawBatchMaxGeneration !== "" &&
+    !(Number.isInteger(parsedBatchMaxGeneration) && parsedBatchMaxGeneration > 0)
+  ) {
+    warnings.push(
+      `orchestration.cascade.batch_max_generation is not a positive integer ("${rawBatchMaxGeneration}") — falling back to default ${preset.batchMaxGeneration}`,
+    );
+  }
+
   // token_budget precedence: orchestration.cascade.token_budget (new home) >
   // pipeline.token_budget_per_batch (deprecated alias, forge#1858) > preset default.
   // The legacy fallback is validated through parseIntOrUnlimited itself before use —
@@ -195,6 +297,16 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
     typeof config.keyword_heuristic === "boolean" ? config.keyword_heuristic : preset.keywordHeuristic;
   const p3SameFileDefer =
     typeof config.p3_same_file_defer === "boolean" ? config.p3_same_file_defer : preset.p3SameFileDefer;
+  const maxAmplification = parseOptionalPositiveNumber(config.max_amplification);
+  if (maxAmplification.warning) warnings.push(`orchestration.cascade.max_amplification ${maxAmplification.warning}`);
+  const convergenceWindow = parseIntOrUnlimited(config.convergence_window, 3);
+  if (convergenceWindow.warning || convergenceWindow.value === UNLIMITED) {
+    warnings.push(
+      convergenceWindow.warning
+        ? `orchestration.cascade.convergence_window ${convergenceWindow.warning}`
+        : 'orchestration.cascade.convergence_window cannot be "unlimited" — falling back to default 3',
+    );
+  }
 
   // Both-uncapped notice: neither generation depth nor token spend is bounded this
   // run. This is never a preset default (no preset in CASCADE_PRESETS sets both to
@@ -213,10 +325,13 @@ export function resolveCascadePolicy(config = {}, legacyTokenBudgetPerBatch) {
   return {
     policy: {
       maxGeneration: maxGen.value,
+      batchMaxGeneration,
       tokenBudget: tokenBudget.value,
       deferOnBatchGated,
       keywordHeuristic,
       p3SameFileDefer,
+      maxAmplification: maxAmplification.value,
+      convergenceWindow: convergenceWindow.value === UNLIMITED ? 3 : convergenceWindow.value,
     },
     policyName,
     bothUncapped,
@@ -238,6 +353,18 @@ export function admitsGeneration(generation, policy) {
 }
 
 /**
+ * P3 batches may aggregate deferred findings only through this finite ceiling.
+ * The resulting batch must record its maximum member generation for auditability.
+ *
+ * @param {number} generation
+ * @param {CascadePolicy} policy
+ * @returns {boolean}
+ */
+export function admitsBatchGeneration(generation, policy) {
+  return generation <= policy.batchMaxGeneration;
+}
+
+/**
  * @param {number} projectedSpend - BATCH_TOKEN_SPEND if this unit were admitted.
  * @param {CascadePolicy} policy
  * @returns {boolean} true if there is still headroom under the token budget.
@@ -245,6 +372,19 @@ export function admitsGeneration(generation, policy) {
 export function admitsTokenSpend(projectedSpend, policy) {
   if (policy.tokenBudget === UNLIMITED) return true;
   return projectedSpend <= policy.tokenBudget;
+}
+
+/**
+ * Compute the observable cascade amplification signal and opt-in bound state.
+ * The bound is deliberately not an admission decision: callers only apply it
+ * to same-lineage refinements, never to unrelated or high-value findings.
+ */
+export function evaluateAmplification(mergedUnits, findingsSpawned, policy) {
+  const ratio = mergedUnits > 0 ? findingsSpawned / mergedUnits : 0;
+  return {
+    ratio,
+    exceedsBound: policy.maxAmplification !== null && ratio > policy.maxAmplification,
+  };
 }
 
 /**
@@ -291,4 +431,99 @@ export function evaluateCascadeFinding(finding, policy) {
     return { admit: false, reason: `per-batch token budget exhausted (orchestration.cascade.token_budget=${policy.tokenBudget})` };
   }
   return { admit: true, reason: null };
+}
+
+/**
+ * Deterministic P3 batching rules mirrored by the orchestration specs.
+ * Grouping order is deliberately strongest-context first: a finding can only
+ * belong to one group, so earlier rules claim it before broader rules run.
+ */
+export const P3_BATCHING_RULES = Object.freeze({
+  maxMembers: 8,
+  sameFileMinimum: 2,
+  sourcePrMinimum: 2,
+  defectClassMinimum: 2,
+  leafDirectoryMinimum: 3,
+});
+
+const HIGH_BLAST_RADIUS = /(?:^|\/)(?:\.env\.example|docker-compose[^/]*|compose[^/]*|index\.[^/]+|main\.[^/]+)$/i;
+
+function priorityOf(finding) {
+  const labels = (finding.labels || []).map((label) => typeof label === "string" ? label : label?.name);
+  return labels.find((label) => /^priority:P[0-3]$/.test(label))?.slice(-2) || labels.find((label) => /^P[0-3]$/.test(label)) || "P3";
+}
+
+/** Priority is urgency, not risk: only P0/P1 stay individual for latency. */
+export function batchExclusionReason(finding, dangerZones = []) {
+  if (["P0", "P1"].includes(priorityOf(finding))) return "urgency";
+  const file = finding.affectedFile || "";
+  if (/^infra\/migrations\/.*credit_balance/i.test(file) || /^services\/api\/app\/billing\//i.test(file)) return "domain";
+  if (dangerZones.some((zone) => file === zone || file.startsWith(`${zone}/`))) return "domain";
+  if (/\/migrations?\//i.test(file) || HIGH_BLAST_RADIUS.test(file)) return "high-blast-radius";
+  return classifyBatchSafety(`${finding.title || ""}\n${finding.body || ""}`) === "billing" ? "domain" : null;
+}
+
+function sourcePr(body = "") {
+  return body.match(/^\*\*Source\*\*: PR #(\d+)\b/m)?.[1] || null;
+}
+
+function defectClass(body = "") {
+  return body.match(/<!-- FORGE:CLASS: ([a-z0-9]+(?:-[a-z0-9]+)*) -->/)?.[1] || null;
+}
+
+function leafDirectory(file = "") {
+  const slash = file.lastIndexOf("/");
+  return slash > 0 ? file.slice(0, slash) : null;
+}
+
+/**
+ * Plan P3 batches from already safety-filtered, open, unbatched, undispatched
+ * findings. The caller executes these groups and preserves unclaimed findings
+ * for a later full-queue sweep.
+ */
+export function planP3BatchGroups(findings, rules = P3_BATCHING_RULES, { openBatches = [], dangerZones = [] } = {}) {
+  const remaining = new Map(
+    findings
+      .filter((finding) => finding?.number && finding.affectedFile && !batchExclusionReason(finding, dangerZones))
+      .map((finding) => [finding.number, finding]),
+  );
+  const groups = [];
+  const extensions = [];
+
+  for (const batch of openBatches) {
+    const key = batch.affectedFile || batch.key;
+    const headroom = rules.maxMembers - (batch.memberCount ?? batch.members?.length ?? 0);
+    if (!key || headroom <= 0) continue;
+    for (const member of batch.members || []) remaining.delete(typeof member === "object" ? member.number : member);
+    const members = [...remaining.values()].filter((finding) => finding.affectedFile === key).slice(0, headroom);
+    if (members.length) {
+      extensions.push({ batch: batch.number, key, members: members.map((finding) => finding.number) });
+      members.forEach((finding) => remaining.delete(finding.number));
+    }
+  }
+
+  const claim = (kind, key, minimum) => {
+    const byKey = new Map();
+    for (const finding of remaining.values()) {
+      const groupKey = key(finding);
+      if (!groupKey) continue;
+      const members = byKey.get(groupKey) || [];
+      members.push(finding);
+      byKey.set(groupKey, members);
+    }
+    for (const [groupKey, members] of [...byKey].sort(([a], [b]) => a.localeCompare(b))) {
+      while (members.length >= minimum) {
+        const chunk = members.splice(0, rules.maxMembers);
+        groups.push({ kind, key: groupKey, members: chunk.map((finding) => finding.number) });
+        chunk.forEach((finding) => remaining.delete(finding.number));
+      }
+    }
+  };
+
+  claim("same-file", (finding) => finding.affectedFile, rules.sameFileMinimum);
+  claim("source-pr", (finding) => sourcePr(finding.body), rules.sourcePrMinimum);
+  claim("defect-class", (finding) => defectClass(finding.body), rules.defectClassMinimum);
+  claim("leaf-directory", (finding) => leafDirectory(finding.affectedFile), rules.leafDirectoryMinimum);
+
+  return { groups, extensions, ungrouped: [...remaining.keys()] };
 }

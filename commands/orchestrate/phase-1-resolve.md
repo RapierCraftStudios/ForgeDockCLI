@@ -1,4 +1,5 @@
 ---
+
 install: core
 ---
 <!-- SPDX-FileCopyrightText: Copyright (c) RapierCraft Studios -->
@@ -167,7 +168,7 @@ done
 
 **Two independent filters apply, in sequence**: first the T0-vs-backlog *time* filter (`CASCADE_SEARCH` above — which issues are even fetched), then the generation *depth* filter below (which of the fetched issues are admitted). They answer different questions — "how far back in time" vs. "how many cascade hops deep" — and either can be widened independently of the other.
 
-**Generation > `max_generation` findings are excluded by default** by the loop above — a `review-finding` issue whose *source* chain is deeper than `orchestration.cascade.max_generation` (default: 1, i.e. generation ≥ 2 excluded — the pre-#2234 behavior, unchanged when the section is absent) is normally deferred permanently (`PERMANENT_DEFERRED`) by Step 4C's own absolute check. That cap is an **autonomy guard**, not a human-request guard: it exists to stop an unattended run from cascading forever, not to block an operator who explicitly asked for this exact bucket of work. See `phase-4-execution.md` Step 4C rule 1 and the reworded anti-pattern note for the full rationale.
+**Generation > `max_generation` findings are excluded by default** by the loop above — a `review-finding` issue whose *source* chain is deeper than `orchestration.cascade.max_generation` (default: 1, i.e. generation ≥ 2 excluded — the pre-#2234 behavior, unchanged when the section is absent) is normally deferred by Step 4C's autonomous check. The only automated exception is bounded P3 aggregation: a generation-2 P3 may become part of one auditable batch under `batch_max_generation`; it is never individually re-dispatched. That cap is an **autonomy guard**, not a human-request guard: it exists to stop an unattended run from cascading forever, not to block an operator who explicitly asked for this exact bucket of work. See `phase-4-execution.md` Step 4C rule 1 and the reworded anti-pattern note for the full rationale.
 
 This resolve step is a human-requested entry point (the operator typed `cascade`/`review-findings`/`findings` directly), so it honors explicit overrides for both filters:
 
@@ -344,13 +345,31 @@ done
 
 **MUST NOT**: This hint MUST NOT be used, anywhere in this pipeline, to auto-close an issue, auto-skip it from dispatch, exclude it from the resolved issue set, or substitute for the investigation agent's own evidence-based verdict. Every `likely-moot: yes` issue is still dispatched into a full `/work-on` pipeline exactly like every other issue in the resolved set — the "CRITICAL: No duplicate detection at orchestrator level" rule below governs this identically.
 
-### P3 Review-Finding Batching (deterministic grouping rule)
+### Review-Finding Batching (deterministic grouping rule)
 
 <!-- Added: forge#1333 -->
 <!-- Extended: forge#1818 — default-batchable eligibility, surface-area grouping, lowered same-file threshold -->
 <!-- Extended: forge#2232 — priority-label schema tolerance (bare P<n> vs priority:P<n>) -->
 
-Before finalizing the issue set, apply the P3 batching rule to reduce full-pipeline overhead on low-severity review findings.
+Before finalizing the issue set, apply the shared batching rule to reduce full-pipeline overhead on routine review findings.
+
+**Single implementation (MANDATORY):** `bin/engine/admission.mjs` owns the eligibility, same-file, leaf-directory, age, eight-member, open-batch-extension, and singleton-reason rules through `planP3Batches()`. Every admission point supplies its complete current candidate registry plus parsed open batch metadata to that function, then executes only its returned `create`/`extend` actions. Do not independently reproduce thresholds or eligibility predicates in this file. The legacy shell examples below describe GitHub data collection and action execution only; their grouping decisions must be replaced by the evaluator result. Include original resolved issues, prior-cycle singletons, cascade findings, predicate re-resolution matches, and completion-sweep candidates in the registry. <!-- Added: forge#2851 -->
+
+After executing the plan, retain every singleton in the registry for the next admission event and record `summarizeP3BatchPlan()` in the per-run batching summary: clusters formed, members absorbed, open batches extended, and ungrouped members with their reasons.
+
+```bash
+# BATCH_CANDIDATE_REGISTRY_JSON contains every candidate accumulated so far, with
+# a stable `id` (`{repo}:{number}`), repo, title, problem/body, labels, affectedFile,
+# createdAt, and isBatch. OPEN_BATCHES_JSON contains existing batch issue metadata.
+# Run this after initial resolution and every later admission event; execute returned
+# actions using memberIds, never bare issue numbers, so satellite issues cannot collide.
+BATCH_PLAN=$(node -e '
+  import("{REPO_PATH}/bin/engine/admission.mjs").then(({ planP3Batches, summarizeP3BatchPlan }) => {
+    const plan = planP3Batches({ candidates: JSON.parse(process.argv[1]), openBatches: JSON.parse(process.argv[2]) });
+    console.log(JSON.stringify({ plan, summary: summarizeP3BatchPlan(plan) }));
+  });
+' "$BATCH_CANDIDATE_REGISTRY_JSON" "$OPEN_BATCHES_JSON")
+```
 
 **Priority label schema**: ForgeDock's own issue creator (`review-pr.md`) writes only the canonical `priority:P<n>` label form. Some repos this pipeline operates against (issues opened externally, imported, or predating ForgeDock adoption) instead carry a bare `P<n>` label with no `priority:` prefix. Every priority-read check in this section — and its mirrors in `phase-4-execution.md` and `cleanup.md` — MUST accept both forms. `priority:P<n>` wins when (unusually) both are present on the same issue. Issue-*creation* call sites (the batch-issue creation below) are unaffected and keep writing canonical `priority:P<n>` only — there is no case where this pipeline needs to *write* the bare form. <!-- Added: forge#2232 -->
 
@@ -360,11 +379,10 @@ Before finalizing the issue set, apply the P3 batching rule to reduce full-pipel
 
 The `<!-- FORGE:BATCHABLE -->` marker (still appended by `review-pr.md` at finding-creation time) is honored when present but is no longer REQUIRED for eligibility — a `review-finding`+`priority:P3` issue is batchable by default unless explicitly excluded. This closes the gap where cascade-spawned findings that never carried the marker sat un-batched indefinitely. <!-- Added: forge#1818 -->
 
-**Safety exclusions — NEVER batch, at any priority** (override all trigger conditions):
-- Issue body contains the word "security", "billing", "anti-bot", or "auth" anywhere in the title or `## Problem` section
-- Issue has a `security`, `billing`, `anti-bot`, or `auth` label
+**Safety classification:** P0/P1 findings stay individual because batching adds urgent-work latency. P2 is an ordering signal, not a batching veto. Billing is never batched, and path-owned danger zones, migrations, high-fan-in entrypoints, compose files, and `.env.example` are excluded by `batchExclusionReason()` in `bin/engine/admission.mjs`. The default path map excludes `infra/migrations/*credit_balance*` and `services/api/app/billing/**` regardless of wording. Security-relevant findings may batch only with members of the same coarse class, capped at **3** members. Every exclusion must log its `urgency`, `domain`, or `high-blast-radius` predicate.
+- Issue has a `needs-human`, `blocked`, or `operator-only` label, or explicitly states `operator-only`, `manual action required`, or `human action required` in its title or `## Problem` section
 
-These exclusions apply regardless of priority: P1/P2 findings are already never batched (see Important limits), and P3 findings in these domains are excluded even though they would otherwise qualify for default-batchable treatment. <!-- Added: forge#1818 -->
+Use `bin/engine/admission.mjs`'s `classifyBatchSafety()` as the reference classifier in every mirror. It recognizes `inject`, `injection`, `xss`, `csrf`, `ssrf`, `bypass`, `escalat`, `credential`, `secret`, `token`, `password`, `pgpassword`, `htpasswd`, `redact`, `sanitiz`, `scheme`, `traversal`, `deserializ`, `rce`, and `privilege`, as well as security/anti-bot and auth. Auth matches compound identifiers (`MaintenanceAuth`, `AdminAuth`, `authz_check`) but not `authority_source`; exact `**Agent**:` attribution lines are stripped before classification. A `FORGE:CLASS` slug takes precedence when present, otherwise use this coarse class. <!-- Changed: forge#2859 -->
 
 **Grouping algorithm (surface area — same file first, leaf directory as broader fallback):** <!-- Changed: forge#1818 — was domain-only -->
 ```bash
@@ -372,8 +390,8 @@ These exclusions apply regardless of priority: P1/P2 findings are already never 
 # NOTE: `--label` is an exact-match GH filter and cannot OR "priority:P3" with bare "P3" in
 # one query, so the P3 test moves into the jq predicate below (schema-tolerant, forge#2232).
 # Only "review-finding" stays in the --label filter.
-# Safety-exclusion keyword alternation, shared verbatim across all three
-# mirrored sites (this file, phase-4-execution.md, cleanup.md) — see forge#2423.
+# Billing remains the sole absolute exclusion. Security findings stay in the
+# candidate set so they can be grouped by their same `FORGE:CLASS`/coarse class.
 # Word-boundary anchored so it matches whole terms only, not substrings:
 # `authority_source`/`authoritative`/`author`/`authored` no longer trip `auth`.
 # `authentication|authorization|authn|authz` are listed explicitly so real
@@ -384,7 +402,7 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
   --limit 500 \
   --json number,title,body,labels \
   --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
-         | select((.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i")) | not)
+         | select((.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i")) | not)
          # Strip the review-finding template's attribution boilerplate
          # (**Confidence**/**Severity**/**Review comment** — see forge#2477
          # note below for why **Source**/**Agent** are deliberately excluded
@@ -410,8 +428,8 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
          # is not auto-batched) for closing a real bypass — the safe direction
          # for a security-relevant exclusion. <!-- forge#2477 -->
          | (.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) as $stripped_body
-         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i") | not)
-         | select(([.labels[].name] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth")) | not)')
+         | select($stripped_body | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i") | not)
+         | select(([.labels[].name] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only")) | not)')
 
 # Surface area = the exact affected file path listed first under "## Affected Files" (primary grouping key).
 # Leaf directory = dirname of that file (broader fallback grouping key, formerly called "domain").
@@ -428,10 +446,25 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
 #   Title "fix auth bypass in login flow"                      → still excluded (genuine auth finding — true positive preserved)
 ```
 
-**Batch creation rule (two-tier threshold):** <!-- Changed: forge#1818 — added lower same-file tier -->
+**Batch creation rule (ordered grouping keys):** <!-- Changed: forge#1818 — added lower same-file tier -->
 - **Same-file cluster** (primary, low threshold): When **2+** batchable P3 issues share the exact same affected file, create a batch issue for that file cluster. Same-file P3 findings are the dominant low-value token sink (dead imports, stale comments, style nits) and already conflict with each other if built individually — the low threshold reflects that they'd otherwise serialize into slow one-at-a-time chains regardless of count.
-- **Leaf-directory cluster** (broader grouping, existing threshold preserved): When **5+** batchable P3 issues share the same leaf directory but are not already covered by a same-file cluster above, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
-- Form same-file clusters first; evaluate any remaining ungrouped findings for leaf-directory clustering. A finding is claimed by at most one batch.
+- **Source-PR cohort**: When **2+** remaining findings cite the same `**Source**: PR #N`, create a batch regardless of their affected paths. The source citation is parsed mechanically; a source PR that closed unmerged remains eligible.
+- **Defect-class cluster**: When **2+** remaining findings have the same `<!-- FORGE:CLASS: <slug> -->` annotation, create a batch. This is opt-in and uses only the emitted machine-readable slug; do not infer a class from prose.
+- **Leaf-directory cluster** (broader fallback): When **3+** remaining batchable P3 issues share the same leaf directory but are not already claimed, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
+- Form groups in this order: same-file, source-PR, defect-class, leaf-directory. A finding is claimed by at most one batch.
+
+**Reference implementation and periodic sweep (MANDATORY):** `bin/engine/admission.mjs` exports `planP3BatchGroups()` and `batchExclusionReason()`, the deterministic reference for eligibility, the four ordered keys, the 3-member leaf threshold, and the eight-member cap. Every pass supplies the complete retained candidate registry plus open batches; execute `extensions` before creating new groups, retain `ungrouped` findings, and log each selected group kind or exclusion predicate. Run it at initial resolution and again after every five completions or whenever the deferred queue reaches the concurrency cap. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
+
+**Generation-cap exception (sanctioned, bounded, and auditable):** P3 batching may aggregate a
+deferred generation-2 finding without `--allow-gen2`: aggregation replaces several low-priority
+pipelines with one reviewed unit and is therefore a bounded alternative to recursively dispatching
+each finding. It is not an implicit unlimited override. Before forming each cluster, use
+`compute_generation` above for every member, retain only members at or below the finite
+`orchestration.cascade.batch_max_generation` ceiling (default `2`), and leave higher-generation
+members deferred. Record the maximum retained member generation as `{BATCH_MAX_GENERATION}` and
+list every retained generation-2-or-higher member in the batch body. This makes the exception
+visible to operators and ensures a generation-6 finding cannot become dispatchable merely by being
+grouped. `policy: all` does not remove this batching ceiling. <!-- Added: forge#2849 -->
 
 **Sanitize the surface-area path before interpolation (MANDATORY):** `{SURFACE_AREA}` is an affected-file path derived from an issue body, and git filenames can legally carry shell metacharacters (`` ` ``, `$()`, quotes). Restrict it to a validated `[A-Za-z0-9._/-]` charset before templating it into `--title` / `--body`, so an untrusted issue body cannot break the `gh` argument boundary. The same guard is applied at the mirror site in `phase-4-execution.md`. <!-- forge#1833, forge#1835 -->
 
@@ -452,7 +485,13 @@ Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory),
 
 <!-- FORGE:BATCH_MEMBERS -->
 {for each member issue: "- [ ] #{NUM}: {TITLE}"}
+{for security-class members only: "  - **Verdict**: [ ] live vector  [ ] defence-in-depth"}
 <!-- /FORGE:BATCH_MEMBERS -->
+
+**Maximum member generation**: {BATCH_MAX_GENERATION}
+<!-- FORGE:BATCH_MAX_GENERATION: {BATCH_MAX_GENERATION} --> <!-- allowlist:check-spec-markers -->
+
+**Generation >= 2 members admitted by bounded batching**: {#{NUM} (generation N), or "none"}
 
 ## Acceptance Criteria
 
@@ -462,7 +501,7 @@ Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory),
 
 ## Context
 
-**Batch policy**: 2+ open P3 findings sharing the same file, or 5+ sharing the same leaf directory, or oldest > 72h.
+**Batch policy**: 2+ same file, 2+ same source PR cohort, 2+ same explicit defect class, or 3+ same leaf directory (or oldest > 72h).
 **Member issues**: #{N1}, #{N2}, #{N3}, ...
 
 <!-- FORGE:BATCHABLE -->
@@ -473,32 +512,32 @@ BATCH_EOF
 ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"fix(batch): P3 review findings — ${SAFE_SURFACE_AREA} (batch #{BATCH_N})\" --body-file \"${BATCH_BODY_FILE}\" --label \"review-finding\" --label \"priority:P3\" --label \"batch\" --exclude \"${MEMBER_LIST}\""))
 ```
 
-**Extract the created batch issue number from the Skill output** (see `commands/issue.md` Phase 4C/4E — it echoes `Created: {url}` and reports `**#{NUMBER}**: {title}`):
+**Consume `/issue`'s explicit result contract** (see `commands/issue.md` Phases 2D and 4C). A dedup STOP is an expected, named outcome; any output without either result marker is a hard create failure:
 
 ```bash
-BATCH_ISSUE_NUM=$(echo "$ISSUE_SKILL_OUTPUT" | grep -oE 'issues/[0-9]+' | head -1 | grep -oE '[0-9]+')
-[ -z "$BATCH_ISSUE_NUM" ] && BATCH_ISSUE_NUM=$(echo "$ISSUE_SKILL_OUTPUT" | grep -oE '\*\*#[0-9]+\*\*' | head -1 | grep -oE '[0-9]+')
+BATCH_ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*ISSUE_CREATE_RESULT:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
 
-if [ -z "$BATCH_ISSUE_NUM" ]; then
-  # With --exclude "${MEMBER_LIST}" passed above, Phase 2D no longer fires on the
-  # cluster's own declared members — a STOP reaching this point means a GENUINE
-  # non-member duplicate was found (some other open issue already covers this
-  # exact surface area), or a usage error. Do NOT replace member issues with a
-  # batch issue for this cluster; leave the members on the standard individual
-  # pipeline instead. <!-- Reworded: forge#2432 -->
-  echo "WARNING: /issue did not report a created batch issue number — likely a Phase 2D dedup STOP against a non-member issue (a real duplicate — member exclusion via --exclude \"${MEMBER_LIST}\" is already applied above, so this is not a false positive against the cluster's own members) or a usage error. Do not replace member issues with a batch issue for this cluster; leave the members on the standard individual pipeline instead."
+if [ -n "$DEDUP_NUMBER" ]; then
+  echo "Batch dedup STOP: existing non-member issue #${DEDUP_NUMBER}; members remain on the standard individual pipeline."
+elif [ -z "$BATCH_ISSUE_NUM" ]; then
+  # Neither verified creation nor explicit dedup was reported. Do not replace
+  # member issues. <!-- forge#2842 -->
+  echo "ERROR: /issue did not report a verified batch issue number. This is a create failure (including a swallowed GitHub secondary-rate-limit response), not a dedup STOP. Do not replace member issues; stop this batch and retry after resolving the GitHub failure." >&2
+  exit 1
 fi
 ```
 
 **Replace member issues with the batch issue** in the resolved issue set. Member issues are NOT individually dispatched to `/work-on` — the batch issue is the single pipeline unit.
 
 **Important limits**:
-- Max **8** members per batch issue — if more than 8 batchable P3s exist in a surface-area cluster, create multiple batch issues of ≤ 8 each <!-- Changed: forge#1818 — was 10 -->
+- Routine batches have at most **8** members. Security-class batches have at most **3** members and never mix classes.
 - P1 and P2 issues are NEVER batched — they keep the standard one-issue-one-PR path
-- Security/billing/anti-bot/auth findings are NEVER batched at any priority (see Safety exclusions above) <!-- Added: forge#1818 -->
+- Billing is NEVER batched; security P3 findings follow the same-class, three-member rule above.
+- Human-gated findings are NEVER batched: `needs-human`, `blocked`, `operator-only`, and explicit operator-action requests remain independently tracked
 - Batch issues themselves are never nested inside other batch issues
 
-If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a leaf directory, AND none exceed 72h, skip batch creation entirely — individual P3s run through the standard pipeline.
+If no grouping key reaches its threshold and no leaf-directory candidate exceeds 72h, skip batch creation entirely — individual P3s run through the standard pipeline.
 
 ### CRITICAL: No duplicate detection at orchestrator level
 
@@ -518,4 +557,3 @@ If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a lea
 **Why**: Surface-level similarity hides critical differences. #3842 (api_key.id lazy load) and #4039 (user.id lazy load) had identical error messages but targeted completely different ORM objects. Closing #4039 as a "duplicate" would have left a customer-impacting P0 bug unfixed.
 
 ---
-
