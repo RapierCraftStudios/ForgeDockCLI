@@ -32,17 +32,42 @@
  * cascade until N tokens spent" — `max_generation` and `token_budget` below
  * are independent levers precisely so that shape of policy is expressible.
  *
- * Hard invariant (NOT configurable by design): safety exclusions — findings
- * whose `## Problem` section indicates security/billing/anti-bot/auth
- * concerns — are never batched and never auto-admitted by ANY policy,
- * including `all`. That exclusion lives upstream of this module (the P3
- * batching eligibility check in `phase-1-resolve.md` / the surface-area
- * batching check in `phase-4-execution.md`) and is intentionally absent
- * from the levers this module resolves.
+ * Billing findings are never batched. Security-relevant P3 findings may only
+ * batch with findings in the same coarse class, with a maximum of three
+ * members. The prose mirrors use `classifyBatchSafety` as their reference.
  */
 
 /** Sentinel string accepted anywhere an "int | unlimited" lever is read. */
 export const UNLIMITED = "unlimited";
+
+const BATCH_SAFETY_CLASSES = [
+  ["billing", /\bbilling\b/i],
+  ["auth", /\b(?:[A-Za-z0-9]*[A-Z][A-Za-z0-9]*[Aa][Uu][Tt][Hh][A-Za-z0-9]*|[Aa][Uu][Tt][Hh](?:[NnZz]?_|[A-Z]))\b|\b(?:authentication|authorization|authn|authz)\b/i],
+  ["injection", /\b(?:inject|injection|xss|csrf|ssrf|deserializ|rce)\w*/i],
+  ["access-control", /\b(?:bypass|escalat|privilege)\w*/i],
+  ["credential", /\b(?:credential|secret|token|password|pgpassword|htpasswd)\w*/i],
+  ["redaction", /\b(?:redact|sanitiz)\w*/i],
+  ["scheme", /\bscheme\b/i],
+  ["traversal", /\btraversal\b/i],
+  ["security", /\b(?:security|anti-bot)\b/i],
+];
+
+/**
+ * Return the batching safety class for title/Problem text. `null` is routine
+ * work; `billing` is an absolute exclusion; every other value is eligible only
+ * for a same-class, maximum-three-member security batch.
+ *
+ * `auth` deliberately matches camelCase/PascalCase and underscore identifiers
+ * (MaintenanceAuth, AdminAuth, authz_check) without matching authority_source.
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function classifyBatchSafety(text) {
+  const findingText = text.replace(/^\*\*Agent\*\*:.*$/gim, "");
+  const explicitClass = findingText.match(/<!--\s*FORGE:CLASS:\s*([a-z0-9-]+)\s*-->/i)?.[1];
+  if (explicitClass) return explicitClass.toLowerCase();
+  return BATCH_SAFETY_CLASSES.find(([, pattern]) => pattern.test(findingText))?.[0] ?? null;
+}
 
 /**
  * @typedef {Object} CascadePolicy

@@ -9,7 +9,31 @@ import {
   admitsGeneration,
   admitsTokenSpend,
   evaluateCascadeFinding,
+  classifyBatchSafety,
 } from "./admission.mjs";
+
+describe("classifyBatchSafety", () => {
+  it("classifies the six security findings that previously evaded batching exclusion", () => {
+    const fixtures = [
+      ["MaintenanceAuth alias bypasses write rate limit", "auth"],
+      ["nested bash -c double substitution permits command injection", "injection"],
+      ["CTA href needs scheme validation to reject javascript URIs", "scheme"],
+      ["Discord markdown code-fence injection from log samples", "injection"],
+      ["redact raw psql DETAIL and CONTEXT on migration failure", "redaction"],
+      ["PGPASSWORD interpolated into a SQL literal", "credential"],
+    ];
+    for (const [text, expected] of fixtures) {
+      assert.equal(classifyBatchSafety(text), expected, text);
+    }
+  });
+
+  it("keeps the documented false positives batchable while matching identifier auth", () => {
+    assert.equal(classifyBatchSafety("authority_source docstring fix"), null);
+    assert.equal(classifyBatchSafety("**Agent**: Security\n## Problem\nstale docstring count"), null);
+    assert.equal(classifyBatchSafety("AdminAuth and authz_check must reject bypasses"), "auth");
+    assert.equal(classifyBatchSafety("injection\n<!-- FORGE:CLASS: shell-hardening -->"), "shell-hardening");
+  });
+});
 
 describe("parseIntOrUnlimited", () => {
   it("parses a positive integer", () => {
