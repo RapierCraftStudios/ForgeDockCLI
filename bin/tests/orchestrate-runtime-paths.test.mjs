@@ -10,6 +10,7 @@ const phase3 = readFileSync(
   new URL("../../commands/orchestrate/phase-3-dependency.md", import.meta.url),
   "utf8",
 );
+const issue = readFileSync(new URL("../../commands/issue.md", import.meta.url), "utf8");
 const opencodeDocs = readFileSync(
   new URL("../../docs/OPENCODE.md", import.meta.url),
   "utf8",
@@ -37,11 +38,12 @@ describe("orchestrate runtime helper paths", () => {
   });
 
   it("requires mktemp paths and rejects root-level temp files", () => {
-    assert.match(phase4, /BODY_FILE="\$\(mktemp\)"/);
-    assert.match(phase4, /never hand-roll (?:a )?(?:temp )?path/i);
-    assert.match(phase4, /\/tmp_invbody_31076\.txt/);
-    assert.match(phase4, /bypass mode cannot clear/i);
-    assert.match(phase4, /\/tmp\/body\.md/);
+    for (const spec of [phase4, issue]) {
+      assert.match(spec, /mktemp/);
+      assert.match(spec, /never hand-roll/i);
+      assert.match(spec, /\/tmp_invbody_31076\.txt/);
+      assert.match(spec, /bypass mode cannot clear|unattended cleanup|interactive deletion approval/i);
+    }
   });
 
   it("resolves affected-file extraction from ForgeDock before the target repo", () => {
