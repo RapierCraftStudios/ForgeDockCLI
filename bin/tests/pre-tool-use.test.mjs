@@ -1644,6 +1644,8 @@ describe("pre-tool-use hook — dangerous rm target guard (#2856)", () => {
     [`${RM} -rf node_modules`, "bare relative name"],
     [`${RM} -f /tmp/a.txt /tmp/b.txt`, "multiple safe operands"],
     [`${RM} -f "/tmp/quoted path.txt"`, "quoted path with embedded whitespace"],
+    [`${RM} -f "/tmp/safe(/probe.txt)"`, "quoted path with parentheses is one operand (#2882)"],
+    [`${RM} -f /tmp/safe\(/probe.txt\)`, "escaped unquoted path with parentheses is one operand (#2882)"],
     [`BODY_FILE=$(mktemp); ${RM} -f "$BODY_FILE"`, "mktemp cleanup — the canonical pipeline shape"],
     [`${RM} -f "$BODY_FILE"`, "bare variable, no path suffix — cannot synthesize a root path"],
     [`D=/tmp/x; ${RM} -rf "$D"/*`, "variable assigned earlier in the same command"],

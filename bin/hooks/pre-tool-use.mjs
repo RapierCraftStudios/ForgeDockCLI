@@ -410,7 +410,7 @@ const ENV_ASSIGNMENT_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
  * command-substitution opener (`$(`) is stripped separately by
  * `extractCommandSegments()`.
  */
-const RM_SEGMENT_SPLIT_RE = /[;&|()`]+/;
+const RM_SEGMENT_SPLIT_RE = /[;&|`]+|\$\(/;
 
 /**
  * Match a heredoc redirection and capture its delimiter, so heredoc BODIES can
@@ -1183,7 +1183,9 @@ function stripHeredocBodies(command) {
  * Segmentation is done at three levels so a command name glued to a separator
  * with no whitespace is still recovered (the metacharacter-adjacency bypass of
  * issue #2034, review findings SEC-1/SEC-2): newlines, then `;`/`&`/`|`/
- * parens/backticks inside unquoted tokens.
+ * backticks, and command-substitution openers inside unquoted tokens. Bare
+ * parentheses are valid path characters, so they must remain part of an
+ * operand rather than creating a bogus command segment.
  *
  * Inert quoted tokens (see `isInertQuotedToken()`) are passed through unsplit
  * and kept in place, so `rm -f "/tmp/quoted path.txt"` still resolves a target
