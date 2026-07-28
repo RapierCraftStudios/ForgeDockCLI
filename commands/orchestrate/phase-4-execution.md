@@ -2435,9 +2435,9 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   # keyword is not auto-batched) for closing a real bypass — the safe
   # direction for a security-relevant exclusion. <!-- forge#2477 -->
   echo "$FINDING_DATA" | jq -e '
-    (.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i"))
-    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i"))
-    or ([.labels[]] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth"))
+    (.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i"))
+    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz|operator-only|manual action required|human action required)\\b"; "i"))
+    or ([.labels[]] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth" or . == "needs-human" or . == "blocked" or . == "operator-only"))
   ' >/dev/null && continue
 
   # Only P3 findings are eligible (P1/P2 already dispatched individually above).
