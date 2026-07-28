@@ -2015,6 +2015,11 @@ while IFS= read -r ACTION; do
   ACTION_MEMBERS=($(echo "$ACTION" | jq -r '.members[]'))
   [ "${#ACTION_MEMBERS[@]}" -gt 0 ] || continue
 
+  if [ "${DRY_RUN:-false}" = "true" ]; then
+    echo "DRY_RUN: would ${ACTION_TYPE} P3 batch members: ${ACTION_MEMBERS[*]}"
+    continue
+  fi
+
   if [ "$ACTION_TYPE" = "extend" ]; then
     BATCH_NUMBER=$(echo "$ACTION" | jq -r '.batch')
     BATCH_BODY=$(gh issue view "$BATCH_NUMBER" -R "$ACTION_REPO" --json body --jq '.body')
