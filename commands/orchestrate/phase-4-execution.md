@@ -2112,21 +2112,29 @@ for FINDING_NUM in {spawned_finding_numbers}; do
 
   # Count each finding once and retain source provenance for the final per-PR
   # breakdown. Missing source/file evidence fails open as new surface.
-  SOURCE_PR=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '(?i)\*\*source\*\*:\s*pr\s*#\K[0-9]+' | head -1)
+  FINDING_BODY=$(echo "$FINDING_DATA" | jq -r '.body')
+  SOURCE_PR=""
+  if [[ "$FINDING_BODY" =~ \*\*[Ss]ource\*\*:[[:space:]]*[Pp][Rr][[:space:]]*\#([0-9]+) ]]; then
+    SOURCE_PR="${BASH_REMATCH[1]}"
+  fi
   if [ -z "${AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]:-}" ]; then
     AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]=1
     FINDINGS_SPAWNED=$((FINDINGS_SPAWNED + 1))
     [ -n "$SOURCE_PR" ] && FINDINGS_BY_SOURCE_PR[$SOURCE_PR]=$(( ${FINDINGS_BY_SOURCE_PR[$SOURCE_PR]:-0} + 1 ))
   fi
   FINDING_IS_REFINEMENT=false
-  FINDING_FILE_FOR_LINEAGE=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oP '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+  FINDING_FILE_FOR_LINEAGE=$(echo "$FINDING_BODY" | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
   if [ -n "$SOURCE_PR" ] && [ -n "$FINDING_FILE_FOR_LINEAGE" ]; then
-    SOURCE_ISSUE=$(gh pr view "$SOURCE_PR" -R {GH_REPO} --json body --jq '.body' 2>/dev/null \
-      | grep -oP '(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#\K[0-9]+' | head -1)
+    SOURCE_ISSUE=""
+    SOURCE_PR_BODY=$(gh pr view "$SOURCE_PR" -R {GH_REPO} --json body --jq '.body' 2>/dev/null || echo "")
+    SOURCE_PR_BODY_LOWER=$(echo "$SOURCE_PR_BODY" | tr '[:upper:]' '[:lower:]')
+    if [[ "$SOURCE_PR_BODY_LOWER" =~ (close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+\#([0-9]+) ]]; then
+      SOURCE_ISSUE="${BASH_REMATCH[3]}"
+    fi
     if [ -n "$SOURCE_ISSUE" ]; then
       PARENT_DATA=$(gh issue view "$SOURCE_ISSUE" -R {GH_REPO} --json labels,body \
         --jq '{labels: [.labels[].name], body: .body}' 2>/dev/null || echo '{}')
-      PARENT_FILE=$(echo "$PARENT_DATA" | jq -r '.body // ""' | grep -oP '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+      PARENT_FILE=$(echo "$PARENT_DATA" | jq -r '.body // ""' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
       if echo "$PARENT_DATA" | jq -e '[.labels[] | select(. == "review-finding")] | length > 0' >/dev/null && \
          [ "$PARENT_FILE" = "$FINDING_FILE_FOR_LINEAGE" ]; then
         FINDING_IS_REFINEMENT=true
