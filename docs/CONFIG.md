@@ -375,10 +375,14 @@ orchestration:
 
 ## `pipeline` (OPTIONAL)
 
-Tuning knobs for `/orchestrate`'s batch engine — stall detection, narration verbosity, and (deprecated alias only, see `orchestration.cascade` above) the review-finding cascade token budget. All keys optional; sane defaults apply when omitted.
+Tuning knobs for the CLI backend and `/orchestrate`'s batch engine — invocation and stall timeouts, narration verbosity, and (deprecated alias only, see `orchestration.cascade` above) the review-finding cascade token budget. All keys optional; sane defaults apply when omitted.
 
 ```yaml
 pipeline:
+  # Wall-clock limit for one CLI backend invocation. The environment variable
+  # FORGEDOCK_CLI_TIMEOUT_MS (milliseconds) takes precedence. Default: 60.
+  cli_timeout_minutes: 60
+
   # Minutes an agent may sit idle (no FORGE:HEARTBEAT / label change) before
   # /orchestrate's stall detector treats it as stuck and attempts an
   # auto-resume. Default: 15.
@@ -401,12 +405,13 @@ pipeline:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `cli_timeout_minutes` | integer | No | Wall-clock minutes for one CLI backend invocation. Default: 60. `FORGEDOCK_CLI_TIMEOUT_MS` (milliseconds) takes precedence. |
 | `stall_timeout_minutes` | integer | No | Idle minutes before the stall detector attempts auto-resume. Default: 15 |
 | `token_budget_per_batch` | integer | No | **Deprecated** — use `orchestration.cascade.token_budget`. Default: 900000 |
 | `token_estimate_per_finding` | integer | No | Estimated tokens per P3-or-lower cascade finding. Default: 150000 |
 | `narration` | string | No | `terse` \| `verbose`. Default: `terse` |
 
-**Commands that use this section**: `orchestrate`
+**Commands that use this section**: CLI backend (`cli_timeout_minutes`); `orchestrate` (remaining keys)
 
 ---
 
