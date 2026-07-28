@@ -70,6 +70,35 @@ export function classifyBatchSafety(text) {
 }
 
 /**
+ * True only for the narrow automated-alert duplicate case. Human-authored
+ * reports and alerts without a stable generator/trigger identity always stay
+ * for investigation.
+ *
+ * @param {Object} canonical
+ * @param {Object} candidate
+ * @returns {boolean}
+ */
+export function canDeduplicateAutomatedAlert(canonical, candidate) {
+  const isAutomated = (issue) =>
+    issue?.authorType === "Bot" || /\[bot\]$/i.test(issue?.authorLogin || "");
+  const normalizeTitle = (title) => String(title || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const hasIdentity = (value) => typeof value === "string" && value.trim() !== "";
+
+  return (
+    isAutomated(canonical) &&
+    isAutomated(candidate) &&
+    normalizeTitle(canonical.title) !== "" &&
+    normalizeTitle(canonical.title) === normalizeTitle(candidate.title) &&
+    hasIdentity(canonical.generator) &&
+    hasIdentity(candidate.generator) &&
+    canonical.generator === candidate.generator &&
+    hasIdentity(canonical.trigger) &&
+    hasIdentity(candidate.trigger) &&
+    canonical.trigger === candidate.trigger
+  );
+}
+
+/**
  * @typedef {Object} CascadePolicy
  * @property {number|typeof UNLIMITED} maxGeneration - Max cascade generation depth
  *   admitted. 1 = only original (non-review-finding-spawned) issues; a
