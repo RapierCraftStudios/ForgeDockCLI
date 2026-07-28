@@ -9,6 +9,7 @@ import {
   admitsGeneration,
   admitsTokenSpend,
   evaluateCascadeFinding,
+  planP3BatchGroups,
 } from "./admission.mjs";
 
 describe("parseIntOrUnlimited", () => {
@@ -261,5 +262,54 @@ describe("evaluateCascadeFinding — Step 4C rule-chain parity", () => {
     const result = evaluateCascadeFinding({ ...baseFinding, projectedTokenSpend: 900001 }, policy);
     assert.equal(result.admit, false);
     assert.match(result.reason, /token budget exhausted/);
+  });
+});
+
+describe("planP3BatchGroups — concern-level P3 batching", () => {
+  const finding = (number, affectedFile, body = "") => ({ number, affectedFile, body });
+
+  it("keeps same-file grouping ahead of every broader key", () => {
+    const plan = planP3BatchGroups([
+      finding(1, "infra/monitoring/a.yml", "**Source**: PR #42"),
+      finding(2, "infra/monitoring/a.yml", "**Source**: PR #42"),
+      finding(3, "infra/monitoring/b.yml", "**Source**: PR #42"),
+    ]);
+    assert.deepEqual(plan.groups, [
+      { kind: "same-file", key: "infra/monitoring/a.yml", members: [1, 2] },
+    ]);
+    assert.deepEqual(plan.ungrouped, [3]);
+  });
+
+  it("groups a shared source PR only within one top-level subsystem", () => {
+    const plan = planP3BatchGroups([
+      finding(1, "infra/monitoring/a.yml", "**Source**: PR #42"),
+      finding(2, "infra/monitoring/b.yml", "**Source**: PR #42"),
+      finding(3, "scripts/a.sh", "**Source**: PR #42"),
+    ]);
+    assert.deepEqual(plan.groups, [
+      { kind: "source-pr", key: "PR #42 + infra/monitoring", members: [1, 2] },
+    ]);
+    assert.deepEqual(plan.ungrouped, [3]);
+  });
+
+  it("groups explicit defect classes across files", () => {
+    const plan = planP3BatchGroups([
+      finding(1, "infra/monitoring/a.yml", "<!-- FORGE:CLASS: fail-loud-check -->"),
+      finding(2, "scripts/check.sh", "<!-- FORGE:CLASS: fail-loud-check -->"),
+    ]);
+    assert.deepEqual(plan.groups, [
+      { kind: "defect-class", key: "fail-loud-check", members: [1, 2] },
+    ]);
+  });
+
+  it("lowers leaf-directory grouping to three and caps batches at eight", () => {
+    const three = planP3BatchGroups([
+      finding(1, "scripts/a.sh"), finding(2, "scripts/b.sh"), finding(3, "scripts/c.sh"),
+    ]);
+    assert.deepEqual(three.groups, [{ kind: "leaf-directory", key: "scripts", members: [1, 2, 3] }]);
+
+    const nine = planP3BatchGroups(Array.from({ length: 9 }, (_, index) => finding(index + 1, `scripts/${index}.sh`)));
+    assert.deepEqual(nine.groups, [{ kind: "leaf-directory", key: "scripts", members: [1, 2, 3, 4, 5, 6, 7, 8] }]);
+    assert.deepEqual(nine.ungrouped, [9]);
   });
 });

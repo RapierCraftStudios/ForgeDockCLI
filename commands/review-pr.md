@@ -1792,9 +1792,11 @@ cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 **Prevention**: [one sentence — what the builder must do to avoid this class of bug]
 
 <!-- FORGE:PATTERN: [pattern-slug] -->
+<!-- FORGE:CLASS: [pattern-slug] -->
 <!-- This machine-readable tag is used by pipeline-health Phase 4A to count pattern recurrences.
-     When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
-     Keep the slug consistent across all findings for the same defect class. --> <!-- Added: forge#1331 -->
+      When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
+      Keep the slug consistent across all findings for the same defect class. FORGE:CLASS is
+      consumed by orchestrate's P3 batching rule; use a lowercase hyphenated slug. --> <!-- Added: forge#1331, forge#2858 -->
 
 ## Affected Files
 

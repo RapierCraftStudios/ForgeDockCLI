@@ -2241,9 +2241,11 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
 done
 ```
 
-**Surface-area batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
+**Concern-level batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
-Cascade-spawned findings collected within a single `/orchestrate` run never pass back through Phase 1's batching rule — Phase 1 only runs once, at the start. Without a check here, same-file P3 findings spawned mid-run always dispatch individually, defeating the batching policy for exactly the findings it exists to catch. Apply the same grouping rule from `commands/orchestrate/phase-1-resolve.md` ("P3 Review-Finding Batching") to `QUEUED_FINDINGS` before the dispatch step below:
+Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched P3 candidate set, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates plus new findings, apply Phase 1's safety exclusions, and call `planP3BatchGroups()` from `bin/engine/admission.mjs`. Execute the resulting groups before dispatch, retaining its `ungrouped` members for the next sweep. This preserves the same-file, source-PR + subsystem, defect-class, leaf-directory ordering, 3-member leaf threshold, and eight-member cap defined in Phase 1. Record the selected group kind in the run summary. <!-- Added: forge#2858 -->
+
+The per-cycle `QUEUED_FINDINGS` loop below remains the action-creation mechanism, but it MUST consume the complete-sweep planner output rather than decide groups from its local same-file map. Do not dispatch a locally ungrouped member until the next periodic sweep has considered it against the retained candidate set.
 
 ```bash
 # Group QUEUED_FINDINGS by exact affected file, reusing the SAME safety
