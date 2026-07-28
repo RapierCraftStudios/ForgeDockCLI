@@ -353,6 +353,12 @@ export function planP3Batches({ candidates = [], openBatches = [], now = Date.no
   const actions = [];
 
   for (const batch of [...openBatches].sort((a, b) => `${repoOf(a)}:${a.number}`.localeCompare(`${repoOf(b)}:${b.number}`, undefined, { numeric: true }))) {
+    // Persistent registries retain every candidate, including members already absorbed by a batch.
+    // Remove those members before planning so repeated admission events can only add new findings.
+    for (const member of batch.members || []) {
+      const memberId = typeof member === "object" ? candidateId(member) : `${repoOf(batch)}:${member}`;
+      remaining.delete(memberId);
+    }
     const key = batch.affectedFile || batch.key;
     const headroom = rules.maxMembers - Number(batch.memberCount ?? batch.members?.length ?? 0);
     if (!key || headroom <= 0) continue;

@@ -305,6 +305,16 @@ describe("P3 batching policy", () => {
     assert.deepEqual(plan.singletons, [{ number: 6, id: "default:6", reason: "no same-file, leaf-directory, or age cluster" }]);
   });
 
+  it("does not re-add members already present in an open batch", () => {
+    const plan = planP3Batches({
+      candidates: [finding(5, "commands/orchestrate/a.md"), finding(6, "commands/orchestrate/a.md")],
+      openBatches: [{ number: 99, affectedFile: "commands/orchestrate/a.md", members: [5], memberCount: 1 }],
+      now: Date.parse("2026-01-02T00:00:00Z"),
+    });
+    assert.deepEqual(plan.actions, [{ type: "extend", batch: 99, key: "commands/orchestrate/a.md", members: [6], memberIds: ["default:6"] }]);
+    assert.deepEqual(plan.singletons, []);
+  });
+
   it("keeps leaf-directory and age rules available to every caller", () => {
     const leafPlan = planP3Batches({
       candidates: [1, 2, 3, 4, 5].map((number) => finding(number, `commands/orchestrate/${number}.md`)),

@@ -2005,11 +2005,70 @@ BATCH_PLAN=$(node -e '
     console.log(JSON.stringify({ plan, summary: summarizeP3BatchPlan(plan) }));
   });
 ' "$BATCH_CANDIDATE_REGISTRY_JSON" "$OPEN_BATCHES_JSON")
-# Create or extend batches from `.plan.actions[]`, keep `.plan.singletons` in the registry,
-# and append `.summary` to the Phase 6 per-run report.
+
+# The evaluator is the only batching decision-maker. Execute every returned action before
+# dispatching: remove absorbed members from QUEUED_FINDINGS, retain only its singletons in
+# the registry, and refresh OPEN_BATCHES_JSON after mutations for the next admission event.
+while IFS= read -r ACTION; do
+  ACTION_TYPE=$(echo "$ACTION" | jq -r '.type')
+  ACTION_REPO=$(echo "$ACTION" | jq -r '.repo // "{GH_REPO}"')
+  ACTION_MEMBERS=($(echo "$ACTION" | jq -r '.members[]'))
+  [ "${#ACTION_MEMBERS[@]}" -gt 0 ] || continue
+
+  if [ "$ACTION_TYPE" = "extend" ]; then
+    BATCH_NUMBER=$(echo "$ACTION" | jq -r '.batch')
+    BATCH_BODY=$(gh issue view "$BATCH_NUMBER" -R "$ACTION_REPO" --json body --jq '.body')
+    MEMBER_LINES=""
+    for MEMBER in "${ACTION_MEMBERS[@]}"; do
+      MEMBER_TITLE=$(gh issue view "$MEMBER" -R "$ACTION_REPO" --json title --jq '.title')
+      MEMBER_LINES="${MEMBER_LINES}- [ ] #${MEMBER}: ${MEMBER_TITLE}"$'\n'
+    done
+    UPDATED_BATCH_BODY=$(printf '%s' "$BATCH_BODY" | sed "/<!-- \/FORGE:BATCH_MEMBERS -->/i\\${MEMBER_LINES}")
+    gh issue edit "$BATCH_NUMBER" -R "$ACTION_REPO" --body "$UPDATED_BATCH_BODY"
+    BATCH_ISSUE_NUM="$BATCH_NUMBER"
+  else
+    ACTION_KEY=$(echo "$ACTION" | jq -r '.key' | tr -cd 'A-Za-z0-9._/-')
+    MEMBER_LINES=""
+    for MEMBER in "${ACTION_MEMBERS[@]}"; do
+      MEMBER_TITLE=$(gh issue view "$MEMBER" -R "$ACTION_REPO" --json title --jq '.title')
+      MEMBER_LINES="${MEMBER_LINES}- [ ] #${MEMBER}: ${MEMBER_TITLE}"$'\n'
+    done
+    BATCH_ISSUE_NUM=$(gh issue create -R "$ACTION_REPO" \
+      --title "fix(batch): P3 review findings - ${ACTION_KEY} (batch)" \
+      --label "review-finding,priority:P3,batch" \
+      --body "## Problem
+
+Batch of P3 review findings grouped by the shared ${ACTION_TYPE} policy.
+
+## Member Findings
+
+<!-- FORGE:BATCH_MEMBERS -->
+${MEMBER_LINES}<!-- /FORGE:BATCH_MEMBERS -->
+
+## Acceptance Criteria
+
+- [ ] All member findings addressed or closed as false-positive
+- [ ] Member issues auto-closed with reference to this batch PR on merge
+
+<!-- FORGE:BATCHABLE -->" --json number --jq '.number')
+  fi
+
+  SURFACE_BATCHED_FINDINGS+=("${ACTION_MEMBERS[@]}")
+  QUEUED_FINDINGS=($(printf '%s\n' "${QUEUED_FINDINGS[@]}" | grep -vxF -f <(printf '%s\n' "${ACTION_MEMBERS[@]}") || true))
+  [ -n "$BATCH_ISSUE_NUM" ] && QUEUED_FINDINGS+=("$BATCH_ISSUE_NUM")
+done < <(echo "$BATCH_PLAN" | jq -c '.plan.actions[]')
+
+BATCH_CANDIDATE_REGISTRY_JSON=$(echo "$BATCH_PLAN" | jq -c --argjson candidates "$BATCH_CANDIDATE_REGISTRY_JSON" \
+  '.plan.singletons as $singletons | $candidates | map(select(.id as $id | $singletons | any(.id == $id)))')
+OPEN_BATCHES_JSON=$(gh issue list {GH_FLAG} --state open --label batch --limit 500 --json number,body \
+  --jq '[.[] | {number, affectedFile: (.body | capture("Batch of P3 review findings in \*\*(?<file>[^*]+)\*\*").file? // ""), members: [.body | scan("- \\[ \\] #(?<number>[0-9]+)") | .number | tonumber]}]')
+P3_BATCH_SUMMARIES+=("$(echo "$BATCH_PLAN" | jq -c '.summary')")
 ```
 
+The retired same-file-only loop below is historical reference for issue-body formatting only. It is not executable policy: it must remain disabled so it cannot override evaluator actions or reintroduce the per-cycle scan cap.
+
 ```bash
+if false; then
 # Group QUEUED_FINDINGS by exact affected file, reusing the SAME safety
 # exclusions as phase-1-resolve.md. Both sites go through jq test() (Oniguruma)
 # with identical patterns — NOT grep ERE — so the two batching checks cannot
@@ -2165,6 +2224,7 @@ BATCH_EOF
     echo "Batched ${#CHUNK[@]} findings into #${BATCH_ISSUE_NUM}; members removed from QUEUED_FINDINGS and the DAG."
   done
 done
+fi
 ```
 
 Findings clustered here are replaced by their batch issue in `QUEUED_FINDINGS` (and therefore the DAG, which is built from `QUEUED_FINDINGS` in the dispatch step below) — the individual member issues in `SURFACE_BATCHED_FINDINGS` are never dispatched. Findings that remain ungrouped (fewer than 2 sharing a file in this collection round) stay individually queued below; they retain default-batchable eligibility and will be picked up by the next `/orchestrate` invocation's Phase 1 resolve if a same-file or leaf-directory cluster later forms across runs.
