@@ -198,8 +198,9 @@ function openCodeReviewDispatchContract() {
   return [
     "OpenCode review-dispatch override:",
     "Before applying the workflow's Claude-specific Task/Agent availability check, treat an OpenCode runtime marker (`FORGE_RUNTIME=opencode`, `OPENCODE_SESSION_ID`, `OPENCODE_PID`, or `OPENCODE`) as native capability context and set `DISPATCH_TOOL=task`.",
-    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background: true }`; use `general` for implementation/review and `explore` for read-only discovery.",
-    "Use `background: true` for independent orchestration and review work. OpenCode returns a running task marker immediately and injects a later task-result event into the parent; process each event immediately instead of waiting for the slowest sibling.",
+    "Do not enter the `Neither tool is available` branch solely because Claude's literal `Task` and `Agent` names are absent. Every native task call must use `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`; use `general` for implementation/review and `explore` for read-only discovery.",
+    "Native tasks are foreground by default. Review, quality, remediation, and any other load-bearing child must await its completed task result and propagate its structured `*_RESULT` block before the parent continues. A progress message is not a result. `background: true` is reserved for the Phase 4 OpenCode ready-issue dispatcher, which persists the returned child-session id before handling its completion event.",
+    "For a `work-on/remediate` task, preserve the remediation state transition: after FIXABLE classification, replace `needs-human` with `workflow:in-review`; restore `needs-human` only for a fresh block or an UNFIXABLE policy escalation. Never retain both labels during automated remediation or re-review.",
     "If lowercase native `task` is genuinely absent from the current tool registry, post `FORGE:REVIEW_BLOCKED` and stop; never replace the required isolated review with inline work or another controller.",
   ].join("\n");
 }
@@ -225,7 +226,7 @@ function openCodeBuildStageContract(forgeHome) {
     "For B5, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + implementPath + "` with the exact build arguments, stage changes, and return only `IMPLEMENT_RESULT`. Wait for the completed task result before continuing.",
     "Parse `IMPLEMENT_RESULT` from the completed B5 task. Continue to B6 only for `COMPLETE` or `ALREADY_DONE`; preserve the workflow's existing terminal handling for every other status.",
     "For B6, call native `task` with `subagent_type: \"general\"` and `background: false`. Its prompt must load and execute `" + validatePath + "` with the worktree and B5 changed-file list, then return only `VALIDATE_RESULT`. Wait for completion before the acceptance gate.",
-    "This foreground requirement applies only to these serialized build stages. Keep independent orchestration, discovery, and review tasks at `background: true`.",
+    "Foreground is the native default for every load-bearing child. Only the Phase 4 OpenCode ready-issue dispatcher uses `background: true`.",
   ].join("\n");
 }
 
@@ -254,7 +255,7 @@ export function renderOpenCodeCommand({ description, forgeHome, command }) {
     "OpenCode runtime mapping:",
     "",
     "- `Skill(skill=\"x\", args=\"y\")` means use the registered native OpenCode skill named `" + nativeSkillExpression + "` in the current context with the exact arguments. Its authoritative source is `" + commandsPath + "/${x.replaceAll(\":\", \"/\")}.md`. If the native skill or source is unavailable, stop with `FORGE_OPENCODE_CAPABILITY_ERROR` and an actionable path; never invoke `forgedock run-issue`, `npx forgedock run-issue`, or recursive `opencode run` as a fallback.",
-    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Use `background: true` for independent work; preserve explicit `background: false` when the workflow must await a child result. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, resume by task ID when requested, and never inline a required isolated review.",
+    "- `Task(...)` or a permitted `Agent(...)` means use OpenCode's `task` tool with a top-level argument object shaped like `{ description: \"...\", prompt: \"...\", subagent_type: \"general\"|\"explore\", background }`. `subagent_type` is mandatory: map Claude `general-purpose` to `general` for implementation/review and `codebase-explorer` to `explore` for read-only discovery. If the source omits a type, set `subagent_type: \"general\"` before calling the tool; never emit a call containing only `description` and `prompt`. Omitted `background` means foreground and the parent must await the result. Set `background: true` only for Phase 4 OpenCode ready-issue dispatch after persisting its returned child-session id. Unsupported types must stop with `FORGE_OPENCODE_CAPABILITY_ERROR`. Preserve requested isolation and parallelism, and never inline a required isolated review.",
     openCodeReviewDispatchContract(),
     "- Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.",
     "- OpenCode injects `FORGE_HOME` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.",
@@ -291,7 +292,7 @@ Do not invoke \`forgedock run-issue\`, \`npx forgedock run-issue\`, or recursive
 OpenCode runtime mapping:
 
 - \`Skill(skill="x", args="y")\` means lazily read \`${commandsPath}/\${x.replaceAll(":", "/")}.md\` and execute that workflow in the current context with the exact arguments. Colon separators become slash separators; existing slash separators remain unchanged. This matches Claude Code Skill's in-conversation loading; it is not a reason to spawn a subagent.
-- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool with \`{ description, prompt, subagent_type, background }\`. Translate \`general-purpose\` to \`general\` and \`codebase-explorer\` to \`explore\`; never omit \`subagent_type\`. Resume by task ID when requested. A successful background call returns \`<task id=... state="running">\`; a later \`state="completed"\` or \`state="error"\` task result is the completion event for that one issue. Do not wait for all tasks before processing an event.
+- \`Task(...)\` or a permitted \`Agent(...)\` means use OpenCode's \`task\` tool with \`{ description, prompt, subagent_type, background }\`. Translate \`general-purpose\` to \`general\` and \`codebase-explorer\` to \`explore\`; never omit \`subagent_type\`. Omitted \`background\` is foreground and must be awaited. Only Phase 4 OpenCode ready-issue dispatch sets \`background: true\`; it persists the returned child-session id, then processes each later \`state="completed"\` or \`state="error"\` event independently.
 - Map Claude tool names to the corresponding OpenCode tools. Do not skip a step merely because its source uses Claude-style invocation syntax.
 - OpenCode injects \`FORGE_HOME\` into shell commands through the ForgeDock plugin. GitHub labels, FORGE annotations, worktree isolation, and terminal-state rules remain unchanged.
 - If a Claude-version, Claude-transcript, or Claude-cache rule has no OpenCode equivalent, ignore only that runtime-specific optimization and preserve the workflow invariant it was intended to protect.
@@ -345,9 +346,10 @@ function normalizeTaskArgs(args) {
   }
 
   args.subagent_type = subagentType
-  // Serialized phases use an awaited child task. Preserve their explicit
-  // foreground request; independent calls retain the background default.
-  if (args.background !== false && process.env[BACKGROUND_FLAG] !== "false") args.background = true
+  // A parent may only complete after load-bearing child work completes. The
+  // orchestration dispatcher is the sole caller that opts into background work.
+  if (args.background === undefined || args.background === null) args.background = false
+  if (process.env[BACKGROUND_FLAG] === "false") args.background = false
 }
 `;
   return `${PLUGIN_SENTINEL}

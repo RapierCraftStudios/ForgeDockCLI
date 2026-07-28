@@ -203,6 +203,15 @@ If `ATTRIBUTION_PR_FOOTER` is `true`, append the following footer to the PR body
 
 ### R2C: Create PR
 
+For a batch issue, construct a non-closing reference line from `BATCH_MEMBERS` before creating the PR:
+
+```bash
+BATCH_MEMBER_REFS=""
+if [ "${IS_BATCH:-0}" = "1" ]; then
+  BATCH_MEMBER_REFS=$(printf 'Refs #%s\n' "${BATCH_MEMBERS[@]}")
+fi
+```
+
 ```bash
 gh pr create {GH_FLAG} \
   --base {PR_BASE} \
@@ -223,6 +232,8 @@ gh pr create {GH_FLAG} \
 ---
 
 Closes #{NUMBER}
+${BATCH_MEMBER_REFS}
+**Batch member disposition**: The batch issue is the code unit being closed. Referenced members that require human or operator action remain open as a split outcome.
 
 **Implementation branch**: \`{BRANCH}\`
 **Base**: \`{PR_BASE}\`
@@ -277,6 +288,22 @@ Invoke the review command:
 ```
 Skill(skill="review-pr", args="{PR_NUMBER} --auto-merge --issue {NUMBER} --base {PR_BASE} --gh-flag {GH_FLAG}")
 ```
+
+**OpenCode joined-child contract**: When `FORGE_RUNTIME=opencode` (or an OpenCode runtime marker is present), invoke this load-bearing review through one native foreground `task` instead of treating the `Skill(...)` line as an asynchronous handoff:
+
+```
+if DRY_RUN=true:
+  record "Would invoke the foreground review task for PR #{PR_NUMBER}."
+else:
+  task(
+    description="Review PR #{PR_NUMBER}",
+    subagent_type="general",
+    background=false,
+    prompt="Load commands/review-pr.md and execute it for PR {PR_NUMBER} with --auto-merge --issue {NUMBER} --base {PR_BASE} --gh-flag {GH_FLAG}. Return only the structured REVIEW_RESULT block after the review reaches its outcome."
+  )
+```
+
+Wait for that task's completed result before Phase R4. Propagate its `REVIEW_RESULT` as this module's child state; do not return `REVIEW_RESULT`, report progress, release an orchestrator slot, or begin close work while the child is running. If the child errors or returns no parseable `REVIEW_RESULT`, return `REVIEW_RESULT: status: BLOCKED` with the child failure as the blocker. The normal `Skill(...)` invocation above remains the non-OpenCode path.
 
 /review-pr handles: full domain-agent review → post findings as separate issues (non-blocking) → merge the PR → close the issue → clean up worktree.
 

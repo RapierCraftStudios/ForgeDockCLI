@@ -1,4 +1,5 @@
 ---
+
 install: core
 ---
 <!-- SPDX-FileCopyrightText: Copyright (c) RapierCraft Studios -->
@@ -208,6 +209,7 @@ Sweep (Step 4F.2.5) once the batch is no longer fully gated.
 | #{F} | {title} | original | ⏸ Awaiting Merge | #{PR} | staging |
 | #{E} | {title} | original | ⏭ Skipped (dep) | — | — |
 | #{G} | {title} | original | 🔗 Blocked-on-Merge (gated by #{PRED}) | — | — |
+| #{H} | {title} | original | ⚠ Review Panel Degraded | #{PR} | {target} |
 
 `⏸ Awaiting Merge` (`workflow:awaiting-merge`) is structurally distinct from `⚠ Blocked`
 (`needs-human`): a Blocked row means the pipeline hit something it cannot resolve on its own
@@ -222,6 +224,17 @@ also distinct from `⏭ Skipped (dep)`, which means the predecessor `FAILED` out
 was abandoned. A Blocked-on-Merge row means the work is queued and will auto-dispatch the instant
 the gating predecessor's PR merges — no manual `/orchestrate` re-run required. Never render a
 blocked-on-human-merge dependent as `⏭ Skipped (dep)`.
+
+### Degraded Review Panels
+
+{IF any PR reviewed during this batch has the `review-degraded` label:}
+| Issue | PR | Target | Required action |
+|-------|----|--------|-----------------|
+| #{NUM} | #{PR} | {target} | Re-run the complete isolated review panel in a fresh session |
+
+These PRs are not eligible to merge or deploy. A dispatch-pool failure produced an incomplete panel, so no inline or partial-panel verdict is accepted.
+
+{ELSE: omit this section entirely.}
 
 {IF `MERGE_READY_PRS` (Step 6A.5) is non-empty:}
 
@@ -286,12 +299,14 @@ current session's live wake pick them up automatically if it is still running).
 {list of cosmetic deferred issue numbers and titles}
 
 ### Summary
+- **Knowledge Gists**: {IF FORGE_GIST_CAPABLE == "false": "Skipped - unavailable for the batch authentication (informational)." ELSE: "Available."}
 - **Investigations**: {N} completed, spawned {M} new issues
 - **Review findings**: {N} spawned, {M} resolved in-batch, {K} swept, {J} deferred (cosmetic), {L} deferred (gen2), {IDLE_POLICY_DEFERRED_COUNT} deferred (idle policy, forge#1814)
 - **Succeeded**: {N} issues resolved (implementation + sweep)
 - **Failed**: {N} issues need attention
 - **Merge-ready**: {#MERGE_READY_PRS[@]:-0} PRs awaiting only a human merge (see "Merge-Ready" section above)
 - **Blocked-on-merge**: {#BLOCKED_ON_MERGE[@]:-0} issues queued behind a human-gated predecessor, will auto-dispatch on merge (see "Blocked-on-Merge" section above)
+- **Degraded review panels**: {N} PRs require a fresh full-panel re-review before merge/deploy
 - **Skipped**: {N} issues (dependency failures)
 
 ### Post-Batch Cleanup
@@ -325,6 +340,9 @@ current session's live wake pick them up automatically if it is still running).
 | Findings deferred — idle policy (forge#1814) | {IDLE_POLICY_DEFERRED_COUNT} (batch fully human-gated at defer time — see Step 4B item 6.7) |
 | P3 findings clubbed (surface-area batching, forge#1818) | {SURFACE_BATCH_COUNT:-0} batch(es) covering {#SURFACE_BATCHED_FINDINGS[@]:-0} finding(s) — see Step 4C |
 | Findings deferred — token budget (forge#1858) | {#TOKEN_DEFERRED[@]:-0} (batch spend {BATCH_TOKEN_SPEND:-0}/{TOKEN_BUDGET:-uncapped} tokens — see Step 4C) |
+| **Cascade amplification** | **{FINDINGS_SPAWNED:-0}/{MERGED_UNITS:-0} = {AMPLIFICATION_RATIO:-0} findings per merged unit** |
+| Amplification composition | {#REFINEMENT_FINDINGS[@]:-0} same-lineage refinements; {#NEW_SURFACE_FINDINGS[@]:-0} new-surface findings |
+| Amplification bound | {CASCADE_MAX_AMPLIFICATION:-off}; {#AMPLIFICATION_DEFERRED[@]:-0} same-lineage refinements deferred to completion sweep |
 | Competing recommendations reconciled (Phase 2.5) | {RECONCILED_COUNT} (investigation plans arbitrated in place + serialized) |
 | Findings validated | {N} |
 | False positives | {N} ({%}) |
@@ -334,11 +352,16 @@ current session's live wake pick them up automatically if it is still running).
 | Actual spend (best-effort telemetry) | ${ACTUAL_SPEND:-—} |
 | Issues deferred (budget ceiling) | {#DEFERRED_BUDGET_ISSUES[@]:-0} |
 | ε-reserve issued (no-prior dispatch) | {EPSILON_DISPATCHED:-no} |
+| Top-level workers dispatched | ${TOP_LEVEL_DISPATCH_TOTAL:-0} |
+| Subagent spawns planned (8 per worker) | ${PLANNED_SUBAGENT_SPAWNS:-0} |
+| Subagent spawns observed | ${OBSERVED_SUBAGENT_SPAWNS:-unavailable} |
 | **Value-weighted throughput** | **{VALUE_THROUGHPUT:-—} value-pts/USD** |
 
 `value-weighted throughput` = Σ(priority_weight × danger_zone_weight) for **merged** issues ÷ actual spend (USD). A higher value means more high-priority issues were resolved per dollar. Trend this across runs via `/pipeline-health` to measure the economic scheduling ROI. <!-- Added: forge#1743 -->
 
 `P3 findings clubbed` and `Findings deferred — token budget` are a DIFFERENT mechanism from the `$`-denominated `Budget limit`/`Projected spend`/`Actual spend`/`Issues deferred (budget ceiling)` rows above (forge#1743, opt-in `--budget N` flag, gates the *original* issue dispatch order). The token-budget row reads the always-on, token-denominated ceiling that scopes ONLY to Step 4C's review-finding cascade dispatch (forge#1858); `SURFACE_BATCH_COUNT` and `SURFACE_BATCHED_FINDINGS` are populated by the same Step 4C surface-area-batching block (forge#1818) that clubs P3 findings sharing a file/leaf-directory into one dispatched pipeline. Both degrade gracefully to `0`/`uncapped` when the batch had no review findings or ran with defaults. <!-- Added: forge#1858 -->
+
+**Cascade amplification detail**: render one row per `FINDINGS_BY_SOURCE_PR` entry: `| PR #{source} | {finding count} | {refinement count} | {new-surface count} |`. A ratio at or above 1.0 means the batch is not reducing its open-work count through merges alone; it does **not** mean the findings are low-value. Include any convergence warning and state that the default `max_amplification: off` never defers findings. When an opt-in bound deferred a refinement, list it under Completion Sweep as re-evaluable rather than silently omitting it.
 
 **Compute value-weighted throughput** (populate before rendering the table):
 
@@ -433,4 +456,3 @@ the Summary section above. `BATCH_ELAPSED` is the wall-clock duration of the orc
 (Step 6B `Duration`), not the sum of per-issue elapsed times.
 
 ---
-

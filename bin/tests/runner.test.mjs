@@ -45,6 +45,7 @@ import {
   renderDryRun,
   renderSummaryCard,
   resolveConfiguredDefaultModel,
+  resolveConfiguredCliTimeout,
   runCommand,
   isClaudeCliAvailable,
   CLI_PROBE_OUTPUT_SENTINEL,
@@ -1071,6 +1072,84 @@ describe("resolveConfiguredDefaultModel", () => {
     mkdirSync(join(dir, "forge.yaml"), { recursive: true });
     assert.doesNotThrow(() => resolveConfiguredDefaultModel(dir));
     assert.equal(resolveConfiguredDefaultModel(dir), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI timeout resolution (issue #2866 — forge.yaml pipeline.cli_timeout_minutes)
+// ---------------------------------------------------------------------------
+
+describe("CLI timeout resolution", () => {
+  let timeoutTmp;
+  let originalTimeout;
+
+  before(() => {
+    timeoutTmp = mkdtempSync(join(os.tmpdir(), "forgedock-cli-timeout-cfg-"));
+    originalTimeout = process.env.FORGEDOCK_CLI_TIMEOUT_MS;
+    delete process.env.FORGEDOCK_CLI_TIMEOUT_MS;
+  });
+
+  after(() => {
+    rmSync(timeoutTmp, { recursive: true, force: true });
+    if (originalTimeout === undefined) {
+      delete process.env.FORGEDOCK_CLI_TIMEOUT_MS;
+    } else {
+      process.env.FORGEDOCK_CLI_TIMEOUT_MS = originalTimeout;
+    }
+  });
+
+  function captureTimeout(cwd) {
+    let timeout;
+    runCliBackend({
+      spec: loadCommandSpec(COMMANDS_DIR, "work-on"),
+      userMessage: "Execute: /work-on 2866",
+      args: ["2866"],
+      cwd,
+      logger: { log: () => {} },
+      spawnFn: (_bin, _args, options) => {
+        timeout = options.timeout;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+    return timeout;
+  }
+
+  it("uses pipeline.cli_timeout_minutes from forge.yaml", () => {
+    const dir = join(timeoutTmp, "configured");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "forge.yaml"), "pipeline:\n  cli_timeout_minutes: 20\n");
+
+    assert.equal(resolveConfiguredCliTimeout(dir), 20 * 60 * 1000);
+    assert.equal(captureTimeout(dir), 20 * 60 * 1000);
+  });
+
+  it("gives FORGEDOCK_CLI_TIMEOUT_MS precedence over forge.yaml", () => {
+    const dir = join(timeoutTmp, "env-precedence");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "forge.yaml"), "pipeline:\n  cli_timeout_minutes: 20\n");
+    process.env.FORGEDOCK_CLI_TIMEOUT_MS = "12345";
+
+    try {
+      assert.equal(captureTimeout(dir), 12345);
+    } finally {
+      delete process.env.FORGEDOCK_CLI_TIMEOUT_MS;
+    }
+  });
+
+  it("ignores zero, negative, and non-numeric configured timeouts", () => {
+    for (const [name, value] of [["zero", "0"], ["negative", "-1"], ["text", "abc"]]) {
+      const dir = join(timeoutTmp, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "forge.yaml"), `pipeline:\n  cli_timeout_minutes: ${value}\n`);
+      assert.equal(resolveConfiguredCliTimeout(dir), null);
+      assert.equal(captureTimeout(dir), 60 * 60 * 1000);
+    }
+  });
+
+  it("uses the one-hour default without environment or project configuration", () => {
+    const dir = join(timeoutTmp, "default");
+    mkdirSync(dir, { recursive: true });
+    assert.equal(captureTimeout(dir), 60 * 60 * 1000);
   });
 });
 

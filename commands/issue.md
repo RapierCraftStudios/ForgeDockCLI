@@ -13,7 +13,7 @@ You create GitHub issues with the exact structure the `/work-on` pipeline expect
 
 `/issue` is the structured create-hook for issue creation across the pipeline — it enforces the canonical template, reads code before drafting, runs dedup, and validates mandatory sections. Because those checks are deterministic, `/issue` **creates the issue by default once they pass** — it does not wait for a human to approve the draft. Pass `--dry-run` to review the draft without creating anything (see Argument Parsing below).
 
-`/issue` also accepts a **programmatic invocation form** for callers that have already composed a title, body, labels, and (optionally) a milestone — e.g. `Skill(skill="issue", args="--title \"fix: ...\" --body-file \"$(mktemp)\" --label bug --label P2")` (the caller writes the body to that path before invoking). This form skips the free-text parsing (Phase 1) and LLM drafting (Phase 3) entirely, but still runs the same dedup and body-validation correctness gates as the interactive path. See **Programmatic Invocation Contract** below — in particular, `--body-file` callers MUST use a `mktemp`-created path, never a fixed literal like `/tmp/body.md`; concurrent orchestrated agents share this host's `/tmp`, and a fixed path can be clobbered mid-flight by another agent (forge#2198).
+`/issue` also accepts a **programmatic invocation form** for callers that have already composed a title, body, labels, and (optionally) a milestone — e.g. `Skill(skill="issue", args="--title \"fix: ...\" --body-file \"$(mktemp)\" --label bug --label P2")` (the caller writes the body to that path before invoking). This form skips the free-text parsing (Phase 1) and LLM drafting (Phase 3) entirely, but still runs the same dedup and body-validation correctness gates as the interactive path. See **Programmatic Invocation Contract** below — in particular, `--body-file` callers MUST use a `mktemp`-created path, never hand-roll a path or use a fixed literal like `/tmp/body.md`; concurrent orchestrated agents share this host's `/tmp`, and a fixed path can be clobbered mid-flight by another agent (forge#2198).
 
 **Agent model policy**: `model: "{DEFAULT_MODEL}"` — resolved from forge.yaml `agents.default_model`, else "sonnet" (standard tier). Fallback: `model: "opus"` if rate-limited. Feature gate: pass `effort` in Task/Skill spawns only on Claude Code >= 2.1.154.
 **NEVER use plan mode (EnterPlanMode).**
@@ -184,7 +184,7 @@ For callers that have already composed a title, body, labels, and (optionally) a
 
 If `--title` is present but neither `--body` nor `--body-file` is supplied, or both are supplied, this is a usage error: print `ERROR: programmatic mode requires exactly one of --body or --body-file` and STOP — do not fall through to Phase 2D or Phase 4B.
 
-**`--body-file` path requirement (MANDATORY for the caller)**: The path passed to `--body-file` MUST come from `mktemp` (e.g. `BODY_FILE="$(mktemp)"`), never a fixed literal such as `/tmp/body.md` or `/tmp/issue.json`. Concurrent orchestrated agents (`/orchestrate` dispatches up to `orchestration.max_concurrent` agents, default 12) share this host's `/tmp` — a fixed filename collides across agents, and a second agent's write to the same path can silently corrupt the first agent's staged content before it is read. `mktemp` gives every caller a collision-free path at effectively zero cost. This applies to every `--body-file` caller across the pipeline (`commands/work-on.md`, `commands/work-on/decompose.md`, `commands/review-pr*.md`, `commands/orchestrate/phase-1-resolve.md`, and all others) — all current callers already comply; this is the stated contract that keeps it that way (forge#2198).
+**`--body-file` path requirement (MANDATORY for the caller)**: The path passed to `--body-file` MUST come from `mktemp` (e.g. `BODY_FILE="$(mktemp)"`); never hand-roll a temp path. Never write a temp file to a single-segment root path such as `/tmp_invbody_31076.txt`: Claude Code treats removing it as dangerous and requires an explicit approval that bypass mode cannot clear, hanging unattended runs. Do not use fixed literals such as `/tmp/body.md` or `/tmp/issue.json`, either. Concurrent orchestrated agents (`/orchestrate` dispatches up to `orchestration.max_concurrent` agents, default 12) share this host's `/tmp` — a fixed filename collides across agents, and a second agent's write to the same path can silently corrupt the first agent's staged content before it is read. `mktemp` gives every caller a collision-free path at effectively zero cost. Safe: `BODY_FILE="$(mktemp)"`. Unsafe: `/tmp_invbody_31076.txt` (a missing slash that creates a root-level path) and `/tmp/body.md` (a fixed path). This applies to every `--body-file` caller across the pipeline (`commands/work-on.md`, `commands/work-on/decompose.md`, `commands/review-pr*.md`, `commands/orchestrate/phase-1-resolve.md`, and all others) — all current callers already comply; this is the stated contract that keeps it that way (forge#2198, forge#2855).
 
 **Fail-loud read ordering (the defensive mechanism against a clobbered body-file)**: `/issue` reads `$PROGRAMMATIC_BODY_FILE` exactly once, into memory, immediately below — it never re-reads the file later in the pipeline. This is deliberate: combined with a `mktemp`-unique path, it minimizes the window in which another process could overwrite the file between the caller's write and this read to effectively nil (no other agent has any reason to target a `mktemp`-generated path). If the file is missing or unreadable at read time, the check below fails loudly (`exit 1`) rather than silently proceeding with an empty or partial body — a clobbered/missing body-file is surfaced as an error, not pushed to GitHub.
 
@@ -354,11 +354,14 @@ DEDUP_EXIT=$?
 if [ "$DEDUP_EXIT" -eq 1 ]; then
   echo "Near-duplicate detected: $DEDUP_RESULT"
   echo "Existing issue found — do NOT create a new one."
-  # STOP here and report to user (see handling rules below)
+  DEDUP_NUMBER=$(printf '%s\n' "$DEDUP_RESULT" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
+  [ -n "$DEDUP_NUMBER" ] || { echo "ERROR: dedup STOP returned no issue number." >&2; exit 2; }
+  echo "ISSUE_CREATE_RESULT:DEDUP number=${DEDUP_NUMBER}"
+  exit 1  # STOP here and report the explicit dedup result to the caller
 elif [ "$DEDUP_EXIT" -eq 2 ]; then
   echo "Dedup check usage error: $DEDUP_RESULT"
   echo "Do NOT proceed to issue creation — fix the invocation and retry."
-  # STOP here — do not fall through to gh issue create
+  exit 2  # STOP here — do not fall through to issue creation
 fi
 ```
 
@@ -639,56 +642,84 @@ Re-run without --dry-run to create this issue.
 
 ### 4B: Create the issue
 
+**Never use `gh issue create` for this step.** GitHub CLI can report success with
+empty output when GitHub rejects content creation with a secondary-rate-limit 403.
+Use `gh api --method POST`, which preserves that API failure, and require a unique
+token to survive a read-back before treating the issue as created. The token is
+generated by this caller, not inferred from a title search, so a similarly titled
+existing issue cannot be mistaken for the new one.
+
 ```bash
-gh issue create {GH_FLAG} \
-  --title "{TITLE}" \
-  --label "{PRIORITY_LABEL},{CATEGORY_LABEL}" \
-  --body "$(cat <<'ISSUE_EOF'
-{FULL_BODY}
-ISSUE_EOF
-)"
+CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+CREATE_BODY="${FULL_BODY}
+
+<!-- issue-create-token:${CREATE_TOKEN} -->"
+CREATE_RESPONSE=$(gh api "repos/${GH_REPO}/issues" --method POST \
+  -f title="{TITLE}" -f body="$CREATE_BODY" \
+  -f 'labels[]={PRIORITY_LABEL}' -f 'labels[]={CATEGORY_LABEL}') || {
+  echo "ERROR: GitHub rejected issue creation; no issue was created." >&2
+  exit 1
+}
+NEW_NUMBER=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
+[ -n "$NEW_NUMBER" ] || { echo "ERROR: issue creation returned no issue number." >&2; exit 1; }
+CREATED_BODY=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json body --jq '.body') || exit 1
+printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}" || {
+  echo "ERROR: issue #${NEW_NUMBER} did not contain this create token; refusing to report success." >&2
+  exit 1
+}
+if [ -n "${MILESTONE_TITLE:-}" ]; then
+  [ "${DRY_RUN:-false}" != "true" ] || { echo "ERROR: refusing milestone edit during dry run." >&2; exit 1; }
+  gh issue edit "$NEW_NUMBER" {GH_FLAG} --milestone "$MILESTONE_TITLE" || exit 1
+fi
 ```
 
-If milestone was identified:
-```bash
-gh issue create {GH_FLAG} \
-  --title "{TITLE}" \
-  --label "{PRIORITY_LABEL},{CATEGORY_LABEL}" \
-  --milestone "{MILESTONE_TITLE}" \
-  --body "$(cat <<'ISSUE_EOF'
-{FULL_BODY}
-ISSUE_EOF
-)"
-```
+**Programmatic mode variable mapping**: `{TITLE}` = `$PROGRAMMATIC_TITLE`; `{FULL_BODY}` = `$PROGRAMMATIC_BODY` (post-Phase-3F); the milestone branch is used iff `$PROGRAMMATIC_MILESTONE` is non-empty, with `{MILESTONE_TITLE}` = `$PROGRAMMATIC_MILESTONE`. This is the same verified REST-create path the interactive mode uses — no new command surface, only a new source for the variables.
 
-**Programmatic mode variable mapping**: `{TITLE}` = `$PROGRAMMATIC_TITLE`; `{FULL_BODY}` = `$PROGRAMMATIC_BODY` (post-Phase-3F); the milestone branch is used iff `$PROGRAMMATIC_MILESTONE` is non-empty, with `{MILESTONE_TITLE}` = `$PROGRAMMATIC_MILESTONE`. This is the same `gh issue create` call the interactive path uses — no new command surface, only a new source for the variables.
-
-`{PRIORITY_LABEL},{CATEGORY_LABEL}` in the interactive-mode template above stands for `PROGRAMMATIC_LABELS[@]`, but the actual `--label` flag(s) passed to `gh issue create` are built as one repeatable `--label` per array element — NOT a single comma-joined string. `gh issue create --label` itself comma-splits its argument, so joining `PROGRAMMATIC_LABELS[@]` with `,` and passing it as one value would incorrectly fragment any individual label that contains a literal comma (see forge#2097). `--label` is a repeatable flag — passing it multiple times accumulates labels without any join/split ambiguity. Zero labels is valid and must omit `--label` entirely (an empty `--label ""` would fail):
+`{PRIORITY_LABEL},{CATEGORY_LABEL}` in the interactive-mode template above stands for `PROGRAMMATIC_LABELS[@]`. REST API labels are passed as repeated `labels[]` fields, so labels remain distinct and zero labels need no field:
 
 ```bash
-LABEL_FLAG=()
+CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+CREATE_BODY="${PROGRAMMATIC_BODY}
+
+<!-- issue-create-token:${CREATE_TOKEN} -->"
+API_LABELS=()
 for label in "${PROGRAMMATIC_LABELS[@]}"; do
-  LABEL_FLAG+=(--label "$label")
+  API_LABELS+=(-f "labels[]=$label")
 done
-
+CREATE_RESPONSE=$(gh api "repos/${GH_REPO}/issues" --method POST \
+  -f title="$PROGRAMMATIC_TITLE" -f body="$CREATE_BODY" "${API_LABELS[@]}") || exit 1
+NEW_NUMBER=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
+[ -n "$NEW_NUMBER" ] || { echo "ERROR: issue creation returned no issue number." >&2; exit 1; }
+CREATED_BODY=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json body --jq '.body') || exit 1
+printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}" || {
+  echo "ERROR: issue #${NEW_NUMBER} did not contain this create token; refusing to report success." >&2
+  exit 1
+}
 if [ -n "$PROGRAMMATIC_MILESTONE" ]; then
-  gh issue create {GH_FLAG} --title "$PROGRAMMATIC_TITLE" "${LABEL_FLAG[@]}" \
-    --milestone "$PROGRAMMATIC_MILESTONE" --body "$PROGRAMMATIC_BODY"
-else
-  gh issue create {GH_FLAG} --title "$PROGRAMMATIC_TITLE" "${LABEL_FLAG[@]}" \
-    --body "$PROGRAMMATIC_BODY"
+  [ "${DRY_RUN:-false}" != "true" ] || { echo "ERROR: refusing milestone edit during dry run." >&2; exit 1; }
+  gh issue edit "$NEW_NUMBER" {GH_FLAG} --milestone "$PROGRAMMATIC_MILESTONE" || exit 1
 fi
 ```
 
 ### 4C: Post-creation verification
 
 ```bash
-# Verify the issue was created correctly
-ISSUE_URL=$(gh issue view {NEW_NUMBER} {GH_FLAG} --json url --jq '.url')
+# The mandatory create-token read-back in 4B is the success gate. This read
+# obtains report metadata only; it must not replace that gate with a title search.
+ISSUE_URL=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json url --jq '.url')
 LABELS=$(gh issue view {NEW_NUMBER} {GH_FLAG} --json labels --jq '[.labels[].name] | join(", ")')
 echo "Created: ${ISSUE_URL}"
 echo "Labels: ${LABELS}"
+echo "ISSUE_CREATE_RESULT:CREATED number=${NEW_NUMBER} url=${ISSUE_URL}"
 ```
+
+### Content-Creation Rule
+
+Apply the same fail-closed pattern to `gh issue comment`, `gh pr comment`, and
+`gh pr create`: use `gh api --method POST`, include a caller-generated token in
+the submitted body, capture the returned object ID/number, then GET that exact
+object and assert the token is present. Empty output, a missing ID, or a failed
+read-back is a hard error, never a successful no-op or a search-indexing retry.
 
 ### 4C.5: Body Validation (MANDATORY)
 

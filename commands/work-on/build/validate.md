@@ -109,6 +109,8 @@ if iteration == max_iterations AND result != PASS AND blocker_findings not empty
 Skill("quality-gate", args="{CHANGED_FILES} --worktree {WORKTREE_PATH}")
 ```
 
+**Timeout handling**: The quality-gate's executable checks carry their own explicit timeouts; a `QUALITY-GATE-TIMEOUT` result is a failed gate iteration. Record it as HIGH, do not apply speculative fixes, and proceed to V1-FAIL immediately (post the failure comment, add `needs-human`, return `GATE_PASSED: false`). Do not retry a timed-out check. A wall-time timeout for the in-context `Skill(...)` invocation itself requires native runtime support and is not claimed by this workflow.
+
 **Rules**:
 - Re-run after EVERY fix pass — never trust that fixes resolved findings without verification
 - Each iteration re-scans ALL changed files — fixes can introduce new issues
@@ -138,6 +140,24 @@ Run after quality gate passes. All tool commands are read from `forge.yaml → v
 **Track skipped checks** — initialize before any check runs:
 ```bash
 SKIPPED_CHECKS=""
+
+# Verification commands are project configuration; bound each one so a stalled
+# formatter, typechecker, or build cannot block validation indefinitely.
+# Set FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS to override the 120-second default.
+run_verification_command() {
+    local label="$1" command="$2"
+    local timeout_seconds="${FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS:-120}"
+    if ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "VERIFY-CONFIG | HIGH | timeout | FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS must be a positive integer (got '$timeout_seconds')"
+        return 2
+    fi
+    timeout "$timeout_seconds" bash -c "$command" 2>&1
+    local command_exit=$?
+    if [ "$command_exit" -eq 124 ]; then
+        echo "VERIFY-TIMEOUT | HIGH | $label | timed out after ${timeout_seconds}s"
+    fi
+    return "$command_exit"
+}
 ```
 
 **Python**:
@@ -146,7 +166,7 @@ cd {WORKTREE_PATH}
 
 PYTHON_FORMAT=$(yq '.verification.commands.python.format // ""' forge.yaml 2>/dev/null || echo '')
 if [ -n "$PYTHON_FORMAT" ]; then
-    eval "$PYTHON_FORMAT" 2>&1
+    run_verification_command "python.format" "$PYTHON_FORMAT"
 else
     echo "SKIPPED — python.format not configured in verification.commands"
     SKIPPED_CHECKS="${SKIPPED_CHECKS:+$SKIPPED_CHECKS, }python.format"
@@ -166,18 +186,19 @@ TS_TYPECHECK=$(yq '.verification.commands.typescript.typecheck // ""' forge.yaml
 TS_BUILD=$(yq '.verification.commands.typescript.build // ""' forge.yaml 2>/dev/null || echo '')
 
 if [ -n "$TS_FORMAT" ]; then
-    eval "$TS_FORMAT" 2>&1
+    run_verification_command "typescript.format" "$TS_FORMAT"
 else
     echo "SKIPPED — typescript.format not configured in verification.commands"
     SKIPPED_CHECKS="${SKIPPED_CHECKS:+$SKIPPED_CHECKS, }typescript.format"
 fi
 
 if [ -n "$TS_TYPECHECK" ]; then
-    eval "$TS_TYPECHECK" 2>&1
+    run_verification_command "typescript.typecheck" "$TS_TYPECHECK"
     TS_EXIT=$?
 elif [ -n "$TS_BUILD" ]; then
-    eval "$TS_BUILD" 2>&1 | tail -30
+    TS_OUTPUT=$(run_verification_command "typescript.build" "$TS_BUILD")
     TS_EXIT=$?
+    echo "$TS_OUTPUT" | tail -30
 else
     echo "SKIPPED — typescript.typecheck and typescript.build not configured in verification.commands"
     SKIPPED_CHECKS="${SKIPPED_CHECKS:+$SKIPPED_CHECKS, }typescript.typecheck/build"

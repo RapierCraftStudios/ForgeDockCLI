@@ -252,6 +252,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Diff the PR head, not GitHub's synthetic merge commit. The latter
+          # contains newer base-branch changes that are unrelated to this PR.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Check commands/ for unguarded side-effect verbs
         run: |

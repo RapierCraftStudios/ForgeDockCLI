@@ -1417,7 +1417,7 @@ async function relinkAndHint() {
   // version-check path), so wiring it here covers "refreshed after every
   // successful update" without duplicating the call at each branch. Note:
   // this is NOT reached by install's already-managed-active short-circuit
-  // (that path calls statusScreen(), never relinkAndHint()) — see the
+  // (that path is also used by managed-active install) — see the
   // writeInstallReceipt() JSDoc in journey.mjs for the full picture.
   await writeInstallReceipt(c, { forged });
   await refreshManagedOpenCodeAdapter();
@@ -2416,6 +2416,16 @@ async function doctor(fix = false) {
                 broken++;
                 brokenLinks.push(rel);
                 symlinkOk = false;
+              } else {
+                try {
+                  // readlink() only validates the stored target. Opening the
+                  // link also catches platform-specific traversal failures.
+                  readFileSync(tgt);
+                } catch {
+                  broken++;
+                  brokenLinks.push(`${rel} (unreadable — link resolves but cannot be traversed)`);
+                  symlinkOk = false;
+                }
               }
             } else {
               // Regular file — copy-mode install (Windows without Developer Mode).
@@ -3266,6 +3276,7 @@ function help() {
  *   FORGEDOCK_BACKEND      Default backend ("cli"|"api"|"auto") when --backend is omitted.
  *   FORGEDOCK_MODEL        Default model id when --model is omitted.
  *   FORGEDOCK_CLI_TIMEOUT_MS  Wall-clock timeout (ms) for the cli backend invocation.
+ *                              Overrides forge.yaml pipeline.cli_timeout_minutes.
  *   FORGEDOCK_SHELL        Override the shell used by run_bash / the cli backend.
  *                          Defaults to bash when found (Git Bash / WSL on
  *                          Windows, /bin/bash on POSIX), falling back to the
@@ -3808,7 +3819,9 @@ switch (command) {
       }
     }
     if (existsSync(join(c.cwd, "forge.yaml")) && resolveState(c.cwd) === "managed-active") {
-      await statusScreen(c);
+      // A configured directory may still have missing commands after uninstall.
+      // Refresh managed files without re-running the configuration journey.
+      await relinkAndHint();
     } else {
       exitCode = await runJourney(c);
       // Record persistHome()'s outcome (set on c.persistHomeResult inside

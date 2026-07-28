@@ -298,9 +298,10 @@ Concurrency limits and cascade admission policy for `/orchestrate`'s batch engin
 
 ```yaml
 orchestration:
-  # Maximum number of /work-on sub-agents dispatched concurrently. Guards against
-  # saturating the Anthropic API rate limit in one burst on a large ready set.
-  # Default: 12.
+  # Maximum number of top-level /work-on agents dispatched concurrently. Each
+  # worker normally fans out to about 8 total subagent spawns (build, quality
+  # gate, and review included), so set this to no more than session_budget / 8.
+  # Default: 12; use 25 or fewer for a 200-spawn session budget.
   max_concurrent: 12
 
   cascade:
@@ -331,6 +332,14 @@ orchestration:
     # Default: 1 (from the "balanced" preset); "unlimited" under "all".
     max_generation: 1
 
+    # Maximum generation a P3 batch may aggregate. Batching is a sanctioned,
+    # auditable exception to Step 4C's autonomous cascade cap: it can fold
+    # several deferred low-priority findings into one reviewed unit, but it
+    # must never make recursion unbounded. Every batch records the maximum
+    # member generation in FORGE:BATCH_MAX_GENERATION. This value is always
+    # finite, even under policy: all. Default: 2.
+    batch_max_generation: 2
+
     # Per-batch token ceiling for Step 4C's review-finding cascade dispatch.
     # New home for the same lever previously read only as
     # `pipeline.token_budget_per_batch` (kept working as a deprecated alias —
@@ -353,17 +362,29 @@ orchestration:
     # (avoids serializing agents on same-file predecessor edges). Default:
     # true (from "balanced"); false under "all".
     p3_same_file_defer: true
+
+    # Running findings-spawned / merged-units ceiling. "off" (the default)
+    # only reports amplification; a positive decimal defers further
+    # same-lineage refinements to the completion sweep once exceeded.
+    max_amplification: "off"
+
+    # Number of consecutive merged-unit observations at ratio >= 1.0 before
+    # printing a convergence warning. Default: 3.
+    convergence_window: 3
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `max_concurrent` | integer | No | Max concurrent `/work-on` sub-agent dispatch. Default: 12 |
+| `max_concurrent` | integer | No | Max concurrent top-level `/work-on` dispatches. Plan for roughly 8 total subagent spawns per worker; default: 12. |
 | `cascade.policy` | string | No | `all` \| `balanced` \| `conservative`. Default: `balanced` |
 | `cascade.max_generation` | integer or `"unlimited"` | No | Max cascade generation admitted at Phase 1 resolve time. Default: 1 |
+| `cascade.batch_max_generation` | integer | No | Finite maximum member generation that an automated P3 batch may aggregate. Default: 2 |
 | `cascade.token_budget` | integer or `"unlimited"` | No | Per-batch token ceiling for Step 4C cascade dispatch. Default: 900000 (deprecated alias: `pipeline.token_budget_per_batch`) |
 | `cascade.defer_on_batch_gated` | boolean | No | Suppress cascade dispatch when the original batch is fully human-gated. Default: `true` |
 | `cascade.keyword_heuristic` | boolean | No | Defer P3-and-below comment/typo-titled findings. Default: `true` |
 | `cascade.p3_same_file_defer` | boolean | No | Defer P3 findings sharing a file with the active batch. Default: `true` |
+| `cascade.max_amplification` | positive number or `"off"` | No | Opt-in ceiling for same-lineage refinement dispatch. Default: `"off"` |
+| `cascade.convergence_window` | positive integer | No | Consecutive ratio observations at or above 1.0 before warning. Default: 3 |
 
 **Hard invariant — not configurable**: safety exclusions (findings whose `## Problem` section indicates security/billing/anti-bot/auth concerns) are never batched and never auto-admitted by any `cascade.policy`, including `all`. That exclusion is enforced upstream of this section (the P3 batching eligibility check) and has no corresponding key here by design.
 
@@ -375,10 +396,14 @@ orchestration:
 
 ## `pipeline` (OPTIONAL)
 
-Tuning knobs for `/orchestrate`'s batch engine — stall detection, narration verbosity, and (deprecated alias only, see `orchestration.cascade` above) the review-finding cascade token budget. All keys optional; sane defaults apply when omitted.
+Tuning knobs for the CLI backend and `/orchestrate`'s batch engine — invocation and stall timeouts, narration verbosity, and (deprecated alias only, see `orchestration.cascade` above) the review-finding cascade token budget. All keys optional; sane defaults apply when omitted.
 
 ```yaml
 pipeline:
+  # Wall-clock limit for one CLI backend invocation. The environment variable
+  # FORGEDOCK_CLI_TIMEOUT_MS (milliseconds) takes precedence. Default: 60.
+  cli_timeout_minutes: 60
+
   # Minutes an agent may sit idle (no FORGE:HEARTBEAT / label change) before
   # /orchestrate's stall detector treats it as stuck and attempts an
   # auto-resume. Default: 15.
@@ -401,12 +426,13 @@ pipeline:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `cli_timeout_minutes` | integer | No | Wall-clock minutes for one CLI backend invocation. Default: 60. `FORGEDOCK_CLI_TIMEOUT_MS` (milliseconds) takes precedence. |
 | `stall_timeout_minutes` | integer | No | Idle minutes before the stall detector attempts auto-resume. Default: 15 |
 | `token_budget_per_batch` | integer | No | **Deprecated** — use `orchestration.cascade.token_budget`. Default: 900000 |
 | `token_estimate_per_finding` | integer | No | Estimated tokens per P3-or-lower cascade finding. Default: 150000 |
 | `narration` | string | No | `terse` \| `verbose`. Default: `terse` |
 
-**Commands that use this section**: `orchestrate`
+**Commands that use this section**: CLI backend (`cli_timeout_minutes`); `orchestrate` (remaining keys)
 
 ---
 
