@@ -715,9 +715,9 @@ Do NOT suppress the finding by making the check less strict or adding fake no-op
 ```bash
 # 2G.9: Danger-zone recurrence check
 # Step 1: Read injected danger-zone cards from FORGE:CONTEXT comment on the issue
-CONTEXT_COMMENT=$(gh api repos/{GH_REPO}/issues/{ISSUE_NUMBER}/comments \
+CONTEXT_COMMENT=$(timeout 10 gh api repos/{GH_REPO}/issues/{ISSUE_NUMBER}/comments \
   --jq '[.[] | select(.body | contains("<!-- FORGE:CONTEXT -->"))] | last | .body // ""' 2>/dev/null \
-  | timeout 10 cat || echo '')
+  || echo '')
 
 # Extract the Danger-Zone Rule Cards section
 DZ_SECTION=$(echo "$CONTEXT_COMMENT" \
@@ -1332,11 +1332,15 @@ else
                 continue
             fi
 
-            # Run the check; pass changed files list and worktree path
-            CHECK_OUTPUT=$("$SCRIPT_PATH" "{CHANGED_FILES}" "{WORKTREE_PATH}" 2>/dev/null)
+            # Bound every third-party check. Exit 124 is timeout's documented code.
+            CHECK_OUTPUT=$(timeout 30 "$SCRIPT_PATH" "{CHANGED_FILES}" "{WORKTREE_PATH}" 2>/dev/null)
             CHECK_EXIT=$?
 
-            if [ "$CHECK_EXIT" -eq 1 ]; then
+            if [ "$CHECK_EXIT" -eq 124 ]; then
+                REGISTRY_FINDINGS="${REGISTRY_FINDINGS}
+REGISTRY-${SLUG}-timeout | HIGH | (check-registry) | Registry check '$SLUG' timed out after 30s — failing closed. Investigate and optimize the script before proceeding."
+                echo "2R: TIMEOUT — $SLUG (30s) — fail-closed HIGH finding added"
+            elif [ "$CHECK_EXIT" -eq 1 ]; then
                 # Check fired — append to findings
                 while IFS= read -r line; do
                     [ -z "$line" ] && continue

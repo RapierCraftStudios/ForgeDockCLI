@@ -78,6 +78,7 @@ LAYER1_FILES=()
 declare -A EDGE_KIND    # "{PRED}:{SUCCESSOR}" → same-file | directory | shared-module (forge#1860)
 declare -A EDGE_FILES   # "{PRED}:{SUCCESSOR}" → the specific file(s) that triggered the edge (forge#1860)
 declare -A FILE_SOURCE  # {NUM} → contract-deliverables | affected-files-section | body-fallback | none (forge#2436, forge#2848)
+declare -A ISSUE_FILES  # {NUM} → newline-separated declared file set (forge#2844)
 
 # Resolve ForgeDock's helper from the runtime installation before falling back to
 # the target repository. The orchestrator runs inside the project being worked on,
@@ -112,6 +113,7 @@ for NUM in {issue_numbers}; do
   EXTRACT_OUT=$(bash "$AFFECTED_FILES_SCRIPT" "$NUM" -R "{GH_REPO}")
   FILE_SOURCE[$NUM]=$(echo "$EXTRACT_OUT" | head -1 | sed 's/^PROVENANCE=//')
   FILES_FOR_NUM=$(echo "$EXTRACT_OUT" | tail -n +2)
+  ISSUE_FILES[$NUM]="$FILES_FOR_NUM"
 
   if [ "${FILE_SOURCE[$NUM]}" = "error" ]; then
     echo "ERROR: affected-file extraction for #$NUM was inconclusive after a GitHub/API failure." >&2
@@ -1290,6 +1292,33 @@ For the same reason, this reconstruction also MUST call `verify_file_overlap_edg
 # Reconstruct dispatch state from GitHub after compaction / wake
 # Run this block at the top of every resumed Phase 4 loop iteration.
 
+# Keep this byte-identical to phase-4-execution.md Step 4A. A wake can start in a
+# fresh context, so it cannot rely on the live dispatch helper still being defined.
+read_active_claims() {
+  local COORD_NUM="$1"
+  local CLAIMS HOLDER TERMINAL
+  CLAIMS=$(gh api --paginate --slurp "repos/{GH_REPO}/issues/${COORD_NUM}/comments" 2>/dev/null \
+    | jq -c '
+        flatten as $comments |
+        [$comments[]
+         | select(.body | contains("<!-- FORGE:CLAIM -->"))
+         | . as $claim
+         | ($claim.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) as $holder
+         | select([$comments[]
+                   | select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->"))
+                   | select((.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) == $holder)
+                   | select(.created_at > $claim.created_at)] | length == 0)
+         | {holder: $holder,
+            files: ($claim.body | capture("\\*\\*Files\\*\\*: (?<files>[\\s\\S]*?)(?:\\n\\*\\*Interfaces\\*\\*:|$)").files)}]') || return 1
+
+  for HOLDER in $(echo "$CLAIMS" | jq -r '.[].holder'); do
+    TERMINAL=$(gh issue view "$HOLDER" -R {GH_REPO} --json labels --jq \
+      '[.labels[].name | select(. == "workflow:merged" or . == "workflow:invalid" or . == "workflow:awaiting-merge" or . == "needs-human")] | length > 0' 2>/dev/null)
+    [ "$TERMINAL" = "true" ] && CLAIMS=$(echo "$CLAIMS" | jq --arg holder "$HOLDER" '[.[] | select(.holder != $holder)]')
+  done
+  echo "$CLAIMS"
+}
+
 # 0. Lease check (MANDATORY, forge#2627) — run BEFORE any of the reconstruction below.
 #    A wake/resume is either this same orchestrator continuing its own batch or, less
 #    commonly, a fresh invocation resuming someone else's interrupted batch. Either way,
@@ -1357,6 +1386,7 @@ fi
 #    (same classify_predecessor_state() function defined in phase-4-execution.md Step 4B —
 #    re-declare it here if this block runs in a fresh context that hasn't sourced Step 4B yet).
 declare -A ISSUE_CLASS
+declare -A ISSUE_FILES
 DONE_ISSUES=()
 GATED_ISSUES=()
 FAILED_ISSUES=()
@@ -1372,6 +1402,22 @@ for NUM in {all_issue_numbers_in_batch}; do
     *) ACTIVE_ISSUES+=("$NUM") ;;
   esac
 done
+
+# 1.5. Rebuild the durable file-claim map. The claims board, not the orchestrator's
+# in-context memory, is authoritative before every later dispatch. Rebuild the target
+# declarations too because ISSUE_FILES is lost across compaction.
+if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ]; then
+  ACTIVE_CLAIMS=$(read_active_claims "$COORD_ISSUE_NUMBER")
+  declare -A ACTIVE_CLAIM_FILES
+  for HOLDER in $(echo "$ACTIVE_CLAIMS" | jq -r '.[].holder'); do
+    ACTIVE_CLAIM_FILES["$HOLDER"]=$(echo "$ACTIVE_CLAIMS" | jq -r --arg holder "$HOLDER" '.[] | select(.holder == $holder) | .files')
+  done
+
+  for NUM in {all_issue_numbers_in_batch}; do
+    EXTRACT_OUT=$(bash "$AFFECTED_FILES_SCRIPT" "$NUM" -R "{GH_REPO}")
+    ISSUE_FILES[$NUM]=$(echo "$EXTRACT_OUT" | tail -n +2)
+  done
+fi
 
 # 2. Re-derive the ready set: any non-terminal issue whose predecessors are ALL classified DONE
 #    (or GATED-but-edge-dropped — see the re-verification gate below).
@@ -1475,6 +1521,6 @@ done
 #    predecessor's edge dropped (forge#1904); that case is legitimately ready, not a re-add.
 ```
 
-**Why this keeps context small**: Each `Agent()` call returns an agent ID stored only in `AGENT_ISSUE_MAP`, which is rebuilt per Step 4A.pre dispatch batch. After compaction, the map is gone — but the DAG state, including `blocked-on-human-merge` tracking (a durable `FORGE:BLOCKED_ON_HUMAN_MERGE` comment plus label, not an in-context variable), is fully on GitHub. The reconstruction above re-derives the ready set, the gated set, and the blocked-on-human-merge set from labels and comments alone, so the orchestrator context never needs to hold cumulative dispatch history.
+**Why this keeps context small**: Each `Agent()` call returns an agent ID stored only in `AGENT_ISSUE_MAP`, and engine/OpenCode dispatches use equivalent ephemeral `ENGINE_DISPATCH_MAP` and `OPENCODE_DISPATCH_MAP` caches. After compaction, those maps are gone — but the DAG state, including `blocked-on-human-merge` tracking (a durable `FORGE:BLOCKED_ON_HUMAN_MERGE` comment plus label, not an in-context variable) and OpenCode child correlation (`FORGE:DISPATCH`), is fully on GitHub. The reconstruction above re-derives the ready set, the gated set, and the blocked-on-human-merge set from labels and comments alone, so the orchestrator context never needs to hold cumulative dispatch history.
 
 ---
