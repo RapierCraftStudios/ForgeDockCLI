@@ -154,7 +154,7 @@ REMAINING_AFTER=0
 Multi-phase issues have **two or more checkbox-bearing sections** — that is, two or more heading-delimited sections that each contain at least one GFM task item. Test that structure directly; do **not** infer it from the presence of headings. Every templated issue carries `## Problem`, `## Evidence`, `## Affected Files`, `## Acceptance Criteria`, and `## Context`, so a heading count is `> 0` universally and says nothing about phase structure. <!-- Fixed: forge#2840 -->
 
 ```bash
-# Structural test: count sections that actually contain checkbox items.
+# Structural test: count heading-delimited sections that contain checkbox items.
 # Multi-phase == 2+ checkbox-bearing sections. A single checkbox group is
 # single-phase regardless of how many prose headings surround it.
 #
@@ -172,9 +172,9 @@ else
 fi
 
 CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
-  /^#+ /         { if (has) { n++; has=0 }; next }
-  /^[-*+] \[[ xX]\]/ { has=1 }
-  END            { if (has) n++; print n+0 }
+  /^#+ /                     { if (in_section && has) n++; in_section=1; has=0; next }
+  in_section && /^[-*+] \[[ xX]\]/ { has=1 }
+  END                        { if (in_section && has) n++; print n+0 }
 ')
 
 # Sub-issue-tracker guard: a decompose parent whose only checkbox group is
