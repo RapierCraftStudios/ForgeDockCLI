@@ -653,7 +653,7 @@ existing issue cannot be mistaken for the new one.
 CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 CREATE_BODY="${FULL_BODY}
 
-<!-- FORGE:CREATE_TOKEN:${CREATE_TOKEN} -->"
+<!-- issue-create-token:${CREATE_TOKEN} -->"
 CREATE_RESPONSE=$(gh api "repos/${GH_REPO}/issues" --method POST \
   -f title="{TITLE}" -f body="$CREATE_BODY" \
   -f 'labels[]={PRIORITY_LABEL}' -f 'labels[]={CATEGORY_LABEL}') || {
@@ -663,11 +663,12 @@ CREATE_RESPONSE=$(gh api "repos/${GH_REPO}/issues" --method POST \
 NEW_NUMBER=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
 [ -n "$NEW_NUMBER" ] || { echo "ERROR: issue creation returned no issue number." >&2; exit 1; }
 CREATED_BODY=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json body --jq '.body') || exit 1
-printf '%s' "$CREATED_BODY" | grep -qF "FORGE:CREATE_TOKEN:${CREATE_TOKEN}" || {
+printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}" || {
   echo "ERROR: issue #${NEW_NUMBER} did not contain this create token; refusing to report success." >&2
   exit 1
 }
 if [ -n "${MILESTONE_TITLE:-}" ]; then
+  [ "${DRY_RUN:-false}" != "true" ] || { echo "ERROR: refusing milestone edit during dry run." >&2; exit 1; }
   gh issue edit "$NEW_NUMBER" {GH_FLAG} --milestone "$MILESTONE_TITLE" || exit 1
 fi
 ```
@@ -680,7 +681,7 @@ fi
 CREATE_TOKEN="forge-create-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 CREATE_BODY="${PROGRAMMATIC_BODY}
 
-<!-- FORGE:CREATE_TOKEN:${CREATE_TOKEN} -->"
+<!-- issue-create-token:${CREATE_TOKEN} -->"
 API_LABELS=()
 for label in "${PROGRAMMATIC_LABELS[@]}"; do
   API_LABELS+=(-f "labels[]=$label")
@@ -690,11 +691,12 @@ CREATE_RESPONSE=$(gh api "repos/${GH_REPO}/issues" --method POST \
 NEW_NUMBER=$(echo "$CREATE_RESPONSE" | jq -r '.number // empty')
 [ -n "$NEW_NUMBER" ] || { echo "ERROR: issue creation returned no issue number." >&2; exit 1; }
 CREATED_BODY=$(gh issue view "$NEW_NUMBER" {GH_FLAG} --json body --jq '.body') || exit 1
-printf '%s' "$CREATED_BODY" | grep -qF "FORGE:CREATE_TOKEN:${CREATE_TOKEN}" || {
+printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}" || {
   echo "ERROR: issue #${NEW_NUMBER} did not contain this create token; refusing to report success." >&2
   exit 1
 }
 if [ -n "$PROGRAMMATIC_MILESTONE" ]; then
+  [ "${DRY_RUN:-false}" != "true" ] || { echo "ERROR: refusing milestone edit during dry run." >&2; exit 1; }
   gh issue edit "$NEW_NUMBER" {GH_FLAG} --milestone "$PROGRAMMATIC_MILESTONE" || exit 1
 fi
 ```

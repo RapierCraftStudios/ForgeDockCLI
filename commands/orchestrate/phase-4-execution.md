@@ -2137,7 +2137,7 @@ BATCH_EOF
     )"
     CREATE_BODY="${CREATE_BODY}
 
-<!-- FORGE:CREATE_TOKEN:${CREATE_TOKEN} -->"
+<!-- issue-create-token:${CREATE_TOKEN} -->"
     CREATE_RESPONSE=$(gh api "repos/{GH_REPO}/issues" --method POST \
       -f title="$PROPOSED_BATCH_TITLE" -f body="$CREATE_BODY" \
       -f 'labels[]=review-finding' -f 'labels[]=priority:P3' -f 'labels[]=batch') || {
@@ -2150,7 +2150,7 @@ BATCH_EOF
       continue
     fi
     CREATED_BODY=$(gh issue view "$BATCH_ISSUE_NUM" -R {GH_REPO} --json body --jq '.body') || continue
-    if ! printf '%s' "$CREATED_BODY" | grep -qF "FORGE:CREATE_TOKEN:${CREATE_TOKEN}"; then
+    if ! printf '%s' "$CREATED_BODY" | grep -qF "issue-create-token:${CREATE_TOKEN}"; then
       echo "ERROR: batch issue #${BATCH_ISSUE_NUM} failed create-token read-back; members remain queued." >&2
       continue
     fi
