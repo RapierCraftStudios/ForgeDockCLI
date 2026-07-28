@@ -1894,6 +1894,7 @@ Gating predecessor #${NUM} reached \`workflow:merged\` — dispatching now. (Was
    ```
    ✓ #{NUMBER} — {title} → PR #{PR} merged to {target}
    ✗ #{NUMBER} — {title} → {reason for failure}
+   ⚠ #{NUMBER} — {title} → PR #{PR} blocked: review panel degraded (full fresh-session re-review required)
    ⚠ #{NUMBER} — {title} → PIPELINE BYPASS (no /work-on — PR invalid)
    ⏸ #{NUMBER} — {title} → PR #{PR} awaiting-merge (remediated + re-approved, `main`/deploy-gate base — human merge only, no diagnosis needed; non-`main` bases now auto-land to `workflow:merged` via remediate.md M7, forge#2570)
    🔗 #{NUMBER} — {title} → blocked-on-human-merge (gated by #{PRED}, will auto-dispatch on #{PRED} merge)
@@ -1918,6 +1919,8 @@ Gating predecessor #${NUM} reached \`workflow:merged\` — dispatching now. (Was
    forge#1812) is distinct from both: it marks a DEPENDENT of a GATED predecessor (item 6.5) — the
    dependent itself has no problem at all, it is simply waiting on someone else's merge. See Phase 6's
    "Merge-Ready" report section (`phase-6-report.md` Step 6A.5/6B) for the batch-level rollup.
+
+   Before printing a terminal status for a PR, inspect its labels. If it has `review-degraded`, print the dedicated blocked line above and retain the issue's `needs-human` state. Never report a degraded review as merged or awaiting-merge.
 
 9. **Run staging integrity check** (from Step 4A-pre) if the completed agent merged a PR targeting staging.
 
