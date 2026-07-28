@@ -77,6 +77,11 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(phase4, /do not wait for the slowest sibling/i);
   });
 
+  it("limits cohort edge removal to the diff-verified DONE predecessor", () => {
+    assert.match(phase4, /for DESC_PRED in "\$PRED"; do/);
+    assert.doesNotMatch(phase4, /for DESC_PRED in \{predecessors_of_DESC\}; do/);
+  });
+
   it("documents the compact OpenCode preflight", () => {
     const orchestrate = readFileSync(
       new URL("../../commands/orchestrate.md", import.meta.url),

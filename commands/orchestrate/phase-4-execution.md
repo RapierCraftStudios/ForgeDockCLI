@@ -1227,12 +1227,10 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
                   *) echo "  re-derivation for #${DESC} inconclusive (provenance: ${REDERIVE_PROV}) — keeping all edges"; continue ;;
                 esac
 
-                # Drop any surviving edge into DESC whose triggering file no longer
-                # appears in the refreshed list. Only EDGE_KIND-tagged (Layer 1/2/3)
-                # edges are eligible, exactly as verify_file_overlap_edge enforces —
-                # explicit `Depends on`, the DATABASE chain, Layer 4 and Layer 5 edges
-                # never populate EDGE_KIND and are never dropped here.
-                for DESC_PRED in {predecessors_of_DESC}; do
+                # Re-derive only PRED's edge into DESC. PRED is the DONE predecessor
+                # whose merged diff just disproved this edge; other predecessors may
+                # still be building and must retain their serialization edges.
+                for DESC_PRED in "$PRED"; do
                   [ -z "${EDGE_KIND["${DESC_PRED}:${DESC}"]:-}" ] && continue
                   STILL_OVERLAPS=false
                   for EF in ${EDGE_FILES["${DESC_PRED}:${DESC}"]:-}; do
