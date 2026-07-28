@@ -71,7 +71,7 @@ Domain estimation (above) catches broad category overlap but misses cases where 
 
 Each issue's extraction also carries a **provenance** tag, in descending order of confidence — `contract-deliverables` (from a `FORGE:CONTRACT` comment's own `### Deliverables` table), `affected-files-section` (from the INVESTIGATOR comment's own scoped section), `body-fallback` (from the raw issue body's scoped section, pre-investigation), or `none` (no scoped section found; correctly yields zero paths so Layer 4 fires). This is recorded per issue in `FILE_SOURCE[$NUM]` and consumed by Layer 5 (below) and Step 3E's plan presentation.
 
-**Why `contract-deliverables` ranks highest** <!-- Added: forge#2848 -->: a deliverables table states *intent to change* ("I will edit this file"), whereas an Affected Files list — and far more so a raw issue body — routinely names files as *context*: "this interacts with X", "similar to the check in Y". The extractor cannot tell those apart, which is what makes a body-derived file list over-predict overlap. **Temporal caveat — do not over-claim this source**: `FORGE:CONTRACT` is posted at *build* time (`work-on/build.md` Phase B2), which is **after** this phase builds the DAG. On a cold first-pass plan no contract exists, so this provenance is inert by construction and extraction lands on one of the three values below. It pays off only on the paths that re-extract later: the wake/compaction reconstruction block (below), mid-batch re-derivation on a dropped edge (`phase-4-execution.md`'s DONE-arm handling), and `IN_PROGRESS` predecessors built in an earlier wave or session. A contract whose deliverables table yields zero paths **falls through** to the investigator source rather than blackholing to `none` — a contract is an upgrade over that source, never a replacement for it.
+**Why `contract-deliverables` ranks highest** <!-- Added: forge#2848 -->: a deliverables table states *intent to change* ("I will edit this file"), whereas an Affected Files list — and far more so a raw issue body — routinely names files as *context*: "this interacts with X", "similar to the check in Y". The extractor cannot tell those apart, which is what makes a body-derived file list over-predict overlap. **Temporal caveat — do not over-claim this source**: `FORGE:CONTRACT` is posted at *build* time (`work-on/build.md` Phase B2), which is **after** this phase builds the DAG. On a cold first-pass plan no contract exists, so this provenance is inert by construction and extraction lands on one of the three values below. It pays off only on paths that explicitly re-extract later: mid-batch re-derivation on a dropped edge (`phase-4-execution.md`'s DONE-arm handling, lines 1208-1268) and `IN_PROGRESS` predecessors built in an earlier wave or session. Wake/compaction reconstruction does not retain the in-memory edge metadata and does not re-extract. A contract whose deliverables table yields zero paths **falls through** to the investigator source rather than blackholing to `none` — a contract is an upgrade over that source, never a replacement for it.
 
 ```bash
 LAYER1_FILES=()
@@ -1393,15 +1393,12 @@ for NUM in "${ACTIVE_ISSUES[@]}"; do
   GATING_PRED=""
   for PRED in {predecessors_of_NUM}; do
     case "${ISSUE_CLASS[$PRED]:-IN_PROGRESS}" in
-      # DONE needs no re-verification call HERE, even though phase-4-execution.md's live
-      # DONE arm does make one (forge#2848). The two things that call buys — suppressing a
-      # spurious same-file brief, and triggering cohort re-derivation — are both already
-      # covered at wake time by construction: this block builds no SAME_FILE_BRIEF, and a
-      # wake re-plan re-runs Step 3C Layer 1 extraction from scratch, which now prefers a
-      # FORGE:CONTRACT deliverables table over the body scrape the stale edge came from.
-      # Wake time is in fact where `contract-deliverables` provenance pays off most, since
-      # by then the issues have been built and their contracts exist. Adding a call here
-      # would duplicate that at extra API cost, not add coverage.
+      # DONE needs no re-verification call HERE because it already satisfies the edge, and
+      # this reconstruction builds no SAME_FILE_BRIEF. Unlike the live DONE arm, this path
+      # does not retain EDGE_KIND/EDGE_FILES or re-run Layer 1 extraction; consequently it
+      # does not re-derive stale DONE-path edges after wake. That live-only re-derivation is
+      # in phase-4-execution.md lines 1208-1268. Adding the helper call here would therefore
+      # add API cost without affecting wake-time dispatch readiness.
       DONE) ;;
       GATED|FAILED)
         EDGE_VERDICT=$(verify_file_overlap_edge "$PRED" "$NUM")

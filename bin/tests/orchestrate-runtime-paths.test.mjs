@@ -110,6 +110,12 @@ describe("orchestrate runtime helper paths", () => {
     );
   });
 
+  it("does not claim wake reconstruction re-extracts DONE-path edges", () => {
+    assert.match(phase3, /does not retain EDGE_KIND\/EDGE_FILES or re-run Layer 1 extraction/);
+    assert.match(phase3, /phase-4-execution\.md lines 1208-1268/);
+    assert.doesNotMatch(phase3, /wake re-plan re-runs Step 3C Layer 1 extraction/);
+  });
+
   it("documents the compact OpenCode preflight", () => {
     const orchestrate = readFileSync(
       new URL("../../commands/orchestrate.md", import.meta.url),
