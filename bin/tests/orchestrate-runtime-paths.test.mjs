@@ -10,6 +10,7 @@ const phase3 = readFileSync(
   new URL("../../commands/orchestrate/phase-3-dependency.md", import.meta.url),
   "utf8",
 );
+const issue = readFileSync(new URL("../../commands/issue.md", import.meta.url), "utf8");
 const opencodeDocs = readFileSync(
   new URL("../../docs/OPENCODE.md", import.meta.url),
   "utf8",
@@ -45,6 +46,16 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(phase3, /FILE_SOURCE\[\$NUM\].*=.*error/);
     assert.match(phase3, /affected-file extraction for #\$NUM was inconclusive/);
     assert.doesNotMatch(phase3, /bash scripts\/extract-affected-files\.sh/);
+  });
+
+  it("requires mktemp paths and rejects root-level temp files", () => {
+    for (const spec of [phase4, issue]) {
+      assert.match(spec, /BODY_FILE="\$\(mktemp\)"/);
+      assert.match(spec, /never hand-roll (?:a )?(?:temp )?path/i);
+      assert.match(spec, /\/tmp_invbody_31076\.txt/);
+      assert.match(spec, /bypass mode cannot clear/i);
+      assert.match(spec, /\/tmp\/body\.md/);
+    }
   });
 
   it("documents OpenCode helper and worktree locations", () => {
