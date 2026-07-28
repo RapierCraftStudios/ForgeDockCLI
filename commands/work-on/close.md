@@ -164,11 +164,11 @@ Multi-phase issues have **two or more checkbox-bearing sections** — that is, t
 # - '^#+ ' (not '^#{2,3} ') matches every heading depth and avoids awk
 #   interval-quantifier variance across awk implementations.
 # - grep -E / awk only — no PCRE. '^#+ ' needs none.
-FENCE_COUNT=$(echo "$BODY" | grep -c '^```' || true)
+FENCE_COUNT=$(echo "$BODY" | grep -cE '^(```+|~~~+)' || true)
 if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
   BODY_STRIPPED="$BODY"
 else
-  BODY_STRIPPED=$(echo "$BODY" | awk '/^```/{f=!f; next} !f')
+  BODY_STRIPPED=$(echo "$BODY" | awk '/^(```+|~~~+)/{f=!f; next} !f')
 fi
 
 CHECKBOX_SECTIONS=$(echo "$BODY_STRIPPED" | awk '
