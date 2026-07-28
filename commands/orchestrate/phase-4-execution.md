@@ -1170,6 +1170,11 @@ verify_file_overlap_edge() {
 
 ```bash
 # After each agent completion, check for newly ready issues:
+READINESS_RESCAN=true
+while [ "$READINESS_RESCAN" = "true" ]; do
+  # Re-derivation can remove an unresolved predecessor from an issue that this
+  # pass has already visited. Repeat the scan so it can dispatch this cycle.
+  READINESS_RESCAN=false
 for BLOCKED_NUM in {all_blocked_issue_numbers}; do
   ALL_PREDS_DONE=true
   ANY_PRED_GATED=false
@@ -1211,7 +1216,16 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
             # against a raw-issue-body scrape is evidence the whole cohort's extraction
             # is suspect (see phase-3-dependency.md Layer 4's cohort-confidence guidance).
             if [ "${FILE_SOURCE[$PRED]:-}" = "body-fallback" ] && [ -n "$AFFECTED_FILES_SCRIPT" ]; then
-              for DESC in {still_blocked_descendants}; do
+              # Re-derive only direct descendants of this DONE predecessor that
+              # are still blocked now. This intentionally excludes unrelated
+              # blocked issues and descendants whose PRED edge was already removed.
+              STILL_BLOCKED_DESCENDANTS=()
+              for CANDIDATE in {all_blocked_issue_numbers}; do
+                case " ${PREDECESSORS[$CANDIDATE]:-} " in
+                  *" $PRED "*) STILL_BLOCKED_DESCENDANTS+=("$CANDIDATE") ;;
+                esac
+              done
+              for DESC in "${STILL_BLOCKED_DESCENDANTS[@]}"; do
                 # Memoize conclusive results per descendant per batch. An inconclusive
                 # extraction gets one retry so a transient failure or pre-contract
                 # attempt does not permanently foreclose re-derivation. The two-attempt
@@ -1262,6 +1276,7 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
                     # gate below stops waiting on it. DESC becomes dispatch-eligible on
                     # this same cycle if that was its last outstanding predecessor.
                     PREDECESSORS[$DESC]=$(echo "${PREDECESSORS[$DESC]}" | tr ' ' '\n' | grep -vx "$DESC_PRED" | tr '\n' ' ')
+                    READINESS_RESCAN=true
                   fi
                 done
               done
@@ -1321,6 +1336,7 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
     echo "#{BLOCKED_NUM} is BLOCKED-ON-HUMAN-MERGE — gated by: ${GATING_PREDS[*]}. See item 6.5."
     # Do NOT dispatch. Do NOT mark skipped. Tracked via item 6.5.
   fi
+done
 done
 # Run Steps 4A.pre.0 → 4A.pre → 4A for newly ready issues. Step 4A's own dispatch-batch
 # computation (the HEADROOM/DISPATCH_NOW logic, forge#1912) is what actually caps this —

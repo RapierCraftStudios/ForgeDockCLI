@@ -110,6 +110,21 @@ describe("orchestrate runtime helper paths", () => {
     );
   });
 
+  it("limits cohort re-derivation to current descendants and rescans released issues", () => {
+    assert.match(
+      phase4,
+      /STILL_BLOCKED_DESCENDANTS=\(\)[\s\S]*?for CANDIDATE in \{all_blocked_issue_numbers\}; do[\s\S]*?PREDECESSORS\[\$CANDIDATE\][\s\S]*?for DESC in "\$\{STILL_BLOCKED_DESCENDANTS\[@\]\}"; do/,
+    );
+    assert.match(
+      phase4,
+      /READINESS_RESCAN=true[\s\S]*?while \[ "\$READINESS_RESCAN" = "true" \]; do[\s\S]*?READINESS_RESCAN=false/,
+    );
+    assert.match(
+      phase4,
+      /PREDECESSORS\[\$DESC\]=[\s\S]*?READINESS_RESCAN=true/,
+    );
+  });
+
   it("does not claim wake reconstruction re-extracts DONE-path edges", () => {
     assert.match(phase3, /does not retain EDGE_KIND\/EDGE_FILES or re-run Layer 1 extraction/);
     assert.match(phase3, /phase-4-execution\.md lines 1208-1268/);
