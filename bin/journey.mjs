@@ -2666,14 +2666,11 @@ function readForgedockVersion(forgeHome) {
 
 /**
  * Write a machine-readable install-receipt.json to {ctx.home}/.forge/ after a
- * successful install (runJourney) or update (bin/forgedock.mjs's
+ * successful install (runJourney) or refresh (bin/forgedock.mjs's
  * relinkAndHint — shared by both update() branches: the git-clone
  * fast-forward path and the npm version-check path). Note: re-running
- * `npx forgedock install` on an already-managed-active repo takes the
- * statusScreen() short-circuit instead of runJourney()/relinkAndHint() — that
- * path does not refresh the receipt (it also does not touch forge() or
- * anything else, so this is consistent with the rest of that short-circuit's
- * no-op behavior, not a gap specific to this feature). See docs/CONFIG.md
+ * `npx forgedock install` on an already-managed-active repo uses
+ * relinkAndHint() rather than re-running the configuration journey. See docs/CONFIG.md
  * "Install Receipt" for the schema.
  *
  * Deliberately narrow field set — no PII/secrets: no process.env values, no
