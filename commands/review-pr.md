@@ -1540,7 +1540,7 @@ The `protocols.md` file contains the Evidence-Based Review Protocol, Structured 
 8. If Phase 2.5 found broken assumptions, append them to the agent's prompt as "Pre-found integration issues to verify"
 9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: false` for each reviewer.
 
-**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent posts findings directly to the PR via `gh pr comment`.
+**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent must persist its finalized body before posting it with `gh pr comment --body-file`, include `<!-- FORGE:REVIEW-AGENT:{lowercase-domain} -->`, and return its verdict and findings to the orchestrator independently of GitHub delivery.
 
 #### Domain Diff Slicing
 
@@ -1569,9 +1569,29 @@ When substituting `[FILE_LIST]` in each agent's template:
 ```bash
 gh pr view $ARGUMENTS --json comments --jq '.comments | length'
 gh api repos/{owner}/{repo}/issues/$ARGUMENTS/comments --jq '.[-10:] | .[].body[:100]'
+
+# Every dispatched agent must have delivered its own persisted review to GitHub.
+# Do not infer a clean review from a missing comment: its return text may contain
+# findings that could not be posted because GitHub writes were throttled.
+MISSING_AGENT_COMMENTS=""
+for AGENT in $SELECTED_AGENTS; do
+    AGENT_DOMAIN=$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')
+    AGENT_COMMENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+        --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+        2>/dev/null || printf '0')
+    if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+        MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+    fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+    echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+    echo "Use each agent's returned verdict, findings, and durable body path to recover the review."
+    exit 1
+fi
 ```
 
-**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing.
+**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing. A missing comment is an explicit delivery failure: do not synthesize a verdict or treat it as a clean result.
 
 ---
 
