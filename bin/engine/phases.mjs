@@ -117,6 +117,23 @@ async function commitsAhead(lane, branch, io) {
 function has(blob, marker) { return blob.includes(marker); }
 
 /**
+ * The interactive workflow persists its conservative complexity decision in a
+ * FORGE:FAST_PATH comment. The engine must consume that decision too; otherwise
+ * its separate context/architect phases negate the documented trivial path.
+ * Only an exact TRIVIAL value is eligible to skip work, so malformed or absent
+ * annotations continue through the full pipeline.
+ */
+function complexityBand(comments) {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i];
+    if (!body?.includes("FORGE:FAST_PATH")) continue;
+    const match = body.match(/\*\*COMPLEXITY_BAND\*\*:\s*([A-Z_]+)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
  * Fetch the issue's live `state` (OPEN/CLOSED) and `labels` in one call.
  *
  * This is the single data source for two consumers (forge#2352):
@@ -254,10 +271,13 @@ export const PHASES = [
     command: "work-on/build/context",
     entryCondition: (s) => s.committed.includes("investigate"),
     async reconcile(state, io) {
+      const markers = await issueMarkers(state.issue, io);
+      if (complexityBand(markers.comments) === "TRIVIAL") {
+        return { satisfied: true, outputs: { skipped: "trivial-complexity-band", phase: "context" } };
+      }
       // Idempotent resume: FORGE:CONTEXT:COMPLETE present → skip the LLM re-run.
       // Bare FORGE:CONTEXT matches a partial/interrupted annotation — require :COMPLETE.
-      const { blob } = await issueMarkers(state.issue, io);
-      return has(blob, PHASE_MARKERS.context.completionMarker) ? { satisfied: true } : { satisfied: false };
+      return has(markers.blob, PHASE_MARKERS.context.completionMarker) ? { satisfied: true } : { satisfied: false };
     },
     async detectOutcome(state, io) {
       const { blob } = await issueMarkers(state.issue, io);
@@ -271,10 +291,13 @@ export const PHASES = [
     command: "work-on/build/architect",
     entryCondition: (s) => s.committed.includes("context"),
     async reconcile(state, io) {
+      const markers = await issueMarkers(state.issue, io);
+      if (complexityBand(markers.comments) === "TRIVIAL") {
+        return { satisfied: true, outputs: { skipped: "trivial-complexity-band", phase: "architect" } };
+      }
       // Idempotent resume: FORGE:ARCHITECT:COMPLETE present → skip the LLM re-run.
       // Bare FORGE:ARCHITECT matches a partial/interrupted annotation — require :COMPLETE.
-      const { blob } = await issueMarkers(state.issue, io);
-      return has(blob, PHASE_MARKERS.architect.completionMarker) ? { satisfied: true } : { satisfied: false };
+      return has(markers.blob, PHASE_MARKERS.architect.completionMarker) ? { satisfied: true } : { satisfied: false };
     },
     async detectOutcome(state, io) {
       const { blob } = await issueMarkers(state.issue, io);
@@ -356,7 +379,7 @@ export const PHASES = [
       if (!pr) return { status: "failed", detail: "no PR created" };
       if (pr.merged) return { status: "committed", outputs: { pr: pr.number } };
       if (pr.needsHuman) return { status: "blocked", detail: "review escalated", outputs: { pr: pr.number } };
-      return { status: "failed", detail: "PR open, not merged" };
+      return { status: "failed", detail: "PR open, not merged", retryable: false };
     },
   },
   {
@@ -370,23 +393,9 @@ export const PHASES = [
     // phase table (closing the literal "remediate appears nowhere in the
     // engine" gap) and is fully unit-tested via `pickPhase`/`detectOutcome`.
     //
-    // KNOWN LIMITATION (documented, not fixed here — see forge#2379
-    // investigation "What We Found"): `review`'s `"blocked"` outcome (the
-    // needs-human escalation) causes `bin/engine.mjs`'s `runIssue()` to
-    // `terminate()` immediately, before `review` is ever added to
-    // `state.committed` — and the divergence guard just above that also
-    // pauses before any non-`close` phase once the issue carries
-    // `needs-human`. So a single continuous `runIssue()` walk cannot reach
-    // this phase's `entryCondition` today. In practice `remediate.md` is
-    // (correctly, per `work-on.md` Phase 0A.1) invoked as its own separate
-    // top-level entry point (`/work-on <pr> --remediate`), not as a
-    // continuation of the original run — this phase entry documents and
-    // tests the target state shape for a future run that reconstructs
-    // `committed`/`terminalReason` from live GitHub state (e.g. a dedicated
-    // remediation-run entry point) rather than from a fresh local run-log.
-    // Making that live wiring real is out of this issue's scope — it needs
-    // changes to `review`'s `"blocked"` contract and to `bin/tests/engine.test.mjs`,
-    // both outside this issue's declared file set.
+    // A blocked review is committed with terminalReason "needs-human" before
+    // the engine selects this phase, preserving the review verdict while
+    // handing the PR to remediation in the same run.
     id: "remediate",
     command: "work-on/remediate",
     entryCondition: (s) => s.committed.includes("review") && s.terminalReason === "needs-human",

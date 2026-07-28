@@ -25,6 +25,7 @@
  *   renderDryRun(ctx)                       → string
  *   renderSummaryCard(ctx)                  → string
  *   resolveConfiguredDefaultModel(cwd)      → string|null   (forge.yaml agents.default_model, resolved)
+ *   resolveConfiguredCliTimeout(cwd)        → number|null   (forge.yaml pipeline.cli_timeout_minutes, ms)
  *   runCommand(opts)                        → Promise<{status, ...}>
  *
  * Design notes:
@@ -64,8 +65,10 @@ const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1000;
 // Default wall-clock limit for a single `claude --print` CLI-backend
 // invocation (issue #2003). This bounds an entire command run (the CLI's own
 // internal tool-use loop), not one bash step, so it is deliberately larger
-// than DEFAULT_BASH_TIMEOUT_MS. Override via FORGEDOCK_CLI_TIMEOUT_MS (ms).
-const DEFAULT_CLI_TIMEOUT_MS = 15 * 60 * 1000;
+// than DEFAULT_BASH_TIMEOUT_MS. This is a safety ceiling, not a cap on normal
+// build work. Override via FORGEDOCK_CLI_TIMEOUT_MS (ms) or forge.yaml's
+// pipeline.cli_timeout_minutes.
+const DEFAULT_CLI_TIMEOUT_MS = 60 * 60 * 1000;
 // Short bound for the `claude --version` presence probe used by backend
 // auto-detection — this must never make --dry-run (or a live run) hang, so
 // it is far shorter than DEFAULT_CLI_TIMEOUT_MS. Mirrors the timeout already
@@ -234,6 +237,27 @@ export function resolveConfiguredDefaultModel(cwd) {
     const parsed = parseForgeYaml(raw);
     const configured = parsed?.agents?.default_model;
     return resolveModelAlias(configured);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the CLI backend timeout from forge.yaml's
+ * `pipeline.cli_timeout_minutes` field, if it is a positive integer.
+ *
+ * @param {string} cwd - Working directory to look for forge.yaml in.
+ * @returns {number|null} Timeout in milliseconds, or null when not configured.
+ */
+export function resolveConfiguredCliTimeout(cwd) {
+  try {
+    const forgeYamlPath = join(cwd, "forge.yaml");
+    if (!existsSync(forgeYamlPath)) return null;
+    const raw = readFileSync(forgeYamlPath, "utf-8");
+    const minutes = Number(parseForgeYaml(raw)?.pipeline?.cli_timeout_minutes);
+    return Number.isFinite(minutes) && Number.isInteger(minutes) && minutes > 0
+      ? minutes * 60 * 1000
+      : null;
   } catch {
     return null;
   }
@@ -1079,8 +1103,10 @@ export function runCliBackend({
   spawnFn = spawnSync,
 }) {
   const rawTimeout = parseInt(process.env.FORGEDOCK_CLI_TIMEOUT_MS, 10);
-  const timeoutMs =
-    Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : DEFAULT_CLI_TIMEOUT_MS;
+  const configuredTimeout = resolveConfiguredCliTimeout(cwd);
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0
+    ? rawTimeout
+    : configuredTimeout ?? DEFAULT_CLI_TIMEOUT_MS;
 
   // Write the system prompt (command spec + framing) to a private temp file
   // rather than passing it inline as an argv string — see the SYSTEM PROMPT

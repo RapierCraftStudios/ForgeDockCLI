@@ -7,7 +7,7 @@
 #   extract-affected-files.sh <issue_number> "-R <owner/repo>"   (single pre-joined token also accepted)
 #
 # Output (stdout):
-#   Line 1:   PROVENANCE=affected-files-section | body-fallback | none | error
+#   Line 1:   PROVENANCE=contract-deliverables | affected-files-section | body-fallback | none | error
 #   Line 2+:  one extracted file path per line (zero lines when PROVENANCE=none or error)
 #
 # Exit codes:
@@ -16,12 +16,39 @@
 #       that files were found).
 #   2 — Usage error (missing issue number, malformed -R value).
 #
-# Extraction rules (forge#2436):
+# Extraction rules (forge#2436, extended forge#2848):
+#   0. Highest-confidence path — the issue's FORGE:CONTRACT comment (if one exists),
+#      scoped to ONLY its own "### Deliverables" section. A contract deliverables table
+#      states *intent to change* ("I will edit this file"), whereas an investigation's
+#      Affected Files list and especially a raw issue body routinely name files as
+#      *context* ("this interacts with X", "similar to the check in Y"). Preferring the
+#      contract is what stops a cohort of issues that merely cite the same file from
+#      being serialized against each other (forge#2848).
+#      -> PROVENANCE=contract-deliverables
+#
+#      TEMPORAL CAVEAT — do not over-claim this source: FORGE:CONTRACT is posted at
+#      *build* time (work-on/build.md Phase B2), which is AFTER /orchestrate Phase 3
+#      builds the DAG. On a cold first-pass plan no contract exists yet, so this path is
+#      inert by construction. It pays off only on the paths that re-extract later: wake /
+#      re-plan after compaction, mid-batch re-derivation (phase-4-execution.md's DONE-arm
+#      DROP handling), and IN_PROGRESS predecessors built in an earlier wave or session.
+#
+#      FALL-THROUGH RULE (load-bearing — see forge#2848 risk table): a contract that
+#      exists but whose Deliverables section yields ZERO paths MUST fall through to the
+#      INVESTIGATOR path below. A contract is an *upgrade* over the investigator source,
+#      never a replacement for it — blackholing to `none` here would fire Layer 4's
+#      conservative serialization for exactly the mid-batch issues this change exists to
+#      un-serialize, i.e. the bug being fixed, inverted. Note this is deliberately NOT
+#      the same shape as the INVESTIGATOR->body relationship in rule 2, which does NOT
+#      fall through on zero files (see rule 2's own note, forge#2382).
 #   1. Primary path — the issue's FORGE:INVESTIGATOR comment (if one exists), scoped to
 #      ONLY its own "### Affected Files" section. Capture stops at the next markdown
 #      heading of any level, so paths mentioned in "### Evidence", "### Root Cause",
 #      "### Related Issues", etc. are never collected.
 #      -> PROVENANCE=affected-files-section
+#      NOTE (forge#2382): unlike rule 0, an INVESTIGATOR comment that EXISTS but yields
+#      zero paths does NOT fall through to rule 2 — an investigation that scoped its own
+#      Affected Files section to nothing is a confirmed-empty result, not a missing one.
 #   2. Fallback path — used ONLY when no FORGE:INVESTIGATOR comment exists at all.
 #      Scoped to a deliverables-shaped heading in the raw issue body:
 #      "## Affected Files", "## Deliverables", or "### Files to change". Capture stops
@@ -126,6 +153,20 @@ fi
 # deeper sub-heading inside a deliverables section still closes capture
 # rather than leaking into unrelated prose.
 # --------------------------------------------------------------------------- #
+extract_contract_section() {
+  # forge#2848 — same sentinel shape as the two helpers below, targeting the
+  # FORGE:CONTRACT comment's "### Deliverables" table. The `/^### Deliverables/`
+  # heading and the awk sentinel are the ones already proven in-tree at
+  # commands/work-on/build.md:218 and :258; only the path-extraction step differs
+  # (this script uses grep -oE via extract_paths, never build.md's grep -oP —
+  # forge#2436 removed the PCRE dependency on purpose, see extract_paths below).
+  awk '
+    /^### Deliverables/ { p=1; next }
+    /^#/ { p=0 }
+    p { print }
+  ' <<< "$1"
+}
+
 extract_investigator_section() {
   awk '
     /^### Affected Files/ { p=1; next }
@@ -152,12 +193,48 @@ extract_paths() {
   grep -oE "$EXT_REGEX" <<< "$1" 2>/dev/null | tr -d '`' | sort -u || true
 }
 
-# --------------------------------------------------------------------------- #
-# Primary path: FORGE:INVESTIGATOR comment, scoped to its own Affected Files section
-# --------------------------------------------------------------------------- #
 PROVENANCE="none"
 FILES=""
 GH_CALL_FAILED=0
+
+# --------------------------------------------------------------------------- #
+# Highest-confidence path: FORGE:CONTRACT comment, scoped to its own Deliverables
+# section (forge#2848). Runs AHEAD of the INVESTIGATOR path because a deliverables
+# table states intent to change, while an Affected Files list may name files that
+# are merely relevant. See rule 0 in the header for the temporal caveat (a contract
+# only exists post-build, so this is inert on a cold first-pass plan).
+#
+# Uses the same `if ! VAR=$(cmd); then GH_CALL_FAILED=1; fi` idiom as the calls
+# below — never `|| true` — so a failed contract fetch stays distinguishable from
+# "no contract exists" and can still escalate to PROVENANCE=error if nothing else
+# recovers real data (forge#2504).
+# --------------------------------------------------------------------------- #
+if ! CONTRACT_BODY=$(gh api "repos/${REPO}/issues/${NUM}/comments" \
+  --jq '[.[] | select(.body | contains("FORGE:CONTRACT"))] | last | .body // ""' 2>/dev/null); then
+  GH_CALL_FAILED=1
+  echo "WARNING: gh api call failed while fetching comments for issue #$NUM (repo: $REPO) — cannot confirm whether a FORGE:CONTRACT comment exists; treating as inconclusive, not empty" >&2
+  CONTRACT_BODY=""
+fi
+
+if [[ -n "$CONTRACT_BODY" ]]; then
+  SCOPED=$(extract_contract_section "$CONTRACT_BODY")
+  FILES=$(extract_paths "$SCOPED")
+  if [[ -n "$FILES" ]]; then
+    PROVENANCE="contract-deliverables"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# Primary path: FORGE:INVESTIGATOR comment, scoped to its own Affected Files section
+#
+# Guarded on `-z "$FILES"` so the contract path above FALLS THROUGH when it yielded
+# zero paths (no contract, no Deliverables section, or a deliverables table naming no
+# recognized file extension). The guard wraps the whole INVESTIGATOR/body block from
+# the outside, leaving the INVESTIGATOR->body-fallback relationship inside it
+# byte-identical — that inner relationship deliberately does NOT fall through on zero
+# files (forge#2382), and this change must not alter it.
+# --------------------------------------------------------------------------- #
+if [[ -z "$FILES" ]]; then
 
 # NOTE: deliberately no `| tail -1` here — `gh api --jq`'s raw-string output
 # for a multi-line `.body` field embeds literal newlines, so isolating "the
@@ -215,6 +292,9 @@ else
     fi
   fi
 fi
+fi  # end contract fall-through guard (forge#2848) — the INVESTIGATOR/body block
+    # above is intentionally left un-indented so it stays byte-identical to its
+    # pre-forge#2848 form; only the surrounding guard is new.
 
 # forge#2504: only escalate to "error" when neither path yielded real data AND
 # at least one gh call genuinely failed along the way. A failed primary call

@@ -189,6 +189,8 @@ should_dispatch() {
 
 **WHY THIS EXISTS** <!-- Added: forge#1912 -->: Phase 4's dispatch loops previously launched every DAG-ready issue in one shot — the engine-first bash loop backgrounded every `should_dispatch()`-passing issue with no count limit, and the Agent-spawn-fallback path was explicitly instructed to "launch all ready agents simultaneously." On a large ready set this saturates the Anthropic API rate limit in one burst, causing cascading failures across most of the batch. This is a distinct, count-denominated gate from the dollar-denominated `--budget` gate above (Step 4A-pre.0) — an issue can be deferred for budget reasons, concurrency reasons, or both; each gate accumulates its own deferred list independently.
 
+`MAX_CONCURRENT` caps top-level `/work-on` dispatches, not the total number of harness subagents. A normal worker can spawn context, architect, implement, validate, quality-gate, and review children. Budget **8 total subagent spawns per worker** when choosing this value: `max_concurrent <= session_subagent_budget / 8`. This is a conservative planning multiplier, not a second runtime semaphore; the harness does not expose a reliable cross-agent spawn counter to this shell-level dispatcher.
+
 Initialize the concurrency cap and its batch-scope tracking state before the first dispatch:
 
 ```bash
@@ -209,8 +211,12 @@ fi
 
 ACTIVE_DISPATCH_COUNT=0             # in-flight dispatched-but-not-yet-completed agents, this batch
 DEFERRED_CONCURRENCY_ISSUES=()      # ready issues held back because no headroom was available
+SUBAGENT_SPAWN_BUDGET_PER_WORKER=8  # /work-on + build/review fan-out planning estimate
+TOP_LEVEL_DISPATCH_TOTAL=0
+PLANNED_SUBAGENT_SPAWNS=0
+OBSERVED_SUBAGENT_SPAWNS="unavailable" # replace only with harness telemetry; never infer
 
-echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT} (forge.yaml → orchestration.max_concurrent; default 12 when unset or invalid)"
+echo "Concurrency gate initialized: MAX_CONCURRENT=${MAX_CONCURRENT}; plan for up to $((MAX_CONCURRENT * SUBAGENT_SPAWN_BUDGET_PER_WORKER)) subagent spawns in flight (8 per worker)"
 # --- End concurrency gate initialization ---
 ```
 
@@ -225,6 +231,31 @@ dispatch_headroom() {
 ```
 
 **This is a hard cap, not a suggestion.** No dispatch site in Phase 4 may background/spawn more than `dispatch_headroom` new agents without first waiting for in-flight agents to complete. Issues that cannot be dispatched due to the cap go into `DEFERRED_CONCURRENCY_ISSUES[]` and are released — in the order they were deferred — as running agents complete (Step 4B), the same event-driven model (no sleep/poll loops) the file already uses for DAG-readiness and budget gating.
+
+**Dispatch accounting**: Immediately after each successful top-level dispatch, increment `TOP_LEVEL_DISPATCH_TOTAL` and add `SUBAGENT_SPAWN_BUDGET_PER_WORKER` to `PLANNED_SUBAGENT_SPAWNS`. When the runtime reports child-spawn telemetry, replace `OBSERVED_SUBAGENT_SPAWNS` with that measured total; otherwise leave it `unavailable` rather than fabricating a measured value.
+
+### Step 4A-pre.0.3: Secondary content-creation backpressure (MANDATORY)
+
+GitHub's `resources.core` quota does not report secondary content-creation throttles. Treat any GitHub API response with HTTP `403` whose body contains `secondary rate limit` as a batch-wide backpressure signal.
+
+```bash
+# Call from every dispatcher-owned gh write/create wrapper and from a child completion
+# report that includes its final GitHub API error. Do not retry the failed request here.
+SECONDARY_RATE_LIMITED=false
+SECONDARY_RATE_LIMIT_MESSAGE=""
+
+record_secondary_rate_limit() {
+  local STATUS="$1"
+  local BODY="$2"
+  if [ "$STATUS" = "403" ] && echo "$BODY" | grep -qi 'secondary rate limit'; then
+    SECONDARY_RATE_LIMITED=true
+    SECONDARY_RATE_LIMIT_MESSAGE="$BODY"
+    echo "SECONDARY RATE LIMIT: pausing all new dispatch. Do not retry GitHub content creation until an operator resumes the batch." >&2
+  fi
+}
+```
+
+Before every dispatch site computes headroom or launches a worker, check `SECONDARY_RATE_LIMITED`. When true, preserve the ready/deferred queues, launch no more workers, and end the active dispatch cycle. Do not poll or retry GitHub calls to discover recovery: an operator resumes the batch after the throttle clears. In-flight agents receive this contract in the dispatch prompt: on a secondary-limit 403, they must stop their GitHub write/create retry loop, report the response to the orchestrator, and exit their current phase without creating replacement work.
 
 ### Step 4A-pre: Staging baseline tracking (MANDATORY — continuous)
 
@@ -409,6 +440,16 @@ echo "Step 4A.pre: using BATCH_T0=${BATCH_T0} for Step 4C's run-spawned cascade 
 DEFERRED_FINDINGS=()
 QUEUED_FINDINGS=()
 declare -A DEFERRED_REASONS
+# Count every finding regardless of admission, so a deferred refinement never
+# makes the reported amplification ratio look better than it was.
+FINDINGS_SPAWNED=0
+MERGED_UNITS=0
+AMPLIFICATION_RATIO_HISTORY=()
+AMPLIFICATION_DEFERRED=()
+declare -A FINDINGS_BY_SOURCE_PR
+declare -A REFINEMENT_FINDINGS
+declare -A NEW_SURFACE_FINDINGS
+declare -A AMPLIFICATION_FINDING_SEEN
 declare -A AGENT_ISSUE_MAP
 # Engine-first dispatch equivalent of AGENT_ISSUE_MAP (fixed forge#2466): keyed by issue
 # number, holds the task id returned by each backgrounded `Bash(run_in_background=true,
@@ -428,6 +469,42 @@ declare -A OPENCODE_DISPATCH_MAP
 # brief on every completion cycle this loop re-runs before BLOCKED_NUM actually dispatches.
 declare -A SAME_FILE_BRIEF
 declare -A EDGE_BRIEFED
+
+# DONE-path edge re-verification memo (forge#2848). A conclusive re-derivation is
+# memoized in EDGE_REDERIVED; inconclusive results get one retry, capped by
+# EDGE_REDERIVE_ATTEMPTS. This avoids caching a transient failure while bounding
+# extraction to two attempts per descendant per batch.
+declare -A EDGE_REDERIVED
+declare -A EDGE_REDERIVE_ATTEMPTS
+
+# Affected-file extraction helper, resolved for the DONE-path cohort re-derivation
+# (forge#2848). Same resolver precedence as phase-3-dependency.md Step 3C Layer 1 —
+# ForgeDock's runtime installation before the target repository — because the
+# orchestrator runs inside the project being worked on, where a bare
+# `bash scripts/extract-affected-files.sh` silently fails when that project has not
+# copied ForgeDock's helper scripts into its own repository (#2794/#2791).
+resolve_extract_affected_files() {
+  local candidates=()
+  [ -n "${FORGE_HOME:-}" ] && candidates+=("$FORGE_HOME/scripts/extract-affected-files.sh")
+  [ -n "${REPO_PATH:-}" ] && candidates+=("$REPO_PATH/scripts/extract-affected-files.sh")
+  candidates+=("$PWD/scripts/extract-affected-files.sh")
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "ERROR: extract-affected-files.sh is not installed in any configured runtime path." >&2
+  return 1
+}
+
+# Non-fatal here, unlike Phase 3's hard exit: Phase 3 cannot build a DAG at all without
+# this helper, whereas Phase 4 only needs it for the OPTIONAL re-derivation optimization.
+# If it is missing, re-derivation is skipped and edges stay as planned — the conservative
+# direction, and identical to this file's pre-forge#2848 behavior.
+AFFECTED_FILES_SCRIPT=$(resolve_extract_affected_files) || AFFECTED_FILES_SCRIPT=""
 
 # Human-gated idle/backpressure flag (Step 4B item 6.7, forge#1814). Starts false —
 # recomputed every completion cycle over {all_batch_issue_numbers}. Declared at batch
@@ -492,6 +569,23 @@ fi
 
 TOKEN_ESTIMATE_PER_FINDING=$(yq '.pipeline.token_estimate_per_finding // 150000' forge.yaml 2>/dev/null || echo 150000)
 
+# Amplification is observational by default. The optional ceiling is evaluated
+# only against same-lineage refinements in Step 4C, never against new surface.
+CASCADE_MAX_AMPLIFICATION=$(yq '.orchestration.cascade.max_amplification // "off"' forge.yaml 2>/dev/null || echo "off")
+if [ "$CASCADE_MAX_AMPLIFICATION" != "off" ]; then
+  if ! echo "$CASCADE_MAX_AMPLIFICATION" | grep -qE '^[0-9]+(\.[0-9]+)?$' || \
+     ! awk "BEGIN { exit !($CASCADE_MAX_AMPLIFICATION > 0) }"; then
+    echo "WARNING: forge.yaml → orchestration.cascade.max_amplification must be a positive number or off — disabling the bound"
+    CASCADE_MAX_AMPLIFICATION="off"
+  fi
+fi
+CONVERGENCE_WINDOW=$(yq '.orchestration.cascade.convergence_window // 3' forge.yaml 2>/dev/null || echo 3)
+if ! echo "$CONVERGENCE_WINDOW" | grep -qE '^[1-9][0-9]*$'; then
+  echo "WARNING: forge.yaml → orchestration.cascade.convergence_window must be a positive integer — falling back to 3"
+  CONVERGENCE_WINDOW=3
+fi
+echo "Cascade amplification: max_amplification=${CASCADE_MAX_AMPLIFICATION} convergence_window=${CONVERGENCE_WINDOW} (off preserves current admission behavior)"
+
 # Independent boolean levers — each accepts an explicit granular override on
 # top of the resolved preset (preset supplies the default, not a hard value).
 CASCADE_DEFER_ON_BATCH_GATED=$(yq ".orchestration.cascade.defer_on_batch_gated // ${PRESET_DEFER_GATED}" forge.yaml 2>/dev/null || echo "$PRESET_DEFER_GATED")
@@ -548,6 +642,97 @@ Use `${ISSUE_LANE[$NUM]}` and `${ISSUE_PR_BASE[$NUM]}` to populate `{LANE}` and 
 
 ### Step 4A: Dispatch ready issues
 
+### Step 4A.0: Probe Knowledge Gist capability once
+
+Probe the authenticated identity once for this orchestration run before any engine, Agent, or
+OpenCode worker is dispatched. A GitHub App installation token identifies as `Bot` and cannot use
+the Gists API; cache that fact rather than letting every worker rediscover it by attempting a
+write. An unavailable identity probe preserves existing behavior for PAT-authenticated runs.
+
+```bash
+if [ -z "${FORGE_GIST_CAPABLE+x}" ]; then
+  GIST_AUTH_TYPE=$(gh api user --jq '.type' 2>/dev/null || true)
+  if [ "$GIST_AUTH_TYPE" = "Bot" ]; then
+    FORGE_GIST_CAPABLE=false
+  else
+    FORGE_GIST_CAPABLE=true
+  fi
+  export FORGE_GIST_CAPABLE
+fi
+
+if [ "$FORGE_GIST_CAPABLE" = "true" ]; then
+  echo "Knowledge Gist capability available"
+else
+  echo "INFO: Knowledge Gist subsystem unavailable for this authentication; workers will skip it"
+fi
+```
+
+Carry `FORGE_GIST_CAPABLE` unchanged through every dispatch path. Do not probe it in individual
+workers dispatched by this run. Phase 6 reports a false value once at batch level.
+
+**Claims-board dispatch gate (MANDATORY, before every individual dispatch)** <!-- Added: forge#2844 -->: The coordination issue is the durable authority for file ownership. Do not use `EDGE_FILES`, `ISSUE_FILES`, or a remembered prior read as evidence that a claim is free. Immediately before dispatching each issue, re-read the full claims board and refuse that dispatch when the issue's declared file set intersects a live claim held by another issue. This applies equally to engine, Claude Agent, and OpenCode task dispatches, including newly-ready issues and wake reconstruction.
+
+```bash
+# Returns unreleased claims as [{holder: "123", files: "..."}]. A release is a separate,
+# later comment, so it must be paired with its claim by holder rather than searched for in the
+# claim comment itself. Terminal holder states also self-heal claims left behind by dead agents.
+read_active_claims() {
+  local COORD_NUM="$1"
+  local CLAIMS HOLDER TERMINAL
+  CLAIMS=$(gh api --paginate --slurp "repos/{GH_REPO}/issues/${COORD_NUM}/comments" 2>/dev/null \
+    | jq -c '
+        flatten as $comments |
+        [$comments[]
+         | select(.body | contains("<!-- FORGE:CLAIM -->"))
+         | . as $claim
+         | ($claim.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) as $holder
+         | select([$comments[]
+                   | select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->"))
+                   | select((.body | capture("\\*\\*Holder\\*\\*: #(?<holder>[0-9]+)").holder) == $holder)
+                   | select(.created_at > $claim.created_at)] | length == 0)
+         | {holder: $holder,
+            files: ($claim.body | capture("\\*\\*Files\\*\\*: (?<files>[\\s\\S]*?)(?:\\n\\*\\*Interfaces\\*\\*:|$)").files)}]') || return 1
+
+  for HOLDER in $(echo "$CLAIMS" | jq -r '.[].holder'); do
+    TERMINAL=$(gh issue view "$HOLDER" -R {GH_REPO} --json labels --jq \
+      '[.labels[].name | select(. == "workflow:merged" or . == "workflow:invalid" or . == "workflow:awaiting-merge" or . == "needs-human")] | length > 0' 2>/dev/null)
+    [ "$TERMINAL" = "true" ] && CLAIMS=$(echo "$CLAIMS" | jq --arg holder "$HOLDER" '[.[] | select(.holder != $holder)]')
+  done
+  echo "$CLAIMS"
+}
+
+claim_conflicts_with_live_holder() {
+  local NUM="$1" TARGET_FILES CLAIM HOLDER CLAIM_FILES OVERLAP
+  TARGET_FILES=$(printf '%s\n' "${ISSUE_FILES[$NUM]:-}" | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+  [ -z "$TARGET_FILES" ] && return 1  # No declared paths: normal conservative DAG rules still apply.
+
+  ACTIVE_CLAIMS=$(read_active_claims "$COORD_ISSUE_NUMBER") || {
+    echo "REFUSING TO DISPATCH #${NUM}: could not read the durable claims board." >&2
+    return 0
+  }
+  while IFS= read -r CLAIM; do
+    HOLDER=$(echo "$CLAIM" | jq -r '.holder')
+    [ "$HOLDER" = "$NUM" ] && continue
+    CLAIM_FILES=$(echo "$CLAIM" | jq -r '.files' | sed -E '/^[[:space:]]*$/d; s/^[[:space:]]*[-*][[:space:]]*//; s/`//g' | sort -u)
+    OVERLAP=$(comm -12 <(printf '%s\n' "$TARGET_FILES") <(printf '%s\n' "$CLAIM_FILES"))
+    if [ -n "$OVERLAP" ]; then
+      echo "DEFERRING #${NUM}: declared files overlap live claim held by #${HOLDER}: ${OVERLAP//$'\n'/, }"
+      return 0
+    fi
+  done < <(echo "$ACTIVE_CLAIMS" | jq -c '.[]')
+  return 1
+}
+
+# Run this immediately before each engine Bash, Agent(), or OpenCode task call. Do not batch the
+# board read: another worker can claim a file between two dispatches in the same ready set.
+if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ]; then
+  if claim_conflicts_with_live_holder "$NUM"; then
+    DEFERRED_CLAIM_ISSUES+=("$NUM")
+    continue
+  fi
+fi
+```
+
 **Engine-first dispatch (default)**: When `forgedock` is in PATH, dispatch each ready issue via the durable engine rather than spawning prose Agent sub-agents. The engine's phase table enforces gate semantics in code — its fail-closed review gate and deterministic phase ordering are not subject to LLM interpretation.
 
 **OpenCode dispatch (runtime-neutral adapter)**: When `FORGE_RUNTIME=opencode` or
@@ -568,7 +753,7 @@ task(
   description="Work on {PROJECT_PREFIX}#{NUMBER}",
   subagent_type="general",
   background=true,
-  prompt="Use the same Phase 4A work-on template below. Invoke Skill(skill='work-on', args='{PROJECT_PREFIX}{NUMBER} --under-orchestration') and continue until a terminal workflow state."
+  prompt="Use the same Phase 4A work-on template below. Before invoking it, run `export FORGE_GIST_CAPABLE={FORGE_GIST_CAPABLE}` so the cached orchestration capability is preserved. Invoke Skill(skill='work-on', args='{PROJECT_PREFIX}{NUMBER} --under-orchestration') and continue until a terminal workflow state."
 )
 ```
 
@@ -678,6 +863,18 @@ if [ "$FORGEDOCK_AVAILABLE" = "true" ]; then
   if [ "${#DEFERRED_CONCURRENCY_ISSUES[@]}" -gt 0 ]; then
     echo "CONCURRENCY DEFER: ${#DEFERRED_CONCURRENCY_ISSUES[@]} ready issue(s) held back — ${ACTIVE_DISPATCH_COUNT}/${MAX_CONCURRENT} already in flight. Will dispatch as slots free up: ${DEFERRED_CONCURRENCY_ISSUES[*]}"
   fi
+  # Filter against the durable board once while forming this engine batch. The tool-call
+  # instruction below re-checks immediately before each launch to close the remaining TOCTOU gap.
+  CLAIM_SAFE_DISPATCH=()
+  for NUM in "${DISPATCH_NOW[@]}"; do
+    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_ISSUE_NUMBER:-}" ] && claim_conflicts_with_live_holder "$NUM"; then
+      DEFERRED_CLAIM_ISSUES+=("$NUM")
+      continue
+    fi
+    CLAIM_SAFE_DISPATCH+=("$NUM")
+  done
+  DISPATCH_NOW=("${CLAIM_SAFE_DISPATCH[@]}")
+
   echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message via forgedock run-issue (headroom was ${HEADROOM})"
 
   for NUM in "${DISPATCH_NOW[@]}"; do
@@ -714,10 +911,10 @@ fi
 fi
 ```
 
-**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Issue one `Bash(...)` call per issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
+**Dispatch each issue in `DISPATCH_NOW` via its own backgrounded `Bash` call (MANDATORY when `FORGEDOCK_AVAILABLE=true`) — never shell `&`/`wait`.** Immediately before each call, run `claim_conflicts_with_live_holder "{NUM}"`; if it returns success, defer that issue rather than dispatching it. Issue one `Bash(...)` call per remaining issue in `DISPATCH_NOW`, all in the same message, so they run concurrently within the headroom already computed above:
 
 ```
-Bash(command="forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
+Bash(command="FORGE_GIST_CAPABLE=${FORGE_GIST_CAPABLE} forgedock run-issue {NUM} --lane {PR_BASE}", run_in_background=true, description="Engine-drive issue #{NUM}")
 ```
 
 Capture the task id each call returns into `ENGINE_DISPATCH_MAP[{NUM}]` (declared alongside `AGENT_ISSUE_MAP` below — Step 4B's completion handler uses this map to identify which issue a backgrounded engine-mode `Bash` completion notification belongs to, the same role `AGENT_ISSUE_MAP` plays for `agent_completed` notifications):
@@ -762,6 +959,8 @@ Agent(
 **Repository**: {GH_REPO}
 **Repo path**: {REPO_PATH}
 
+**KNOWLEDGE GIST CAPABILITY**: This orchestration already probed it: `{FORGE_GIST_CAPABLE}`. Before invoking `/work-on`, run `export FORGE_GIST_CAPABLE={FORGE_GIST_CAPABLE}`. Do not re-probe or attempt Gist creation when it is `false`.
+
 **YOUR MISSION**: Invoke `/work-on` via the Skill tool and let it run to completion. `/work-on` is a self-contained routing loop that handles the ENTIRE pipeline: investigate → build (context → architect → implement → validate) → review (push → PR → /review-pr --auto-merge) → close (project board → trajectory log → worktree cleanup). Do NOT intervene, compensate, or manually close issues — `/work-on` handles everything including issue closure and label updates in its close phase.
 
 **CRITICAL — DO NOT STOP EARLY**: /work-on runs as a multi-phase routing loop. Each phase (investigate, build, review, close) returns an intermediate result — these are NOT completion signals. You are NOT done until the issue reaches a terminal state: `workflow:merged`, `workflow:invalid`, `needs-human`, or `workflow:awaiting-merge`. If /work-on returns after only one phase (e.g., investigation), you MUST invoke it again immediately — it will re-read GitHub state and continue to the next phase. Keep invoking /work-on until it reaches a terminal state. Never output 'done' or stop after an intermediate result.
@@ -775,6 +974,7 @@ Agent(
   - The `--under-orchestration` flag tells `/work-on` to post its phase-entry `FORGE:HEARTBEAT` comments (Phases 0/1/3/5) — this orchestrator's Step 4B.5 stall detector depends on those timestamps. A solo `/work-on` run omits the flag and skips those writes entirely (see `commands/work-on.md` → Orchestration Flag).
 - NEVER bypass /work-on with manual git/gh commands — the label updates and structured comments are critical for tracking
 - **File-backed GitHub bodies — entity scope plus read-back is mandatory**: Never stage a `gh --body-file` body at a generic shared `/tmp` path, including one made by bare `mktemp`. Prefer the session scratchpad or a repo-relative scratch directory on Windows: a native Windows `gh` may not resolve Git Bash `/tmp` reliably. Create a filename that contains the target issue/PR number and an agent-unique token, then use `mktemp` for its random suffix. Put one caller-chosen marker such as `<!-- FORGE:BODY-INTEGRITY:${NUMBER}_investigator_${AGENT_TOKEN} -->` in the body. After every `gh issue create|edit` or `gh pr create|comment` using `--body-file`, re-read the target object and assert the exact marker is present; a mismatch is a hard error. Unique names reduce collisions, but only read-back detects a collision that substitutes plausible-looking content from another agent. Do not rely on eyeballing. (forge#2843) <!-- allowlist:check-command-side-effects -->
+- **GitHub secondary rate limit**: If a GitHub API call returns HTTP 403 with `secondary rate limit` in its response, do NOT retry it or start a polling loop. Stop GitHub content creation for this phase, report the status and response body to the orchestrator in your final result, and wait for a later batch resume. Retrying extends the throttle for every sibling.
 - **`docker cp` — NEVER write into a bind-mounted shared container**: If the project you're working on runs its dev/test containers with a bind mount to the main (non-worktree) checkout, `docker cp` into that container writes through the mount into the main checkout — not your isolated per-issue worktree. Before running `docker cp` into any container, confirm its mount source is your own worktree, not a shared/main one; if you can't confirm that, don't assume an in-container test run reflects your feature branch. (forge#2198)
 - NEVER target `main` for PRs targeting the default repo. Use `{STAGING_BRANCH}` for fast-lane issues, or `milestone/{slug}` for milestone issues.
 - Satellite repos (MCP, n8n) have no staging branch — fast-lane PRs go to `main` for those.
@@ -964,7 +1164,7 @@ fi
 echo "Dispatching ${#DISPATCH_NOW[@]} issue(s) this message (headroom was ${HEADROOM})"
 ```
 
-Spawn `Agent()` for every issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by `${#DISPATCH_NOW[@]}` — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
+Immediately before every Claude `Agent()` or OpenCode `task()` call, run `claim_conflicts_with_live_holder "{NUM}"`; when it returns success, append the issue to `DEFERRED_CLAIM_ISSUES[]` and do not make that call. Spawn `Agent()` for every remaining issue in `DISPATCH_NOW` (not the raw ready set) using the template above. After the batch spawn, increment `ACTIVE_DISPATCH_COUNT` by the number actually dispatched — this happens in addition to, not instead of, capturing each returned agent ID into `AGENT_ISSUE_MAP` above.
 
 If `DISPATCH_NOW` is empty (headroom is 0), do not spawn any agents this cycle — wait for the next `agent_completed` notification, which frees a slot and re-triggers this dispatch computation (Step 4B).
 
@@ -1042,7 +1242,7 @@ classify_predecessor_state() {
 
 A GATED predecessor whose PR later merges reclassifies to DONE the next time `classify_predecessor_state` runs (its label flips to `workflow:merged`) — this is exactly what the merge-triggered wake check (item 6.6 below) relies on.
 
-**File-overlap edge re-verification** <!-- Added: forge#1904 --> — `classify_predecessor_state()` answers "is the predecessor resolved enough to proceed," but it says nothing about whether a specific Layer 1/2/3 file-overlap edge (`EDGE_KIND`/`EDGE_FILES`, tagged in `phase-3-dependency.md` Step 3C/3D) was ever real. Both were built from a **pre-build guess** — the predecessor's `FORGE:INVESTIGATOR` "Affected Files" list, or a raw issue-body parse if no investigation existed yet. Once a predecessor reaches FAILED or GATED, that guess must be checked against ground truth (the predecessor's actual PR diff, or the absence of any PR) before the edge is allowed to keep blocking a dependent. Without this, a predecessor that reaches `needs-human` or `workflow:invalid` having never touched the guessed shared file (or never opened a PR at all) leaves its dependents gated/skipped on a conflict that never existed.
+**File-overlap edge re-verification** <!-- Added: forge#1904 --> — `classify_predecessor_state()` answers "is the predecessor resolved enough to proceed," but it says nothing about whether a specific Layer 1/2/3 file-overlap edge (`EDGE_KIND`/`EDGE_FILES`, tagged in `phase-3-dependency.md` Step 3C/3D) was ever real. Both were built from a **pre-build guess** — the predecessor's `FORGE:INVESTIGATOR` "Affected Files" list, or a raw issue-body parse if no investigation existed yet. Once a predecessor reaches FAILED, GATED, **or DONE**, that guess must be checked against ground truth (the predecessor's actual PR diff, or the absence of any PR) before the edge is allowed to keep blocking a dependent or to inject a same-file brief. Without this, a predecessor that reaches `needs-human` or `workflow:invalid` having never touched the guessed shared file (or never opened a PR at all) leaves its dependents gated/skipped on a conflict that never existed — and on the happy path, an over-serialized chain is never reconciled at all and stays serialized for its entire life (forge#2848).
 
 ```bash
 verify_file_overlap_edge() {
@@ -1072,9 +1272,25 @@ verify_file_overlap_edge() {
   # a MERGED PR would already classify the predecessor DONE, not FAILED/GATED — so this filter
   # also guarantees `gh pr diff` below targets a live, still-open branch rather than an
   # abandoned PR whose branch may since have been force-deleted (e.g. by /cleanup).
+  #
+  # forge#2848 — the DONE call site widens what this can surface: for a DONE predecessor
+  # the live PR is MERGED, not OPEN. That is the *better* case, not a problem — a merged
+  # PR's diff is ground truth rather than a still-moving branch, and `gh pr diff` serves it
+  # from the API, so it keeps working after the head branch is deleted on merge. The
+  # CLOSED-unmerged exclusion is unchanged and still correct for all three call sites.
   local PRED_PR
+  local PRED_PR_EXIT
   PRED_PR=$(gh pr list -R {GH_REPO} --state all --search "\"Closes #${PRED}\" in:body" \
-    --json number,state --jq '[.[] | select(.state != "CLOSED")][0].number // empty' 2>/dev/null || echo "")
+    --json number,state --jq '[.[] | select(.state != "CLOSED")][0].number // empty' 2>/dev/null)
+  PRED_PR_EXIT=$?
+
+  if [ "$PRED_PR_EXIT" -ne 0 ]; then
+    # Fail-safe: could not determine whether a live predecessor PR exists (transient API
+    # error, rate limit, or search-index lag). Keep the edge rather than conflating a failed
+    # lookup with confirmed absence of a PR and dropping a real conflict.
+    echo "KEEP"
+    return
+  fi
 
   if [ -z "$PRED_PR" ]; then
     # Predecessor reached a terminal/gated state having never opened a PR (or only ever had
@@ -1124,16 +1340,28 @@ verify_file_overlap_edge() {
 }
 ```
 
-**Call sites**: item 6 (FAILED handling, below) and item 6.5 (GATED handling, below) both call this helper — once per `EDGE_KIND`-tagged predecessor edge — before cascading a skip or tracking `blocked-on-human-merge`. `phase-3-dependency.md`'s wake/compaction reconstruction block calls the identical logic (mirrored verbatim, not re-derived) for the case where the predecessor resolves after the orchestrator session has already ended — see that file's "Orchestrator state reconstruction on wake / after compaction" section. This mirroring is deliberate: keeping the check in exactly one function definition, called (not reimplemented) from both files, avoids the same drift class forge#1812 had to fix once already for DONE/GATED/FAILED classification itself.
+**Call sites**: item 6 (FAILED handling, below), item 6.5 (GATED handling, below), and the DONE arm of the core streaming dispatch loop (below — see "DONE-path edge re-verification") all call this helper — once per `EDGE_KIND`-tagged predecessor edge — before cascading a skip or tracking `blocked-on-human-merge`. `phase-3-dependency.md`'s wake/compaction reconstruction block calls the identical logic (mirrored verbatim, not re-derived) for the case where the predecessor resolves after the orchestrator session has already ended — see that file's "Orchestrator state reconstruction on wake / after compaction" section. This mirroring is deliberate: keeping the check in exactly one function definition, called (not reimplemented) from both files, avoids the same drift class forge#1812 had to fix once already for DONE/GATED/FAILED classification itself.
 
 **Recursive cascade note (item 6 only)**: when a dependent `DEP` is itself marked "skipped — dependency failed" (edge confirmed `KEEP`, not dropped), `DEP` becomes the new FAILED anchor for its own direct dependents — re-run this same `verify_file_overlap_edge` check at that next hop too, rather than assuming every transitive descendant is unconditionally skipped. A grandchild dependent whose only path to the failure runs through a spurious (droppable) edge one hop down must not be skipped just because its parent was.
 
-**Never called from**: the DONE branch (that predecessor's code is already merged — the edge, if real, is already resolved) or the `IN_PROGRESS` branch (nothing to re-verify yet — the predecessor hasn't concluded).
+**Never called from**: the `IN_PROGRESS` branch (nothing to re-verify yet — the predecessor hasn't concluded).
+
+**DONE-path edge re-verification** <!-- Added: forge#2848 --> — the DONE branch *does* call this helper, and it is the only call site that fires on the happy path. Be precise about what it buys, because the obvious reading is wrong:
+
+**It does NOT release the dependent.** A DONE predecessor already satisfies its own edge — see the `;; # satisfied` arm and the `ALL_PREDS_DONE` gate below. Dropping an edge whose predecessor is already DONE releases nobody, so re-verification alone cannot re-parallelize anything. What it actually buys is two things:
+
+1. **Suppressing a spurious same-file brief.** The DONE arm spends up to three `gh api` comment fetches per edge and then injects a `SAME_FILE_BRIEF` excerpt into the dependent's dispatch context. When the predecessor's real diff never touched the guessed file, that brief is not merely wasted tokens — it actively misleads the agent into coordinating on a file the predecessor never wrote. Verifying **before** those fetches skips all three calls and the brief.
+2. **Producing the disproof signal that enables re-derivation.** This is the part that actually re-parallelizes. A `DROP` on a `body-fallback`-provenance edge is evidence that the whole cohort's extraction is suspect: the first real diff has just contradicted the guess the chain was built on. By that point the still-blocked descendants have been investigated and possibly contracted, so re-running Layer 1 extraction against those now-higher-provenance sources and dropping edges that no longer hold is what collapses the chain. This is the step an operator performed by hand in the batch that motivated forge#2848; wiring it here makes it automatic.
 
 **Core streaming dispatch loop**: After processing each agent completion, check the DAG for newly unblocked issues. If any issue now has all predecessors classified `DONE`, dispatch it immediately (run Steps 4A.pre.0, 4A.pre, and 4A for the newly ready issues). This is the key difference from the wave model — issues dispatch as soon as their specific predecessors complete, not after an entire group finishes.
 
 ```bash
 # After each agent completion, check for newly ready issues:
+READINESS_RESCAN=true
+while [ "$READINESS_RESCAN" = "true" ]; do
+  # Re-derivation can remove an unresolved predecessor from an issue that this
+  # pass has already visited. Repeat the scan so it can dispatch this cycle.
+  READINESS_RESCAN=false
 for BLOCKED_NUM in {all_blocked_issue_numbers}; do
   ALL_PREDS_DONE=true
   ANY_PRED_GATED=false
@@ -1151,6 +1379,100 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
         EDGE_TYPE="${EDGE_KIND["${PRED}:${BLOCKED_NUM}"]:-}"
         if [ -n "$EDGE_TYPE" ] && [ -z "${EDGE_BRIEFED["${PRED}:${BLOCKED_NUM}"]:-}" ]; then
           EDGE_BRIEFED["${PRED}:${BLOCKED_NUM}"]=1
+
+          # DONE-path edge re-verification (forge#2848). Runs FIRST — before the three
+          # `gh api` brief fetches below — so a disproven edge costs zero extra API calls
+          # and injects no brief. EDGE_BRIEFED is already set above, so a DROP is not
+          # retried on the next completion cycle.
+          #
+          # Fail-safe direction is unchanged: verify_file_overlap_edge returns KEEP on any
+          # fetch failure, so a transient API error can only ever preserve the brief, never
+          # silently suppress a real one.
+          EDGE_VERDICT=$(verify_file_overlap_edge "$PRED" "$BLOCKED_NUM")
+          if [ "$EDGE_VERDICT" = "DROP" ]; then
+            echo "DONE-path re-verification: edge #${PRED} → #${BLOCKED_NUM} (${EDGE_TYPE}, files: ${EDGE_FILES["${PRED}:${BLOCKED_NUM}"]:-?}) DROPPED — #${PRED}'s merged diff never touched the guessed file. Skipping same-file brief."
+
+            # Leave SAME_FILE_BRIEF[$BLOCKED_NUM] UNSET rather than setting it empty —
+            # the dispatch-context builder treats unset as the no-op case, and an empty
+            # string would render an orphaned "shared file context" heading with nothing
+            # under it.
+
+            # Cohort re-derivation (forge#2848) — the step that actually releases
+            # dependents. Gated on `body-fallback` provenance only: a DROP against a
+            # contract- or investigation-derived list is a one-off miss, but a DROP
+            # against a raw-issue-body scrape is evidence the whole cohort's extraction
+            # is suspect (see phase-3-dependency.md Layer 4's cohort-confidence guidance).
+            if [ "${FILE_SOURCE[$PRED]:-}" = "body-fallback" ] && [ -n "$AFFECTED_FILES_SCRIPT" ]; then
+              # Re-derive only direct descendants of this DONE predecessor that
+              # are still blocked now. This intentionally excludes unrelated
+              # blocked issues and descendants whose PRED edge was already removed.
+              STILL_BLOCKED_DESCENDANTS=()
+              for CANDIDATE in {all_blocked_issue_numbers}; do
+                case " ${PREDECESSORS[$CANDIDATE]:-} " in
+                  *" $PRED "*) STILL_BLOCKED_DESCENDANTS+=("$CANDIDATE") ;;
+                esac
+              done
+              for DESC in "${STILL_BLOCKED_DESCENDANTS[@]}"; do
+                # Memoize conclusive results per descendant per batch. An inconclusive
+                # extraction gets one retry so a transient failure or pre-contract
+                # attempt does not permanently foreclose re-derivation. The two-attempt
+                # cap preserves an O(descendants) API budget for the hot dispatch loop.
+                [ -n "${EDGE_REDERIVED[$DESC]:-}" ] && continue
+                REDERIVE_ATTEMPTS=${EDGE_REDERIVE_ATTEMPTS[$DESC]:-0}
+                [ "$REDERIVE_ATTEMPTS" -ge 2 ] && continue
+                EDGE_REDERIVE_ATTEMPTS[$DESC]=$((REDERIVE_ATTEMPTS + 1))
+
+                # Re-run Layer 1 extraction. By now DESC has been investigated and
+                # possibly contracted, so this typically returns a higher-provenance
+                # list than the body scrape the original edge was built from. Resolve
+                # the helper through the runtime path, never a bare `bash scripts/...`
+                # (#2794) — same resolver precedence as phase-3-dependency.md Layer 1.
+                REDERIVE_OUT=$(bash "$AFFECTED_FILES_SCRIPT" "$DESC" -R {GH_REPO})
+                REDERIVE_PROV=$(echo "$REDERIVE_OUT" | head -1 | sed 's/^PROVENANCE=//')
+                REDERIVE_FILES=$(echo "$REDERIVE_OUT" | tail -n +2)
+
+                # Fail-safe: only act on a CONFIRMED-empty overlap. `error` means the
+                # extraction was inconclusive (a `gh` call failed — forge#2504), and
+                # `none`/`body-fallback` mean we learned nothing better than what we
+                # already had. In all three cases keep every edge untouched.
+                case "$REDERIVE_PROV" in
+                  contract-deliverables|affected-files-section) EDGE_REDERIVED[$DESC]=1 ;;
+                  *) echo "  re-derivation for #${DESC} inconclusive (provenance: ${REDERIVE_PROV}) — keeping all edges"; continue ;;
+                esac
+
+                # Re-derive only PRED's edge into DESC. PRED is the DONE predecessor
+                # whose merged diff just disproved this edge; other predecessors may
+                # still be building and must retain their serialization edges.
+                for DESC_PRED in "$PRED"; do
+                  [ -z "${EDGE_KIND["${DESC_PRED}:${DESC}"]:-}" ] && continue
+                  STILL_OVERLAPS=false
+                  for EF in ${EDGE_FILES["${DESC_PRED}:${DESC}"]:-}; do
+                    [ -z "$EF" ] && continue
+                    EF_CLEAN="${EF%/}"
+                    EF_ESCAPED=$(printf '%s' "$EF_CLEAN" | sed 's/[.[\*^$()+?{|]/\\&/g')
+                    if echo "$REDERIVE_FILES" | grep -qE "(^|/)${EF_ESCAPED}(/|$)"; then
+                      STILL_OVERLAPS=true
+                      break
+                    fi
+                  done
+                  if [ "$STILL_OVERLAPS" = "false" ]; then
+                    echo "  re-derived edge #${DESC_PRED} → #${DESC}: DROPPED — '${EDGE_FILES["${DESC_PRED}:${DESC}"]}' absent from #${DESC}'s refreshed ${REDERIVE_PROV} file list"
+                    unset 'EDGE_KIND['"${DESC_PRED}:${DESC}"']'
+                    unset 'EDGE_FILES['"${DESC_PRED}:${DESC}"']'
+                    # Remove DESC_PRED from PREDECESSORS[$DESC] so the ALL_PREDS_DONE
+                    # gate below stops waiting on it. DESC becomes dispatch-eligible on
+                    # this same cycle if that was its last outstanding predecessor.
+                    PREDECESSORS[$DESC]=$(echo "${PREDECESSORS[$DESC]}" | tr ' ' '\n' | grep -vx "$DESC_PRED" | tr '\n' ' ')
+                    READINESS_RESCAN=true
+                  fi
+                done
+              done
+            fi
+
+            # Edge disproven — nothing further to do for this (PRED, BLOCKED_NUM) pair.
+            continue
+          fi
+
           SHARED_FILE="${EDGE_FILES["${PRED}:${BLOCKED_NUM}"]:-}"
 
           # Prefer FORGE:BUILDER (the concrete "what changed" record). Fall back to
@@ -1201,6 +1523,7 @@ for BLOCKED_NUM in {all_blocked_issue_numbers}; do
     echo "#{BLOCKED_NUM} is BLOCKED-ON-HUMAN-MERGE — gated by: ${GATING_PREDS[*]}. See item 6.5."
     # Do NOT dispatch. Do NOT mark skipped. Tracked via item 6.5.
   fi
+done
 done
 # Run Steps 4A.pre.0 → 4A.pre → 4A for newly ready issues. Step 4A's own dispatch-batch
 # computation (the HEADROOM/DISPATCH_NOW logic, forge#1912) is what actually caps this —
@@ -1361,11 +1684,7 @@ done
    # After CLAIM_RELEASED for issue NUM:
    # Read all active FORGE:CLAIM annotations from coordination issue
    if [ -n "${FORGE_COORD_ISSUE:-}" ] && [ -n "${COORD_NUM:-}" ]; then
-     ACTIVE_CLAIMS=$(gh api repos/{GH_REPO}/issues/${COORD_NUM}/comments \
-       --jq '[.[] | select(.body | contains("<!-- FORGE:CLAIM -->")) |
-              select(.body | contains("<!-- FORGE:CLAIM_RELEASED -->") | not)] |
-             map({holder: (.body | capture("\\*\\*Holder\\*\\*: (?P<h>[^\\n]+)").h),
-                  files: (.body | capture("\\*\\*Files\\*\\*: (?P<f>[^\\n]+)").f)})' 2>/dev/null || echo '[]')
+      ACTIVE_CLAIMS=$(read_active_claims "$COORD_NUM" 2>/dev/null || echo '[]')
      # For each still-blocked issue in a Layer-2/4 pair: check if its claim's file set
      # is disjoint from all remaining active claims. If so, mark it ready.
      # (Layer-1 and Layer-3 edges are never relaxed — this check is Layer-2/4 only.)
@@ -1429,7 +1748,7 @@ done
            run_in_background=true,
            prompt="You are remediating GitHub PR #{GATING_PR} for the {PROJECT_NAME} project (repo: {GH_REPO}), which is currently held at `needs-human` on its linked issue #{PRED}.
 
-**YOUR MISSION**: Invoke `Skill(skill='work-on', args='{GATING_PR} --remediate --issue {PRED} --repo {GH_REPO} --gh-flag {GH_FLAG}')` and let it run to completion. This is a self-contained flow: it checks out the PR branch, fixes any fixable review findings, re-reviews, and either auto-lands the PR, holds it at `workflow:awaiting-merge` for a human, re-escalates back to `needs-human`, or reports the block as policy-level and unfixable. Do NOT intervene manually — do not run raw git/gh commands yourself.
+**YOUR MISSION**: Invoke `Skill(skill='work-on', args='{GATING_PR} --remediate --issue {PRED} --repo {GH_REPO} --gh-flag {GH_FLAG}')` and let it run to completion. This is a self-contained flow: it classifies the gate first, replaces `needs-human` with `workflow:in-review` only for fixable remediation, checks out the PR branch, fixes any fixable review findings, re-reviews, and either auto-lands the PR, holds it at `workflow:awaiting-merge` for a human, re-escalates back to `needs-human`, or reports the block as policy-level and unfixable. Do NOT intervene manually — do not run raw git/gh commands yourself.
 
 **DO NOT STOP EARLY**: if the Skill call returns without a terminal `REMEDIATE_RESULT.status`, invoke it again — it re-reads GitHub state and resumes. Terminal statuses are: `COMPLETE`, `ALREADY_DONE`, `UNFIXABLE`, `BLOCKED`.
 
@@ -1780,6 +2099,30 @@ gh issue list -R {GH_REPO} --state open --search "label:review-finding created:>
 
 **If review-finding issues were spawned:**
 
+**Amplification accounting (MANDATORY, before cascade admission):** Count every finding created by this batch, including findings later deferred by any cascade rule. After each merged unit, compute `FINDINGS_SPAWNED / MERGED_UNITS`, append the value to `AMPLIFICATION_RATIO_HISTORY`, and print a convergence warning when the latest `CONVERGENCE_WINDOW` observations are all `>= 1.0`. A high ratio is a signal, not a failure: valuable deep review findings can legitimately raise it.
+
+For each finding, extract its source PR from `**Source**: PR #N` and increment `FINDINGS_BY_SOURCE_PR[N]`. Classify it as a **same-lineage refinement** only when that source PR closes a `review-finding` issue and both that parent finding and this finding name the same affected file; otherwise classify it as **new surface**. Record the finding number in `REFINEMENT_FINDINGS` or `NEW_SURFACE_FINDINGS` respectively. If provenance or a file path cannot be established, classify as new surface conservatively; never suppress it as a refinement.
+
+When `CASCADE_MAX_AMPLIFICATION` is not `off`, and the current ratio is greater than that ceiling, defer only newly discovered entries in `REFINEMENT_FINDINGS` with reason `amplification bound exceeded (same-lineage refinement)`. Add them to `DEFERRED_FINDINGS` and `DEFERRED_REASONS` so Step 4F re-evaluates them after the batch drains. Do not apply this bound to new-surface findings, P1/P2 findings, or any finding when the option is `off`.
+
+```bash
+# Run once for each completed issue before collecting its findings. Only merged
+# units advance the denominator; invalid/skipped units do not imply delivered work.
+if gh issue view "$NUM" -R {GH_REPO} --json labels \
+  --jq '[.labels[].name | select(. == "workflow:merged")] | length' | grep -qx '1'; then
+  MERGED_UNITS=$((MERGED_UNITS + 1))
+  AMPLIFICATION_RATIO=$(awk "BEGIN { printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS }")
+  AMPLIFICATION_RATIO_HISTORY+=("$AMPLIFICATION_RATIO")
+  if [ "${#AMPLIFICATION_RATIO_HISTORY[@]}" -ge "$CONVERGENCE_WINDOW" ]; then
+    RECENT_RATIOS=("${AMPLIFICATION_RATIO_HISTORY[@]: -$CONVERGENCE_WINDOW}")
+    if printf '%s\n' "${RECENT_RATIOS[@]}" | awk '$1 < 1 { exit 1 }'; then
+      echo "CONVERGENCE WARNING: amplification has remained >= 1.0 for ${CONVERGENCE_WINDOW} merged units (${AMPLIFICATION_RATIO} current). This can be productive review refinement, but the batch is not shrinking."
+    fi
+  fi
+fi
+
+```
+
 **Cascade control (MANDATORY — run before folding findings into the DAG):**
 
 For each spawned finding, determine whether it should be **executed** or **deferred**:
@@ -1828,6 +2171,45 @@ ALL_BATCH_FILES=$(echo "$ALL_BATCH_FILES" | sort -u | grep -v '^$')
 for FINDING_NUM in {spawned_finding_numbers}; do
   FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json labels,title,body,updatedAt \
     --jq '{labels: [.labels[].name], title: .title, body: .body, updatedAt: .updatedAt}')
+
+  # Count each finding once and retain source provenance for the final per-PR
+  # breakdown. Missing source/file evidence fails open as new surface.
+  FINDING_BODY=$(echo "$FINDING_DATA" | jq -r '.body')
+  SOURCE_PR=""
+  if [[ "$FINDING_BODY" =~ \*\*[Ss]ource\*\*:[[:space:]]*[Pp][Rr][[:space:]]*\#([0-9]+) ]]; then
+    SOURCE_PR="${BASH_REMATCH[1]}"
+  fi
+  if [ -z "${AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]:-}" ]; then
+    AMPLIFICATION_FINDING_SEEN[$FINDING_NUM]=1
+    FINDINGS_SPAWNED=$((FINDINGS_SPAWNED + 1))
+    [ -n "$SOURCE_PR" ] && FINDINGS_BY_SOURCE_PR[$SOURCE_PR]=$(( ${FINDINGS_BY_SOURCE_PR[$SOURCE_PR]:-0} + 1 ))
+  fi
+  FINDING_IS_REFINEMENT=false
+  FINDING_FILE_FOR_LINEAGE=$(echo "$FINDING_BODY" | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+  if [ -n "$SOURCE_PR" ] && [ -n "$FINDING_FILE_FOR_LINEAGE" ]; then
+    SOURCE_ISSUE=""
+    SOURCE_PR_BODY=$(gh pr view "$SOURCE_PR" -R {GH_REPO} --json body --jq '.body' 2>/dev/null || echo "")
+    SOURCE_PR_BODY_LOWER=$(echo "$SOURCE_PR_BODY" | tr '[:upper:]' '[:lower:]')
+    if [[ "$SOURCE_PR_BODY_LOWER" =~ (close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+\#([0-9]+) ]]; then
+      SOURCE_ISSUE="${BASH_REMATCH[3]}"
+    fi
+    if [ -n "$SOURCE_ISSUE" ]; then
+      PARENT_DATA=$(gh issue view "$SOURCE_ISSUE" -R {GH_REPO} --json labels,body \
+        --jq '{labels: [.labels[].name], body: .body}' 2>/dev/null || echo '{}')
+      PARENT_FILE=$(echo "$PARENT_DATA" | jq -r '.body // ""' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
+      if echo "$PARENT_DATA" | jq -e '[.labels[] | select(. == "review-finding")] | length > 0' >/dev/null && \
+         [ "$PARENT_FILE" = "$FINDING_FILE_FOR_LINEAGE" ]; then
+        FINDING_IS_REFINEMENT=true
+        REFINEMENT_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      else
+        NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+      fi
+    else
+      NEW_SURFACE_FINDINGS[$FINDING_NUM]="$SOURCE_PR"
+    fi
+  else
+    NEW_SURFACE_FINDINGS[$FINDING_NUM]="${SOURCE_PR:-unknown}"
+  fi
 
   # Code-branch repair guard (MANDATORY — before priority/defer heuristics below).
   # A review-finding with no **Code branch** annotation, whose parent PR's base is
@@ -2006,6 +2388,18 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
     DEFER=false
   fi
 
+  # Opt-in only: never defer a new-surface or P1/P2 finding because another
+  # lineage is noisy. Step 4F re-evaluates this explicit deferral after drain.
+  AMPLIFICATION_RATIO=$(awk "BEGIN { if ($MERGED_UNITS) printf \"%.2f\", $FINDINGS_SPAWNED / $MERGED_UNITS; else print 0 }")
+  if [ "$DEFER" = "false" ] && [ "$FINDING_IS_REFINEMENT" = "true" ] && \
+     [ "$PRIORITY" != "P1" ] && [ "$PRIORITY" != "P2" ] && \
+     [ "$CASCADE_MAX_AMPLIFICATION" != "off" ] && \
+     awk "BEGIN { exit !($AMPLIFICATION_RATIO > $CASCADE_MAX_AMPLIFICATION) }"; then
+    DEFER=true
+    DEFER_REASON="amplification bound exceeded (same-lineage refinement; ${AMPLIFICATION_RATIO} > ${CASCADE_MAX_AMPLIFICATION})"
+    AMPLIFICATION_DEFERRED+=("$FINDING_NUM")
+  fi
+
   if [ "$DEFER" = "true" ]; then
     DEFERRED_FINDINGS+=($FINDING_NUM)
     DEFERRED_REASONS[$FINDING_NUM]="$DEFER_REASON"
@@ -2016,9 +2410,11 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
 done
 ```
 
-**Surface-area batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
+**Concern-level batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
-Cascade-spawned findings collected within a single `/orchestrate` run never pass back through Phase 1's batching rule — Phase 1 only runs once, at the start. Without a check here, same-file P3 findings spawned mid-run always dispatch individually, defeating the batching policy for exactly the findings it exists to catch. Apply the same grouping rule from `commands/orchestrate/phase-1-resolve.md` ("P3 Review-Finding Batching") to `QUEUED_FINDINGS` before the dispatch step below:
+Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched P3 candidate set, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates plus new findings, apply Phase 1's safety exclusions, and call `planP3BatchGroups()` from `bin/engine/admission.mjs`. Execute the resulting groups before dispatch, retaining its `ungrouped` members for the next sweep. This preserves the same-file, source-PR + subsystem, defect-class, leaf-directory ordering, 3-member leaf threshold, and eight-member cap defined in Phase 1. Record the selected group kind in the run summary. <!-- Added: forge#2858 -->
+
+The per-cycle `QUEUED_FINDINGS` loop below remains the action-creation mechanism, but it MUST consume the complete-sweep planner output rather than decide groups from its local same-file map. Do not dispatch a locally ungrouped member until the next periodic sweep has considered it against the retained candidate set.
 
 ```bash
 # Group QUEUED_FINDINGS by exact affected file, reusing the SAME safety
@@ -2050,7 +2446,8 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   FINDING_DATA=$(gh issue view $FINDING_NUM -R {GH_REPO} --json title,body,labels \
     --jq '{title: .title, body: .body, labels: [.labels[].name]}')
 
-  # Safety exclusions — never batch, at any priority. Same jq test() engine and
+  # Billing is never batched. Security findings are classified below and may
+  # batch only with their exact same class. Same jq test() engine and
   # patterns as phase-1-resolve.md's batching rule (single shared mechanism).
   # Word-boundary anchored (not bare substrings) and attribution-boilerplate
   # (**Confidence**/**Severity**/**Review comment** — see forge#2477 note below
@@ -2078,9 +2475,9 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   # keyword is not auto-batched) for closing a real bypass — the safe
   # direction for a security-relevant exclusion. <!-- forge#2477 -->
   echo "$FINDING_DATA" | jq -e '
-    (.title | test("\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i"))
-    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\\b"; "i"))
-    or ([.labels[]] | any(. == "security" or . == "billing" or . == "anti-bot" or . == "auth"))
+    (.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ((.body | gsub("(?m)^\\*\\*(?:Confidence\\*\\*: (?:CONFIRMED|LIKELY|POSSIBLE)|Severity\\*\\*: (?:CRITICAL|HIGH|MEDIUM|LOW|INFO)|Review comment\\*\\*: https?://\\S+)$"; "")) | test("## Problem[\\s\\S]{0,500}\\b(billing|operator-only|manual action required|human action required)\\b"; "i"))
+    or ([.labels[]] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only"))
   ' >/dev/null && continue
 
   # Only P3 findings are eligible (P1/P2 already dispatched individually above).
@@ -2090,7 +2487,11 @@ for FINDING_NUM in "${QUEUED_FINDINGS[@]}"; do
   FINDING_FILE=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
   [ -z "$FINDING_FILE" ] && continue
 
-  SURFACE_FILE_MEMBERS["$FINDING_FILE"]="${SURFACE_FILE_MEMBERS[$FINDING_FILE]} $FINDING_NUM"
+  SAFETY_CLASS=$(node -e 'import("./bin/engine/admission.mjs").then(({ classifyBatchSafety }) => process.stdout.write(classifyBatchSafety(process.argv[1]) || "routine"))' "$(echo "$FINDING_DATA" | jq -r '.title + "\n" + .body + "\n" + (.labels | join(" "))')")
+  # Same file is not enough for security work: the class key prevents a
+  # credential finding from sharing a batch with injection/auth hardening.
+  SURFACE_KEY="${SAFETY_CLASS}:${FINDING_FILE}"
+  SURFACE_FILE_MEMBERS["$SURFACE_KEY"]="${SURFACE_FILE_MEMBERS[$SURFACE_KEY]} $FINDING_NUM"
 done
 
 # For each same-file cluster of 2+, actually CREATE the batch issue (executable —
@@ -2101,23 +2502,30 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
   MEMBERS=(${SURFACE_FILE_MEMBERS[$FILE]})
   [ "${#MEMBERS[@]}" -ge 2 ] || continue
 
+  SAFETY_CLASS=${FILE%%:*}
+  SURFACE_FILE=${FILE#*:}
+
   # Sanitize the affected-file path before interpolating it into the issue title/body.
   # Git filenames can legally carry shell metacharacters (`$()`, backticks, quotes);
   # restrict to a validated charset so the value cannot break the gh argument
   # boundary from an untrusted issue body. Shared guard with phase-1-resolve.md. <!-- forge#1833, forge#1835 -->
-  SAFE_SURFACE_AREA=$(printf '%s' "$FILE" | tr -cd 'A-Za-z0-9._/-')
+  SAFE_SURFACE_AREA=$(printf '%s' "$SURFACE_FILE" | tr -cd 'A-Za-z0-9._/-')
 
-  echo "Same-run surface-area cluster: ${#MEMBERS[@]} P3 findings share $FILE — creating batch issue(s)"
+  echo "Same-run surface-area cluster: ${#MEMBERS[@]} ${SAFETY_CLASS} findings share $SURFACE_FILE — creating batch issue(s)"
 
-  # Cap at 8 members per batch (phase-1-resolve.md limit); split into batches of <=8.
-  for START in $(seq 0 8 $(( ${#MEMBERS[@]} - 1 ))); do
-    CHUNK=("${MEMBERS[@]:$START:8}")
+  # Routine batches cap at 8; security-class batches cap at 3 and their body
+  # must state a live-vector or defence-in-depth verdict for every member.
+  BATCH_CAP=8
+  [ "$SAFETY_CLASS" != "routine" ] && BATCH_CAP=3
+  for START in $(seq 0 "$BATCH_CAP" $(( ${#MEMBERS[@]} - 1 ))); do
+    CHUNK=("${MEMBERS[@]:$START:$BATCH_CAP}")
     [ "${#CHUNK[@]}" -ge 2 ] || continue
 
     MEMBER_LINES=""
     for M in "${CHUNK[@]}"; do
       MTITLE=$(gh issue view "$M" -R {GH_REPO} --json title --jq '.title' 2>/dev/null || echo "")
       MEMBER_LINES="${MEMBER_LINES}- [ ] #${M}: ${MTITLE}"$'\n'
+      [ "$SAFETY_CLASS" = "routine" ] || MEMBER_LINES="${MEMBER_LINES}  - **Verdict**: [ ] live vector  [ ] defence-in-depth"$'\n'
     done
 
     # Dedup-check with member exclusion (MANDATORY — forge#2432, identical mechanism to
@@ -2662,6 +3070,8 @@ The context-gathering phase can fetch this index to discover all investigation G
 **Project**: {PROJECT_NAME}
 **Repository**: {GH_REPO}
 **Repo path**: {REPO_PATH}
+
+**KNOWLEDGE GIST CAPABILITY**: This orchestration already probed it: `${FORGE_GIST_CAPABLE}`. Before invoking `/work-on`, run `export FORGE_GIST_CAPABLE=${FORGE_GIST_CAPABLE}`. Do not re-probe or attempt Gist creation when it is `false`.
 
 **YOUR MISSION**: Invoke \`/work-on\` via the Skill tool and let it run to completion. \`/work-on\` is a self-contained routing loop that handles the ENTIRE pipeline: investigate → build (context → architect → implement → validate) → review (push → PR → /review-pr --auto-merge) → close (project board → trajectory log → worktree cleanup). Do NOT intervene, compensate, or manually close issues — \`/work-on\` handles everything including issue closure and label updates in its close phase.
 

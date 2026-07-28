@@ -5,15 +5,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, cpSync, unlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, cpSync, unlinkSync, rmSync, chmodSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "forgedock.mjs");
 
-function runCli(args, { cwd, home, extraEnv } = {}) {
-  return spawnSync(process.execPath, [CLI, ...args], {
+function runCli(args, { cli = CLI, cwd, home, extraEnv } = {}) {
+  return spawnSync(process.execPath, [cli, ...args], {
     cwd: cwd ?? mkdtempSync(join(os.tmpdir(), "fd-cli-cwd-")),
     env: { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1", ...extraEnv },
     encoding: "utf-8",
@@ -145,6 +145,22 @@ describe("router", () => {
     const res = runCli(["status"], { home: mkdtempSync(join(os.tmpdir(), "fd-s-")) });
     assert.equal(res.status, 0);
     assert.match(res.stdout, /unmanaged|not active/i);
+  });
+
+  it("install restores commands in an already managed directory", () => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-managed-install-home-"));
+    const cwd = mkdtempSync(join(os.tmpdir(), "fd-managed-install-cwd-"));
+    writeFileSync(join(cwd, "forge.yaml"), "project:\n", "utf-8");
+
+    try {
+      const res = runCli(["install", "--fast"], { cwd, home });
+      assert.equal(res.status, 0, res.stdout + res.stderr);
+      assert.match(res.stdout, /Forging commands/);
+      assert.ok(existsSync(join(home, ".claude", "commands", "work-on.md")));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("disable then status reports opted out", () => {
@@ -1221,6 +1237,61 @@ describe("doctor --fix (forge#1944)", () => {
     manifest.files[rel] = true;
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
   }
+
+  it("reports a symlink that resolves but cannot be traversed (forge#2837)", (t) => {
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-doctor-unreadable-src-"));
+    const home = mkdtempSync(join(os.tmpdir(), "fd-doctor-unreadable-home-"));
+    const cwd = mkdtempSync(join(os.tmpdir(), "fd-doctor-unreadable-cwd-"));
+    const sourcePath = join(forgeHome, "commands", "one.md");
+    const targetPath = join(home, ".claude", "commands", "one.md");
+
+    try {
+      cpSync(dirname(CLI), join(forgeHome, "bin"), {
+        recursive: true,
+        filter: (src) => !src.includes("tests"),
+      });
+      mkdirSync(dirname(sourcePath), { recursive: true });
+      mkdirSync(dirname(targetPath), { recursive: true });
+      writeFileSync(sourcePath, "# /one\n", "utf-8");
+      writeFileSync(join(forgeHome, "package.json"), JSON.stringify({ name: "forgedock", version: "1.0.0" }) + "\n");
+
+      try {
+        symlinkSync(sourcePath, targetPath);
+        chmodSync(sourcePath, 0o000);
+      } catch (err) {
+        if (["EACCES", "EPERM", "ENOTSUP"].includes(err.code)) {
+          t.skip("filesystem does not support unreadable symlink targets");
+          return;
+        }
+        throw err;
+      }
+
+      try {
+        readFileSync(sourcePath, "utf-8");
+        t.skip("filesystem does not enforce unreadable file permissions");
+        return;
+      } catch (err) {
+        if (!["EACCES", "EPERM"].includes(err.code)) throw err;
+      }
+
+      const result = runCli(["doctor"], {
+        cli: join(forgeHome, "bin", "forgedock.mjs"),
+        cwd,
+        home,
+        extraEnv: stubTools(),
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(
+        result.stdout,
+        /one\.md \(unreadable — link resolves but cannot be traversed\)/,
+      );
+    } finally {
+      try { chmodSync(sourcePath, 0o600); } catch { /* cleanup only */ }
+      rmSync(forgeHome, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
   it("repairs a stale copy-mode command file (Check 1) and is idempotent", () => {
     const { home, cwd, extraEnv } = setupInstall();

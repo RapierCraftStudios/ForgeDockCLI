@@ -273,7 +273,7 @@ If detected, dispatch immediately and STOP — do NOT fall through to Phase 0B's
 Skill(skill="work-on/remediate", args="${REMEDIATE_PR_NUMBER} ${REMEDIATE_ISSUE_FLAG} --repo {GH_REPO} --gh-flag {GH_FLAG}")
 ```
 
-**After `REMEDIATE_RESULT` returns, STOP unconditionally** — do not run any further Phase 0–7 logic in this file. `work-on/remediate.md` is self-contained: when `re_gate_outcome: AUTO-LANDED`, it drives its own close phase internally (Phase M8 invokes `Skill("work-on:close", ...)` directly) before returning. For every other outcome (`HELD-AWAITING-MERGE`, `RE-ESCALATED`, `UNFIXABLE`, `BLOCKED`, `ALREADY_DONE`), the issue is already at a terminal state (`workflow:awaiting-merge` or `needs-human`, or already closed) per the Universal Phase Dispatcher — nothing further to do.
+**After `REMEDIATE_RESULT` returns, STOP unconditionally** — do not run any further Phase 0–7 logic in this file. `work-on/remediate.md` is self-contained: a FIXABLE remediation replaces `needs-human` with the active `workflow:in-review` state only while it is running, then ends at `workflow:merged`, `workflow:awaiting-merge`, or a newly asserted `needs-human` label. When `re_gate_outcome: AUTO-LANDED`, it drives its own close phase internally (Phase M8 invokes `Skill("work-on:close", ...)` directly) before returning. For every other outcome (`HELD-AWAITING-MERGE`, `RE-ESCALATED`, `UNFIXABLE`, `BLOCKED`, `ALREADY_DONE`), the issue is already at a terminal state (`workflow:awaiting-merge` or `needs-human`, or already closed) per the Universal Phase Dispatcher — nothing further to do.
 
 This mode is reachable both standalone (a human or script running `/work-on <pr> --remediate` directly) and via the orchestrator (`commands/orchestrate/phase-4-execution.md` item 6.4 auto-dispatches the identical `Skill(skill='work-on', args='{PR} --remediate --issue {N} ...')` invocation against a `needs-human`-gated predecessor's own PR).
 
@@ -358,9 +358,21 @@ fi
 
 **Batch issue pipeline rules** (when `IS_BATCH=true`):
 - Build phases execute exactly as normal (the batch issue body IS the spec for what to fix)
-- After successful merge, auto-close all member issues with a cross-reference:
+- Batch members are referenced in the PR body with `Refs #N`, never `Closes #N`; the batch issue is the only issue the PR may close.
+- After successful merge, re-read every member's live state and labels before closing it. A member that is `needs-human`, `blocked`, or `operator-only` remains open and is reported as a split outcome:
   ```bash
   for MEMBER in "${BATCH_MEMBERS[@]}"; do
+    MEMBER_SNAPSHOT=$(gh issue view "$MEMBER" {GH_FLAG} --json state,labels \
+      --jq '{state: .state, labels: [.labels[].name]}' 2>/dev/null) || {
+      echo "WARNING: could not verify batch member #${MEMBER}; leaving it open"
+      continue
+    }
+    MEMBER_GATED=$(echo "$MEMBER_SNAPSHOT" | jq -r \
+      '(.state != "OPEN") or ([.labels[] | select(. == "needs-human" or . == "blocked" or . == "operator-only")] | length > 0)')
+    if [ "$MEMBER_GATED" = "true" ]; then
+      echo "SPLIT OUTCOME: #${MEMBER} remains open because it requires a human or operator action."
+      continue
+    fi
     gh issue close "$MEMBER" {GH_FLAG} \
       --comment "Resolved as part of batch PR #{PR_NUMBER} (#{ISSUE_NUMBER}). See batch issue for details."
     gh issue edit "$MEMBER" {GH_FLAG} --add-label "workflow:merged" 2>/dev/null || true
@@ -2081,11 +2093,42 @@ gh issue comment {NUMBER} {GH_FLAG} --body "<!-- FORGE:CHECKPOINT -->
 
 ```bash
 BODY=$(gh issue view {NUMBER} {GH_FLAG} --json body --jq '.body')
-REMAINING_BEFORE=$(echo "$BODY" | grep -c '^- \[ \]' || true)
-HAS_PHASE_HEADINGS=$(echo "$BODY" | grep -cP '^#{2,3} ' || true)
+REMAINING_BEFORE=$(printf '%s\n' "$BODY" | grep -cE '^[-*+] \[ \]' || true)
+
+# Structural test: count heading-delimited sections that contain checkbox items.
+# Multi-phase == 2+ checkbox-bearing sections. A single checkbox group is
+# single-phase regardless of how many prose headings surround it.
+#
+# - Fenced code blocks are stripped first: issue bodies routinely embed fenced
+#   blocks whose lines start with '#' or contain a literal '- [ ]'. An
+#   unterminated fence keeps the original body so later work is never hidden.
+# - ATX headings and setext underlines both delimit sections. The ATX pattern
+#   avoids awk interval-quantifier variance across awk implementations.
+# - grep -E / awk only — no PCRE. '^#+ ' needs none.
+FENCE_COUNT=$(printf '%s\n' "$BODY" | grep -cE '^(```+|~~~+)' || true)
+if [ $(( ${FENCE_COUNT:-0} % 2 )) -ne 0 ]; then
+  BODY_STRIPPED="$BODY"
+else
+  BODY_STRIPPED=$(printf '%s\n' "$BODY" | awk '/^(```+|~~~+)/{f=!f; next} !f')
+fi
+
+CHECKBOX_SECTIONS=$(printf '%s\n' "$BODY_STRIPPED" | awk '
+  /^#+ / { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  /^(=+|-+)$/ && previous != "" { if (in_section && has) n++; in_section=1; has=0; previous=""; next }
+  { if (in_section && /^[-*+] \[[ xX]\]/) has=1; previous=$0 }
+  END { if (in_section && has) n++; print n+0 }
+')
+
+# Sub-issue-tracker guard: a decompose parent whose only checkbox group is
+# '## Sub-Issue Tracker' counts 1 section. Checking those off would mark open
+# sub-issues done and close the tracker, so any unchecked GFM task item for an
+# issue forces multi-phase.
+SUBISSUE_ITEMS=$(printf '%s\n' "$BODY_STRIPPED" | grep -cE '^[-*+] \[ \] #[0-9]+' || true)
 ```
 
-If multi-phase (`HAS_PHASE_HEADINGS > 0` AND `REMAINING_BEFORE > 0`): do NOT check off future phase items. Add PR reference only.
+**Sync invariant:** Keep the structural computation above and its consuming multi-phase guard in `commands/work-on/close.md` Phase C1 synchronized. The guard is `CHECKBOX_SECTIONS >= 2 OR SUBISSUE_ITEMS > 0`; this Phase 6A path is reached only when `REMAINING_BEFORE > 0`. <!-- Fixed: forge#2840, #2874 -->
+
+If multi-phase (`CHECKBOX_SECTIONS >= 2` OR a `- [ ] #NNN` sub-issue item is present): do NOT check off future phase items. Add PR reference only. A heading count is **not** the test — every templated issue carries `## Problem`/`## Evidence`/`## Context`, so it is `> 0` universally.
 
 If single-phase or final phase: check off all `[ ]` items, add PR reference.
 

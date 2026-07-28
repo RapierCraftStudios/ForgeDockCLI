@@ -1540,7 +1540,7 @@ The `protocols.md` file contains the Evidence-Based Review Protocol, Structured 
 8. If Phase 2.5 found broken assumptions, append them to the agent's prompt as "Pre-found integration issues to verify"
 9. Launch via the resolved `{DISPATCH_TOOL}` (see Sub-Agent Dispatch Tool Resolution above) with `model: "{SUBAGENT_MODEL}"` (forge.yaml `agents.subagent_model`, else `agents.default_model`, else `"sonnet"`; fallback `"opus"` if rate-limited). Under OpenCode, emit a top-level `subagent_type: "general"` or `"explore"` in the native `task` argument object and use `background: false` for each reviewer.
 
-**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent posts findings directly to the PR via `gh pr comment`.
+**CRITICAL**: Launch ALL selected agents in a SINGLE message using multiple `{DISPATCH_TOOL}` calls. Each agent must persist its finalized body before posting it with `gh pr comment --body-file`, include `<!-- FORGE:REVIEW-AGENT:{lowercase-domain} -->`, and return its verdict and findings to the orchestrator independently of GitHub delivery.
 
 #### Domain Diff Slicing
 
@@ -1569,9 +1569,29 @@ When substituting `[FILE_LIST]` in each agent's template:
 ```bash
 gh pr view $ARGUMENTS --json comments --jq '.comments | length'
 gh api repos/{owner}/{repo}/issues/$ARGUMENTS/comments --jq '.[-10:] | .[].body[:100]'
+
+# Every dispatched agent must have delivered its own persisted review to GitHub.
+# Do not infer a clean review from a missing comment: its return text may contain
+# findings that could not be posted because GitHub writes were throttled.
+MISSING_AGENT_COMMENTS=""
+for AGENT in $SELECTED_AGENTS; do
+    AGENT_DOMAIN=$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')
+    AGENT_COMMENT_COUNT=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+        --jq "[.[] | select(.body | contains(\"<!-- FORGE:REVIEW-AGENT:${AGENT_DOMAIN} -->\"))] | length" \
+        2>/dev/null || printf '0')
+    if [ "${AGENT_COMMENT_COUNT:-0}" -lt 1 ]; then
+        MISSING_AGENT_COMMENTS="${MISSING_AGENT_COMMENTS} ${AGENT_DOMAIN}"
+    fi
+done
+
+if [ -n "$MISSING_AGENT_COMMENTS" ]; then
+    echo "REVIEW DELIVERY FAILURE: missing findings comment(s) for:${MISSING_AGENT_COMMENTS}"
+    echo "Use each agent's returned verdict, findings, and durable body path to recover the review."
+    exit 1
+fi
 ```
 
-**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing.
+**Do NOT proceed until ALL launched agent comments are visible on the PR.** Under OpenCode, each foreground `task(..., background: false)` returns only when that reviewer is complete; verify its corresponding structured PR comment before continuing. A missing comment is an explicit delivery failure: do not synthesize a verdict or treat it as a clean result.
 
 ---
 
@@ -1776,9 +1796,11 @@ cat <<'ISSUE_EOF' > "$FINDING_ISSUE_BODY_FILE"
 **Prevention**: [one sentence — what the builder must do to avoid this class of bug]
 
 <!-- FORGE:PATTERN: [pattern-slug] -->
+<!-- FORGE:CLASS: [pattern-slug] -->
 <!-- This machine-readable tag is used by pipeline-health Phase 4A to count pattern recurrences.
-     When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
-     Keep the slug consistent across all findings for the same defect class. --> <!-- Added: forge#1331 -->
+      When this slug appears on 3+ findings, a check-promotion issue is automatically filed.
+      Keep the slug consistent across all findings for the same defect class. FORGE:CLASS is
+      consumed by orchestrate's P3 batching rule; use a lowercase hyphenated slug. --> <!-- Added: forge#1331, forge#2858 -->
 
 ## Affected Files
 
@@ -2155,9 +2177,10 @@ if [ "$PRE_MERGE_HEALTH" = "CONFLICTING" ] || [ "$PRE_MERGE_HEALTH_STATE" = "DIR
 else
 
 # Previously-escalated re-review guard <!-- Added: forge#1810; base-scoped: forge#2570 -->
-# If the linked issue currently carries needs-human, this PR was escalated at some
-# earlier point (VERDICT/purpose-regression/calibration/trust/mergeability) and has
-# now been remediated + re-reviewed back to a clean, mergeable APPROVED state above.
+# If the linked issue currently carries needs-human, or remediation has posted its
+# in-progress marker, this PR was escalated at some earlier point
+# (VERDICT/purpose-regression/calibration/trust/mergeability) and has now been
+# remediated + re-reviewed back to a clean, mergeable APPROVED state above.
 #
 # forge#2570: the hold is now scoped by the PR's target branch. This PR still transitions
 # to workflow:awaiting-merge (clearing needs-human) in BOTH cases below — the transition is
@@ -2170,8 +2193,8 @@ else
 #     uses for the same target branch — no manual click. This reconciles the asymmetry where a
 #     bot-only re-review (authorAssociation=NONE) could never satisfy the strict ≥2 verified-
 #     human bar and so stranded staging PRs the fast lane would auto-merge.
-PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels \
-  --jq '[.labels[].name] | any(. == "needs-human")' 2>/dev/null || echo "false")
+PREVIOUSLY_ESCALATED=$(gh issue view {MERGE_ISSUE} {MERGE_GH_FLAG} --json labels,comments \
+  --jq '([.labels[].name | . == "needs-human"] + [.comments[].body | contains("FORGE:REMEDIATION")]) | any' 2>/dev/null || echo "false")
 GUARD_BASE=$(gh pr view {PR_NUMBER} {MERGE_GH_FLAG} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "")
 
 if [ "$PREVIOUSLY_ESCALATED" = "true" ]; then

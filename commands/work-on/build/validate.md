@@ -143,12 +143,18 @@ SKIPPED_CHECKS=""
 
 # Verification commands are project configuration; bound each one so a stalled
 # formatter, typechecker, or build cannot block validation indefinitely.
+# Set FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS to override the 120-second default.
 run_verification_command() {
     local label="$1" command="$2"
-    timeout 120 bash -c "$command" 2>&1
+    local timeout_seconds="${FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS:-120}"
+    if ! [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+        echo "VERIFY-CONFIG | HIGH | timeout | FORGEDOCK_VERIFICATION_TIMEOUT_SECONDS must be a positive integer (got '$timeout_seconds')"
+        return 2
+    fi
+    timeout "$timeout_seconds" bash -c "$command" 2>&1
     local command_exit=$?
     if [ "$command_exit" -eq 124 ]; then
-        echo "VERIFY-TIMEOUT | HIGH | $label | timed out after 120s"
+        echo "VERIFY-TIMEOUT | HIGH | $label | timed out after ${timeout_seconds}s"
     fi
     return "$command_exit"
 }

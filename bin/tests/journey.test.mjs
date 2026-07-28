@@ -2432,6 +2432,105 @@ describe("forge (Act II)", () => {
       );
     });
   });
+
+  describe("pre-existing unreadable symlink repair (forge#2836)", () => {
+    // forge#2620 taught that fs.symlink() can succeed while producing a link
+    // this runtime cannot traverse. That lesson was wired into the *creation*
+    // path only. Both install loops also had an "already installed" fast path
+    // that trusted `readlink(target) === file` as proof of health — which a
+    // dead-but-correctly-targeted MSYS link on Windows satisfies. These tests
+    // cover the loops' *decision* to call the repair machinery, which the
+    // existing atomicSymlinkInstall() unit tests above never exercise.
+    //
+    // Reproducing an untraversable-link-with-readable-source needs OS-specific
+    // link semantics: on Windows a directory-typed symlink pointing at a
+    // regular file stores the byte-identical target (readlink matches) but
+    // cannot be read through — the same observable shape as the MSYS reparse
+    // point in the bug report, and with the source file still perfectly
+    // readable so the repair can actually complete. On POSIX the type argument
+    // is ignored and the link resolves normally, so there is no way to make
+    // readFile(target) and readFile(file) disagree; the repair tests skip
+    // there. The "healthy link is still skipped" test below is portable and
+    // guards the other direction (the gate must not over-fire) everywhere.
+    const makeUnreadableLink = (file, target, t) => {
+      if (process.platform !== "win32") {
+        t.skip("untraversable-but-correctly-targeted symlink is not reproducible on POSIX");
+        return false;
+      }
+      try {
+        symlinkSync(file, target, "dir");
+      } catch (err) {
+        if (err.code === "EPERM" || err.code === "EACCES") {
+          t.skip("symlink creation unavailable (Windows without Developer Mode)");
+          return false;
+        }
+        throw err;
+      }
+      // Sanity-check the fixture actually reproduces the bug shape before
+      // asserting on it — a link that happens to be readable here would make
+      // the test vacuously pass against the pre-fix code.
+      assert.ok(lstatSync(target).isSymbolicLink(), "fixture must be a symlink");
+      assert.equal(readlinkSync(target), file, "fixture must store the correct target string");
+      assert.throws(() => readFileSync(target), "fixture must not be traversable");
+      return true;
+    };
+
+    it("forge() repairs an existing link whose target string is correct but which cannot be read", async (t) => {
+      const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home-2836a-"));
+      const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src-2836a-"));
+      mkdirSyncFs(join(forgeHome, "commands"), { recursive: true });
+      mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+      writeFileSync(join(forgeHome, "commands", "a.md"), "A", "utf-8");
+      writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+      const file = join(forgeHome, "commands", "a.md");
+      const target = join(home, ".claude", "commands", "a.md");
+      mkdirSyncFs(join(home, ".claude", "commands"), { recursive: true });
+      if (!makeUnreadableLink(file, target, t)) return;
+
+      const { ctx } = stubCtx({ home });
+      ctx.forgeHome = forgeHome;
+      const res = await forge(ctx);
+
+      assert.equal(res.skipped, 0, "a dead link must never be counted as healthy (forge#2836)");
+      assert.equal(res.updated, 1, "the entry already existed — repair counts as updated");
+      assert.equal(res.installed, 0, "the entry already existed — installed must not increase");
+      assert.equal(
+        readFileSync(target, "utf-8"),
+        "A",
+        "the repaired entry must be readable and carry the source content",
+      );
+    });
+
+    it("a healthy pre-existing link is still skipped and left untouched (the gate must not over-fire)", async (t) => {
+      const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home-2836c-"));
+      const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src-2836c-"));
+      mkdirSyncFs(join(forgeHome, "commands"), { recursive: true });
+      mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+      writeFileSync(join(forgeHome, "commands", "a.md"), "A", "utf-8");
+      writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+      const target = join(home, ".claude", "commands", "a.md");
+      mkdirSyncFs(join(home, ".claude", "commands"), { recursive: true });
+      try {
+        symlinkSync(join(forgeHome, "commands", "a.md"), target);
+      } catch (err) {
+        if (err.code === "EPERM" || err.code === "EACCES") {
+          t.skip("symlink creation unavailable (Windows without Developer Mode)");
+          return;
+        }
+        throw err;
+      }
+
+      const { ctx } = stubCtx({ home });
+      ctx.forgeHome = forgeHome;
+      const res = await forge(ctx);
+
+      assert.equal(res.skipped, 1, "a readable correctly-targeted link must still short-circuit");
+      assert.equal(res.updated, 0, "the traversability gate must not convert healthy links to copies");
+      assert.ok(lstatSync(target).isSymbolicLink(), "a healthy link must remain a symlink");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
