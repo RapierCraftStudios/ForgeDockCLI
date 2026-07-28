@@ -292,3 +292,120 @@ export function evaluateCascadeFinding(finding, policy) {
   }
   return { admit: true, reason: null };
 }
+
+/** Shared, deterministic policy for every P3 review-finding batching admission point. */
+export const P3_BATCHING_RULES = Object.freeze({
+  maxMembers: 8,
+  sameFileMinimum: 2,
+  leafDirectoryMinimum: 5,
+  staleAfterHours: 72,
+});
+
+const BATCH_EXCLUSION = /\b(security|billing|anti-bot|auth|authentication|authorization|authn|authz)\b/i;
+const BATCH_EXCLUSION_LABELS = new Set(["security", "billing", "anti-bot", "auth"]);
+
+function priorityOf(labels = []) {
+  const names = labels.map((label) => (typeof label === "string" ? label : label?.name)).filter(Boolean);
+  return names.find((label) => /^priority:P3$/.test(label)) ? "P3" : names.find((label) => /^P3$/.test(label)) ? "P3" : null;
+}
+
+function leafDirectory(file) {
+  const slash = String(file || "").lastIndexOf("/");
+  return slash > 0 ? file.slice(0, slash) : "";
+}
+
+/**
+ * Determine whether a finding is eligible before it is admitted to the shared batching pool.
+ * Callers pass the full title/body/labels so this rule cannot drift by admission point.
+ */
+export function isBatchableP3Finding(finding) {
+  if (!finding || finding.isBatch || priorityOf(finding.labels) !== "P3" || !finding.affectedFile) return false;
+  const labels = new Set((finding.labels || []).map((label) => (typeof label === "string" ? label : label?.name)));
+  if ([...BATCH_EXCLUSION_LABELS].some((label) => labels.has(label))) return false;
+  return !BATCH_EXCLUSION.test(`${finding.title || ""}\n${finding.problem || finding.body || ""}`);
+}
+
+function chunk(members, size, minimum) {
+  const chunks = [];
+  for (let offset = 0; offset < members.length; offset += size) {
+    const next = members.slice(offset, offset + size);
+    if (next.length >= minimum) chunks.push(next);
+  }
+  return chunks;
+}
+
+/**
+ * Plan batching over the complete current candidate set, not only this cycle's arrivals.
+ * Open batches are extended before a new batch is created; callers execute the returned
+ * actions with GitHub and retain the returned singleton reasons for the run summary.
+ */
+export function planP3Batches({ candidates = [], openBatches = [], now = Date.now(), rules = P3_BATCHING_RULES } = {}) {
+  const repoOf = (item) => item.repo || "default";
+  const candidateId = (finding) => finding.id || `${repoOf(finding)}:${finding.number}`;
+  const action = (details, members) => ({
+    ...details,
+    members: members.map((finding) => finding.number),
+    memberIds: members.map(candidateId),
+  });
+  const eligible = [...new Map(candidates.filter(isBatchableP3Finding).map((finding) => [candidateId(finding), finding])).values()]
+    .sort((a, b) => `${repoOf(a)}:${a.number}`.localeCompare(`${repoOf(b)}:${b.number}`, undefined, { numeric: true }));
+  const remaining = new Map(eligible.map((finding) => [candidateId(finding), finding]));
+  const actions = [];
+
+  for (const batch of [...openBatches].sort((a, b) => `${repoOf(a)}:${a.number}`.localeCompare(`${repoOf(b)}:${b.number}`, undefined, { numeric: true }))) {
+    const key = batch.affectedFile || batch.key;
+    const headroom = rules.maxMembers - Number(batch.memberCount ?? batch.members?.length ?? 0);
+    if (!key || headroom <= 0) continue;
+    const members = [...remaining.values()].filter((finding) => repoOf(finding) === repoOf(batch) && finding.affectedFile === key).slice(0, headroom);
+    if (members.length) {
+      actions.push(action({ type: "extend", batch: batch.number, key, ...(repoOf(batch) === "default" ? {} : { repo: repoOf(batch) }) }, members));
+      members.forEach((finding) => remaining.delete(candidateId(finding)));
+    }
+  }
+
+  const byFile = new Map();
+  for (const finding of remaining.values()) {
+    const key = `${repoOf(finding)} ${finding.affectedFile}`;
+    const group = byFile.get(key) || [];
+    group.push(finding);
+    byFile.set(key, group);
+  }
+  for (const [compositeKey, members] of [...byFile].sort(([a], [b]) => a.localeCompare(b))) {
+    const [repo, key] = compositeKey.split(" ");
+    for (const membersChunk of chunk(members, rules.maxMembers, rules.sameFileMinimum)) {
+      actions.push(action({ type: "create", grouping: "same-file", key, ...(repo === "default" ? {} : { repo }) }, membersChunk));
+      membersChunk.forEach((finding) => remaining.delete(candidateId(finding)));
+    }
+  }
+
+  const byDirectory = new Map();
+  for (const finding of remaining.values()) {
+    const directory = leafDirectory(finding.affectedFile);
+    if (!directory) continue;
+    const key = `${repoOf(finding)} ${directory}`;
+    const group = byDirectory.get(key) || [];
+    group.push(finding);
+    byDirectory.set(key, group);
+  }
+  for (const [compositeKey, members] of [...byDirectory].sort(([a], [b]) => a.localeCompare(b))) {
+    const [repo, key] = compositeKey.split(" ");
+    const oldest = Math.min(...members.map((finding) => new Date(finding.createdAt || now).getTime()));
+    const stale = now - oldest > rules.staleAfterHours * 60 * 60 * 1000;
+    const minimum = stale ? 1 : rules.leafDirectoryMinimum;
+    for (const membersChunk of chunk(members, rules.maxMembers, minimum)) {
+      actions.push(action({ type: "create", grouping: stale ? "age" : "leaf-directory", key, ...(repo === "default" ? {} : { repo }) }, membersChunk));
+      membersChunk.forEach((finding) => remaining.delete(candidateId(finding)));
+    }
+  }
+
+  const singletons = [...remaining.values()].map((finding) => ({ number: finding.number, id: candidateId(finding), reason: "no same-file, leaf-directory, or age cluster" }));
+  return { actions, singletons, eligible: eligible.map(candidateId) };
+}
+
+/** Format policy output for the per-run audit record required by the orchestrator. */
+export function summarizeP3BatchPlan(plan) {
+  const formed = plan.actions.filter((action) => action.type === "create").length;
+  const absorbed = plan.actions.reduce((total, action) => total + action.members.length, 0);
+  const extended = plan.actions.filter((action) => action.type === "extend").length;
+  return { formed, extended, absorbed, singletons: plan.singletons };
+}

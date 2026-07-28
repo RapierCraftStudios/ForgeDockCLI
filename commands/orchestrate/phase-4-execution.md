@@ -1633,6 +1633,8 @@ import("{REPO_PATH}/bin/engine/resolve.mjs").then(({ foldNewMatches }) => {
 
 `newMatches` from `foldNewMatches` are candidate issues, not admitted ones. Each one MUST be dispatched through the exact same path a T0-resolved issue takes — DAG dependency analysis (`phase-3-dependency.md`), then Step 4A/4B's standard `dispatch_headroom`-gated dispatch — **not** through Step 4C's review-finding-specific `evaluateCascadeFinding` chain (that gate's rules, e.g. the comment/typo keyword heuristic, are shaped for cascade-spawned findings, not arbitrary re-resolved issues). This is the same non-bypass requirement Step 4C already satisfies for its own admission stream; this step must not become a second, ungated entry point into the DAG. Add every `newMatch` to `ALL_BATCH_ISSUE_NUMBERS` (so a later re-resolution round or Step 4C sees it as already processed) and to `SORTED_READY_SET`/the DAG exactly as Step 4A.pre.0 processes a T0-resolved issue.
 
+Also add every new match to `BATCH_CANDIDATE_REGISTRY` and invoke `planP3Batches()` before dispatch. The registry includes prior-cycle singletons and original batch candidates, so predicate re-resolution can extend an existing under-cap batch or form a newly eligible cluster instead of dispatching a matching finding alone. <!-- Added: forge#2851 -->
+
 **Reporting (mandatory — do not let this become an alert-only dead-code path, per forge#1832)**: track which issues were T0-resolved vs. admitted via re-resolution, and which round each entered in. Surface this distinction in the final report (`phase-6-report.md`) rather than only in a log line — a run whose predicate still matches unadmitted work at exit (round cap or config disabled mid-run) must say so explicitly, not report a silent clean drain.
 
 **Multi-repo**: for `all-repos`/satellite-scoped queries (`next <N> all-repos`, `mcp:fast`, etc.), re-run the query against every repo the original resolution covered — not just the default repo.
@@ -1990,7 +1992,22 @@ done
 
 **Surface-area batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
-Cascade-spawned findings collected within a single `/orchestrate` run never pass back through Phase 1's batching rule — Phase 1 only runs once, at the start. Without a check here, same-file P3 findings spawned mid-run always dispatch individually, defeating the batching policy for exactly the findings it exists to catch. Apply the same grouping rule from `commands/orchestrate/phase-1-resolve.md` ("P3 Review-Finding Batching") to `QUEUED_FINDINGS` before the dispatch step below:
+Cascade-spawned findings collected within a single `/orchestrate` run must be evaluated by the same implementation as initial resolution. Maintain `BATCH_CANDIDATE_REGISTRY` for the whole run: initial resolved issues, every `QUEUED_FINDINGS` admission, predicate re-resolution matches, completion-sweep candidates, and prior-cycle singletons. Parse open batch issues and pass both collections to `planP3Batches()` from `bin/engine/admission.mjs` after every admission event; execute its `create` and `extend` actions, retain its singletons, and append `summarizeP3BatchPlan()` to the per-run audit summary. Do not rebuild a per-cycle-only `SURFACE_FILE_MEMBERS` map or impose a separate scan cap: those mechanisms make late-arriving matches and original candidates invisible. <!-- Added: forge#2851 -->
+
+The legacy shell block below is retained only for action execution details. Its duplicate eligibility/grouping logic must not be used to make batching decisions; the typed evaluator is authoritative.
+
+```bash
+# BATCH_CANDIDATE_REGISTRY_JSON and OPEN_BATCHES_JSON persist at batch scope. Recompute
+# the plan after Step 4B.6, Step 4C, and Step 4F; action.memberIds are repo-qualified.
+BATCH_PLAN=$(node -e '
+  import("{REPO_PATH}/bin/engine/admission.mjs").then(({ planP3Batches, summarizeP3BatchPlan }) => {
+    const plan = planP3Batches({ candidates: JSON.parse(process.argv[1]), openBatches: JSON.parse(process.argv[2]) });
+    console.log(JSON.stringify({ plan, summary: summarizeP3BatchPlan(plan) }));
+  });
+' "$BATCH_CANDIDATE_REGISTRY_JSON" "$OPEN_BATCHES_JSON")
+# Create or extend batches from `.plan.actions[]`, keep `.plan.singletons` in the registry,
+# and append `.summary` to the Phase 6 per-run report.
+```
 
 ```bash
 # Group QUEUED_FINDINGS by exact affected file, reusing the SAME safety
@@ -2438,6 +2455,8 @@ echo "Completion sweep: ${#SWEEP_CANDIDATES[@]} re-evaluable, ${#PERMANENT_DEFER
 **Step 4F.2: Re-evaluate sweep candidates**
 
 Re-run the Step 4C heuristics against the now-empty DAG. Since all original batch issues are in terminal state, the `ALL_BATCH_FILES` list for file-overlap detection is empty — P3 same-file deferrals will now pass.
+
+Before dispatching `SWEEP_EXECUTE`, add every sweep candidate to `BATCH_CANDIDATE_REGISTRY` and re-run `planP3Batches()` with the current open-batch metadata. This is required even after the DAG drains: age and leaf-directory rules remain available, and prior singletons can now form or extend a batch with candidates discovered in a later admission path. <!-- Added: forge#2851 -->
 
 ```bash
 SWEEP_EXECUTE=()

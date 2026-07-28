@@ -352,6 +352,24 @@ done
 
 Before finalizing the issue set, apply the P3 batching rule to reduce full-pipeline overhead on low-severity review findings.
 
+**Single implementation (MANDATORY):** `bin/engine/admission.mjs` owns the eligibility, same-file, leaf-directory, age, eight-member, open-batch-extension, and singleton-reason rules through `planP3Batches()`. Every admission point supplies its complete current candidate registry plus parsed open batch metadata to that function, then executes only its returned `create`/`extend` actions. Do not independently reproduce thresholds or eligibility predicates in this file. The legacy shell examples below describe GitHub data collection and action execution only; their grouping decisions must be replaced by the evaluator result. Include original resolved issues, prior-cycle singletons, cascade findings, predicate re-resolution matches, and completion-sweep candidates in the registry. <!-- Added: forge#2851 -->
+
+After executing the plan, retain every singleton in the registry for the next admission event and record `summarizeP3BatchPlan()` in the per-run batching summary: clusters formed, members absorbed, open batches extended, and ungrouped members with their reasons.
+
+```bash
+# BATCH_CANDIDATE_REGISTRY_JSON contains every candidate accumulated so far, with
+# a stable `id` (`{repo}:{number}`), repo, title, problem/body, labels, affectedFile,
+# createdAt, and isBatch. OPEN_BATCHES_JSON contains existing batch issue metadata.
+# Run this after initial resolution and every later admission event; execute returned
+# actions using memberIds, never bare issue numbers, so satellite issues cannot collide.
+BATCH_PLAN=$(node -e '
+  import("{REPO_PATH}/bin/engine/admission.mjs").then(({ planP3Batches, summarizeP3BatchPlan }) => {
+    const plan = planP3Batches({ candidates: JSON.parse(process.argv[1]), openBatches: JSON.parse(process.argv[2]) });
+    console.log(JSON.stringify({ plan, summary: summarizeP3BatchPlan(plan) }));
+  });
+' "$BATCH_CANDIDATE_REGISTRY_JSON" "$OPEN_BATCHES_JSON")
+```
+
 **Priority label schema**: ForgeDock's own issue creator (`review-pr.md`) writes only the canonical `priority:P<n>` label form. Some repos this pipeline operates against (issues opened externally, imported, or predating ForgeDock adoption) instead carry a bare `P<n>` label with no `priority:` prefix. Every priority-read check in this section — and its mirrors in `phase-4-execution.md` and `cleanup.md` — MUST accept both forms. `priority:P<n>` wins when (unusually) both are present on the same issue. Issue-*creation* call sites (the batch-issue creation below) are unaffected and keep writing canonical `priority:P<n>` only — there is no case where this pipeline needs to *write* the bare form. <!-- Added: forge#2232 -->
 
 **Trigger conditions** (default-batchable — no opt-in marker required):
