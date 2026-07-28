@@ -1844,19 +1844,21 @@ if [ "$FINDING_PRIORITY_EXIT" -ne 0 ]; then
 else
 
 # --label is repeatable (not comma-joined) per the /issue programmatic contract.
-Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}")
+ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"$FINDING_ISSUE_TITLE\" --body-file \"$FINDING_ISSUE_BODY_FILE\" --label review-finding --label needs-validation --label \"$FINDING_PRIORITY\" ${MILESTONE_FLAG}"))
 rm -f "$FINDING_ISSUE_BODY_FILE"
 
-# /issue has no machine-readable return contract (it's a user-facing command, not a work-on
-# subcommand) — resolve the created issue's number by exact-title search immediately after
-# the call. The title embeds ${PR_NUMBER} and the finding summary, making it unique enough
-# for a reliable single-match lookup. Retry to absorb GitHub Search API indexing lag.
-ISSUE_NUM=""
-for _resolve_attempt in 1 2 3; do
-  ISSUE_NUM=$(gh issue list -R ${REPO} --search "in:title \"${FINDING_ISSUE_TITLE}\"" --state open --limit 1 --json number --jq '.[0].number // empty')
-  [ -n "$ISSUE_NUM" ] && break
-  sleep 2
-done
+# /issue succeeds only after its API create-token read-back (Phase 4B). Its
+# explicit result marker distinguishes a verified create from an intentional
+# dedup STOP; never use title search to mask a swallowed 403.
+ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ -n "$DEDUP_NUMBER" ]; then
+  ISSUE_NUM="$DEDUP_NUMBER"
+  echo "Review finding deduped against existing issue #${ISSUE_NUM}."
+elif [ -z "$ISSUE_NUM" ]; then
+  echo "ERROR: /issue did not report a verified review-finding number; stopping review instead of silently dropping the finding." >&2
+  exit 1
+fi
 fi
 ```
 

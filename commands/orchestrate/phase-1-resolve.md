@@ -473,20 +473,19 @@ BATCH_EOF
 ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"fix(batch): P3 review findings — ${SAFE_SURFACE_AREA} (batch #{BATCH_N})\" --body-file \"${BATCH_BODY_FILE}\" --label \"review-finding\" --label \"priority:P3\" --label \"batch\" --exclude \"${MEMBER_LIST}\""))
 ```
 
-**Extract the created batch issue number from the Skill output** (see `commands/issue.md` Phase 4C/4E — it echoes `Created: {url}` and reports `**#{NUMBER}**: {title}`):
+**Consume `/issue`'s explicit result contract** (see `commands/issue.md` Phases 2D and 4C). A dedup STOP is an expected, named outcome; any output without either result marker is a hard create failure:
 
 ```bash
-BATCH_ISSUE_NUM=$(echo "$ISSUE_SKILL_OUTPUT" | grep -oE 'issues/[0-9]+' | head -1 | grep -oE '[0-9]+')
-[ -z "$BATCH_ISSUE_NUM" ] && BATCH_ISSUE_NUM=$(echo "$ISSUE_SKILL_OUTPUT" | grep -oE '\*\*#[0-9]+\*\*' | head -1 | grep -oE '[0-9]+')
+BATCH_ISSUE_NUM=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:CREATED number=\([0-9][0-9]*\).*/\1/p' | head -1)
+DEDUP_NUMBER=$(printf '%s\n' "$ISSUE_SKILL_OUTPUT" | sed -n 's/.*FORGE:ISSUE_CREATE:DEDUP number=\([0-9][0-9]*\).*/\1/p' | head -1)
 
-if [ -z "$BATCH_ISSUE_NUM" ]; then
-  # With --exclude "${MEMBER_LIST}" passed above, Phase 2D no longer fires on the
-  # cluster's own declared members — a STOP reaching this point means a GENUINE
-  # non-member duplicate was found (some other open issue already covers this
-  # exact surface area), or a usage error. Do NOT replace member issues with a
-  # batch issue for this cluster; leave the members on the standard individual
-  # pipeline instead. <!-- Reworded: forge#2432 -->
-  echo "WARNING: /issue did not report a created batch issue number — likely a Phase 2D dedup STOP against a non-member issue (a real duplicate — member exclusion via --exclude \"${MEMBER_LIST}\" is already applied above, so this is not a false positive against the cluster's own members) or a usage error. Do not replace member issues with a batch issue for this cluster; leave the members on the standard individual pipeline instead."
+if [ -n "$DEDUP_NUMBER" ]; then
+  echo "Batch dedup STOP: existing non-member issue #${DEDUP_NUMBER}; members remain on the standard individual pipeline."
+elif [ -z "$BATCH_ISSUE_NUM" ]; then
+  # Neither verified creation nor explicit dedup was reported. Do not replace
+  # member issues. <!-- forge#2842 -->
+  echo "ERROR: /issue did not report a verified batch issue number. This is a create failure (including a swallowed GitHub secondary-rate-limit response), not a dedup STOP. Do not replace member issues; stop this batch and retry after resolving the GitHub failure." >&2
+  exit 1
 fi
 ```
 
@@ -518,4 +517,3 @@ If fewer than 2 batchable P3 findings share a file, AND fewer than 5 share a lea
 **Why**: Surface-level similarity hides critical differences. #3842 (api_key.id lazy load) and #4039 (user.id lazy load) had identical error messages but targeted completely different ORM objects. Closing #4039 as a "duplicate" would have left a customer-impacting P0 bug unfixed.
 
 ---
-
