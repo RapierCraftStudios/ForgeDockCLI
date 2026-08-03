@@ -31,6 +31,6 @@
 
 - Delivery and review worktrees now install their own lockfile-pinned dependencies before agents or verification run, preventing false baseline/build failures from missing modules.
 - Process-verifier tests use isolated leases so ForgeDock can verify its own test suite without recursively waiting on the outer machine-wide verification lock.
-- BuildResult acceptance evidence now carries the controller-observed issue body and labels, so independent reviewers can verify GitHub-metadata criteria instead of treating repository checks as evidence.
+- BuildResult acceptance evidence now carries controller-observed issue body, labels, and prerequisite-admission Outcomes/timestamps, so independent reviewers can verify GitHub-metadata and dependency-ordering criteria instead of treating repository checks as evidence.
 - GitHub App credential refresh now uses a packaged cross-platform Node helper instead of passing Windows paths through Bash.
 - Windows legacy verification now uses file URLs for dynamic ESM imports and path-aware orphan-symlink ownership checks.

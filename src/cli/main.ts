@@ -118,12 +118,21 @@ async function workOn(argv: string[]): Promise<void> {
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
+  const subjectEvidence = issueSubjectEvidence(issue);
   if (dependencyIssues.includes(issue.number)) throw new Error(`Issue #${issue.number} cannot depend on itself`);
   for (const dependency of dependencyIssues) {
-    const reconciled = reconcileLatestRunArtifacts(await authoritativeArtifacts.list({ repo: issue.repo, issue: dependency }));
+    const dependencyArtifacts = await authoritativeArtifacts.list({ repo: issue.repo, issue: dependency });
+    const reconciled = reconcileLatestRunArtifacts(dependencyArtifacts);
     if (reconciled.state !== "completed") {
       throw new Error(`Dependency #${dependency} is ${reconciled.state}, not completed; refusing to start #${issue.number}`);
     }
+    const dependencyIssue = await github.getIssue(dependency, issue.repo);
+    const mergedOutcome = dependencyArtifacts
+      .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged")
+      .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+    subjectEvidence.push(
+      `Dependency #${dependency} admission: authoritative artifact state completed${reconciled.runId ? ` in run ${reconciled.runId}` : ""}; merged Outcome recorded ${mergedOutcome?.createdAt ?? "with no timestamp"}; issue state ${dependencyIssue.state}; labels ${dependencyIssue.labels.join(", ") || "none"}`,
+    );
   }
   const priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
   let resumeRunId: string | undefined;
@@ -213,7 +222,7 @@ async function workOn(argv: string[]): Promise<void> {
       const result = await resumeWorkOn({
         run, intent: intentArtifact, investigation, packet, outcome, workspace,
         baseBranch: localRepository.defaultBranch, verification, baselineChecks,
-        subjectEvidence: issueSubjectEvidence(issue),
+        subjectEvidence,
         autoMerge: argv.includes("--auto-merge"),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
@@ -249,7 +258,7 @@ async function workOn(argv: string[]): Promise<void> {
       baseRef,
       verification,
       baselineChecks,
-      subjectEvidence: issueSubjectEvidence(issue),
+      subjectEvidence,
       autoMerge: argv.includes("--auto-merge"),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
