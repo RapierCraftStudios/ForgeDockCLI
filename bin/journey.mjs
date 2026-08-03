@@ -747,7 +747,7 @@ export async function preflight(ctx) {
 // Act II — Forging: command symlinks + SessionStart hook (Task 6)
 // ---------------------------------------------------------------------------
 
-import { mkdir, symlink, readlink, lstat, readdir, rename, copyFile, readFile, writeFile, unlink, rm, open } from "fs/promises";
+import { mkdir, symlink, readlink, lstat, realpath, readdir, rename, copyFile, readFile, writeFile, unlink, rm, open } from "fs/promises";
 import { compareVersions } from "./registry.mjs";
 import { relative, dirname as pathDirname, isAbsolute, resolve, sep } from "path";
 import {
@@ -1145,14 +1145,29 @@ export const PIPELINE_SCRIPTS = new Set([
   "validate-pr-target.sh",
 ]);
 
+// Matches a Windows drive-relative path like "C:foo" (drive letter + colon,
+// NOT followed by a path separator) — as opposed to a drive-absolute path
+// like "C:\\foo" or "C:/foo". A drive-relative target is relative to that
+// drive's own current working directory, which Node has no API to query.
+const WINDOWS_DRIVE_RELATIVE_RE = /^[A-Za-z]:(?![\\/])/;
+
+// Kept private, but split out so both symlink cleaners share exactly the same
+// platform-sensitive classification. On POSIX, `:` is an ordinary filename
+// character and must not trigger this Windows-only fail-closed rule.
+function isWindowsDriveRelativeTarget(target, platform = process.platform) {
+  return platform === "win32" && WINDOWS_DRIVE_RELATIVE_RE.test(target);
+}
+
 /**
  * Recursively walk targetDir and remove ForgeDock-managed symlinks whose target
  * file no longer exists on disk. These are "orphaned" symlinks left behind
  * when a command is renamed or deleted.
  *
- * Safety invariant: the effective target must resolve to a strict descendant
- * of commandsDir. Root-equal, parent-traversing, sibling-prefix, cross-volume,
- * unreadable, and otherwise unprovable targets are left untouched.
+ * Safety invariant: the effective target must be a strict lexical descendant
+ * of commandsDir, and its nearest existing ancestor must canonically resolve
+ * at or below commandsDir. Root-equal targets, parent traversal, sibling
+ * prefixes, cross-volume paths, unreadable metadata, and otherwise unprovable
+ * ownership are left untouched.
  *
  * @param {string} targetDir   - ~/.claude/commands (installed commands root)
  * @param {string} commandsDir - FORGE_HOME/commands (source commands root)
@@ -1160,7 +1175,45 @@ export const PIPELINE_SCRIPTS = new Set([
  */
 async function pruneOrphanedSymlinks(targetDir, commandsDir) {
   const resolvedCommandsRoot = resolve(commandsDir);
+  let canonicalCommandsRoot;
+  try {
+    canonicalCommandsRoot = await realpath(resolvedCommandsRoot);
+  } catch {
+    return 0; // the managed root itself cannot be proved — preserve everything
+  }
   let pruned = 0;
+
+  async function isPhysicallyManagedMissingTarget(resolvedTarget) {
+    // The leaf is known to be missing. Walk upward with lstat() so an existing
+    // symlink — including a dangling one — is selected as the nearest lexical
+    // ancestor instead of being followed and accidentally skipped.
+    let existingAncestor = pathDirname(resolvedTarget);
+    while (true) {
+      try {
+        await lstat(existingAncestor);
+        break;
+      } catch (err) {
+        if (err.code !== "ENOENT") return false;
+        if (existingAncestor === resolvedCommandsRoot) return false;
+        const parent = pathDirname(existingAncestor);
+        if (parent === existingAncestor) return false;
+        existingAncestor = parent;
+      }
+    }
+
+    let canonicalAncestor;
+    try {
+      canonicalAncestor = await realpath(existingAncestor);
+    } catch {
+      // In particular, realpath() fails for a dangling intermediate symlink.
+      return false;
+    }
+    const physicalRelative = relative(canonicalCommandsRoot, canonicalAncestor);
+    return physicalRelative === ""
+      || (physicalRelative !== ".."
+        && !physicalRelative.startsWith(`..${sep}`)
+        && !isAbsolute(physicalRelative));
+  }
 
   async function walk(dir) {
     let entries;
@@ -1181,6 +1234,9 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
         } catch {
           continue; // can't read link — skip
         }
+        // A Windows drive-relative target depends on that drive's unknowable
+        // current directory. Preserve it before resolve() can guess a path.
+        if (isWindowsDriveRelativeTarget(target)) continue;
         // readlink() may return a relative target, which is resolved from the
         // link's containing directory rather than from the process cwd.
         const resolvedTarget = resolve(pathDirname(full), target);
@@ -1196,7 +1252,19 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
           // target exists — not orphaned
         } catch (err) {
           if (err.code !== "ENOENT") continue; // unexpected error — skip to be safe
-          // target is gone → orphaned symlink
+          if (!(await isPhysicallyManagedMissingTarget(resolvedTarget))) continue;
+
+          // Recheck the leaf after canonicalization so a target that appeared
+          // during the proof is not treated as an orphan.
+          try {
+            await lstat(resolvedTarget);
+            continue;
+          } catch (recheckErr) {
+            if (recheckErr.code !== "ENOENT") continue;
+          }
+
+          // Lexical and physical ownership are both proved and the target is
+          // still gone → remove the orphaned installed link.
           try {
             await unlink(full);
             pruned++;
@@ -1240,21 +1308,6 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
  * @param {string} targetDir - ~/.claude/commands
  * @returns {Promise<number>} Number of stale entries removed.
  */
-// Matches a Windows drive-relative path like "C:foo" (drive letter + colon,
-// NOT followed by a path separator) — as opposed to a drive-absolute path
-// like "C:\foo" or "C:/foo", which path.isAbsolute() already recognizes
-// correctly. A drive-relative target resolves relative to that drive's own
-// current working directory, which Node has no API to query — there is no
-// way to compute the correct absolute path here (review finding on PR #2658,
-// forge#2659). Deliberately narrow: only fires when isAbsolute() has already
-// said "no" and the string still starts with `<letter>:` immediately
-// followed by a non-separator character. Platform-gated (review finding
-// forge#2663): on POSIX, `:` has no special meaning in filenames, so a
-// literal relative target like `C:foo` is a perfectly valid path component
-// and must NOT be misclassified as an unresolvable Windows drive-relative
-// path — only apply this heuristic on win32.
-const WINDOWS_DRIVE_RELATIVE_RE = /^[A-Za-z]:(?![\\/])/;
-
 export async function pruneStaleExtensionlessEntries(targetDir) {
   let pruned = 0;
   let entries;
@@ -1290,7 +1343,7 @@ export async function pruneStaleExtensionlessEntries(targetDir) {
     //   - Shell-style tilde ("~/foo", "~\foo", or bare "~") — expand against
     //     os.homedir() first, matching shell semantics (review finding on
     //     PR #2658, forge#2660).
-    if (process.platform === "win32" && WINDOWS_DRIVE_RELATIVE_RE.test(linkTarget)) continue; // can't resolve without the drive's own cwd — leave alone
+    if (isWindowsDriveRelativeTarget(linkTarget)) continue; // can't resolve without the drive's own cwd — leave alone
     let effectiveTarget = linkTarget;
     if (effectiveTarget === "~" || effectiveTarget.startsWith("~/") || effectiveTarget.startsWith("~\\")) {
       effectiveTarget = join(os.homedir(), effectiveTarget.slice(1));
