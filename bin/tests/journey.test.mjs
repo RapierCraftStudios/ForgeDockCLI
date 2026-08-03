@@ -5,7 +5,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, rmSync, chmodSync, utimesSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, dirname, sep } from "node:path";
 import os from "node:os";
 import { writeForgeYaml, backfillForgeYaml, backupExisting, detectDescription, makeCtx, preflight, forge, read, review, celebrate, connect, maybeOfferDemo, openUrl, runJourney, manualLowConfidenceKeys, parseInstallTier, findMarkdownFiles, isEphemeralCachePath, detectCrossEnvInstall, validateForgeYamlShape, writeInstallReceipt, persistHome, isSymlinkTraversable, atomicSymlinkInstall, pruneStaleExtensionlessEntries } from "../journey.mjs";
 import { detectEnvironment } from "../env-detect.mjs";
@@ -2058,7 +2058,7 @@ describe("forge (Act II)", () => {
       }
       throw err;
     }
-    assert.ok(existsSync(orphanLink) || true, "orphan link created (lstat follows the broken link)");
+    assert.ok(lstatSync(orphanLink).isSymbolicLink(), "orphan link created");
 
     const { ctx, w } = stubCtx({ home });
     ctx.forgeHome = forgeHome;
@@ -2071,6 +2071,38 @@ describe("forge (Act II)", () => {
     // pruned count reported
     assert.equal(res.pruned, 1);
     assert.match(w.text, /orphaned symlink/);
+  });
+
+  it("prunes an orphaned ForgeDock symlink with a relative managed target", async (t) => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home9-rel-"));
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src9-rel-"));
+    const commandsDir = join(forgeHome, "commands");
+    mkdirSyncFs(commandsDir, { recursive: true });
+    mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+    writeFileSync(join(commandsDir, "a.md"), "A", "utf-8");
+    writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+    const targetCommands = join(home, ".claude", "commands");
+    mkdirSyncFs(targetCommands, { recursive: true });
+    const orphanLink = join(targetCommands, "removed-relative.md");
+    const missingManagedTarget = join(commandsDir, "removed-relative.md");
+    const relativeTarget = relative(dirname(orphanLink), missingManagedTarget);
+    try {
+      symlinkSync(relativeTarget, orphanLink);
+    } catch (err) {
+      if (err.code === "EPERM" || err.code === "EACCES") {
+        t.skip("symlink creation unavailable (Windows without Developer Mode)");
+        return;
+      }
+      throw err;
+    }
+
+    const { ctx } = stubCtx({ home });
+    ctx.forgeHome = forgeHome;
+    const res = await forge(ctx);
+
+    assert.throws(() => lstatSync(orphanLink), { code: "ENOENT" });
+    assert.equal(res.pruned, 1);
   });
 
   it("does not remove user-owned symlinks pointing outside commandsDir", async (t) => {
@@ -2103,6 +2135,39 @@ describe("forge (Act II)", () => {
 
     // User-owned symlink must survive untouched
     assert.ok(existsSync(userLink), "user-owned symlink preserved");
+    assert.equal(res.pruned, 0);
+  });
+
+  it("preserves a broken link whose traversing target resolves outside commandsDir", async (t) => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home10-traversal-"));
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src10-traversal-"));
+    const commandsDir = join(forgeHome, "commands");
+    mkdirSyncFs(commandsDir, { recursive: true });
+    mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+    writeFileSync(join(commandsDir, "a.md"), "A", "utf-8");
+    writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+    const targetCommands = join(home, ".claude", "commands");
+    mkdirSyncFs(targetCommands, { recursive: true });
+    const userLink = join(targetCommands, "broken-user-link.md");
+    // Keep the parent segment in the stored target so containment must be
+    // decided from the normalized effective target, not a textual prefix.
+    const traversalTarget = commandsDir + sep + ".." + sep + "user-owned-missing.md";
+    try {
+      symlinkSync(traversalTarget, userLink);
+    } catch (err) {
+      if (err.code === "EPERM" || err.code === "EACCES") {
+        t.skip("symlink creation unavailable (Windows without Developer Mode)");
+        return;
+      }
+      throw err;
+    }
+
+    const { ctx } = stubCtx({ home });
+    ctx.forgeHome = forgeHome;
+    const res = await forge(ctx);
+
+    assert.ok(lstatSync(userLink).isSymbolicLink(), "broken user-owned symlink preserved");
     assert.equal(res.pruned, 0);
   });
 
