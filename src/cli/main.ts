@@ -213,6 +213,7 @@ async function workOn(argv: string[]): Promise<void> {
       const result = await resumeWorkOn({
         run, intent: intentArtifact, investigation, packet, outcome, workspace,
         baseBranch: localRepository.defaultBranch, verification, baselineChecks,
+        subjectEvidence: issueSubjectEvidence(issue),
         autoMerge: argv.includes("--auto-merge"),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
@@ -248,6 +249,7 @@ async function workOn(argv: string[]): Promise<void> {
       baseRef,
       verification,
       baselineChecks,
+      subjectEvidence: issueSubjectEvidence(issue),
       autoMerge: argv.includes("--auto-merge"),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
@@ -458,6 +460,14 @@ function loadOrchestrationItems(issueNumbers: number[], repo: string): Scheduled
       claims: config?.claims?.length ? config.claims : [`component:${repo}`],
     };
   });
+}
+
+function issueSubjectEvidence(issue: { number: number; body: string; labels: readonly string[] }): string[] {
+  const compactBody = issue.body.replace(/\s+/g, " ").trim().slice(0, 2_000);
+  return [
+    `GitHub issue #${issue.number} labels: ${issue.labels.length ? issue.labels.join(", ") : "none"}`,
+    `GitHub issue #${issue.number} body: ${compactBody || "(empty)"}`,
+  ];
 }
 
 function latestRunArtifacts(artifacts: readonly DurableArtifact[]): { runId: string; artifacts: DurableArtifact[] } | undefined {

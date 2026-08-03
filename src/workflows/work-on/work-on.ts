@@ -46,6 +46,7 @@ export async function workOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    subjectEvidence?: readonly string[];
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -98,6 +99,7 @@ export async function workOn(
     let verified = await verifyAndCommit({
       run, packet: prepared.packet, submission: built.submission, workspace, commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = verified.run;
@@ -149,6 +151,7 @@ export async function workOn(
       verified = await verifyAndCommit({
         run, packet: prepared.packet, submission: remediated.submission, workspace, commands,
         ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+        ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
       run = verified.run;
@@ -198,6 +201,7 @@ export async function resumeWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    subjectEvidence?: readonly string[];
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -231,6 +235,7 @@ export async function resumeWorkOn(
     let verified = await verifyAndCommit({
       run, packet: input.packet, submission, workspace: input.workspace, commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = verified.run;
@@ -279,6 +284,7 @@ export async function resumeWorkOn(
       verified = await verifyAndCommit({
         run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
         ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+        ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
       run = verified.run;

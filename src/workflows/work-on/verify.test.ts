@@ -58,12 +58,16 @@ describe("verification and commit barrier", () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
-    const result = await verifyAndCommit({ run, packet: packet(run), submission, workspace, commands: [command] }, {
+    const result = await verifyAndCommit({
+      run, packet: packet(run), submission, workspace, commands: [command],
+      subjectEvidence: ["GitHub issue #1 labels: pipeline-probe", "GitHub issue #1 body: Depends on #5"],
+    }, {
       verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
     });
     assert.equal(result.run.state, "publishing");
     assert.equal(result.buildResult?.payload.headSha, "a".repeat(40));
     assert.equal(result.buildResult?.payload.checks[0]?.status, "passed");
+    assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
   });
 
   it("retains unchanged baseline-failure evidence without treating a required failure as passed", async () => {

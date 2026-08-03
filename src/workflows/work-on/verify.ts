@@ -24,6 +24,7 @@ export async function verifyAndCommit(
     commands: readonly VerificationCommand[];
     baselineChecks?: readonly CheckResult[];
     allowUnexpectedPaths?: boolean;
+    subjectEvidence?: readonly string[];
     signal?: AbortSignal;
   },
   dependencies: {
@@ -95,11 +96,13 @@ export async function verifyAndCommit(
         headSha,
         changedPaths,
         summary: input.submission.summary,
-        acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => ({
-          criterion,
-          status: "passed" as const,
-          evidence: input.submission.criterionCoverage.find((item) => item.criterion === criterion)?.implementation ?? evidenceSummary,
-        })),
+        acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => {
+          const implementation = input.submission.criterionCoverage.find((item) => item.criterion === criterion)?.implementation ?? evidenceSummary;
+          const controllerEvidence = input.subjectEvidence?.length
+            ? ` Controller-observed subject evidence: ${input.subjectEvidence.join(" | ")}`
+            : "";
+          return { criterion, status: "passed" as const, evidence: `${implementation}${controllerEvidence}` };
+        }),
         checks,
         decisions: input.submission.decisions,
         residualRisks: input.submission.residualRisks,
