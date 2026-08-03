@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
@@ -18,11 +18,17 @@ describe("isolated Git worktrees", () => {
     git(repo, "config", "user.name", "ForgeDock Test");
     git(repo, "config", "user.email", "forgedock@example.invalid");
     writeFileSync(join(repo, "README.md"), "base\n");
-    git(repo, "add", "README.md");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "worktree-fixture", version: "1.0.0", dependencies: { example: "file:vendor/example" } }));
+    mkdirSync(join(repo, "vendor", "example"), { recursive: true });
+    writeFileSync(join(repo, "vendor", "example", "package.json"), JSON.stringify({ name: "example", version: "1.0.0" }));
+    writeFileSync(join(repo, "vendor", "example", "index.js"), "export {};\n");
+    execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: repo, stdio: "ignore", shell: process.platform === "win32" });
+    git(repo, "add", "README.md", "package.json", "package-lock.json", "vendor/example");
     git(repo, "commit", "-m", "base");
 
     const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
     const workspace = await manager.create({ runId: "run_test", issue: 12, baseRef: "HEAD" });
+    assert.equal(existsSync(join(workspace.path, "node_modules", "example", "package.json")), true);
     writeFileSync(join(workspace.path, "feature.txt"), "implemented\n");
     mkdirSync(join(workspace.path, "docs", "pipeline-probes"), { recursive: true });
     writeFileSync(join(workspace.path, "docs", "pipeline-probes", "receipt.md"), "probe\n");
@@ -39,6 +45,7 @@ describe("isolated Git worktrees", () => {
       "feature.txt",
     ]);
     await manager.remove(workspace);
+    assert.equal(existsSync(join(repo, "vendor", "example", "index.js")), true);
     assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), new RegExp(workspace.branch.replaceAll("/", "\\/")));
   });
 });

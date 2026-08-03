@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -27,6 +28,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
     }
     await this.git(["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
+    await this.installDependencies(path);
     return { path, branch, baseRef: input.baseRef };
   }
 
@@ -39,6 +41,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const fetched = (await this.git(["rev-parse", "FETCH_HEAD"], this.#repo)).trim();
     if (fetched !== input.headSha) throw new Error(`Fetched review SHA ${fetched} does not match PR head ${input.headSha}`);
     await this.git(["worktree", "add", "--detach", path, fetched], this.#repo);
+    await this.installDependencies(path);
     return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha };
   }
 
@@ -85,6 +88,23 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
+  private async installDependencies(worktreePath: string): Promise<void> {
+    if (!existsSync(join(worktreePath, "package-lock.json"))) return;
+    const command = process.platform === "win32" ? process.execPath : "npm";
+    const npmCli = process.platform === "win32"
+      ? [process.env.npm_execpath, join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")]
+        .find((candidate): candidate is string => Boolean(candidate && existsSync(candidate)))
+      : undefined;
+    if (process.platform === "win32" && !npmCli) throw new Error("Unable to locate npm-cli.js while preparing isolated worktree dependencies");
+    const args = [...(npmCli ? [npmCli] : []), "ci", "--no-audit", "--no-fund"];
+    try {
+      await execFileAsync(command, args, { cwd: worktreePath, encoding: "utf8", windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+    } catch (error) {
+      const detail = error as Error & { stderr?: string };
+      throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+    }
+  }
+
   private async git(args: string[], cwd: string): Promise<string> {
     try {
       const { stdout } = await execFileAsync("git", args, {
@@ -106,7 +126,9 @@ function isOperationalPath(path: string): boolean {
   return normalized === ".pi-subagents"
     || normalized.startsWith(".pi-subagents/")
     || normalized === ".forgedock"
-    || normalized.startsWith(".forgedock/");
+    || normalized.startsWith(".forgedock/")
+    || normalized === "node_modules"
+    || normalized.startsWith("node_modules/");
 }
 
 function assertInside(root: string, candidate: string): void {
