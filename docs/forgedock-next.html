@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ForgeDock Next — Greenfield Rewrite Brief</title>
+  <style>
+    :root {
+      --bg: #090d12;
+      --panel: #101720;
+      --panel-2: #151f2b;
+      --line: #293747;
+      --text: #edf4f7;
+      --muted: #9cafbd;
+      --blue: #65b7ff;
+      --cyan: #60e6d2;
+      --green: #7ee2a8;
+      --yellow: #f3ca72;
+      --red: #ff8e8e;
+      --purple: #c7a6ff;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+      --radius: 16px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 75% -10%, rgba(96, 230, 210, .11), transparent 31rem),
+        radial-gradient(circle at 8% 7%, rgba(101, 183, 255, .12), transparent 28rem),
+        var(--bg);
+      font: 15px/1.62 var(--sans);
+    }
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { font: inherit; }
+    code, pre { font-family: var(--mono); }
+    code { color: #bce7ff; }
+    .shell { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
+    aside {
+      position: sticky; top: 0; align-self: start; height: 100vh; overflow: auto;
+      border-right: 1px solid var(--line); background: rgba(8, 13, 18, .9); backdrop-filter: blur(18px);
+      padding: 25px 18px;
+    }
+    .brand { display: flex; gap: 11px; align-items: center; margin-bottom: 25px; }
+    .mark {
+      display: grid; place-items: center; width: 38px; height: 38px; border: 1px solid #4d6f83;
+      border-radius: 11px; color: var(--cyan); background: linear-gradient(145deg, #182a35, #101820);
+      font-weight: 900; box-shadow: inset 0 0 18px rgba(96, 230, 210, .08);
+    }
+    .brand strong { display: block; letter-spacing: .03em; }
+    .brand small { color: var(--muted); }
+    nav a {
+      display: block; padding: 7px 10px; margin: 2px 0; border-radius: 8px; color: var(--muted); font-size: 13px;
+    }
+    nav a:hover { color: var(--text); background: var(--panel); text-decoration: none; }
+    .side-note { margin-top: 25px; padding: 12px; border: 1px solid var(--line); border-radius: 11px; color: var(--muted); font-size: 12px; }
+    main { width: min(1180px, 100%); padding: 48px clamp(22px, 5vw, 72px) 100px; }
+    section { scroll-margin-top: 20px; margin: 0 0 72px; }
+    .eyebrow { color: var(--cyan); font: 700 12px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    h1 { max-width: 950px; margin: 13px 0 18px; font-size: clamp(39px, 6vw, 74px); line-height: .98; letter-spacing: -.055em; }
+    h2 { margin: 0 0 12px; font-size: clamp(26px, 3vw, 39px); line-height: 1.08; letter-spacing: -.035em; }
+    h3 { margin: 0 0 9px; font-size: 18px; line-height: 1.25; }
+    h4 { margin: 20px 0 8px; }
+    p { margin: 8px 0 15px; }
+    .lede { max-width: 870px; color: #c8d7df; font-size: 19px; }
+    .muted, .section-intro { color: var(--muted); }
+    .section-intro { max-width: 830px; margin-bottom: 24px; font-size: 16px; }
+    .thesis {
+      margin: 30px 0; padding: 22px 24px; border: 1px solid #376477; border-left: 4px solid var(--cyan);
+      border-radius: var(--radius); background: linear-gradient(100deg, rgba(96, 230, 210, .1), rgba(101, 183, 255, .04));
+      box-shadow: var(--shadow); font-size: 18px;
+    }
+    .thesis strong { color: white; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 27px; }
+    .stat { padding: 17px; border: 1px solid var(--line); border-radius: 13px; background: rgba(16, 23, 32, .78); }
+    .stat b { display: block; color: var(--cyan); font: 800 26px/1 var(--mono); }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { padding: 21px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(16, 23, 32, .82); }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .card.accent { border-color: #3c6671; background: linear-gradient(145deg, rgba(96, 230, 210, .08), rgba(16, 23, 32, .88)); }
+    .num { color: var(--cyan); font: 700 12px/1 var(--mono); }
+    .pill, .tag {
+      display: inline-block; padding: 3px 8px; border: 1px solid var(--line); border-radius: 99px;
+      color: var(--muted); background: #0d131a; font: 700 10px/1.4 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+    }
+    .tag.keep { color: var(--green); border-color: #315e47; }
+    .tag.delete { color: var(--red); border-color: #643b40; }
+    .tag.rewrite { color: var(--yellow); border-color: #645638; }
+    .tag.defer { color: var(--purple); border-color: #554473; }
+    .diagram {
+      overflow-x: auto; padding: 23px; border: 1px solid var(--line); border-radius: var(--radius);
+      background: #0b1118; box-shadow: inset 0 0 45px rgba(101, 183, 255, .035);
+    }
+    .layers { min-width: 690px; display: grid; gap: 9px; }
+    .layer { display: grid; grid-template-columns: 145px 1fr; align-items: center; gap: 15px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .layer b { color: var(--blue); font: 700 12px/1.3 var(--mono); text-transform: uppercase; }
+    .flow { display: flex; align-items: stretch; gap: 7px; min-width: 940px; }
+    .step { flex: 1; min-width: 100px; padding: 14px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); text-align: center; }
+    .step b { display: block; color: var(--cyan); font-size: 12px; }
+    .step small { color: var(--muted); }
+    .arrow { align-self: center; color: #587080; }
+    ul.clean { padding-left: 19px; }
+    ul.clean li { margin: 6px 0; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding: 7px 0 7px 27px; border-bottom: 1px solid rgba(41, 55, 71, .45); }
+    .checklist li::before { content: "✓"; position: absolute; left: 2px; color: var(--green); font-weight: 800; }
+    pre {
+      overflow: auto; margin: 14px 0; padding: 18px; border: 1px solid var(--line); border-radius: 12px;
+      color: #d5e9f2; background: #080c11; font-size: 12px; line-height: 1.55;
+    }
+    table { width: 100%; border-collapse: collapse; border: 1px solid var(--line); background: rgba(16, 23, 32, .76); }
+    th, td { padding: 13px 14px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { position: sticky; top: 0; z-index: 1; color: #bfd0d9; background: #141e29; font: 700 11px/1.3 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    td { font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    tr:hover td { background: rgba(101, 183, 255, .025); }
+    .table-wrap { overflow: auto; border-radius: 14px; box-shadow: var(--shadow); }
+    .decision { min-width: 170px; }
+    .decision-buttons { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .decision-buttons button, .action {
+      cursor: pointer; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: #0d141b;
+      padding: 5px 7px; font-size: 10px; font-weight: 800; text-transform: uppercase;
+    }
+    .decision-buttons button:hover, .action:hover { color: white; border-color: #52687a; }
+    .decision-buttons button.active[data-choice="approve"] { color: #07130c; border-color: var(--green); background: var(--green); }
+    .decision-buttons button.active[data-choice="hold"] { color: #191207; border-color: var(--yellow); background: var(--yellow); }
+    .decision-buttons button.active[data-choice="discuss"] { color: #150b0b; border-color: var(--red); background: var(--red); }
+    .decision-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 15px 0; }
+    .progress { flex: 1; min-width: 220px; height: 8px; overflow: hidden; border-radius: 99px; background: #1a2530; }
+    .progress > span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, var(--cyan), var(--green)); transition: width .2s ease; }
+    .decision-count { color: var(--muted); font: 12px var(--mono); }
+    .branch { display: grid; grid-template-columns: 150px 1fr; gap: 11px; margin: 8px 0; padding: 11px; border-left: 2px solid #375066; background: rgba(15, 22, 30, .7); }
+    .branch b { color: var(--blue); font: 700 12px var(--mono); }
+    .callout { padding: 16px 18px; border: 1px solid #5c5030; border-radius: 12px; color: #eadbb8; background: rgba(243, 202, 114, .07); }
+    .danger { border-color: #693e44; color: #f2c4c4; background: rgba(255, 142, 142, .07); }
+    details { margin: 10px 0; border: 1px solid var(--line); border-radius: 12px; background: rgba(16, 23, 32, .75); }
+    summary { cursor: pointer; padding: 14px 17px; font-weight: 750; }
+    details > div { padding: 0 17px 16px; color: #c3d1d9; }
+    .roadmap { counter-reset: phase; }
+    .roadmap .card { position: relative; padding-left: 68px; }
+    .roadmap .card::before { counter-increment: phase; content: counter(phase); position: absolute; left: 20px; top: 20px; display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid #446170; border-radius: 50%; color: var(--cyan); font: 800 12px var(--mono); }
+    .footer { padding-top: 30px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+    @media (max-width: 900px) {
+      .shell { display: block; }
+      aside { position: relative; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      aside nav { display: flex; overflow-x: auto; gap: 3px; }
+      aside nav a { white-space: nowrap; }
+      .side-note { display: none; }
+      main { padding-top: 34px; }
+      .stats, .grid.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .stats, .grid.two, .grid.three { grid-template-columns: 1fr; }
+      h1 { font-size: 44px; }
+      .layer { grid-template-columns: 1fr; gap: 5px; }
+      .branch { grid-template-columns: 1fr; }
+      th, td { padding: 11px; }
+    }
+    @media print {
+      :root { color-scheme: light; --bg: white; --panel: white; --panel-2: #f6f8fa; --line: #cad2d8; --text: #111820; --muted: #53616c; }
+      body { background: white; font-size: 11px; }
+      .shell { display: block; }
+      aside, .decision-buttons, .decision-toolbar { display: none; }
+      main { width: 100%; padding: 0; }
+      section { break-inside: avoid; margin-bottom: 30px; }
+      h1 { font-size: 42px; }
+      .card, .diagram, table, .stat { box-shadow: none; background: white; }
+      pre { color: #111; background: #f5f5f5; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .progress > span { transition: none; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <div class="brand"><div class="mark">F</div><div><strong>ForgeDock Next</strong><small>rewrite decision brief</small></div></div>
+    <nav aria-label="Document sections">
+      <a href="#decision">The decision</a>
+      <a href="#principles">Non-negotiables</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#commands">Command surface</a>
+      <a href="#work-on">work-on</a>
+      <a href="#review">review-pr</a>
+      <a href="#orchestrate">orchestrate</a>
+      <a href="#artifacts">Artifacts & state</a>
+      <a href="#bloat">Removal decisions</a>
+      <a href="#tui">Branded TUI & DX</a>
+      <a href="#neutrality">No lock-in</a>
+      <a href="#migration">Delivery plan</a>
+      <a href="#acceptance">Acceptance tests</a>
+    </nav>
+    <div class="side-note">Standalone artifact. Removal choices are saved only in this browser via <code>localStorage</code>. No repository or network writes occur.</div>
+  </aside>
+
+  <main>
+    <section id="decision">
+      <div class="eyebrow">Recommendation · greenfield replacement</div>
+      <h1>Delete the engine.<br>Keep the discipline.</h1>
+      <p class="lede">ForgeDock should not port its Claude-era engine to Pi. It should replace that engine with a small, typed workflow controller, use Pi as an embedded agent runtime, and expose a ForgeDock-owned CLI and TUI.</p>
+      <div class="thesis"><strong>Pi is the execution kernel—not the workflow authority, state store, product identity, or durable memory.</strong> GitHub holds institutional memory. ForgeDock code owns transitions and side effects. Models do bounded reasoning and implementation work. This preserves the valuable behavior without preserving the accidental machinery.</div>
+      <div class="stats" aria-label="Current complexity inventory">
+        <div class="stat"><b>45,689</b><span>lines across all 83 command specs</span></div>
+        <div class="stat"><b>20,006</b><span>lines for the three core workflow families</span></div>
+        <div class="stat"><b>12,143</b><span>lines in current CLI/runtime/engine files</span></div>
+        <div class="stat"><b>3</b><span>public workflows in the proposed product</span></div>
+      </div>
+      <p class="muted">Core-spec breakdown: <code>work-on</code> 8,864 lines · <code>review-pr</code> 4,636 lines · <code>orchestrate</code> 6,506 lines. This is implementation evidence, not a target to preserve.</p>
+    </section>
+
+    <section id="principles">
+      <div class="eyebrow">Product contract</div>
+      <h2>What survives the rewrite</h2>
+      <p class="section-intro">The rewrite is allowed to destroy internal compatibility. It is not allowed to weaken externally observable safety.</p>
+      <div class="grid three">
+        <div class="card accent"><span class="num">01</span><h3>Prove before coding</h3><p>Every issue is investigated. The valid outcomes are <code>confirmed</code>, <code>invalid</code>, or <code>decompose</code>.</p></div>
+        <div class="card"><span class="num">02</span><h3>Freeze the job</h3><p>A versioned Build Packet fixes scope, acceptance criteria, relevant history, plan, risks, and verification.</p></div>
+        <div class="card"><span class="num">03</span><h3>Verify with evidence</h3><p>Tests, static checks, build commands, and acceptance checks are controller-recorded evidence—not model assurances.</p></div>
+        <div class="card"><span class="num">04</span><h3>Review independently</h3><p>A reviewer starts in a fresh session with intent, packet, evidence, and diff; never the builder conversation.</p></div>
+        <div class="card"><span class="num">05</span><h3>Anchor to a SHA</h3><p>Review approval is valid only for the exact reviewed commit. A changed head invalidates the verdict.</p></div>
+        <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable truth. Local databases and Pi sessions accelerate execution but cannot be the only record.</p></div>
+      </div>
+      <div class="callout" style="margin-top:14px"><strong>Determinism belongs at the boundary.</strong> ForgeDock controls phase selection, permissions, validation, retries, state transitions, merge eligibility, and closure. A model may propose; it may not silently govern.</div>
+    </section>
+
+    <section id="architecture">
+      <div class="eyebrow">Target system</div>
+      <h2>A small controller around a replaceable runtime</h2>
+      <p class="section-intro">“Built around Pi” should mean using its SDK, session runtime, tools, compaction, and provider ecosystem—not shelling out to a branded coding CLI and encoding the product in prompts again.</p>
+      <div class="diagram">
+        <div class="layers">
+          <div class="layer"><b>ForgeDock UX</b><span><code>npx forgedock</code> · three workflow commands · branded TUI · approvals · queue and review views</span></div>
+          <div class="layer"><b>Workflow core</b><span>typed state machines · transition guards · policy · retries · reconciliation · artifact validation</span></div>
+          <div class="layer"><b>Domain services</b><span>investigation · Build Packet · verification · review aggregation · scheduler · leases · worktrees</span></div>
+          <div class="layer"><b>Runtime port</b><span>ForgeDock-owned <code>AgentRuntime</code> interface, event model, task schema, and contract tests</span></div>
+          <div class="layer"><b>Pi adapter</b><span><code>@earendil-works/pi-coding-agent</code> SDK · isolated sessions · compaction · tool execution · model registry</span></div>
+          <div class="layer"><b>Providers</b><span>OpenAI · Anthropic · Google · Bedrock · OpenRouter · local OpenAI-compatible endpoints · custom providers</span></div>
+          <div class="layer"><b>External ports</b><span>GitHub first · Git/worktrees · process runner · local SQLite cache · clock/notifications</span></div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card"><h3>ForgeDock owns</h3><ul class="clean"><li>Workflow state and transition rules</li><li>Artifact schemas and GitHub rendering</li><li>Role permissions and tool policy</li><li>Verification and merge policy</li><li>User-facing CLI/TUI and terminology</li></ul></div>
+        <div class="card"><h3>Pi supplies</h3><ul class="clean"><li>Provider-neutral model invocation</li><li>Agent sessions and compaction</li><li>Streaming events and tool-call loop</li><li>Provider auth/model discovery</li><li>TUI primitives that can accelerate the branded shell</li></ul></div>
+      </div>
+      <pre aria-label="Proposed runtime interface">interface AgentRuntime {
+  capabilities(): Promise&lt;RuntimeCapabilities&gt;;
+  run(task: AgentTask, signal: AbortSignal): AsyncIterable&lt;AgentEvent&gt;;
+  resume(ref: EphemeralSessionRef, input: ResumeInput): AsyncIterable&lt;AgentEvent&gt;;
+  close(ref: EphemeralSessionRef): Promise&lt;void&gt;;
+}
+
+type AgentTask = {
+  role: "investigator" | "packet-author" | "builder" | "reviewer" | "remediator";
+  objective: string;
+  context: readonly DurableArtifact[];
+  workspace: WorkspaceGrant;
+  tools: readonly ToolGrant[];
+  outputSchema: JsonSchema;
+  modelPolicy: CapabilityPolicy; // no provider name required
+};</pre>
+      <p class="muted">Durable artifacts store role, result, and optional model provenance for audit. They never require a Pi session ID to remain usable.</p>
+    </section>
+
+    <section id="commands">
+      <div class="eyebrow">Public surface</div>
+      <h2>Three workflows, a few utilities</h2>
+      <p class="section-intro">Users should express intent. They should not have to know internal stage names or select a recovery command for every failure mode.</p>
+      <div class="grid three">
+        <div class="card accent"><span class="pill">core</span><h3><code>forgedock work-on &lt;issue&gt;</code></h3><p>Take one issue from intent through investigation, build, verification, PR, independent review, and configured completion.</p></div>
+        <div class="card accent"><span class="pill">core</span><h3><code>forgedock review-pr &lt;pr&gt;</code></h3><p>Run a fresh, SHA-anchored review against original intent; optionally enter controller-governed remediation.</p></div>
+        <div class="card accent"><span class="pill">core</span><h3><code>forgedock orchestrate &lt;set&gt;</code></h3><p>Schedule many <code>work-on</code> runs with dependencies, worktree isolation, conflict claims, leases, and bounded concurrency.</p></div>
+      </div>
+      <pre>forgedock                         # open the branded interactive TUI
+forgedock work-on 142             # one issue, guided defaults
+forgedock review-pr 167           # independent review at current SHA
+forgedock orchestrate 142 151 159 --max-parallel 3
+forgedock orchestrate --query 'label:ready milestone:v2' --dry-run
+
+# Utilities, not separate workflows
+forgedock status [run|issue|pr]
+forgedock resume [run]
+forgedock doctor
+forgedock config
+forgedock models</pre>
+      <p><strong>Important consolidation:</strong> <code>status</code>, <code>resume</code>, and stale-run recovery are views/actions on one run model. They are not prompt-heavy commands with independent behavior.</p>
+    </section>
+
+    <section id="work-on">
+      <div class="eyebrow">Workflow 1</div>
+      <h2><code>work-on</code>: one issue, one controlled trajectory</h2>
+      <div class="diagram" aria-label="work-on state flow">
+        <div class="flow">
+          <div class="step"><b>Resolve</b><small>repo, issue, policy</small></div><div class="arrow">→</div>
+          <div class="step"><b>Investigate</b><small>prove or route</small></div><div class="arrow">→</div>
+          <div class="step"><b>Prepare</b><small>Build Packet</small></div><div class="arrow">→</div>
+          <div class="step"><b>Build</b><small>isolated worktree</small></div><div class="arrow">→</div>
+          <div class="step"><b>Verify</b><small>executable gates</small></div><div class="arrow">→</div>
+          <div class="step"><b>Publish</b><small>branch + PR</small></div><div class="arrow">→</div>
+          <div class="step"><b>Review</b><small>fresh context</small></div><div class="arrow">→</div>
+          <div class="step"><b>Complete</b><small>merge/stop/close</small></div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card"><h3>Controller responsibilities</h3><ul class="checklist"><li>Resolve repository state and permissions</li><li>Create worktree and enforce role grants</li><li>Select the next state from validated output</li><li>Run deterministic verification commands</li><li>Create/update issue, branch, and PR artifacts</li><li>Check SHA freshness and merge eligibility</li><li>Persist every committed transition</li></ul></div>
+        <div class="card"><h3>Agent responsibilities</h3><ul class="checklist"><li>Investigate claims against code and history</li><li>Produce schema-valid artifacts</li><li>Plan changes within frozen scope</li><li>Edit and test only inside the granted workspace</li><li>Explain evidence, decisions, and residual risk</li><li>Remediate only accepted blocking findings</li></ul></div>
+      </div>
+      <h3 style="margin-top:24px">Investigation branches are first-class</h3>
+      <div class="branch"><b>confirmed</b><span>Create the Build Packet and continue. Confidence/risk can determine whether preparation uses one or multiple fresh agents.</span></div>
+      <div class="branch"><b>invalid</b><span>Post evidence and a proposed terminal outcome. The controller applies configured closure policy; no builder is started.</span></div>
+      <div class="branch"><b>decompose</b><span>Create an explicit decomposition proposal and child intents. The parent reaches a durable <code>decomposed</code> outcome; children become ordinary work items.</span></div>
+      <div class="callout danger" style="margin-top:14px"><strong>No monolithic agent session.</strong> Investigation, build, and review are separate tasks. Session continuity may be used inside a role for recovery, but never as the workflow’s source of truth.</div>
+    </section>
+
+    <section id="review">
+      <div class="eyebrow">Workflow 2</div>
+      <h2><code>review-pr</code>: independent and commit-specific</h2>
+      <p class="section-intro">The current many-agent review machinery should become a small review protocol with risk-based specialist routing.</p>
+      <div class="grid three">
+        <div class="card"><span class="num">INPUT</span><h3>Clean review packet</h3><p>Original issue intent, investigation, Build Packet, PR diff, verification evidence, repository policy, and current head SHA.</p></div>
+        <div class="card"><span class="num">PROCESS</span><h3>Fresh role sessions</h3><p>One baseline reviewer is mandatory. Security, data, API, frontend, infrastructure, or other specialists are selected from changed surfaces and risk.</p></div>
+        <div class="card"><span class="num">OUTPUT</span><h3>One typed verdict</h3><p>Every finding includes severity, confidence, evidence, location, intent relevance, remediation, and blocking status.</p></div>
+      </div>
+      <h3 style="margin-top:24px">Deterministic policy, not reviewer vibes</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Condition</th><th>Controller response</th></tr></thead>
+        <tbody>
+          <tr><td>No blocking findings; required checks pass; SHA unchanged</td><td>Approve. Merge only if repository policy permits auto-merge.</td></tr>
+          <tr><td>Actionable in-scope blocking finding</td><td>Enter remediation with only accepted findings; re-run verification; review the new SHA in fresh context.</td></tr>
+          <tr><td>Head SHA changed during review</td><td>Invalidate all outstanding verdicts and restart review at the new head.</td></tr>
+          <tr><td>Finding is speculative, out of scope, or lacks evidence</td><td>Record as non-blocking or reject it; do not expand the build silently.</td></tr>
+          <tr><td>Retry/remediation budget exhausted</td><td>Stop as <code>blocked</code> with a human-readable handoff. Never merge optimistically.</td></tr>
+        </tbody>
+      </table></div>
+      <details><summary>Recommended review roles</summary><div><p><strong>Always:</strong> baseline correctness/intent reviewer plus deterministic repository checks.</p><p><strong>Conditional:</strong> security/auth, persistence/migrations, API compatibility, concurrency, frontend/accessibility, infrastructure/CI, or domain-specific review. Selection is code/config, based on changed paths, diff semantics, Build Packet risks, and repository policy.</p><p><strong>Removed:</strong> a fixed fan-out to every specialist and a large prose orchestrator that asks a model to decide what review means.</p></div></details>
+      <details><summary>Independence boundary</summary><div>The reviewer may use the same model family if that is the configured option, but receives a new Pi session, no builder transcript, no builder scratchpad, and no uncommitted workspace state. For high-risk changes, policy may require a different provider/model class as an additional independence measure.</div></details>
+    </section>
+
+    <section id="orchestrate">
+      <div class="eyebrow">Workflow 3</div>
+      <h2><code>orchestrate</code>: schedule work, do not invent a second pipeline</h2>
+      <p class="section-intro">An orchestration worker runs the same <code>work-on</code> state machine. Orchestration adds coordination only.</p>
+      <div class="grid two">
+        <div class="card accent"><h3>Keep</h3><ul class="clean"><li>Explicit dependency DAG and cycle detection</li><li>One isolated worktree per active issue</li><li>Bounded concurrency and resource budgets</li><li>Predicted and observed path/component claims</li><li>Lease, heartbeat, stale-worker recovery</li><li>PR head freshness and merge sequencing</li><li>Restart/reconciliation from durable artifacts</li></ul></div>
+        <div class="card"><h3>Do not carry forward</h3><ul class="clean"><li>Recursive opportunistic cascades</li><li>Near-miss/backlog mining inside execution</li><li>Complex value/cost scoring as a model task</li><li>Model-authoritative batching or completion sweeps</li><li>Background shell dispatch as workflow control</li><li>A second set of build/review semantics</li><li>Agents writing authoritative scheduling state</li></ul></div>
+      </div>
+      <h3 style="margin-top:24px">Minimal scheduler</h3>
+      <pre>ready = issues
+  .filter(dependenciesSatisfied)
+  .filter(notTerminal)
+  .filter(noActiveLease)
+  .filter(claimsCompatible)
+  .sort(byConfiguredPriorityThenAge);
+
+while (capacity.available && ready.length) {
+  controller.startWorkOn(ready.shift(), isolatedWorktree());
+}</pre>
+      <p>The selected model interprets a natural-language issue query and proposes evidence-backed dependencies, priorities, and coarse path/component claims. Typed code validates the graph, rejects cycles or unselected dependencies, and materializes bounded topological batches. Claims become precise after the Build Packet (expected paths). Actual changed paths are checked before publish and before merge. A conflict blocks or serializes work; a model does not “reason away” the collision.</p>
+      <div class="callout"><strong>Decomposition is explicit, not a cascade.</strong> Child issues can be offered for enqueueing, but the scheduler does not recursively discover and launch unrelated work unless a user-configured query includes it.</div>
+    </section>
+
+    <section id="artifacts">
+      <div class="eyebrow">Durable memory</div>
+      <h2>Six artifacts replace annotation sprawl</h2>
+      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The JSON is authoritative for machines; the Markdown remains useful to people.</p>
+      <div class="grid three">
+        <div class="card"><span class="num">01</span><h3>Intent</h3><p>Problem, desired outcome, constraints, source, acceptance hints, links, and dependency declarations.</p></div>
+        <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
+        <div class="card"><span class="num">03</span><h3>Build Packet</h3><p>Frozen scope, criteria, context/history, implementation plan, verification plan, risks, and out-of-scope items.</p></div>
+        <div class="card"><span class="num">04</span><h3>Build Result</h3><p>Branch/SHA, changes, criteria evidence, commands and results, artifacts, decisions, and residual risks.</p></div>
+        <div class="card"><span class="num">05</span><h3>Review Verdict</h3><p>Reviewed SHA, reviewer roles, checks, structured findings, disposition, and freshness metadata.</p></div>
+        <div class="card"><span class="num">06</span><h3>Outcome</h3><p>Merged, invalid, decomposed, blocked, or abandoned; final references, reason, and completion timestamp.</p></div>
+      </div>
+      <pre>{
+  "schema": "forgedock.artifact/v2",
+  "kind": "ReviewVerdict",
+  "id": "rv_...",
+  "runId": "run_...",
+  "subject": { "repo": "owner/repo", "pr": 167 },
+  "createdAt": "ISO-8601",
+  "producer": { "role": "reviewer", "runtime": "pi", "model": "optional-audit-data" },
+  "payload": {
+    "headSha": "full-sha",
+    "disposition": "approve | request_changes | blocked",
+    "findings": [],
+    "checks": [],
+    "supersedes": "optional-artifact-id"
+  }
+}</pre>
+      <h3>Operational state is separate</h3>
+      <p>Run ID, state, attempt, lease owner, lease expiry, heartbeat, workspace, target branch, and ephemeral session references belong to a run record—not semantic artifacts. GitHub receives committed transitions and recovery metadata. SQLite is a rebuildable local index/cache. Pi session files are diagnostic execution records only.</p>
+      <div class="grid two">
+        <div class="card"><h3>GitHub must be enough to…</h3><ul class="clean"><li>Understand why work was attempted</li><li>See what was proved and planned</li><li>Audit what changed and how it was verified</li><li>Know exactly which SHA was reviewed</li><li>Determine the terminal outcome</li></ul></div>
+        <div class="card"><h3>Local state may improve…</h3><ul class="clean"><li>Fast status queries and TUI rendering</li><li>Streaming event history and cost tracking</li><li>In-flight process recovery</li><li>Workspace bookkeeping</li><li>Session continuation within one role</li></ul></div>
+      </div>
+      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
+      <h3>Project guidance and reference memory</h3>
+      <div class="grid three">
+        <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. ForgeDock Next updates only a marker-bounded managed section for role models, thinking, concurrency, and merge defaults.</p></div>
+        <div class="card"><h3><code>FORGE.md</code></h3><p>Explicit user-maintained project and agentic preferences, loaded by the terminal and bounded workflow roles while remaining subordinate to current intent.</p></div>
+        <div class="card"><h3><code>devdocs/</code></h3><p>Obsidian-compatible reference notes with anchors, links, and backlinks. A compact scorer retrieves only relevant summaries; notes never authorize actions or override typed contracts.</p></div>
+      </div>
+    </section>
+
+    <section id="bloat">
+      <div class="eyebrow">Approval matrix</div>
+      <h2>What should be deleted, absorbed, or moved out of core</h2>
+      <p class="section-intro">These are proposed product decisions, not merely code cleanup. Choose Approve, Hold, or Discuss; the browser will preserve your choices locally.</p>
+      <div class="decision-toolbar">
+        <div class="progress" aria-hidden="true"><span id="decision-progress"></span></div>
+        <span class="decision-count" id="decision-count">0 / 0 decided</span>
+        <button class="action" id="copy-decisions" type="button">Copy decision summary</button>
+        <button class="action" id="clear-decisions" type="button">Clear</button>
+      </div>
+      <div class="table-wrap"><table id="decision-table">
+        <thead><tr><th>Current mechanism</th><th>Proposal</th><th>Why / replacement</th><th>Your decision</th></tr></thead>
+        <tbody>
+          <tr data-id="legacy-engine"><td><code>bin/engine.mjs</code> and <code>bin/engine/*</code></td><td><span class="tag delete">delete</span> Greenfield controller</td><td>Do not adapt the existing phase engine. Capture behavioral fixtures, then replace it with typed workflow state machines.</td><td class="decision"></td></tr>
+          <tr data-id="claude-runner"><td><code>bin/runner.mjs</code>, Claude SDK/CLI dispatch, provider branches</td><td><span class="tag delete">delete</span> Pi SDK adapter</td><td>No subprocess protocol pretending to be portability. Embed Pi behind <code>AgentRuntime</code>.</td><td class="decision"></td></tr>
+          <tr data-id="legacy-tui"><td>Current <code>bin/tui.mjs</code> and CLI presentation</td><td><span class="tag rewrite">rewrite</span> ForgeDock UX</td><td>Ship ForgeDock branding, workflow views, approvals, and model controls; use Pi TUI primitives where helpful.</td><td class="decision"></td></tr>
+          <tr data-id="prose-dispatch"><td>Universal phase dispatcher and prose routing rules</td><td><span class="tag delete">delete</span> Code transitions</td><td>Prompts should define a role/task. State transitions, retry limits, and routing belong in code.</td><td class="decision"></td></tr>
+          <tr data-id="core-specs"><td>20,006 lines of core workflow command prose</td><td><span class="tag rewrite">rewrite</span> Compact role packs</td><td>Move shell recipes, validation, GitHub mutations, recovery, and policy into tested services. Keep only reasoning guidance.</td><td class="decision"></td></tr>
+          <tr data-id="claude-hooks"><td>Claude Code hooks, plugin installation, session env assumptions</td><td><span class="tag delete">delete</span></td><td>Use ForgeDock tool grants and Pi runtime events. No dependency on a vendor-specific installation layout.</td><td class="decision"></td></tr>
+          <tr data-id="phase-sentinels"><td>Many phase completion sentinels and workflow labels</td><td><span class="tag rewrite">rewrite</span> v2 artifacts</td><td>Six schemas plus one run state. Retain a read-only legacy parser and temporary compatibility projection.</td><td class="decision"></td></tr>
+          <tr data-id="context-plan"><td>Mandatory separate contract, context, and architect stages</td><td><span class="tag rewrite">consolidate</span> Build Packet</td><td>Preserve all information, not three ceremonies. High-risk policy can still use multiple independent agents to author/check the packet.</td><td class="decision"></td></tr>
+          <tr data-id="fixed-reviewers"><td>Fixed fleet of specialist review agents</td><td><span class="tag rewrite">replace</span> Risk router</td><td>One baseline independent review; add specialists only for detected surfaces and declared risks.</td><td class="decision"></td></tr>
+          <tr data-id="gate-commands"><td><code>quality-gate</code>, <code>test-gate</code>, repeated shell safety recipes</td><td><span class="tag delete">absorb</span> Verification service</td><td>One typed command runner records exit status, output digest, duration, environment, and required/optional policy.</td><td class="decision"></td></tr>
+          <tr data-id="pipeline-utils"><td><code>pipeline-status</code>, <code>pipeline-resume</code>, <code>recover-orphans</code>, <code>pipeline-health</code></td><td><span class="tag rewrite">consolidate</span> Run utilities</td><td>One state model powers status, resume, reconciliation, and doctor views without separate agent prompts.</td><td class="decision"></td></tr>
+          <tr data-id="autopilot"><td><code>autopilot</code></td><td><span class="tag delete">delete</span></td><td><code>orchestrate</code> is the bounded automation product. A second autonomous loop creates overlapping policy and recovery semantics.</td><td class="decision"></td></tr>
+          <tr data-id="staging-review"><td><code>review-pr-staging</code></td><td><span class="tag delete">absorb</span></td><td>Review target/base environment is configuration on <code>review-pr</code>, not another workflow.</td><td class="decision"></td></tr>
+          <tr data-id="monolith"><td><code>work-on-monolithic</code></td><td><span class="tag delete">delete</span></td><td>The supported path is one controller with isolated role sessions; no parallel monolithic implementation.</td><td class="decision"></td></tr>
+          <tr data-id="orchestrate-policy"><td>Cascades, near-miss mining, implicit batching, synthesis, completion sweeps</td><td><span class="tag delete">remove from core</span></td><td>Accept explicit issues/query, dependencies, and decomposition. Reintroduce discovery later only as an optional planner.</td><td class="decision"></td></tr>
+          <tr data-id="gist-memory"><td>Gist/milestone memory indexes and indirect context chains</td><td><span class="tag delete">remove by default</span></td><td>Use direct GitHub artifact references and search. Add external artifact storage only for payloads that exceed host limits.</td><td class="decision"></td></tr>
+          <tr data-id="misc-commands"><td>Audit, design, deploy, incident, analytics, optimization, marketing-adjacent commands</td><td><span class="tag defer">move out of core</span></td><td>Optional packages/extensions or archive. The base <code>npx forgedock</code> install should teach one coherent product.</td><td class="decision"></td></tr>
+          <tr data-id="github-memory"><td>GitHub issue/PR institutional memory</td><td><span class="tag keep">keep</span> simplify</td><td>This is the core value proposition. Preserve durable, human-readable context while reducing annotation mechanics.</td><td class="decision"></td></tr>
+          <tr data-id="worktrees"><td>Worktrees, dependency checks, conflict/resource claims</td><td><span class="tag keep">keep</span> recode</td><td>These are real concurrency controls. Implement them as domain services, not prose conventions.</td><td class="decision"></td></tr>
+          <tr data-id="review-barrier"><td>Fresh review, remediation, re-verification, re-review</td><td><span class="tag keep">keep</span> harden</td><td>This barrier caught real critical and scope-sensitive failures. Make it simpler and more deterministic, never optional by accident.</td><td class="decision"></td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="tui">
+      <div class="eyebrow">Product experience</div>
+      <h2>Pi underneath; ForgeDock everywhere the user looks</h2>
+      <p class="section-intro">A theme alone is not a product shell. The long-term TUI should expose workflow concepts rather than a generic chat transcript.</p>
+      <div class="grid three">
+        <div class="card"><h3>Run timeline</h3><p>Current state, completed barriers, attempts, elapsed time, active model, tool activity, and the next controller action.</p></div>
+        <div class="card"><h3>Review desk</h3><p>SHA, checks, findings grouped by severity, accepted/rejected rationale, diff locations, remediation status, and merge control.</p></div>
+        <div class="card"><h3>Orchestration board</h3><p>Dependency graph, ready/running/blocked lanes, leases, conflict claims, worktrees, budget, and concurrency.</p></div>
+        <div class="card"><h3>Model profiles</h3><p>Select providers/models by role or capability. Show context limits, tool/image support, reasoning levels, cost, and availability.</p></div>
+        <div class="card"><h3>Human checkpoints</h3><p>Edit/approve the Build Packet, override rejected findings, stop runs, approve merge, and see consequences before acting.</p></div>
+        <div class="card"><h3>Developer cockpit</h3><p>Attach to a role session, open the worktree/editor, inspect commands, rerun a gate, export diagnostics, and resume safely.</p></div>
+      </div>
+      <h3 style="margin-top:26px">Recommended TUI sequence</h3>
+      <div class="grid roadmap">
+        <div class="card"><h3>Headless workflow first</h3><p>Use the Pi SDK programmatically. Prove state, artifacts, permissions, and recovery before spending effort on presentation.</p></div>
+        <div class="card"><h3>ForgeDock extension + theme for development</h3><p>Use Pi’s extension, custom provider, theme, and keybinding mechanisms to accelerate internal testing without treating that UI as final.</p></div>
+        <div class="card"><h3>Own branded shell</h3><p><code>npx forgedock</code> starts a ForgeDock TUI composed over the SDK and, where useful, <code>@earendil-works/pi-tui</code>. No Pi command or branding is required in normal use.</p></div>
+        <div class="card"><h3>Advanced DX</h3><p>Add notifications, cost/budget controls, workflow templates, session attach, editor integration, rich diffs, run exports, and extension points.</p></div>
+      </div>
+    </section>
+
+    <section id="neutrality">
+      <div class="eyebrow">Anti-lock-in design</div>
+      <h2>Provider neutrality needs architectural enforcement</h2>
+      <div class="grid two">
+        <div class="card accent"><h3>Model-provider neutral</h3><ul class="checklist"><li>No provider names in workflow transitions</li><li>Role selection by capabilities and policy</li><li>Built-in, proxy, OAuth, gateway, and local models supported through Pi</li><li>Cross-provider handoff uses ForgeDock artifacts, not hidden chat state</li><li>Per-role provider/model configuration is optional, not required</li></ul></div>
+        <div class="card"><h3>Runtime neutral</h3><ul class="checklist"><li>All Pi use stays in one adapter package</li><li>Workflow tests run against an in-memory fake runtime</li><li>ForgeDock owns task/event/output schemas</li><li>No Pi session format in durable contracts</li><li>A second runtime can pass the same conformance suite later</li></ul></div>
+      </div>
+      <p style="margin-top:18px"><strong>Pi is still a dependency.</strong> It is a good dependency here because it is MIT-licensed, SDK-embeddable, and already supports multiple API families and custom providers. The runtime port prevents that sensible choice from becoming the next irreversible product boundary.</p>
+      <div class="callout"><strong>GitHub is an intentional product dependency.</strong> It remains the first durable host because the product’s core promise is institutional memory in issues and PRs. Put it behind a <code>ForgeHost</code> port so GitLab or another host is possible later, but do not dilute the first implementation with premature multi-host parity.</div>
+      <h3 style="margin-top:24px">Role-based least privilege</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Role</th><th>Repository</th><th>GitHub</th><th>Forbidden authority</th></tr></thead>
+        <tbody>
+          <tr><td>Investigator / packet author</td><td>Read-only</td><td>Read-only through scoped tools</td><td>No edits, labels, branches, PRs, closure</td></tr>
+          <tr><td>Builder / remediator</td><td>Write only in assigned worktree</td><td>No direct write token</td><td>No merge, issue closure, authoritative state updates</td></tr>
+          <tr><td>Reviewer</td><td>Read-only at frozen SHA</td><td>Read issue/PR/checks</td><td>No edits, remediation, or merge</td></tr>
+          <tr><td>Controller</td><td>Git/worktree operations</td><td>Validated state/artifact/PR/merge writes</td><td>Cannot bypass configured policy or missing evidence</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="migration">
+      <div class="eyebrow">Safe delivery</div>
+      <h2>Greenfield code, evidence-driven cutover</h2>
+      <p class="section-intro">“Scrap the engine” should not mean “forget what production taught us.” Preserve behavior through fixtures and acceptance tests, not copied architecture.</p>
+      <div class="grid roadmap">
+        <div class="card"><h3>Freeze the contract</h3><p>Approve this scope, state machine, six artifacts, controller authority, review policy, and removals. Create synthetic regression cases from observed patterns; do not commit private AlterLab content.</p></div>
+        <div class="card"><h3>Build the new skeleton</h3><p>TypeScript workspace with workflow core, ports, fake adapters, event log, schema validation, and tests. No dependency on the old engine.</p></div>
+        <div class="card"><h3>Prove Pi on investigation</h3><p>Run one read-only investigation through the Pi SDK with two different providers. Validate typed output, interruption, restart, and GitHub projection.</p></div>
+        <div class="card"><h3>Complete <code>work-on</code> to PR</h3><p>Add worktrees, Build Packet, builder, verification, and PR publication. Keep merge manual until review behavior is proven.</p></div>
+        <div class="card"><h3>Add independent review</h3><p>Implement SHA freezing, risk routing, findings, remediation, re-verification, and re-review. Shadow/canary against known scenarios.</p></div>
+        <div class="card"><h3>Add lean orchestration</h3><p>Dependencies, leases, claims, concurrency, recovery, and merge ordering—nothing else.</p></div>
+        <div class="card"><h3>Ship the branded TUI</h3><p>Build the workflow-native interface after the controller event model is stable, then expose it from <code>npx forgedock</code>.</p></div>
+        <div class="card"><h3>Remove legacy paths</h3><p>Delete the old engine, runner, Claude-specific hooks/specs, overlapping commands, and compatibility projection after the agreed cutover window.</p></div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="callout danger"><strong>Immediate prerequisite:</strong> Pi 0.83.0 requires Node <code>&gt;=22.19.0</code>; this machine currently reports <code>22.17.0</code>. Update the development runtime and the package engine floor before the proof of concept.</div>
+        <div class="callout"><strong>Licensing decision:</strong> Pi and <code>@forgedock/protocol</code> are MIT. This repository is AGPL-3.0, so code merged and distributed here via <code>npx forgedock</code> remains under that repository’s license unless distribution/licensing is deliberately changed.</div>
+      </div>
+      <h3 style="margin-top:24px">Proposed source shape</h3>
+      <pre>src/
+  cli/                   # three workflows + utilities
+  tui/                   # ForgeDock-branded event-driven interface
+  core/
+    state/               # typed states, transitions, invariants
+    artifacts/           # six schemas + Markdown projection
+    policy/              # merge, retry, risk, approval policy
+  workflows/
+    work-on/
+    review-pr/
+    orchestrate/
+  runtime/
+    agent-runtime.ts      # ForgeDock port
+    pi-adapter.ts         # the only Pi-coupled implementation
+    fake-runtime.ts       # deterministic tests
+  adapters/
+    github/
+    git/
+    process/
+    sqlite/
+  roles/                  # compact prompts and output schemas
+  test/fixtures/          # synthetic behavioral regressions</pre>
+    </section>
+
+    <section id="acceptance">
+      <div class="eyebrow">Definition of done</div>
+      <h2>The rewrite succeeds only if these remain true</h2>
+      <div class="grid two">
+        <div class="card"><h3>Workflow behavior</h3><ul class="checklist"><li>Invalid issues stop before coding with evidence</li><li>Decomposed parents produce linked, independently runnable children</li><li>Builders cannot broaden frozen scope silently</li><li>Verification records executable results</li><li>Review starts without builder conversation context</li><li>Any changed SHA invalidates prior review</li><li>Blocking findings force fix, verification, and re-review</li></ul></div>
+        <div class="card"><h3>Portability and recovery</h3><ul class="checklist"><li>The same workflow runs on at least two providers</li><li>A local/custom provider can be configured without workflow code changes</li><li>The controller test suite passes with a fake runtime and no Pi</li><li>A killed run reconciles without guessing from chat history</li><li>A second machine can understand completed work from GitHub alone</li><li>Two conflicting issues are serialized or blocked deterministically</li><li>No role can exceed its side-effect grant</li></ul></div>
+      </div>
+      <h3 style="margin-top:24px">Regression scenario suite</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Scenario</th><th>Expected invariant</th></tr></thead>
+        <tbody>
+          <tr><td>Reported bug is already fixed or superseded</td><td><code>invalid</code> outcome; no branch or PR.</td></tr>
+          <tr><td>Issue spans independently deliverable systems</td><td><code>decomposed</code> parent; explicit child intents and dependency links.</td></tr>
+          <tr><td>Reviewer finds a critical logic flaw after all tests pass</td><td>Merge blocked; accepted finding remediated and independently re-reviewed.</td></tr>
+          <tr><td>Reviewer proposes unrelated cleanup</td><td>Finding rejected or non-blocking due to intent/scope mismatch.</td></tr>
+          <tr><td>Workflow or permission file changed</td><td>Infrastructure/security specialist selected by policy.</td></tr>
+          <tr><td>Two concurrent builds claim overlapping migration paths</td><td>Conflict detected before integration; one run waits or is replanned.</td></tr>
+          <tr><td>Local state disappears midway through a run</td><td>Controller reconstructs semantic progress from GitHub and safely re-establishes operational state.</td></tr>
+          <tr><td>Provider fails or model becomes unavailable</td><td>Retry/fallback obeys policy; no duplicated GitHub side effects and no lost committed artifact.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="thesis" style="margin-top:28px"><strong>Final recommendation:</strong> approve a greenfield ForgeDock core, delete rather than port the current engine, embed Pi behind a ForgeDock runtime boundary, and delay deep TUI customization until the new workflow contract is executable. The moat is not the old engine or a particular model. It is reliable, recoverable software delivery with durable institutional memory.</div>
+    </section>
+
+    <footer class="footer">
+      <p><strong>ForgeDock Next rewrite brief</strong> · generated from the repository architecture/spec audit and observed workflow behavior · no private issue content included.</p>
+      <p>Document path: <code>docs/forgedock-next.html</code></p>
+    </footer>
+  </main>
+</div>
+<script>
+(() => {
+  const KEY = "forgedock-next-decisions-v1";
+  const table = document.getElementById("decision-table");
+  const rows = [...table.querySelectorAll("tbody tr[data-id]")];
+  let state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (_) { state = {}; }
+
+  function render() {
+    let decided = 0;
+    for (const row of rows) {
+      const id = row.dataset.id;
+      const cell = row.querySelector(".decision");
+      if (!cell.querySelector(".decision-buttons")) {
+        const group = document.createElement("div");
+        group.className = "decision-buttons";
+        group.setAttribute("role", "group");
+        group.setAttribute("aria-label", `Decision for ${id}`);
+        for (const choice of ["approve", "hold", "discuss"]) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.dataset.choice = choice;
+          button.textContent = choice;
+          button.addEventListener("click", () => {
+            state[id] = state[id] === choice ? undefined : choice;
+            if (!state[id]) delete state[id];
+            try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (_) {}
+            render();
+          });
+          group.appendChild(button);
+        }
+        cell.appendChild(group);
+      }
+      for (const button of cell.querySelectorAll("button")) {
+        const active = state[id] === button.dataset.choice;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      }
+      if (state[id]) decided++;
+    }
+    document.getElementById("decision-count").textContent = `${decided} / ${rows.length} decided`;
+    document.getElementById("decision-progress").style.width = `${rows.length ? (decided / rows.length) * 100 : 0}%`;
+  }
+
+  document.getElementById("clear-decisions").addEventListener("click", () => {
+    if (!confirm("Clear all locally saved decisions?")) return;
+    state = {};
+    try { localStorage.removeItem(KEY); } catch (_) {}
+    render();
+  });
+
+  document.getElementById("copy-decisions").addEventListener("click", async (event) => {
+    const lines = ["ForgeDock Next — removal decisions", ""];
+    for (const row of rows) {
+      const name = row.cells[0].innerText.trim().replace(/\s+/g, " ");
+      lines.push(`- [${(state[row.dataset.id] || "undecided").toUpperCase()}] ${name}`);
+    }
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      const old = event.currentTarget.textContent;
+      event.currentTarget.textContent = "Copied";
+      setTimeout(() => event.currentTarget.textContent = old, 1400);
+    } catch (_) {
+      prompt("Copy decision summary:", lines.join("\n"));
+    }
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

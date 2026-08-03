@@ -138,27 +138,28 @@ jobs:
           # failure left the bumped version on npm without committing it back to the repo.
           # Checking CURRENT_VERSION would always be true (the committed version is always
           # the last published version), which would permanently disable publishing.
-          if npm show forgedock@"$NEXT_VERSION" version --silent 2>/dev/null | grep -q "$NEXT_VERSION"; then
-            echo "Next version $NEXT_VERSION already published — re-run detected, skipping bump"
+          if npm show forgedock@"$NEXT_VERSION" version --silent 2>/dev/null | grep -qx "$NEXT_VERSION"; then
+            echo "Next version $NEXT_VERSION is already published — reconciling repository metadata"
+            npm version "$NEXT_VERSION" --no-git-tag-version --allow-same-version
             echo "VERSION=$NEXT_VERSION" >> $GITHUB_ENV
-            echo "SKIP_PUBLISH=true" >> $GITHUB_ENV
+            echo "REGISTRY_ALREADY_PUBLISHED=true" >> $GITHUB_ENV
           else
             npm version "$BUMP_TYPE" --no-git-tag-version
             NEW_VERSION=$(node -p "require('./package.json').version")
             echo "VERSION=$NEW_VERSION" >> $GITHUB_ENV
-            echo "SKIP_PUBLISH=false" >> $GITHUB_ENV
+            echo "REGISTRY_ALREADY_PUBLISHED=false" >> $GITHUB_ENV
           fi
 
       - name: Publish to npm (OIDC trusted publishing)
-        if: env.SKIP_PUBLISH != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
         run: npm publish --provenance --access public
 
       - name: Save package.json before name mutation
-        if: env.SKIP_PUBLISH != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
         run: cp package.json package.json.orig
 
       - name: Publish to GitHub Packages
-        if: env.SKIP_PUBLISH != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
         run: |
           NPMRC="$RUNNER_TEMP/.npmrc"
           echo "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" > "$NPMRC"
@@ -169,7 +170,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore package.json name
-        if: always() && env.SKIP_PUBLISH != 'true'
+        if: always() && env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
         run: mv package.json.orig package.json
 
       - name: Sync plugin.json version
@@ -187,9 +188,30 @@ jobs:
       - name: Push version bump
         if: env.SKIP_PUBLISH != 'true'
         run: |
-          git add package.json .claude-plugin/plugin.json
+          git add package.json package-lock.json .claude-plugin/plugin.json
           git commit -m "chore: bump version to ${{ env.VERSION }} [skip ci]"
-          git push
+
+          # A workflow concurrency group serializes publish jobs, not arbitrary
+          # pushes to main. Rebase the generated metadata commit onto the latest
+          # main and retry a raced non-fast-forward update. npm may already be
+          # irreversible at this point, so failure must be explicit and a later
+          # run's REGISTRY_ALREADY_PUBLISHED path must reconcile the same version.
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Version metadata conflicts with current main; refusing to overwrite it"
+              exit 1
+            fi
+            npm test
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main advanced during version update (attempt $attempt/3); retrying"
+            sleep $((attempt * 2))
+          done
+          echo "Unable to reconcile version metadata with main after 3 attempts"
+          exit 1
 
       - name: Create GitHub Release
         if: env.SKIP_PUBLISH != 'true'

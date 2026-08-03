@@ -14,7 +14,7 @@
 
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
 <a href="https://github.com/RapierCraftStudios/ForgeDock/stargazers"><img src="https://img.shields.io/github/stars/RapierCraftStudios/ForgeDock?style=social" alt="GitHub Stars" /></a>
-<a href="https://docs.anthropic.com/en/docs/claude-code"><img src="https://img.shields.io/badge/Built%20for-Claude%20Code-blueviolet" alt="Claude Code" /></a>
+<a href="https://github.com/RapierCraftStudios/pi"><img src="https://img.shields.io/badge/Terminal-ForgeDock%20Pi%20fork-ff8c1a" alt="Powered by the ForgeDock Pi fork" /></a>
 <a href="https://www.npmjs.com/package/forgedock"><img src="https://img.shields.io/npm/v/forgedock?color=cb3837&logo=npm" alt="npm" /></a>
 <a href="https://www.npmjs.com/package/forgedock"><img src="https://img.shields.io/npm/dm/forgedock?color=cb3837&logo=npm&label=downloads" alt="npm downloads per month" /></a>
 <a href="https://github.com/RapierCraftStudios/ForgeDock/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
@@ -54,15 +54,29 @@ $ /work-on #1230        "orchestrate: Layer 5 co-change signal is dead code"
   filed by the pipeline's own staging review. fixed before a human read it.
 ```
 
-### Try it in 30 seconds — on a throwaway repo, nothing to lose
+### Launch the ForgeDock terminal
 
-**Requires for this demo:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (subscription or `ANTHROPIC_API_KEY`) · [GitHub CLI](https://cli.github.com/) (authenticated) · Node.js ≥ 18.
+**Requires:** [GitHub CLI](https://cli.github.com/) (authenticated), Node.js ≥ 22.19, and credentials for any Pi-supported model provider.
 
 ```bash
-npx forgedock demo     # spins up a risk-free demo repo and shows you the pipeline end to end
+npx forgedock
 ```
 
-Ready to use it for real? **`npx forgedock`** walks you through one continuous setup: it checks your environment, installs the slash commands, reads your repo, and hands you a single annotated `forge.yaml` to review — you press Enter once.
+When testing unpublished changes from a source checkout, use the checkout-safe launcher instead:
+
+```bash
+npm run terminal
+```
+
+`npx forgedock` resolves the installed/cached registry package; it does not implicitly run unpublished files from the current repository. Use `/forgedock-runtime` to verify the `semantic-tools+live-subagents-v2` runtime, bundled delegation bridge, and resolved package root on demand; the idle terminal does not reserve space for a persistent runtime widget.
+
+When orchestration is active, press `←` or `↓` on an empty editor to focus the worker fleet, select a worker, and press `Enter` to open its live controller transcript. ForgeDock expands tool arguments and streaming output by default; press `x` (or `Ctrl+O`) to toggle the compact view.
+
+ForgeDock now ships a source-maintained [Pi fork](https://github.com/RapierCraftStudios/pi) with ForgeDock's Chrome & Ember identity. First launch guides you through terminal appearance, provider authentication, and explicit model selection. The terminal exposes controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands. Each command lazily activates its own semantic native tool, so the selected model can interpret natural-language intent without loading large Markdown workflow specs into every conversation. `/orchestrate` asks the model to derive an evidence-backed issue DAG, then deterministically validates dependencies, priorities, and path/component claims before launching bounded topological batches in the visible `pi-subagents` fleet. Children can escalate decisions to the main-model supervisor, which can ask the user a recommended multiple-choice question when human judgment is required.
+
+Verification is serialized across ForgeDock runs on the machine, Node test fanout is bounded, and timeout/cancellation terminates the complete subprocess tree rather than orphaning workers. Subagent transcripts stay in temporary operational storage instead of delivery worktrees, and automatic remediation cannot expand beyond the frozen Build Packet.
+
+`forge.yaml` remains the project configuration file. `/forgedock-config use openai-codex/gpt-5.6-sol with max thinking for workers` updates only ForgeDock Next's managed section while preserving legacy settings; those defaults control worker/reviewer models, thinking, concurrency, and merge policy. `FORGE.md` is explicit user-maintained project guidance, and `/forgedock-remember` can persist a preference or a structured decision. `devdocs/` is a reference-only, Obsidian-compatible long-term memory graph: ForgeDock retrieves compact anchored summaries, links, and backlinks instead of loading the corpus, and memory can never authorize actions or override current intent or typed contracts. The fork is an internal interaction kernel; ForgeDock is the product identity, and its typed controller remains the sole owner of workflow transitions, verification, GitHub publication, review gates, and merge authority.
 
 > ⭐ **If ForgeDock saves you time, [star the repo](https://github.com/RapierCraftStudios/ForgeDock/stargazers)** — it's the whole marketing budget.
 

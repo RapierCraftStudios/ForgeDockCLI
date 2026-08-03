@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import type { VerificationCommand } from "../core/ports/verification.js";
+
+export function discoverVerificationCommands(
+  cwd: string,
+  baseRef?: string,
+): Array<Omit<VerificationCommand, "cwd">> {
+  const manifest = readPackageManifest(cwd, baseRef);
+  const scripts = manifest.scripts ?? {};
+  const npm = npmInvocation();
+  const commands: Array<Omit<VerificationCommand, "cwd">> = [];
+  if (scripts.build) commands.push({ id: "build", command: npm.command, args: [...npm.prefix, "run", "build"], timeoutMs: 10 * 60_000, required: true });
+  if (scripts.test) commands.push({ id: "test", command: npm.command, args: [...npm.prefix, "test"], timeoutMs: 20 * 60_000, required: true });
+  if (!commands.length) throw new Error("No required verification commands detected; define package.json scripts.build or scripts.test");
+  return commands;
+}
+
+function readPackageManifest(cwd: string, baseRef?: string): { scripts?: Record<string, string> } {
+  let source: string;
+  try {
+    source = baseRef
+      ? execFileSync("git", ["show", `${baseRef}:package.json`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+      : readFileSync(join(cwd, "package.json"), "utf8");
+  } catch (error) {
+    const location = baseRef ? `${baseRef}:package.json` : join(cwd, "package.json");
+    throw new Error(`No verification policy found at ${location}. The initial CLI auto-detects package.json build/test scripts only.`, { cause: error });
+  }
+  try {
+    return JSON.parse(source) as { scripts?: Record<string, string> };
+  } catch (error) {
+    throw new Error(`Invalid package.json verification policy${baseRef ? ` at ${baseRef}` : ""}`, { cause: error });
+  }
+}
+
+function npmInvocation(): { command: string; prefix: string[] } {
+  if (process.platform !== "win32") return { command: "npm", prefix: [] };
+  const candidates = [
+    process.env.npm_execpath,
+    join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+  ].filter((value): value is string => Boolean(value));
+  const cli = candidates.find(existsSync);
+  if (!cli) throw new Error("Unable to locate npm-cli.js for shell-free verification on Windows");
+  return { command: process.execPath, prefix: [cli] };
+}

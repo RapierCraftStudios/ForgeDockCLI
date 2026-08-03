@@ -1,13 +1,17 @@
 {
   "name": "forgedock",
   "version": "1.8.0",
-  "description": "Autonomous development pipeline for coding agents. GitHub as institutional memory, with native Claude Code and OpenCode entrypoints.",
+  "description": "Provider-neutral software delivery workflows with GitHub as durable institutional memory.",
+  "type": "module",
   "bin": {
-    "forgedock": "bin/forgedock.mjs"
+    "forgedock": "bin/forgedock-terminal.mjs",
+    "forgedock-next": "bin/forgedock-next.mjs",
+    "forgedock-legacy": "bin/forgedock.mjs"
   },
   "keywords": [
-    "claude-code",
     "ai-agents",
+    "provider-neutral",
+    "coding-agent",
     "autonomous-coding",
     "github-automation",
     "developer-tools",
@@ -15,9 +19,7 @@
     "code-review",
     "llm",
     "knowledge-graph",
-    "claude",
-    "opencode",
-    "anthropic",
+    "pi",
     "agentic-ai",
     "devtools",
     "automation"
@@ -35,6 +37,8 @@
   "files": [
     "bin/",
     "!bin/tests/",
+    "dist/",
+    "agents/",
     "commands/",
     "docs/",
     "!docs/site/.vitepress/",
@@ -47,18 +51,29 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test \"bin/tests/**/*.test.mjs\" \"bin/engine/**/*.test.mjs\" \"packages/protocol/test/**/*.test.mjs\"",
+    "build": "tsc -p tsconfig.json",
+    "build:pi": "npm --prefix vendor/pi run build --workspace=@earendil-works/pi-tui && npm --prefix vendor/pi run build:offline --workspace=@earendil-works/pi-ai && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-agent-core && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-storage-sqlite-node && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-coding-agent",
+    "stage:pi": "node scripts/stage-pi-fork.mjs",
+    "postinstall": "node scripts/patch-pi-subagents-visibility.mjs",
+    "prepack": "npm run build:pi && npm run stage:pi && npm run build",
+    "test": "npm run build && npm run test:next && npm run test:legacy",
+    "test:next": "node --test --test-concurrency=4 \"dist/**/*.test.js\"",
+    "test:legacy": "node --test --test-concurrency=4 \"bin/tests/**/*.test.mjs\" \"bin/engine/**/*.test.mjs\" \"packages/protocol/test/**/*.test.mjs\"",
+    "next": "npm run build --silent && node bin/forgedock-next.mjs",
+    "terminal": "npm run build --silent && node bin/forgedock-terminal.mjs",
     "docs:dev": "vitepress dev docs/site",
     "docs:build": "vitepress build docs/site",
     "docs:preview": "vitepress preview docs/site"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   },
   "optionalDependencies": {
     "@anthropic-ai/sdk": ">=0.30.0 <1"
   },
   "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3",
     "vitepress": "^1.6.3"
   },
   "peerDependencies": {
@@ -68,5 +83,25 @@
     "@anthropic-ai/claude-code": {
       "optional": true
     }
-  }
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "file:vendor/pi-runtime",
+    "pi-subagents": "0.40.0",
+    "typebox": "1.3.7",
+    "undici": "8.10.0"
+  },
+  "bundledDependencies": [
+    "@earendil-works/pi-coding-agent",
+    "pi-subagents",
+    "undici"
+  ],
+  "overrides": {
+    "vite": "6.4.3",
+    "undici": "8.10.0"
+  },
+  "bundleDependencies": [
+    "@earendil-works/pi-coding-agent",
+    "pi-subagents",
+    "undici"
+  ]
 }

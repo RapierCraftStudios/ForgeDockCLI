@@ -23,6 +23,15 @@ secrets/
 .claude/
 CLAUDE.md
 
+# ForgeDock local operational cache (GitHub artifacts remain authoritative)
+.forgedock/state.db
+.forgedock/state.db-*
+.forgedock/worktrees/
+.forgedock/*.jsonl
+.forgedock/*.stderr
+.forgedock/observations/
+.pi-subagents/
+
 # Spec Knowledge Graph (generated; gitignored by default — opt-in to commit,
 # mirroring per-repo adaptive scripts)
 .forgedock/graph/
@@ -32,6 +41,8 @@ marketing/
 
 # Node
 node_modules/
+/dist/
+docs/site/.vitepress/dist/
 .superpowers/
 
 # Scratch diff dumps (root-level only — e.g. _bin_diff.txt, _cmd_diff.txt)

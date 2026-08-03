@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import type { ArtifactKind, Subject } from "../artifacts/schema.js";
+
+export type Workflow = "work-on" | "review-pr" | "orchestrate";
+export type RunStateName =
+  | "queued"
+  | "investigating"
+  | "preparing"
+  | "building"
+  | "verifying"
+  | "publishing"
+  | "reviewing"
+  | "remediating"
+  | "merging"
+  | "closing"
+  | "completed"
+  | "invalid"
+  | "decomposed"
+  | "blocked"
+  | "failed"
+  | "cancelled";
+
+export type TransitionEvent =
+  | "START_INVESTIGATION"
+  | "INVESTIGATION_CONFIRMED"
+  | "INVESTIGATION_INVALID"
+  | "INVESTIGATION_DECOMPOSED"
+  | "BUILD_PACKET_READY"
+  | "BUILD_COMPLETED"
+  | "VERIFICATION_PASSED"
+  | "VERIFICATION_FAILED"
+  | "RESUME_VERIFICATION"
+  | "PR_PUBLISHED"
+  | "REVIEW_APPROVED"
+  | "REVIEW_CHANGES_REQUESTED"
+  | "REVIEW_BLOCKED"
+  | "REMEDIATION_COMPLETED"
+  | "MERGE_COMPLETED"
+  | "CLOSE_COMPLETED"
+  | "BLOCK"
+  | "FAIL"
+  | "CANCEL";
+
+export interface RunState {
+  schema: "forgedock.run/v1";
+  runId: string;
+  workflow: Workflow;
+  subject: Subject;
+  state: RunStateName;
+  attempt: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  headSha?: string;
+  artifactIds: Partial<Record<ArtifactKind, string[]>>;
+  blockedReason?: string;
+  failure?: string;
+}
+
+export interface TransitionRecord {
+  runId: string;
+  sequence: number;
+  event: TransitionEvent;
+  from: RunStateName;
+  to: RunStateName;
+  occurredAt: string;
+  reason?: string;
+}
+
+const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent, RunStateName>>>> = {
+  queued: { START_INVESTIGATION: "investigating", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  investigating: {
+    INVESTIGATION_CONFIRMED: "preparing",
+    INVESTIGATION_INVALID: "invalid",
+    INVESTIGATION_DECOMPOSED: "decomposed",
+    BLOCK: "blocked",
+    FAIL: "failed",
+    CANCEL: "cancelled",
+  },
+  preparing: { BUILD_PACKET_READY: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  building: { BUILD_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  verifying: {
+    VERIFICATION_PASSED: "publishing",
+    VERIFICATION_FAILED: "blocked",
+    BLOCK: "blocked",
+    FAIL: "failed",
+    CANCEL: "cancelled",
+  },
+  publishing: { PR_PUBLISHED: "reviewing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  reviewing: {
+    REVIEW_APPROVED: "merging",
+    REVIEW_CHANGES_REQUESTED: "remediating",
+    REVIEW_BLOCKED: "blocked",
+    BLOCK: "blocked",
+    FAIL: "failed",
+    CANCEL: "cancelled",
+  },
+  remediating: { REMEDIATION_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  merging: { MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  closing: { CLOSE_COMPLETED: "completed", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  completed: {},
+  invalid: {},
+  decomposed: {},
+  blocked: { RESUME_VERIFICATION: "verifying" },
+  failed: {},
+  cancelled: {},
+};
+
+export const terminalStates = new Set<RunStateName>([
+  "completed", "invalid", "decomposed", "blocked", "failed", "cancelled",
+]);
+
+export function createRun(input: {
+  workflow: Workflow;
+  subject: Subject;
+  runId?: string;
+  now?: string;
+}): RunState {
+  const now = input.now ?? new Date().toISOString();
+  return {
+    schema: "forgedock.run/v1",
+    runId: input.runId ?? `run_${crypto.randomUUID()}`,
+    workflow: input.workflow,
+    subject: input.subject,
+    state: input.workflow === "review-pr" ? "reviewing" : "queued",
+    attempt: 1,
+    version: 0,
+    createdAt: now,
+    updatedAt: now,
+    artifactIds: {},
+  };
+}
+
+export function canTransition(state: RunState, event: TransitionEvent): boolean {
+  return transitions[state.state][event] !== undefined;
+}
+
+export function transition(
+  state: RunState,
+  event: TransitionEvent,
+  options: { now?: string; reason?: string; headSha?: string } = {},
+): { state: RunState; record: TransitionRecord } {
+  const next = transitions[state.state][event];
+  if (!next) throw new InvalidTransitionError(state.state, event);
+  const now = options.now ?? new Date().toISOString();
+  const nextState: RunState = {
+    ...state,
+    state: next,
+    version: state.version + 1,
+    updatedAt: now,
+  };
+  if (options.headSha !== undefined) nextState.headSha = options.headSha;
+  if (event === "RESUME_VERIFICATION") {
+    nextState.attempt = state.attempt + 1;
+    delete nextState.blockedReason;
+  }
+  if (next === "blocked" && options.reason !== undefined) nextState.blockedReason = options.reason;
+  if (next === "failed" && options.reason !== undefined) nextState.failure = options.reason;
+  return {
+    state: nextState,
+    record: {
+      runId: state.runId,
+      sequence: nextState.version,
+      event,
+      from: state.state,
+      to: next,
+      occurredAt: now,
+      ...(options.reason !== undefined ? { reason: options.reason } : {}),
+    },
+  };
+}
+
+export function attachArtifact(state: RunState, kind: ArtifactKind, artifactId: string): RunState {
+  const existing = state.artifactIds[kind] ?? [];
+  if (existing.includes(artifactId)) return state;
+  return {
+    ...state,
+    artifactIds: { ...state.artifactIds, [kind]: [...existing, artifactId] },
+  };
+}
+
+export class InvalidTransitionError extends Error {
+  constructor(readonly from: RunStateName, readonly event: TransitionEvent) {
+    super(`Cannot apply ${event} while run is ${from}`);
+    this.name = "InvalidTransitionError";
+  }
+}

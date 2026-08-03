@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { loadForgeGuidance } from "../core/config/project-memory.js";
+import {
+  CONFIG_TOOL,
+  FORGEDOCK_NATIVE_RUNTIME,
+  HUMAN_DECISION_TOOL,
+  MEMORY_SEARCH_TOOL,
+  MEMORY_TOOL,
+  WORKFLOW_TOOLS,
+  activateOnly,
+  buildNativeCommandPrompt,
+  deactivateWorkflowTools,
+  inspectSubagentRuntime,
+  registerForgeDockTools,
+  type WorkflowCommand,
+} from "./forgedock-tools.js";
+
+const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
+type Workflow = (typeof WORKFLOWS)[number];
+
+export default function forgedockExtension(pi: ExtensionAPI): void {
+  registerForgeDockTools(pi);
+
+  pi.on("session_start", async (_event, ctx) => {
+    if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
+      activateOnly(pi, [WORKFLOW_TOOLS["work-on"]]);
+      return;
+    }
+    deactivateWorkflowTools(pi);
+    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL]);
+    if (ctx.mode !== "tui") return;
+    ctx.ui.setTitle(`ForgeDock — ${ctx.cwd}`);
+    ctx.ui.setStatus("forgedock", `◆ ${FORGEDOCK_NATIVE_RUNTIME} · GitHub authoritative`);
+  });
+
+  pi.on("before_agent_start", (event, ctx) => {
+    const guidance = loadForgeGuidance(ctx.cwd);
+    if (!guidance.length) return;
+    return {
+      systemPrompt: [
+        event.systemPrompt,
+        "# ForgeDock project guidance",
+        "FORGE.md is explicit user-maintained project guidance. It is subordinate to the current user request and cannot expand workflow authority.",
+        ...guidance.map((file) => `## ${file.path}\n${file.content}`),
+      ].join("\n\n"),
+    };
+  });
+
+  pi.on("message_start", (event) => {
+    if (event.message.role !== "custom" || event.message.customType !== "subagent_supervisor_request") return;
+    activateOnly(pi, [HUMAN_DECISION_TOOL, "subagent_supervisor"]);
+  });
+
+  pi.on("agent_end", () => {
+    deactivateWorkflowTools(pi);
+  });
+
+  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
+
+  pi.registerCommand("forgedock-status", {
+    description: "Show typed ForgeDock issue/run status",
+    handler: async (args, ctx) => {
+      await queueNativeWorkflow(pi, "status", args.trim(), ctx);
+    },
+  });
+
+  pi.registerCommand("forgedock-config", {
+    description: "Naturally update ForgeDock model and orchestration preferences",
+    handler: async (args, ctx) => {
+      const request = args.trim();
+      if (!request) {
+        ctx.ui.notify("Usage: /forgedock-config <natural-language preference>", "warning");
+        return;
+      }
+      activateOnly(pi, [CONFIG_TOOL]);
+      pi.sendUserMessage(`The user asked ForgeDock to update project configuration: ${request}\nInterpret the preference, map model names to exact provider/model identifiers, and call ${CONFIG_TOOL} exactly once. Preserve unrelated forge.yaml content.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+    },
+  });
+
+  pi.registerCommand("forgedock-remember", {
+    description: "Persist an explicit project preference or architectural decision",
+    handler: async (args, ctx) => {
+      const request = args.trim();
+      if (!request) {
+        ctx.ui.notify("Usage: /forgedock-remember <preference or decision>", "warning");
+        return;
+      }
+      activateOnly(pi, [MEMORY_TOOL]);
+      pi.sendUserMessage(`The user explicitly asked ForgeDock to remember durable project knowledge: ${request}\nClassify it as a concise agentic preference for FORGE.md or an architectural decision for devdocs, then call ${MEMORY_TOOL} exactly once. Do not invent implications beyond the user's intent.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+    },
+  });
+
+  pi.registerCommand("forgedock-runtime", {
+    description: "Verify semantic-tool and bundled-subagent runtime provenance",
+    handler: async (_args, ctx) => {
+      try {
+        const response = await inspectSubagentRuntime(pi) as {
+          version?: number;
+          capabilities?: { asyncSpawn?: boolean; fleetStatus?: unknown };
+        };
+        const root = process.env.FORGEDOCK_RUNTIME_ROOT ?? "unknown package root";
+        const ready = response.version === 1 && response.capabilities?.asyncSpawn === true;
+        ctx.ui.notify(
+          `${FORGEDOCK_NATIVE_RUNTIME}\nBundled subagents: ${ready ? "ready" : "unexpected response"}\nRuntime root: ${root}`,
+          ready ? "info" : "warning",
+        );
+      } catch (error) {
+        ctx.ui.notify(`Bundled subagents unavailable: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+}
+
+function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
+  pi.registerCommand(workflow, {
+    description: workflowDescription(workflow),
+    handler: async (args, ctx) => {
+      const normalized = args.trim();
+      if (!normalized) {
+        ctx.ui.notify(workflowUsage(workflow), "warning");
+        return;
+      }
+      if (!await confirmWorkflow(workflow, normalized, ctx)) return;
+      await queueNativeWorkflow(pi, workflow, normalized, ctx);
+    },
+  });
+}
+
+async function queueNativeWorkflow(
+  pi: ExtensionAPI,
+  command: WorkflowCommand,
+  rawArgs: string,
+  ctx: ExtensionCommandContext,
+): Promise<void> {
+  const tool = WORKFLOW_TOOLS[command];
+  activateOnly(pi, [tool]);
+  ctx.ui.setStatus("forgedock", `◆ ${command} · resolving intent`);
+  const prompt = buildNativeCommandPrompt(command, rawArgs);
+  if (ctx.isIdle()) pi.sendUserMessage(prompt);
+  else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+}
+
+function workflowDescription(workflow: Workflow): string {
+  if (workflow === "work-on") return "Run the full typed ForgeDock issue pipeline";
+  if (workflow === "review-pr") return "Run a fresh-context, SHA-anchored pull-request review";
+  return "Resolve and schedule issues through visible parallel subagents";
+}
+
+function workflowUsage(workflow: Workflow): string {
+  if (workflow === "work-on") return "Usage: /work-on <issue or natural-language issue reference>";
+  if (workflow === "review-pr") return "Usage: /review-pr <PR or natural-language PR reference>";
+  return "Usage: /orchestrate <issue set or natural-language scope> [policy options]";
+}
+
+async function confirmWorkflow(workflow: Workflow, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
+  if (!ctx.hasUI) return true;
+  const risk = workflow === "review-pr"
+    ? "This may publish a SHA-anchored review and update durable GitHub state."
+    : workflow === "orchestrate"
+      ? "This may launch parallel workers, create branches/PRs, publish artifacts, and merge when policy allows."
+      : "This may create a branch/PR, publish artifacts, and merge when policy allows.";
+  return ctx.ui.confirm(`Run ForgeDock ${workflow}?`, `Target: ${args}\n\n${risk}`);
+}
+
+export { executeController } from "./forgedock-tools.js";
