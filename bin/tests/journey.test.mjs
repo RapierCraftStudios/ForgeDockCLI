@@ -2105,6 +2105,81 @@ describe("forge (Act II)", () => {
     assert.equal(res.pruned, 1);
   });
 
+  it("preserves an orphan symlink with a Windows drive-relative raw target", async (t) => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home9-driverel-"));
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src9-driverel-"));
+    const commandsDir = join(forgeHome, "commands");
+    mkdirSyncFs(commandsDir, { recursive: true });
+    mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+    writeFileSync(join(commandsDir, "a.md"), "A", "utf-8");
+    writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+    const targetCommands = join(home, ".claude", "commands");
+    mkdirSyncFs(targetCommands, { recursive: true });
+    const orphanLink = join(targetCommands, "drive-relative.md");
+    try {
+      symlinkSync("C:missing.md", orphanLink);
+    } catch (err) {
+      if (err.code === "EPERM" || err.code === "EACCES") {
+        t.skip("symlink creation unavailable (Windows without Developer Mode)");
+        return;
+      }
+      throw err;
+    }
+
+    if (process.platform === "win32" && readlinkSync(orphanLink) !== "C:missing.md") {
+      // CreateSymbolicLink may normalize this target to an absolute path. The
+      // raw drive-relative branch is only under test when the literal survives.
+      t.skip("native Windows normalized the drive-relative symlink target");
+      return;
+    }
+    if (process.platform !== "win32") {
+      assert.equal(readlinkSync(orphanLink), "C:missing.md");
+    }
+
+    const { ctx } = stubCtx({ home });
+    ctx.forgeHome = forgeHome;
+    const res = await forge(ctx);
+
+    assert.ok(lstatSync(orphanLink).isSymbolicLink(), "drive-relative symlink preserved");
+    assert.equal(res.pruned, 0);
+  });
+
+  it("preserves a relative orphan target that physically escapes through an intermediate symlink", async (t) => {
+    const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home9-physical-"));
+    const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src9-physical-"));
+    const commandsDir = join(forgeHome, "commands");
+    const outsideDir = mkdtempSync(join(os.tmpdir(), "fd-forge-outside9-physical-"));
+    mkdirSyncFs(commandsDir, { recursive: true });
+    mkdirSyncFs(join(forgeHome, "bin", "hooks"), { recursive: true });
+    writeFileSync(join(commandsDir, "a.md"), "A", "utf-8");
+    writeFileSync(join(forgeHome, "bin", "hooks", "session-start.mjs"), "// hook", "utf-8");
+
+    const escapeDir = join(commandsDir, "escape");
+    const targetCommands = join(home, ".claude", "commands");
+    const orphanLink = join(targetCommands, "physical-escape.md");
+    mkdirSyncFs(targetCommands, { recursive: true });
+    try {
+      symlinkSync(outsideDir, escapeDir, "dir");
+      const escapedMissingTarget = join(escapeDir, "missing.md");
+      symlinkSync(relative(dirname(orphanLink), escapedMissingTarget), orphanLink);
+    } catch (err) {
+      if (err.code === "EPERM" || err.code === "EACCES") {
+        t.skip("symlink creation unavailable (Windows without Developer Mode)");
+        return;
+      }
+      throw err;
+    }
+    assert.ok(lstatSync(escapeDir).isSymbolicLink(), "intermediate escape symlink created");
+
+    const { ctx } = stubCtx({ home });
+    ctx.forgeHome = forgeHome;
+    const res = await forge(ctx);
+
+    assert.ok(lstatSync(orphanLink).isSymbolicLink(), "physically escaping orphan symlink preserved");
+    assert.equal(res.pruned, 0);
+  });
+
   it("does not remove user-owned symlinks pointing outside commandsDir", async (t) => {
     const home = mkdtempSync(join(os.tmpdir(), "fd-forge-home10-"));
     const forgeHome = mkdtempSync(join(os.tmpdir(), "fd-forge-src10-"));

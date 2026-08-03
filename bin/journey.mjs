@@ -747,7 +747,7 @@ export async function preflight(ctx) {
 // Act II — Forging: command symlinks + SessionStart hook (Task 6)
 // ---------------------------------------------------------------------------
 
-import { mkdir, symlink, readlink, lstat, readdir, rename, copyFile, readFile, writeFile, unlink, rm, open } from "fs/promises";
+import { mkdir, symlink, readlink, lstat, realpath, readdir, rename, copyFile, readFile, writeFile, unlink, rm, open } from "fs/promises";
 import { compareVersions } from "./registry.mjs";
 import { relative, dirname as pathDirname, isAbsolute, resolve, sep } from "path";
 import {
@@ -1160,6 +1160,14 @@ export const PIPELINE_SCRIPTS = new Set([
  */
 async function pruneOrphanedSymlinks(targetDir, commandsDir) {
   const resolvedCommandsRoot = resolve(commandsDir);
+  let canonicalCommandsRoot;
+  try {
+    canonicalCommandsRoot = await realpath(resolvedCommandsRoot);
+  } catch {
+    // Ownership cannot be proven without a canonical managed root. Preserve
+    // every candidate rather than aborting forge or relying on lexical paths.
+    return 0;
+  }
   let pruned = 0;
 
   async function walk(dir) {
@@ -1181,6 +1189,10 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
         } catch {
           continue; // can't read link — skip
         }
+        // A Windows drive-relative target depends on that drive's unknowable
+        // current directory. Reject it before resolving it as a normal
+        // relative path. On POSIX, the same text is a valid filename.
+        if (process.platform === "win32" && WINDOWS_DRIVE_RELATIVE_RE.test(target)) continue;
         // readlink() may return a relative target, which is resolved from the
         // link's containing directory rather than from the process cwd.
         const resolvedTarget = resolve(pathDirname(full), target);
@@ -1196,7 +1208,43 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
           // target exists — not orphaned
         } catch (err) {
           if (err.code !== "ENOENT") continue; // unexpected error — skip to be safe
-          // target is gone → orphaned symlink
+
+          // The missing path is only managed if its nearest existing lexical
+          // ancestor physically resolves within the canonical commands root.
+          // lstat() is intentional: it recognizes an intermediate symlink
+          // even when that symlink's destination or descendant is missing.
+          let existingAncestor = pathDirname(resolvedTarget);
+          let ancestorFound = false;
+          while (true) {
+            try {
+              await lstat(existingAncestor);
+              ancestorFound = true;
+              break;
+            } catch (ancestorErr) {
+              if (ancestorErr.code !== "ENOENT") break;
+              if (existingAncestor === resolvedCommandsRoot) break;
+              const parent = pathDirname(existingAncestor);
+              if (parent === existingAncestor) break;
+              existingAncestor = parent;
+            }
+          }
+          if (!ancestorFound) continue;
+
+          let canonicalAncestor;
+          try {
+            canonicalAncestor = await realpath(existingAncestor);
+          } catch {
+            continue; // dangling/unreadable ancestor — ownership is unproven
+          }
+          const physicalRelative = relative(canonicalCommandsRoot, canonicalAncestor);
+          const isPhysicallyManaged = physicalRelative === ""
+            || (physicalRelative !== ".."
+              && !physicalRelative.startsWith(`..${sep}`)
+              && !isAbsolute(physicalRelative));
+          if (!isPhysicallyManaged) continue;
+
+          // Target is missing and both lexical and physical ownership are
+          // proven → orphaned symlink.
           try {
             await unlink(full);
             pruned++;
