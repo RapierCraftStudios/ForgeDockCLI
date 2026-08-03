@@ -3,12 +3,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 import { ProcessVerificationRunner } from "./process-verifier.js";
 
 describe("deterministic process verification", () => {
   it("records executable evidence without invoking a shell", async () => {
-    const runner = new ProcessVerificationRunner();
+    const runner = isolatedRunner();
     const [result] = await runner.run([{
       id: "pass", command: process.execPath, args: ["-e", "console.log('verified')"],
       cwd: process.cwd(), timeoutMs: 5_000, required: true,
@@ -20,7 +21,7 @@ describe("deterministic process verification", () => {
   });
 
   it("extracts stable TAP failure identities for baseline comparison", async () => {
-    const runner = new ProcessVerificationRunner();
+    const runner = isolatedRunner();
     const [result] = await runner.run([{
       id: "tap-fail", command: process.execPath,
       args: ["-e", "console.log('not ok 15 - windows path import'); console.log('not ok 176 - forge (Act II)'); process.exit(1)"],
@@ -83,7 +84,7 @@ describe("deterministic process verification", () => {
   });
 
   it("stops after a required failure", async () => {
-    const runner = new ProcessVerificationRunner();
+    const runner = isolatedRunner();
     const results = await runner.run([
       { id: "fail", command: process.execPath, args: ["-e", "process.exit(3)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
       { id: "never", command: process.execPath, args: ["-e", "process.exit(0)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
@@ -93,6 +94,10 @@ describe("deterministic process verification", () => {
     assert.equal(results[0]?.exitCode, 3);
   });
 });
+
+function isolatedRunner(): ProcessVerificationRunner {
+  return new ProcessVerificationRunner({ lockPath: join(tmpdir(), `forgedock-verifier-test-${randomUUID()}.lock`) });
+}
 
 async function assertEventuallyDead(pid: number): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt++) {

@@ -30,5 +30,6 @@
 ### Fixed
 
 - Delivery and review worktrees now install their own lockfile-pinned dependencies before agents or verification run, preventing false baseline/build failures from missing modules.
+- Process-verifier tests use isolated leases so ForgeDock can verify its own test suite without recursively waiting on the outer machine-wide verification lock.
 - GitHub App credential refresh now uses a packaged cross-platform Node helper instead of passing Windows paths through Bash.
 - Windows legacy verification now uses file URLs for dynamic ESM imports and path-aware orphan-symlink ownership checks.
