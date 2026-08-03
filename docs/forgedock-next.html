@@ -286,11 +286,13 @@ forgedock orchestrate --query 'label:ready milestone:v2' --dry-run
 
 # Utilities, not separate workflows
 forgedock status [run|issue|pr]
+/forgedock-tasks [list | output &lt;id&gt; | cancel &lt;id&gt;]
 forgedock resume [run]
 forgedock doctor
 forgedock config
 forgedock models</pre>
       <p><strong>Important consolidation:</strong> <code>status</code>, <code>resume</code>, and stale-run recovery are views/actions on one run model. They are not prompt-heavy commands with independent behavior.</p>
+      <p>Interactive work and review tools may place the typed controller in a native session-scoped background task so the supervisor remains responsive. Task logs and JSON records are operational only; GitHub artifacts remain semantic truth. Orchestration children stay synchronously owned, and cancellation or terminal shutdown kills the controller's complete process tree.</p>
     </section>
 
     <section id="work-on">

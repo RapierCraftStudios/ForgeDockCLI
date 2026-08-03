@@ -15,6 +15,7 @@ import { appendProjectPreference, recordProjectDecision } from "../core/config/p
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
 import { buildScheduleBatches, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { startNestedAgentBridge } from "./nested-agent-bridge.js";
+import { ForgeDockBackgroundTasks, renderRecord, terminateProcessTree } from "./background-tasks.js";
 
 export const WORKFLOW_TOOLS = {
   "work-on": "forgedock_work_on",
@@ -26,6 +27,7 @@ export const HUMAN_DECISION_TOOL = "forgedock_ask_user";
 export const CONFIG_TOOL = "forgedock_configure";
 export const MEMORY_TOOL = "forgedock_remember";
 export const MEMORY_SEARCH_TOOL = "forgedock_memory_search";
+export const BACKGROUND_TASK_TOOL = "forgedock_tasks";
 export const FORGEDOCK_NATIVE_RUNTIME = "semantic-tools+live-subagents-v2";
 export const LAZY_FORGEDOCK_TOOLS = new Set<string>([...Object.values(WORKFLOW_TOOLS), HUMAN_DECISION_TOOL]);
 export const HIDDEN_SUBAGENT_TOOLS = new Set(["subagent", "subagent_wait", "subagent_supervisor", "intercom"]);
@@ -52,7 +54,8 @@ interface ToolDetails {
   delegation?: unknown;
 }
 
-export function registerForgeDockTools(pi: ExtensionAPI): void {
+export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTasks {
+  const backgroundTasks = new ForgeDockBackgroundTasks(pi);
   pi.registerTool({
     name: WORKFLOW_TOOLS["work-on"],
     label: "ForgeDock work on",
@@ -65,6 +68,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): void {
       dryRun: Type.Optional(Type.Boolean()),
       autoMerge: Type.Optional(Type.Boolean()),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
+      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -75,7 +79,10 @@ export function registerForgeDockTools(pi: ExtensionAPI): void {
       if (params.dryRun) args.push("--dry-run");
       if (params.autoMerge) args.push("--auto-merge");
       if (params.rerun) args.push("--rerun");
-      return runControllerTool(pi, "work-on", args, signal, onUpdate, ctx);
+      const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
+      return background
+        ? runControllerToolBackground(pi, backgroundTasks, "work-on", args, ctx)
+        : runControllerTool(pi, "work-on", args, signal, onUpdate, ctx);
     },
   });
 
@@ -87,13 +94,17 @@ export function registerForgeDockTools(pi: ExtensionAPI): void {
       pullRequest: Type.Integer({ minimum: 1, description: "Resolved pull-request number" }),
       issue: Type.Optional(Type.Integer({ minimum: 1, description: "Original issue number when known" })),
       repo: Type.Optional(Type.String({ description: "Optional owner/repo; defaults to the current checkout" })),
+      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
       const args = [String(params.pullRequest)];
       if (params.issue) args.push("--issue", String(params.issue));
       if (params.repo) args.push("--repo", params.repo);
-      return runControllerTool(pi, "review-pr", args, signal, onUpdate, ctx);
+      const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
+      return background
+        ? runControllerToolBackground(pi, backgroundTasks, "review-pr", args, ctx)
+        : runControllerTool(pi, "review-pr", args, signal, onUpdate, ctx);
     },
   });
 
@@ -113,6 +124,32 @@ export function registerForgeDockTools(pi: ExtensionAPI): void {
       if (params.repo) args.push("--repo", params.repo);
       if (params.json) args.push("--json");
       return runControllerTool(pi, "status", args, signal, onUpdate, ctx, false);
+    },
+  });
+
+  pi.registerTool({
+    name: BACKGROUND_TASK_TOOL,
+    label: "ForgeDock background tasks",
+    description: "List native ForgeDock background controller tasks, read a bounded log tail, or cancel a running task and its complete process tree.",
+    parameters: Type.Object({
+      action: Type.String({ enum: ["list", "output", "cancel"] }),
+      taskId: Type.Optional(Type.String({ description: "Required for output and cancel" })),
+    }),
+    executionMode: "parallel",
+    async execute(_id, params) {
+      if (params.action === "list") {
+        const records = backgroundTasks.list();
+        return {
+          content: [{ type: "text", text: records.length ? records.map(renderRecord).join("\n") : "No ForgeDock background tasks." }],
+          details: { action: "list", taskId: "", records, record: null },
+        };
+      }
+      if (!params.taskId) throw new Error(`taskId is required for ${params.action}`);
+      if (params.action === "output") {
+        return { content: [{ type: "text", text: backgroundTasks.output(params.taskId) }], details: { action: "output", taskId: params.taskId, records: [], record: null } };
+      }
+      const record = backgroundTasks.cancel(params.taskId);
+      return { content: [{ type: "text", text: `Cancelled ${renderRecord(record)}` }], details: { action: "cancel", taskId: params.taskId, records: [record], record: null } };
     },
   });
 
@@ -336,6 +373,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): void {
       };
     },
   });
+
+  return backgroundTasks;
 }
 
 export function activateOnly(pi: ExtensionAPI, names: readonly string[]): void {
@@ -427,6 +466,48 @@ function buildIssueWorkerTask(
     `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, dependencies: options.dependencies, autoMerge: Boolean(options.autoMerge), rerun: Boolean(options.rerun) })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Report its final state and any required human action.",
   ].join("\n");
+}
+
+async function runControllerToolBackground(
+  pi: ExtensionAPI,
+  tasks: ForgeDockBackgroundTasks,
+  command: Exclude<WorkflowCommand, "status">,
+  args: string[],
+  ctx: ExtensionContext,
+) {
+  const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
+  const modelArgs = ctx.model && !args.includes("--provider") && !args.includes("--model")
+    ? ["--provider", ctx.model.provider, "--model", ctx.model.id]
+    : [];
+  const nestedBridge = await startNestedAgentBridge(pi);
+  const config = readForgeDockConfig(ctx.cwd);
+  const reviewer = splitConfiguredModel(config.reviewerModel);
+  const env = {
+    ...nestedBridge.env,
+    ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
+    ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+  };
+  try {
+    const record = tasks.start({
+      command: process.execPath,
+      args: [entry, command, ...args, ...modelArgs],
+      cwd: ctx.cwd,
+      env,
+      cleanup: () => nestedBridge.close(),
+      ctx,
+    });
+    return {
+      content: [{
+        type: "text" as const,
+        text: `ForgeDock ${command} started as ${record.id}. Continue with other work; use ${BACKGROUND_TASK_TOOL} to list tasks or read its bounded log tail.`,
+      }],
+      details: { command, args, state: "delegated", taskId: record.id, logPath: record.logPath } satisfies ToolDetails & { taskId: string; logPath: string },
+    };
+  } catch (error) {
+    await nestedBridge.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 async function runControllerTool(
@@ -534,7 +615,7 @@ export function executeController(
       return limited.content;
     };
     const emit = () => onOutput(formatLiveOutput(stdout, stderr, truncated));
-    const abort = () => child.kill();
+    const abort = () => terminateProcessTree(child);
     const cleanup = () => signal?.removeEventListener("abort", abort);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");

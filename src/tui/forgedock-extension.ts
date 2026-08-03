@@ -3,6 +3,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import {
+  BACKGROUND_TASK_TOOL,
   CONFIG_TOOL,
   FORGEDOCK_NATIVE_RUNTIME,
   HUMAN_DECISION_TOOL,
@@ -21,15 +22,16 @@ const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 
 export default function forgedockExtension(pi: ExtensionAPI): void {
-  registerForgeDockTools(pi);
+  const backgroundTasks = registerForgeDockTools(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
       activateOnly(pi, [WORKFLOW_TOOLS["work-on"]]);
       return;
     }
+    backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
-    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL]);
+    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL]);
     if (ctx.mode !== "tui") return;
     ctx.ui.setTitle(`ForgeDock — ${ctx.cwd}`);
     ctx.ui.setStatus("forgedock", `◆ ${FORGEDOCK_NATIVE_RUNTIME} · GitHub authoritative`);
@@ -55,6 +57,10 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_end", () => {
     deactivateWorkflowTools(pi);
+  });
+
+  pi.on("session_shutdown", async () => {
+    await backgroundTasks.shutdown();
   });
 
   for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
@@ -89,6 +95,32 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
       }
       activateOnly(pi, [MEMORY_TOOL]);
       pi.sendUserMessage(`The user explicitly asked ForgeDock to remember durable project knowledge: ${request}\nClassify it as a concise agentic preference for FORGE.md or an architectural decision for devdocs, then call ${MEMORY_TOOL} exactly once. Do not invent implications beyond the user's intent.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+    },
+  });
+
+  pi.registerCommand("forgedock-tasks", {
+    description: "List, inspect, or cancel native ForgeDock background tasks",
+    handler: async (args, ctx) => {
+      const [action = "list", taskId] = args.trim().split(/\s+/);
+      try {
+        if (action === "list") {
+          const records = backgroundTasks.list();
+          ctx.ui.notify(records.length ? records.map((record) => `${record.id} · ${record.status} · ${record.args.slice(1, 3).join(" ")}`).join("\n") : "No ForgeDock background tasks.", "info");
+          return;
+        }
+        if (!taskId || (action !== "output" && action !== "cancel")) {
+          ctx.ui.notify("Usage: /forgedock-tasks [list | output <task-id> | cancel <task-id>]", "warning");
+          return;
+        }
+        if (action === "cancel") {
+          const record = backgroundTasks.cancel(taskId);
+          ctx.ui.notify(`Cancelled ${record.id}`, "warning");
+        } else {
+          ctx.ui.notify(backgroundTasks.output(taskId), "info");
+        }
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     },
   });
 

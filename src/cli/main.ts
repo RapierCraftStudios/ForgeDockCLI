@@ -229,6 +229,7 @@ async function workOn(argv: string[]): Promise<void> {
       }, { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent });
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
       process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
+      if (result.run.state !== "completed") process.exitCode = 2;
       return;
     }
 
@@ -271,6 +272,7 @@ async function workOn(argv: string[]): Promise<void> {
     });
     const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
     process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Run ${result.run.runId} · ${result.run.state}${suffix}\n`);
+    if (result.run.state !== "completed") process.exitCode = 2;
   } finally {
     await runtime.close();
     store.close();

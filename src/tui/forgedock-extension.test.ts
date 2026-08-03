@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import forgedockExtension, { executeController } from "./forgedock-extension.js";
@@ -35,6 +38,9 @@ function fakePi(initialActive = ["read", "bash", "subagent", "subagent_wait", "s
     },
     sendUserMessage: (content: string, options?: { deliverAs?: "steer" | "followUp" }) => {
       sent.push(options ? { content, options } : { content });
+    },
+    sendMessage: (message: { content: string }) => {
+      sent.push({ content: message.content });
     },
     getActiveTools: () => active,
     setActiveTools: (names: string[]) => { active = names; state.active = names; },
@@ -72,11 +78,11 @@ test("commands lazily activate separate semantic native tools without loading Ma
   const state = fakePi();
   assert.deepEqual(
     [...state.tools.keys()].sort(),
-    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_remember", "forgedock_review_pr", "forgedock_status", "forgedock_work_on"],
+    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_remember", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
   );
 
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", ui: {} });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search"]);
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
 
   await state.commands.get("orchestrate")?.("all open enhancement issues --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
@@ -84,7 +90,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_orchestrate"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate"]);
 });
 
 test("runtime diagnostic verifies the real bundled subagent RPC bridge", async () => {
@@ -141,11 +147,11 @@ test("busy sessions queue native workflow intent as a follow-up", async () => {
 
 test("supervisor escalations lazily expose MCQ and reply tools", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_ask_user", "subagent_supervisor"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "subagent_supervisor"]);
 });
 
 test("human checkpoints present a required recommendation and return the selected option", async () => {
@@ -256,6 +262,41 @@ test("controller subprocess output streams before completion", async () => {
   assert.match(result.stdout, /second/);
   assert.ok(updates.some((output) => output.includes("first")));
   assert.ok(updates.some((output) => output.includes("second")));
+});
+
+test("direct work-on defaults to a native non-blocking controller task", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
+  const entry = join(root, "controller.mjs");
+  writeFileSync(entry, "setTimeout(() => console.log('controller done'), 50);\n");
+  const state = fakePi();
+  const ctx = { ...commandContext(), cwd: root, mode: "rpc" } as any;
+  await state.handlers.get("session_start")?.[0]?.({}, ctx);
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  process.env.FORGEDOCK_CONTROLLER_ENTRY = entry;
+  try {
+    const tool = state.tools.get("forgedock_work_on");
+    assert.ok(tool);
+    const started = Date.now();
+    const result = await tool.execute("background-work", { issue: 20 }, undefined, undefined, ctx);
+    assert.ok(Date.now() - started < 1_000);
+    const details = result.details as { taskId?: string; state?: string };
+    assert.equal(details.state, "delegated");
+    assert.match(details.taskId ?? "", /^task_/);
+    const tasks = state.tools.get("forgedock_tasks");
+    assert.ok(tasks);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const listed = await tasks.execute("list", { action: "list" }, undefined, undefined, ctx);
+      const records = (listed.details as { records: Array<{ id: string; status: string }> }).records;
+      if (records.find((record) => record.id === details.taskId)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const listed = await tasks.execute("list-final", { action: "list" }, undefined, undefined, ctx);
+    assert.equal((listed.details as { records: Array<{ id: string; status: string }> }).records.find((record) => record.id === details.taskId)?.status, "completed");
+  } finally {
+    await state.handlers.get("session_shutdown")?.[0]?.({}, ctx);
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+  }
 });
 
 test("native command prompts preserve natural-language intent", () => {

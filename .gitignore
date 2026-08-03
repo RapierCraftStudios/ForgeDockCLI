@@ -27,6 +27,7 @@ CLAUDE.md
 .forgedock/state.db
 .forgedock/state.db-*
 .forgedock/worktrees/
+.forgedock/tasks/
 .forgedock/*.jsonl
 .forgedock/*.stderr
 .forgedock/observations/

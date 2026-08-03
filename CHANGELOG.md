@@ -14,6 +14,7 @@
 - Evidence-backed orchestration DAGs with deterministic topological batching, priority ordering, conflict claims, and authoritative prerequisite admission.
 - Natural-language ForgeDock Next configuration updates in a managed `forge.yaml` section.
 - `FORGE.md` project guidance plus token-bounded, Obsidian-compatible `devdocs/` memory retrieval with anchors, links, and backlinks.
+- Native session-scoped background controller tasks for direct work/review runs, with task IDs, bounded log inspection, passive completion notices, cancellation, and shutdown cleanup—without another runtime dependency.
 
 ### Changed
 
@@ -26,6 +27,7 @@
 - Bundled subagent artifacts use temp storage and are excluded from delivery diffs; specialist routing now uses token boundaries to avoid accidental fanout from substrings such as `RapierCraft` or `metadata`.
 - Automatic review remediation refuses changes outside the frozen Build Packet instead of widening scope and emitting oversized operational-artifact failure comments.
 - npm publication now reconciles already-published versions and retries version metadata pushes against current `main` rather than wedging after a concurrent push.
+- Direct terminal work/review runs background by default while orchestration children remain synchronously owned by their worker, preserving typed dependency and nested-review lifetimes.
 
 ### Fixed
 
