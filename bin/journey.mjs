@@ -749,7 +749,7 @@ export async function preflight(ctx) {
 
 import { mkdir, symlink, readlink, lstat, readdir, rename, copyFile, readFile, writeFile, unlink, rm, open } from "fs/promises";
 import { compareVersions } from "./registry.mjs";
-import { relative, dirname as pathDirname, isAbsolute } from "path";
+import { relative, dirname as pathDirname, isAbsolute, resolve, sep } from "path";
 import {
   installSessionStartHook,
   installSubagentStopHook,
@@ -1146,21 +1146,20 @@ export const PIPELINE_SCRIPTS = new Set([
 ]);
 
 /**
- * Recursively walk targetDir and remove any symlink whose target begins with
- * commandsDir (i.e. a ForgeDock-managed link) but whose target file no longer
- * exists on disk. These are "orphaned" symlinks left behind when a command is
- * renamed or deleted.
+ * Recursively walk targetDir and remove ForgeDock-managed symlinks whose target
+ * file no longer exists on disk. These are "orphaned" symlinks left behind
+ * when a command is renamed or deleted.
  *
- * Safety invariant: only symlinks whose readlink() result starts with
- * commandsDir + "/" are touched. User-owned symlinks and third-party links are
- * never removed.
+ * Safety invariant: the effective target must resolve to a strict descendant
+ * of commandsDir. Root-equal, parent-traversing, sibling-prefix, cross-volume,
+ * unreadable, and otherwise unprovable targets are left untouched.
  *
  * @param {string} targetDir   - ~/.claude/commands (installed commands root)
  * @param {string} commandsDir - FORGE_HOME/commands (source commands root)
  * @returns {Promise<number>} Number of orphaned symlinks removed.
  */
 async function pruneOrphanedSymlinks(targetDir, commandsDir) {
-  const prefix = commandsDir + "/";
+  const resolvedCommandsRoot = resolve(commandsDir);
   let pruned = 0;
 
   async function walk(dir) {
@@ -1182,11 +1181,18 @@ async function pruneOrphanedSymlinks(targetDir, commandsDir) {
         } catch {
           continue; // can't read link — skip
         }
-        // Only manage links that point into our commandsDir
-        if (!target.startsWith(prefix)) continue;
-        // Check whether the target file still exists
+        // readlink() may return a relative target, which is resolved from the
+        // link's containing directory rather than from the process cwd.
+        const resolvedTarget = resolve(pathDirname(full), target);
+        const relativeTarget = relative(resolvedCommandsRoot, resolvedTarget);
+        const isManaged = relativeTarget !== ""
+          && relativeTarget !== ".."
+          && !relativeTarget.startsWith(`..${sep}`)
+          && !isAbsolute(relativeTarget);
+        if (!isManaged) continue;
+        // Check whether the effective target file still exists.
         try {
-          await lstat(target);
+          await lstat(resolvedTarget);
           // target exists — not orphaned
         } catch (err) {
           if (err.code !== "ENOENT") continue; // unexpected error — skip to be safe
