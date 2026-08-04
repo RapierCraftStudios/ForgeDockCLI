@@ -206,7 +206,7 @@
       <div class="eyebrow">Recommendation · greenfield replacement</div>
       <h1>Delete the engine.<br>Keep the discipline.</h1>
       <p class="lede">ForgeDock should not port its Claude-era engine to Pi. It should replace that engine with a small, typed workflow controller, use Pi as an embedded agent runtime, and expose a ForgeDock-owned CLI and TUI.</p>
-      <div class="thesis"><strong>Pi is the execution kernel—not the workflow authority, state store, product identity, or durable memory.</strong> GitHub holds institutional memory. ForgeDock code owns transitions and side effects. Models do bounded reasoning and implementation work. This preserves the valuable behavior without preserving the accidental machinery.</div>
+      <div class="thesis"><strong>Pi is the execution kernel—not the workflow authority, state store, product identity, or durable memory.</strong> GitHub holds institutional memory for the GitHub adapter. The typed ForgeDock controller alone owns transitions and side effects. Models do bounded reasoning and implementation work. The approved security and portability direction is normative in <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-status">Verifiable Workflow Authority and Portability</a>.</div>
       <div class="stats" aria-label="Current complexity inventory">
         <div class="stat"><b>45,689</b><span>lines across all 83 command specs</span></div>
         <div class="stat"><b>20,006</b><span>lines for the three core workflow families</span></div>
@@ -226,7 +226,7 @@
         <div class="card"><span class="num">03</span><h3>Verify with evidence</h3><p>Tests, static checks, build commands, and acceptance checks are controller-recorded evidence—not model assurances.</p></div>
         <div class="card"><span class="num">04</span><h3>Review independently</h3><p>A reviewer starts in a fresh session with intent, packet, evidence, and diff; never the builder conversation.</p></div>
         <div class="card"><span class="num">05</span><h3>Anchor to a SHA</h3><p>Review approval is valid only for the exact reviewed commit. A changed head invalidates the verdict.</p></div>
-        <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable truth. Local databases and Pi sessions accelerate execution but cannot be the only record.</p></div>
+        <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable semantic truth for the GitHub adapter. Local databases, Pi sessions, events, leases, and bundles cannot be the only or competing live record.</p></div>
       </div>
       <div class="callout" style="margin-top:14px"><strong>Determinism belongs at the boundary.</strong> ForgeDock controls phase selection, permissions, validation, retries, state transitions, merge eligibility, and closure. A model may propose; it may not silently govern.</div>
     </section>
@@ -266,7 +266,7 @@ type AgentTask = {
   outputSchema: JsonSchema;
   modelPolicy: CapabilityPolicy; // no provider name required
 };</pre>
-      <p class="muted">Durable artifacts store role, result, and optional model provenance for audit. They never require a Pi session ID to remain usable.</p>
+      <p class="muted">Durable artifacts store role, result, and optional model provenance for audit. They never require a Pi session ID to remain usable. Future protected gates require the contract's canonical envelope, controller identity, exact subject/run/action/SHA bindings, and fail-closed host guarantees; Pi, models, events, leases, local state, and bundles do not gain controller authority.</p>
     </section>
 
     <section id="commands">
@@ -366,12 +366,13 @@ while (capacity.available && ready.length) {
 }</pre>
       <p>The selected model interprets a natural-language issue query and proposes evidence-backed dependencies, priorities, labels, affected files, and coarse path/component claims. Typed code validates the graph, rejects cycles or unselected dependencies, and derives stable serialization edges. Compatible P2/P3 review findings with the same bounded concern surface may be contracted into one durable batch issue and one work-on agent; successful completion projects the batch Outcome to and closes every member. “Batch” refers only to that efficiency work unit—not a DAG level. The scheduler streams the live ready set as each node's own predecessors complete. Claims become precise after the Build Packet (expected paths). Actual changed paths are checked before publish and before merge. A conflict blocks or serializes work; a model does not “reason away” the collision.</p>
       <div class="callout"><strong>Decomposition is explicit, not a cascade.</strong> Child issues can be offered for enqueueing, but the scheduler does not recursively discover and launch unrelated work unless a user-configured query includes it.</div>
+      <p class="muted"><strong>Coordination boundary:</strong> current SQLite leases are local coordination. Cross-machine claims require host-atomic compare-and-swap plus monotonic fencing; unsupported hosts fail closed. Workflow events report controller decisions for replayable views but cannot authorize them.</p>
     </section>
 
     <section id="artifacts">
       <div class="eyebrow">Durable memory</div>
       <h2>Six artifacts replace annotation sprawl</h2>
-      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The JSON is authoritative for machines; the Markdown remains useful to people.</p>
+      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. Today, <code>forgedock.artifact/v2</code> is structurally validated but unsigned and therefore explicitly legacy-unprotected. The future protected envelope is separately versioned and verified before reconciliation; the detailed contract is <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-protected-envelope">normative</a>.</p>
       <div class="grid three">
         <div class="card"><span class="num">01</span><h3>Intent</h3><p>Problem, desired outcome, constraints, source, acceptance hints, links, and dependency declarations.</p></div>
         <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
@@ -397,12 +398,12 @@ while (capacity.available && ready.length) {
   }
 }</pre>
       <h3>Operational state is separate</h3>
-      <p>Run ID, state, attempt, lease owner, lease expiry, heartbeat, workspace, target branch, and ephemeral session references belong to a run record—not semantic artifacts. GitHub receives committed transitions and recovery metadata. SQLite is a rebuildable local index/cache. Pi session files are diagnostic execution records only.</p>
+      <p>Run ID, state, attempt, lease owner, lease expiry, heartbeat, workspace, target branch, and ephemeral session references belong to a run record—not semantic artifacts. GitHub receives committed transitions and recovery metadata and remains durable semantic truth for its adapter. SQLite is a rebuildable local index/cache. Pi session files, workflow events, leases, and portable bundles are operational, projection, coordination, or archival aids only.</p>
       <div class="grid two">
         <div class="card"><h3>GitHub must be enough to…</h3><ul class="clean"><li>Understand why work was attempted</li><li>See what was proved and planned</li><li>Audit what changed and how it was verified</li><li>Know exactly which SHA was reviewed</li><li>Determine the terminal outcome</li></ul></div>
         <div class="card"><h3>Local state may improve…</h3><ul class="clean"><li>Fast status queries and TUI rendering</li><li>Streaming event history and cost tracking</li><li>In-flight process recovery</li><li>Workspace bookkeeping</li><li>Session continuation within one role</li></ul></div>
       </div>
-      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
+      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. Current runs emit unsigned v2 artifacts with a <code>LEGACY_UNPROTECTED</code> trust status. Future protected and mixed sets retain per-item trust labels, fail closed on gaps/forks/conflicts, and never upgrade legacy evidence or resolve protected ordering by timestamp/latest-kind. Portable imports remain read-only archival data outside live reconciliation and mutation authority.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
         <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
@@ -478,7 +479,7 @@ while (capacity.available && ready.length) {
         <div class="card"><h3>Runtime neutral</h3><ul class="checklist"><li>All Pi use stays in one adapter package</li><li>Workflow tests run against an in-memory fake runtime</li><li>ForgeDock owns task/event/output schemas</li><li>No Pi session format in durable contracts</li><li>A second runtime can pass the same conformance suite later</li></ul></div>
       </div>
       <p style="margin-top:18px"><strong>Pi is still a dependency.</strong> It is a good dependency here because it is MIT-licensed, SDK-embeddable, and already supports multiple API families and custom providers. The runtime port prevents that sensible choice from becoming the next irreversible product boundary.</p>
-      <div class="callout"><strong>GitHub is an intentional product dependency.</strong> It remains the first durable host because the product’s core promise is institutional memory in issues and PRs. Put it behind a <code>ForgeHost</code> port so GitLab or another host is possible later, but do not dilute the first implementation with premature multi-host parity.</div>
+      <div class="callout"><strong>GitHub is an intentional product dependency.</strong> It remains durable semantic truth for the GitHub adapter because the product’s core promise is institutional memory in issues and PRs. Put it behind a <code>ForgeHost</code> port so GitLab or another host is possible later. Every adapter must discover and prove operation-specific publication read-back, immutable SHA/freshness, expected-head merge, and CAS/fencing guarantees; missing or unknown guarantees block the dependent operation.</div>
       <h3 style="margin-top:24px">Role-based least privilege</h3>
       <div class="table-wrap"><table>
         <thead><tr><th>Role</th><th>Repository</th><th>GitHub</th><th>Forbidden authority</th></tr></thead>
@@ -486,7 +487,7 @@ while (capacity.available && ready.length) {
           <tr><td>Investigator / packet author</td><td>Read-only</td><td>Read-only through scoped tools</td><td>No edits, labels, branches, PRs, closure</td></tr>
           <tr><td>Builder / remediator</td><td>Write only in assigned worktree</td><td>No direct write token</td><td>No merge, issue closure, authoritative state updates</td></tr>
           <tr><td>Reviewer</td><td>Read-only at frozen SHA</td><td>Read issue/PR/checks</td><td>No edits, remediation, or merge</td></tr>
-          <tr><td>Controller</td><td>Git/worktree operations</td><td>Validated state/artifact/PR/merge writes</td><td>Cannot bypass configured policy or missing evidence</td></tr>
+          <tr><td>Controller</td><td>Git/worktree operations</td><td>Validated state/artifact/PR/merge writes through conforming adapters</td><td>Cannot bypass configured policy, exact bindings, capabilities, host guarantees, or missing evidence</td></tr>
         </tbody>
       </table></div>
     </section>

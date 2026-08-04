@@ -7,9 +7,20 @@ This is the execution tracker for the greenfield rewrite described in [`../forge
 - The legacy engine is evidence and a temporary compatibility path, not a dependency of the new core.
 - Workflow authority stays in typed ForgeDock code.
 - Pi is accessed only through `src/runtime/pi-adapter.ts`.
-- GitHub artifacts are durable truth; local state and Pi sessions are operational aids.
-- No phase is reported complete until its acceptance tests pass.
+- GitHub artifacts are durable semantic truth for the GitHub adapter; local state, Pi sessions, events, leases, and bundles are non-authoritative operational, projection, coordination, or archival aids.
+- The normative security and compatibility contract is [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md); the currently implemented unsigned v2 baseline is not protected evidence.
+- No phase or authority/portability slice is reported complete until its acceptance and conformance tests pass and the evidence is linked below.
 - Private AlterLab issue content must not be copied into this repository.
+
+## Verifiable Workflow Authority & Portability milestone
+
+This matrix is the evidence gate for the milestone. Rows MUST use direct URLs from authoritative milestone metadata, map to stable normative anchors, and remain pending until concrete conformance evidence is linked. The supplied authoritative metadata identifies only the contract-freeze issue; it contains no follow-on issue identifiers or URLs. Consequently, no follow-on rows are guessed, and milestone issue-coverage remains blocked until the controller supplies that metadata. When supplied, every follow-on issue MUST be added exactly once before this matrix can be complete.
+
+| Authoritative issue | Normative sections implemented | Required linked conformance evidence | Status |
+|---|---|---|---|
+| [ForgeDockCLI #6 — freeze the verifiable workflow trust contract](https://github.com/RapierCraftStudios/ForgeDockCLI/issues/6) | [Status](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-status), [threat model](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-threat-model), [algorithm suite](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-algorithm-suite), [protected envelope](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-protected-envelope), [verification states](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-verification-states), [identity](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-controller-identity), [capabilities](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-semantic-capabilities), [subject/host](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-subject-host), [events](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-events), [leases](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-leases), [bundles](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-bundles), [compatibility](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-compatibility), [limits](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-limitations), [vectors](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-test-vectors), and [alternatives](VERIFIABLE-WORKFLOW-AUTHORITY.md#vwa-rejected-alternatives) | Approved architecture review plus link/anchor inspection and independently reproduced fixed-vector results; controller-owned verification link not yet available | **Pending evidence** |
+
+No prose-only row may be changed to complete. A follow-on implementation row additionally requires executable positive and negative tests for its mapped sections, adapter conformance evidence where applicable, and a controller verification artifact tied to the implemented SHA.
 
 ## Vertical slices
 
