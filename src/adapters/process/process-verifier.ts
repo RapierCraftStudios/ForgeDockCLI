@@ -134,8 +134,8 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       signal?.removeEventListener("abort", abort);
       const output = Buffer.concat(chunks).toString("utf8");
       const durationMs = Math.max(0, Math.round(performance.now() - started));
-      const summary = summarize(output, timedOut);
       const status = code === 0 && !timedOut ? "passed" as const : "failed" as const;
+      const summary = summarize(output, timedOut, status);
       const failureSignatures = status === "failed" ? extractFailureSignatures(output, timedOut) : [];
       resolve({
         command: [spec.command, ...spec.args].join(" "),
@@ -176,11 +176,15 @@ function terminateProcessTree(child: ChildProcess): void {
   force.unref();
 }
 
-function summarize(output: string, timedOut: boolean): string {
+function summarize(output: string, timedOut: boolean, status: "passed" | "failed"): string {
   if (timedOut) return "Timed out";
   const normalized = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
   if (!normalized) return "";
   const lines = normalized.split(/\r?\n/).filter(Boolean);
+  if (status === "failed") {
+    const firstFailure = lines.findIndex((line) => /^\s*not ok\s+\d+\s+-\s+/.test(line));
+    if (firstFailure >= 0) return lines.slice(firstFailure, firstFailure + 16).join(" | ").slice(0, 1_500);
+  }
   return lines.slice(-3).join(" | ").slice(0, 500);
 }
 

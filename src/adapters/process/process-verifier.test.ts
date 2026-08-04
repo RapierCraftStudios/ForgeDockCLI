@@ -58,6 +58,7 @@ describe("deterministic process verification", () => {
       cwd: process.cwd(), timeoutMs: 5_000, required: true,
     }]);
     assert.deepEqual(result?.failureSignatures, ["not ok - forge (Act II)", "not ok - windows path import"]);
+    assert.match(result?.summary ?? "", /not ok 15 - windows path import/);
   });
 
   it("serializes verification across runner instances that share machine-global fixtures", async () => {

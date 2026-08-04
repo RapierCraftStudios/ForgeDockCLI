@@ -58,6 +58,7 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
 
   const inheritedPath = environmentValue(clean, "PATH");
   clean.PATH = [...new Set([...candidates, ...(inheritedPath ? [inheritedPath] : [])])].join(delimiter);
+  if (gitRoot) clean.FORGEDOCK_GIT_BASH = join(gitRoot, "usr", "bin", "bash.exe");
   return clean;
 }
 
