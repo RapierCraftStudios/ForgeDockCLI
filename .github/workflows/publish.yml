@@ -94,7 +94,9 @@ jobs:
       - name: Install dependencies
         run: |
           npm ci --ignore-scripts
-          npm ci --prefix vendor/pi --ignore-scripts
+          # The pinned fork currently carries a forward dependency override not
+          # reflected in its npm lock; install resolves that fork-local build graph.
+          npm install --prefix vendor/pi --ignore-scripts --no-audit --no-fund
 
       - name: Apply bundled subagent runtime patches
         run: node scripts/patch-pi-subagents-visibility.mjs
