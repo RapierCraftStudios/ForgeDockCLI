@@ -49,7 +49,8 @@ export async function reviewPullRequest(
     const roles = selectReviewerRoles(input.buildResult.payload.changedPaths, input.packet);
     const reviewerRuns = roles.map(async (role) => {
       let priorFailure: string | undefined;
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      let transportFailureObserved = false;
+      for (let attempt = 1; attempt <= 4; attempt++) {
         try {
           const result = await dependencies.runtime.run<ReviewerSubmission>({
             id: `${run.runId}:review:${frozen.headSha}:${role}${attempt === 1 ? "" : `:retry-${attempt}`}`,
@@ -83,8 +84,11 @@ export async function reviewPullRequest(
           });
           return { role, output: result.output, sessionRef: result.sessionRef };
         } catch (error) {
-          if (input.signal?.aborted || attempt === 2) throw error;
+          if (input.signal?.aborted) throw error;
           priorFailure = error instanceof Error ? error.message : String(error);
+          transportFailureObserved ||= isTransientReviewerTransportFailure(priorFailure);
+          const retryLimit = transportFailureObserved ? 4 : 2;
+          if (attempt >= retryLimit) throw error;
         }
       }
       throw new Error(`${role} reviewer exhausted its retry budget`);
@@ -129,6 +133,10 @@ export async function reviewPullRequest(
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
   }
+}
+
+export function isTransientReviewerTransportFailure(message: string): boolean {
+  return /websocket|socket hang up|econnreset|etimedout|transport failed|response failed|network error/i.test(message);
 }
 
 export function selectReviewerRoles(paths: readonly string[], packet: DurableArtifact<"BuildPacket">): ReviewerRole[] {

@@ -5,7 +5,7 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { reviewPullRequest, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { isTransientReviewerTransportFailure, reviewPullRequest, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -79,6 +79,25 @@ describe("fresh-context PR review", () => {
     assert.equal(runtime.tasks.length, 3);
     assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-2")));
     assert.ok(runtime.tasks.find((task) => task.id.endsWith(":retry-2"))?.instructions.includes("previous operational attempt failed"));
+  });
+
+  it("uses additional fresh attempts for transient reviewer transport failures", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new FakeAgentRuntime([
+      async () => { throw new Error("WebSocket error"); },
+      clean,
+      async () => { throw new Error("Nested reviewer transport failed: ECONNRESET"); },
+      clean,
+    ]);
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "merging");
+    assert.equal(runtime.tasks.length, 4);
+    assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-3")));
+    assert.equal(isTransientReviewerTransportFailure("read failed: optional path missing"), false);
   });
 
   it("runs independently selected reviewer roles concurrently", async () => {
