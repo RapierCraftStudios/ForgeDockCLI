@@ -8,7 +8,7 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import type { BuilderSubmission } from "./build.js";
-import { resumeBuildWorkOn, resumeWorkOn, workOn } from "./work-on.js";
+import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main" };
@@ -112,6 +112,45 @@ describe("complete work-on trajectory", () => {
 
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
+  });
+
+  it("resumes publication without replaying build or verification", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_publish_resume", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation });
+    const packetArtifact = createArtifact({ kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+      },
+    });
+    let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId });
+    await runs.create(run);
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED"] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    const runtime = new FakeAgentRuntime([{ summary: "Approved", findings: [] }]);
+    const resumed = await resumePublicationWorkOn({
+      run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
+      workspace, baseBranch: "main", autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(resumed.run.state, "completed");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
+      "RESUME_PUBLICATION", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    ]);
   });
 
   it("resumes retained verification without replaying investigation, packet authoring, or build", async () => {

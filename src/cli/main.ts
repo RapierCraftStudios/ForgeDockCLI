@@ -15,7 +15,7 @@ import type { AgentEvent } from "../runtime/agent-runtime.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
 import { parseBatchMemberIssues } from "../workflows/orchestrate/batching.js";
 import { runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
@@ -216,7 +216,11 @@ async function workOn(argv: string[]): Promise<void> {
       if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
-      const checkpointArtifact = admission.checkpoint === "verification" ? latestArtifact(runArtifacts, "Outcome") : packet;
+      const checkpointArtifact = admission.checkpoint === "verification"
+        ? latestArtifact(runArtifacts, "Outcome")
+        : admission.checkpoint === "publication"
+          ? latestArtifact(runArtifacts, "BuildResult")
+          : packet;
       const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
       for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
       const recoveredRun = {
@@ -241,7 +245,7 @@ async function workOn(argv: string[]): Promise<void> {
       const verifier = new ProcessVerificationRunner();
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
-      if (admission.checkpoint === "build") {
+      if (admission.checkpoint === "build" || admission.checkpoint === "publication") {
         workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef });
       } else {
         outcome = latestArtifact(runArtifacts, "Outcome");
@@ -256,11 +260,14 @@ async function workOn(argv: string[]): Promise<void> {
         if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
       }
       const verification = discoverVerificationCommands(process.cwd(), baseRef);
-      const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
+      const baselineChecks = admission.checkpoint === "publication"
+        ? undefined
+        : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace,
-        baseBranch: localRepository.defaultBranch, verification, baselineChecks,
+        baseBranch: localRepository.defaultBranch, verification,
+        ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         subjectEvidence,
         ...(batchMembers.length ? { batchMembers } : {}),
         autoMerge: argv.includes("--auto-merge"),
@@ -271,7 +278,12 @@ async function workOn(argv: string[]): Promise<void> {
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent };
       const result = admission.checkpoint === "build"
         ? await resumeBuildWorkOn(common, dependencies)
-        : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
+        : admission.checkpoint === "publication"
+          ? await resumePublicationWorkOn({
+            ...common,
+            buildResult: latestArtifact(runArtifacts, "BuildResult")!,
+          }, dependencies)
+          : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
       process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
       if (result.run.state !== "completed") process.exitCode = 2;

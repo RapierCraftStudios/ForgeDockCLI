@@ -412,6 +412,119 @@ export async function resumeWorkOn(
   }
 }
 
+export async function resumePublicationWorkOn(
+  input: {
+    run: RunState;
+    intent: DurableArtifact<"Intent">;
+    investigation: DurableArtifact<"Investigation">;
+    packet: DurableArtifact<"BuildPacket">;
+    buildResult: DurableArtifact<"BuildResult">;
+    workspace: GitWorkspace;
+    baseBranch: string;
+    verification: readonly Omit<VerificationCommand, "cwd">[];
+    baselineChecks?: readonly CheckResult[];
+    provider?: string;
+    model?: string;
+    autoMerge?: boolean;
+    maxRemediationCycles?: number;
+    subjectEvidence?: readonly string[];
+    batchMembers?: readonly number[];
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult> {
+  if (input.run.state !== "publishing") throw new Error(`Publication resume requires publishing state, found ${input.run.state}`);
+  let run = input.run;
+  const resumed = transition(run, "RESUME_PUBLICATION", { reason: `Resuming verified head ${input.buildResult.payload.headSha} without replaying build or verification` });
+  await dependencies.runs.commit(run.version, resumed.state, resumed.record);
+  run = resumed.state;
+  const runtimeOptions = {
+    ...(input.provider !== undefined ? { provider: input.provider } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  };
+  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  let buildResult = input.buildResult;
+  try {
+    const published = await publishPullRequest({
+      run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace, baseBranch: input.baseBranch,
+    }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
+    run = published.run;
+    let pullRequest = published.pullRequest;
+    let verdict: DurableArtifact<"ReviewVerdict">;
+    let priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined;
+    let cycle = 0;
+    while (true) {
+      const reviewed = await reviewPullRequest({
+        run, pullRequest, intent: input.intent, investigation: input.investigation,
+        packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+        ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = reviewed.run;
+      verdict = reviewed.verdict;
+      priorVerdict = verdict;
+      if (run.state === "merging") break;
+      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      if (scopeViolation) {
+        run = await blockForBudget(run, dependencies, scopeViolation);
+        return { run, pullRequest };
+      }
+      cycle++;
+      if (cycle > (input.maxRemediationCycles ?? 2)) {
+        run = await blockForBudget(run, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+        return { run, pullRequest };
+      }
+      const remediated = await remediateReview({
+        run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+        buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime, runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = remediated.run;
+      const verified = await verifyAndCommit({
+        run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+        ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+        ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      run = verified.run;
+      if (!verified.buildResult) return { run, pullRequest };
+      buildResult = verified.buildResult;
+      const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+        git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+      });
+      run = revision.run;
+      pullRequest = revision.pullRequest;
+    }
+    const completed = await completeWorkItem({
+      run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+      ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+    }, { host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = completed.run;
+    return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorkflowExecutionError) run = error.run;
+    if (run.state !== "failed" && run.state !== "blocked") {
+      const failed = transition(run, "FAIL", { reason });
+      await dependencies.runs.commit(run.version, failed.state, failed.record);
+      run = failed.state;
+    }
+    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    throw error;
+  } finally {
+    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    if (!retainForRecovery) {
+      try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
+    }
+  }
+}
+
 function blockingFindingOutsidePacket(
   verdict: DurableArtifact<"ReviewVerdict">,
   packet: DurableArtifact<"BuildPacket">,

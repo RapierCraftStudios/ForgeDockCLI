@@ -41,6 +41,7 @@ export interface ForgeHost {
     title: string;
     body: string;
   }): Promise<PullRequestSnapshot>;
+  findOpenPullRequest?(repo: string, headBranch: string): Promise<PullRequestSnapshot | undefined>;
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
   getPullRequestDiff(repo: string, number: number): Promise<string>;
   mergePullRequest(repo: string, number: number, expectedHeadSha: string): Promise<void>;

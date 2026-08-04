@@ -5,23 +5,28 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
-import { publishPullRequest } from "./publish.js";
+import { publishPullRequest, renderPullRequestHandoff } from "./publish.js";
 
 const sha = "d".repeat(40);
 const workspace: GitWorkspace = { path: "/tmp/w", branch: "forgedock/fix", baseRef: "main" };
 class PublishGit implements GitWorkspaceManager {
   pushed = false;
+  observedHead = sha;
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return ["src/a.ts"]; }
   async commit(): Promise<string> { return sha; }
   async push(): Promise<void> { this.pushed = true; }
-  async head(): Promise<string> { return sha; }
+  async head(): Promise<string> { return this.observedHead; }
   async remove(): Promise<void> {}
 }
 class PublishHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   input?: { body: string };
+  existing?: PullRequestSnapshot;
+  createCount = 0;
+  async findOpenPullRequest(): Promise<PullRequestSnapshot | undefined> { return this.existing; }
   async createPullRequest(input: { repo: string; issue: number; headBranch: string; baseBranch: string; title: string; body: string }): Promise<PullRequestSnapshot> {
+    this.createCount++;
     this.input = input;
     return { repo: input.repo, number: 3, title: input.title, body: input.body, url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: input.headBranch, baseBranch: input.baseBranch };
   }
@@ -52,5 +57,59 @@ describe("PR publication", () => {
     assert.equal(git.pushed, true);
     assert.match(host.input?.body ?? "", /Build Packet/);
     assert.match(host.input?.body ?? "", /Build Result/);
+  });
+
+  it("refuses to push when the retained workspace no longer matches the verified SHA", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await publishingRun(runs);
+    const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const git = new PublishGit();
+    git.observedHead = "a".repeat(40);
+    await assert.rejects(
+      publishPullRequest({ run, intent, packet, buildResult, workspace, baseBranch: "main" }, { git, host: new PublishHost(), runs }),
+      /does not match verified build/,
+    );
+    assert.equal(git.pushed, false);
+  });
+
+  it("reuses an already-created PR when publication is retried", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await publishingRun(runs);
+    const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const host = new PublishHost();
+    host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "main" };
+    const result = await publishPullRequest({ run, intent, packet, buildResult, workspace, baseBranch: "main" }, { git: new PublishGit(), host, runs });
+    assert.equal(result.pullRequest.url, host.existing.url);
+    assert.equal(host.createCount, 0);
+  });
+
+  it("keeps large durable artifacts out of GitHub's bounded PR body", () => {
+    const runId = "run_large";
+    const packet = createArtifact({
+      kind: "BuildPacket", runId, subject: { repo: "a/b", issue: 2 }, producer: { role: "packet-author" },
+      payload: {
+        scope: ["x".repeat(70_000)], acceptanceCriteria: Array.from({ length: 100 }, (_, index) => `criterion ${index} ${"x".repeat(2_000)}`),
+        context: [], implementationPlan: ["Write the specification"], expectedPaths: ["docs/spec.md"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+      },
+    });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId, subject: packet.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha,
+        changedPaths: Array.from({ length: 100 }, (_, index) => `docs/${index}-${"p".repeat(1_000)}.md`), summary: "s".repeat(70_000),
+        acceptanceEvidence: Array.from({ length: 100 }, (_, index) => ({ criterion: `criterion ${index} ${"y".repeat(2_000)}`, status: "passed" as const, evidence: "e".repeat(2_000) })),
+        checks: Array.from({ length: 100 }, (_, index) => ({ command: `check-${index} ${"c".repeat(2_000)}`, status: "passed" as const, durationMs: 1, summary: "o".repeat(2_000) })),
+        decisions: [], residualRisks: Array.from({ length: 100 }, () => "r".repeat(2_000)),
+      },
+    });
+    const body = renderPullRequestHandoff({ issue: 2, packet, buildResult });
+    assert.ok(body.length < 65_536);
+    assert.match(body, new RegExp(packet.id));
+    assert.match(body, new RegExp(buildResult.id));
+    assert.doesNotMatch(body, /FORGEDOCK:ARTIFACT/);
   });
 });

@@ -6,7 +6,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "building" | "blocked"; checkpoint: "build" | "verification"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing"; checkpoint: "build" | "verification" | "publication"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -48,6 +48,13 @@ export function decideSubjectAdmission(
   if (reconciled.state === "blocked") {
     const recoverable = latest.artifacts.some((artifact) => artifact.kind === "Outcome" && artifact.payload.status === "blocked" && artifact.payload.failureEvidence);
     if (recoverable) return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
+  }
+  if (reconciled.state === "failed") {
+    const verifiedBuild = latest.artifacts.some((artifact) => artifact.kind === "BuildResult");
+    const reviewStarted = latest.artifacts.some((artifact) => artifact.kind === "ReviewVerdict");
+    if (verifiedBuild && !reviewStarted) {
+      return { action: "resume", runId: latest.runId, state: "publishing", checkpoint: "publication", artifacts: latest.artifacts };
+    }
   }
   if (options.rerun && terminalStates.has(reconciled.state)) return { action: "start" };
   if (terminalStates.has(reconciled.state)) {

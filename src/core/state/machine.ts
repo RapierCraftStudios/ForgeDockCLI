@@ -32,6 +32,7 @@ export type TransitionEvent =
   | "VERIFICATION_PASSED"
   | "VERIFICATION_FAILED"
   | "RESUME_VERIFICATION"
+  | "RESUME_PUBLICATION"
   | "PR_PUBLISHED"
   | "REVIEW_APPROVED"
   | "REVIEW_CHANGES_REQUESTED"
@@ -88,7 +89,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     FAIL: "failed",
     CANCEL: "cancelled",
   },
-  publishing: { PR_PUBLISHED: "reviewing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  publishing: { RESUME_PUBLICATION: "publishing", PR_PUBLISHED: "reviewing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   reviewing: {
     REVIEW_APPROVED: "merging",
     REVIEW_CHANGES_REQUESTED: "remediating",
@@ -152,7 +153,7 @@ export function transition(
     updatedAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
-  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD") {
+  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

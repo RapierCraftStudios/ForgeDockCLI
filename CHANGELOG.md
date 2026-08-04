@@ -40,3 +40,4 @@
 - BuildResult acceptance evidence now carries controller-observed issue body, labels, and prerequisite-admission Outcomes/timestamps, so independent reviewers can verify GitHub-metadata and dependency-ordering criteria instead of treating repository checks as evidence.
 - GitHub App credential refresh now uses a packaged cross-platform Node helper instead of passing Windows paths through Bash.
 - Windows legacy verification now uses file URLs for dynamic ESM imports and path-aware orphan-symlink ownership checks.
+- Pull request publication now emits a bounded compact handoff instead of duplicating large durable artifacts into the PR body, reuses an existing branch PR idempotently, and can resume the publication checkpoint without replaying build or verification.
