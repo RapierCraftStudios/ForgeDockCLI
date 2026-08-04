@@ -52,6 +52,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history needed for git describe --tags (path-guard check)
+          submodules: recursive  # prepack rebuilds the pinned ForgeDock Pi fork
 
       - name: Check if publishable files changed
         run: |
