@@ -490,6 +490,30 @@ test("direct work-on defaults to a native non-blocking controller task", async (
   }
 });
 
+test("missing reviewer probe paths remain evidence instead of failing the review process", () => {
+  const state = fakePi();
+  forgedockExtension(state.pi);
+  const handler = state.handlers.get("tool_result")?.[0];
+  assert.ok(handler);
+  const previous = process.env.PI_SUBAGENT_CHILD_AGENT;
+  process.env.PI_SUBAGENT_CHILD_AGENT = "forgedock-reviewer";
+  try {
+    const result = handler({
+      toolName: "read",
+      isError: true,
+      content: [{ type: "text", text: "ENOENT: no such file or directory, access 'workflows/missing.yml'" }],
+    });
+    assert.deepEqual(result, {
+      isError: false,
+      content: [{ type: "text", text: "File does not exist at the requested path. Treat absence as review evidence and continue with ls/find rather than failing the review." }],
+    });
+    assert.equal(handler({ toolName: "read", isError: true, content: [{ type: "text", text: "EACCES: permission denied" }] }), undefined);
+  } finally {
+    if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
+    else process.env.PI_SUBAGENT_CHILD_AGENT = previous;
+  }
+});
+
 test("shell fallback cannot impose a wall-clock timeout on lifecycle controllers", () => {
   const state = fakePi();
   forgedockExtension(state.pi);

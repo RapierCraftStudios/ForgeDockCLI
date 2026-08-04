@@ -63,6 +63,24 @@ describe("fresh-context PR review", () => {
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
   });
 
+  it("retries one operationally failed reviewer in fresh context without discarding successful peers", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new FakeAgentRuntime([
+      async () => { throw new Error("read failed: optional path missing"); },
+      clean,
+      clean,
+    ]);
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "merging");
+    assert.equal(runtime.tasks.length, 3);
+    assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-2")));
+    assert.ok(runtime.tasks.find((task) => task.id.endsWith(":retry-2"))?.instructions.includes("previous operational attempt failed"));
+  });
+
   it("runs independently selected reviewer roles concurrently", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);

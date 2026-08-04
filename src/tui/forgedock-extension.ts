@@ -51,6 +51,16 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     };
   });
 
+  pi.on("tool_result", (event) => {
+    if (process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-reviewer" || event.toolName !== "read" || !event.isError) return;
+    const missing = event.content.some((item) => item.type === "text" && /\bENOENT:\s*no such file or directory\b/i.test(item.text));
+    if (!missing) return;
+    return {
+      isError: false,
+      content: [{ type: "text" as const, text: "File does not exist at the requested path. Treat absence as review evidence and continue with ls/find rather than failing the review." }],
+    };
+  });
+
   pi.on("tool_call", (event) => {
     if (event.toolName !== "bash") return;
     const command = (event.input as { command?: unknown }).command;
