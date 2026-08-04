@@ -45,8 +45,9 @@ describe("ForgeDock Pi terminal launcher", () => {
 
   it("discovers and propagates Git Bash before starting the Pi terminal", () => {
     const launcher = readFileSync(entry, "utf8");
-    assert.match(launcher, /verificationEnvironment\(process\.env\)\.FORGEDOCK_GIT_BASH/);
-    assert.match(launcher, /process\.env\.FORGEDOCK_GIT_BASH = discoveredGitBash/);
+    assert.match(launcher, /discoveredEnvironment = verificationEnvironment\(process\.env\)/);
+    assert.match(launcher, /process\.env\.PATH = discoveredEnvironment\.PATH/);
+    assert.match(launcher, /process\.env\.FORGEDOCK_GIT_BASH = discoveredEnvironment\.FORGEDOCK_GIT_BASH/);
   });
 
   it("ships and invokes the GitHub App refresher without a bash path boundary", () => {

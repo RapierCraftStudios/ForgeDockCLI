@@ -51,8 +51,9 @@ if (!isSupported(process.versions.node)) {
     }
     refreshConfiguredGitHubApp(packageRoot, cliArgs);
     const { verificationEnvironment } = await import(pathToFileURL(environmentModule).href);
-    const discoveredGitBash = verificationEnvironment(process.env).FORGEDOCK_GIT_BASH;
-    if (discoveredGitBash) process.env.FORGEDOCK_GIT_BASH = discoveredGitBash;
+    const discoveredEnvironment = verificationEnvironment(process.env);
+    if (discoveredEnvironment.PATH) process.env.PATH = discoveredEnvironment.PATH;
+    if (discoveredEnvironment.FORGEDOCK_GIT_BASH) process.env.FORGEDOCK_GIT_BASH = discoveredEnvironment.FORGEDOCK_GIT_BASH;
     const { materializeWorkerAgent } = await import(pathToFileURL(workerAgentModule).href);
     const workerAgent = materializeWorkerAgent(workerAgentTemplate, extensionEntry, [reviewerAgentTemplate]);
     // Async issue workers and their nested reviewers may outlive a non-interactive
