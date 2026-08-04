@@ -12,9 +12,14 @@ export type SubjectAdmissionDecision =
 
 /**
  * Prevent repeated commands from creating a new semantic run over an issue that
- * already has a terminal or in-flight durable run. The newest run wins; older
- * terminal artifacts must not hide a later interrupted attempt.
+ * already has a terminal or in-flight durable delivery run. The newest run
+ * carrying an Intent wins; standalone review runs cannot mask issue delivery.
  */
+export function workOnDeliveryArtifacts(artifacts: readonly DurableArtifact[]): DurableArtifact[] {
+  const runIds = new Set(artifacts.filter((artifact) => artifact.kind === "Intent").map((artifact) => artifact.runId));
+  return artifacts.filter((artifact) => runIds.has(artifact.runId));
+}
+
 export function decideSubjectAdmission(
   artifacts: readonly DurableArtifact[],
   options: { rerun?: boolean } = {},
@@ -22,12 +27,15 @@ export function decideSubjectAdmission(
   if (artifacts.length === 0) return { action: "start" };
 
   const byRun = new Map<string, DurableArtifact[]>();
-  for (const artifact of artifacts) {
+  for (const artifact of workOnDeliveryArtifacts(artifacts)) {
     const runArtifacts = byRun.get(artifact.runId) ?? [];
     runArtifacts.push(artifact);
     byRun.set(artifact.runId, runArtifacts);
   }
-  const latest = [...byRun.entries()]
+  const deliveryRuns = [...byRun.entries()];
+  if (deliveryRuns.length === 0) return { action: "start" };
+
+  const latest = deliveryRuns
     .map(([runId, runArtifacts]) => ({
       runId,
       artifacts: runArtifacts,

@@ -150,6 +150,32 @@ describe("subject run admission", () => {
     }
   });
 
+  it("does not let a newer standalone review mask a recoverable delivery run", () => {
+    const deliveryRunId = "run_delivery";
+    const reviewVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_standalone_review", subject: { ...subject, pr: 56 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["reviewer"], findings: [], checks: [] },
+    });
+    const decision = decideSubjectAdmission([
+      intent(deliveryRunId, "2026-01-01T00:00:00.000Z"),
+      ...publicationArtifacts(deliveryRunId),
+      { ...reviewVerdict, createdAt: "2026-01-02T00:00:00.000Z" },
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.runId, deliveryRunId);
+      assert.equal(decision.checkpoint, "publication");
+    }
+  });
+
+  it("starts delivery when an issue has only standalone review artifacts", () => {
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_review_only", subject: { ...subject, pr: 56 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["reviewer"], findings: [], checks: [] },
+    });
+    assert.deepEqual(decideSubjectAdmission([verdict]), { action: "start" });
+  });
+
   it("does not misclassify a failed reviewed run as a publication checkpoint", () => {
     const runId = "run_review_failed";
     const artifacts = publicationArtifacts(runId);

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } from "../core/ports/repositories.js";
-import { decideSubjectAdmission } from "../core/state/admission.js";
+import { decideSubjectAdmission, workOnDeliveryArtifacts } from "../core/state/admission.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
@@ -66,7 +66,8 @@ async function status(argv: string[]): Promise<void> {
     const github = new GitHubClient(process.cwd());
     const issue = await github.getIssue(Number(issueValue), option(argv, "--repo"));
     const artifacts = await new GitHubArtifactRepository(github).list({ repo: issue.repo, issue: issue.number });
-    const reconciled = reconcileLatestRunArtifacts(artifacts);
+    const deliveryArtifacts = workOnDeliveryArtifacts(artifacts);
+    const reconciled = reconcileLatestRunArtifacts(deliveryArtifacts.length ? deliveryArtifacts : artifacts);
     const result = { subject: `${issue.repo}#${issue.number}`, ...reconciled };
     if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     else {
@@ -389,7 +390,9 @@ async function reviewPr(argv: string[]): Promise<void> {
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
-  const runs = projectRunsToGitHub(store, github);
+  // Standalone review is advisory and read-only. Its operational state must not
+  // replace the issue delivery controller's workflow-label projection.
+  const runs = store;
   const runtime = new PiAgentRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),

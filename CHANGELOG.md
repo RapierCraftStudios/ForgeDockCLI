@@ -42,3 +42,4 @@
 - Windows legacy verification now uses file URLs for dynamic ESM imports and path-aware orphan-symlink ownership checks.
 - Pull request publication now emits a bounded compact handoff instead of duplicating large durable artifacts into the PR body, reuses an existing branch PR idempotently, and can resume the publication checkpoint without replaying build or verification.
 - Workflow controllers and nested reviewers no longer carry fixed wall-clock lifetimes. Long-running healthy work remains active until completion or explicit cancellation, while owner disconnects still release reviewer listeners and verification-command and short transport-handshake timeouts remain bounded.
+- Standalone read-only review runs no longer mask recoverable issue-delivery runs or project issue workflow labels; resuming `work-on` reuses the PR and retains its automatic remediate–verify–republish–re-review loop.

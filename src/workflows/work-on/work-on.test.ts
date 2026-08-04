@@ -153,6 +153,55 @@ describe("complete work-on trajectory", () => {
     ]);
   });
 
+  it("automatically remediates an in-scope blocking review and obtains a fresh verdict", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_publish_remediate", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation });
+    const packetArtifact = createArtifact({ kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+      },
+    });
+    let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId });
+    await runs.create(run);
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED"] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    const finding = {
+      id: "correctness-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
+    };
+    const runtime = new FakeAgentRuntime([
+      { summary: "Changes required", findings: [finding] },
+      submission,
+      { summary: "Approved after remediation", findings: [] },
+    ]);
+    const resumed = await resumePublicationWorkOn({
+      run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
+      workspace, baseBranch: "main", autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(resumed.run.state, "completed");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "remediator", "reviewer"]);
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-7), [
+      "REVIEW_CHANGES_REQUESTED", "REMEDIATION_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED",
+      "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    ]);
+  });
+
   it("resumes retained verification without replaying investigation, packet authoring, or build", async () => {
     const initialRuntime = new FakeAgentRuntime([investigation, packet, submission]);
     const artifacts = new InMemoryArtifactRepository();
