@@ -321,7 +321,12 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
           agent: "forgedock-issue-worker",
           task: buildIssueWorkerTask(
             item.issue,
-            { autoMerge, rerun: params.rerun, resume, dependencies: item.dependencies.map(issueNumberFromId) },
+            {
+              autoMerge,
+              rerun: params.rerun,
+              resume: shouldResumeObservedItem(item.labels, resume),
+              dependencies: item.dependencies.map(issueNumberFromId),
+            },
             { issue: item.issue, title: item.title, summary: item.summary },
           ),
           cwd: ctx.cwd,
@@ -715,6 +720,14 @@ function issueNumberFromId(id: string): number {
   const match = /^issue-(\d+)$/.exec(id);
   if (!match) throw new Error(`Invalid issue dependency id: ${id}`);
   return Number(match[1]);
+}
+
+export function shouldResumeObservedItem(labels: readonly string[], sameSessionRetry: boolean): boolean {
+  if (sameSessionRetry) return true;
+  return labels.some((label) => label === "workflow:building"
+    || label === "workflow:in-review"
+    || label === "workflow:engine-error"
+    || label === "needs-human");
 }
 
 function buildIssueWorkerTask(

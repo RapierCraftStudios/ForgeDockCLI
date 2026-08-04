@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { request as httpRequest } from "node:http";
 import { join } from "node:path";
 import {
   createAgentSession,
@@ -168,10 +169,10 @@ async function runNestedReviewer<T>(
   const ownerRunId = task.id.split(":review:", 1)[0] ?? task.id;
   const provisionalSessionRef = `nested_pending_${crypto.randomUUID()}`;
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model });
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({
+  const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string }>({
+    url,
+    token,
+    body: {
       ownerRunId,
       id: task.id,
       role: task.role,
@@ -184,15 +185,53 @@ async function runNestedReviewer<T>(
       provider: input.provider,
       model: input.model,
       thinking: input.thinking ?? "high",
-    }),
+    },
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   });
-  const payload = await response.json() as { output?: T; sessionRef?: string; provider?: string; model?: string; error?: string };
-  if (!response.ok || payload.output === undefined) throw new Error(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`);
+  const payload = response.payload;
+  if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
+    throw new Error(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`);
+  }
   const sessionRef = payload.sessionRef ?? provisionalSessionRef;
   input.emit({ type: "artifact.submitted", taskId: task.id });
   input.emit({ type: "session.completed", taskId: task.id, sessionRef });
   return { output: payload.output, sessionRef, provider: payload.provider ?? input.provider, model: payload.model ?? input.model };
+}
+
+export function postNestedAgentRequest<T>(input: {
+  url: string;
+  token: string;
+  body: unknown;
+  signal?: AbortSignal;
+}): Promise<{ status: number; payload: T }> {
+  const target = new URL(input.url);
+  if (target.protocol !== "http:") throw new Error(`Nested reviewer bridge requires local HTTP, found ${target.protocol}`);
+  const encoded = JSON.stringify(input.body);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(target, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${input.token}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(encoded),
+      },
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.once("error", (error) => reject(new Error(`Nested reviewer response failed: ${error.message}`, { cause: error })));
+      response.once("end", () => {
+        try {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({ status: response.statusCode ?? 500, payload: JSON.parse(text) as T });
+        } catch (error) {
+          reject(new Error("Nested reviewer bridge returned invalid JSON", { cause: error }));
+        }
+      });
+    });
+    request.once("error", (error) => reject(new Error(`Nested reviewer transport failed: ${error.message}`, { cause: error })));
+    request.end(encoded);
+  });
 }
 
 function createTaskResourceLoader<T>(task: AgentTask<T>): ResourceLoader {

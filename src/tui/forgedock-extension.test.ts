@@ -301,7 +301,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
     const result = await tool.execute("call-1", {
       issueNumbers: [7, 8],
       executionPlan: [
-        { issue: 7, title: "Seven", summary: "Implement the accepted bounded behavior.", priority: 1, dependsOn: [], claims: ["src/core"] },
+        { issue: 7, title: "Seven", summary: "Implement the accepted bounded behavior.", priority: 1, dependsOn: [], claims: ["src/core"], labels: ["workflow:building"] },
         { issue: 8, title: "Eight", summary: "Consume Seven's completed behavior.", priority: 2, dependsOn: [7], claims: ["src/api"] },
       ],
       maxParallel: 2,
@@ -324,6 +324,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.match(spawnRequest.params.model, /^openai-codex\/gpt-worker(?::[a-z]+)?$/);
   assert.equal(spawnRequest.params.chain, undefined);
   assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"dependencies":\[\]/);
+  assert.match(spawnRequest.params.task, /"resume":true/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);
 });
