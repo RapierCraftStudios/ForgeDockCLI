@@ -41,11 +41,13 @@ describe("deterministic process verification", () => {
   it("resolves Git Bash rather than the Windows or WSL launcher in headed verification", async () => {
     if (process.platform !== "win32") return;
     const inherited = process.env.PATH;
-    process.env.PATH = "C:\\Windows\\System32;C:\\Users\\ItsMr\\AppData\\Local\\Microsoft\\WindowsApps";
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+    assert.ok(systemRoot);
+    process.env.PATH = join(systemRoot, "System32");
     try {
       const script = [
         "const {spawnSync}=require('node:child_process');",
-        "const r=spawnSync('bash',['-c','test -n \"$MSYSTEM\" && command -v mktemp'],{encoding:'utf8'});",
+        "const r=spawnSync('bash',['-c','test -n \"$MSYSTEM\" && command -v mktemp && command -v jq'],{encoding:'utf8'});",
         "if(r.status!==0){process.stderr.write(r.stderr||'wrong bash');process.exit(42)}",
         "console.log(r.stdout.trim())",
       ].join("");
@@ -55,6 +57,7 @@ describe("deterministic process verification", () => {
       }]);
       assert.equal(result?.status, "passed");
       assert.match(result?.summary ?? "", /mktemp/);
+      assert.match(result?.summary ?? "", /jq/);
     } finally {
       if (inherited === undefined) delete process.env.PATH;
       else process.env.PATH = inherited;

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join } from "node:path";
 import { describe, it } from "node:test";
 import { controllerEnvironment, isAgentTransportVariable, verificationEnvironment } from "./controller-environment.js";
 
@@ -34,15 +37,19 @@ describe("controller environment boundary", () => {
     assert.equal(environment.PI_INTERCOM_SESSION_ID, undefined);
   });
 
-  it("puts Git Bash ahead of ambiguous Windows bash launchers during verification", () => {
+  it("puts discovered Git Bash and user tools ahead of ambiguous Windows launchers", () => {
+    if (process.platform !== "win32") return;
+    const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+    assert.ok(systemRoot);
     const environment = verificationEnvironment({
-      PROGRAMFILES: "C:\\Program Files",
+      SystemRoot: systemRoot,
+      USERPROFILE: homedir(),
       LOCALAPPDATA: process.env.LOCALAPPDATA,
-      PATH: "C:\\Windows\\System32;C:\\Windows",
+      PATH: join(systemRoot, "System32"),
     });
-    if (process.platform === "win32") {
-      assert.match(environment.PATH ?? "", /^C:\\Program Files\\Git\\usr\\bin;/i);
-    }
+    const entries = (environment.PATH ?? "").split(delimiter);
+    assert.ok(existsSync(join(entries[0] ?? "", "bash.exe")), `Git Bash was not discovered: ${environment.PATH}`);
+    if (existsSync(join(homedir(), "bin"))) assert.ok(entries.includes(join(homedir(), "bin")));
   });
 
   it("classifies worker transport without stripping ordinary Pi model settings", () => {

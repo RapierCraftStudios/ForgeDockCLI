@@ -42,7 +42,7 @@ export function resolveTestBash(environment = process.env) {
       }
     }
   } catch {
-    // Fixed installation locations below still provide a deterministic probe.
+    // PATH discovery is optional; environment-derived roots remain available.
   }
 
   const resolved = candidates.find((candidate) => existsSync(candidate));
