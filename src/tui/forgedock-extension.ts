@@ -51,6 +51,16 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     };
   });
 
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "bash") return;
+    const command = (event.input as { command?: unknown }).command;
+    if (typeof command !== "string" || !isLifecycleControllerShellCommand(command)) return;
+    return {
+      block: true,
+      reason: "ForgeDock lifecycle controllers cannot be launched through the shell tool or bounded by its wall-clock timeout. Use the active semantic workflow, resume, task-status, or cancellation tool instead.",
+    };
+  });
+
   pi.on("message_start", (event) => {
     if (event.message.role !== "custom" || event.message.customType !== "subagent_supervisor_request") return;
     activateOnly(pi, [HUMAN_DECISION_TOOL, "subagent_supervisor"]);
@@ -144,6 +154,13 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+export function isLifecycleControllerShellCommand(command: string): boolean {
+  const lifecycle = "(?:work-on|review-pr|orchestrate|reset)";
+  const directEntry = new RegExp(`(?:dist[\\\\/]cli[\\\\/]main\\.js|bin[\\\\/]forgedock-next\\.mjs|forgedock-next(?:\\.cmd|\\.exe)?)[\"']?\\s+${lifecycle}\\b`, "i");
+  const packageScript = new RegExp(`npm(?:\\.cmd)?\\s+(?:--silent\\s+)?run\\s+(?:--silent\\s+)?(?:next|forgedock-next)\\s+--\\s+${lifecycle}\\b`, "i");
+  return directEntry.test(command) || packageScript.test(command);
 }
 
 function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {

@@ -8,6 +8,7 @@ import { startNestedAgentBridge } from "./nested-agent-bridge.js";
 class FakeEvents {
   handlers = new Map<string, Array<(data: unknown) => void>>();
   requests: any[] = [];
+  autoRespond = true;
 
   on(name: string, handler: (data: unknown) => void): () => void {
     this.handlers.set(name, [...(this.handlers.get(name) ?? []), handler]);
@@ -17,7 +18,7 @@ class FakeEvents {
   emit(name: string, data: any): void {
     if (name === "prompt-template:subagent:request") {
       this.requests.push(data);
-      queueMicrotask(() => this.emit("prompt-template:subagent:response", {
+      if (this.autoRespond) queueMicrotask(() => this.emit("prompt-template:subagent:response", {
         version: 2,
         requestId: data.requestId,
         ownerRunId: data.ownerRunId,
@@ -64,6 +65,49 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
     assert.equal(events.requests[0]?.agent, "forgedock-reviewer");
     assert.equal(events.requests[0]?.context, "fresh");
     assert.equal(events.requests[0]?.result.kind, "structured");
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("nested reviewers have no fixed wall-clock lifetime and stop on explicit client cancellation", async () => {
+  const events = new FakeEvents();
+  events.autoRespond = false;
+  const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
+  const controller = new AbortController();
+  try {
+    const pending = fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        ownerRunId: "run-long",
+        id: "run-long:review:abc:correctness",
+        role: "reviewer",
+        objective: "Review for as long as useful progress continues",
+        instructions: "Read only",
+        context: [],
+        cwd: process.cwd(),
+        tools: ["read", "grep", "find", "ls"],
+        outputSchema: { type: "object" },
+        provider: "openai-codex",
+        model: "gpt-test",
+      }),
+      signal: controller.signal,
+    });
+    for (let attempt = 0; attempt < 100 && events.requests.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(events.requests.length, 1);
+    assert.equal(events.handlers.get("prompt-template:subagent:response")?.length, 1);
+    controller.abort();
+    await assert.rejects(pending, /abort/i);
+    for (let attempt = 0; attempt < 100 && events.handlers.get("prompt-template:subagent:response")?.length; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(events.handlers.get("prompt-template:subagent:response")?.length, 0);
   } finally {
     await bridge.close();
   }

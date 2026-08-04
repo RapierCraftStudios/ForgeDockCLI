@@ -122,6 +122,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
 - [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
 - [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
+- [x] Remove fixed wall-clock lifetimes from workflow controllers and nested reviews; retain explicit cancellation, owner-disconnect cleanup, and verification-command and short transport-handshake bounds
 - [x] Materialize issue-worker definitions with an absolute child-only ForgeDock extension path so strict subagent tool allowlists can actually load `forgedock_work_on`
 - [x] Project typed run transitions into auto-provisioned, mutually exclusive `workflow:*` GitHub labels without making labels authoritative
 - [x] Refresh explicitly configured GitHub App credentials at interactive terminal startup through a packaged cross-platform Node helper

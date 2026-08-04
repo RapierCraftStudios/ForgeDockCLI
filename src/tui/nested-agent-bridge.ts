@@ -40,7 +40,17 @@ export interface NestedAgentBridge {
 
 export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAgentBridge> {
   const token = crypto.randomUUID();
-  const server = createServer((request, response) => void handleRequest(pi, token, request, response));
+  const pending = new Set<AbortController>();
+  const server = createServer((request, response) => {
+    const controller = new AbortController();
+    pending.add(controller);
+    request.once("aborted", () => controller.abort(new Error("Nested agent client disconnected")));
+    response.once("close", () => {
+      if (!response.writableEnded) controller.abort(new Error("Nested agent response disconnected"));
+    });
+    void handleRequest(pi, token, request, response, controller.signal)
+      .finally(() => pending.delete(controller));
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -55,25 +65,26 @@ export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAg
       FORGEDOCK_NESTED_AGENT_TOKEN: token,
     },
     close: () => new Promise<void>((resolve, reject) => {
+      for (const controller of pending) controller.abort(new Error("Nested agent bridge closed"));
       server.close((error) => error ? reject(error) : resolve());
       server.closeAllConnections();
     }),
   };
 }
 
-async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingMessage, response: ServerResponse, signal: AbortSignal): Promise<void> {
   try {
     if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
     if (request.headers.authorization !== `Bearer ${token}`) return send(response, 401, { error: "Unauthorized" });
     const payload = validateRequest(JSON.parse(await readBody(request)) as unknown);
-    const result = await delegate(pi, payload);
+    const result = await delegate(pi, payload, signal);
     send(response, 200, result);
   } catch (error) {
     send(response, 500, { error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-function delegate(pi: ExtensionAPI, input: NestedAgentRequest): Promise<NestedAgentResponse> {
+function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSignal): Promise<NestedAgentResponse> {
   const requestId = crypto.randomUUID();
   const request: SubagentDelegationV2Request = {
     version: 2,
@@ -94,7 +105,7 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest): Promise<NestedAg
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
       if (typeof unsubscribe === "function") unsubscribe();
       callback();
     };
@@ -113,8 +124,10 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest): Promise<NestedAg
         model: value.model ?? input.model,
       }));
     });
-    const timer = setTimeout(() => finish(() => reject(new Error(`Nested ${input.role} timed out`))), 30 * 60_000);
-    pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
+    const abort = () => finish(() => reject(signal.reason instanceof Error ? signal.reason : new Error(`Nested ${input.role} cancelled`)));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    else pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
   });
 }
 

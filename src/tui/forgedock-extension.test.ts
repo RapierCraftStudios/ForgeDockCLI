@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
-import forgedockExtension, { executeController } from "./forgedock-extension.js";
+import forgedockExtension, { executeController, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import { buildNativeCommandPrompt, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
 
 interface FakePiState {
@@ -489,9 +489,27 @@ test("direct work-on defaults to a native non-blocking controller task", async (
   }
 });
 
+test("shell fallback cannot impose a wall-clock timeout on lifecycle controllers", () => {
+  const state = fakePi();
+  forgedockExtension(state.pi);
+  const guard = state.handlers.get("tool_call")?.[0];
+  assert.ok(guard);
+  const blocked = guard({ toolName: "bash", input: { command: "node dist/cli/main.js work-on 6 --rerun" } });
+  assert.deepEqual(blocked, {
+    block: true,
+    reason: "ForgeDock lifecycle controllers cannot be launched through the shell tool or bounded by its wall-clock timeout. Use the active semantic workflow, resume, task-status, or cancellation tool instead.",
+  });
+  assert.equal(guard({ toolName: "bash", input: { command: "node dist/cli/main.js status --issue 6" } }), undefined);
+  assert.equal(guard({ toolName: "bash", input: { command: "npm test" } }), undefined);
+  assert.equal(isLifecycleControllerShellCommand("forgedock-next orchestrate 6,7"), true);
+  assert.equal(isLifecycleControllerShellCommand("npm run next -- work-on 6 --rerun"), true);
+});
+
 test("native command prompts preserve natural-language intent", () => {
   const prompt = buildNativeCommandPrompt("orchestrate", "all open issues except blocked");
   assert.match(prompt, /\/orchestrate all open issues except blocked/);
   assert.match(prompt, /concrete eligible issue-number set/);
+  assert.match(prompt, /Never invoke forgedock-next, dist\/cli\/main\.js, or another lifecycle controller through bash\/shell/);
+  assert.match(buildNativeCommandPrompt("work-on", "6 --resume"), /Never invoke the lifecycle CLI through bash\/shell or add a wall-clock timeout/);
   assert.doesNotMatch(prompt, /invocationToken|\.md/);
 });

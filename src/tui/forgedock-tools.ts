@@ -560,13 +560,14 @@ export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: stri
       "Batching is an efficiency lever only for compatible P2/P3 review findings with the same bounded surface or concern; it means one materialized batch issue and one work-on agent closes all member issues after successful delivery. DAG ready sets and topological levels are never called batches.",
       `Then call ${tool} exactly once with the resolved issueNumbers, a complete executionPlan, and requested policy options. Set confirmed=true only when the user supplied --auto/--confirm. Ask a concise clarification first only when the target set or a consequential dependency remains genuinely ambiguous.`,
       "The native tool validates and contracts eligible batch work units, derives serialization edges, presents the plan checkpoint, and streams visible workers as predecessors complete. Continue supervising escalations delivered into this chat.",
+      "Workflow controllers and nested reviews have no fixed wall-clock lifetime while they remain owned. Never invoke forgedock-next, dist/cli/main.js, or another lifecycle controller through bash/shell or attach a shell timeout. If a native call blocks or fails, inspect its durable status and use only the semantic resume/cancel tools; never fall back to an ad-hoc CLI retry.",
     ].join("\n");
   }
   if (command === "work-on") {
-    return `The user invoked /work-on ${rawArgs}. Resolve the intent to one concrete issue number with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec.`;
+    return `The user invoked /work-on ${rawArgs}. Resolve the intent to one concrete issue number with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout; use native task status, resume, or explicit cancellation only.`;
   }
   if (command === "review-pr") {
-    return `The user invoked /review-pr ${rawArgs}. Resolve the intent to one concrete pull request with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec.`;
+    return `The user invoked /review-pr ${rawArgs}. Resolve the intent to one concrete pull request with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout; use native task status or explicit cancellation only.`;
   }
   return `The user invoked /forgedock-status ${rawArgs}. Call ${tool} exactly once with the requested status filters.`;
 }
@@ -726,7 +727,7 @@ function buildIssueWorkerTask(
     brief ? `Issue brief — ${brief.title}: ${brief.summary}` : "No issue brief was supplied; escalate rather than guessing if the controller request is ambiguous.",
     "If scope, product intent, or a risky decision is genuinely ambiguous, call contact_supervisor with need_decision or interview_request and wait for the reply.",
     `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, dependencies: options.dependencies, autoMerge: Boolean(options.autoMerge), rerun: Boolean(options.rerun), resume: options.resume })}`,
-    "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Report its final state and any required human action.",
+    "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
 }
 
