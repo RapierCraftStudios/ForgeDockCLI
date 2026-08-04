@@ -21,47 +21,33 @@ describe("deterministic process verification", () => {
   });
 
   it("does not expose orchestrator child identity to verification commands", async () => {
-    const inherited = process.env.PI_SUBAGENT_CHILD_AGENT;
-    process.env.PI_SUBAGENT_CHILD_AGENT = "forgedock-issue-worker";
-    try {
-      const runner = isolatedRunner();
-      const [result] = await runner.run([{
-        id: "clean-environment", command: process.execPath,
-        args: ["-e", "if(process.env.PI_SUBAGENT_CHILD_AGENT) process.exit(41); console.log('controller environment')"],
-        cwd: process.cwd(), timeoutMs: 5_000, required: true,
-      }]);
-      assert.equal(result?.status, "passed");
-      assert.match(result?.summary ?? "", /controller environment/);
-    } finally {
-      if (inherited === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
-      else process.env.PI_SUBAGENT_CHILD_AGENT = inherited;
-    }
+    const runner = isolatedRunner({ ...process.env, PI_SUBAGENT_CHILD_AGENT: "forgedock-issue-worker" });
+    const [result] = await runner.run([{
+      id: "clean-environment", command: process.execPath,
+      args: ["-e", "if(process.env.PI_SUBAGENT_CHILD_AGENT) process.exit(41); console.log('controller environment')"],
+      cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.equal(result?.status, "passed");
+    assert.match(result?.summary ?? "", /controller environment/);
   });
 
   it("resolves Git Bash rather than the Windows or WSL launcher in headed verification", async () => {
     if (process.platform !== "win32") return;
-    const inherited = process.env.PATH;
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
     assert.ok(systemRoot);
-    process.env.PATH = join(systemRoot, "System32");
-    try {
-      const script = [
-        "const {spawnSync}=require('node:child_process');",
-        "const r=spawnSync('bash',['-c','test -n \"$MSYSTEM\" && command -v mktemp && command -v jq'],{encoding:'utf8'});",
-        "if(r.status!==0){process.stderr.write(r.stderr||'wrong bash');process.exit(42)}",
-        "console.log(r.stdout.trim())",
-      ].join("");
-      const [result] = await isolatedRunner().run([{
-        id: "git-bash", command: process.execPath, args: ["-e", script],
-        cwd: process.cwd(), timeoutMs: 15_000, required: true,
-      }]);
-      assert.equal(result?.status, "passed");
-      assert.match(result?.summary ?? "", /mktemp/);
-      assert.match(result?.summary ?? "", /jq/);
-    } finally {
-      if (inherited === undefined) delete process.env.PATH;
-      else process.env.PATH = inherited;
-    }
+    const script = [
+      "const {spawnSync}=require('node:child_process');",
+      "const r=spawnSync('bash',['-c','test -n \"$MSYSTEM\" && command -v mktemp && command -v jq'],{encoding:'utf8'});",
+      "if(r.status!==0){process.stderr.write(r.stderr||'wrong bash');process.exit(42)}",
+      "console.log(r.stdout.trim())",
+    ].join("");
+    const [result] = await isolatedRunner({ ...process.env, PATH: join(systemRoot, "System32") }).run([{
+      id: "git-bash", command: process.execPath, args: ["-e", script],
+      cwd: process.cwd(), timeoutMs: 15_000, required: true,
+    }]);
+    assert.equal(result?.status, "passed");
+    assert.match(result?.summary ?? "", /mktemp/);
+    assert.match(result?.summary ?? "", /jq/);
   });
 
   it("extracts stable TAP failure identities for baseline comparison", async () => {
@@ -139,8 +125,11 @@ describe("deterministic process verification", () => {
   });
 });
 
-function isolatedRunner(): ProcessVerificationRunner {
-  return new ProcessVerificationRunner({ lockPath: join(tmpdir(), `forgedock-verifier-test-${randomUUID()}.lock`) });
+function isolatedRunner(environment: NodeJS.ProcessEnv = process.env): ProcessVerificationRunner {
+  return new ProcessVerificationRunner({
+    lockPath: join(tmpdir(), `forgedock-verifier-test-${randomUUID()}.lock`),
+    environment,
+  });
 }
 
 async function assertEventuallyDead(pid: number): Promise<void> {

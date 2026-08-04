@@ -145,7 +145,7 @@ function checkTable(checks: readonly { command: string; status: string; duration
   if (!checks.length) return "";
   const rows = checks.map((check) => {
     const status = check.status === "failed" && check.baselineStatus === "failed" && check.regression === false
-      ? "passed (baseline failures unchanged)"
+      ? "failed (baseline failures unchanged)"
       : check.status;
     return `| \`${check.command.replaceAll("|", "\\|")}\` | ${status} | ${check.durationMs} ms | ${(check.summary ?? "").replaceAll("|", "\\|")} |`;
   });

@@ -12,9 +12,11 @@ const DEFAULT_LOCK_PATH = join(tmpdir(), "forgedock-verification.lock");
 
 export class ProcessVerificationRunner implements VerificationRunner {
   readonly #lockPath: string;
+  readonly #environment: NodeJS.ProcessEnv;
 
-  constructor(options: { lockPath?: string } = {}) {
+  constructor(options: { lockPath?: string; environment?: NodeJS.ProcessEnv } = {}) {
     this.#lockPath = options.lockPath ?? DEFAULT_LOCK_PATH;
+    this.#environment = { ...(options.environment ?? process.env) };
   }
 
   async run(commands: readonly VerificationCommand[], signal?: AbortSignal): Promise<CheckResult[]> {
@@ -23,7 +25,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
       const results: CheckResult[] = [];
       for (const command of commands) {
         if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted");
-        const result = await runOne(command, signal);
+        const result = await runOne(command, this.#environment, signal);
         results.push(result);
         if (command.required && result.status === "failed") break;
       }
@@ -94,12 +96,12 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function runOne(spec: VerificationCommand, signal?: AbortSignal): Promise<CheckResult> {
+function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CheckResult> {
   return new Promise((resolve, reject) => {
     const started = performance.now();
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
-      env: verificationEnvironment(process.env),
+      env: verificationEnvironment(environment),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,

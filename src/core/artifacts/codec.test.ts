@@ -34,6 +34,34 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("never renders a baseline-equivalent required failure as passed", () => {
+    const outcome = createArtifact({
+      kind: "Outcome",
+      runId: "run_test",
+      subject: { repo: "acme/widget", issue: 42 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        status: "blocked",
+        reason: "Required verification failed",
+        childIssues: [],
+        failureEvidence: {
+          branch: "forgedock/issue-42",
+          workspacePath: "/tmp/issue-42",
+          builderSummary: "Implemented the change",
+          changedPaths: ["src/index.ts"],
+          checks: [{
+            command: "npm test", status: "failed", exitCode: 1, durationMs: 10,
+            outputDigest: "a".repeat(64), failureSignatures: ["not ok - flaky fixture"],
+            baselineStatus: "failed", baselineFailureSignatures: ["not ok - flaky fixture"], regression: false,
+          }],
+        },
+      },
+    });
+    const comment = renderArtifactComment(outcome);
+    assert.match(comment, /failed \(baseline failures unchanged\)/);
+    assert.doesNotMatch(comment, /passed \(baseline failures unchanged\)/);
+  });
+
   it("skips a damaged marker and continues parsing valid markers", () => {
     const good = encodeArtifactMarker(intent());
     const found = findArtifacts(`<!-- FORGEDOCK:ARTIFACT v2 b64:not-json -->\n${good}`);
