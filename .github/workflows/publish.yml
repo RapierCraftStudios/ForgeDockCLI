@@ -98,6 +98,9 @@ jobs:
           # reflected in its npm lock; install resolves that fork-local build graph.
           npm install --prefix vendor/pi --ignore-scripts --no-audit --no-fund
 
+      - name: Hydrate pinned Pi offline model data
+        run: npm --prefix vendor/pi run hydrate:model-data
+
       - name: Apply bundled subagent runtime patches
         run: node scripts/patch-pi-subagents-visibility.mjs
 
