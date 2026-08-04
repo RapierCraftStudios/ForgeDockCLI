@@ -8,7 +8,7 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import type { BuilderSubmission } from "./build.js";
-import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn } from "./work-on.js";
+import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main" };
@@ -51,6 +51,16 @@ const submission: BuilderSubmission = {
 };
 
 describe("complete work-on trajectory", () => {
+  it("records a new durable failure cause while deduplicating an identical retry", () => {
+    const runId = "run_failures";
+    const failed = createArtifact({
+      kind: "Outcome", runId, subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { status: "failed", reason: "fetch failed", childIssues: [] },
+    });
+    assert.equal(shouldAppendFailureOutcome([failed], runId, "fetch failed"), false);
+    assert.equal(shouldAppendFailureOutcome([failed], runId, "read failed: optional path missing"), true);
+  });
+
   it("retains the worktree when verification blocks delivery", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet, submission]);
     const artifacts = new InMemoryArtifactRepository();

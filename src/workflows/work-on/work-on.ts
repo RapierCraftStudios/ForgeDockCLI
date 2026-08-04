@@ -554,9 +554,17 @@ function pathMatchesExpectation(path: string, expected: string): boolean {
   return path === expected || path.startsWith(`${expected}/`);
 }
 
+export function shouldAppendFailureOutcome(existing: readonly DurableArtifact[], runId: string, reason: string): boolean {
+  const latestFailure = existing
+    .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.runId === runId && artifact.kind === "Outcome" && artifact.payload.status === "failed")
+    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
+    .at(-1);
+  return latestFailure?.payload.reason !== reason;
+}
+
 async function appendFailureOutcome(run: RunState, reason: string, dependencies: WorkOnDependencies): Promise<void> {
   const existing = await dependencies.artifacts.list(run.subject);
-  if (existing.some((artifact) => artifact.runId === run.runId && artifact.kind === "Outcome" && artifact.payload.status === "failed")) return;
+  if (!shouldAppendFailureOutcome(existing, run.runId, reason)) return;
   await dependencies.artifacts.append(createArtifact({
     kind: "Outcome",
     runId: run.runId,
