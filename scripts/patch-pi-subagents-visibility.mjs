@@ -52,6 +52,16 @@ patch(join(root, "src", "extension", "index.ts"), [[
   '\tconst config = { ...loadConfig(), artifactDir: "temp" as const };',
 ]]);
 
+// A ForgeDock reviewer is read-only and its schema-valid structured submission
+// is the authoritative result. A failed optional probe must remain negative
+// evidence instead of invalidating an artifact the reviewer subsequently
+// completed. Keep this exception scoped to the ForgeDock reviewer; mutating
+// or general-purpose subagents retain pi-subagents' fail-on-tool-error policy.
+patch(join(root, "src", "runs", "foreground", "execution.ts"), [[
+  "\t\tconst errInfo = detectSubagentError(messages);",
+  "\t\tconst completedForgeDockReview = agent.name === \"forgedock-reviewer\" && options.structuredOutput !== undefined && structuredOutputToolInvoked && existsSync(options.structuredOutput.outputPath);\n\t\tconst errInfo = completedForgeDockReview ? detectSubagentError([]) : detectSubagentError(messages);",
+]]);
+
 patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
     'import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";',

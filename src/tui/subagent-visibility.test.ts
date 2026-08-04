@@ -25,6 +25,11 @@ describe("bundled subagent live visibility", () => {
     assert.match(defaults, /DEFAULT_ARTIFACT_CONFIG[\s\S]*?dir: "temp"/);
   });
 
+  it("accepts a completed read-only ForgeDock review despite an earlier optional probe failure", () => {
+    const execution = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8");
+    assert.match(execution, /agent\.name === "forgedock-reviewer"[\s\S]*?structuredOutputToolInvoked[\s\S]*?detectSubagentError\(\[\]\)/);
+  });
+
   it("projects streaming tool updates into the per-worker fleet transcript", async () => {
     const jiti = createJiti(import.meta.url, { interopDefault: true });
     const childTranscript = await jiti.import(resolve("node_modules/pi-subagents/src/shared/child-transcript.ts")) as {
