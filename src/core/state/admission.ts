@@ -49,10 +49,13 @@ export function decideSubjectAdmission(
     const recoverable = latest.artifacts.some((artifact) => artifact.kind === "Outcome" && artifact.payload.status === "blocked" && artifact.payload.failureEvidence);
     if (recoverable) return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
   }
-  if (reconciled.state === "failed") {
+  if (reconciled.state === "publishing" || reconciled.state === "failed") {
+    const intent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
+    const investigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
+    const packet = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
     const verifiedBuild = latest.artifacts.some((artifact) => artifact.kind === "BuildResult");
     const reviewStarted = latest.artifacts.some((artifact) => artifact.kind === "ReviewVerdict");
-    if (verifiedBuild && !reviewStarted) {
+    if (intent && investigation && packet && verifiedBuild && !reviewStarted) {
       return { action: "resume", runId: latest.runId, state: "publishing", checkpoint: "publication", artifacts: latest.artifacts };
     }
   }

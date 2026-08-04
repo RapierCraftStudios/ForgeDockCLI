@@ -29,6 +29,34 @@ function outcome(runId: string, createdAt: string, status: "invalid" | "decompos
   return { ...artifact, createdAt };
 }
 
+function publicationArtifacts(runId: string): DurableArtifact[] {
+  return [
+    createArtifact({
+      kind: "Investigation", runId, subject, producer: { role: "investigator" },
+      payload: {
+        outcome: "confirmed", confidence: "high", summary: "confirmed",
+        evidence: [{ claim: "broken", source: "docs/a.md", detail: "missing contract" }],
+        rootCause: "missing contract", affectedSurfaces: ["docs/a.md"], risks: [], recommendation: "document it",
+      },
+    }),
+    createArtifact({
+      kind: "BuildPacket", runId, subject, producer: { role: "packet-author" },
+      payload: {
+        scope: ["document contract"], acceptanceCriteria: ["documented"], context: [], implementationPlan: ["edit docs/a.md"],
+        expectedPaths: ["docs/a.md"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+      },
+    }),
+    createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: {
+        branch: "forgedock/issue-1", headSha: "d".repeat(40), changedPaths: ["docs/a.md"], summary: "done",
+        acceptanceEvidence: [{ criterion: "documented", status: "passed", evidence: "verified" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [],
+      },
+    }),
+  ];
+}
+
 describe("subject run admission", () => {
   it("starts when no durable state exists", () => {
     assert.deepEqual(decideSubjectAdmission([]), { action: "start" });
@@ -97,18 +125,23 @@ describe("subject run admission", () => {
 
   it("resumes publication after a verified build failed before review", () => {
     const runId = "run_publish";
-    const buildResult = createArtifact({
-      kind: "BuildResult", runId, subject, producer: { role: "controller" },
-      payload: {
-        branch: "forgedock/issue-1", headSha: "d".repeat(40), changedPaths: ["docs/a.md"], summary: "done",
-        acceptanceEvidence: [{ criterion: "documented", status: "passed", evidence: "verified" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [],
-      },
-    });
     const decision = decideSubjectAdmission([
       intent(runId, "2026-01-01T00:00:00.000Z"),
-      buildResult,
+      ...publicationArtifacts(runId),
       outcome(runId, "2026-01-01T00:02:00.000Z", "failed"),
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "publishing");
+      assert.equal(decision.checkpoint, "publication");
+    }
+  });
+
+  it("resumes an interrupted publication without requiring a failed Outcome", () => {
+    const runId = "run_publish_interrupted";
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      ...publicationArtifacts(runId),
     ]);
     assert.equal(decision.action, "resume");
     if (decision.action === "resume") {
@@ -119,18 +152,12 @@ describe("subject run admission", () => {
 
   it("does not misclassify a failed reviewed run as a publication checkpoint", () => {
     const runId = "run_review_failed";
-    const buildResult = createArtifact({
-      kind: "BuildResult", runId, subject, producer: { role: "controller" },
-      payload: {
-        branch: "forgedock/issue-1", headSha: "d".repeat(40), changedPaths: ["docs/a.md"], summary: "done",
-        acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [],
-      },
-    });
+    const artifacts = publicationArtifacts(runId);
     const verdict = createArtifact({
       kind: "ReviewVerdict", runId, subject, producer: { role: "reviewer" },
       payload: { headSha: "d".repeat(40), disposition: "approve", reviewerRoles: ["reviewer"], findings: [], checks: [] },
     });
-    assert.equal(decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), buildResult, verdict, outcome(runId, "2026-01-01T00:03:00.000Z", "failed")]).action, "skip");
+    assert.equal(decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...artifacts, verdict, outcome(runId, "2026-01-01T00:03:00.000Z", "failed")]).action, "skip");
   });
 
   it("resumes a blocked verification attempt with retained evidence", () => {
