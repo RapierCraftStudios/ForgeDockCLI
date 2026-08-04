@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 
 const AGENT_TRANSPORT_PREFIXES = ["PI_SUBAGENT_", "PI_SUBAGENTS_"] as const;
+export const FORGEDOCK_VERIFICATION_PATH = "FORGEDOCK_VERIFICATION_PATH";
 const AGENT_TRANSPORT_KEYS = new Set([
   "PI_INTERCOM_SESSION_ID",
 ]);
@@ -46,7 +47,8 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
   const programFiles = environmentValue(clean, "ProgramFiles");
   const programData = environmentValue(clean, "ProgramData") ?? environmentValue(clean, "ALLUSERSPROFILE");
   const localAppData = environmentValue(clean, "LOCALAPPDATA");
-  const candidates = [
+  const sealedEntries = pathEntries(environmentValue(clean, FORGEDOCK_VERIFICATION_PATH));
+  const discoveredCandidates = [
     gitRoot && join(gitRoot, "usr", "bin"),
     gitRoot && join(gitRoot, "mingw64", "bin"),
     join(userHome, "bin"),
@@ -55,11 +57,25 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
     programData && join(programData, "chocolatey", "bin"),
     localAppData && join(localAppData, "Microsoft", "WinGet", "Links"),
   ].filter((value): value is string => typeof value === "string" && existsSync(value));
+  const candidates = [...sealedEntries, ...discoveredCandidates];
 
-  const inheritedPath = environmentValue(clean, "PATH");
-  clean.PATH = [...new Set([...candidates, ...(inheritedPath ? [inheritedPath] : [])])].join(delimiter);
+  const inheritedEntries = pathEntries(environmentValue(clean, "PATH"));
+  setEnvironmentValue(clean, "PATH", uniquePathEntries([...candidates, ...inheritedEntries]).join(delimiter));
   if (gitRoot) clean.FORGEDOCK_GIT_BASH = join(gitRoot, "usr", "bin", "bash.exe");
+  if (!environmentValue(clean, "USERPROFILE")) clean.USERPROFILE = userHome;
   return clean;
+}
+
+/**
+ * Freeze the dynamically discovered verification toolchain before entering Pi.
+ * Descendants may replace PATH for a probe, but their verifier can always
+ * reconstruct the same package-safe prefix from this inherited manifest.
+ */
+export function sealVerificationEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const sealed = verificationEnvironment(environment);
+  const path = environmentValue(sealed, "PATH");
+  if (path) sealed[FORGEDOCK_VERIFICATION_PATH] = path;
+  return sealed;
 }
 
 function discoverGitForWindowsRoot(environment: NodeJS.ProcessEnv): string | undefined {
@@ -138,6 +154,29 @@ function gitRootFromBash(bash: string): string | undefined {
 function environmentValue(environment: NodeJS.ProcessEnv, requestedName: string): string | undefined {
   const key = Object.keys(environment).find((name) => name.toLowerCase() === requestedName.toLowerCase());
   return key ? environment[key] : undefined;
+}
+
+function pathEntries(value: string | undefined): string[] {
+  return (value ?? "").split(delimiter).map((entry) => entry.trim()).filter(Boolean);
+}
+
+function uniquePathEntries(entries: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const entry of entries) {
+    const key = process.platform === "win32" ? entry.replace(/[\\/]+$/, "").toLowerCase() : entry.replace(/\/+$/, "");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(entry);
+  }
+  return unique;
+}
+
+function setEnvironmentValue(environment: NodeJS.ProcessEnv, name: string, value: string): void {
+  for (const key of Object.keys(environment)) {
+    if (key.toLowerCase() === name.toLowerCase()) delete environment[key];
+  }
+  environment[name] = value;
 }
 
 export function isAgentTransportVariable(name: string): boolean {

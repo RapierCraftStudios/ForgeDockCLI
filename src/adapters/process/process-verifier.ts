@@ -6,7 +6,7 @@ import { closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync, wr
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
-import { verificationEnvironment } from "../../runtime/controller-environment.js";
+import { sealVerificationEnvironment, verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const DEFAULT_LOCK_PATH = join(tmpdir(), "forgedock-verification.lock");
 
@@ -16,7 +16,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
 
   constructor(options: { lockPath?: string; environment?: NodeJS.ProcessEnv } = {}) {
     this.#lockPath = options.lockPath ?? DEFAULT_LOCK_PATH;
-    this.#environment = { ...(options.environment ?? process.env) };
+    this.#environment = sealVerificationEnvironment(options.environment ?? process.env);
   }
 
   async run(commands: readonly VerificationCommand[], signal?: AbortSignal): Promise<CheckResult[]> {

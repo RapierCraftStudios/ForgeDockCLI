@@ -50,10 +50,11 @@ if (!isSupported(process.versions.node)) {
       }
     }
     refreshConfiguredGitHubApp(packageRoot, cliArgs);
-    const { verificationEnvironment } = await import(pathToFileURL(environmentModule).href);
-    const discoveredEnvironment = verificationEnvironment(process.env);
-    if (discoveredEnvironment.PATH) process.env.PATH = discoveredEnvironment.PATH;
-    if (discoveredEnvironment.FORGEDOCK_GIT_BASH) process.env.FORGEDOCK_GIT_BASH = discoveredEnvironment.FORGEDOCK_GIT_BASH;
+    const { sealVerificationEnvironment } = await import(pathToFileURL(environmentModule).href);
+    const discoveredEnvironment = sealVerificationEnvironment(process.env);
+    for (const name of ["PATH", "USERPROFILE", "FORGEDOCK_GIT_BASH", "FORGEDOCK_VERIFICATION_PATH"]) {
+      if (discoveredEnvironment[name]) process.env[name] = discoveredEnvironment[name];
+    }
     const { materializeWorkerAgent } = await import(pathToFileURL(workerAgentModule).href);
     const workerAgent = materializeWorkerAgent(workerAgentTemplate, extensionEntry, [reviewerAgentTemplate]);
     // Async issue workers and their nested reviewers may outlive a non-interactive
