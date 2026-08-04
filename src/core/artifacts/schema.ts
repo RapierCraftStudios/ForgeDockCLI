@@ -152,6 +152,7 @@ export const OutcomePayloadSchema = Type.Object({
   finalSha: Type.Optional(Sha),
   prUrl: Type.Optional(Type.String()),
   childIssues: Type.Array(Type.String()),
+  batchParent: Type.Optional(Type.Integer({ minimum: 1 })),
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,
     workspacePath: NonEmptyString,

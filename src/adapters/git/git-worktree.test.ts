@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
@@ -29,6 +29,10 @@ describe("isolated Git worktrees", () => {
     const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
     const workspace = await manager.create({ runId: "run_test", issue: 12, baseRef: "HEAD" });
     assert.equal(existsSync(join(workspace.path, "node_modules", "example", "package.json")), true);
+    writeFileSync(join(workspace.path, "feature.txt"), "partial implementation\n");
+    const recovered = await manager.recover({ runId: "run_test", issue: 12, baseRef: "HEAD" });
+    assert.deepEqual(recovered, workspace);
+    assert.equal(readFileSync(join(recovered.path, "feature.txt"), "utf8"), "partial implementation\n");
     writeFileSync(join(workspace.path, "feature.txt"), "implemented\n");
     mkdirSync(join(workspace.path, "docs", "pipeline-probes"), { recursive: true });
     writeFileSync(join(workspace.path, "docs", "pipeline-probes", "receipt.md"), "probe\n");

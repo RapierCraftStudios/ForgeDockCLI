@@ -6,6 +6,7 @@ import { closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync, wr
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
+import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const DEFAULT_LOCK_PATH = join(tmpdir(), "forgedock-verification.lock");
 
@@ -98,7 +99,7 @@ function runOne(spec: VerificationCommand, signal?: AbortSignal): Promise<CheckR
     const started = performance.now();
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
-      env: process.env,
+      env: verificationEnvironment(process.env),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,

@@ -35,12 +35,15 @@ import { dirname, resolve, join, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { chmodSync } from "node:fs";
+import { resolveTestBash, testBashEnvironment } from "./helpers/bash.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 const SCRIPT_PATH = join(REPO_ROOT, "scripts", "derive-finding-milestone.sh");
 const FAKE_GH_DIR = join(__dirname, "fixtures", "fake-gh");
 const FAKE_GH_PATH = join(FAKE_GH_DIR, "gh");
+const TEST_BASH = resolveTestBash();
+const TEST_BASH_ENV = testBashEnvironment(process.env, TEST_BASH);
 
 // The fake `gh` shim is resolved via PATH lookup (derive-finding-milestone.sh
 // invokes `gh` directly, not `bash gh`), so it must carry the executable bit.
@@ -66,12 +69,12 @@ try {
  * Returns { stdout, stderr, status }.
  */
 function run(args, fakeGhEnv = {}) {
-  const result = spawnSync("bash", [SCRIPT_PATH, ...args], {
+  const result = spawnSync(TEST_BASH, [SCRIPT_PATH, ...args], {
     encoding: "utf-8",
     timeout: 10000,
     env: {
-      ...process.env,
-      PATH: `${FAKE_GH_DIR}${delimiter}${process.env.PATH}`,
+      ...TEST_BASH_ENV,
+      PATH: `${FAKE_GH_DIR}${delimiter}${TEST_BASH_ENV.PATH}`,
       ...fakeGhEnv,
     },
   });

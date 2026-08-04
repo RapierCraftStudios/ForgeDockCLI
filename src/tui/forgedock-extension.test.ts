@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import forgedockExtension, { executeController } from "./forgedock-extension.js";
-import { buildNativeCommandPrompt } from "./forgedock-tools.js";
+import { buildNativeCommandPrompt, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
 
 interface FakePiState {
   pi: ExtensionAPI;
@@ -78,11 +79,11 @@ test("commands lazily activate separate semantic native tools without loading Ma
   const state = fakePi();
   assert.deepEqual(
     [...state.tools.keys()].sort(),
-    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_remember", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
+    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
   );
 
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration"]);
 
   await state.commands.get("orchestrate")?.("all open enhancement issues --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
@@ -90,7 +91,44 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration", "forgedock_orchestrate"]);
+});
+
+test("natural configuration resolves a friendly live model name for all subagents", async () => {
+  const state = fakePi();
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-model-config-"));
+  const models = [
+    { provider: "openai-codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+    { provider: "openai-codex", id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+  ];
+  try {
+    const tool = state.tools.get("forgedock_configure");
+    assert.ok(tool);
+    await tool.execute("config-1", {
+      subagentModel: "Luna 5.6",
+      subagentThinking: "max",
+    }, undefined, undefined, {
+      ...commandContext(),
+      cwd,
+      hasUI: false,
+      modelRegistry: { getAvailable: () => models, getAll: () => models },
+    } as any);
+    assert.deepEqual(readForgeDockConfig(cwd), {
+      workerModel: "openai-codex/gpt-5.6-luna",
+      workerThinking: "max",
+      reviewerModel: "openai-codex/gpt-5.6-luna",
+      reviewerThinking: "max",
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("model configuration rejects installed models without available authentication", () => {
+  const unavailable = { provider: "example", id: "luna-5.6" };
+  assert.throws(() => resolveModelReference("example/luna-5.6", {
+    modelRegistry: { getAvailable: () => [], getAll: () => [unavailable] },
+  } as any), /installed but unavailable/);
 });
 
 test("runtime diagnostic verifies the real bundled subagent RPC bridge", async () => {
@@ -145,42 +183,83 @@ test("busy sessions queue native workflow intent as a follow-up", async () => {
   assert.deepEqual(state.sent[0]?.options, { deliverAs: "followUp" });
 });
 
-test("supervisor escalations lazily expose MCQ and reply tools", async () => {
+test("supervisor escalations lazily expose decision-interview and reply tools", async () => {
   const state = fakePi();
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "subagent_supervisor"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration", "forgedock_ask_user", "subagent_supervisor"]);
 });
 
-test("human checkpoints present a required recommendation and return the selected option", async () => {
+test("human checkpoints use the tabbed decision interview and return typed answers", async () => {
   const state = fakePi();
-  let rendered = "";
+  const screens: string[] = [];
   const ctx = {
     ...commandContext(),
+    mode: "tui",
     ui: {
-      select: async (title: string, choices: string[]) => {
-        rendered = `${title}\n${choices.join("\n")}`;
-        return choices[0];
+      setWorkingVisible: () => undefined,
+      custom: async (factory: (...args: any[]) => any) => {
+        let completed: unknown;
+        const component = factory(
+          { requestRender: () => undefined },
+          {
+            fg: (_color: string, text: string) => text,
+            bg: (_color: string, text: string) => text,
+            bold: (text: string) => text,
+          },
+          {},
+          (value: unknown) => { completed = value; },
+        );
+        screens.push(component.render(80).join("\n"));
+        component.handleInput("1");
+        screens.push(component.render(80).join("\n"));
+        component.handleInput("1");
+        return completed;
       },
     },
   } as any;
   const tool = state.tools.get("forgedock_ask_user");
   assert.ok(tool);
-  const result = await tool.execute("mcq-1", {
+  const result = await tool.execute("decision-1", {
     title: "Choose rollout",
-    question: "How should this ship?",
-    options: [
-      { id: "safe", label: "Canary", description: "Limits blast radius" },
-      { id: "fast", label: "Immediate", description: "Finishes sooner with more risk" },
-    ],
-    recommendedId: "safe",
-    recommendation: "Canary has bounded impact.",
+    questions: [{
+      id: "rollout",
+      label: "Rollout",
+      prompt: "How should this ship?",
+      type: "single",
+      options: [
+        { value: "safe", label: "Canary", description: "Limits blast radius" },
+        { value: "fast", label: "Immediate", description: "Finishes sooner with more risk" },
+      ],
+      recommendedValue: "safe",
+      recommendation: "Canary has bounded impact.",
+    }],
   }, undefined, undefined, ctx);
-  assert.match(rendered, /safe: Canary ★ recommended/);
-  assert.match(rendered, /Recommendation: Canary has bounded impact/);
-  assert.match((result.content[0] as { text: string }).text, /User selected safe/);
+  assert.match(screens[0] ?? "", /★ Recommended: Canary/);
+  assert.match(screens[0] ?? "", /Canary has bounded impact/);
+  assert.match(screens[1] ?? "", /Review your decisions/);
+  assert.match((result.content[0] as { text: string }).text, /rollout: Canary/);
+  assert.deepEqual((result.details as { answers: Record<string, { values: string[] }> }).answers.rollout?.values, ["safe"]);
+});
+
+test("decision interviews normalize stored legacy single-question calls", () => {
+  const tool = fakePi().tools.get("forgedock_ask_user");
+  assert.ok(tool?.prepareArguments);
+  const normalized = tool.prepareArguments!({
+    title: "Legacy",
+    question: "Choose?",
+    options: [
+      { id: "a", label: "A", description: "First" },
+      { id: "b", label: "B", description: "Second" },
+    ],
+    recommendedId: "a",
+    recommendation: "A is safer.",
+  }) as { questions: Array<{ id: string; recommendedValue: string; options: Array<{ value: string }> }> };
+  assert.equal(normalized.questions[0]?.id, "decision");
+  assert.equal(normalized.questions[0]?.recommendedValue, "a");
+  assert.deepEqual(normalized.questions[0]?.options.map((option) => option.value), ["a", "b"]);
 });
 
 test("ForgeDock issue children receive only the typed mutation tool", async () => {
@@ -197,19 +276,19 @@ test("ForgeDock issue children receive only the typed mutation tool", async () =
   }
 });
 
-test("orchestrate delegates a validated issue DAG as visible topological batches", async () => {
+test("orchestrate starts only the live DAG ready set without static batch phases", async () => {
   const state = fakePi();
-  let spawnRequest: any;
+  const spawnRequests: any[] = [];
   const originalEmit = state.pi.events.emit.bind(state.pi.events);
   state.pi.events.emit = ((name: string, data: any) => {
     originalEmit(name, data);
-    if (name === "subagents:rpc:v1:request") {
-      spawnRequest = data;
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      spawnRequests.push(data);
       queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
         version: 1,
         requestId: data.requestId,
         success: true,
-        data: { text: "started", details: { asyncId: "test-run" } },
+        data: { text: "started", details: { asyncId: `test-run-${spawnRequests.length}` } },
       }));
     }
   }) as typeof state.pi.events.emit;
@@ -228,24 +307,116 @@ test("orchestrate delegates a validated issue DAG as visible topological batches
       maxParallel: 2,
       workerModel: "openai-codex/gpt-worker",
     }, undefined, undefined, commandContext() as any);
-    assert.match((result.content[0] as { text: string }).text, /accepted the 2-issue DAG/);
-    assert.match((result.content[0] as { text: string }).text, /Batch 1: #7/);
-    assert.match((result.content[0] as { text: string }).text, /Batch 2: #8/);
+    assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
+    assert.match((result.content[0] as { text: string }).text, /Initial ready set: #7/);
+    assert.match((result.content[0] as { text: string }).text, /DAG nodes: 2/);
+    assert.doesNotMatch((result.content[0] as { text: string }).text, /visible batch|Batch 1/);
   } finally {
     if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
     else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
   }
 
+  assert.equal(spawnRequests.length, 1);
+  const spawnRequest = spawnRequests[0];
   assert.equal(spawnRequest.method, "spawn");
   assert.equal(spawnRequest.params.async, true);
-  assert.equal(spawnRequest.params.chain.length, 2);
-  assert.equal(spawnRequest.params.chain[0].parallel.length, 1);
-  assert.equal(spawnRequest.params.chain[0].parallel[0].agent, "forgedock-issue-worker");
-  assert.equal(spawnRequest.params.chain[0].parallel[0].model, "openai-codex/gpt-worker");
-  assert.match(spawnRequest.params.chain[0].parallel[0].task, /forgedock_work_on.*\{"issue":7,"dependencies":\[\]/);
-  assert.match(spawnRequest.params.chain[1].parallel[0].task, /"dependencies":\[7\]/);
-  assert.match(spawnRequest.params.chain[0].parallel[0].task, /Implement the accepted bounded behavior/);
-  assert.match(spawnRequest.params.chain[0].parallel[0].task, /contact_supervisor/);
+  assert.equal(spawnRequest.params.agent, "forgedock-issue-worker");
+  assert.match(spawnRequest.params.model, /^openai-codex\/gpt-worker(?::[a-z]+)?$/);
+  assert.equal(spawnRequest.params.chain, undefined);
+  assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"dependencies":\[\]/);
+  assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
+  assert.match(spawnRequest.params.task, /contact_supervisor/);
+});
+
+test("headless orchestration requires explicit dispatch authorization", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  await assert.rejects(() => tool.execute("headless", {
+    issueNumbers: [7],
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /requires explicit confirmed=true/);
+});
+
+test("visible DAG delegation dispatches a successor on its predecessor completion event", async () => {
+  const state = fakePi();
+  const launched: number[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      const issue = Number(/issue #(\d+)/.exec(data.params.task)?.[1]);
+      launched.push(issue);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true,
+        data: { details: { asyncId: `run-${issue}` } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = new VisibleDagDelegator(state.pi);
+  const completed: number[] = [];
+  const run = await delegator.start({
+    items: [
+      { id: "issue-1", issue: 1, title: "One", summary: "One", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] },
+      { id: "issue-2", issue: 2, title: "Two", summary: "Two", priority: 1, dependencies: ["issue-1"], claims: [], labels: [], affectedFiles: [], memberIssues: [2] },
+    ],
+    maxParallel: 2,
+    taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    assertCompleted: async (item) => { completed.push(item.issue); },
+    onComplete: () => undefined,
+  });
+  assert.deepEqual(launched, [1]);
+  originalEmit("subagent:async-complete", { runId: "run-1" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(launched, [1, 2]);
+  originalEmit("subagent:async-complete", { runId: "run-2" });
+  await run.completion;
+  assert.deepEqual(completed, [1, 2]);
+  await delegator.shutdown();
+});
+
+test("visible DAG resume retries failed nodes without replaying completed nodes", async () => {
+  const state = fakePi();
+  const launched: string[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      const runId = `retry-run-${launched.length + 1}`;
+      launched.push(runId);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: runId } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = new VisibleDagDelegator(state.pi);
+  let assertions = 0;
+  const results: string[] = [];
+  const resumeFlags: boolean[] = [];
+  const first = await delegator.start({
+    items: [{ id: "issue-6", issue: 6, title: "Six", summary: "Six", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [6] }],
+    maxParallel: 1,
+    taskFor: (item, resume) => {
+      resumeFlags.push(resume);
+      return { agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() };
+    },
+    assertCompleted: async () => {
+      assertions++;
+      if (assertions === 1) throw new Error("interrupted build");
+    },
+    onComplete: (result) => results.push(result.status.get("issue-6") ?? "missing"),
+  });
+  originalEmit("subagent:async-complete", { runId: "retry-run-1" });
+  await first.completion;
+  assert.deepEqual(results, ["failed"]);
+
+  const resumed = await delegator.resume(first.id);
+  originalEmit("subagent:async-complete", { runId: "retry-run-2" });
+  await resumed.completion;
+  assert.deepEqual(launched, ["retry-run-1", "retry-run-2"]);
+  assert.deepEqual(resumeFlags, [false, true]);
+  assert.deepEqual(results, ["failed", "completed"]);
+  await delegator.shutdown();
 });
 
 test("controller subprocess output streams before completion", async () => {
@@ -262,6 +433,25 @@ test("controller subprocess output streams before completion", async () => {
   assert.match(result.stdout, /second/);
   assert.ok(updates.some((output) => output.includes("first")));
   assert.ok(updates.some((output) => output.includes("second")));
+});
+
+test("controller subprocess does not inherit the invoking worker role", async () => {
+  const previous = process.env.PI_SUBAGENT_CHILD_AGENT;
+  process.env.PI_SUBAGENT_CHILD_AGENT = "forgedock-issue-worker";
+  try {
+    const result = await executeController(
+      process.execPath,
+      ["-e", "process.stdout.write(process.env.PI_SUBAGENT_CHILD_AGENT ?? 'clean')"],
+      process.cwd(),
+      undefined,
+      () => undefined,
+    );
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, "clean");
+  } finally {
+    if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
+    else process.env.PI_SUBAGENT_CHILD_AGENT = previous;
+  }
 });
 
 test("direct work-on defaults to a native non-blocking controller task", async () => {

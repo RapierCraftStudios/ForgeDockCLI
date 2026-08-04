@@ -49,7 +49,7 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
           : outcome.payload.status === "failed" ? "failed"
             : outcome.payload.status === "abandoned" ? "cancelled"
               : "blocked";
-    if (outcome.payload.status === "merged" && (!verdict || verdict.payload.disposition !== "approve")) {
+    if (outcome.payload.status === "merged" && !outcome.payload.batchParent && (!verdict || verdict.payload.disposition !== "approve")) {
       warnings.push("Merged Outcome has no approving Review Verdict");
       state = "blocked";
     }

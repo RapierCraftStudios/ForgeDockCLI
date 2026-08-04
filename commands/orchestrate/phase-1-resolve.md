@@ -374,10 +374,10 @@ BATCH_PLAN=$(node -e '
 **Priority label schema**: ForgeDock's own issue creator (`review-pr.md`) writes only the canonical `priority:P<n>` label form. Some repos this pipeline operates against (issues opened externally, imported, or predating ForgeDock adoption) instead carry a bare `P<n>` label with no `priority:` prefix. Every priority-read check in this section — and its mirrors in `phase-4-execution.md` and `cleanup.md` — MUST accept both forms. `priority:P<n>` wins when (unusually) both are present on the same issue. Issue-*creation* call sites (the batch-issue creation below) are unaffected and keep writing canonical `priority:P<n>` only — there is no case where this pipeline needs to *write* the bare form. <!-- Added: forge#2232 -->
 
 **Trigger conditions** (default-batchable — no opt-in marker required):
-1. The issue has label `review-finding` + a P3 priority label (`priority:P3` or bare `P3`)
+1. The issue has label `review-finding` + a P2/P3 priority label (`priority:P2`/`priority:P3` or bare `P2`/`P3`)
 2. The issue does NOT match any Safety exclusion below
 
-The `<!-- FORGE:BATCHABLE -->` marker (still appended by `review-pr.md` at finding-creation time) is honored when present but is no longer REQUIRED for eligibility — a `review-finding`+`priority:P3` issue is batchable by default unless explicitly excluded. This closes the gap where cascade-spawned findings that never carried the marker sat un-batched indefinitely. <!-- Added: forge#1818 -->
+The `<!-- FORGE:BATCHABLE -->` marker (still appended by `review-pr.md` at finding-creation time) is honored when present but is no longer REQUIRED for eligibility — a `review-finding` with P2 or P3 priority is batchable by default unless explicitly excluded. This closes the gap where cascade-spawned findings that never carried the marker sat un-batched indefinitely. <!-- Added: forge#1818 -->
 
 **Safety classification:** P0/P1 findings stay individual because batching adds urgent-work latency. P2 is an ordering signal, not a batching veto. Billing is never batched, and path-owned danger zones, migrations, high-fan-in entrypoints, compose files, and `.env.example` are excluded by `batchExclusionReason()` in `bin/engine/admission.mjs`. The default path map excludes `infra/migrations/*credit_balance*` and `services/api/app/billing/**` regardless of wording. Security-relevant findings may batch only with members of the same coarse class, capped at **3** members. Every exclusion must log its `urgency`, `domain`, or `high-blast-radius` predicate.
 - Issue has a `needs-human`, `blocked`, or `operator-only` label, or explicitly states `operator-only`, `manual action required`, or `human action required` in its title or `## Problem` section
@@ -386,9 +386,9 @@ Use `bin/engine/admission.mjs`'s `classifyBatchSafety()` as the reference classi
 
 **Grouping algorithm (surface area — same file first, leaf directory as broader fallback):** <!-- Changed: forge#1818 — was domain-only -->
 ```bash
-# Fetch all open batchable P3 issues (default-batchable; marker no longer required).
-# NOTE: `--label` is an exact-match GH filter and cannot OR "priority:P3" with bare "P3" in
-# one query, so the P3 test moves into the jq predicate below (schema-tolerant, forge#2232).
+# Fetch all open batchable P2/P3 issues (default-batchable; marker no longer required).
+# NOTE: `--label` is an exact-match GH filter and cannot OR both canonical and bare P2/P3
+# forms in one query, so the priority test moves into jq (schema-tolerant, forge#2232).
 # Only "review-finding" stays in the --label filter.
 # Billing remains the sole absolute exclusion. Security findings stay in the
 # candidate set so they can be grouped by their same `FORGE:CLASS`/coarse class.
@@ -396,12 +396,12 @@ Use `bin/engine/admission.mjs`'s `classifyBatchSafety()` as the reference classi
 # `authority_source`/`authoritative`/`author`/`authored` no longer trip `auth`.
 # `authentication|authorization|authn|authz` are listed explicitly so real
 # auth-domain findings that never use the bare word "auth" still exclude.
-BATCHABLE_P3=$(gh issue list {GH_FLAG} \
+BATCHABLE_FINDINGS=$(gh issue list {GH_FLAG} \
   --state open \
   --label "review-finding" \
   --limit 500 \
   --json number,title,body,labels \
-  --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P3$")))
+  --jq '.[] | select([.labels[].name] | any(test("^(priority:)?P[23]$")))
          | select((.title | test("\\b(billing|operator-only|manual action required|human action required)\\b"; "i")) | not)
          # Strip the review-finding template's attribution boilerplate
          # (**Confidence**/**Severity**/**Review comment** — see forge#2477
@@ -447,10 +447,10 @@ BATCHABLE_P3=$(gh issue list {GH_FLAG} \
 ```
 
 **Batch creation rule (ordered grouping keys):** <!-- Changed: forge#1818 — added lower same-file tier -->
-- **Same-file cluster** (primary, low threshold): When **2+** batchable P3 issues share the exact same affected file, create a batch issue for that file cluster. Same-file P3 findings are the dominant low-value token sink (dead imports, stale comments, style nits) and already conflict with each other if built individually — the low threshold reflects that they'd otherwise serialize into slow one-at-a-time chains regardless of count.
+- **Same-file cluster** (primary, low threshold): When **2+** batchable P2/P3 issues share the exact same affected file, create a batch issue for that file cluster. Same-file findings are the dominant repeated-pipeline token sink (dead imports, stale comments, style nits) and already conflict with each other if built individually — the low threshold reflects that they'd otherwise serialize into slow one-at-a-time chains regardless of count.
 - **Source-PR cohort**: When **2+** remaining findings cite the same `**Source**: PR #N`, create a batch regardless of their affected paths. The source citation is parsed mechanically; a source PR that closed unmerged remains eligible.
 - **Defect-class cluster**: When **2+** remaining findings have the same `<!-- FORGE:CLASS: <slug> -->` annotation, create a batch. This is opt-in and uses only the emitted machine-readable slug; do not infer a class from prose.
-- **Leaf-directory cluster** (broader fallback): When **3+** remaining batchable P3 issues share the same leaf directory but are not already claimed, OR the oldest batchable P3 in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
+- **Leaf-directory cluster** (broader fallback): When **3+** remaining batchable P2/P3 issues share the same leaf directory but are not already claimed, OR the oldest batchable finding in that leaf directory exceeds 72 hours, create a batch issue for that leaf-directory cluster.
 - Form groups in this order: same-file, source-PR, defect-class, leaf-directory. A finding is claimed by at most one batch.
 
 **Reference implementation and periodic sweep (MANDATORY):** `bin/engine/admission.mjs` exports `planP3BatchGroups()` and `batchExclusionReason()`, the deterministic reference for eligibility, the four ordered keys, the 3-member leaf threshold, and the eight-member cap. Every pass supplies the complete retained candidate registry plus open batches; execute `extensions` before creating new groups, retain `ungrouped` findings, and log each selected group kind or exclusion predicate. Run it at initial resolution and again after every five completions or whenever the deferred queue reaches the concurrency cap. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
@@ -479,7 +479,7 @@ BATCH_BODY_FILE="$(mktemp)"
 cat > "$BATCH_BODY_FILE" <<'BATCH_EOF'
 ## Problem
 
-Batch of P3 review findings in **{SURFACE_AREA}** (same file or leaf directory), grouped to reduce per-finding pipeline overhead.
+Batch of P2/P3 review findings in **{SURFACE_AREA}** (same file or leaf directory), grouped to reduce per-finding pipeline overhead.
 
 ## Member Findings
 
@@ -509,7 +509,9 @@ BATCH_EOF
 ```
 
 ```
-ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"fix(batch): P3 review findings — ${SAFE_SURFACE_AREA} (batch #{BATCH_N})\" --body-file \"${BATCH_BODY_FILE}\" --label \"review-finding\" --label \"priority:P3\" --label \"batch\" --exclude \"${MEMBER_LIST}\""))
+# Preserve the highest urgency represented by the members; batching never downgrades P2 to P3.
+BATCH_PRIORITY={P2 if any member carries priority:P2 or bare P2, otherwise P3}
+ISSUE_SKILL_OUTPUT=$(Skill(skill="issue", args="--title \"fix(batch): P2/P3 review findings — ${SAFE_SURFACE_AREA} (batch #{BATCH_N})\" --body-file \"${BATCH_BODY_FILE}\" --label \"review-finding\" --label \"priority:${BATCH_PRIORITY}\" --label \"batch\" --exclude \"${MEMBER_LIST}\""))
 ```
 
 **Consume `/issue`'s explicit result contract** (see `commands/issue.md` Phases 2D and 4C). A dedup STOP is an expected, named outcome; any output without either result marker is a hard create failure:
@@ -532,8 +534,8 @@ fi
 
 **Important limits**:
 - Routine batches have at most **8** members. Security-class batches have at most **3** members and never mix classes.
-- P1 and P2 issues are NEVER batched — they keep the standard one-issue-one-PR path
-- Billing is NEVER batched; security P3 findings follow the same-class, three-member rule above.
+- P0 and P1 issues are NEVER batched — they keep the standard one-issue-one-PR path
+- Billing is NEVER batched; security P2/P3 findings follow the same-class, three-member rule above.
 - Human-gated findings are NEVER batched: `needs-human`, `blocked`, `operator-only`, and explicit operator-action requests remain independently tracked
 - Batch issues themselves are never nested inside other batch issues
 

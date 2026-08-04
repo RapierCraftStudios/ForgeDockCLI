@@ -5,6 +5,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
+import { controllerEnvironment } from "../runtime/controller-environment.js";
 
 export type BackgroundTaskStatus = "running" | "completed" | "blocked" | "failed" | "cancelled";
 
@@ -81,7 +82,7 @@ export class ForgeDockBackgroundTasks {
     try {
       child = spawn(input.command, input.args, {
         cwd: input.cwd,
-        env: { ...process.env, ...input.env },
+        env: controllerEnvironment(process.env, input.env),
         windowsHide: true,
         detached: process.platform !== "win32",
         stdio: ["ignore", descriptor, descriptor],

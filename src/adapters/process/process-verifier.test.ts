@@ -20,6 +20,47 @@ describe("deterministic process verification", () => {
     assert.match(result?.summary ?? "", /verified/);
   });
 
+  it("does not expose orchestrator child identity to verification commands", async () => {
+    const inherited = process.env.PI_SUBAGENT_CHILD_AGENT;
+    process.env.PI_SUBAGENT_CHILD_AGENT = "forgedock-issue-worker";
+    try {
+      const runner = isolatedRunner();
+      const [result] = await runner.run([{
+        id: "clean-environment", command: process.execPath,
+        args: ["-e", "if(process.env.PI_SUBAGENT_CHILD_AGENT) process.exit(41); console.log('controller environment')"],
+        cwd: process.cwd(), timeoutMs: 5_000, required: true,
+      }]);
+      assert.equal(result?.status, "passed");
+      assert.match(result?.summary ?? "", /controller environment/);
+    } finally {
+      if (inherited === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
+      else process.env.PI_SUBAGENT_CHILD_AGENT = inherited;
+    }
+  });
+
+  it("resolves Git Bash rather than the Windows or WSL launcher in headed verification", async () => {
+    if (process.platform !== "win32") return;
+    const inherited = process.env.PATH;
+    process.env.PATH = "C:\\Windows\\System32;C:\\Users\\ItsMr\\AppData\\Local\\Microsoft\\WindowsApps";
+    try {
+      const script = [
+        "const {spawnSync}=require('node:child_process');",
+        "const r=spawnSync('bash',['-c','test -n \"$MSYSTEM\" && command -v mktemp'],{encoding:'utf8'});",
+        "if(r.status!==0){process.stderr.write(r.stderr||'wrong bash');process.exit(42)}",
+        "console.log(r.stdout.trim())",
+      ].join("");
+      const [result] = await isolatedRunner().run([{
+        id: "git-bash", command: process.execPath, args: ["-e", script],
+        cwd: process.cwd(), timeoutMs: 15_000, required: true,
+      }]);
+      assert.equal(result?.status, "passed");
+      assert.match(result?.summary ?? "", /mktemp/);
+    } finally {
+      if (inherited === undefined) delete process.env.PATH;
+      else process.env.PATH = inherited;
+    }
+  });
+
   it("extracts stable TAP failure identities for baseline comparison", async () => {
     const runner = isolatedRunner();
     const [result] = await runner.run([{

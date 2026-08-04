@@ -72,11 +72,11 @@ npm run terminal
 
 When orchestration is active, press `←` or `↓` on an empty editor to focus the worker fleet, select a worker, and press `Enter` to open its live controller transcript. ForgeDock expands tool arguments and streaming output by default; press `x` (or `Ctrl+O`) to toggle the compact view.
 
-ForgeDock now ships a source-maintained [Pi fork](https://github.com/RapierCraftStudios/pi) with ForgeDock's Chrome & Ember identity. First launch guides you through terminal appearance, provider authentication, and explicit model selection. The terminal exposes controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands. Each command lazily activates its own semantic native tool, so the selected model can interpret natural-language intent without loading large Markdown workflow specs into every conversation. Direct work and review runs start as native session-scoped background controller tasks by default, allowing the supervisor to continue responding while typed execution proceeds. Use `/forgedock-tasks list`, `/forgedock-tasks output <task-id>`, or `/forgedock-tasks cancel <task-id>` to inspect or stop them; cancellation and terminal shutdown terminate the complete owned process tree. `/orchestrate` asks the model to derive an evidence-backed issue DAG, then deterministically validates dependencies, priorities, and path/component claims before launching bounded topological batches in the visible `pi-subagents` fleet. Children remain synchronous with their typed controller so dependency waves and review bridges cannot outlive worker ownership.
+ForgeDock now ships a source-maintained [Pi fork](https://github.com/RapierCraftStudios/pi) with ForgeDock's Chrome & Ember identity. First launch guides you through terminal appearance, provider authentication, and explicit model selection. The terminal exposes controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands. Each command lazily activates its own semantic native tool, so the selected model can interpret natural-language intent without loading large Markdown workflow specs into every conversation. Direct work and review runs start as native session-scoped background controller tasks by default, allowing the supervisor to continue responding while typed execution proceeds. Use `/forgedock-tasks list`, `/forgedock-tasks output <task-id>`, or `/forgedock-tasks cancel <task-id>` to inspect or stop them; cancellation and terminal shutdown terminate the complete owned process tree. `/orchestrate` asks the model to derive an evidence-backed issue DAG, then typed code validates dependencies, contracts compatible P2/P3 review findings with the same bounded concern surface into one batch issue/work unit, and derives stable serialization edges from path/component claims. The visible fleet streams the live ready set as each node's own predecessors complete—DAG levels are not called batches. If a worker is interrupted after its frozen Build Packet, typed admission recovers the deterministic worktree and resumes at build rather than demanding an impossible generic “resume or clean” choice. A plain “resume” can retry the latest failed/blocked DAG in the same supervisor session: completed nodes remain completed, failed nodes recover their durable checkpoint, and successors stream when ready. A successful batch Outcome is projected to every member before the controller closes the member issues. Children remain synchronous with their typed controller so dependency scheduling and review bridges cannot outlive worker ownership.
 
 Verification is serialized across ForgeDock runs on the machine, Node test fanout is bounded, and timeout/cancellation terminates the complete subprocess tree rather than orphaning workers. Subagent transcripts stay in temporary operational storage instead of delivery worktrees, and automatic remediation cannot expand beyond the frozen Build Packet.
 
-`forge.yaml` remains the project configuration file. `/forgedock-config use openai-codex/gpt-5.6-sol with max thinking for workers` updates only ForgeDock Next's managed section while preserving legacy settings; those defaults control worker/reviewer models, thinking, concurrency, and merge policy. `FORGE.md` is explicit user-maintained project guidance, and `/forgedock-remember` can persist a preference or a structured decision. `devdocs/` is a reference-only, Obsidian-compatible long-term memory graph: ForgeDock retrieves compact anchored summaries, links, and backlinks instead of loading the corpus, and memory can never authorize actions or override current intent or typed contracts. The fork is an internal interaction kernel; ForgeDock is the product identity, and its typed controller remains the sole owner of workflow transitions, verification, GitHub publication, review gates, and merge authority.
+`forge.yaml` remains the project configuration file. A normal `npx forgedock` launch creates a minimal marker-bounded file in the current repository when one is absent. `/forgedock-config use Luna 5.6 with max thinking for all subagents` resolves the friendly name against the live authenticated model catalog and updates both workers and reviewers while preserving unrelated legacy settings; those defaults control role models, thinking, concurrency, and merge policy. `FORGE.md` is explicit user-maintained project guidance, and `/forgedock-remember` can persist a preference or a structured decision. `devdocs/` is a reference-only, Obsidian-compatible long-term memory graph: ForgeDock retrieves compact anchored summaries, links, and backlinks instead of loading the corpus, and memory can never authorize actions or override current intent or typed contracts. The fork is an internal interaction kernel; ForgeDock is the product identity, and its typed controller remains the sole owner of workflow transitions, verification, GitHub publication, review gates, and merge authority.
 
 > ⭐ **If ForgeDock saves you time, [star the repo](https://github.com/RapierCraftStudios/ForgeDock/stargazers)** — it's the whole marketing budget.
 
@@ -93,7 +93,7 @@ Verification is serialized across ForgeDock runs on the machine, Node test fanou
 | A crash or compaction loses the run | State lives on GitHub and in an event-sourced run log — the pipeline resumes where it stopped |
 | You write the issue, plan the fix, open the PR, and review it | `/work-on #42` → investigated, built, reviewed, merged |
 | Review depends on whoever has capacity | 9 domain-specialist agents (security, billing, DB, concurrency…) review every PR |
-| One task at a time, serialized by your attention | `/orchestrate` runs a whole milestone — many issues in parallel, each its own full pipeline |
+| One task at a time, serialized by your attention | `/orchestrate` runs a whole milestone through a streaming DAG; compatible findings can share one pipeline |
 
 ---
 
@@ -137,7 +137,7 @@ And the part that makes it compound — the context phase citing past bugs *by n
 
 ## Orchestrate an entire milestone
 
-`/work-on` ships one issue. **`/orchestrate` ships a milestone.** It decomposes the milestone into dependency-ordered waves and runs a full `/work-on` pipeline on each issue **in parallel** — investigating, building, reviewing, and merging many at once, while GitHub labels track every agent's state live. On this repo's record day, that meant **29 issues taken to merged inside a single hour**.
+`/work-on` ships one work unit. **`/orchestrate` ships a milestone.** It builds a dependency DAG and streams each ready work unit as soon as its own predecessors complete. Ordinary issues remain individual units; compatible P2/P3 review findings may be contracted into one batch issue and one `/work-on` pipeline, with all member issues closed only after the batch is verified, reviewed, and completed. On this repo's record day, that meant **29 issues taken to merged inside a single hour**.
 
 Scheduling is conflict-aware before it is parallel. Five detection layers decide what may run concurrently: same-file overlap, directory proximity, shared-module fan-in, a conservative fallback when file extraction is low-confidence, and **historical co-change coupling mined from `git log`** — files that changed together in the past are assumed to conflict now. Database-touching issues are always serialized. The resulting graph is cycle-checked (Kahn's algorithm) and executed in topologically sorted waves; overlapping work is expressed as ordinary `Depends on #N` edges anyone can read.
 
@@ -146,7 +146,7 @@ Scheduling is conflict-aware before it is parallel. Five detection layers decide
 </div>
 
 ```bash
-/orchestrate milestone/checkout-v2     # decompose → conflict-aware waves → merged PRs
+/orchestrate milestone/checkout-v2     # resolve → streaming conflict-aware DAG → merged PRs
 ```
 
 ---
@@ -204,7 +204,7 @@ Every mechanism above exists because autonomous agents fail in predictable ways.
 | Command | What it does |
 | --- | --- |
 | **`/work-on`** | Full issue lifecycle: investigate → build → quality gate → review → merge |
-| `/orchestrate` | A whole milestone in parallel — conflict-aware waves, one pipeline per issue |
+| `/orchestrate` | A whole milestone through a streaming conflict-aware DAG; compatible P2/P3 findings can share one batch pipeline |
 | `/issue` | Creates pipeline-ready GitHub issues |
 | `/milestone` | Create, manage, and ship milestones |
 | `/review-pr` | Context-aware PR review with domain-specialist agents |

@@ -86,6 +86,21 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => JSON.parse(String((row as { state_json: string }).state_json)) as RunState);
   }
 
+  rebuildRun(state: RunState): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.prepare("DELETE FROM transitions WHERE run_id = ?").run(state.runId);
+      this.#database.prepare(`
+        INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET version = excluded.version, state_json = excluded.state_json
+      `).run(state.runId, state.version, JSON.stringify(state));
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
     if (state.version !== expectedVersion + 1 || record.sequence !== state.version) {
       throw new Error("Run commit must advance exactly one version");

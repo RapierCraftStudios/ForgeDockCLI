@@ -71,6 +71,30 @@ describe("subject run admission", () => {
     ], { rerun: true }), { action: "start" });
   });
 
+  it("resumes an interrupted build from its frozen durable packet", () => {
+    const investigation = createArtifact({
+      kind: "Investigation", runId: "run_build", subject, producer: { role: "investigator" },
+      payload: {
+        outcome: "confirmed", confidence: "high", summary: "confirmed",
+        evidence: [{ claim: "broken", source: "src/a.ts", detail: "missing guard" }],
+        rootCause: "missing guard", affectedSurfaces: ["src/a.ts"], risks: [], recommendation: "add guard",
+      },
+    });
+    const packet = createArtifact({
+      kind: "BuildPacket", runId: "run_build", subject, producer: { role: "packet-author" },
+      payload: {
+        scope: ["add guard"], acceptanceCriteria: ["guard exists"], context: [], implementationPlan: ["edit src/a.ts"],
+        expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+      },
+    });
+    const decision = decideSubjectAdmission([intent("run_build", "2026-01-01T00:00:00.000Z"), investigation, packet]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "building");
+      assert.equal(decision.checkpoint, "build");
+    }
+  });
+
   it("resumes a blocked verification attempt with retained evidence", () => {
     const blocked = createArtifact({
       kind: "Outcome", runId: "run_recover", subject, producer: { role: "controller" },
@@ -84,6 +108,9 @@ describe("subject run admission", () => {
     });
     const decision = decideSubjectAdmission([intent("run_recover", "2026-01-01T00:00:00.000Z"), blocked]);
     assert.equal(decision.action, "resume");
-    if (decision.action === "resume") assert.equal(decision.runId, "run_recover");
+    if (decision.action === "resume") {
+      assert.equal(decision.runId, "run_recover");
+      assert.equal(decision.checkpoint, "verification");
+    }
   });
 });

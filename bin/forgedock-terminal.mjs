@@ -32,13 +32,23 @@ if (!isSupported(process.versions.node)) {
   const packageRoot = resolve(dirname(self), "..");
   const extensionEntry = resolve(packageRoot, "dist", "tui", "forgedock-extension.js");
   const workerAgentModule = resolve(packageRoot, "dist", "tui", "worker-agent.js");
+  const configModule = resolve(packageRoot, "dist", "core", "config", "forgedock-config.js");
   const workerAgentTemplate = resolve(packageRoot, "agents", "forgedock-issue-worker.md");
   const reviewerAgentTemplate = resolve(packageRoot, "agents", "forgedock-reviewer.md");
-  if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
+  if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(configModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
     console.error("ForgeDock terminal has not been built. Run `npm run build:pi && npm run build` first.");
     process.exitCode = 1;
   } else {
-    refreshConfiguredGitHubApp(packageRoot, process.argv.slice(2));
+    const cliArgs = process.argv.slice(2);
+    if (shouldBootstrapProject(cliArgs)) {
+      try {
+        const { ensureForgeDockConfig } = await import(pathToFileURL(configModule).href);
+        ensureForgeDockConfig(process.cwd());
+      } catch (error) {
+        console.error(`ForgeDock warning: could not create forge.yaml: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    refreshConfiguredGitHubApp(packageRoot, cliArgs);
     const { materializeWorkerAgent } = await import(pathToFileURL(workerAgentModule).href);
     const workerAgent = materializeWorkerAgent(workerAgentTemplate, extensionEntry, [reviewerAgentTemplate]);
     // Async issue workers and their nested reviewers may outlive a non-interactive
@@ -52,6 +62,10 @@ if (!isSupported(process.versions.node)) {
     process.argv.splice(2, 0, "--extension", subagentsEntry, "--extension", extensionEntry);
     await import(pathToFileURL(terminalEntry).href);
   }
+}
+
+function shouldBootstrapProject(args) {
+  return !args.some((arg) => arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v");
 }
 
 function refreshConfiguredGitHubApp(packageRoot, args) {

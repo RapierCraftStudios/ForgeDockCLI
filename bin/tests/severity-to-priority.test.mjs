@@ -33,19 +33,23 @@ import assert from "node:assert/strict";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveTestBash, testBashEnvironment } from "./helpers/bash.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 const SCRIPT_PATH = join(REPO_ROOT, "scripts", "severity-to-priority.sh");
+const TEST_BASH = resolveTestBash();
+const TEST_BASH_ENV = testBashEnvironment(process.env, TEST_BASH);
 
 /**
  * Run severity-to-priority.sh via bash with the given arguments.
  * Returns { stdout, stderr, status }.
  */
 function run(args) {
-  const result = spawnSync("bash", [SCRIPT_PATH, ...args], {
+  const result = spawnSync(TEST_BASH, [SCRIPT_PATH, ...args], {
     encoding: "utf-8",
     timeout: 10000,
+    env: TEST_BASH_ENV,
   });
   return result;
 }

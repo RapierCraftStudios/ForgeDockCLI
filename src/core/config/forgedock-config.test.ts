@@ -5,9 +5,29 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { modelWithThinking, readForgeDockConfig, updateForgeDockConfig } from "./forgedock-config.js";
+import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, updateForgeDockConfig } from "./forgedock-config.js";
 
 describe("ForgeDock Next project configuration", () => {
+  it("bootstraps a valid minimal forge.yaml exactly once", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
+    try {
+      const first = ensureForgeDockConfig(cwd);
+      assert.equal(first.created, true);
+      const raw = readFileSync(first.path, "utf8");
+      assert.match(raw, /^# forge\.yaml — ForgeDock project configuration/m);
+      assert.match(raw, /agents: \{\}/);
+      assert.match(raw, /orchestration: \{\}/);
+      assert.deepEqual(readForgeDockConfig(cwd), {});
+
+      writeFileSync(first.path, `${raw}# user content\n`);
+      const second = ensureForgeDockConfig(cwd);
+      assert.equal(second.created, false);
+      assert.match(readFileSync(second.path, "utf8"), /# user content/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("updates a managed forge.yaml section without replacing legacy configuration", () => {
     const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
     try {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const START = "# FORGEDOCK:NEXT-CONFIG:START";
@@ -34,6 +34,13 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
   }) as ForgeDockNextConfig;
 }
 
+export function ensureForgeDockConfig(cwd: string): { path: string; created: boolean } {
+  const path = join(cwd, "forge.yaml");
+  if (existsSync(path)) return { path, created: false };
+  writeConfigAtomically(path, `# forge.yaml — ForgeDock project configuration\n\n${renderManagedBlock({})}\n`);
+  return { path, created: true };
+}
+
 export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): { path: string; config: ForgeDockNextConfig } {
   validatePatch(patch);
   const path = join(cwd, "forge.yaml");
@@ -50,9 +57,7 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
   } else {
     next = `${existing.trimEnd()}\n\n${rendered}\n`;
   }
-  const temporary = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  writeFileSync(temporary, next, { encoding: "utf8", mode: 0o600 });
-  renameSync(temporary, path);
+  writeConfigAtomically(path, next);
   return { path, config };
 }
 
@@ -77,12 +82,15 @@ function managedBlock(raw: string): string | undefined {
 }
 
 function renderManagedBlock(config: ForgeDockNextConfig): string {
-  const lines = [START, "next:", "  agents:"];
+  const hasAgents = config.workerModel !== undefined || config.workerThinking !== undefined
+    || config.reviewerModel !== undefined || config.reviewerThinking !== undefined;
+  const hasOrchestration = config.maxParallel !== undefined || config.autoMerge !== undefined;
+  const lines = [START, "next:", hasAgents ? "  agents:" : "  agents: {}"];
   if (config.workerModel !== undefined) lines.push(`    worker_model: ${JSON.stringify(config.workerModel)}`);
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
   if (config.reviewerModel !== undefined) lines.push(`    reviewer_model: ${JSON.stringify(config.reviewerModel)}`);
   if (config.reviewerThinking !== undefined) lines.push(`    reviewer_thinking: ${JSON.stringify(config.reviewerThinking)}`);
-  lines.push("  orchestration:");
+  lines.push(hasOrchestration ? "  orchestration:" : "  orchestration: {}");
   if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
   if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
   lines.push(END);
@@ -129,6 +137,21 @@ function parseBoolean(value: string | undefined): boolean | undefined {
   if (value === "true") return true;
   if (value === "false") return false;
   return undefined;
+}
+
+function writeConfigAtomically(path: string, content: string): void {
+  const temporary = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600 });
+    renameSync(temporary, path);
+  } catch (error) {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // The temporary file may not have been created.
+    }
+    throw error;
+  }
 }
 
 function compact<T extends object>(value: T): T {

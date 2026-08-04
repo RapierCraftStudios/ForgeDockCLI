@@ -351,7 +351,7 @@ forgedock models</pre>
       <p class="section-intro">An orchestration worker runs the same <code>work-on</code> state machine. Orchestration adds coordination only.</p>
       <div class="grid two">
         <div class="card accent"><h3>Keep</h3><ul class="clean"><li>Explicit dependency DAG and cycle detection</li><li>One isolated worktree per active issue</li><li>Bounded concurrency and resource budgets</li><li>Predicted and observed path/component claims</li><li>Lease, heartbeat, stale-worker recovery</li><li>PR head freshness and merge sequencing</li><li>Restart/reconciliation from durable artifacts</li></ul></div>
-        <div class="card"><h3>Do not carry forward</h3><ul class="clean"><li>Recursive opportunistic cascades</li><li>Near-miss/backlog mining inside execution</li><li>Complex value/cost scoring as a model task</li><li>Model-authoritative batching or completion sweeps</li><li>Background shell dispatch as workflow control</li><li>A second set of build/review semantics</li><li>Agents writing authoritative scheduling state</li></ul></div>
+        <div class="card"><h3>Do not carry forward</h3><ul class="clean"><li>Recursive opportunistic cascades</li><li>Near-miss/backlog mining inside execution</li><li>Complex value/cost scoring as a model task</li><li>Model-authoritative batching or completion sweeps (typed concern batching remains)</li><li>Background shell dispatch as workflow control</li><li>A second set of build/review semantics</li><li>Agents writing authoritative scheduling state</li></ul></div>
       </div>
       <h3 style="margin-top:24px">Minimal scheduler</h3>
       <pre>ready = issues
@@ -364,7 +364,7 @@ forgedock models</pre>
 while (capacity.available && ready.length) {
   controller.startWorkOn(ready.shift(), isolatedWorktree());
 }</pre>
-      <p>The selected model interprets a natural-language issue query and proposes evidence-backed dependencies, priorities, and coarse path/component claims. Typed code validates the graph, rejects cycles or unselected dependencies, and materializes bounded topological batches. Claims become precise after the Build Packet (expected paths). Actual changed paths are checked before publish and before merge. A conflict blocks or serializes work; a model does not “reason away” the collision.</p>
+      <p>The selected model interprets a natural-language issue query and proposes evidence-backed dependencies, priorities, labels, affected files, and coarse path/component claims. Typed code validates the graph, rejects cycles or unselected dependencies, and derives stable serialization edges. Compatible P2/P3 review findings with the same bounded concern surface may be contracted into one durable batch issue and one work-on agent; successful completion projects the batch Outcome to and closes every member. “Batch” refers only to that efficiency work unit—not a DAG level. The scheduler streams the live ready set as each node's own predecessors complete. Claims become precise after the Build Packet (expected paths). Actual changed paths are checked before publish and before merge. A conflict blocks or serializes work; a model does not “reason away” the collision.</p>
       <div class="callout"><strong>Decomposition is explicit, not a cascade.</strong> Child issues can be offered for enqueueing, but the scheduler does not recursively discover and launch unrelated work unless a user-configured query includes it.</div>
     </section>
 
@@ -405,7 +405,8 @@ while (capacity.available && ready.length) {
       <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
-        <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. ForgeDock Next updates only a marker-bounded managed section for role models, thinking, concurrency, and merge defaults.</p></div>
+        <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
+        <div class="card"><h3>Checkpoint-native resume</h3><p>Interrupted build nodes recover the deterministic retained worktree and frozen Build Packet. Same-session DAG resume preserves completed nodes, retries only failed or blocked nodes, and immediately restores streaming successor dispatch.</p></div>
         <div class="card"><h3><code>FORGE.md</code></h3><p>Explicit user-maintained project and agentic preferences, loaded by the terminal and bounded workflow roles while remaining subordinate to current intent.</p></div>
         <div class="card"><h3><code>devdocs/</code></h3><p>Obsidian-compatible reference notes with anchors, links, and backlinks. A compact scorer retrieves only relevant summaries; notes never authorize actions or override typed contracts.</p></div>
       </div>

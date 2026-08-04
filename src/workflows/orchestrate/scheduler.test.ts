@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildScheduleBatches, claimsConflict, InMemoryLeaseRepository, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
+import { buildSchedulePreview, claimsConflict, InMemoryLeaseRepository, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -28,14 +28,39 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("d"), "completed");
   });
 
-  it("materializes deterministic dependency waves and separates conflicting claims", () => {
-    const batches = buildScheduleBatches([
+  it("materializes claim conflicts as stable DAG edges instead of static batches", () => {
+    const materialized = materializeClaimDependencies([
       { id: "a", issue: 1, priority: 2, dependencies: [], claims: ["src/core"] },
       { id: "b", issue: 2, priority: 1, dependencies: [], claims: ["src/core/state"] },
       { id: "c", issue: 3, priority: 1, dependencies: [], claims: ["docs"] },
       { id: "d", issue: 4, priority: 1, dependencies: ["a"], claims: ["src/api"] },
-    ], 3);
-    assert.deepEqual(batches.map((batch) => batch.map((item) => item.id)), [["b", "c"], ["a"], ["d"]]);
+    ]);
+    assert.deepEqual(materialized.edges.map((edge) => [edge.predecessor, edge.successor]), [["a", "b"]]);
+    const preview = buildSchedulePreview(materialized.items);
+    assert.deepEqual(preview.initialReady.map((item) => item.id), ["c", "a"]);
+    assert.equal(preview.criticalPath.length, 2);
+    assert.equal(preview.criticalPath[0]?.id, "a");
+  });
+
+  it("streams a newly ready successor without waiting for an unrelated ready node", async () => {
+    const releases = new Map<string, () => void>();
+    const started: string[] = [];
+    const schedule = runSchedule([
+      { id: "a", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "b", issue: 2, priority: 1, dependencies: [], claims: [] },
+      { id: "d", issue: 4, priority: 1, dependencies: ["a"], claims: [] },
+    ], 2, async (item) => {
+      started.push(item.id);
+      await new Promise<void>((resolve) => releases.set(item.id, resolve));
+    });
+    await sleep(5);
+    assert.deepEqual(started, ["a", "b"]);
+    releases.get("a")?.();
+    await sleep(5);
+    assert.deepEqual(started, ["a", "b", "d"]);
+    releases.get("b")?.();
+    releases.get("d")?.();
+    await schedule;
   });
 
   it("blocks dependents when a prerequisite fails", async () => {

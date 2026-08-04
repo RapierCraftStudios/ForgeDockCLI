@@ -54,6 +54,27 @@ test("native background controller records output and completion without blockin
   await tasks.shutdown();
 });
 
+test("native background controller does not inherit the invoking worker role", async () => {
+  const previous = process.env.PI_SUBAGENT_CHILD_AGENT;
+  process.env.PI_SUBAGENT_CHILD_AGENT = "forgedock-issue-worker";
+  const { cwd, tasks, ctx } = fixture();
+  try {
+    const record = tasks.start({
+      command: process.execPath,
+      args: ["-e", "console.log(process.env.PI_SUBAGENT_CHILD_AGENT ?? 'clean')"],
+      cwd,
+      ctx,
+    });
+    await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
+    assert.match(tasks.output(record.id), /clean/);
+    assert.doesNotMatch(tasks.output(record.id), /forgedock-issue-worker/);
+  } finally {
+    await tasks.shutdown();
+    if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD_AGENT;
+    else process.env.PI_SUBAGENT_CHILD_AGENT = previous;
+  }
+});
+
 test("native background cancellation terminates the owned task", async () => {
   const { cwd, tasks, ctx } = fixture();
   const record = tasks.start({

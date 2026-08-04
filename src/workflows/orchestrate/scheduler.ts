@@ -18,42 +18,60 @@ export interface ScheduleResult {
   startOrder: string[];
 }
 
-export function buildScheduleBatches(items: readonly ScheduledWorkItem[], maxParallel: number): ScheduledWorkItem[][] {
-  if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
+export interface ClaimSerializationEdge {
+  predecessor: string;
+  successor: string;
+  overlappingClaims: string[];
+}
+
+export interface SchedulePreview {
+  initialReady: ScheduledWorkItem[];
+  criticalPath: ScheduledWorkItem[];
+}
+
+export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]): {
+  items: ScheduledWorkItem[];
+  edges: ClaimSerializationEdge[];
+} {
   validateGraph(items);
-  const remaining = new Map(items.map((item) => [item.id, item]));
-  const completed = new Set<string>();
-  const batches: ScheduledWorkItem[][] = [];
+  const mutable = new Map(items.map((item) => [item.id, { ...item, dependencies: [...item.dependencies], claims: [...item.claims] }]));
+  const ordered = [...mutable.values()].sort((left, right) => left.issue - right.issue || left.id.localeCompare(right.id));
+  const edges: ClaimSerializationEdge[] = [];
 
-  while (remaining.size) {
-    const ready = [...remaining.values()]
-      .filter((item) => item.dependencies.every((dependency) => completed.has(dependency)))
-      .sort((left, right) => left.priority - right.priority || left.issue - right.issue);
-    if (!ready.length) throw new Error("Orchestration graph has no schedulable items");
-
-    const waveIds: string[] = [];
-    const pending = [...ready];
-    while (pending.length) {
-      const batch: ScheduledWorkItem[] = [];
-      for (let index = 0; index < pending.length && batch.length < maxParallel;) {
-        const candidate = pending[index]!;
-        if (batch.some((active) => claimsConflict(candidate.claims, active.claims))) {
-          index++;
-          continue;
-        }
-        batch.push(candidate);
-        pending.splice(index, 1);
-      }
-      if (!batch.length) batch.push(pending.shift()!);
-      batches.push(batch);
-      waveIds.push(...batch.map((item) => item.id));
-    }
-    for (const id of waveIds) {
-      remaining.delete(id);
-      completed.add(id);
+  for (let leftIndex = 0; leftIndex < ordered.length; leftIndex++) {
+    for (let rightIndex = leftIndex + 1; rightIndex < ordered.length; rightIndex++) {
+      const left = ordered[leftIndex]!;
+      const right = ordered[rightIndex]!;
+      if (!claimsConflict(left.claims, right.claims)) continue;
+      if (dependsTransitively(mutable, right.id, left.id) || dependsTransitively(mutable, left.id, right.id)) continue;
+      right.dependencies.push(left.id);
+      edges.push({ predecessor: left.id, successor: right.id, overlappingClaims: overlappingClaims(left.claims, right.claims) });
     }
   }
-  return batches;
+
+  const result = items.map((item) => mutable.get(item.id)!);
+  validateGraph(result);
+  return { items: result, edges };
+}
+
+export function buildSchedulePreview(items: readonly ScheduledWorkItem[]): SchedulePreview {
+  validateGraph(items);
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const initialReady = items
+    .filter((item) => item.dependencies.length === 0)
+    .sort((left, right) => left.priority - right.priority || left.issue - right.issue);
+  const paths = new Map<string, ScheduledWorkItem[]>();
+  const pathTo = (item: ScheduledWorkItem): ScheduledWorkItem[] => {
+    const known = paths.get(item.id);
+    if (known) return known;
+    const predecessors = item.dependencies.map((dependency) => pathTo(byId.get(dependency)!));
+    const longest = predecessors.sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
+    const path = [...longest, item];
+    paths.set(item.id, path);
+    return path;
+  };
+  const criticalPath = items.map(pathTo).sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
+  return { initialReady, criticalPath };
 }
 
 export async function runSchedule(
@@ -123,6 +141,27 @@ function claimOverlaps(left: string, right: string): boolean {
 
 function normalizeClaim(claim: string): string {
   return claim.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "").toLowerCase();
+}
+
+function overlappingClaims(left: readonly string[], right: readonly string[]): string[] {
+  return [...new Set(left.flatMap((a) => right.filter((b) => claimOverlaps(a, b)).map((b) => `${a} ↔ ${b}`)))];
+}
+
+function dependsTransitively(items: ReadonlyMap<string, ScheduledWorkItem>, itemId: string, dependencyId: string): boolean {
+  const pending = [...(items.get(itemId)?.dependencies ?? [])];
+  const visited = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (current === dependencyId) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(items.get(current)?.dependencies ?? []));
+  }
+  return false;
+}
+
+function comparePaths(left: readonly ScheduledWorkItem[], right: readonly ScheduledWorkItem[]): number {
+  return left.map((item) => item.issue).join(",").localeCompare(right.map((item) => item.issue).join(","));
 }
 
 export function validateGraph(items: readonly ScheduledWorkItem[]): void {

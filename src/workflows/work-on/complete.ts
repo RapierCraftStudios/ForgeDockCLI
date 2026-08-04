@@ -12,6 +12,7 @@ export async function completeWorkItem(
     pullRequest: PullRequestSnapshot;
     verdict: DurableArtifact<"ReviewVerdict">;
     autoMerge: boolean;
+    childIssues?: readonly number[];
   },
   dependencies: { host: ForgeHost; artifacts: ArtifactRepository; runs: RunRepository },
 ): Promise<{ run: RunState; awaitingHuman: boolean; outcome?: DurableArtifact<"Outcome"> }> {
@@ -35,6 +36,8 @@ export async function completeWorkItem(
     run = merged.state;
     const issue = run.subject.issue;
     if (!issue) throw new Error("work-on completion requires an issue subject");
+    const childIssues = [...new Set(input.childIssues ?? [])]
+      .filter((child) => Number.isSafeInteger(child) && child > 0 && child !== issue);
     const outcome = createArtifact({
       kind: "Outcome",
       runId: run.runId,
@@ -45,9 +48,26 @@ export async function completeWorkItem(
         reason: `Merged PR #${pullRequest.number} after independent review of ${pullRequest.headSha}.`,
         finalSha: pullRequest.headSha,
         prUrl: pullRequest.url,
-        childIssues: [],
+        childIssues: childIssues.map((child) => `issue-${child}`),
       },
     });
+    for (const childIssue of childIssues) {
+      await dependencies.host.closeIssue(run.subject.repo, childIssue, `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`);
+      await dependencies.artifacts.append(createArtifact({
+        kind: "Outcome",
+        runId: run.runId,
+        subject: { repo: run.subject.repo, issue: childIssue },
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: {
+          status: "merged",
+          reason: `Completed as member of batch issue #${issue} by PR #${pullRequest.number}.`,
+          finalSha: pullRequest.headSha,
+          prUrl: pullRequest.url,
+          childIssues: [],
+          batchParent: issue,
+        },
+      }));
+    }
     await dependencies.artifacts.append(outcome);
     run = attachArtifact(run, "Outcome", outcome.id);
     await dependencies.host.closeIssue(run.subject.repo, issue, `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`);

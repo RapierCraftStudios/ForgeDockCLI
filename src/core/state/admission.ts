@@ -6,7 +6,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "blocked"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "building" | "blocked"; checkpoint: "build" | "verification"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -37,9 +37,17 @@ export function decideSubjectAdmission(
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
+  if (reconciled.state === "building") {
+    const intent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
+    const investigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
+    const packet = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
+    if (intent && investigation && packet) {
+      return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
+    }
+  }
   if (reconciled.state === "blocked") {
     const recoverable = latest.artifacts.some((artifact) => artifact.kind === "Outcome" && artifact.payload.status === "blocked" && artifact.payload.failureEvidence);
-    if (recoverable) return { action: "resume", runId: latest.runId, state: "blocked", artifacts: latest.artifacts };
+    if (recoverable) return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
   }
   if (options.rerun && terminalStates.has(reconciled.state)) return { action: "start" };
   if (terminalStates.has(reconciled.state)) {
@@ -49,6 +57,6 @@ export function decideSubjectAdmission(
     action: "block",
     runId: latest.runId,
     state: reconciled.state,
-    reason: `Existing run ${latest.runId} is ${reconciled.state}; resume or clean it before starting another run`,
+    reason: `Existing run ${latest.runId} is ${reconciled.state} and has no controller-supported durable resume checkpoint; reset it before starting another run`,
   };
 }

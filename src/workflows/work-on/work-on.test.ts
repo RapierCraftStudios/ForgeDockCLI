@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import type { BuilderSubmission } from "./build.js";
-import { resumeWorkOn, workOn } from "./work-on.js";
+import { resumeBuildWorkOn, resumeWorkOn, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main" };
@@ -71,6 +72,46 @@ describe("complete work-on trajectory", () => {
     assert.equal(git.removed, false);
     const outcome = artifacts.artifacts.find((artifact) => artifact.kind === "Outcome");
     assert.equal(outcome?.kind === "Outcome" ? outcome.payload.failureEvidence?.workspacePath : undefined, workspace.path);
+  });
+
+  it("resumes an interrupted building run from its frozen packet and retained worktree", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_build_resume", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({
+      kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation,
+    });
+    const packetArtifact = createArtifact({
+      kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet,
+    });
+    let run = attachArtifact(createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId }), "Intent", intent.id);
+    await runs.create(run);
+    for (const [event, artifact] of [
+      ["START_INVESTIGATION", undefined],
+      ["INVESTIGATION_CONFIRMED", investigationArtifact],
+      ["BUILD_PACKET_READY", packetArtifact],
+    ] as const) {
+      if (artifact) run = attachArtifact(run, artifact.kind, artifact.id);
+      const advanced = transition(run, event);
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    for (const artifact of [intent, investigationArtifact, packetArtifact]) await artifacts.append(artifact);
+
+    const runtime = new FakeAgentRuntime([submission, { summary: "Approved", findings: [] }]);
+    const resumed = await resumeBuildWorkOn({
+      run, intent, investigation: investigationArtifact, packet: packetArtifact,
+      workspace, baseBranch: "main", autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+
+    assert.equal(resumed.run.state, "completed");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
   });
 
   it("resumes retained verification without replaying investigation, packet authoring, or build", async () => {

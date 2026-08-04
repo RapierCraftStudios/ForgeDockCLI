@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { materializeWorkerAgent } from "./worker-agent.js";
@@ -21,6 +22,25 @@ describe("ForgeDock Pi terminal launcher", () => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^forgedock - provider-neutral software delivery terminal/m);
     assert.match(result.stdout, /forgedock \[options\]/);
+  });
+
+  it("bootstraps forge.yaml through the parent terminal launcher", () => {
+    const launcher = readFileSync(entry, "utf8");
+    assert.match(launcher, /ensureForgeDockConfig\(process\.cwd\(\)\)/);
+    assert.match(launcher, /shouldBootstrapProject\(cliArgs\)/);
+
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-launch-config-"));
+    try {
+      const result = spawnSync(process.execPath, [resolve(entry), "--list-models"], {
+        cwd,
+        encoding: "utf8",
+        env: { ...process.env, PI_OFFLINE: "1" },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(readFileSync(join(cwd, "forge.yaml"), "utf8"), /FORGEDOCK:NEXT-CONFIG:START/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("ships and invokes the GitHub App refresher without a bash path boundary", () => {

@@ -53,7 +53,16 @@ export interface GitHubIssue {
   url: string;
   state: "OPEN" | "CLOSED";
   labels: string[];
+  milestone?: { number: number; title: string };
   comments: GitHubIssueComment[];
+}
+
+export interface BatchIssueInput {
+  repo: string;
+  title: string;
+  body: string;
+  priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3";
+  milestone?: string;
 }
 
 export class GitHubClient implements ForgeHost {
@@ -76,14 +85,19 @@ export class GitHubClient implements ForgeHost {
     const resolvedRepo = repo ?? await this.resolveRepository();
     const result = await this.gh([
       "issue", "view", String(number), "--repo", resolvedRepo,
-      "--json", "number,title,body,url,state,labels",
+      "--json", "number,title,body,url,state,labels,milestone",
     ]);
-    const issue = JSON.parse(result) as Omit<GitHubIssue, "repo" | "labels" | "comments"> & { labels?: Array<{ name?: string }> };
+    const issue = JSON.parse(result) as Omit<GitHubIssue, "repo" | "labels" | "comments" | "milestone"> & {
+      labels?: Array<{ name?: string }>;
+      milestone?: { number: number; title: string } | null;
+    };
     const comments = await this.listIssueCommentSnapshots({ repo: resolvedRepo, issue: number });
+    const { milestone, ...snapshot } = issue;
     return {
-      ...issue,
+      ...snapshot,
       body: issue.body ?? "",
       labels: issue.labels?.flatMap((label) => label.name ? [label.name] : []) ?? [],
+      ...(milestone ? { milestone } : {}),
       comments,
       repo: resolvedRepo,
     };
@@ -255,6 +269,27 @@ export class GitHubClient implements ForgeHost {
   async closeIssue(repo: string, number: number, reason: string): Promise<void> {
     await this.postIssueComment({ repo, issue: number }, reason);
     await this.gh(["issue", "close", String(number), "--repo", repo]);
+  }
+
+  async materializeBatchIssue(input: BatchIssueInput): Promise<IssueSnapshot> {
+    const marker = /<!-- FORGEDOCK:BATCH ([0-9-]+) -->/.exec(input.body)?.[0];
+    if (!marker) throw new Error("Batch issue body is missing its deterministic FORGEDOCK:BATCH marker");
+    const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.state === "OPEN" && issue.body.includes(marker));
+    if (existing) return existing;
+
+    await this.gh([
+      "label", "create", "batch", "--repo", input.repo, "--color", "C2E0C6",
+      "--description", "Multiple compatible findings delivered as one verified work unit", "--force",
+    ]);
+    const createArgs = [
+      "issue", "create", "--repo", input.repo, "--title", input.title, "--body-file", "-",
+      "--label", "batch", "--label", "review-finding", "--label", input.priorityLabel,
+    ];
+    if (input.milestone) createArgs.push("--milestone", input.milestone);
+    const url = (await this.gh(createArgs, input.body)).trim();
+    const number = Number(url.split("/").at(-1));
+    if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a batch issue number");
+    return { repo: input.repo, number, title: input.title, body: input.body, url, state: "OPEN" };
   }
 
   async findOpenPullRequest(repo: string, headBranch: string): Promise<PullRequestSnapshot | undefined> {

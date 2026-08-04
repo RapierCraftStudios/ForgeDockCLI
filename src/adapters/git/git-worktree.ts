@@ -19,15 +19,35 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   }
 
   async create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace> {
-    const suffix = input.runId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(-24);
-    const branch = `forgedock/issue-${input.issue}-${suffix}`;
-    const path = resolve(this.#root, `issue-${input.issue}-${suffix}`);
-    assertInside(this.#root, path);
+    const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
     if (input.baseRef.startsWith("origin/")) {
       await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
     }
     await this.git(["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
+    await this.installDependencies(path);
+    return { path, branch, baseRef: input.baseRef };
+  }
+
+  async recover(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace> {
+    const { branch, path } = this.workspaceIdentity(input);
+    await mkdir(dirname(path), { recursive: true });
+    if (input.baseRef.startsWith("origin/")) {
+      await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
+    }
+    if (existsSync(path)) {
+      const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
+      const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
+      if (root !== path || observedBranch !== branch) {
+        throw new Error(`Retained workspace identity mismatch for ${path}: expected ${branch}, found ${observedBranch || "detached HEAD"}`);
+      }
+    } else {
+      await this.git(["worktree", "prune"], this.#repo);
+      const branchExists = await this.branchExists(branch);
+      await this.git(branchExists
+        ? ["worktree", "add", path, branch]
+        : ["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
+    }
     await this.installDependencies(path);
     return { path, branch, baseRef: input.baseRef };
   }
@@ -85,6 +105,23 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     await this.git(["worktree", "remove", "--force", workspace.path], this.#repo);
     if (workspace.branch.startsWith("forgedock/")) {
       try { await this.git(["branch", "-D", workspace.branch], this.#repo); } catch { /* branch may already be absent */ }
+    }
+  }
+
+  private workspaceIdentity(input: { runId: string; issue: number }): { branch: string; path: string } {
+    const suffix = input.runId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(-24);
+    const branch = `forgedock/issue-${input.issue}-${suffix}`;
+    const path = resolve(this.#root, `issue-${input.issue}-${suffix}`);
+    assertInside(this.#root, path);
+    return { branch, path };
+  }
+
+  private async branchExists(branch: string): Promise<boolean> {
+    try {
+      await this.git(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], this.#repo);
+      return true;
+    } catch {
+      return false;
     }
   }
 

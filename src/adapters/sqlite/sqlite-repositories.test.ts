@@ -29,6 +29,21 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("rebuilds divergent operational run state from durable authority", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const queued = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 1 }, runId: "run_rebuild" });
+      await store.create(queued);
+      const started = transition(queued, "START_INVESTIGATION");
+      await store.commit(queued.version, started.state, started.record);
+      store.rebuildRun({ ...queued, state: "building" });
+      assert.equal((await store.load(queued.runId))?.state, "building");
+      assert.deepEqual(await store.history(queued.runId), []);
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists cross-process-style leases with stale recovery", () => {
     const store = new SqliteRepositories(":memory:");
     try {

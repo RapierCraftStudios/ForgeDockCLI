@@ -13,12 +13,12 @@ class CompletionHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   snapshot = { ...openPr };
   merges = 0;
-  closes = 0;
+  closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async mergePullRequest(): Promise<void> { this.merges++; this.snapshot.state = "MERGED"; }
-  async closeIssue(): Promise<void> { this.closes++; }
+  async closeIssue(_repo: string, issue: number): Promise<void> { this.closes.push(issue); }
 }
 
 async function mergingRun(runs: InMemoryRunRepository): Promise<RunState> {
@@ -62,6 +62,22 @@ describe("merge and close authority", () => {
     assert.equal(result.run.state, "completed");
     assert.equal(result.outcome?.payload.status, "merged");
     assert.equal(host.merges, 1);
-    assert.equal(host.closes, 1);
+    assert.deepEqual(host.closes, [2]);
+  });
+
+  it("projects a successful batch Outcome to every member before closing them", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    const artifacts = new InMemoryArtifactRepository();
+    const result = await completeWorkItem({
+      run, pullRequest: openPr, verdict: verdict(run), autoMerge: true, childIssues: [7, 8, 7, 2],
+    }, { host, artifacts, runs });
+    assert.deepEqual(result.outcome?.payload.childIssues, ["issue-7", "issue-8"]);
+    assert.deepEqual(host.closes, [7, 8, 2]);
+    const childOutcomes = (await artifacts.list({ repo: "a/b", issue: 7 }, "Outcome"))
+      .filter((artifact) => artifact.kind === "Outcome");
+    assert.equal(childOutcomes[0]?.payload.status, "merged");
+    assert.match(childOutcomes[0]?.payload.reason ?? "", /batch issue #2/);
   });
 });

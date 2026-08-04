@@ -15,8 +15,9 @@ import type { AgentEvent } from "../runtime/agent-runtime.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
-import { resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
+import { parseBatchMemberIssues } from "../workflows/orchestrate/batching.js";
 import { runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 
@@ -102,7 +103,7 @@ async function workOn(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueArg = argv.find((arg) => !arg.startsWith("-"));
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge] [--resume] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
@@ -118,7 +119,9 @@ async function workOn(argv: string[]): Promise<void> {
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
+  const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
   const subjectEvidence = issueSubjectEvidence(issue);
+  if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
   if (dependencyIssues.includes(issue.number)) throw new Error(`Issue #${issue.number} cannot depend on itself`);
   for (const dependency of dependencyIssues) {
     const dependencyArtifacts = await authoritativeArtifacts.list({ repo: issue.repo, issue: dependency });
@@ -144,9 +147,12 @@ async function workOn(argv: string[]): Promise<void> {
       return;
     }
     if (admission.action === "block") {
-      throw new Error(`${admission.reason}. Resolve or resume the existing run before starting another.`);
+      throw new Error(admission.reason);
     }
     if (admission.action === "resume") {
+      if (!argv.includes("--resume")) {
+        throw new Error(`Existing run ${admission.runId} has a recoverable ${admission.checkpoint} checkpoint. Re-run with --resume to continue it; reset only if you intentionally want to abandon its durable work`);
+      }
       resumeRunId = admission.runId;
       resumeArtifacts = admission.artifacts;
     }
@@ -183,50 +189,89 @@ async function workOn(argv: string[]): Promise<void> {
     ...(model !== undefined ? { model } : {}),
   });
   const onAgentEvent = (event: AgentEvent) => writeAgentEvent(event);
+  const leaseItem = `issue-${issue.number}`;
+  const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
+  const leaseController = new AbortController();
+  let leaseToken: string | undefined;
+  let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
+    const lease = store.acquire(leaseItem, leaseOwner, 60_000);
+    if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
+    leaseToken = lease.token;
+    leaseHeartbeat = setInterval(() => {
+      try { store.heartbeat(leaseItem, lease.token, 60_000); }
+      catch (error) { leaseController.abort(error); }
+    }, 20_000);
+
     if (resumeRunId) {
+      const admission = decideSubjectAdmission(resumeArtifacts);
+      if (admission.action !== "resume" || admission.runId !== resumeRunId) {
+        throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
+      }
       const runArtifacts = resumeArtifacts.filter((artifact) => artifact.runId === resumeRunId);
       const intentArtifact = latestArtifact(runArtifacts, "Intent");
       const investigation = latestArtifact(runArtifacts, "Investigation");
       const packet = latestArtifact(runArtifacts, "BuildPacket");
-      const outcome = latestArtifact(runArtifacts, "Outcome");
-      if (!intentArtifact || !investigation || !packet || !outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
-        throw new Error(`Run ${resumeRunId} is blocked but does not contain a complete retained verification checkpoint`);
+      if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
+        throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
+      const checkpointArtifact = admission.checkpoint === "verification" ? latestArtifact(runArtifacts, "Outcome") : packet;
+      const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
+      for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
+      const recoveredRun = {
+        schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
+        state: admission.state, attempt: 1, version: 0,
+        createdAt: intentArtifact.createdAt, updatedAt: checkpointArtifact?.createdAt ?? packet.createdAt,
+        artifactIds,
+        ...(admission.state === "blocked" && checkpointArtifact?.kind === "Outcome" ? { blockedReason: checkpointArtifact.payload.reason } : {}),
+      };
       let run = await store.load(resumeRunId);
       if (!run) {
-        const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
-        for (const artifact of runArtifacts) {
-          artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
-        }
-        run = {
-          schema: "forgedock.run/v1", runId: resumeRunId, workflow: "work-on", subject,
-          state: "blocked", attempt: 1, version: 0,
-          createdAt: intentArtifact.createdAt, updatedAt: outcome.createdAt,
-          artifactIds, blockedReason: outcome.payload.reason,
-        };
-        await store.create(run);
+        await store.create(recoveredRun);
+        run = recoveredRun;
+      } else if (run.state !== admission.state) {
+        process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${run.state}) from durable GitHub state (${admission.state})\n`);
+        store.rebuildRun(recoveredRun);
+        run = recoveredRun;
       }
-      const workspace = {
-        path: outcome.payload.failureEvidence.workspacePath,
-        branch: outcome.payload.failureEvidence.branch,
-        baseRef: `origin/${localRepository.defaultBranch}`,
-      };
-      if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
-      const verification = discoverVerificationCommands(process.cwd(), workspace.baseRef);
+
+      const baseRef = `origin/${localRepository.defaultBranch}`;
       const git = new GitWorktreeManager(process.cwd());
       const verifier = new ProcessVerificationRunner();
-      const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef: workspace.baseRef });
-      process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from retained verification workspace; investigation and build will not replay\n`);
-      const result = await resumeWorkOn({
-        run, intent: intentArtifact, investigation, packet, outcome, workspace,
+      let workspace;
+      let outcome: DurableArtifact<"Outcome"> | undefined;
+      if (admission.checkpoint === "build") {
+        workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef });
+      } else {
+        outcome = latestArtifact(runArtifacts, "Outcome");
+        if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
+          throw new Error(`Run ${resumeRunId} does not contain complete retained verification evidence`);
+        }
+        workspace = {
+          path: outcome.payload.failureEvidence.workspacePath,
+          branch: outcome.payload.failureEvidence.branch,
+          baseRef,
+        };
+        if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
+      }
+      const verification = discoverVerificationCommands(process.cwd(), baseRef);
+      const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
+      process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
+      const common = {
+        run, intent: intentArtifact, investigation, packet, workspace,
         baseBranch: localRepository.defaultBranch, verification, baselineChecks,
         subjectEvidence,
+        ...(batchMembers.length ? { batchMembers } : {}),
         autoMerge: argv.includes("--auto-merge"),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
-      }, { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent });
+        signal: leaseController.signal,
+      };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent };
+      const result = admission.checkpoint === "build"
+        ? await resumeBuildWorkOn(common, dependencies)
+        : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
       process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
       if (result.run.state !== "completed") process.exitCode = 2;
@@ -239,6 +284,7 @@ async function workOn(argv: string[]): Promise<void> {
         intent, priorArtifacts, cwd: process.cwd(),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
+        signal: leaseController.signal,
       }, { runtime, artifacts, runs, decomposer: github, onAgentEvent });
       process.stdout.write(`\n${renderArtifactMarkdown(result.investigation)}\n\n`);
       process.stdout.write(`${statusGlyph("passed", mode)} Investigation committed · run state: ${result.run.state}${dryRun ? " · dry run (not published)" : ""}\n`);
@@ -260,9 +306,11 @@ async function workOn(argv: string[]): Promise<void> {
       verification,
       baselineChecks,
       subjectEvidence,
+      ...(batchMembers.length ? { batchMembers } : {}),
       autoMerge: argv.includes("--auto-merge"),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
+      signal: leaseController.signal,
     }, {
       runtime, artifacts, runs,
       git,
@@ -274,6 +322,8 @@ async function workOn(argv: string[]): Promise<void> {
     process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Run ${result.run.runId} · ${result.run.state}${suffix}\n`);
     if (result.run.state !== "completed") process.exitCode = 2;
   } finally {
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+    if (leaseToken) store.release(leaseItem, leaseToken);
     await runtime.close();
     store.close();
   }
@@ -402,7 +452,23 @@ async function orchestrate(argv: string[]): Promise<void> {
           return;
         }
         if (admission.action === "block") {
-          throw new Error(`${admission.reason}. Use status/resume, clean the stale state, or pass --rerun explicitly.`);
+          throw new Error(admission.reason);
+        }
+        if (admission.action === "resume") {
+          clearInterval(heartbeat);
+          store.release(item.id, lease.token);
+          const resumeArgs = [String(item.issue), "--repo", repository.repo, "--resume"];
+          const dependencies = item.dependencies.map(issueNumberFromScheduledId);
+          if (dependencies.length) resumeArgs.push("--depends-on", dependencies.join(","));
+          if (argv.includes("--auto-merge")) resumeArgs.push("--auto-merge");
+          if (provider !== undefined) resumeArgs.push("--provider", provider);
+          if (model !== undefined) resumeArgs.push("--model", model);
+          await workOn(resumeArgs);
+          const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
+          outcomes.set(item.id, resumed.state);
+          if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; dependents remain blocked`);
+          process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
+          return;
         }
         const issue = await github.getIssue(item.issue, repository.repo);
         const intent = createArtifact({
@@ -533,6 +599,12 @@ function option(argv: string[], name: string): string | undefined {
   return value;
 }
 
+function issueNumberFromScheduledId(id: string): number {
+  const match = /^issue-(\d+)$/.exec(id);
+  if (!match) throw new Error(`Invalid scheduled issue dependency: ${id}`);
+  return Number(match[1]);
+}
+
 function parseIssueNumbers(value: string | undefined): number[] {
   if (!value) return [];
   const values = value.split(",").map((item) => item.trim());
@@ -550,7 +622,7 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--auto-merge] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--auto-merge] [--resume] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");

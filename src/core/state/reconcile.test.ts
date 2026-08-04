@@ -34,4 +34,13 @@ describe("GitHub artifact reconciliation", () => {
     assert.equal(result.state, "blocked");
     assert.match(result.warnings[0] ?? "", /no approving/);
   });
+
+  it("accepts a controller-projected batch-member outcome without duplicating the parent review chain", () => {
+    const outcome = createArtifact({
+      ...common,
+      kind: "Outcome",
+      payload: { status: "merged", reason: "completed by batch", finalSha: sha, childIssues: [], batchParent: 20 },
+    });
+    assert.equal(reconcileArtifacts([outcome] as DurableArtifact[]).state, "completed");
+  });
 });

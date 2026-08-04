@@ -9,6 +9,7 @@ import {
   HUMAN_DECISION_TOOL,
   MEMORY_SEARCH_TOOL,
   MEMORY_TOOL,
+  ORCHESTRATION_RESUME_TOOL,
   WORKFLOW_TOOLS,
   activateOnly,
   buildNativeCommandPrompt,
@@ -31,7 +32,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     }
     backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
-    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL]);
+    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, ORCHESTRATION_RESUME_TOOL]);
     if (ctx.mode !== "tui") return;
     ctx.ui.setTitle(`ForgeDock — ${ctx.cwd}`);
     ctx.ui.setStatus("forgedock", `◆ ${FORGEDOCK_NATIVE_RUNTIME} · GitHub authoritative`);
@@ -81,7 +82,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
         return;
       }
       activateOnly(pi, [CONFIG_TOOL]);
-      pi.sendUserMessage(`The user asked ForgeDock to update project configuration: ${request}\nInterpret the preference, map model names to exact provider/model identifiers, and call ${CONFIG_TOOL} exactly once. Preserve unrelated forge.yaml content.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+      pi.sendUserMessage(`The user asked ForgeDock to update project configuration: ${request}\nInterpret the preference and call ${CONFIG_TOOL} exactly once. Pass friendly model names through to the tool for live-catalog resolution; when the user says all subagents, set both through subagentModel/subagentThinking. Preserve unrelated forge.yaml content.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
     },
   });
 
@@ -154,7 +155,9 @@ function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
         ctx.ui.notify(workflowUsage(workflow), "warning");
         return;
       }
-      if (!await confirmWorkflow(workflow, normalized, ctx)) return;
+      // Orchestration confirms the resolved DAG and proposed work-unit batches inside
+      // its native tool; a pre-resolution confirmation would be both vague and duplicate.
+      if (workflow !== "orchestrate" && !await confirmWorkflow(workflow, normalized, ctx)) return;
       await queueNativeWorkflow(pi, workflow, normalized, ctx);
     },
   });

@@ -8,13 +8,14 @@
 ### Added
 
 - Provider-neutral typed ForgeDock runtime with durable v2 workflow artifacts, guarded state transitions, isolated worktrees, deterministic verification, GitHub projection, reconciliation, and resumable verification checkpoints.
-- ForgeDock-branded Pi terminal with lazily activated semantic workflow tools, supervised parallel issue workers, visible nested reviewer agents, and recommended multiple-choice human checkpoints.
+- ForgeDock-branded Pi terminal with lazily activated semantic workflow tools, supervised parallel issue workers, visible nested reviewer agents, and evidence-backed human decision checkpoints.
 - Source-pinned ForgeDock Pi fork and packaged runtime staging with explicit provenance and fork policy.
 - Isolated live GitHub lifecycle probes covering investigation, Build Packet creation, build, verification, PR publication, parallel independent review, merge, closure, and cleanup.
-- Evidence-backed orchestration DAGs with deterministic topological batching, priority ordering, conflict claims, and authoritative prerequisite admission.
-- Natural-language ForgeDock Next configuration updates in a managed `forge.yaml` section.
+- Evidence-backed orchestration DAGs with deterministic priority ordering, claim-derived serialization edges, streaming ready-set dispatch, authoritative prerequisite admission, and real P2/P3 concern batching into one batch issue/work-on unit.
+- Automatic minimal `forge.yaml` bootstrap on normal parent-terminal launch, plus natural-language ForgeDock Next configuration with live-catalog model alias resolution and one setting for all worker/reviewer subagents.
 - `FORGE.md` project guidance plus token-bounded, Obsidian-compatible `devdocs/` memory retrieval with anchors, links, and backlinks.
 - Native session-scoped background controller tasks for direct work/review runs, with task IDs, bounded log inspection, passive completion notices, cancellation, and shutdown cleanup—without another runtime dependency.
+- A dependency-free, pi-native decision interview inspired by pi-ask: tabbed single/multi/preview questions, evidence-backed recommendations, number-key selection, inline custom answers, question/option notes, dirty-dismiss protection, and a Submit/Elaborate/Cancel review step.
 
 ### Changed
 
@@ -31,6 +32,9 @@
 
 ### Fixed
 
+- Controllers and verification commands now cross an explicit environment boundary that removes inherited Pi subagent role/routing variables. Windows verification also resolves Git Bash deterministically instead of depending on whether headed `npx forgedock` inherited Git Bash, WSL, or System32 first on PATH.
+- Interrupted orchestration nodes at `building` now recover their deterministic worktree and frozen Build Packet automatically. The supervisor retains a native same-session DAG resume tool that retries only failed/blocked nodes, preserves completed nodes, and no longer offers build runs a verification-only resume path.
+- `/orchestrate` no longer presents static topological phases as “batches” or launches them as a barrier chain. Batch now means an efficiency work unit that aggregates compatible findings; DAG nodes stream as their own predecessors complete, and successful batch completion projects Outcomes to and closes every member issue.
 - Delivery and review worktrees now install their own lockfile-pinned dependencies before agents or verification run, preventing false baseline/build failures from missing modules.
 - Process-verifier tests use isolated leases so ForgeDock can verify its own test suite without recursively waiting on the outer machine-wide verification lock.
 - BuildResult acceptance evidence now carries controller-observed issue body, labels, and prerequisite-admission Outcomes/timestamps, so independent reviewers can verify GitHub-metadata and dependency-ordering criteria instead of treating repository checks as evidence.

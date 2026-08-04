@@ -28,6 +28,14 @@ describe("workflow state machine", () => {
     assert.equal(transition(started, "INVESTIGATION_DECOMPOSED").state.state, "decomposed");
   });
 
+  it("records a new attempt when resuming an interrupted build", () => {
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY"] as const) run = transition(run, event).state;
+    const resumed = transition(run, "RESUME_BUILD").state;
+    assert.equal(resumed.state, "building");
+    assert.equal(resumed.attempt, 2);
+  });
+
   it("resumes a retained verification workspace without replaying investigation or build", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
     for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_FAILED"] as const) {

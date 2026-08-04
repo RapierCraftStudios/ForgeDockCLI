@@ -28,6 +28,7 @@ export type TransitionEvent =
   | "INVESTIGATION_DECOMPOSED"
   | "BUILD_PACKET_READY"
   | "BUILD_COMPLETED"
+  | "RESUME_BUILD"
   | "VERIFICATION_PASSED"
   | "VERIFICATION_FAILED"
   | "RESUME_VERIFICATION"
@@ -79,7 +80,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     CANCEL: "cancelled",
   },
   preparing: { BUILD_PACKET_READY: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
-  building: { BUILD_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  building: { BUILD_COMPLETED: "verifying", RESUME_BUILD: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   verifying: {
     VERIFICATION_PASSED: "publishing",
     VERIFICATION_FAILED: "blocked",
@@ -151,7 +152,7 @@ export function transition(
     updatedAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
-  if (event === "RESUME_VERIFICATION") {
+  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

@@ -8,6 +8,8 @@ install: core
 
 ## Phase 4: Streaming DAG Execution
 
+**Resume rule:** when the operator says “resume” after a failed/blocked scheduling attempt, preserve nodes already proven complete and retry only failed/blocked nodes. Each retry must enter `/work-on` through its durable phase checkpoint; an interrupted `building` node continues from its frozen Build Packet and retained worktree. Never answer with a generic “resume or clean” choice unless typed admission has positively classified the checkpoint as non-recoverable.
+
 **Entry requires `phase-3-dependency.md`'s Step 3D.6 completion gate to have passed.** <!-- Added: forge#1913 --> Every step below (budget init, dispatch, dependency resolution) reads `ISSUES[]`, `PREDECESSORS[]`, `ISSUE_DOMAIN[]`, `ISSUE_SCORE[]`, `ISSUE_COST_ESTIMATE[]`, and `ISSUE_HAS_PRIOR[]` as authoritative Phase 3 output — none of these are re-derived here. If Phase 4 is being entered without having actually run Phase 3's Steps 3A–3E.5 in this session (e.g. a fresh session resuming mid-batch), reconstruct from GitHub via the "Orchestrator state reconstruction on wake / after compaction" procedure in `phase-3-dependency.md` rather than assuming these variables are already populated.
 
 ### Step 4A-pre.-1: Lease gate (MANDATORY, before any dispatch) <!-- Added: forge#2627 -->
@@ -2526,7 +2528,7 @@ Finding #${FINDING_NUM} has no **Code branch** annotation and its parent PR #${R
 done
 ```
 
-**Concern-level batching for queued P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
+**Concern-level batching for queued P2/P3 findings (MANDATORY check before dispatch):** <!-- Added: forge#1818 -->
 
 Cascade-spawned findings collected within a single `/orchestrate` run must be reconsidered against the complete open, unbatched, undispatched candidate registry, not only `QUEUED_FINDINGS` from this completion cycle. At initial resolution and after every five completions (or whenever `DEFERRED_FINDINGS` reaches `MAX_CONCURRENT`), collect retained ungrouped candidates, new findings, and open batch membership; call `planP3BatchGroups()` with that registry and `batchExclusionReason()` danger-zone inputs. Execute returned `extensions` before new groups, retain `ungrouped` members for the next sweep, and record group kinds or exclusion predicates in the run summary. <!-- Added: forge#2858; extended: forge#2851, forge#2852 -->
 
@@ -2600,9 +2602,9 @@ for FINDING_NUM in "${BATCHING_CANDIDATES[@]}"; do
     or ([.labels[]] | any(. == "billing" or . == "needs-human" or . == "blocked" or . == "operator-only"))
   ' >/dev/null && continue
 
-  # Only P3 findings are eligible (P1/P2 already dispatched individually above).
-  # Schema-tolerant: matches canonical priority:P3 or bare P3 (forge#2232).
-  echo "$FINDING_DATA" | jq -e '[.labels[]] | any(test("^(priority:)?P3$"))' >/dev/null || continue
+  # P2/P3 findings are eligible; P0/P1 keep the latency-sensitive individual path.
+  # Schema-tolerant: matches canonical priority:P2/P3 or bare P2/P3 (forge#2232).
+  echo "$FINDING_DATA" | jq -e '[.labels[]] | any(test("^(priority:)?P[23]$"))' >/dev/null || continue
 
   FINDING_FILE=$(echo "$FINDING_DATA" | jq -r '.body' | grep -oE '`[^`]+\.(py|tsx?|jsx?|sql|json|ya?ml|sh|md)`' | head -1 | tr -d '`')
   [ -z "$FINDING_FILE" ] && continue
@@ -2643,9 +2645,12 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
 
     MEMBER_LINES=""
     BATCH_MEMBER_GENERATION=1
+    BATCH_PRIORITY="P3"
     GEN2_MEMBER_LINES=""
     for M in "${CHUNK[@]}"; do
-      MTITLE=$(gh issue view "$M" -R {GH_REPO} --json title --jq '.title' 2>/dev/null || echo "")
+      MEMBER_DATA=$(gh issue view "$M" -R {GH_REPO} --json title,labels 2>/dev/null || echo '{}')
+      MTITLE=$(echo "$MEMBER_DATA" | jq -r '.title // ""')
+      echo "$MEMBER_DATA" | jq -e '[.labels[].name] | any(test("^(priority:)?P2$"))' >/dev/null 2>&1 && BATCH_PRIORITY="P2"
       MEMBER_LINES="${MEMBER_LINES}- [ ] #${M}: ${MTITLE}"$'\n'
       MEMBER_GENERATION="${FINDING_GENERATIONS[$M]:-1}"
       if [ "$MEMBER_GENERATION" -gt "$BATCH_MEMBER_GENERATION" ]; then
@@ -2666,7 +2671,7 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
     # a GENUINE non-member duplicate. --exclude narrows the candidate set; it is NOT a
     # --force equivalent.
     CHUNK_LIST=$(IFS=,; echo "${CHUNK[*]}")
-    PROPOSED_BATCH_TITLE="fix(batch): P3 review findings — ${SAFE_SURFACE_AREA} (same-run batch)"
+    PROPOSED_BATCH_TITLE="fix(batch): P2/P3 review findings — ${SAFE_SURFACE_AREA} (same-run batch)"
     DEDUP_RESULT=$(scripts/issue-dedup.sh "$PROPOSED_BATCH_TITLE" {GH_FLAG} --exclude "$CHUNK_LIST" 2>&1)
     DEDUP_EXIT=$?
 
@@ -2684,7 +2689,7 @@ for FILE in "${!SURFACE_FILE_MEMBERS[@]}"; do
     CREATE_BODY="$(cat <<BATCH_EOF
 ## Problem
 
-Batch of P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered mid-run by phase-4-execution.md to reduce per-finding pipeline overhead.
+Batch of P2/P3 review findings in **${SAFE_SURFACE_AREA}** (same file), clustered mid-run by phase-4-execution.md to reduce per-finding pipeline overhead.
 
 ## Member Findings
 
@@ -2711,7 +2716,7 @@ BATCH_EOF
 <!-- issue-create-token:${CREATE_TOKEN} -->"
     CREATE_RESPONSE=$(gh api "repos/{GH_REPO}/issues" --method POST \
       -f title="$PROPOSED_BATCH_TITLE" -f body="$CREATE_BODY" \
-      -f 'labels[]=review-finding' -f 'labels[]=priority:P3' -f 'labels[]=batch') || {
+      -f 'labels[]=review-finding' -f "labels[]=priority:${BATCH_PRIORITY}" -f 'labels[]=batch') || {
       echo "ERROR: GitHub rejected same-run batch creation; members remain queued." >&2
       continue
     }

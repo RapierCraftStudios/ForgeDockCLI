@@ -28,10 +28,13 @@ import { join, dirname, resolve } from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveTestBash, testBashEnvironment } from "./helpers/bash.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
 const FORGE_RUN_SH = join(REPO_ROOT, "scripts", "forge-run.sh");
+const TEST_BASH = resolveTestBash();
+const TEST_BASH_ENV = testBashEnvironment(process.env, TEST_BASH);
 
 /**
  * Simulated `gh` auth-failure stderr: multi-line, and includes a literal
@@ -71,12 +74,12 @@ function makeFakeGhStub(binDir) {
  * Returns { stdout, stderr, status }.
  */
 function runForgeRun(args, fakeGhBinDir) {
-  const result = spawnSync("bash", [FORGE_RUN_SH, ...args], {
+  const result = spawnSync(TEST_BASH, [FORGE_RUN_SH, ...args], {
     encoding: "utf-8",
     timeout: 15000,
     env: {
-      ...process.env,
-      PATH: `${fakeGhBinDir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}`,
+      ...TEST_BASH_ENV,
+      PATH: `${fakeGhBinDir}${process.platform === "win32" ? ";" : ":"}${TEST_BASH_ENV.PATH}`,
     },
   });
   return result;
@@ -293,7 +296,7 @@ describe("forge-run.sh ACTION_ESCAPED — routed through json_str() (forge#2265)
       writeFileSync(harnessPath, harness, "utf-8");
       chmodSync(harnessPath, 0o755);
 
-      const result = spawnSync("bash", [harnessPath], { encoding: "utf-8", timeout: 15000 });
+      const result = spawnSync(TEST_BASH, [harnessPath], { encoding: "utf-8", timeout: 15000, env: TEST_BASH_ENV });
       assert.equal(result.status, 0, `harness script failed: ${result.stderr}`);
 
       const escaped = result.stdout;

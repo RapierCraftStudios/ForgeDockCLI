@@ -96,7 +96,11 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] In-memory and SQLite lease ownership, heartbeat, expiry, and stale recovery semantics
 - [x] Explicit issue-set CLI and dry-run plan
 - [x] Natural-language issue discovery produces a typed evidence-backed DAG with priorities, dependencies, and path/component claims
-- [x] Visible asynchronous topological batches preserve bounded concurrency and conflict serialization
+- [x] Visible asynchronous workers stream the live DAG ready set without static topological phase barriers
+- [x] Same-session DAG resume preserves completed nodes and retries failed/blocked nodes through durable work-on checkpoint recovery
+- [x] Interrupted building runs recover their deterministic retained worktree and continue from the frozen Build Packet
+- [x] Compatible P2/P3 review findings sharing a bounded concern surface contract into one durable batch issue and one work-on agent
+- [x] Successful batch completion projects a typed merged Outcome to each member before closing the member issues
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
 - [x] Durable same-checkout cross-process leases and heartbeats
 - [ ] Cross-machine/GitHub-backed lease coordination
@@ -115,7 +119,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Inject controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands
 - [x] Expose one semantic native tool per command, activate only the invoked workflow schema, and let the selected model resolve natural-language intent without runtime Markdown loading
 - [x] Bundle pinned `pi-subagents`, launch visible parallel issue workers, and preserve the typed controller as the only mutation authority
-- [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated recommended-MCQ checkpoint for decisions that require the user
+- [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
 - [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
 - [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
 - [x] Materialize issue-worker definitions with an absolute child-only ForgeDock extension path so strict subagent tool allowlists can actually load `forgedock_work_on`
@@ -123,7 +127,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Refresh explicitly configured GitHub App credentials at interactive terminal startup through a packaged cross-platform Node helper
 - [x] Serialize verification, bound Node test fanout, and terminate full subprocess trees on timeout/cancellation
 - [x] Keep subagent transcripts out of delivery worktrees and reject automatic remediation outside frozen Build Packet paths
-- [x] Preserve `forge.yaml` as project configuration with an isolated ForgeDock Next managed section and natural-language `/forgedock-config` updates
+- [x] Bootstrap `forge.yaml` on parent-terminal launch and preserve it through an isolated ForgeDock Next managed section with natural-language `/forgedock-config`, live-catalog model alias resolution, and all-subagent role updates
 - [x] Load explicit `FORGE.md` project guidance in the terminal and bounded typed workflow agents
 - [x] Provide token-bounded `devdocs/` memory retrieval with anchors, wiki links, backlinks, and an explicit reference-only authority boundary
 - [x] Persist user-requested preferences and decisions through `/forgedock-remember`
@@ -132,7 +136,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [ ] Review desk
 - [ ] Orchestration board
 - [ ] Model/provider profiles and capability diagnostics
-- [x] Recommended multiple-choice human checkpoints for supervised child escalations
+- [x] Tabbed single/multi/preview decision interviews with explicit recommendations, custom answers, notes, review, and elaboration for supervised child escalations
 - [ ] Session attach and durable cross-restart child supervision
 
 ### 6. Cutover
@@ -148,7 +152,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 ## Current verification
 
 - New TypeScript build: passing.
-- New core and terminal integration tests cover typed configuration, deterministic DAG batches, prerequisite admission, FORGE.md preferences, token-bounded devdocs retrieval, links/backlinks, native background controller completion/cancellation, and the previously listed workflow/runtime boundaries, including runtime provenance/RPC diagnostics, lazy semantic-tool dispatch, least-authority issue-child tooling, visible nested reviewer delegation, supervisor escalation activation, recommended-MCQ rendering, controller streaming, resumable verification, deterministic review thresholds, a complete synthetic `work-on` trajectory across all six artifacts, GitHub reconciliation, dual issue/PR projection, workspace-escape tests, and the branded Pi fork launcher.
+- New core and terminal integration tests cover typed configuration, streaming DAG scheduling, P2/P3 work-unit contraction and member closure, prerequisite admission, FORGE.md preferences, token-bounded devdocs retrieval, links/backlinks, native background controller completion/cancellation, and the previously listed workflow/runtime boundaries, including runtime provenance/RPC diagnostics, lazy semantic-tool dispatch, least-authority issue-child tooling, visible nested reviewer delegation, supervisor escalation activation, tabbed decision-interview rendering, controller streaming, resumable verification, deterministic review thresholds, a complete synthetic `work-on` trajectory across all six artifacts, GitHub reconciliation, dual issue/PR projection, workspace-escape tests, and the branded Pi fork launcher.
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
