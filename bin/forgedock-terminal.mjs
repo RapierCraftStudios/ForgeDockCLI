@@ -33,9 +33,10 @@ if (!isSupported(process.versions.node)) {
   const extensionEntry = resolve(packageRoot, "dist", "tui", "forgedock-extension.js");
   const workerAgentModule = resolve(packageRoot, "dist", "tui", "worker-agent.js");
   const configModule = resolve(packageRoot, "dist", "core", "config", "forgedock-config.js");
+  const environmentModule = resolve(packageRoot, "dist", "runtime", "controller-environment.js");
   const workerAgentTemplate = resolve(packageRoot, "agents", "forgedock-issue-worker.md");
   const reviewerAgentTemplate = resolve(packageRoot, "agents", "forgedock-reviewer.md");
-  if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(configModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
+  if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(configModule) || !existsSync(environmentModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
     console.error("ForgeDock terminal has not been built. Run `npm run build:pi && npm run build` first.");
     process.exitCode = 1;
   } else {
@@ -49,6 +50,9 @@ if (!isSupported(process.versions.node)) {
       }
     }
     refreshConfiguredGitHubApp(packageRoot, cliArgs);
+    const { verificationEnvironment } = await import(pathToFileURL(environmentModule).href);
+    const discoveredGitBash = verificationEnvironment(process.env).FORGEDOCK_GIT_BASH;
+    if (discoveredGitBash) process.env.FORGEDOCK_GIT_BASH = discoveredGitBash;
     const { materializeWorkerAgent } = await import(pathToFileURL(workerAgentModule).href);
     const workerAgent = materializeWorkerAgent(workerAgentTemplate, extensionEntry, [reviewerAgentTemplate]);
     // Async issue workers and their nested reviewers may outlive a non-interactive
