@@ -530,7 +530,7 @@ Every host adapter MUST expose the following closed response. Unknown members at
   "proof": {
     "keyId": "hdk_d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
     "algorithm": "Ed25519",
-    "signature": "unpadded-base64url-of-exactly-64-bytes"
+    "signature": "wm9OKlhFol7_k-oiyeME0RH_XlWC8AlcFL6GEMvlk4ANd0FvzaTUtroEdztfdXNvW5LdhFjfxZ26OgpNu2XNCQ"
   }
 }
 ```
@@ -564,7 +564,7 @@ Verification performs, in order: closed JSON/JCS/type/bound checks; independent 
 
 #### Discovery proof fixture and reject vectors
 
-The schema example above is also the fixed discovery-value fixture, except that the prose placeholder in `proof.signature` is replaced by the deterministic signature computed from the exact input below. Its test-only signing seed is RFC 8032 test seed `9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60`; it yields raw public key `d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a`, the displayed derived `keyId`, and external trust metadata `(authority=gha_01j8m6f4x9k2q7v3c5n8r0t1wy, repositoryId=R_kgDOLfrozen123, endpoint=https://api.github.example/v3, activatedAt=2026-08-01T00:00:00Z, status=active)`. The seed is public test material and MUST NOT be used outside conformance tests.
+The schema example above is the complete fixed discovery-value fixture, including its literal `proof.signature`. Its test-only signing seed is RFC 8032 test seed `9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60`; it yields raw public key `d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a`, the displayed derived `keyId`, and external trust metadata `(authority=gha_01j8m6f4x9k2q7v3c5n8r0t1wy, repositoryId=R_kgDOLfrozen123, endpoint=https://api.github.example/v3, activatedAt=2026-08-01T00:00:00Z, status=active)`. The seed is public test material and MUST NOT be used outside conformance tests.
 
 The exact JCS body text (one UTF-8 line, no BOM or trailing newline) is:
 
@@ -572,7 +572,7 @@ The exact JCS body text (one UTF-8 line, no BOM or trailing newline) is:
 {"adapterId":"github-protected","adapterVersion":"1.0.0","challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","endpoint":"https://api.github.example/v3","epoch":42,"expiresAt":"2026-08-03T16:06:12Z","guarantees":{"coordination":{"compareAndSwap":true,"fencing":true,"leases":true},"events":{"authenticated":true,"ordered":true,"replayable":true},"limits":{"maxArtifactBytes":1048576,"maxCommentBytes":65536},"lookup":{"canonicalSubjects":true,"exactFullSha":true},"publication":{"fencedReceipts":false,"protectedArtifacts":true,"protectedPullRequests":false}},"hostAuthorityId":"gha_01j8m6f4x9k2q7v3c5n8r0t1wy","hostInstanceId":"instance-7","issuedAt":"2026-08-03T16:01:12Z","repository":{"hostAuthorityId":"gha_01j8m6f4x9k2q7v3c5n8r0t1wy","repo":"owner/name","repositoryId":"R_kgDOLfrozen123","type":"github.repo"},"supportedOperations":["artifact.append","artifact.read"],"supportedSubjectTypes":["git.commit","github.issue","github.pr","github.repo"],"validFrom":"2026-08-03T16:01:12Z"}
 ```
 
-The exact signature input representation is the UTF-8 bytes for `ForgeDock-Host-Discovery-Signature-v1`, one zero byte, `forgedock.host-discovery/v1`, one zero byte, then the body line above. A fixture generator MUST write the resulting strict unpadded-base64url 64-byte Ed25519 signature into `proof.signature`; implementations MUST compare that independently generated value byte-for-byte rather than retaining the prose placeholder. The positive case uses trusted `now = 2026-08-03T16:02:00Z`, configured maximum age 300 seconds, no retained epoch, and the independently configured trust metadata above; it MUST verify and atomically retain epoch 42 and the response digest.
+The exact signature input representation is the UTF-8 bytes for `ForgeDock-Host-Discovery-Signature-v1`, one zero byte, `forgedock.host-discovery/v1`, one zero byte, then the body line above. The expected strict unpadded-base64url 64-byte Ed25519 signature is exactly `wm9OKlhFol7_k-oiyeME0RH_XlWC8AlcFL6GEMvlk4ANd0FvzaTUtroEdztfdXNvW5LdhFjfxZ26OgpNu2XNCQ`. A fixture generator MUST independently recompute that value from the published seed and exact input; implementations MUST compare the recomputed output byte-for-byte with both this expected value and `proof.signature`. The positive case uses trusted `now = 2026-08-03T16:02:00Z`, configured maximum age 300 seconds, no retained epoch, and the independently configured trust metadata above; it MUST verify and atomically retain epoch 42 and the response digest.
 
 The following mutations are fixed reject classes. Unless stated otherwise, mutate only the named value and leave the original proof unchanged.
 
