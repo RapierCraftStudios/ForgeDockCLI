@@ -186,6 +186,7 @@
     <nav aria-label="Document sections">
       <a href="#decision">The decision</a>
       <a href="#principles">Non-negotiables</a>
+      <a href="#trust-direction">Trust & portability</a>
       <a href="#architecture">Architecture</a>
       <a href="#commands">Command surface</a>
       <a href="#work-on">work-on</a>
@@ -229,6 +230,18 @@
         <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable truth. Local databases and Pi sessions accelerate execution but cannot be the only record.</p></div>
       </div>
       <div class="callout" style="margin-top:14px"><strong>Determinism belongs at the boundary.</strong> ForgeDock controls phase selection, permissions, validation, retries, state transitions, merge eligibility, and closure. A model may propose; it may not silently govern.</div>
+    </section>
+
+    <section id="trust-direction">
+      <div class="eyebrow">Approved direction · normative contract</div>
+      <h2>Verifiable evidence without a second authority</h2>
+      <p class="section-intro">The approved trust and portability direction is frozen in the <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md">normative authority specification</a>. This brief remains a projection: it records boundaries and product consequences, not a second copy of canonical byte or cryptographic rules.</p>
+      <div class="grid three">
+        <div class="card accent"><h3>Controller identity</h3><p>ForgeDock-owned keys, exact subject/run/SHA binding, protected evidence, and fail-closed verification. Models never hold signing keys.</p></div>
+        <div class="card"><h3>Portable, archival evidence</h3><p>Deterministic bundles can be checked offline, but imported evidence never becomes competing live authority. GitHub remains durable semantic truth for its adapter.</p></div>
+        <div class="card"><h3>Capability and coordination fences</h3><p>Least-authority grants, versioned controller events, and CAS/fenced leases report or constrain work; only typed controller decisions authorize it.</p></div>
+      </div>
+      <div class="callout" style="margin-top:14px"><strong>Boundary preserved:</strong> Pi remains a replaceable execution kernel, providers remain runtime-neutral, host adapters report capabilities rather than inventing guarantees, and GitHub mutations remain controller-owned. Missing, stale, revoked, or unverifiable trust and coordination guarantees fail closed.</div>
     </section>
 
     <section id="architecture">
