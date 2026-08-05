@@ -30,7 +30,7 @@ The following invariants apply throughout:
 1. The typed ForgeDock controller alone decides transitions, verification gates, publication, review disposition, merge eligibility, issue closure, and decomposition.
 2. GitHub is durable semantic truth for the GitHub adapter. SQLite, process state, sessions, bundles, and leases are operational or archival aids unless the controller has separately committed a decision to GitHub.
 3. Models and runtimes receive no signing private keys and no unmediated authoritative host mutation rights.
-4. Repository, canonical subject, run, action, and reviewed full-SHA bindings are exact; a nearby or abbreviated value is not equivalent.
+4. Repository, canonical subject, run, action, and every action-specific revision binding are exact; a nearby or abbreviated value is not equivalent. Actions registered without a revision binding carry no placeholder SHA.
 5. Missing, unsupported, stale, replayed, conflicting, or unverifiable trust evidence fails closed for the protected action while remaining inspectable as evidence where safe.
 
 <a id="threat-model"></a>
@@ -50,7 +50,7 @@ The trust root is the controller identity and its explicitly configured trust-ro
 | **Local state** | Rebuildable indexes, leases, checkpoints, process supervision, and caches | Semantic truth when it conflicts with a committed host artifact |
 | **Portable bundle** | Public, exported, archival evidence and verification metadata | Live authority, current policy, or permission to mutate a repository |
 
-Protected assets are controller private keys, trust-root records, exact workflow decisions, artifact integrity and provenance, reviewed SHA bindings, capability nonces and replay state, lease ownership/fencing state, and the confidentiality of credentials, sessions, worktree secrets, and private repository data.
+Protected assets are controller private keys, trust-root records, exact workflow decisions, artifact integrity and provenance, action-specific revision bindings, capability nonces and replay state, lease ownership/fencing state, and the confidentiality of credentials, sessions, worktree secrets, and private repository data.
 
 ### 2.2 Untrusted inputs and attacker capabilities
 
@@ -70,7 +70,7 @@ This contract does not claim to protect a compromised controller process, a comp
 ### 2.3 Boundary rules
 
 - **Controller ↔ model/runtime:** task grants are capabilities for bounded work, not workflow authority. Runtime events are reports; only controller code may commit a transition or host mutation.
-- **Controller ↔ host/GitHub:** adapter operations are typed requests with exact subject, run, action, and SHA bindings. A successful HTTP/API response is not a decision and MUST be checked before it is recorded as one.
+- **Controller ↔ host/GitHub:** adapter operations are typed requests with exact subject, run, action, and action-specific revision bindings when the action has one. A successful HTTP/API response is not a decision and MUST be checked before it is recorded as one.
 - **Controller ↔ local state:** local state may accelerate recovery, but reconstruction MUST prefer validated durable artifacts and MUST NOT infer an authorization from a cache-only record.
 - **Controller ↔ portable bundle:** import produces archival evidence and a verification report. It never joins the live run, replaces current policy, or competes with GitHub.
 - **Controller ↔ trust root:** key lookup and lifecycle status are prerequisites for protected verification. The controller MUST NOT silently substitute a provider key, GitHub App credential, model token, or unknown key.
@@ -232,7 +232,7 @@ Capabilities authorize a bounded request to the controller; they do not bypass c
 
 Unknown actions are rejected by default. An implementation MAY support a new action only in a new contract/profile version with explicit tests and policy; it MUST NOT interpret an unknown action as read-only or as its closest known action.
 
-A capability is not a free-standing semantic record. It is a controller-issued canonical envelope with exactly this shape (unknown fields are rejected):
+A capability is not a free-standing semantic record. It is a controller-issued canonical envelope with exactly the common top-level fields `profile`, `capabilityId`, `delegationId`, `body`, and `proof`; unknown fields are rejected. Its `body` contains exactly the common fields governed by the semantic-body table below (including the registered conditional presence of `runId`) plus only the action-specific revision member required by the closed matrix in this section. This `merge.request` example carries `reviewedSha`:
 
 ```json
 {
@@ -245,7 +245,7 @@ A capability is not a free-standing semantic record. It is a controller-issued c
     "action": "merge.request",
     "subject": { "type": "github.pr", "repo": "owner/name", "number": 18 },
     "runId": "run_...",
-    "reviewedSha": "full-lowercase-sha",
+    "reviewedSha": "0123456789abcdef0123456789abcdef01234567",
     "issuedAt": "2026-08-03T16:01:12Z",
     "expiresAt": "2026-08-03T16:11:12Z",
     "parentCapabilityId": null,
@@ -258,6 +258,44 @@ A capability is not a free-standing semantic record. It is a controller-issued c
 }
 ```
 
+A `pr.publish` body instead has the same common fields and carries `sourceSha`, never `reviewedSha`:
+
+```json
+{
+  "issuer": "fdck_...",
+  "audience": "worker:...",
+  "action": "pr.publish",
+  "subject": { "type": "github.pr", "repo": "owner/name", "number": 18 },
+  "runId": "run_...",
+  "sourceSha": "89abcdef0123456789abcdef0123456789abcdef",
+  "issuedAt": "2026-08-03T16:01:12Z",
+  "expiresAt": "2026-08-03T16:11:12Z",
+  "parentCapabilityId": null,
+  "depth": 0,
+  "nonce": "base64url-random",
+  "oneShot": true,
+  "constraints": { "coordinationKey": null }
+}
+```
+
+The action-specific revision-binding matrix is exhaustive. Each of the 11 actions appears exactly once:
+
+| Action | `reviewedSha` | `sourceSha` | Revision binding |
+| --- | --- | --- | --- |
+| `artifact.append` | Forbidden | Forbidden | None |
+| `artifact.read` | Forbidden | Forbidden | None |
+| `issue.comment` | Forbidden | Forbidden | None |
+| `issue.label` | Forbidden | Forbidden | None |
+| `pr.publish` | Forbidden | Required | Verified BuildResult source revision |
+| `review.record` | Required | Forbidden | Protected artifact reviewed revision |
+| `merge.request` | Required | Forbidden | Protected artifact reviewed revision |
+| `lease.acquire` | Forbidden | Forbidden | None |
+| `lease.heartbeat` | Forbidden | Forbidden | None |
+| `lease.release` | Forbidden | Forbidden | None |
+| `bundle.export` | Forbidden | Forbidden | None |
+
+A required revision member MUST be present as an exact 40-character lowercase hexadecimal commit SHA. A forbidden member MUST be absent, not `null`, empty, or a placeholder. Missing required members, present forbidden members, unknown members, and actions absent from this matrix are default-deny. For a no-revision action, the authoritative revision binding is the explicit semantic state **no revision**, represented by the absence of both revision members; no SHA is invented.
+
 `capabilityId` and `delegationId` are distinct, globally unique opaque identifiers generated by the controller. They are never derived from attacker-controlled display text, and a `(capabilityId, delegationId)` pair may be issued only once in the authoritative issuance/revocation store. `body.issuer` MUST be a trusted controller key ID, `proof.keyId` MUST equal it, and the proof MUST be an Ed25519 signature over:
 
 ```text
@@ -266,7 +304,7 @@ UTF8(profile) || 0x00 || UTF8(capabilityId) || 0x00 ||
 UTF8(delegationId) || 0x00 || UTF8(JCS(body))
 ```
 
-The signature binds every body field, including nonce, parent, audience, subject, run, reviewed SHA, validity interval, coordination key, and constraints. The controller verifies the exact canonical envelope, trusted issuer lifecycle, issuance record, signature, and parent lineage **before** policy evaluation or nonce consumption. An issuer string alone, a copied key ID, an unsigned object, or a bundle-contained issuance record is never proof of issuance. The configured trust root/checkpoint, not the capability itself, authenticates the issuer key.
+The signature binds every present body field, including the selected revision member, nonce, parent, audience, subject, run, validity interval, coordination key, and constraints. Because body shape validation rejects forbidden and unknown members before signature acceptance, the proof is accepted only for the exact permitted field set and therefore also binds the absence of forbidden revision members. The controller verifies the exact canonical envelope, trusted issuer lifecycle, issuance record, signature, action-specific field presence, and parent lineage **before** policy evaluation or nonce consumption. An issuer string alone, a copied key ID, an unsigned object, or a bundle-contained issuance record is never proof of issuance. The configured trust root/checkpoint, not the capability itself, authenticates the issuer key.
 
 The semantic body has these rules:
 
@@ -277,18 +315,21 @@ The semantic body has these rules:
 | `action` | One closed action above |
 | `subject` | Exact canonical subject, or an explicitly registered subject set; aliases and URLs are not equivalent |
 | `runId` | Exact run binding; absent only for explicitly read-only, non-run-scoped actions |
-| `reviewedSha` | Exactly the same full SHA as the protected action's canonical payload member, requested operation, capability, and fresh host head |
+| `reviewedSha` | Required only for `review.record` and `merge.request`; it MUST equal `payload.reviewedSha` in the registered protected artifact, the controller-requested operation, every capability in the delegated lineage, and the freshly observed host head |
+| `sourceSha` | Required only for `pr.publish`; it MUST equal the exact full lowercase `BuildResult.payload.headSha` from the controller-selected, verified BuildResult for the same run and repository, and the value in the controller request, every capability in the delegated lineage, and the durable operation record |
 | `issuedAt`, `expiresAt` | UTC instants; `issuedAt < expiresAt`, bounded by controller policy; expired or excessive lifetime is denied |
 | `parentCapabilityId`, `depth` | Null/zero only for an original grant; otherwise exact parent and depth increment, maximum depth 3 |
 | `nonce` | Unique random value bound by the proof and issuance record |
 | `oneShot` | Boolean; if true, atomic consumption is required before or with the controller decision |
 | `constraints` | Registered, closed constraints; they include the exact canonical coordination-key set when the action is lease-dependent |
 
-Delegation is a strict subset operation: a child MUST preserve issuer/audience scope, action, subject, run, reviewed SHA, and expiry or narrow them; it MAY reduce constraints and permissions but MUST NOT broaden any field. A child is signed by the issuing controller and names its authenticated parent. The controller records lineage and rejects cycles, reused IDs, duplicate semantic issuance, and a child whose interval, audience, key set, or scope is outside its parent.
+For `review.record` and `merge.request`, the controller MUST freshly read the protected PR head at the action boundary and deny a stale or unequal `reviewedSha`; this capability rule does not change [§3.1](#envelope) or add a revision member to any other protected artifact. For `pr.publish`, `sourceSha` is capability, request, delegation, and host-operation scope only. It is not `payload.reviewedSha`, is not added to the `forgedock.protected/v1` envelope or signature input, and does not broaden the protected kind/action registry.
 
-One-shot replay consumption is an atomic compare-and-set in the authoritative replay store. The controller first authenticates the envelope and confirms issuance, then reserves the nonce and commits the decision. For a host mutation, `operationId = SHA-256(UTF8("ForgeDock-Capability-Operation-v1\0") || UTF8(capabilityId) || 0x00 || UTF8(nonce))` (lowercase hex) is the host idempotency key and is bound to the exact subject/action/SHA. A success, failure, or indeterminate host result is durably associated with that operation. After an indeterminate mutation the grant is never released or retried with a new key; the controller reconciles the original operation before retry and a completed operation returns its original result. A crash leaves an unambiguous consumed/committed/reconcile state. Non-one-shot capabilities still require an authenticated issuance record, exact binding, and expiry.
+Delegation is a strict subset operation: a child MUST preserve issuer scope, action, subject, run, and the action's exact revision binding while narrowing audience, validity, constraints, or permissions only as registered. Thus every ancestor and child MUST preserve the same permitted revision field name and exact value, or preserve the explicit no-revision state; a child MUST NOT add, remove, rename, or change that binding. A child is signed by the issuing controller and names its authenticated parent. The controller records lineage and rejects cycles, reused IDs, duplicate semantic issuance, and a child whose interval, audience, key set, revision binding, or other scope is outside its parent.
 
-Unknown constraints, unavailable issuer or issuance records, absent replay state, clock uncertainty beyond configured skew, unsupported delegation, and missing exact subject/SHA values are default-deny conditions. Capability possession never authorizes merge, publication, review, closure, or a transition without the typed controller's committed decision.
+One-shot replay consumption is an atomic compare-and-set in the authoritative replay store. The controller first authenticates the envelope and confirms issuance, then reserves the nonce and commits the decision. For a host mutation, `operationId = SHA-256(UTF8("ForgeDock-Capability-Operation-v1\0") || UTF8(capabilityId) || 0x00 || UTF8(nonce))` (lowercase hex) remains the host idempotency key. Its immutable authoritative operation record MUST bind the exact subject, run, action, and revision binding: `reviewedSha` plus its value, `sourceSha` plus its value, or the explicit no-revision state. The host request carries the same scope. A success, failure, or indeterminate host result is durably associated with that operation. Replay, retry, or reconciliation with a different subject, run, action, revision field, revision value, or attempted revision for a no-revision operation is denied and MUST NOT create a new mutation. After an indeterminate mutation the grant is never released or retried with a new key; the controller reconciles the original operation before retry and a completed operation returns its original result. A crash leaves an unambiguous consumed/committed/reconcile state. Non-one-shot capabilities still require an authenticated issuance record, exact binding, expiry, and the same conflict checks for any durable operation record.
+
+Unknown constraints, unavailable issuer or issuance records, absent replay state, clock uncertainty beyond configured skew, unsupported delegation, an unknown field, a missing exact subject or required revision, or a present forbidden revision are default-deny conditions. Capability possession never authorizes merge, publication, review, closure, or a transition without the typed controller's committed decision.
 
 <a id="subjects"></a>
 ## 6. Canonical subjects and host adapter conformance
@@ -308,19 +349,41 @@ For GitHub, `owner/name` is the host's canonical API identity, case-normalized t
 
 Every host adapter MUST expose a canonical, controller-authenticated discovery envelope. The response contains `profile: forgedock.host-discovery/v1`, `adapterId`, `adapterVersion`, `hostInstanceId`, exact endpoint and repository binding, supported subject types and operations, exact-SHA behavior, comment/artifact limits, event properties, compare-and-swap/lease properties, `issuedAt`, `validFrom`, `expiresAt`, a strictly increasing host capability `epoch`, the controller's fresh random `challenge`, and `proof` signed by a configured adapter/host trust root. The proof covers the complete JCS body; a discovery time alone is insufficient. The controller rejects a response with a wrong challenge, host/endpoint/repository/adapter binding, unknown signer, non-increasing rollback epoch, revoked signer, `now < validFrom`, `now >= expiresAt`, or age beyond the configured maximum. A fresh challenge is required before each protected operation class (or a documented maximum-age probe tied to that operation); cached evidence never crosses its expiry or host epoch. Stale, replayed, downgraded, missing, or unverifiable discovery is `unverifiable` and its advertised guarantee is unavailable, not inferred from an unrelated successful API call.
 
-An adapter conformance suite MUST test canonical subject round trips, repository ownership, exact full-SHA lookup, stale-head detection, idempotency keys, response-to-request binding, pagination/completeness, error classification, size limits, signed challenge discovery, expiry, replay, epoch rollback/downgrade, and host-instance binding. It MUST distinguish permission denied, not found, conflict, rate limit, stale revision, unsupported guarantee, and indeterminate network result. An indeterminate mutation result is reconciled by its original idempotency key and exact subject before retry; the controller MUST NOT blindly duplicate a side effect.
+An adapter conformance suite MUST test canonical subject round trips, repository ownership, exact full-SHA lookup, stale-head detection, idempotency keys, response-to-request binding, pagination/completeness, error classification, size limits, signed challenge discovery, expiry, replay, epoch rollback/downgrade, and host-instance binding. It MUST distinguish permission denied, not found, conflict, rate limit, stale revision, unsupported guarantee, and indeterminate network result. An indeterminate mutation result is reconciled by its original idempotency key, exact subject, and applicable action-specific revision binding before retry; the controller MUST NOT blindly duplicate a side effect.
 
 Minimum guarantees are:
 
 | Operation | Mandatory host guarantee | If unavailable |
 | --- | --- | --- |
-| Publish artifact/PR | Durable write or idempotent mutation, exact subject/run association, returned immutable reference, and read-after-write verification | Do not claim published or proceed on an unverified result |
+| Publish artifact | Durable write or idempotent mutation, exact subject/run association, returned immutable reference, and read-after-write verification | Do not claim published or proceed on an unverified result |
+| Publish PR | A typed request and immutable operation record bound to `sourceSha`; pre-mutation workspace/source-ref equality; exact pushed or selected remote source; created or reused PR head equality; and fresh read-after-write verification, all against that same SHA | Fail closed, perform no mutation when the unavailable guarantee is known before mutation, and never report the PR as published |
 | Record review | Read the exact full reviewed SHA and prove the head remains that SHA immediately before/after recording | Review is stale/unverifiable; do not approve or merge |
 | Merge | Host-enforced source/base/head identity, current checks/policy, idempotent merge result, controller-approved exact SHA, and—when lease-dependent—an atomic current coordination-key/token/fencing-sequence check at the host mutation linearization point | Merge is denied; a comment or event cannot substitute. An adapter without host fencing is unsupported for lease-dependent merge |
 | Compare-and-swap coordination | Atomic expected-version/sequence update with owner fencing and durable conflict result | Distributed lease/coordination is unsupported; do not run multi-writer coordination |
 | Lease-dependent publish/review/mutation | The host MUST atomically validate the canonical coordination key, owner token, fencing epoch, exact operation ID, and current policy at the external mutation linearization point | Deny the mutation; the current GitHub surface is unsupported for this guarantee unless an adapter layer supplies it |
 
+For `pr.publish`, the controller MUST derive the request's `sourceSha` only from the controller-selected, verified BuildResult for the same run and repository. Before the first external mutation, the retained workspace commit and the source ref selected for publication MUST equal `sourceSha`. At each applicable host mutation boundary, the adapter MUST ensure that the pushed or selected remote source resolves exactly to `sourceSha`; a stale local ref, remote race, abbreviation, or different commit fails closed. The adapter MUST then require a created or reused PR to have head `sourceSha` and MUST confirm that equality with a fresh host read after creation, reuse, or update. These checks apply equally to first publication, retry, and reconciliation.
+
+A known preflight mismatch produces no host mutation. A mismatch or indeterminate result discovered after an external call is associated with the original operation ID, is reconciled using that same operation and `sourceSha`, and MUST NOT be reported as published or retried as a new mutation. If an adapter cannot make the remote source and PR-head guarantees at their applicable mutation boundaries, protected PR publication through that adapter is unsupported. Read-after-write detection does not retroactively authorize a mutation made from the wrong source.
+
 GitHub comments, labels, checks, and webhooks report durable facts or requests. None is an authority path. The controller alone interprets them and commits a transition.
+
+### 6.3 Focused capability and publication conformance vectors
+
+In these vectors, `A = 0123456789abcdef0123456789abcdef01234567` and `B = 89abcdef0123456789abcdef0123456789abcdef`. Unless a row says otherwise, the envelope, proof, lineage, BuildResult, host discovery, policy, and replay evidence are valid. “No mutation” means no new external side effect may be created; reconciliation may only inspect or return the result of the original operation.
+
+| Vector | Input condition | Required authorization and mutation outcome |
+| --- | --- | --- |
+| Non-revision absence accepted | `issue.comment` has neither `reviewedSha` nor `sourceSha` | Capability shape is authorized for policy evaluation; the comment mutation may occur after the controller decision |
+| Non-revision field forbidden | `artifact.read` includes `reviewedSha: A` (the same result applies to `sourceSha`) | Deny before policy and nonce consumption; no mutation |
+| Required review revision missing | `review.record` or `merge.request` omits `reviewedSha` | Deny as incomplete capability scope; no review or merge mutation |
+| Required publication revision missing | `pr.publish` omits `sourceSha` | Deny as incomplete capability scope; no push, PR creation, reuse update, or publication claim |
+| Review/merge head stale | A valid review/merge lineage carries `reviewedSha: A`, but the fresh PR head is `B` | Deny as wrong/stale binding; no review or merge mutation |
+| BuildResult source mismatch | `pr.publish` carries `sourceSha: B`, but the controller-selected verified BuildResult for the same run/repository has `payload.headSha: A` | Deny before host mutation; no push or PR mutation |
+| Delegated publication mismatch | Parent `pr.publish` carries `sourceSha: A`; child removes it, renames it, or carries `sourceSha: B` | Reject the child lineage before policy and nonce consumption; no host mutation |
+| Publication preflight mismatch | The capability and BuildResult carry `sourceSha: A`, but the retained workspace/source ref is `B`, or a selected remote source freshly resolves to `B` at its applicable boundary | Fail closed before the affected external mutation; no PR is created or updated and publication is not reported |
+| PR result head mismatch | A newly created or reused PR, or its fresh read-after-write observation, has head `B` while `sourceSha` is `A` | Record failure or indeterminate state under the original operation ID; do not report published and do not issue a new mutation |
+| Conflicting replay/reconciliation | An operation record is bound to `sourceSha: A` (equivalently `reviewedSha: A` or no revision), but replay or reconciliation requests `B`, changes the revision field, or adds a revision to the no-revision state | Deny the conflicting request; return/reconcile only the original scoped result and create no new mutation |
 
 <a id="events"></a>
 ## 7. Controller events
