@@ -105,11 +105,25 @@ A protected artifact is a UTF-8 canonical JSON object with exactly these top-lev
 
 - `profile` is the exact profile identifier above. Legacy `forgedock.artifact/v2` remains readable but is never upgraded by parsing.
 - `id` and `runId` are opaque, globally unique, non-empty identifiers; their canonical string is signed.
-- `sequence` is a non-negative integer. A run's first protected artifact is sequence `0` and has predecessor `null`; every later artifact has sequence previous plus one and a predecessor digest.
+- `sequence` is an integer in the inclusive range `0..9007199254740991` (the safe IEEE-754 integer range). A run's first protected artifact is sequence `0` and has predecessor `null`; every later artifact has sequence previous plus one and a predecessor digest. Larger, fractional, negative, exponent-form, or otherwise non-safe counters are invalid. This same bound applies to event and lease counters.
 - `createdAt` is an RFC 3339 UTC instant with seconds and `Z` (fractional seconds are permitted only to exactly three, six, or nine digits and are preserved as text). The controller's trusted clock supplies it.
-- `subject` is the canonical identity in [§7](#subjects). `action` is from the closed vocabulary in [§5](#capabilities).
-- `reviewedSha` is required in the payload for review and merge-related actions and is a lowercase, exactly 40-character Git SHA-1 or exactly 64-character SHA-256 value as required by the host. The controller MUST reject abbreviations and case variants.
+- `subject` is the canonical identity in [§6](#subjects). `action` and `kind` MUST be an allowed pair in the closed registry below; an unknown or mismatched pair is `unsupported`.
+- `reviewedSha` has one canonical location: `payload.reviewedSha` for protected `ReviewVerdict/review.record` and `MergeRequest/merge.request`. The verifier extracts that member, and the controller MUST require the same full lowercase SHA in the signature input, capability, requested operation, and freshly observed host head. No second SHA field is authoritative. A legacy v2 `payload.headSha` is readable only as legacy evidence and is never silently mapped into a protected artifact.
+- `payload` schemas are closed, bounded, and secret-free. They MUST NOT contain credentials, tokens, cookies, session or prompt transcripts, raw model output, environment values, worktree secrets, or unbounded repository dumps. The controller validates and rejects a violation before signing or durable publication; it MUST NOT sign a sanitized object while retaining a claim about the rejected original.
 - `digest` and `signature` are integrity fields, not input to their own digest.
+
+#### Protected kind/action registry
+
+The registry is part of `forgedock.protected/v1`; implementations MUST reject every pair not listed here and MUST use the named schema and SHA rule:
+
+| `kind` | Allowed `action` | Required payload shape |
+| --- | --- | --- |
+| `Intent`, `Investigation`, `BuildPacket`, `BuildResult`, `Outcome` | `artifact.append` | Closed, bounded action schema; no reviewed SHA unless explicitly registered by a later profile |
+| `ReviewVerdict` | `review.record` | Closed verdict/disposition/check schema; exactly one `payload.reviewedSha` |
+| `MergeRequest` | `merge.request` | Closed merge-request schema; exactly one `payload.reviewedSha` |
+| Any listed kind | `artifact.read`, `bundle.export` | Read/export request schema only; never a mutation authorization |
+
+The controller MUST reject a listed action paired with the wrong kind, an unknown kind, an extra payload member, or a schema extension without a new profile. Each schema's required/optional members, bounds, and conformance vectors are versioned with this registry.
 
 <a id="canonical-bytes"></a>
 ### 3.2 Canonical bytes
@@ -135,7 +149,7 @@ The literal domain string is ASCII and the separator is one zero byte. The diges
 <a id="signatures"></a>
 ### 3.3 Sequencing, genesis, and signature scope
 
-A run is an append-only logical sequence, but storage systems MAY deliver artifacts out of order. Sequence `0` is the genesis artifact: its `predecessor` MUST be `null`, its `sequence` MUST be `0`, and its `runId` establishes the sequence. Sequence `n > 0` MUST carry the exact digest of sequence `n-1` in `predecessor`; a missing, duplicated, conflicting, or non-contiguous link yields `chain-gap` even if each isolated signature is valid.
+A run is an append-only logical sequence, but storage systems MAY deliver artifacts out of order. Sequence `0` is the genesis artifact: its `predecessor` MUST be `null`, its `sequence` MUST be `0`, and its `runId` establishes the sequence. Sequence `n > 0` MUST carry the exact digest of sequence `n-1` in `predecessor`; a missing chain member, duplicated sequence, competing predecessor, or non-contiguous link yields `chain-gap` even if each isolated signature is valid. The controller MUST serialize protected publication with an atomic append CAS on `(runId, lastSequence, lastDigest)`. The host publication MUST be idempotent by artifact ID/digest. If a competing append is observed, the controller marks the run `unverifiable` and blocks protected actions; it MUST NOT choose whichever branch a read happened to return.
 
 The signature input is domain-separated and binds all authority-relevant identity:
 
@@ -152,20 +166,20 @@ signatureInput =
   UTF8(predecessor-or-"genesis")
 ```
 
-`canonicalSubjectBytes` is the exact UTF-8 JCS encoding of `subject`, and `reviewedSha-or-empty` is the exact lowercase SHA when the action requires one, otherwise the empty string. The Ed25519 signature is over `signatureInput`; `signature` is unpadded base64url of the 64-byte signature. The controller MUST verify the digest before the signature and MUST verify the requested repository, subject, run, action, and reviewed SHA against the current operation, not merely against the artifact itself.
+`canonicalSubjectBytes` is the exact UTF-8 JCS encoding of `subject`. For `ReviewVerdict/review.record` and `MergeRequest/merge.request`, `reviewedSha-or-empty` is computed only by extracting `payload.reviewedSha`; it MUST equal the capability, requested operation, and fresh host head. For all other registered pairs it is the empty string and any reviewed-SHA member is rejected. The Ed25519 signature is over `signatureInput`; `signature` is unpadded base64url of the 64-byte signature. The controller MUST verify the digest before the signature and MUST verify the requested repository, subject, run, action, and reviewed SHA against the current operation, not merely against the artifact itself.
 
 <a id="verification"></a>
 ### 3.4 Verification algorithm and result states
 
-Verification is deterministic and returns one primary state plus structured diagnostics. It MUST perform profile/shape and canonical parsing checks, then digest, key/trust status, signature, binding, chain, time, and policy checks. A verifier MAY report multiple diagnostics but MUST choose the first applicable primary state using this precedence: `malformed`, `incomplete`, `unsupported`, `invalid-signature`, `wrong-binding`, `chain-gap`, `expired`, `revoked`, `unverifiable`, then `verified`.
+Verification is deterministic and returns one primary state plus structured diagnostics. It MUST perform profile/shape and canonical parsing checks, then digest, key/trust status, signature, binding, chain, time, and policy checks. `incomplete` has one narrow meaning: a required field is absent from the artifact being verified (including its own `predecessor` member when the sequence requires one). A missing predecessor artifact, missing sequence member, duplicate/conflicting append, or non-contiguous set is never `incomplete`; it is `chain-gap`. An unavailable trust root/replay store/host proof is `unverifiable`. A verifier MUST choose the first applicable primary state using this precedence: `malformed`, `incomplete`, `unsupported`, `invalid-signature`, `wrong-binding`, `chain-gap`, `expired`, `revoked`, `unverifiable`, then `verified`.
 
 | Primary state | Meaning | Protected authorization |
 | --- | --- | --- |
 | `verified` | Correct protected profile, canonical bytes, digest, trusted non-revoked key, signature, bindings, chain context, and validity | May be considered by the controller, subject to current policy and host checks |
 | `legacy-unverified` | Structurally readable v2 artifact with no protected proof | Evidence only; never authorizes a protected action |
 | `malformed` | Invalid JSON, duplicate keys, invalid canonical data, invalid field shape, or illegal encoding | Reject and quarantine; no authorization |
-| `incomplete` | Required field, predecessor, key record, chain member, reviewed SHA, or required evidence is absent | No authorization; do not guess or repair silently |
-| `unsupported` | Unknown profile version, action, constraint, key algorithm, or schema extension | No authorization; preserve bytes for inspection |
+| `incomplete` | A required field is absent from this artifact itself, including its own required predecessor or reviewed SHA | No authorization; do not guess or repair silently |
+| `unsupported` | Unknown profile version, kind/action pair, constraint, key algorithm, or schema extension | No authorization; preserve bytes for inspection |
 | `invalid-signature` | Digest or Ed25519 signature does not verify for the declared input | Reject; treat as possible tampering |
 | `wrong-binding` | Artifact is validly signed but repository, subject, run, action, or exact reviewed SHA does not match the requested operation | Reject for that operation |
 | `chain-gap` | Required predecessor is missing, duplicated, altered, or sequence is not contiguous | No complete-history claim or protected authorization requiring the chain |
@@ -186,14 +200,16 @@ A ForgeDock controller identity is generated by ForgeDock using a controller-own
 
 The private key MUST be stored in a protected OS keystore or an encrypted file whose decryption secret is supplied out-of-process (for example, an OS credential store or operator secret). It MUST be permission-restricted, excluded from repositories and bundles, and unavailable to model/runtime tool grants. Private-key export is disabled by default. If the key is missing, locked, corrupt, or inaccessible, protected signing and any action requiring the controller identity fail closed; the controller MUST NOT create an unannounced replacement and continue the same run.
 
-`keyId` is a stable public identifier derived only from the canonical public key:
+`keyId` uses an unambiguous fixed-width hexadecimal derivation from the canonical public key:
 
 ```text
-publicKeyBytes = raw 32-byte Ed25519 public key
-keyId = "fdck_" + lowercase(base32-crockford(SHA-256(UTF8("ForgeDock-Key-Id-v1\0") || publicKeyBytes)))[0:26]
+publicKeyBytes = exactly the raw 32-byte Ed25519 public key
+keyId = "fdck_" + lowercase(hex(SHA-256(
+  UTF8("ForgeDock-Key-Id-v1\0") || publicKeyBytes
+)))
 ```
 
-The Crockford alphabet is `0123456789abcdefghjkmnpqrstvwxyz`, with no separators or check symbols; the displayed identifier is lower case.
+`hex` is exactly 64 lowercase ASCII hexadecimal characters, most-significant byte first, with no padding removal, separators, alternate encodings, or truncation. Implementations MUST include vectors covering a public key beginning with zero bytes and a normal key; the hash input and output length above are the vector contract.
 
 The trust record binds `keyId`, algorithm (`Ed25519`), canonical public key, controller installation or operator scope, `activatedAt`, and lifecycle status. Public identifiers are not GitHub App installation IDs, OAuth identities, provider names, model IDs, DIDs, or account aliases.
 
@@ -216,27 +232,63 @@ Capabilities authorize a bounded request to the controller; they do not bypass c
 
 Unknown actions are rejected by default. An implementation MAY support a new action only in a new contract/profile version with explicit tests and policy; it MUST NOT interpret an unknown action as read-only or as its closest known action.
 
-A capability record has exactly these semantic fields:
+A capability is not a free-standing semantic record. It is a controller-issued canonical envelope with exactly this shape (unknown fields are rejected):
+
+```json
+{
+  "profile": "forgedock.capability/v1",
+  "capabilityId": "cap_...",
+  "delegationId": "del_...",
+  "body": {
+    "issuer": "fdck_...",
+    "audience": "worker:...",
+    "action": "merge.request",
+    "subject": { "type": "github.pr", "repo": "owner/name", "number": 18 },
+    "runId": "run_...",
+    "reviewedSha": "full-lowercase-sha",
+    "issuedAt": "2026-08-03T16:01:12Z",
+    "expiresAt": "2026-08-03T16:11:12Z",
+    "parentCapabilityId": null,
+    "depth": 0,
+    "nonce": "base64url-random",
+    "oneShot": true,
+    "constraints": { "coordinationKey": null }
+  },
+  "proof": { "keyId": "fdck_...", "signature": "base64url-without-padding" }
+}
+```
+
+`capabilityId` and `delegationId` are distinct, globally unique opaque identifiers generated by the controller. They are never derived from attacker-controlled display text, and a `(capabilityId, delegationId)` pair may be issued only once in the authoritative issuance/revocation store. `body.issuer` MUST be a trusted controller key ID, `proof.keyId` MUST equal it, and the proof MUST be an Ed25519 signature over:
+
+```text
+UTF8("ForgeDock-Capability-Signature-v1\0") ||
+UTF8(profile) || 0x00 || UTF8(capabilityId) || 0x00 ||
+UTF8(delegationId) || 0x00 || UTF8(JCS(body))
+```
+
+The signature binds every body field, including nonce, parent, audience, subject, run, reviewed SHA, validity interval, coordination key, and constraints. The controller verifies the exact canonical envelope, trusted issuer lifecycle, issuance record, signature, and parent lineage **before** policy evaluation or nonce consumption. An issuer string alone, a copied key ID, an unsigned object, or a bundle-contained issuance record is never proof of issuance. The configured trust root/checkpoint, not the capability itself, authenticates the issuer key.
+
+The semantic body has these rules:
 
 | Field | Rule |
 | --- | --- |
 | `issuer` | Trusted controller `keyId`; an unknown, revoked, or non-controller issuer is denied |
-| `audience` | Exact controller installation, adapter, or worker identity; wildcard audience is forbidden |
+| `audience` | Exact controller installation, adapter, worker identity, and session where applicable; wildcard audience is forbidden |
 | `action` | One closed action above |
 | `subject` | Exact canonical subject, or an explicitly registered subject set; aliases and URLs are not equivalent |
 | `runId` | Exact run binding; absent only for explicitly read-only, non-run-scoped actions |
-| `reviewedSha` | Exact full SHA for `review.record` and `merge.request`; no “latest” or abbreviation |
+| `reviewedSha` | Exactly the same full SHA as the protected action's canonical payload member, requested operation, capability, and fresh host head |
 | `issuedAt`, `expiresAt` | UTC instants; `issuedAt < expiresAt`, bounded by controller policy; expired or excessive lifetime is denied |
-| `delegation` | Parent capability ID, depth, and attenuation record; absent for an original controller grant |
-| `nonce` | Unique random value within the issuer/audience/action scope |
-| `oneShot` | Boolean; if true, atomic consumption is required before the action |
-| `constraints` | Registered, closed semantic constraints only; unknown names or values deny |
+| `parentCapabilityId`, `depth` | Null/zero only for an original grant; otherwise exact parent and depth increment, maximum depth 3 |
+| `nonce` | Unique random value bound by the proof and issuance record |
+| `oneShot` | Boolean; if true, atomic consumption is required before or with the controller decision |
+| `constraints` | Registered, closed constraints; they include the exact canonical coordination-key set when the action is lease-dependent |
 
-Delegation is a strict subset operation: a child MUST preserve issuer/audience scope, action, subject, run, reviewed SHA, and expiry or narrow them; it MAY reduce constraints and permissions but MUST NOT broaden any field. Each delegation increments depth; maximum depth is 3, and a missing or invalid parent makes the child unverifiable. The controller records lineage and rejects cycles, reused delegation IDs, and a child whose interval is outside its parent.
+Delegation is a strict subset operation: a child MUST preserve issuer/audience scope, action, subject, run, reviewed SHA, and expiry or narrow them; it MAY reduce constraints and permissions but MUST NOT broaden any field. A child is signed by the issuing controller and names its authenticated parent. The controller records lineage and rejects cycles, reused IDs, duplicate semantic issuance, and a child whose interval, audience, key set, or scope is outside its parent.
 
-One-shot replay consumption is an atomic compare-and-set operation in the authoritative replay store: reserve nonce, validate all capability and current-policy conditions, commit consumption with the controller action, or release the reservation on a failed precondition. A crash must leave an unambiguous consumed/not-consumed record; an unavailable or non-atomic replay store returns `unverifiable` and denies the action. Duplicate use, a nonce with a different semantic body, and a stale reservation are denied. Non-one-shot capabilities still expire and remain subject to exact binding and policy.
+One-shot replay consumption is an atomic compare-and-set in the authoritative replay store. The controller first authenticates the envelope and confirms issuance, then reserves the nonce and commits the decision. For a host mutation, `operationId = SHA-256(UTF8("ForgeDock-Capability-Operation-v1\0") || UTF8(capabilityId) || 0x00 || UTF8(nonce))` (lowercase hex) is the host idempotency key and is bound to the exact subject/action/SHA. A success, failure, or indeterminate host result is durably associated with that operation. After an indeterminate mutation the grant is never released or retried with a new key; the controller reconciles the original operation before retry and a completed operation returns its original result. A crash leaves an unambiguous consumed/committed/reconcile state. Non-one-shot capabilities still require an authenticated issuance record, exact binding, and expiry.
 
-Unknown constraints, unavailable issuer records, absent replay state, clock uncertainty beyond configured skew, unsupported delegation, and missing exact subject/SHA values are default-deny conditions. Capability possession never authorizes merge, publication, review, closure, or a transition without the typed controller's committed decision.
+Unknown constraints, unavailable issuer or issuance records, absent replay state, clock uncertainty beyond configured skew, unsupported delegation, and missing exact subject/SHA values are default-deny conditions. Capability possession never authorizes merge, publication, review, closure, or a transition without the typed controller's committed decision.
 
 <a id="subjects"></a>
 ## 6. Canonical subjects and host adapter conformance
@@ -250,13 +302,13 @@ A subject is a typed object, not a URL or display name. Canonical subject object
 - pull request: `{ "type": "github.pr", "repo": "owner/name", "number": N }`;
 - commit: `{ "type": "git.commit", "repo": "owner/name", "sha": "full-lowercase-sha" }`.
 
-For GitHub, `owner/name` is the host's canonical API identity, case-normalized to lower case only after the adapter confirms the repository; no URL, clone URL, `#number` shorthand, fork alias, organization alias, or display title is accepted as an equivalent subject. Numbers are positive JSON integers. A PR and an issue with the same number are different subjects. The subject is encoded with [§3.2](#canonical-bytes) and signed exactly.
+For GitHub, `owner/name` is the host's canonical API identity, case-normalized to lower case only after the adapter confirms the repository; no URL, clone URL, `#number` shorthand, fork alias, organization alias, or display title is accepted as an equivalent subject. Numbers are positive safe JSON integers in `1..9007199254740991`; larger values are invalid. A PR and an issue with the same number are different subjects. The subject is encoded with [§3.2](#canonical-bytes) and signed exactly.
 
 ### 6.2 Discovery and conformance
 
-Every host adapter MUST expose a signed-or-authenticated capability discovery result with adapter name/version, host identity, supported subject types, supported operations, exact-SHA behavior, comment/artifact size limits, event delivery properties, compare-and-swap/lease properties, and discovery time. Unsupported or unknown capabilities MUST be treated as unavailable, not inferred from a successful unrelated API call.
+Every host adapter MUST expose a canonical, controller-authenticated discovery envelope. The response contains `profile: forgedock.host-discovery/v1`, `adapterId`, `adapterVersion`, `hostInstanceId`, exact endpoint and repository binding, supported subject types and operations, exact-SHA behavior, comment/artifact limits, event properties, compare-and-swap/lease properties, `issuedAt`, `validFrom`, `expiresAt`, a strictly increasing host capability `epoch`, the controller's fresh random `challenge`, and `proof` signed by a configured adapter/host trust root. The proof covers the complete JCS body; a discovery time alone is insufficient. The controller rejects a response with a wrong challenge, host/endpoint/repository/adapter binding, unknown signer, non-increasing rollback epoch, revoked signer, `now < validFrom`, `now >= expiresAt`, or age beyond the configured maximum. A fresh challenge is required before each protected operation class (or a documented maximum-age probe tied to that operation); cached evidence never crosses its expiry or host epoch. Stale, replayed, downgraded, missing, or unverifiable discovery is `unverifiable` and its advertised guarantee is unavailable, not inferred from an unrelated successful API call.
 
-An adapter conformance suite MUST test canonical subject round trips, repository ownership, exact full-SHA lookup, stale-head detection, idempotency keys, response-to-request binding, pagination/completeness, error classification, size limits, and capability discovery. It MUST distinguish permission denied, not found, conflict, rate limit, stale revision, unsupported guarantee, and indeterminate network result. An indeterminate mutation result is reconciled by idempotency key and exact subject before retry; the controller MUST NOT blindly duplicate a side effect.
+An adapter conformance suite MUST test canonical subject round trips, repository ownership, exact full-SHA lookup, stale-head detection, idempotency keys, response-to-request binding, pagination/completeness, error classification, size limits, signed challenge discovery, expiry, replay, epoch rollback/downgrade, and host-instance binding. It MUST distinguish permission denied, not found, conflict, rate limit, stale revision, unsupported guarantee, and indeterminate network result. An indeterminate mutation result is reconciled by its original idempotency key and exact subject before retry; the controller MUST NOT blindly duplicate a side effect.
 
 Minimum guarantees are:
 
@@ -264,70 +316,70 @@ Minimum guarantees are:
 | --- | --- | --- |
 | Publish artifact/PR | Durable write or idempotent mutation, exact subject/run association, returned immutable reference, and read-after-write verification | Do not claim published or proceed on an unverified result |
 | Record review | Read the exact full reviewed SHA and prove the head remains that SHA immediately before/after recording | Review is stale/unverifiable; do not approve or merge |
-| Merge | Host-enforced source/base/head identity, current checks/policy, idempotent merge result, and controller-approved exact SHA | Merge is denied; a comment or event cannot substitute |
+| Merge | Host-enforced source/base/head identity, current checks/policy, idempotent merge result, controller-approved exact SHA, and—when lease-dependent—an atomic current coordination-key/token/fencing-sequence check at the host mutation linearization point | Merge is denied; a comment or event cannot substitute. An adapter without host fencing is unsupported for lease-dependent merge |
 | Compare-and-swap coordination | Atomic expected-version/sequence update with owner fencing and durable conflict result | Distributed lease/coordination is unsupported; do not run multi-writer coordination |
+| Lease-dependent publish/review/mutation | The host MUST atomically validate the canonical coordination key, owner token, fencing epoch, exact operation ID, and current policy at the external mutation linearization point | Deny the mutation; the current GitHub surface is unsupported for this guarantee unless an adapter layer supplies it |
 
 GitHub comments, labels, checks, and webhooks report durable facts or requests. None is an authority path. The controller alone interprets them and commits a transition.
 
 <a id="events"></a>
 ## 7. Controller events
 
-Events are versioned reports of committed controller decisions. A protected event envelope has `eventProfile`, `eventType`, `eventId`, `runId`, `subject`, `sequence`, `occurredAt`, `causationId`, `correlationId`, `decisionRef`, and `data`, encoded with the canonical rules in [§3.2](#canonical-bytes). `eventType` is closed for each event profile; unknown fields or event types are quarantined, not guessed.
+Events are versioned reports of committed controller decisions. A protected event envelope has exactly `eventProfile`, `eventType`, `eventId`, `runId`, `subject`, `sequence`, `occurredAt`, `causationId`, `correlationId`, `decisionRef`, `decisionDigest`, `data`, `keyId`, `digest`, and `signature`. Define `unsignedEvent` as that object without `digest` and `signature`; `eventDigest = "sha256:" + lowercase(hex(SHA-256(UTF8("ForgeDock-Event-Digest-v1\0") || UTF8(JCS(unsignedEvent)))))`. The signature input is `UTF8("ForgeDock-Event-Signature-v1\0") || UTF8(eventDigest) || 0x00 || UTF8(eventId) || 0x00 || UTF8(decisionRef) || 0x00 || UTF8(decisionDigest)`. All fields, including event type, sequence, and the complete `data` value, are therefore covered. `decisionRef` and `decisionDigest` MUST resolve to the committed controller decision, and `data`/`eventType` MUST equal the controller's deterministic event projection recorded in the decision-to-event index; a matching reference with altered type or data is invalid. The publisher key and lifecycle are checked against the configured trust root, not the event itself. Authenticated transport MAY add defense in depth but never replaces the proof.
 
-`eventId` is unique and immutable. `correlationId` identifies one workflow trajectory; `causationId` names the event or request that caused the decision, when present. `sequence` is the committed per-run event sequence, monotonically increasing from zero. `decisionRef` points to the controller's committed decision/artifact and MUST be resolved and binding-checked before a consumer presents the event as authoritative.
+`eventId` is unique and immutable. `correlationId` identifies one workflow trajectory; `causationId` names the event or request that caused the decision, when present. `sequence` is a safe integer committed by an atomic per-run allocator/CAS. The durable store MUST enforce uniqueness of `(runId, sequence)` and `(runId, eventId)`. The controller commits the decision and a deterministic event/outbox record together, then publishes that exact record; a crash before delivery is recovered by replaying the outbox, never by inventing a new sequence or data value.
 
-The controller MUST commit the decision before publishing its event. Consumers MUST:
-
-1. verify profile, event identity, subject/run correlation, and decision reference;
-2. apply events in sequence order, buffering a bounded gap and reconciling from durable artifacts when needed;
-3. treat duplicate `eventId` or already-applied sequence as idempotent only when the bytes and decision reference match;
-4. quarantine conflicting duplicates, gaps that cannot be reconciled, malformed events, and unknown versions/types;
-5. preserve unknown events for forward-compatible replay without executing them.
+Consumers MUST verify the canonical envelope, trusted publisher, digest, signature, profile, event identity, subject/run correlation, decision reference and digest, and current event lifecycle before projection. They MUST apply events in sequence order, buffer a bounded gap, and reconcile from the durable decision-to-event index. Duplicate `eventId` or sequence is idempotent only when the complete signed bytes and decision reference match. Conflicting duplicates, unauthenticated or replayed events, gaps that cannot be reconciled, malformed events, and unknown versions/types are quarantined before views or notifications. Unknown events may be retained for forward-compatible replay but MUST NOT execute.
 
 Events can update a view model, notifications, or operational projections. They MUST NOT authorize a transition, mutation, publication, review, merge, closure, lease acquisition, or capability grant. A consumer receiving an event is never a substitute for asking the controller to evaluate current state and policy.
 
 <a id="leases"></a>
 ## 8. Distributed leases and compare-and-swap
 
-A lease protects one declared coordination key (for example, a run or exact expected-path claim), has a unique owner token, expiry, heartbeat interval, and monotonic fencing sequence. Acquisition is an atomic CAS from no live lease (or an expired lease) to `(owner, token, sequence + 1, expiry)`. The controller MUST persist the returned sequence and include both token and sequence in every heartbeat, release, state write, and host mutation that depends on the lease.
+A lease protects one canonical coordination key. The key is a JCS object encoded as UTF-8 and hashed as `sha256:hex(SHA-256(UTF8("ForgeDock-Coordination-Key-v1\0") || keyBytes))`; it contains repository, canonical subject or run, resource kind, and a normalized resource claim. Path claims use `/`, remove `.` segments, reject `..`, repeated separators, backslashes, and case aliases, and treat a claim and its ancestor as overlapping. A run-scoped key and a path/component key are distinct. The exact key hash/set MUST be present in the capability constraints and delegated children may only narrow it; a lease request for another or overlapping key is denied.
 
-- **Acquire:** validate host capability and expected version; return one owner and one fencing sequence. A live conflicting owner returns `busy`, never last-write-wins.
-- **Heartbeat:** renew only with exact key, owner token, and current sequence before expiry. A late or duplicate heartbeat is idempotent only when it matches the current record.
-- **Expiry:** an owner that cannot heartbeat before expiry loses authority. Clock use is from the coordination host; clients MUST allow configured bounded skew and MUST NOT extend a lease from a stale local clock.
-- **Release:** is idempotent for the current token/sequence; an old owner cannot release a successor lease.
-- **Stale takeover:** after host-observed expiry, a new owner atomically increments the fencing sequence. The old owner is fenced from subsequent writes even if its process continues.
-- **CAS writes:** every state/coordination write names the expected sequence/version. A mismatch returns `conflict` and the worker stops or reconciles; it does not overwrite.
-- **Split brain:** if two owners believe they hold a lease, the host's higher valid fencing sequence wins. Writes from the lower sequence are rejected. If the host cannot enforce fencing, both writes are unsafe and the controller MUST stop protected coordination and report `unverifiable`.
-- **Failures:** network ambiguity after acquisition or mutation requires reconciliation by idempotency key and sequence. It MUST NOT be resolved by a blind retry or local “last write wins.”
+A lease has a unique unguessable authenticated owner token, expiry, heartbeat interval, safe integer fencing sequence, and request records. The coordination store retains a durable high-water mark per canonical key after release, expiry, deletion, restart, restore, and takeover. It initializes that mark to `0` and atomically allocates `max(highWaterMark, currentRecord.sequence) + 1`; it MUST detect rollback and MUST NOT reset or reuse an epoch (overflow is a terminal `unverifiable` error). Acquisition is an atomic CAS from no live lease (or an expired lease) to `(owner, token, sequence, expiry)`, while retaining the high-water mark.
 
-A host that exposes only local memory, best-effort locks, non-atomic comments, or last-write-wins records does not provide the required distributed guarantee. Single-process operation MAY use the existing local lease semantics when policy explicitly limits the scope to one process; it MUST NOT advertise that as cross-machine coordination.
+- **Acquire:** the request carries a unique idempotency key bound to controller, audience, owner, and canonical key. The host durably stores the result. A retry or lost-response reconciliation returns the original token, sequence, expiry, or an unambiguous terminal result; it never creates a second lease for the same request.
+- **Heartbeat:** each request carries the exact key, authenticated owner token, current sequence, and a strictly increasing owner heartbeat generation plus unique request ID. The host atomically rejects generations at or below the retained generation, retains deduplication results through failover, and rejects old/replayed generations after takeover. A duplicate is idempotent only when its complete request matches the stored result.
+- **Expiry:** an owner that cannot heartbeat before host-observed expiry loses authority. Clock use is from the coordination host; clients MUST allow configured bounded skew and MUST NOT extend a lease from a stale local clock.
+- **Release:** is idempotent for the current token/sequence and has an idempotency key; the high-water mark and deduplication records remain. An old owner cannot release a successor lease.
+- **Stale takeover:** after host-observed expiry, a new owner atomically increments the durable fencing epoch. The old owner is fenced from subsequent writes even if its process continues.
+- **CAS writes and host mutations:** every dependent write names the exact canonical key, token, sequence, and operation id. The host MUST atomically validate them at the external mutation linearization point and return `conflict` for a lower epoch. A later local CAS cannot undo an already accepted GitHub mutation. The current GitHub surface is therefore unsupported for lease-dependent publish/review/merge unless an adapter layer supplies this host-side check.
+- **Split brain:** if two owners believe they hold a lease, the host's higher valid fencing sequence wins; lower-sequence writes are rejected. If the host cannot enforce fencing at the mutation, both writes are unsafe and the controller MUST stop protected coordination and report `unverifiable`.
+- **Failures:** network ambiguity after acquire, heartbeat, release, or mutation requires reconciliation by the original idempotency key and sequence. It MUST NOT be resolved by a blind retry, release of an indeterminate grant, or local “last write wins.”
 
 <a id="bundles"></a>
 ## 9. Portable bundles
 
 A portable bundle is a deterministic archival export, never a second live workflow authority. It contains:
 
-1. a manifest with bundle profile/version, bundle ID, creation time, source host, root subject/run, artifact IDs, byte lengths, and SHA-256 digests;
-2. protected artifacts and permitted legacy v2 evidence, each as exact canonical bytes;
-3. public controller keys and lifecycle/trust metadata needed for offline verification (never private keys);
+1. `manifest.json`, whose exact canonical schema includes `profile`, `bundleId`, `createdAt`, source host, root subject/run, trust-root identifier, checkpoint references, and an ordered `members` array;
+2. protected artifacts as exact UTF-8 JCS bytes and legacy v2 evidence as the exact original marker/decoded bytes, never silently normalized or upgraded;
+3. public controller keys and lifecycle/trust metadata as evidence only (never private keys);
 4. predecessor/chain evidence, checkpoint/anchor references, and host references for exact SHA and decision context;
-5. a bundle-level digest and controller signature over the manifest and ordered member digests.
+5. exactly one `signature.json` containing the bundle digest, signer key ID, and controller signature.
 
-The bundle digest is domain-separated from artifact digests:
+The manifest's top-level fields are exactly `profile`, `bundleId`, `createdAt`, `sourceHost`, `rootSubject`, `rootRunId`, `trustRootId`, `checkpoints`, and `members`; each has a registered type and `checkpoints`/`members` retain array order. Each `members` entry is exactly `{name,type,length,digest}`. `length` is a non-negative safe integer with no leading-zero decimal representation, and `digest` is a lowercase SHA-256 digest of the exact member bytes. Names are restricted normalized ASCII relative paths with `/`, no empty, `.` or `..` component, and no ambiguity. The archive entry set MUST equal the members plus the two fixed control entries `manifest.json` and `signature.json`, one-to-one. Duplicate names, duplicate members, unlisted entries, omitted entries, path aliases, and control entries in `members` are rejected.
+
+The bundle digest is domain-separated from artifact digests and binds the complete manifest and every listed member in the ordered array:
 
 ```text
 bundleDigest = "sha256:" + lowercase(hex(SHA-256(
   UTF8("ForgeDock-Bundle-Digest-v1\0") || manifestBytes || 0x00 ||
-  UTF8(memberName || "\0" || memberDigest) for each member in manifest order
+  UTF8(member.name) || 0x00 || UTF8(member.type) || 0x00 ||
+  UTF8(decimal(member.length)) || 0x00 || UTF8(member.digest)
+  for each member in manifest.members order
 )))
-bundleSignatureInput = UTF8("ForgeDock-Bundle-Signature-v1\0") || UTF8(bundleDigest) || UTF8(bundleId)
+bundleSignatureInput = UTF8("ForgeDock-Bundle-Signature-v1\0") ||
+  UTF8(bundleDigest) || 0x00 || UTF8(bundleId) || 0x00 || UTF8(manifestDigest)
 ```
 
-The Ed25519 signature covers `bundleSignatureInput`; `manifestBytes` is the canonical manifest JSON and member names/digests are the exact ordered values. The deterministic encoding is a ZIP archive with fixed member names sorted by UTF-8 byte order, UTF-8 manifest JSON using [§3.2](#canonical-bytes), fixed Unix epoch timestamps, no extra fields, no compression for canonical member bytes, and no platform-specific permissions. A later implementation MUST publish the exact archive profile and test vectors before claiming interoperability. The bundle profile's hard limits are: 64 MiB total uncompressed bytes, 8 MiB manifest, 1 MiB per artifact, 100,000 members, and 100 MiB maximum compressed input accepted for decompression safety; adapters MAY impose lower limits.
+`manifestBytes` is JCS and `manifestDigest = "sha256:" + lowercase(hex(SHA-256(UTF8("ForgeDock-Bundle-Manifest-Digest-v1\0") || manifestBytes)))`; the signature covers `bundleSignatureInput`. `decimal(member.length)` is the ASCII base-10 representation without a sign, exponent, or leading zero (except zero). `members` is sorted by UTF-8 name bytes and the archive uses that same order. The exact ZIP profile is: `manifest.json` first, listed members in manifest order, `signature.json` last; UTF-8 flag `0x0800`; store method (`0`) for every member; CRC-32 and uncompressed/compressed sizes equal the member bytes in both local and central headers; DOS timestamp `00:00:00, 1980-01-01` in both local and central headers; zero extra/comment fields; no data descriptors; fixed version-needed 10 and fixed version-made-by/platform fields; fixed zero internal/external attributes, disk, and offsets derived only from the prescribed order; and no permissions or host-specific metadata. The Unix epoch is not used because it is not DOS-representable. Any deviation is invalid. Conformance vectors MUST include duplicate and extra-entry archives before interoperability is claimed. Hard limits are 64 MiB total uncompressed bytes, 8 MiB manifest, 1 MiB per artifact, 100,000 members, and 100 MiB maximum compressed input accepted for decompression safety; adapters MAY impose lower limits.
 
-Bundles MUST exclude private keys, provider tokens, GitHub App credentials, OAuth/SSH credentials, cookies, session transcripts, environment files, worktree secrets, unredacted model prompts containing secrets, and operational lease tokens. Export MUST fail or redact deterministically when exclusion cannot be proven. Public repository content is not automatically safe; the exporter applies the configured sensitivity policy.
+Bundles MUST exclude private keys, provider tokens, GitHub App credentials, OAuth/SSH credentials, cookies, session transcripts, environment files, worktree secrets, unredacted model prompts containing secrets, and operational lease tokens. Protected members MUST be emitted byte-for-byte or omitted; they MUST NOT be redacted while retaining a protected digest/signature claim. If a protected member cannot be proven secret-free, export fails or omits it and reports `chain-gap`/incomplete evidence; it never emits a falsely verifiable replacement. Redaction is permitted only for explicitly unprotected legacy evidence, which receives a distinct bundle-only `redacted-legacy-unverified` status (not one of the protected artifact states in [§3.4](#verification)) and is not part of the protected chain. Public repository content is not automatically safe; the exporter applies the configured sensitivity policy before signing or publishing.
 
-Offline verification checks archive structure, limits, member digests, manifest signature, public-key lifecycle, artifact canonical bytes, signatures, bindings, chain/checkpoint evidence, and legacy status without network access. Missing trust metadata, missing predecessor members, stale/revoked keys, or an absent anchor are reported rather than repaired. Offline verification cannot establish current host state, current merge policy, current repository contents, or current revocation status beyond the included trust snapshot.
+Offline verification starts with a preconfigured trust root or an independently authenticated controller checkpoint supplied outside the bundle. Included keys, lifecycle records, and checkpoints may extend that already trusted historical chain but MUST NOT bootstrap trust. Without that anchor, the result is `unverifiable` (or a separate cryptographically-valid-but-untrusted diagnostic), never `verified`. Verification checks the exact archive set, limits, member lengths/digests, manifest and bundle signature, trusted key lifecycle, artifact canonical bytes, signatures, bindings, chain/checkpoint evidence, and legacy status without network access. Missing trust metadata, missing predecessor members, stale/revoked keys, expired discovery, or an absent anchor are reported rather than repaired. Offline verification cannot establish current host state, current merge policy, current repository contents, or current revocation status beyond the independently anchored trust snapshot.
 
 Import stores the bundle under an archival ID and returns per-member states from [§3.4](#verification). It MUST detect duplicate IDs with conflicting bytes, conflicting subjects/runs, invalid signatures, stale checkpoints, and bundle-vs-live differences. Imported evidence MAY be linked to a live run for human review, but it never replaces current GitHub truth, grants capabilities, satisfies a current exact-SHA gate by itself, or becomes competing live authority. A controller may re-verify against the live host before using it.
 
@@ -342,7 +394,7 @@ The protected profile is additive and distinct. No parser silently rewrites a v2
 | Valid new protected set, trusted key and complete chain | Yes | `verified` | Allowed only after current binding, policy, host, and replay checks |
 | Mixed legacy v2 and protected artifacts | Yes, with each member labeled | Protected members verify independently; legacy members remain `legacy-unverified`; missing links can be `chain-gap` | Legacy evidence cannot satisfy a protected gate; the controller may require a complete protected chain |
 | Malformed JSON/marker, invalid shape, duplicate keys | Quarantine raw bytes where safe | `malformed` | Denied |
-| Incomplete protected set, missing key/predecessor/reviewed SHA | Partial display with a gap | `incomplete`, `chain-gap`, or `unverifiable` as applicable | Denied; no silent repair or upgrade |
+| Incomplete protected set, missing key/predecessor/reviewed SHA | Partial display with a gap | Missing field on an artifact: `incomplete`; missing chain member/link: `chain-gap`; unavailable trust evidence: `unverifiable` | Denied; no silent repair or upgrade |
 | Correctly shaped but unknown profile/action/constraint | Preserve for inspection | `unsupported` | Denied |
 | Signed data with wrong digest/signature | Preserve for investigation | `invalid-signature` | Denied |
 | Valid signature but wrong repository/subject/run/action/SHA | Read as signed evidence | `wrong-binding` | Denied for the requested operation |

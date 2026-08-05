@@ -382,9 +382,9 @@ while (capacity.available && ready.length) {
     </section>
 
     <section id="artifacts">
-      <div class="eyebrow">Durable memory</div>
-      <h2>Six artifacts replace annotation sprawl</h2>
-      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The JSON is authoritative for machines; the Markdown remains useful to people.</p>
+      <div class="eyebrow">Durable memory · current v2 baseline</div>
+      <h2>Six legacy artifacts replace annotation sprawl</h2>
+      <p class="section-intro">The current six artifacts are <code>forgedock.artifact/v2</code>: readable structural JSON with a human-readable Markdown projection, but explicitly <code>legacy-unverified</code>. The protected <code>forgedock.protected/v1</code> contract and its exact authority rules live only in the <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md">normative specification</a>; v2 cannot authorize protected actions.</p>
       <div class="grid three">
         <div class="card"><span class="num">01</span><h3>Intent</h3><p>Problem, desired outcome, constraints, source, acceptance hints, links, and dependency declarations.</p></div>
         <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
@@ -393,7 +393,7 @@ while (capacity.available && ready.length) {
         <div class="card"><span class="num">05</span><h3>Review Verdict</h3><p>Reviewed SHA, reviewer roles, checks, structured findings, disposition, and freshness metadata.</p></div>
         <div class="card"><span class="num">06</span><h3>Outcome</h3><p>Merged, invalid, decomposed, blocked, or abandoned; final references, reason, and completion timestamp.</p></div>
       </div>
-      <pre>{
+      <pre aria-label="Legacy v2 example; not protected evidence">{
   "schema": "forgedock.artifact/v2",
   "kind": "ReviewVerdict",
   "id": "rv_...",
@@ -415,7 +415,7 @@ while (capacity.available && ready.length) {
         <div class="card"><h3>GitHub must be enough to…</h3><ul class="clean"><li>Understand why work was attempted</li><li>See what was proved and planned</li><li>Audit what changed and how it was verified</li><li>Know exactly which SHA was reviewed</li><li>Determine the terminal outcome</li></ul></div>
         <div class="card"><h3>Local state may improve…</h3><ul class="clean"><li>Fast status queries and TUI rendering</li><li>Streaming event history and cost tracking</li><li>In-flight process recovery</li><li>Workspace bookkeeping</li><li>Session continuation within one role</li></ul></div>
       </div>
-      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
+      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. The current baseline emits v2 artifacts, which remain <code>legacy-unverified</code> and cannot authorize protected work. Future protected runs may emit <code>forgedock.protected/v1</code> only through the separately reviewed implementation slices; legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
         <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
