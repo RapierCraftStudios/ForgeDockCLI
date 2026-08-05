@@ -10,7 +10,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { modelWithThinking, readForgeDockConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
+import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
@@ -72,10 +72,12 @@ interface VisibleDagRun {
   completion: Promise<void>;
 }
 
+type DagRecoveryMode = "initial" | "resume" | "rerun";
+
 interface VisibleDagInput {
   items: readonly VisibleOrchestrationItem[];
   maxParallel: number;
-  taskFor: (item: VisibleOrchestrationItem, resume: boolean) => { agent: string; task: string; cwd: string; model?: string };
+  taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode) => { agent: string; task: string; cwd: string; model?: string };
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<void>;
   onComplete: (result: Awaited<ReturnType<typeof runSchedule>>, orchestrationId: string) => void;
 }
@@ -103,15 +105,17 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
   pi.registerTool({
     name: ORCHESTRATION_RESUME_TOOL,
     label: "Resume ForgeDock orchestration",
-    description: "Resume the latest failed or blocked orchestration DAG in this supervisor session. Completed nodes stay completed; failed/blocked nodes retry through typed work-on checkpoint recovery, and successors stream when ready.",
+    description: "Resume the latest failed or blocked orchestration DAG in this supervisor session. Completed nodes stay completed. Failed/blocked nodes normally use typed checkpoint resume; after explicit human authorization, list an issue in rerunIssueNumbers to start a fresh semantic controller run instead of repeating an unsupported resume.",
     parameters: Type.Object({
       orchestrationId: Type.Optional(Type.String({ description: "Specific DAG ID; omit to resume the latest interrupted DAG" })),
+      rerunIssueNumbers: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { description: "Failed DAG issues explicitly authorized for a fresh semantic rerun; these receive rerun=true and resume=false" })),
     }),
     executionMode: "sequential",
     async execute(_id, params) {
-      const resumed = await dagDelegator.resume(params.orchestrationId);
+      const rerunIssueNumbers = [...new Set(params.rerunIssueNumbers ?? [])];
+      const resumed = await dagDelegator.resume(params.orchestrationId, { rerunIssueNumbers });
       return {
-        content: [{ type: "text", text: `Resumed ForgeDock DAG ${resumed.id}. Completed nodes were preserved; ${resumed.childRunIds.length} total worker run(s) are now associated with this DAG.` }],
+        content: [{ type: "text", text: `Resumed ForgeDock DAG ${resumed.id}. Completed nodes were preserved; ${resumed.childRunIds.length} total worker run(s) are now associated with this DAG.${rerunIssueNumbers.length ? ` Fresh rerun authorized for ${rerunIssueNumbers.map((issue) => `#${issue}`).join(", ")}.` : ""}` }],
         details: { command: "orchestrate", args: [], state: "delegated", delegation: { orchestrationId: resumed.id, childRunIds: resumed.childRunIds } } satisfies ToolDetails,
       };
     },
@@ -126,19 +130,21 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       repo: Type.Optional(Type.String({ description: "Optional owner/repo; defaults to the current checkout" })),
       throughInvestigation: Type.Optional(Type.Boolean()),
       dryRun: Type.Optional(Type.Boolean()),
-      autoMerge: Type.Optional(Type.Boolean()),
+      autoMerge: Type.Optional(Type.Boolean({ description: "Merge automatically after successful verification and independent approval; defaults enabled unless forge.yaml explicitly disables it" })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       resume: Type.Optional(Type.Boolean({ description: "Explicitly resume a controller-supported durable checkpoint instead of creating a new run" })),
       background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
+      if (params.rerun && params.resume) throw new Error("ForgeDock work-on rerun and resume policies are mutually exclusive");
       const args = [String(params.issue)];
       if (params.dependencies?.length) args.push("--depends-on", [...new Set(params.dependencies)].join(","));
       if (params.repo) args.push("--repo", params.repo);
       if (params.throughInvestigation || params.dryRun) args.push("--through", "investigate");
       if (params.dryRun) args.push("--dry-run");
-      if (params.autoMerge) args.push("--auto-merge");
+      const autoMerge = resolveAutoMerge(params.autoMerge, readForgeDockConfig(ctx.cwd).autoMerge);
+      args.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
       if (params.rerun) args.push("--rerun");
       if (params.resume) args.push("--resume");
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
@@ -241,7 +247,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       }), { description: "Backward-compatible briefs; without executionPlan ForgeDock schedules conservatively" })),
       maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
       dryRun: Type.Optional(Type.Boolean()),
-      autoMerge: Type.Optional(Type.Boolean()),
+      autoMerge: Type.Optional(Type.Boolean({ description: "Merge each work unit automatically after successful verification and independent approval; defaults enabled unless forge.yaml explicitly disables it" })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       confirmed: Type.Optional(Type.Boolean({ description: "Explicit --auto/--confirm authorization for the rendered DAG and proposed work-unit batches" })),
       workerModel: Type.Optional(Type.String({ description: "Optional lower-cost provider/model override for issue workers" })),
@@ -252,7 +258,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       if (issues.length !== params.issueNumbers.length) throw new Error("issueNumbers must be unique");
       const config = readForgeDockConfig(ctx.cwd);
       const maxParallel = params.maxParallel ?? config.maxParallel ?? Math.min(4, issues.length);
-      const autoMerge = params.autoMerge ?? config.autoMerge;
+      const autoMerge = resolveAutoMerge(params.autoMerge, config.autoMerge);
       const discoveredItems = buildVisibleOrchestrationPlan(issues, params.executionPlan, params.issueBriefs);
       const discoveredSchedule = materializeClaimDependencies(discoveredItems);
       const batchPlan = planIssueBatches(discoveredItems);
@@ -317,21 +323,23 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const orchestration = await dagDelegator.start({
         items: schedule.items as VisibleOrchestrationItem[],
         maxParallel,
-        taskFor: (item, resume) => ({
-          agent: "forgedock-issue-worker",
-          task: buildIssueWorkerTask(
-            item.issue,
-            {
-              autoMerge,
-              rerun: params.rerun,
-              resume: shouldResumeObservedItem(item.labels, resume),
-              dependencies: item.dependencies.map(issueNumberFromId),
-            },
+        taskFor: (item, recovery) => {
+          const policy = resolveIssueWorkerRecovery(item.labels, params.rerun === true, recovery);
+          return {
+            agent: "forgedock-issue-worker",
+            task: buildIssueWorkerTask(
+              item.issue,
+              {
+                autoMerge,
+                ...policy,
+                dependencies: item.dependencies.map(issueNumberFromId),
+              },
             { issue: item.issue, title: item.title, summary: item.summary },
-          ),
-          cwd: ctx.cwd,
-          ...(workerModel ? { model: workerModel } : {}),
-        }),
+            ),
+            cwd: ctx.cwd,
+            ...(workerModel ? { model: workerModel } : {}),
+          };
+        },
         assertCompleted: async (item) => {
           repository ??= await github.getRepository();
           const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: repository.repo, issue: item.issue }));
@@ -369,8 +377,9 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       workerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
       reviewerModel: Type.Optional(Type.String({ description: "Nested-reviewer model; exact provider/model ID or unambiguous friendly name" })),
       reviewerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
+      maxReviewSpecialists: Type.Optional(Type.Integer({ minimum: 1, maximum: 6, description: "Soft default specialist budget; independently concrete high-risk surfaces may exceed it" })),
       maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-      autoMerge: Type.Optional(Type.Boolean()),
+      autoMerge: Type.Optional(Type.Boolean({ description: "Default automatic merge policy for work-on and orchestrate; defaults enabled when omitted" })),
     }),
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -387,6 +396,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
         ...(params.reviewerThinking !== undefined || commonThinking !== undefined
           ? { reviewerThinking: (params.reviewerThinking ?? commonThinking) as ThinkingLevel }
           : {}),
+        ...(params.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: params.maxReviewSpecialists } : {}),
         ...(params.maxParallel !== undefined ? { maxParallel: params.maxParallel } : {}),
         ...(params.autoMerge !== undefined ? { autoMerge: params.autoMerge } : {}),
       };
@@ -563,13 +573,13 @@ export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: stri
       "Interpret the request naturally. Use ordinary read-only GitHub tools to resolve it to a concrete eligible issue-number set; do not load Markdown command specs and do not pass natural-language words as issue numbers.",
       "Infer an evidence-backed execution DAG from issue bodies, labels, explicit dependency links, and likely file/component overlap. Do not invent dependencies: use an empty dependsOn list when none is supported. For every item include exact observed labels, scoped affectedFiles, concise path/component claims, priority, and any exact Source PR, FORGE:CLASS, or risk class evidence.",
       "Batching is an efficiency lever only for compatible P2/P3 review findings with the same bounded surface or concern; it means one materialized batch issue and one work-on agent closes all member issues after successful delivery. DAG ready sets and topological levels are never called batches.",
-      `Then call ${tool} exactly once with the resolved issueNumbers, a complete executionPlan, and requested policy options. Set confirmed=true only when the user supplied --auto/--confirm. Ask a concise clarification first only when the target set or a consequential dependency remains genuinely ambiguous.`,
+      `Then call ${tool} exactly once with the resolved issueNumbers, a complete executionPlan, and requested policy options. Automatic merge after successful verification and independent approval is the default; set autoMerge=false only when the user explicitly requests manual merge or --no-auto-merge. Set confirmed=true only when the user supplied --auto/--confirm. Ask a concise clarification first only when the target set or a consequential dependency remains genuinely ambiguous.`,
       "The native tool validates and contracts eligible batch work units, derives serialization edges, presents the plan checkpoint, and streams visible workers as predecessors complete. Continue supervising escalations delivered into this chat.",
-      "Workflow controllers and nested reviews have no fixed wall-clock lifetime while they remain owned. Never invoke forgedock-next, dist/cli/main.js, or another lifecycle controller through bash/shell or attach a shell timeout. If a native call blocks or fails, inspect its durable status and use only the semantic resume/cancel tools; never fall back to an ad-hoc CLI retry.",
+      "Workflow controllers and nested reviews have no fixed wall-clock lifetime while they remain owned. Never invoke forgedock-next, dist/cli/main.js, or another lifecycle controller through bash/shell or attach a shell timeout. If a native call blocks or fails, inspect its durable status and use only the semantic resume/cancel tools; never fall back to an ad-hoc CLI retry. If the user explicitly authorizes a fresh rerun after checkpoint resume is unsupported, call forgedock_resume_orchestration once with that issue in rerunIssueNumbers; do not repeat ordinary resume mode.",
     ].join("\n");
   }
   if (command === "work-on") {
-    return `The user invoked /work-on ${rawArgs}. Resolve the intent to one concrete issue number with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout; use native task status, resume, or explicit cancellation only.`;
+    return `The user invoked /work-on ${rawArgs}. Resolve the intent to one concrete issue number with read-only GitHub tools if needed, then call ${tool} exactly once. Automatic merge after successful verification and independent approval is the default; set autoMerge=false only when the user explicitly requests manual merge or --no-auto-merge. Do not load a Markdown command spec. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout; use native task status, resume, or explicit cancellation only.`;
   }
   if (command === "review-pr") {
     return `The user invoked /review-pr ${rawArgs}. Resolve the intent to one concrete pull request with read-only GitHub tools if needed, then call ${tool} exactly once. Do not load a Markdown command spec. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout; use native task status or explicit cancellation only.`;
@@ -730,16 +740,25 @@ export function shouldResumeObservedItem(labels: readonly string[], sameSessionR
     || label === "needs-human");
 }
 
+export function resolveIssueWorkerRecovery(
+  labels: readonly string[],
+  orchestrationRerun: boolean,
+  recovery: DagRecoveryMode,
+): { rerun: boolean; resume: boolean } {
+  if (orchestrationRerun || recovery === "rerun") return { rerun: true, resume: false };
+  return { rerun: false, resume: shouldResumeObservedItem(labels, recovery === "resume") };
+}
+
 function buildIssueWorkerTask(
   issue: number,
-  options: { autoMerge: boolean | undefined; rerun: boolean | undefined; resume: boolean; dependencies: number[] },
+  options: { autoMerge: boolean; rerun: boolean; resume: boolean; dependencies: number[] },
   brief: { issue: number; title: string; summary: string } | undefined,
 ): string {
   return [
     `Deliver GitHub issue #${issue} through the ForgeDock typed controller.`,
     brief ? `Issue brief — ${brief.title}: ${brief.summary}` : "No issue brief was supplied; escalate rather than guessing if the controller request is ambiguous.",
     "If scope, product intent, or a risky decision is genuinely ambiguous, call contact_supervisor with need_decision or interview_request and wait for the reply.",
-    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, dependencies: options.dependencies, autoMerge: Boolean(options.autoMerge), rerun: Boolean(options.rerun), resume: options.resume })}`,
+    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, dependencies: options.dependencies, autoMerge: options.autoMerge, rerun: Boolean(options.rerun), resume: options.resume })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
 }
@@ -763,6 +782,7 @@ async function runControllerToolBackground(
     ...nestedBridge.env,
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+    ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
   try {
     const record = tasks.start({
@@ -808,6 +828,7 @@ async function runControllerTool(
   const configEnv = {
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+    ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
   let result: ControllerResult;
   try {
@@ -902,7 +923,10 @@ export class VisibleDagDelegator {
     return this.launch(stored, input.items);
   }
 
-  async resume(orchestrationId?: string): Promise<VisibleDagRun> {
+  async resume(
+    orchestrationId?: string,
+    options: { rerunIssueNumbers?: readonly number[] } = {},
+  ): Promise<VisibleDagRun> {
     const stored = orchestrationId ? this.runs.get(orchestrationId) : [...this.runs.values()].reverse().find((run) =>
       !run.running && run.result && [...run.result.status.values()].some((status) => status === "failed" || status === "blocked"));
     if (!stored) throw new Error(orchestrationId
@@ -916,7 +940,12 @@ export class VisibleDagDelegator {
     const remaining = stored.input.items
       .filter((item) => remainingIds.has(item.id))
       .map((item) => ({ ...item, dependencies: item.dependencies.filter((dependency) => remainingIds.has(dependency)) }));
-    return this.launch(stored, remaining, true);
+    const rerunIssueNumbers = new Set(options.rerunIssueNumbers ?? []);
+    const unknownReruns = [...rerunIssueNumbers].filter((issue) => !remaining.some((item) => item.issue === issue || item.memberIssues.includes(issue)));
+    if (unknownReruns.length) {
+      throw new Error(`Fresh rerun override does not match a failed or blocked DAG issue: ${unknownReruns.map((issue) => `#${issue}`).join(", ")}`);
+    }
+    return this.launch(stored, remaining, rerunIssueNumbers);
   }
 
   async shutdown(): Promise<void> {
@@ -926,14 +955,20 @@ export class VisibleDagDelegator {
     this.unsubscribe?.();
   }
 
-  private async launch(stored: StoredDagRun, items: readonly VisibleOrchestrationItem[], resume = false): Promise<VisibleDagRun> {
+  private async launch(
+    stored: StoredDagRun,
+    items: readonly VisibleOrchestrationItem[],
+    rerunIssueNumbers: ReadonlySet<number> = new Set(),
+  ): Promise<VisibleDagRun> {
     stored.running = true;
     const initialLaunches: Promise<unknown>[] = [];
     let collectingInitial = true;
     const result = runSchedule(items, stored.input.maxParallel, async (scheduled) => {
       const item = scheduled as VisibleOrchestrationItem;
+      const explicitlyRerun = rerunIssueNumbers.has(item.issue) || item.memberIssues.some((issue) => rerunIssueNumbers.has(issue));
+      const recovery: DagRecoveryMode = explicitlyRerun ? "rerun" : stored.result ? "resume" : "initial";
       const launch = callSubagentRpc(this.pi, "spawn", {
-        ...stored.input.taskFor(item, resume), async: true, context: "fresh", artifacts: true,
+        ...stored.input.taskFor(item, recovery), async: true, context: "fresh", artifacts: true,
       });
       if (collectingInitial) initialLaunches.push(launch);
       const response = await launch;

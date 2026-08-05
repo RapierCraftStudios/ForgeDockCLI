@@ -14,12 +14,27 @@ export async function publishRemediationRevision(
   if (input.run.state !== "publishing") throw new Error(`Revision publication requires publishing state, found ${input.run.state}`);
   let run = input.run;
   try {
-    await dependencies.git.push(input.workspace);
-    const pullRequest = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
-    if (pullRequest.headSha !== input.buildResult.payload.headSha) {
-      throw new Error(`Published remediation head ${pullRequest.headSha} does not match verified build ${input.buildResult.payload.headSha}`);
+    const workspaceHead = await dependencies.git.head(input.workspace);
+    if (workspaceHead !== input.buildResult.payload.headSha) {
+      throw new Error(`Remediation workspace head ${workspaceHead} does not match verified build ${input.buildResult.payload.headSha}`);
     }
-    const advanced = transition(run, "PR_PUBLISHED", { headSha: pullRequest.headSha });
+    await dependencies.git.push(input.workspace);
+    const observed = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+    if (observed.headBranch !== input.workspace.branch) {
+      throw new Error(`Published PR branch ${observed.headBranch} does not match remediation branch ${input.workspace.branch}`);
+    }
+    let publishedHead = observed.headSha;
+    if (publishedHead !== input.buildResult.payload.headSha && dependencies.host.getBranchHead) {
+      publishedHead = await dependencies.host.getBranchHead(observed.repo, observed.headBranch);
+    }
+    if (publishedHead !== input.buildResult.payload.headSha) {
+      throw new Error(`Published remediation head ${publishedHead} does not match verified build ${input.buildResult.payload.headSha}`);
+    }
+    // GitHub's PR projection can briefly lag the branch ref after a successful
+    // push. Carry only the directly observed ref SHA forward; fresh review
+    // freezes the PR again before granting any authority.
+    const pullRequest = observed.headSha === publishedHead ? observed : { ...observed, headSha: publishedHead };
+    const advanced = transition(run, "PR_PUBLISHED", { headSha: publishedHead });
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, pullRequest };
   } catch (error) {

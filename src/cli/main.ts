@@ -14,6 +14,7 @@ import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import type { AgentEvent } from "../runtime/agent-runtime.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
+import { readForgeDockConfig, resolveAutoMerge } from "../core/config/forgedock-config.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
@@ -104,12 +105,15 @@ async function workOn(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueArg = argv.find((arg) => !arg.startsWith("-"));
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge] [--resume] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
   const dryRun = argv.includes("--dry-run");
   if (dryRun && through !== "investigate") throw new Error("--dry-run must be paired with --through investigate; full work-on creates a branch and PR");
+  if (argv.includes("--rerun") && argv.includes("--resume")) throw new Error("--rerun and --resume are mutually exclusive recovery policies");
+  const autoMerge = commandAutoMerge(argv);
+  const maxReviewSpecialists = configuredMaxReviewSpecialists();
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
   const github = new GitHubClient(process.cwd());
@@ -224,12 +228,14 @@ async function workOn(argv: string[]): Promise<void> {
           : packet;
       const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
       for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
+      const failedOutcome = admission.state === "failed" ? latestArtifact(runArtifacts, "Outcome") : undefined;
       const recoveredRun = {
         schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
         state: admission.state, attempt: 1, version: 0,
         createdAt: intentArtifact.createdAt, updatedAt: checkpointArtifact?.createdAt ?? packet.createdAt,
         artifactIds,
         ...(admission.state === "blocked" && checkpointArtifact?.kind === "Outcome" ? { blockedReason: checkpointArtifact.payload.reason } : {}),
+        ...(failedOutcome?.kind === "Outcome" && failedOutcome.payload.status === "failed" ? { failure: failedOutcome.payload.reason } : {}),
       };
       let run = await store.load(resumeRunId);
       if (!run) {
@@ -244,10 +250,18 @@ async function workOn(argv: string[]): Promise<void> {
       const baseRef = `origin/${localRepository.defaultBranch}`;
       const git = new GitWorktreeManager(process.cwd());
       const verifier = new ProcessVerificationRunner();
+      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
       if (admission.checkpoint === "build" || admission.checkpoint === "publication") {
-        workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef });
+        workspace = await git.recover({
+          runId: resumeRunId,
+          issue: issue.number,
+          baseRef,
+          ...(admission.checkpoint === "publication" && retainedBuildResult?.payload.baseSha
+            ? { baseSha: retainedBuildResult.payload.baseSha }
+            : {}),
+        });
       } else {
         outcome = latestArtifact(runArtifacts, "Outcome");
         if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
@@ -257,6 +271,7 @@ async function workOn(argv: string[]): Promise<void> {
           path: outcome.payload.failureEvidence.workspacePath,
           branch: outcome.payload.failureEvidence.branch,
           baseRef,
+          ...(outcome.payload.failureEvidence.baseSha ? { baseSha: outcome.payload.failureEvidence.baseSha } : {}),
         };
         if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
       }
@@ -271,18 +286,21 @@ async function workOn(argv: string[]): Promise<void> {
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         subjectEvidence,
         ...(batchMembers.length ? { batchMembers } : {}),
-        autoMerge: argv.includes("--auto-merge"),
+        autoMerge,
+        ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent };
+      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
       const result = admission.checkpoint === "build"
         ? await resumeBuildWorkOn(common, dependencies)
         : admission.checkpoint === "publication"
           ? await resumePublicationWorkOn({
             ...common,
-            buildResult: latestArtifact(runArtifacts, "BuildResult")!,
+            buildResult: retainedBuildResult!,
+            ...(priorVerdict ? { priorVerdict } : {}),
           }, dependencies)
           : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
@@ -320,7 +338,8 @@ async function workOn(argv: string[]): Promise<void> {
       baselineChecks,
       subjectEvidence,
       ...(batchMembers.length ? { batchMembers } : {}),
-      autoMerge: argv.includes("--auto-merge"),
+      autoMerge,
+      ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
       signal: leaseController.signal,
@@ -387,6 +406,7 @@ async function reviewPr(argv: string[]): Promise<void> {
   if (issueValue && !/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const maxReviewSpecialists = configuredMaxReviewSpecialists();
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
@@ -403,6 +423,7 @@ async function reviewPr(argv: string[]): Promise<void> {
       ...(issueValue !== undefined ? { issue: Number(issueValue) } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
+      ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
     }, {
       runtime, host: github, workspaces: new GitWorktreeManager(process.cwd()), artifacts, runs,
       onAgentEvent: (event) => writeAgentEvent(event),
@@ -420,8 +441,9 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = argv.filter((arg) => /^\d+$/.test(arg)).map(Number);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--max-parallel N] [--dry-run] [--auto-merge] [--rerun]");
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--max-parallel N] [--dry-run] [--auto-merge | --no-auto-merge] [--rerun]");
   const maxParallelValue = option(argv, "--max-parallel") ?? "2";
+  const autoMerge = commandAutoMerge(argv);
   if (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1) throw new Error("--max-parallel must be a positive integer");
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
   const github = new GitHubClient(process.cwd());
@@ -475,7 +497,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           const resumeArgs = [String(item.issue), "--repo", repository.repo, "--resume"];
           const dependencies = item.dependencies.map(issueNumberFromScheduledId);
           if (dependencies.length) resumeArgs.push("--depends-on", dependencies.join(","));
-          if (argv.includes("--auto-merge")) resumeArgs.push("--auto-merge");
+          resumeArgs.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
           if (provider !== undefined) resumeArgs.push("--provider", provider);
           if (model !== undefined) resumeArgs.push("--model", model);
           await workOn(resumeArgs);
@@ -494,7 +516,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started\n`);
         const result = await executeWorkOn({
           intent, repoPath: process.cwd(), baseBranch: repository.defaultBranch, baseRef: `origin/${repository.defaultBranch}`,
-          verification, autoMerge: argv.includes("--auto-merge"), signal: controller.signal,
+          verification, autoMerge, signal: controller.signal,
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
         }, {
@@ -606,6 +628,24 @@ function writeAgentEvent(event: AgentEvent, prefix?: string): void {
   }
 }
 
+function configuredMaxReviewSpecialists(): number | undefined {
+  const configured = process.env.FORGEDOCK_MAX_REVIEW_SPECIALISTS;
+  if (configured !== undefined) {
+    const parsed = Number(configured);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 6) throw new Error("FORGEDOCK_MAX_REVIEW_SPECIALISTS must be an integer from 1 to 6");
+    return parsed;
+  }
+  return readForgeDockConfig(process.cwd()).maxReviewSpecialists;
+}
+
+function commandAutoMerge(argv: string[]): boolean {
+  const enabled = argv.includes("--auto-merge");
+  const disabled = argv.includes("--no-auto-merge");
+  if (enabled && disabled) throw new Error("--auto-merge and --no-auto-merge cannot be used together");
+  const requested = enabled ? true : disabled ? false : undefined;
+  return resolveAutoMerge(requested, readForgeDockConfig(process.cwd()).autoMerge);
+}
+
 function option(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(name);
   if (index < 0) return undefined;
@@ -637,11 +677,12 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--auto-merge] [--resume] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--no-auto-merge] [--resume] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--max-parallel N] [--dry-run] [--auto-merge] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--max-parallel N] [--dry-run] [--no-auto-merge] [--rerun]\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo]\n\n");
+  process.stdout.write("Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
   process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");
 }

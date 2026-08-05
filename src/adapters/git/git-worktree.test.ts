@@ -44,6 +44,10 @@ describe("isolated Git worktrees", () => {
     const sha = await manager.commit(workspace, "feat: implement issue 12");
     assert.match(sha, /^[0-9a-f]{40,64}$/);
     assert.equal(await manager.head(workspace), sha);
+    assert.deepEqual(await manager.revisionChangedPaths(workspace), ["docs/pipeline-probes/receipt.md", "feature.txt"]);
+    const recoveredAfterCommit = await manager.recover({ runId: "run_test", issue: 12, baseRef: "HEAD" });
+    assert.equal(recoveredAfterCommit.baseSha, workspace.baseSha);
+    assert.deepEqual(await manager.revisionChangedPaths(recoveredAfterCommit), ["docs/pipeline-probes/receipt.md", "feature.txt"]);
     assert.deepEqual(git(workspace.path, "show", "--pretty=", "--name-only").split(/\r?\n/).filter(Boolean).sort(), [
       "docs/pipeline-probes/receipt.md",
       "feature.txt",

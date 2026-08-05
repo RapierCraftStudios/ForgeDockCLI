@@ -97,6 +97,7 @@ export const CheckResultSchema = Type.Object({
 export const BuildResultPayloadSchema = Type.Object({
   branch: NonEmptyString,
   headSha: Sha,
+  baseSha: Type.Optional(Sha),
   changedPaths: Type.Array(NonEmptyString),
   summary: NonEmptyString,
   acceptanceEvidence: Type.Array(Type.Object({
@@ -124,6 +125,36 @@ export const FindingSchema = Type.Object({
   location: Type.Optional(NonEmptyString),
   intentRelevance: NonEmptyString,
   remediation: NonEmptyString,
+  sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+});
+
+const ReviewerRoleSchema = Type.Union([
+  Type.Literal("correctness"), Type.Literal("security"), Type.Literal("data"),
+  Type.Literal("api-compatibility"), Type.Literal("frontend"), Type.Literal("infrastructure"), Type.Literal("concurrency"),
+]);
+const SpecialistReviewerRoleSchema = Type.Union([
+  Type.Literal("security"), Type.Literal("data"), Type.Literal("api-compatibility"),
+  Type.Literal("frontend"), Type.Literal("infrastructure"), Type.Literal("concurrency"),
+]);
+
+export const ReviewPlanSchema = Type.Object({
+  riskTier: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]),
+  specialistBudget: Type.Integer({ minimum: 1, maximum: 6 }),
+  selected: Type.Array(Type.Object({
+    role: ReviewerRoleSchema,
+    score: Type.Integer({ minimum: 0 }),
+    reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+    scope: Type.Array(NonEmptyString),
+    required: Type.Boolean(),
+  }), { minItems: 1 }),
+  skipped: Type.Array(Type.Object({
+    role: SpecialistReviewerRoleSchema,
+    score: Type.Integer({ minimum: 0 }),
+    reason: Type.Union([Type.Literal("below-threshold"), Type.Literal("panel-budget"), Type.Literal("overlapping-coverage")]),
+    evidence: Type.Array(NonEmptyString),
+  })),
 });
 
 export const ReviewVerdictPayloadSchema = Type.Object({
@@ -136,6 +167,7 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   reviewerRoles: Type.Array(NonEmptyString, { minItems: 1 }),
   findings: Type.Array(FindingSchema),
   checks: Type.Array(CheckResultSchema),
+  reviewPlan: Type.Optional(ReviewPlanSchema),
   supersedes: Type.Optional(NonEmptyString),
 });
 
@@ -156,6 +188,7 @@ export const OutcomePayloadSchema = Type.Object({
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,
     workspacePath: NonEmptyString,
+    baseSha: Type.Optional(Sha),
     builderSummary: NonEmptyString,
     changedPaths: Type.Array(NonEmptyString),
     checks: Type.Array(CheckResultSchema),

@@ -89,7 +89,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     }
     case "BuildResult": {
       const payload = artifact.payload as BuildResultPayload;
-      return [heading, meta, "", `**Branch:** \`${payload.branch}\` · **Head:** \`${payload.headSha}\``, "", payload.summary,
+      return [heading, meta, "", `**Branch:** \`${payload.branch}\` · **Head:** \`${payload.headSha}\`${payload.baseSha ? ` · **Frozen base:** \`${payload.baseSha}\`` : ""}`, "", payload.summary,
         listSection("Changed paths", payload.changedPaths.map(code)),
         checklistSection("Acceptance evidence", payload.acceptanceEvidence.map((item) => `${item.criterion} — ${item.status}: ${item.evidence}`), payload.acceptanceEvidence.map((item) => item.status === "passed")),
         checkTable(payload.checks),
@@ -100,7 +100,8 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     case "ReviewVerdict": {
       const payload = artifact.payload as ReviewVerdictPayload;
       return [heading, meta, "", `**Disposition:** \`${payload.disposition}\` · **Reviewed SHA:** \`${payload.headSha}\``, "", `**Reviewer roles:** ${payload.reviewerRoles.map(code).join(", ")}`,
-        payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
+        payload.reviewPlan ? `### Review plan\n**Risk:** \`${payload.reviewPlan.riskTier}\` · **Specialist budget:** ${payload.reviewPlan.specialistBudget}\n${payload.reviewPlan.selected.map((selection) => `- **${selection.role}** · score ${selection.score}${selection.required ? " · required" : ""} — ${selection.reasons.join("; ")}`).join("\n")}${payload.reviewPlan.skipped.length ? `\n\n**Skipped specialists**\n${payload.reviewPlan.skipped.map((selection) => `- **${selection.role}** · score ${selection.score} · ${selection.reason}${selection.evidence.length ? ` — ${selection.evidence.join("; ")}` : " — no qualifying evidence"}`).join("\n")}` : ""}` : "",
+        payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
       ].filter(Boolean).join("\n\n");
     }
@@ -111,7 +112,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         payload.prUrl ? `**Pull request:** ${payload.prUrl}` : "",
         payload.failureEvidence ? [
           `### Retained build attempt`,
-          `**Branch:** \`${payload.failureEvidence.branch}\` · **Recovery workspace:** \`${payload.failureEvidence.workspacePath}\``,
+          `**Branch:** \`${payload.failureEvidence.branch}\` · **Recovery workspace:** \`${payload.failureEvidence.workspacePath}\`${payload.failureEvidence.baseSha ? ` · **Frozen base:** \`${payload.failureEvidence.baseSha}\`` : ""}`,
           "",
           payload.failureEvidence.builderSummary,
           listSection("Changed paths", payload.failureEvidence.changedPaths.map(code)),

@@ -9,7 +9,7 @@ import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.j
 import { reviewPullRequest } from "./review.js";
 
 export async function reviewExistingPullRequest(
-  input: { repo: string; pr: number; issue?: number; provider?: string; model?: string; signal?: AbortSignal },
+  input: { repo: string; pr: number; issue?: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal },
   dependencies: {
     runtime: AgentRuntime;
     host: ForgeHost;
@@ -41,6 +41,7 @@ export async function reviewExistingPullRequest(
       run, pullRequest, intent, investigation, packet, buildResult, workspace: workspace.path,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, {
       runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,

@@ -33,6 +33,7 @@ export type TransitionEvent =
   | "VERIFICATION_FAILED"
   | "RESUME_VERIFICATION"
   | "RESUME_PUBLICATION"
+  | "RECOVER_REVISION_PUBLICATION"
   | "PR_PUBLISHED"
   | "REVIEW_APPROVED"
   | "REVIEW_CHANGES_REQUESTED"
@@ -105,7 +106,9 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
   invalid: {},
   decomposed: {},
   blocked: { RESUME_VERIFICATION: "verifying" },
-  failed: {},
+  // A failed revision publication may be recovered only through the distinct
+  // proof-checked controller path; ordinary publication resume is insufficient.
+  failed: { RECOVER_REVISION_PUBLICATION: "publishing" },
   cancelled: {},
 };
 
@@ -153,7 +156,7 @@ export function transition(
     updatedAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
-  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION") {
+  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

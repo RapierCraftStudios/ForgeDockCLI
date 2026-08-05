@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
-import type { DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
 
 const WORKFLOW_LABELS = [
@@ -22,6 +22,15 @@ const WORKFLOW_LABELS = [
 ] as const;
 
 const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
+
+const REVIEW_FINDING_LABELS = [
+  { name: "review-finding", color: "D93F0B", description: "Defect or improvement found during independent PR review" },
+  { name: "needs-validation", color: "FBCA04", description: "Review finding awaiting validation" },
+  { name: "priority:P0", color: "B60205", description: "Critical priority" },
+  { name: "priority:P1", color: "D93F0B", description: "High priority" },
+  { name: "priority:P2", color: "FBCA04", description: "Medium priority" },
+  { name: "priority:P3", color: "0E8A16", description: "Low priority" },
+] as const;
 
 export function workflowLabelForState(state: RunStateName): string | undefined {
   if (state === "investigating") return "workflow:investigating";
@@ -67,6 +76,7 @@ export interface BatchIssueInput {
 
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
+  private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -131,6 +141,104 @@ export class GitHubClient implements ForgeHost {
       ["api", `repos/${subject.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
       JSON.stringify({ body }),
     );
+  }
+
+  async publishPullRequestComment(input: { repo: string; pullRequest: number; marker: string; body: string }): Promise<void> {
+    if (!input.body.includes(input.marker)) throw new Error("Reviewer comment body is missing its idempotency marker");
+    const subject = { repo: input.repo, pr: input.pullRequest };
+    const comments = await this.listIssueComments(subject);
+    if (!comments.some((comment) => comment.includes(input.marker))) {
+      await this.postIssueComment(subject, input.body);
+    }
+  }
+
+  async materializeReviewFinding(input: {
+    repo: string;
+    sourceIssue?: number;
+    pullRequest: PullRequestSnapshot;
+    runId: string;
+    reviewedHeadSha: string;
+    reviewerRoles: readonly string[];
+    finding: ReviewFindingInput;
+  }): Promise<IssueSnapshot> {
+    await this.ensureReviewFindingLabels(input.repo);
+    const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const legacyMarker = legacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker)
+      || (marker !== legacyMarker && issue.body.includes(legacyMarker)));
+    if (existing) return existing;
+
+    const priority = reviewFindingPriority(input.finding.severity);
+    const title = boundedGitHubText(`fix: ${input.finding.title} (review finding — PR #${input.pullRequest.number})`, 240).replace(/[\r\n]+/g, " ");
+    const affectedFile = reviewFindingPath(input.finding.location);
+    const sensitive = /security|auth|billing|payment|stripe|credential|secret|token/i.test(`${affectedFile ?? ""} ${input.finding.title}`);
+    const body = [
+      "## Problem",
+      "",
+      boundedGitHubText(input.finding.title, 1_000),
+      "",
+      `**Source:** PR #${input.pullRequest.number} — ${boundedGitHubText(input.pullRequest.title, 500)}`,
+      ...(input.sourceIssue ? [`**Delivery issue:** #${input.sourceIssue}`] : []),
+      `**Reviewed SHA:** \`${input.reviewedHeadSha}\``,
+      `**Run:** \`${boundedGitHubCode(input.runId)}\``,
+      `**Reviewers:** ${input.reviewerRoles.map((role) => `\`${boundedGitHubCode(role)}\``).join(", ")}`,
+      ...(input.finding.sourceFindingIds?.length ? [`**Source findings:** ${input.finding.sourceFindingIds.map((id) => `\`${boundedGitHubCode(id)}\``).join(", ")}`] : []),
+      ...(input.finding.sourceSessionRefs?.length ? [`**Reviewer sessions:** ${input.finding.sourceSessionRefs.map((ref) => `\`${boundedGitHubCode(ref)}\``).join(", ")}`] : []),
+      `**Confidence:** ${input.finding.confidence.toUpperCase()}`,
+      `**Severity:** ${input.finding.severity.toUpperCase()}`,
+      `**Controller disposition:** ${input.finding.blocking ? "blocking" : "non-blocking"}`,
+      "",
+      "## Affected Files",
+      "",
+      affectedFile ? `- \`${boundedGitHubCode(affectedFile)}\`${input.finding.location ? ` — ${boundedGitHubText(input.finding.location, 1_000)}` : ""}` : "- Location not reported; validate during investigation.",
+      "",
+      "## Evidence",
+      "",
+      boundedGitHubText(input.finding.evidence, 8_000),
+      "",
+      "## Intent Relevance",
+      "",
+      boundedGitHubText(input.finding.intentRelevance, 4_000),
+      "",
+      "## Required Remediation",
+      "",
+      boundedGitHubText(input.finding.remediation, 4_000),
+      "",
+      "## Acceptance Criteria",
+      "",
+      "- [ ] Validate the finding against the reviewed SHA and current target branch.",
+      "- [ ] Implement or explicitly reject the finding with concrete evidence.",
+      "- [ ] Add focused regression coverage when applicable.",
+      ...(priority === "priority:P3" && !sensitive ? ["", "<!-- FORGE:BATCHABLE -->"] : []),
+      "",
+      marker,
+    ].join("\n");
+
+    const metadata = JSON.parse(await this.gh(["api", `repos/${input.repo}/issues/${input.pullRequest.number}`])) as {
+      milestone?: { title?: string } | null;
+    };
+    const args = [
+      "issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-",
+      "--label", "review-finding", "--label", "needs-validation", "--label", priority,
+    ];
+    if (metadata.milestone?.title) args.push("--milestone", metadata.milestone.title);
+    const url = (await this.gh(args, body)).trim();
+    const number = Number(url.split("/").at(-1));
+    if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
+    return { repo: input.repo, number, title, body, url, state: "OPEN" };
+  }
+
+  private async ensureReviewFindingLabels(repo: string): Promise<void> {
+    let initialization = this.initializedReviewFindingRepos.get(repo);
+    if (!initialization) {
+      initialization = Promise.all(REVIEW_FINDING_LABELS.map((label) => this.gh([
+        "label", "create", label.name, "--repo", repo, "--color", label.color,
+        "--description", label.description, "--force",
+      ]))).then(() => undefined);
+      this.initializedReviewFindingRepos.set(repo, initialization);
+      initialization.catch(() => this.initializedReviewFindingRepos.delete(repo));
+    }
+    await initialization;
   }
 
   async projectRunState(state: RunState): Promise<void> {
@@ -251,6 +359,13 @@ export class GitHubClient implements ForgeHost {
     };
   }
 
+  async getBranchHead(repo: string, branch: string): Promise<string> {
+    const result = await this.gh(["api", `repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`]);
+    const value = JSON.parse(result) as { object?: { sha?: string } };
+    if (!value.object?.sha) throw new Error(`GitHub did not return a head SHA for ${repo}:${branch}`);
+    return value.object.sha;
+  }
+
   async getPullRequestDiff(repo: string, number: number): Promise<string> {
     return this.gh(["pr", "diff", String(number), "--repo", repo]);
   }
@@ -354,6 +469,47 @@ export class GitHubClient implements ForgeHost {
       else child.stdin.end();
     });
   }
+}
+
+export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  const legacyIdentity = reviewFindingIdentity(repo, pullRequest, finding);
+  const identity = /^review-[a-f0-9]{16}$/.test(finding.id) ? `${legacyIdentity}\n${finding.id}` : legacyIdentity;
+  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(identity).digest("hex")} -->`;
+}
+
+function legacyReviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(reviewFindingIdentity(repo, pullRequest, finding)).digest("hex")} -->`;
+}
+
+function reviewFindingIdentity(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  return [
+    repo.toLowerCase(),
+    String(pullRequest),
+    finding.location?.replaceAll("\\", "/").trim().toLowerCase() ?? "",
+    finding.title.replace(/\s+/g, " ").trim().toLowerCase(),
+  ].join("\n");
+}
+
+function reviewFindingPriority(severity: ReviewFindingInput["severity"]): "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3" {
+  if (severity === "critical") return "priority:P0";
+  if (severity === "high") return "priority:P1";
+  if (severity === "medium") return "priority:P2";
+  return "priority:P3";
+}
+
+function reviewFindingPath(location: string | undefined): string | undefined {
+  if (!location) return undefined;
+  const normalized = location.replaceAll("\\", "/").trim();
+  return /(?:^|\s)(\.?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@+-]+)+)/.exec(normalized)?.[1]?.replace(/^\.\//, "");
+}
+
+function boundedGitHubText(value: string, maximum: number): string {
+  const normalized = value.replaceAll("\u0000", "").replace(/<!--[\s\S]*?-->/g, "[comment omitted]").trim();
+  return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}…`;
+}
+
+function boundedGitHubCode(value: string): string {
+  return boundedGitHubText(value, 500).replaceAll("`", "'").replace(/[\r\n]+/g, " ");
 }
 
 function decompositionMarker(repo: string, parentIssue: number, title: string): string {

@@ -92,7 +92,7 @@ describe("subject run admission", () => {
     assert.equal(decideSubjectAdmission([intent("run_old", "2026-01-01T00:00:00.000Z")], { rerun: true }).action, "block");
   });
 
-  it("allows an explicit rerun only after a non-recoverable terminal outcome", () => {
+  it("allows an explicit rerun after a terminal outcome without discarding in-flight work", () => {
     assert.deepEqual(decideSubjectAdmission([
       intent("run_old", "2026-01-01T00:00:00.000Z"),
       outcome("run_old", "2026-01-01T00:01:00.000Z", "decomposed"),
@@ -176,6 +176,41 @@ describe("subject run admission", () => {
     assert.deepEqual(decideSubjectAdmission([verdict]), { action: "start" });
   });
 
+  it("resumes a failed remediation publication when a newer verified head outlived a stale PR projection", () => {
+    const runId = "run_revision_projection_lag";
+    const initial = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact,
+      createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const firstBuild = initial.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(firstBuild?.kind === "BuildResult");
+    const remediationSha = "e".repeat(40);
+    const remediatedBuild = createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: { ...firstBuild.payload, headSha: remediationSha },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const failed = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "failed",
+        reason: `Published remediation head ${"d".repeat(40)} does not match verified build ${remediationSha}`,
+        childIssues: [],
+      },
+    }, { createdAt: "2026-01-01T00:06:00.000Z" });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...initial, verdict, remediatedBuild, failed,
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "failed");
+      assert.equal(decision.checkpoint, "publication");
+    }
+  });
+
   it("does not misclassify a failed reviewed run as a publication checkpoint", () => {
     const runId = "run_review_failed";
     const artifacts = publicationArtifacts(runId);
@@ -184,6 +219,24 @@ describe("subject run admission", () => {
       payload: { headSha: "d".repeat(40), disposition: "approve", reviewerRoles: ["reviewer"], findings: [], checks: [] },
     });
     assert.equal(decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...artifacts, verdict, outcome(runId, "2026-01-01T00:03:00.000Z", "failed")]).action, "skip");
+  });
+
+  it("does not reuse stale verification evidence after a newer review block", () => {
+    const runId = "run_review_blocked";
+    const staleVerification = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "verification failed", childIssues: [],
+        failureEvidence: {
+          branch: "forgedock/issue-1", workspacePath: "/tmp/recovery", builderSummary: "built",
+          changedPaths: ["docs/probe.md"], checks: [{ command: "npm test", status: "failed", durationMs: 1 }],
+        },
+      },
+    }, { createdAt: "2026-01-01T00:01:00.000Z" });
+    const reviewBlocked = outcome(runId, "2026-01-01T00:03:00.000Z", "blocked");
+    const artifacts = [intent(runId, "2026-01-01T00:00:00.000Z"), staleVerification, reviewBlocked];
+    assert.deepEqual(decideSubjectAdmission(artifacts), { action: "skip", runId, state: "blocked" });
+    assert.deepEqual(decideSubjectAdmission(artifacts, { rerun: true }), { action: "start" });
   });
 
   it("resumes a blocked verification attempt with retained evidence", () => {
@@ -203,5 +256,6 @@ describe("subject run admission", () => {
       assert.equal(decision.runId, "run_recover");
       assert.equal(decision.checkpoint, "verification");
     }
+    assert.deepEqual(decideSubjectAdmission([intent("run_recover", "2026-01-01T00:00:00.000Z"), blocked], { rerun: true }), { action: "start" });
   });
 });

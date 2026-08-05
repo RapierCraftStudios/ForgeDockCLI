@@ -8,7 +8,7 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import forgedockExtension, { executeController, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
-import { buildNativeCommandPrompt, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
+import { buildNativeCommandPrompt, resolveIssueWorkerRecovery, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
 
 interface FakePiState {
   pi: ExtensionAPI;
@@ -90,6 +90,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /resolve it to a concrete eligible issue-number set/);
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
+  assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration", "forgedock_orchestrate"]);
 });
@@ -324,6 +325,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.match(spawnRequest.params.model, /^openai-codex\/gpt-worker(?::[a-z]+)?$/);
   assert.equal(spawnRequest.params.chain, undefined);
   assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"dependencies":\[\]/);
+  assert.match(spawnRequest.params.task, /"autoMerge":true/);
   assert.match(spawnRequest.params.task, /"resume":true/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);
@@ -376,6 +378,12 @@ test("visible DAG delegation dispatches a successor on its predecessor completio
   await delegator.shutdown();
 });
 
+test("fresh-rerun authorization cannot be converted back into checkpoint resume", () => {
+  assert.deepEqual(resolveIssueWorkerRecovery(["needs-human"], false, "rerun"), { rerun: true, resume: false });
+  assert.deepEqual(resolveIssueWorkerRecovery(["workflow:engine-error"], true, "initial"), { rerun: true, resume: false });
+  assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
+});
+
 test("visible DAG resume retries failed nodes without replaying completed nodes", async () => {
   const state = fakePi();
   const launched: string[] = [];
@@ -393,12 +401,12 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   const delegator = new VisibleDagDelegator(state.pi);
   let assertions = 0;
   const results: string[] = [];
-  const resumeFlags: boolean[] = [];
+  const recoveryModes: string[] = [];
   const first = await delegator.start({
     items: [{ id: "issue-6", issue: 6, title: "Six", summary: "Six", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [6] }],
     maxParallel: 1,
-    taskFor: (item, resume) => {
-      resumeFlags.push(resume);
+    taskFor: (item, recovery) => {
+      recoveryModes.push(recovery);
       return { agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() };
     },
     assertCompleted: async () => {
@@ -415,8 +423,47 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   originalEmit("subagent:async-complete", { runId: "retry-run-2" });
   await resumed.completion;
   assert.deepEqual(launched, ["retry-run-1", "retry-run-2"]);
-  assert.deepEqual(resumeFlags, [false, true]);
+  assert.deepEqual(recoveryModes, ["initial", "resume"]);
   assert.deepEqual(results, ["failed", "completed"]);
+  await delegator.shutdown();
+});
+
+test("visible DAG recovery applies an explicitly authorized fresh rerun to the failed issue", async () => {
+  const state = fakePi();
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  let launches = 0;
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      const runId = `rerun-override-${++launches}`;
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: runId } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = new VisibleDagDelegator(state.pi);
+  const recoveryModes: string[] = [];
+  let assertions = 0;
+  const first = await delegator.start({
+    items: [{ id: "issue-6", issue: 6, title: "Six", summary: "Six", priority: 1, dependencies: [], claims: [], labels: ["needs-human"], affectedFiles: [], memberIssues: [6] }],
+    maxParallel: 1,
+    taskFor: (_item, recovery) => {
+      recoveryModes.push(recovery);
+      return { agent: "forgedock-issue-worker", task: "Deliver issue #6", cwd: process.cwd() };
+    },
+    assertCompleted: async () => {
+      if (++assertions === 1) throw new Error("checkpoint is not recoverable");
+    },
+    onComplete: () => undefined,
+  });
+  originalEmit("subagent:async-complete", { runId: "rerun-override-1" });
+  await first.completion;
+
+  const resumed = await delegator.resume(first.id, { rerunIssueNumbers: [6] });
+  originalEmit("subagent:async-complete", { runId: "rerun-override-2" });
+  await resumed.completion;
+  assert.deepEqual(recoveryModes, ["initial", "rerun"]);
+  await assert.rejects(() => delegator.resume(first.id, { rerunIssueNumbers: [99] }), /already complete|does not match/);
   await delegator.shutdown();
 });
 
@@ -455,6 +502,15 @@ test("controller subprocess does not inherit the invoking worker role", async ()
   }
 });
 
+test("work-on rejects contradictory fresh-rerun and checkpoint-resume policies", async () => {
+  const state = fakePi();
+  const ctx = commandContext() as any;
+  await state.handlers.get("session_start")?.[0]?.({}, ctx);
+  const tool = state.tools.get("forgedock_work_on");
+  assert.ok(tool);
+  await assert.rejects(tool.execute("conflicting-recovery", { issue: 6, rerun: true, resume: true }, undefined, undefined, ctx), /mutually exclusive/);
+});
+
 test("direct work-on defaults to a native non-blocking controller task", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
   const entry = join(root, "controller.mjs");
@@ -470,8 +526,9 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     const started = Date.now();
     const result = await tool.execute("background-work", { issue: 20 }, undefined, undefined, ctx);
     assert.ok(Date.now() - started < 1_000);
-    const details = result.details as { taskId?: string; state?: string };
+    const details = result.details as { taskId?: string; state?: string; args?: string[] };
     assert.equal(details.state, "delegated");
+    assert.ok(details.args?.includes("--auto-merge"));
     assert.match(details.taskId ?? "", /^task_/);
     const tasks = state.tools.get("forgedock_tasks");
     assert.ok(tasks);

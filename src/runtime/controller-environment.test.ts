@@ -51,6 +51,7 @@ describe("controller environment boundary", () => {
     const entries = (environment.PATH ?? "").split(delimiter);
     assert.ok(existsSync(join(entries[0] ?? "", "bash.exe")), `Git Bash was not discovered: ${environment.PATH}`);
     assert.equal(environment.FORGEDOCK_GIT_BASH, join(entries[0] ?? "", "bash.exe"));
+    assert.equal(environment.MSYSTEM, "MINGW64", "cmd/PowerShell launches receive the Git-for-Windows identity marker");
     if (existsSync(join(homedir(), "bin"))) assert.ok(entries.includes(join(homedir(), "bin")));
   });
 

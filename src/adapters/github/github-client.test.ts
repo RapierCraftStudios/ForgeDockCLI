@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
-import { GitHubArtifactRepository, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, reviewFindingMarker, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -25,6 +25,32 @@ describe("GitHub workflow label projection", () => {
     assert.equal(workflowLabelForState("blocked"), "needs-human");
     assert.equal(workflowLabelForState("failed"), "workflow:engine-error");
     assert.equal(workflowLabelForState("cancelled"), undefined);
+  });
+});
+
+describe("GitHub review finding projection", () => {
+  it("derives a stable deduplication marker from PR, location, and finding identity", () => {
+    const finding = {
+      id: "security-1", severity: "medium" as const, confidence: "high" as const, blocking: true,
+      title: "Token can be replayed", evidence: "No nonce", location: "src/auth.ts:20",
+      intentRelevance: "Breaks authorization", remediation: "Consume a nonce",
+    };
+    const first = reviewFindingMarker("A/B", 57, finding);
+    const second = reviewFindingMarker("a/b", 57, { ...finding, id: "renamed", evidence: "Expanded evidence" });
+    assert.equal(first, second);
+    assert.match(first, /^<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->$/);
+  });
+
+  it("does not collapse distinct consolidated root causes that share a title and location", () => {
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Schema is incomplete", evidence: "Request fields are missing", location: "src/schema.ts:20",
+      intentRelevance: "Breaks clients", remediation: "Define fields",
+    };
+    assert.notEqual(
+      reviewFindingMarker("a/b", 57, finding),
+      reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Response variants are missing" }),
+    );
   });
 });
 

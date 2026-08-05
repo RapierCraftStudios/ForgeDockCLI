@@ -66,7 +66,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Scope-drift check against expected paths
 - [x] Branch push and PR publication with verified-SHA assertion
 - [x] End-to-end six-artifact trajectory test through merge and closure
-- [x] Manual merge default and explicit `--auto-merge`
+- [x] Auto-merge default after successful verification and independent approval, with explicit `--no-auto-merge` opt-out
 - [ ] Idempotent publication reconciliation after a crash between push and state commit
 - [ ] Apply configured issue closure/decomposition actions for terminal investigation outcomes
 - [x] Fail-safe semantic-state reconstruction from GitHub artifacts plus local status store
@@ -79,12 +79,15 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Resolve original intent and exact PR head SHA
 - [x] Detached read-only review worktree at the frozen SHA
 - [x] Baseline fresh-context reviewer
-- [x] Risk-based specialist router
-- [x] Structured findings and deterministic blocking policy
+- [x] Typed, scored Review Plan using changed-path, added-diff, Build Packet, and explicit repository-policy evidence with selected/skipped rationale
+- [x] Soft specialist budget with concrete-surface override, bounded reviewer slices, and one finding-triggered adaptive escalation wave
+- [x] Structured findings, deterministic blocking policy, semantic cross-reviewer consolidation, and source/session lineage
 - [x] SHA freshness invalidation before and after review
-- [x] Bounded remediation, re-verification, revision push, and fresh re-review loop
-- [x] Manual merge default and policy-controlled auto-merge
+- [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results retain the complete delivery path set against an immutable base SHA persisted across recovery
+- [x] Policy-controlled auto-merge default with explicit per-run or project-level opt-out
 - [x] Live GitHub review smoke test with parallel, independently inspectable nested reviewer sessions
+- [x] Per-reviewer provisional PR comments and a controller-authoritative consolidated Review Verdict; create follow-up issues only for consolidated findings that survive remediation or terminal review exhaustion
+- [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before fresh replacement
 
 ### 4. Lean `orchestrate` — scheduler and CLI implemented; durable coordination pending
 
@@ -97,7 +100,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Explicit issue-set CLI and dry-run plan
 - [x] Natural-language issue discovery produces a typed evidence-backed DAG with priorities, dependencies, and path/component claims
 - [x] Visible asynchronous workers stream the live DAG ready set without static topological phase barriers
-- [x] Same-session DAG resume preserves completed nodes and retries failed/blocked nodes through durable work-on checkpoint recovery
+- [x] Same-session DAG resume preserves completed nodes and retries failed/blocked nodes through durable work-on checkpoint recovery; explicit fresh-rerun authorization is carried to selected failed nodes without repeating unsupported resume mode
 - [x] Interrupted building runs recover their deterministic retained worktree and continue from the frozen Build Packet
 - [x] Compatible P2/P3 review findings sharing a bounded concern surface contract into one durable batch issue and one work-on agent
 - [x] Successful batch completion projects a typed merged Outcome to each member before closing the member issues
@@ -119,6 +122,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Inject controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands
 - [x] Expose one semantic native tool per command, activate only the invoked workflow schema, and let the selected model resolve natural-language intent without runtime Markdown loading
 - [x] Bundle pinned `pi-subagents`, launch visible parallel issue workers, and preserve the typed controller as the only mutation authority
+- [x] Surface nested reviewer grandchildren as selectable fleet-tree rows and summarize them as `(+N agents)` on the parent status row
+- [x] Resume incomplete nested reviewers through the package-owned RPC/session lease lifecycle, with structured-output recovery and no controller polling loop
 - [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
 - [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
 - [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
@@ -153,11 +158,11 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 ## Current verification
 
 - New TypeScript build: passing.
-- New core and terminal integration tests cover typed configuration, streaming DAG scheduling, P2/P3 work-unit contraction and member closure, prerequisite admission, FORGE.md preferences, token-bounded devdocs retrieval, links/backlinks, native background controller completion/cancellation, and the previously listed workflow/runtime boundaries, including runtime provenance/RPC diagnostics, lazy semantic-tool dispatch, least-authority issue-child tooling, visible nested reviewer delegation, supervisor escalation activation, tabbed decision-interview rendering, controller streaming, resumable verification, deterministic review thresholds, a complete synthetic `work-on` trajectory across all six artifacts, GitHub reconciliation, dual issue/PR projection, workspace-escape tests, and the branded Pi fork launcher.
+- New core and terminal integration tests cover typed configuration, streaming DAG scheduling, P2/P3 work-unit contraction and member closure, prerequisite admission, FORGE.md preferences, token-bounded devdocs retrieval, links/backlinks, native background controller completion/cancellation, and the previously listed workflow/runtime boundaries, including runtime provenance/RPC diagnostics, lazy semantic-tool dispatch, least-authority issue-child tooling, visible and resumable nested reviewer delegation, scored Review Plans, adaptive specialist escalation, semantic finding consolidation, supervisor escalation activation, tabbed decision-interview rendering, controller streaming, resumable verification, deterministic review thresholds, a complete synthetic `work-on` trajectory across all six artifacts, GitHub reconciliation, dual issue/PR projection, workspace-escape tests, and the branded Pi fork launcher.
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- Legacy suite: 1,807 passing, 0 failing, 7 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
+- ForgeDock Next suite: 193 passing, 0 failing. Legacy suite: 1,813 passing, 0 failing, 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
 
 ## Resolved environment and dependency blockers
 

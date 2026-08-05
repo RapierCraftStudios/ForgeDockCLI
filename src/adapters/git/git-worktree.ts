@@ -24,12 +24,14 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     if (input.baseRef.startsWith("origin/")) {
       await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
     }
-    await this.git(["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
+    const baseSha = (await this.git(["rev-parse", input.baseRef], this.#repo)).trim();
+    await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
+    await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
     await this.installDependencies(path);
-    return { path, branch, baseRef: input.baseRef };
+    return { path, branch, baseRef: input.baseRef, baseSha };
   }
 
-  async recover(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace> {
+  async recover(input: { runId: string; issue: number; baseRef: string; baseSha?: string }): Promise<GitWorkspace> {
     const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
     if (input.baseRef.startsWith("origin/")) {
@@ -49,7 +51,17 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         : ["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
     }
     await this.installDependencies(path);
-    return { path, branch, baseRef: input.baseRef };
+    const configuredBaseSha = await this.configuredBaseSha(branch);
+    const baseSha = input.baseSha
+      ?? configuredBaseSha
+      ?? (await this.git(["merge-base", input.baseRef, "HEAD"], path)).trim();
+    try {
+      await this.git(["merge-base", "--is-ancestor", baseSha, "HEAD"], path);
+    } catch (error) {
+      throw new Error(`Frozen base ${baseSha} is not an ancestor of retained workspace ${branch}`, { cause: error });
+    }
+    await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+    return { path, branch, baseRef: input.baseRef, baseSha };
   }
 
   async createReview(input: { runId: string; pr: number; headSha: string }): Promise<GitWorkspace> {
@@ -62,7 +74,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     if (fetched !== input.headSha) throw new Error(`Fetched review SHA ${fetched} does not match PR head ${input.headSha}`);
     await this.git(["worktree", "add", "--detach", path, fetched], this.#repo);
     await this.installDependencies(path);
-    return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha };
+    return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha, baseSha: input.headSha };
   }
 
   async changedPaths(workspace: GitWorkspace): Promise<string[]> {
@@ -82,6 +94,13 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       }
     }
     return [...paths].sort();
+  }
+
+  async revisionChangedPaths(workspace: GitWorkspace): Promise<string[]> {
+    const baseSha = workspace.baseSha
+      ?? (await this.git(["merge-base", workspace.baseRef, "HEAD"], workspace.path)).trim();
+    const output = await this.git(["diff", "--name-only", "-z", `${baseSha}..HEAD`], workspace.path);
+    return [...new Set(output.split("\0").filter((path) => path && !isOperationalPath(path)))].sort();
   }
 
   async commit(workspace: GitWorkspace, message: string): Promise<string> {
@@ -122,6 +141,14 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private async configuredBaseSha(branch: string): Promise<string | undefined> {
+    try {
+      return (await this.git(["config", "--get", `branch.${branch}.forgedockBaseSha`], this.#repo)).trim() || undefined;
+    } catch {
+      return undefined;
     }
   }
 

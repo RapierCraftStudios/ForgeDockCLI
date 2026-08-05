@@ -69,6 +69,7 @@ export async function verifyAndCommit(
           failureEvidence: {
             branch: input.workspace.branch,
             workspacePath: input.workspace.path,
+            ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
             builderSummary: input.submission.summary,
             changedPaths,
             checks,
@@ -83,6 +84,9 @@ export async function verifyAndCommit(
     }
 
     const headSha = await dependencies.git.commit(input.workspace, `forge: implement issue ${run.subject.issue ?? "work item"}`);
+    const revisionChangedPaths = dependencies.git.revisionChangedPaths
+      ? [...new Set([...(await dependencies.git.revisionChangedPaths(input.workspace)), ...changedPaths])].sort()
+      : changedPaths;
     const evidenceSummary = checks.length
       ? `Required verification passed: ${checks.map((check) => check.command).join(", ")}`
       : "No executable verification commands were configured";
@@ -94,7 +98,8 @@ export async function verifyAndCommit(
       payload: {
         branch: input.workspace.branch,
         headSha,
-        changedPaths,
+        ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
+        changedPaths: revisionChangedPaths,
         summary: input.submission.summary,
         acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => {
           const implementation = input.submission.criterionCoverage.find((item) => item.criterion === criterion)?.implementation ?? evidenceSummary;

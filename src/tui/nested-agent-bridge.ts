@@ -3,13 +3,18 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { SubagentDelegationV2Request, SubagentDelegationV2Response } from "pi-subagents/delegation";
+import type { SubagentDelegationV2Request, SubagentDelegationV2Response, SubagentDelegationV2Update } from "pi-subagents/delegation";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import type { AgentRole, ToolGrant } from "../runtime/agent-runtime.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const SUBAGENT_DELEGATION_REQUEST_EVENT = "prompt-template:subagent:request";
 const SUBAGENT_DELEGATION_RESPONSE_EVENT = "prompt-template:subagent:response";
+const SUBAGENT_DELEGATION_UPDATE_EVENT = "prompt-template:subagent:update";
+const SUBAGENT_DELEGATION_CANCEL_EVENT = "prompt-template:subagent:cancel";
+const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
+const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
+const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 
 interface NestedAgentRequest {
   ownerRunId: string;
@@ -24,6 +29,7 @@ interface NestedAgentRequest {
   provider: string;
   model: string;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  resumeSessionRef?: string;
 }
 
 interface NestedAgentResponse {
@@ -31,6 +37,13 @@ interface NestedAgentResponse {
   sessionRef: string;
   provider: string;
   model: string;
+}
+
+class NestedDelegationError extends Error {
+  constructor(message: string, readonly sessionRef?: string, readonly resumable = false) {
+    super(message);
+    this.name = "NestedDelegationError";
+  }
 }
 
 export interface NestedAgentBridge {
@@ -77,10 +90,16 @@ async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingM
     if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
     if (request.headers.authorization !== `Bearer ${token}`) return send(response, 401, { error: "Unauthorized" });
     const payload = validateRequest(JSON.parse(await readBody(request)) as unknown);
-    const result = await delegate(pi, payload, signal);
+    const result = payload.resumeSessionRef
+      ? await resumeDelegation(pi, payload, signal)
+      : await delegate(pi, payload, signal);
     send(response, 200, result);
   } catch (error) {
-    send(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    send(response, 500, {
+      error: error instanceof Error ? error.message : String(error),
+      ...(error instanceof NestedDelegationError && error.sessionRef ? { sessionRef: error.sessionRef } : {}),
+      ...(error instanceof NestedDelegationError && error.resumable ? { resumable: true } : {}),
+    });
   }
 }
 
@@ -102,38 +121,209 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
   };
   return new Promise((resolve, reject) => {
     let settled = false;
+    let dispatched = false;
+    let observedRunId: string | undefined;
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
       signal.removeEventListener("abort", abort);
-      if (typeof unsubscribe === "function") unsubscribe();
+      if (typeof unsubscribeResponse === "function") unsubscribeResponse();
+      if (typeof unsubscribeUpdate === "function") unsubscribeUpdate();
       callback();
     };
-    const unsubscribe = pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (raw) => {
+    const unsubscribeUpdate = pi.events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (raw) => {
+      const value = raw as SubagentDelegationV2Update;
+      if (value.version === 2 && value.requestId === requestId && value.ownerRunId === input.ownerRunId && value.nodeId === input.id && value.runId) {
+        observedRunId = value.runId;
+      }
+    });
+    const unsubscribeResponse = pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (raw) => {
       const value = raw as SubagentDelegationV2Response;
       if (value.version !== 2 || value.requestId !== requestId || value.ownerRunId !== input.ownerRunId || value.nodeId !== input.id) return;
-      if (value.status !== "completed" || value.result?.kind !== "structured") {
-        finish(() => reject(new Error(value.error ?? `Nested ${input.role} ended with ${value.status}`)));
+      const terminalRunId = "runId" in value ? value.runId : undefined;
+      const terminalResult = "result" in value ? value.result : undefined;
+      const terminalModel = "model" in value ? value.model : undefined;
+      const sessionRef = terminalRunId ?? observedRunId ?? `nested_${requestId}`;
+      // structured_output is schema validated by pi-subagents. Preserve it even
+      // when a trailing provider transport failure changes the terminal status.
+      if (terminalResult?.kind === "structured") {
+        finish(() => resolve({
+          output: terminalResult.value,
+          sessionRef,
+          provider: input.provider,
+          model: terminalModel ?? input.model,
+        }));
         return;
       }
-      const output = value.result.value;
-      finish(() => resolve({
-        output,
-        sessionRef: value.runId ?? `nested_${requestId}`,
-        provider: input.provider,
-        model: value.model ?? input.model,
-      }));
+      finish(() => reject(new NestedDelegationError(
+        value.error ?? `Nested ${input.role} ended with ${value.status}`,
+        sessionRef,
+        Boolean(terminalRunId ?? observedRunId),
+      )));
     });
-    const abort = () => finish(() => reject(signal.reason instanceof Error ? signal.reason : new Error(`Nested ${input.role} cancelled`)));
+    const abort = () => {
+      if (dispatched) pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { version: 2, requestId, ownerRunId: input.ownerRunId, nodeId: input.id });
+      finish(() => reject(signal.reason instanceof Error ? signal.reason : new Error(`Nested ${input.role} cancelled`)));
+    };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
-    else pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
+    else {
+      dispatched = true;
+      pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
+    }
   });
+}
+
+async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSignal): Promise<NestedAgentResponse> {
+  const sourceSessionRef = input.resumeSessionRef!;
+  const bufferedCompletions: unknown[] = [];
+  let targetRunId: string | undefined;
+  let resolveTarget: ((value: unknown) => void) | undefined;
+  const unsubscribeCompletion = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (raw) => {
+    if (targetRunId && completionRunId(raw) === targetRunId && resolveTarget) resolveTarget(raw);
+    else if (bufferedCompletions.length < 64) bufferedCompletions.push(raw);
+  });
+  try {
+    const reply = await subagentRpc(pi, "resume", {
+      id: sourceSessionRef,
+      message: [
+        `Continue the same ForgeDock review for ${input.id}.`,
+        "The previous attempt ended operationally before the controller received a schema-valid result.",
+        "Finish the original bounded objective against the same frozen revision, then call structured_output exactly once.",
+        "Do not broaden the assigned review scope.",
+      ].join(" "),
+    }, signal, (lateReply) => {
+      if (lateReply.success) {
+        const lateRunId = resumedRunId(lateReply.data);
+        if (lateRunId) interruptNestedRun(pi, lateRunId);
+      }
+    });
+    if (!reply.success) {
+      throw new NestedDelegationError(reply.error?.message ?? "Nested reviewer resume was rejected", sourceSessionRef, false);
+    }
+    targetRunId = resumedRunId(reply.data);
+    if (!targetRunId) throw new NestedDelegationError("Nested reviewer resume did not return a revived run id", sourceSessionRef, false);
+    const buffered = bufferedCompletions.find((candidate) => completionRunId(candidate) === targetRunId);
+    const completion = buffered ?? await new Promise<unknown>((resolve, reject) => {
+      const abort = () => {
+        signal.removeEventListener("abort", abort);
+        if (targetRunId) interruptNestedRun(pi, targetRunId);
+        reject(signal.reason instanceof Error ? signal.reason : new Error("Nested reviewer resume cancelled"));
+      };
+      resolveTarget = (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      };
+      const raced = bufferedCompletions.find((candidate) => completionRunId(candidate) === targetRunId);
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      else if (raced) resolveTarget(raced);
+    });
+    const record = asRecord(completion);
+    const child = Array.isArray(record?.results) ? asRecord(record.results[0]) : undefined;
+    const output = child?.structuredOutput ?? record?.structuredOutput;
+    const sessionRef = completionRunId(completion) ?? targetRunId;
+    // As with fresh delegation, structured_output precedes transport teardown.
+    // Preserve it even if the resumed run's trailing terminal status is failed.
+    if (output === undefined) {
+      throw new NestedDelegationError(
+        String(child?.error ?? record?.error ?? `Resumed nested ${input.role} ended without structured output`),
+        sessionRef,
+        false,
+      );
+    }
+    return {
+      output,
+      sessionRef,
+      provider: input.provider,
+      model: typeof child?.model === "string" ? child.model : input.model,
+    };
+  } finally {
+    if (typeof unsubscribeCompletion === "function") unsubscribeCompletion();
+  }
+}
+
+interface SubagentRpcReply {
+  success: boolean;
+  data?: unknown;
+  error?: { message?: string };
+}
+
+function subagentRpc(
+  pi: ExtensionAPI,
+  method: "resume",
+  params: unknown,
+  signal: AbortSignal,
+  onLateReply?: (reply: SubagentRpcReply) => void,
+): Promise<SubagentRpcReply> {
+  const requestId = crypto.randomUUID();
+  const replyEvent = `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let aborted = false;
+    const unsubscribe = pi.events.on(replyEvent, (raw) => {
+      const reply = raw as SubagentRpcReply;
+      if (aborted) {
+        if (typeof unsubscribe === "function") unsubscribe();
+        onLateReply?.(reply);
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      if (typeof unsubscribe === "function") unsubscribe();
+      resolve(reply);
+    });
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      aborted = true;
+      signal.removeEventListener("abort", abort);
+      if (!onLateReply && typeof unsubscribe === "function") unsubscribe();
+      reject(signal.reason instanceof Error ? signal.reason : new Error("Nested reviewer resume cancelled"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    else pi.events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId, method, params, source: { extension: "forgedock" } });
+  });
+}
+
+function interruptNestedRun(pi: ExtensionAPI, runId: string): void {
+  pi.events.emit(SUBAGENT_RPC_REQUEST_EVENT, {
+    version: 1,
+    requestId: crypto.randomUUID(),
+    method: "interrupt",
+    params: { id: runId },
+    source: { extension: "forgedock", reason: "owner-cancelled" },
+  });
+}
+
+function resumedRunId(value: unknown): string | undefined {
+  const data = asRecord(value);
+  const details = asRecord(data?.details);
+  for (const candidate of [details?.asyncId, details?.runId, data?.runId]) {
+    if (typeof candidate === "string" && candidate) return candidate;
+  }
+  const match = typeof data?.text === "string" ? /Revived run:\s*([^\s]+)/.exec(data.text) : undefined;
+  return match?.[1];
+}
+
+function completionRunId(value: unknown): string | undefined {
+  const record = asRecord(value);
+  return typeof record?.runId === "string" ? record.runId : typeof record?.id === "string" ? record.id : undefined;
+}
+
+function asRecord(value: unknown): Record<string, any> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
 }
 
 function buildTask(input: NestedAgentRequest): string {
   const context = input.context.map((artifact) => ({ kind: artifact.kind, id: artifact.id, payload: artifact.payload }));
+  const reviewSpecialty = input.role === "reviewer"
+    ? /:review:[^:\r\n]+:([^:\r\n]+)/.exec(input.id)?.[1]
+    : undefined;
   return [
+    reviewSpecialty ? `ForgeDock review · ${reviewSpecialty}` : `ForgeDock nested task · ${input.role}`,
     `ForgeDock nested task id: ${input.id}`,
     `Role: ${input.role}`,
     "",
@@ -164,6 +354,9 @@ function validateRequest(value: unknown): NestedAgentRequest {
   if (input.role !== "reviewer") throw new Error(`Nested role is not authorized: ${input.role}`);
   if (!Array.isArray(input.context) || !Array.isArray(input.tools)) throw new Error("Nested request context and tools must be arrays");
   if (!input.outputSchema || typeof input.outputSchema !== "object" || Array.isArray(input.outputSchema)) throw new Error("Nested request outputSchema is required");
+  if (input.resumeSessionRef !== undefined && (typeof input.resumeSessionRef !== "string" || !input.resumeSessionRef.trim() || input.resumeSessionRef.length > 256 || /[\r\n]/.test(input.resumeSessionRef))) {
+    throw new Error("Nested request resumeSessionRef is invalid");
+  }
   if (input.tools.some((tool) => tool === "edit" || tool === "write" || tool === "bash")) throw new Error("Nested reviewers must be read-only");
   return input as NestedAgentRequest;
 }

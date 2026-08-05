@@ -8,7 +8,7 @@ import { createRun, transition, type RunState, type TransitionEvent } from "../.
 import type { BuilderSubmission } from "./build.js";
 import { verifyAndCommit } from "./verify.js";
 
-const workspace: GitWorkspace = { path: "/tmp/worktree", branch: "forgedock/issue-1", baseRef: "main" };
+const workspace: GitWorkspace = { path: "/tmp/worktree", branch: "forgedock/issue-1", baseRef: "main", baseSha: "0".repeat(40) };
 const submission: BuilderSubmission = {
   summary: "Implemented guard", changedPaths: ["src/a.ts"],
   criterionCoverage: [{ criterion: "Preserves state", implementation: "Guard preserves previous state" }],
@@ -16,9 +16,10 @@ const submission: BuilderSubmission = {
 };
 
 class FakeGit implements GitWorkspaceManager {
-  constructor(readonly paths: string[]) {}
+  constructor(readonly paths: string[], readonly revisionPaths = paths) {}
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return this.paths; }
+  async revisionChangedPaths(): Promise<string[]> { return this.revisionPaths; }
   async commit(): Promise<string> { return "a".repeat(40); }
   async push(): Promise<void> {}
   async head(): Promise<string> { return "a".repeat(40); }
@@ -66,8 +67,21 @@ describe("verification and commit barrier", () => {
     });
     assert.equal(result.run.state, "publishing");
     assert.equal(result.buildResult?.payload.headSha, "a".repeat(40));
+    assert.equal(result.buildResult?.payload.baseSha, workspace.baseSha);
     assert.equal(result.buildResult?.payload.checks[0]?.status, "passed");
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
+  });
+
+  it("records the complete delivery revision after a partial remediation attempt", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const result = await verifyAndCommit({ run, packet: packet(run), submission, workspace, commands: [command] }, {
+      verifier: new FakeVerifier([passed]),
+      git: new FakeGit(["src/a.ts"], ["SECURITY.md", "docs/contract.md", "src/a.ts"]),
+      artifacts, runs,
+    });
+    assert.deepEqual(result.buildResult?.payload.changedPaths, ["SECURITY.md", "docs/contract.md", "src/a.ts"]);
   });
 
   it("retains unchanged baseline-failure evidence without treating a required failure as passed", async () => {
@@ -106,6 +120,7 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(result.outcome?.payload.failureEvidence, {
       branch: workspace.branch,
       workspacePath: workspace.path,
+      baseSha: workspace.baseSha,
       builderSummary: submission.summary,
       changedPaths: ["src/a.ts"],
       checks: [failed],

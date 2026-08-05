@@ -61,7 +61,13 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
 
   const inheritedEntries = pathEntries(environmentValue(clean, "PATH"));
   setEnvironmentValue(clean, "PATH", uniquePathEntries([...candidates, ...inheritedEntries]).join(delimiter));
-  if (gitRoot) clean.FORGEDOCK_GIT_BASH = join(gitRoot, "usr", "bin", "bash.exe");
+  if (gitRoot) {
+    clean.FORGEDOCK_GIT_BASH = join(gitRoot, "usr", "bin", "bash.exe");
+    // Git for Windows' bash.exe does not populate MSYSTEM when started directly
+    // from cmd/PowerShell. Mark the verified 64-bit Git toolchain explicitly so
+    // headed and Git-Bash-launched verification descendants observe one contract.
+    if (!environmentValue(clean, "MSYSTEM")) clean.MSYSTEM = "MINGW64";
+  }
   if (!environmentValue(clean, "USERPROFILE")) clean.USERPROFILE = userHome;
   return clean;
 }

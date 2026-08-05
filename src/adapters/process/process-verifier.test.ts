@@ -41,7 +41,11 @@ describe("deterministic process verification", () => {
       "if(r.status!==0){process.stderr.write(r.stderr||'wrong bash');process.exit(42)}",
       "console.log(r.stdout.trim())",
     ].join("");
-    const [result] = await isolatedRunner({ ...process.env, PATH: join(systemRoot, "System32") }).run([{
+    const sparseEnvironment: NodeJS.ProcessEnv = { ...process.env, PATH: join(systemRoot, "System32") };
+    for (const name of Object.keys(sparseEnvironment)) {
+      if (name.toLowerCase() === "msystem") delete sparseEnvironment[name];
+    }
+    const [result] = await isolatedRunner(sparseEnvironment).run([{
       id: "git-bash", command: process.execPath, args: ["-e", script],
       cwd: process.cwd(), timeoutMs: 15_000, required: true,
     }]);

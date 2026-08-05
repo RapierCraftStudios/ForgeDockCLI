@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, updateForgeDockConfig } from "./forgedock-config.js";
+import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, updateForgeDockConfig } from "./forgedock-config.js";
 
 describe("ForgeDock Next project configuration", () => {
   it("bootstraps a valid minimal forge.yaml exactly once", () => {
@@ -36,6 +36,7 @@ describe("ForgeDock Next project configuration", () => {
         workerModel: "openai-codex/gpt-5.6-sol",
         workerThinking: "max",
         reviewerThinking: "high",
+        maxReviewSpecialists: 3,
         maxParallel: 3,
       });
       const raw = readFileSync(join(cwd, "forge.yaml"), "utf8");
@@ -45,6 +46,7 @@ describe("ForgeDock Next project configuration", () => {
         workerModel: "openai-codex/gpt-5.6-sol",
         workerThinking: "max",
         reviewerThinking: "high",
+        maxReviewSpecialists: 3,
         maxParallel: 3,
       });
       updateForgeDockConfig(cwd, { autoMerge: false });
@@ -53,6 +55,22 @@ describe("ForgeDock Next project configuration", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it("rejects an unbounded specialist fleet", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
+    try {
+      assert.throws(() => updateForgeDockConfig(cwd, { maxReviewSpecialists: 7 }), /1 to 6/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("enables automatic merge by default while preserving explicit opt-out precedence", () => {
+    assert.equal(resolveAutoMerge(undefined, undefined), true);
+    assert.equal(resolveAutoMerge(undefined, false), false);
+    assert.equal(resolveAutoMerge(false, true), false);
+    assert.equal(resolveAutoMerge(true, false), true);
   });
 
   it("applies a configured thinking suffix idempotently", () => {

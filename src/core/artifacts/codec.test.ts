@@ -34,6 +34,36 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("renders explainable review routing and consolidated finding lineage", () => {
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness", "security"], checks: [],
+        reviewPlan: {
+          riskTier: "high", specialistBudget: 3,
+          selected: [
+            { role: "correctness", score: 1000, reasons: ["mandatory"], scope: ["src/auth.ts"], required: true },
+            { role: "security", score: 120, reasons: ["security-sensitive path"], scope: ["src/auth.ts"], required: true },
+          ],
+          skipped: [{ role: "frontend", score: 0, reason: "below-threshold", evidence: [] }],
+        },
+        findings: [{
+          id: "review-1", severity: "high", confidence: "high", blocking: true, title: "Token is replayable",
+          evidence: "Nonce is not consumed", location: "src/auth.ts:20", intentRelevance: "Breaks authorization",
+          remediation: "Consume the nonce", sourceFindingIds: ["security:SEC-1"], sourceSessionRefs: ["review-session-1"], reviewerRoles: ["security"],
+        }],
+      },
+    });
+    const comment = renderArtifactComment(verdict);
+    assert.match(comment, /Review plan/);
+    assert.match(comment, /security.*score 120/);
+    assert.match(comment, /frontend.*below-threshold/);
+    assert.match(comment, /Sources: `security:SEC-1`/);
+    assert.match(comment, /Sessions: `review-session-1`/);
+    assert.deepEqual(findArtifacts(comment)[0], verdict);
+  });
+
   it("never renders a baseline-equivalent required failure as passed", () => {
     const outcome = createArtifact({
       kind: "Outcome",

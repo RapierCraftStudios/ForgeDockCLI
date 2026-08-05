@@ -15,7 +15,7 @@ import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
 import { verifyAndCommit } from "./verify.js";
-import { reviewPullRequest } from "../review-pr/review.js";
+import { materializeReviewFindings, reviewPullRequest } from "../review-pr/review.js";
 
 export interface WorkOnDependencies {
   runtime: AgentRuntime;
@@ -46,6 +46,7 @@ export async function workOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     signal?: AbortSignal;
@@ -95,6 +96,7 @@ export async function workOn(
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.autoMerge !== undefined ? { autoMerge: input.autoMerge } : {}),
       ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+      ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
       ...(input.batchMembers !== undefined ? { batchMembers: input.batchMembers } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -133,6 +135,7 @@ export async function resumeBuildWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     signal?: AbortSignal;
@@ -180,6 +183,7 @@ async function continueBuildDelivery(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     signal?: AbortSignal;
@@ -225,6 +229,8 @@ async function continueBuildDelivery(
     const reviewed = await reviewPullRequest({
       run, pullRequest, intent: input.intent, investigation: input.investigation,
       packet: input.packet, buildResult, workspace: input.workspace.path,
+      findingIssuePolicy: "approved-only",
+      ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(priorVerdict !== undefined ? { priorVerdict } : {}),
       ...runtimeOptions,
     }, {
@@ -237,13 +243,13 @@ async function continueBuildDelivery(
     if (run.state === "merging") break;
     const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
     if (scopeViolation) {
-      run = await blockForBudget(run, dependencies, scopeViolation);
+      run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
       return { run, pullRequest };
     }
 
     cycle++;
     if (cycle > (input.maxRemediationCycles ?? 2)) {
-      run = await blockForBudget(run, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+      run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
       return { run, pullRequest };
     }
     const remediated = await remediateReview({
@@ -292,6 +298,7 @@ export async function resumeWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     signal?: AbortSignal;
@@ -345,6 +352,8 @@ export async function resumeWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
+        findingIssuePolicy: "approved-only",
+        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
         ...runtimeOptions,
       }, {
@@ -357,12 +366,12 @@ export async function resumeWorkOn(
       if (run.state === "merging") break;
       const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
       if (scopeViolation) {
-        run = await blockForBudget(run, dependencies, scopeViolation);
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
         return { run, pullRequest };
       }
       cycle++;
       if (cycle > (input.maxRemediationCycles ?? 2)) {
-        run = await blockForBudget(run, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
         return { run, pullRequest };
       }
       const remediated = await remediateReview({
@@ -419,6 +428,7 @@ export async function resumePublicationWorkOn(
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
     buildResult: DurableArtifact<"BuildResult">;
+    priorVerdict?: DurableArtifact<"ReviewVerdict">;
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -427,15 +437,32 @@ export async function resumePublicationWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
-  if (input.run.state !== "publishing") throw new Error(`Publication resume requires publishing state, found ${input.run.state}`);
+  if (input.run.state !== "publishing" && input.run.state !== "failed") {
+    throw new Error(`Publication resume requires publishing or recoverable failed state, found ${input.run.state}`);
+  }
+  const recoveringRevision = input.run.state === "failed";
+  if (recoveringRevision) {
+    const expectedHead = /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i
+      .exec(input.run.failure ?? "")?.[1];
+    if (!input.priorVerdict
+      || Date.parse(input.buildResult.createdAt) <= Date.parse(input.priorVerdict.createdAt)
+      || expectedHead?.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()) {
+      throw new Error("Failed run does not carry proof of a newer verified remediation head after a stale PR projection");
+    }
+  }
   let run = input.run;
-  const resumed = transition(run, "RESUME_PUBLICATION", { reason: `Resuming verified head ${input.buildResult.payload.headSha} without replaying build or verification` });
+  const resumed = transition(run, recoveringRevision ? "RECOVER_REVISION_PUBLICATION" : "RESUME_PUBLICATION", {
+    reason: recoveringRevision
+      ? `Recovering verified remediation head ${input.buildResult.payload.headSha} after its PR projection lagged the pushed branch`
+      : `Resuming verified head ${input.buildResult.payload.headSha} without replaying build or verification`,
+  });
   await dependencies.runs.commit(run.version, resumed.state, resumed.record);
   run = resumed.state;
   const runtimeOptions = {
@@ -452,12 +479,14 @@ export async function resumePublicationWorkOn(
     run = published.run;
     let pullRequest = published.pullRequest;
     let verdict: DurableArtifact<"ReviewVerdict">;
-    let priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined;
+    let priorVerdict = input.priorVerdict;
     let cycle = 0;
     while (true) {
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
+        findingIssuePolicy: "approved-only",
+        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
         ...runtimeOptions,
       }, {
@@ -470,12 +499,12 @@ export async function resumePublicationWorkOn(
       if (run.state === "merging") break;
       const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
       if (scopeViolation) {
-        run = await blockForBudget(run, dependencies, scopeViolation);
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
         return { run, pullRequest };
       }
       cycle++;
       if (cycle > (input.maxRemediationCycles ?? 2)) {
-        run = await blockForBudget(run, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
         return { run, pullRequest };
       }
       const remediated = await remediateReview({
@@ -539,10 +568,22 @@ function blockingFindingOutsidePacket(
   return `Blocking review finding requires changes outside the frozen Build Packet (${details}); refusing automatic scope expansion`;
 }
 
-function repositoryPathFromLocation(location: string): string | undefined {
+export function repositoryPathFromLocation(location: string): string | undefined {
   const normalized = location.replaceAll("\\", "/").trim();
-  const match = /(?:^|\s)(\.?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)/.exec(normalized);
-  return match?.[1] ? normalizeRepoPath(match[1]) : undefined;
+  const candidates = normalized.matchAll(/(?:^|[\s`(])(\.?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*)(?=[:#\s`),]|$)/g);
+  for (const match of candidates) {
+    if (!match[1]) continue;
+    const candidate = normalizeRepoPath(match[1]);
+    const finalSegment = candidate.split("/").at(-1) ?? "";
+    // Artifact/session field references are evidence locations, not repository
+    // paths. False scope classification here strands otherwise recoverable runs.
+    if (/^(?:art|run|task)_/i.test(candidate)) continue;
+    const pathLike = candidate.includes("/")
+      || finalSegment.includes(".")
+      || /^(?:Dockerfile(?:\.[A-Za-z0-9_.-]+)?|LICENSE|Makefile|Procfile|README)$/i.test(finalSegment);
+    if (pathLike) return candidate;
+  }
+  return undefined;
 }
 
 function normalizeRepoPath(path: string): string {
@@ -572,6 +613,22 @@ async function appendFailureOutcome(run: RunState, reason: string, dependencies:
     producer: { role: "controller", runtime: "forgedock" },
     payload: { status: "failed", reason, childIssues: [] },
   }));
+}
+
+async function blockForReviewFindings(
+  run: RunState,
+  pullRequest: PullRequestSnapshot,
+  verdict: DurableArtifact<"ReviewVerdict">,
+  dependencies: WorkOnDependencies,
+  reason: string,
+): Promise<RunState> {
+  await materializeReviewFindings({
+    run,
+    pullRequest,
+    findings: verdict.payload.findings,
+    fallbackReviewerRoles: verdict.payload.reviewerRoles,
+  }, dependencies.host);
+  return blockForBudget(run, dependencies, reason);
 }
 
 async function blockForBudget(run: RunState, dependencies: WorkOnDependencies, reason: string): Promise<RunState> {

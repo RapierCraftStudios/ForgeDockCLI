@@ -32,8 +32,9 @@ export interface AgentTask<T> {
 
 export type AgentEvent =
   | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string }
+  | { type: "thinking.delta"; taskId: string; text: string }
   | { type: "text.delta"; taskId: string; text: string }
-  | { type: "tool.started"; taskId: string; tool: string }
+  | { type: "tool.started"; taskId: string; tool: string; args?: unknown }
   | { type: "tool.completed"; taskId: string; tool: string; isError: boolean }
   | { type: "artifact.submitted"; taskId: string }
   | { type: "session.completed"; taskId: string; sessionRef: string };
@@ -41,8 +42,23 @@ export type AgentEvent =
 export interface AgentRunResult<T> {
   output: T;
   sessionRef: string;
+  /** Ordered persisted-session ancestry when a failed session was resumed. */
+  sessionLineage?: readonly string[];
   provider: string;
   model: string;
+}
+
+/** Operational failure metadata used only to recover the same persisted agent session. */
+export class AgentRunError extends Error {
+  readonly sessionRef: string | undefined;
+  readonly resumable: boolean;
+
+  constructor(message: string, options: { sessionRef?: string; resumable?: boolean; cause?: unknown } = {}) {
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "AgentRunError";
+    this.sessionRef = options.sessionRef;
+    this.resumable = options.resumable === true && options.sessionRef !== undefined;
+  }
 }
 
 export type AgentEventSink = (event: AgentEvent) => void;
@@ -56,5 +72,7 @@ export interface RuntimeCapabilities {
 export interface AgentRuntime {
   capabilities(): Promise<RuntimeCapabilities>;
   run<T>(task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>>;
+  /** Resume one explicitly identified persisted session; runtimes without this seam report resumableSessions=false. */
+  resume?<T>(sessionRef: string, task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>>;
   close(): Promise<void>;
 }

@@ -17,6 +17,8 @@ class CompletionHost implements ForgeHost {
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
   async getPullRequestDiff(): Promise<string> { return ""; }
+  async publishPullRequestComment(): Promise<void> {}
+  async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
   async mergePullRequest(): Promise<void> { this.merges++; this.snapshot.state = "MERGED"; }
   async closeIssue(_repo: string, issue: number): Promise<void> { this.closes.push(issue); }
 }

@@ -2,6 +2,7 @@
 
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
+import { Check, Errors } from "typebox/value";
 import {
   createAgentSession,
   createExtensionRuntime,
@@ -17,6 +18,7 @@ import type { DurableArtifact } from "../core/artifacts/schema.js";
 import { splitConfiguredModel, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
+import { AgentRunError } from "./agent-runtime.js";
 import type {
   AgentEventSink,
   AgentRunResult,
@@ -47,7 +49,7 @@ export class PiAgentRuntime implements AgentRuntime {
   async capabilities(): Promise<RuntimeCapabilities> {
     return {
       runtime: "pi",
-      resumableSessions: false,
+      resumableSessions: Boolean(process.env.FORGEDOCK_NESTED_AGENT_URL && process.env.FORGEDOCK_NESTED_AGENT_TOKEN),
       tools: ["read", "grep", "find", "ls", "edit", "write"],
     };
   }
@@ -140,6 +142,30 @@ export class PiAgentRuntime implements AgentRuntime {
     }
   }
 
+  async resume<T>(
+    sessionRef: string,
+    task: AgentTask<T>,
+    options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {},
+  ): Promise<AgentRunResult<T>> {
+    assertToolPolicy(task);
+    if (task.role !== "reviewer" || !process.env.FORGEDOCK_NESTED_AGENT_URL || !process.env.FORGEDOCK_NESTED_AGENT_TOKEN) {
+      throw new AgentRunError("Pi can resume ForgeDock reviewers only through the persisted nested-agent bridge");
+    }
+    const configuredReviewer = splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL);
+    const provider = configuredReviewer?.provider ?? task.modelPolicy.provider ?? this.#options.provider ?? process.env.PI_PROVIDER;
+    const modelId = configuredReviewer?.model ?? task.modelPolicy.model ?? this.#options.model ?? process.env.PI_MODEL;
+    const thinking = configuredThinking(process.env.FORGEDOCK_REVIEWER_THINKING) ?? task.modelPolicy.thinking;
+    if (!provider || !modelId) throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
+    return runNestedReviewer(task, {
+      provider,
+      model: modelId,
+      emit: options.onEvent ?? (() => undefined),
+      resumeSessionRef: sessionRef,
+      ...(thinking !== undefined ? { thinking } : {}),
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
+  }
+
   async close(): Promise<void> {}
 
   private modelRuntime(): Promise<ModelRuntime> {
@@ -161,7 +187,7 @@ export class PiAgentRuntime implements AgentRuntime {
 
 async function runNestedReviewer<T>(
   task: AgentTask<T>,
-  input: { provider: string; model: string; thinking?: ThinkingLevel; emit: AgentEventSink; signal?: AbortSignal },
+  input: { provider: string; model: string; thinking?: ThinkingLevel; emit: AgentEventSink; resumeSessionRef?: string; signal?: AbortSignal },
 ): Promise<AgentRunResult<T>> {
   const url = process.env.FORGEDOCK_NESTED_AGENT_URL;
   const token = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
@@ -169,7 +195,7 @@ async function runNestedReviewer<T>(
   const ownerRunId = task.id.split(":review:", 1)[0] ?? task.id;
   const provisionalSessionRef = `nested_pending_${crypto.randomUUID()}`;
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model });
-  const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string }>({
+  const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean }>({
     url,
     token,
     body: {
@@ -185,17 +211,31 @@ async function runNestedReviewer<T>(
       provider: input.provider,
       model: input.model,
       thinking: input.thinking ?? "high",
+      ...(input.resumeSessionRef ? { resumeSessionRef: input.resumeSessionRef } : {}),
     },
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   });
   const payload = response.payload;
   if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
-    throw new Error(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`);
+    throw new AgentRunError(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
+      ...(payload.sessionRef ? { sessionRef: payload.sessionRef } : {}),
+      resumable: payload.resumable === true,
+    });
   }
   const sessionRef = payload.sessionRef ?? provisionalSessionRef;
+  if (!Check(task.outputSchema, payload.output)) {
+    const details = [...Errors(task.outputSchema, payload.output)].slice(0, 5).map((error) => error.message).join("; ");
+    throw new AgentRunError(`Nested reviewer returned an invalid structured result: ${details}`, { sessionRef, resumable: false });
+  }
   input.emit({ type: "artifact.submitted", taskId: task.id });
   input.emit({ type: "session.completed", taskId: task.id, sessionRef });
-  return { output: payload.output, sessionRef, provider: payload.provider ?? input.provider, model: payload.model ?? input.model };
+  return {
+    output: payload.output,
+    sessionRef,
+    sessionLineage: [...new Set([...(input.resumeSessionRef ? [input.resumeSessionRef] : []), sessionRef])],
+    provider: payload.provider ?? input.provider,
+    model: payload.model ?? input.model,
+  };
 }
 
 export function postNestedAgentRequest<T>(input: {
@@ -311,10 +351,12 @@ function buildPrompt<T>(task: AgentTask<T>): string {
 }
 
 function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink): void {
-  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+  if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
+    emit({ type: "thinking.delta", taskId, text: event.assistantMessageEvent.delta });
+  } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
     emit({ type: "text.delta", taskId, text: event.assistantMessageEvent.delta });
   } else if (event.type === "tool_execution_start") {
-    emit({ type: "tool.started", taskId, tool: event.toolName });
+    emit({ type: "tool.started", taskId, tool: event.toolName, args: event.args });
   } else if (event.type === "tool_execution_end") {
     emit({ type: "tool.completed", taskId, tool: event.toolName, isError: event.isError });
   }

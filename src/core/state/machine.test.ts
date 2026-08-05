@@ -47,6 +47,16 @@ describe("workflow state machine", () => {
     assert.equal(resumed.blockedReason, undefined);
   });
 
+  it("permits only typed publication recovery from a failed revision projection", () => {
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
+    run = transition(run, "FAIL", { reason: "Published remediation head old does not match verified build new" }).state;
+    assert.throws(() => transition(run, "RESUME_PUBLICATION"), InvalidTransitionError);
+    const resumed = transition(run, "RECOVER_REVISION_PUBLICATION").state;
+    assert.equal(resumed.state, "publishing");
+    assert.equal(resumed.attempt, 2);
+    assert.throws(() => transition(run, "REVIEW_APPROVED"), InvalidTransitionError);
+  });
+
   it("forces changes through remediation, verification, publish and fresh review", () => {
     let run = createRun({ workflow: "review-pr", subject: { repo: "a/b", pr: 8 } });
     run = transition(run, "REVIEW_CHANGES_REQUESTED").state;

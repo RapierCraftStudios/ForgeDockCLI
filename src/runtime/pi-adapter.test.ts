@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
-import { postNestedAgentRequest } from "./pi-adapter.js";
+import { Type } from "typebox";
+import { PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
   const server = createServer(handler);
@@ -39,6 +40,31 @@ test("nested reviewer transport does not depend on fetch or an implicit wall-clo
     assert.deepEqual(result.payload.output, { summary: "complete" });
   } finally {
     globalThis.fetch = originalFetch;
+    await endpoint.close();
+  }
+});
+
+test("the controller rejects a malformed nested structured result even after bridge success", async () => {
+  const endpoint = await listen((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ output: { wrong: true }, sessionRef: "nested-malformed" }));
+  });
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  process.env.FORGEDOCK_NESTED_AGENT_URL = endpoint.url;
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = "test-token";
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  try {
+    await assert.rejects(runtime.run({
+      id: "run:review:sha:correctness", role: "reviewer", objective: "Review", instructions: "Read only", context: [],
+      workspace: { cwd: process.cwd(), mode: "read-only" }, tools: ["read"],
+      outputSchema: Type.Object({ summary: Type.String() }), modelPolicy: {},
+    }), /invalid structured result/i);
+  } finally {
+    if (previousUrl === undefined) delete process.env.FORGEDOCK_NESTED_AGENT_URL;
+    else process.env.FORGEDOCK_NESTED_AGENT_URL = previousUrl;
+    if (previousToken === undefined) delete process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+    else process.env.FORGEDOCK_NESTED_AGENT_TOKEN = previousToken;
     await endpoint.close();
   }
 });

@@ -6,6 +6,7 @@ import { join } from "node:path";
 const START = "# FORGEDOCK:NEXT-CONFIG:START";
 const END = "# FORGEDOCK:NEXT-CONFIG:END";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const DEFAULT_AUTO_MERGE = true;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export interface ForgeDockNextConfig {
@@ -13,6 +14,7 @@ export interface ForgeDockNextConfig {
   workerThinking?: ThinkingLevel;
   reviewerModel?: string;
   reviewerThinking?: ThinkingLevel;
+  maxReviewSpecialists?: number;
   maxParallel?: number;
   autoMerge?: boolean;
 }
@@ -29,6 +31,7 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
     workerThinking: parseThinking(value("worker_thinking")),
     reviewerModel: parseString(value("reviewer_model")),
     reviewerThinking: parseThinking(value("reviewer_thinking")),
+    maxReviewSpecialists: parsePositiveInteger(value("max_review_specialists")),
     maxParallel: parsePositiveInteger(value("max_parallel")),
     autoMerge: parseBoolean(value("auto_merge")),
   }) as ForgeDockNextConfig;
@@ -61,6 +64,10 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
   return { path, config };
 }
 
+export function resolveAutoMerge(requested: boolean | undefined, configured: boolean | undefined): boolean {
+  return requested ?? configured ?? DEFAULT_AUTO_MERGE;
+}
+
 export function splitConfiguredModel(value: string | undefined): { provider: string; model: string } | undefined {
   if (!value) return undefined;
   const slash = value.indexOf("/");
@@ -83,13 +90,14 @@ function managedBlock(raw: string): string | undefined {
 
 function renderManagedBlock(config: ForgeDockNextConfig): string {
   const hasAgents = config.workerModel !== undefined || config.workerThinking !== undefined
-    || config.reviewerModel !== undefined || config.reviewerThinking !== undefined;
+    || config.reviewerModel !== undefined || config.reviewerThinking !== undefined || config.maxReviewSpecialists !== undefined;
   const hasOrchestration = config.maxParallel !== undefined || config.autoMerge !== undefined;
   const lines = [START, "next:", hasAgents ? "  agents:" : "  agents: {}"];
   if (config.workerModel !== undefined) lines.push(`    worker_model: ${JSON.stringify(config.workerModel)}`);
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
   if (config.reviewerModel !== undefined) lines.push(`    reviewer_model: ${JSON.stringify(config.reviewerModel)}`);
   if (config.reviewerThinking !== undefined) lines.push(`    reviewer_thinking: ${JSON.stringify(config.reviewerThinking)}`);
+  if (config.maxReviewSpecialists !== undefined) lines.push(`    max_review_specialists: ${config.maxReviewSpecialists}`);
   lines.push(hasOrchestration ? "  orchestration:" : "  orchestration: {}");
   if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
   if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
@@ -106,6 +114,9 @@ function validatePatch(patch: ForgeDockNextConfig): void {
   }
   for (const thinking of [patch.workerThinking, patch.reviewerThinking]) {
     if (thinking !== undefined && !THINKING_LEVELS.includes(thinking)) throw new Error(`Unsupported thinking level: ${thinking}`);
+  }
+  if (patch.maxReviewSpecialists !== undefined && (!Number.isInteger(patch.maxReviewSpecialists) || patch.maxReviewSpecialists < 1 || patch.maxReviewSpecialists > 6)) {
+    throw new Error("maxReviewSpecialists must be an integer from 1 to 6");
   }
   if (patch.maxParallel !== undefined && (!Number.isInteger(patch.maxParallel) || patch.maxParallel < 1 || patch.maxParallel > 20)) {
     throw new Error("maxParallel must be an integer from 1 to 20");

@@ -57,10 +57,16 @@ patch(join(root, "src", "extension", "index.ts"), [[
 // evidence instead of invalidating an artifact the reviewer subsequently
 // completed. Keep this exception scoped to the ForgeDock reviewer; mutating
 // or general-purpose subagents retain pi-subagents' fail-on-tool-error policy.
-patch(join(root, "src", "runs", "foreground", "execution.ts"), [[
-  "\t\tconst errInfo = detectSubagentError(messages);",
-  "\t\tconst completedForgeDockReview = agent.name === \"forgedock-reviewer\" && options.structuredOutput !== undefined && structuredOutputToolInvoked && existsSync(options.structuredOutput.outputPath);\n\t\tconst errInfo = completedForgeDockReview ? detectSubagentError([]) : detectSubagentError(messages);",
-]]);
+patch(join(root, "src", "runs", "foreground", "execution.ts"), [
+  [
+    "\tresult.exitCode = exitCode;\n\tif (interruptedByControl) {",
+    "\tresult.exitCode = exitCode;\n\tconst recoveredForgeDockTransportReview = agent.name === \"forgedock-reviewer\"\n\t\t&& options.structuredOutput !== undefined\n\t\t&& structuredOutputToolInvoked\n\t\t&& existsSync(options.structuredOutput.outputPath)\n\t\t&& !result.timedOut\n\t\t&& !result.stopped\n\t\t&& !options.signal?.aborted\n\t\t&& /websocket|socket hang up|econnreset|etimedout|transport failed|response failed|network error/i.test(result.error ?? \"\");\n\tif (recoveredForgeDockTransportReview) {\n\t\t// The terminating structured artifact is authoritative for a read-only\n\t\t// reviewer. A transport failure after that tool completed must not burn\n\t\t// the finished session; normal schema validation still runs below.\n\t\tresult.exitCode = 0;\n\t\tresult.error = undefined;\n\t}\n\tif (interruptedByControl) {",
+  ],
+  [
+    "\t\tconst errInfo = detectSubagentError(messages);",
+    "\t\tconst completedForgeDockReview = agent.name === \"forgedock-reviewer\" && options.structuredOutput !== undefined && structuredOutputToolInvoked && existsSync(options.structuredOutput.outputPath);\n\t\tconst errInfo = completedForgeDockReview ? detectSubagentError([]) : detectSubagentError(messages);",
+  ],
+]);
 
 patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
@@ -74,6 +80,113 @@ patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
     '\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
     '\tlet lastContext: ExtensionContext | null = null;\n\tpi.on("session_start", (_event, ctx) => {\n\t\tlastContext = ctx;\n\t\tstate.baseCwd = ctx.cwd;\n\t\tstate.currentSessionId = ctx.sessionManager.getSessionId() ?? null;\n\t\tstate.parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;\n\t\tstate.lastUiContext = ctx;\n\t});\n\tregisterPromptTemplateDelegationBridge({\n\t\tevents: pi.events,\n\t\tgetContext: () => lastContext,\n\t\texecute: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.execute(requestId, params, signal, onUpdate, ctx),\n\t\texecuteVersioned: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.executeDelegated(requestId, params, signal, onUpdate, ctx),\n\t});\n\n\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
+  ],
+]);
+
+// Preserve nested foreground children as first-class fleet data. ForgeDock's
+// issue worker is itself an async child, so reviewer grandchildren otherwise
+// collapse into a registry-only implementation detail.
+patch(join(root, "src", "shared", "types.ts"), [
+  [
+    '"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"',
+    '"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "description" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "toolBudget" | "toolBudgetBlocked" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error" | "timeoutMs" | "deadlineAt" | "timedOut" | "stopped" | "turnBudget" | "turnBudgetExceeded" | "wrapUpRequested"',
+  ],
+  [
+    '\tstate: NestedRunState;\n\tagent?: string;\n\tagents?: string[];',
+    '\tstate: NestedRunState;\n\tagent?: string;\n\t/** Bounded launch description used only for fleet identity and observability. */\n\tdescription?: string;\n\tagents?: string[];',
+  ],
+]);
+patch(join(root, "src", "runs", "shared", "nested-events.ts"), [[
+  '\t\t...(stringValue(raw.agent, 128) ? { agent: stringValue(raw.agent, 128) } : {}),\n\t\t...(Array.isArray(raw.agents)',
+  '\t\t...(stringValue(raw.agent, 128) ? { agent: stringValue(raw.agent, 128) } : {}),\n\t\t...(stringValue(raw.description, 2048) ? { description: stringValue(raw.description, 2048) } : {}),\n\t\t...(Array.isArray(raw.agents)',
+]]);
+patch(join(root, "src", "runs", "foreground", "subagent-executor.ts"), [[
+  '\t\t\t\t\t\tagent: agentsForSummary[0],\n\t\t\t\t\t\tagents: agentsForSummary,',
+  '\t\t\t\t\t\tagent: agentsForSummary[0],\n\t\t\t\t\t\t...(foregroundDescription ? { description: foregroundDescription.slice(0, 2048) } : {}),\n\t\t\t\t\t\tagents: agentsForSummary,',
+]]);
+
+patch(join(root, "src", "tui", "fleet.ts"), [
+  [
+    'type Details, type ForegroundChildControl',
+    'type Details, type ForegroundChildControl, type NestedRunSummary',
+  ],
+  [
+    '| { key: string; kind: "async"; runId: string; index?: number; agent: string; state: string; updatedAt: number; run: AsyncRunSummary; step?: AsyncStep }\n) & { description?: string };',
+    '| { key: string; kind: "async"; runId: string; index?: number; agent: string; state: string; updatedAt: number; run: AsyncRunSummary; step?: AsyncStep; nested?: NestedRunSummary }\n) & { description?: string; nestedCount?: number; treePrefix?: string };',
+  ],
+  [
+    '\treturn run.steps.map((step) => ({\n\t\tkey: `async:${run.id}:${step.index}`,\n\t\tkind: "async" as const,\n\t\trunId: run.id,\n\t\tindex: step.index,\n\t\tagent: step.label ? `${step.label} (${step.agent})` : step.agent,\n\t\tstate: step.status,\n\t\tupdatedAt: step.lastActivityAt ?? updatedAt,\n\t\trun,\n\t\tstep,\n\t\t...(description ? { description } : {}),\n\t}));\n}',
+    '\tconst parents: FleetItem[] = run.steps.map((step) => ({\n\t\tkey: `async:${run.id}:${step.index}`,\n\t\tkind: "async" as const,\n\t\trunId: run.id,\n\t\tindex: step.index,\n\t\tagent: step.label ? `${step.label} (${step.agent})` : step.agent,\n\t\tstate: step.status,\n\t\tupdatedAt: step.lastActivityAt ?? updatedAt,\n\t\trun,\n\t\tstep,\n\t\t...(description ? { description } : {}),\n\t}));\n\tif (!run.nestedChildren?.length) return parents;\n\tconst assigned = new Set<string>();\n\tconst output: FleetItem[] = [];\n\tfor (const parent of parents) {\n\t\tconst children = run.nestedChildren.filter((child) => child.parentStepIndex === parent.index\n\t\t\t|| (run.steps.length === 1 && child.parentStepIndex === undefined));\n\t\tconst count = countNestedChildren(children);\n\t\toutput.push(count ? { ...parent, nestedCount: count } : parent);\n\t\toutput.push(...nestedFleetItems(run, children));\n\t\tfor (const child of children) assigned.add(child.id);\n\t}\n\tconst unassigned = run.nestedChildren.filter((child) => !assigned.has(child.id));\n\tif (unassigned.length) {\n\t\tif (output[0]) output[0] = { ...output[0], nestedCount: (output[0].nestedCount ?? 0) + countNestedChildren(unassigned) };\n\t\toutput.splice(1, 0, ...nestedFleetItems(run, unassigned));\n\t}\n\treturn output;\n}\n\nfunction countNestedChildren(children: readonly NestedRunSummary[]): number {\n\treturn children.reduce((count, child) => count + 1 + countNestedChildren(child.children ?? []), 0);\n}\n\nfunction nestedFleetItems(\n\trun: AsyncRunSummary,\n\tchildren: readonly NestedRunSummary[],\n\tancestorLast: readonly boolean[] = [],\n): FleetItem[] {\n\treturn children.flatMap((child, index) => {\n\t\tconst last = index === children.length - 1;\n\t\tconst treePrefix = `${ancestorLast.map((ancestorWasLast) => ancestorWasLast ? "   " : "│  ").join("")}${last ? "└─ " : "├─ "}`;\n\t\tconst firstLine = child.description?.split(/\\r?\\n/, 1)[0]?.trim();\n\t\tconst reviewLabel = /^ForgeDock review · (.+)$/i.exec(firstLine ?? "")?.[1];\n\t\tconst item: FleetItem = {\n\t\t\tkey: `nested:${run.id}:${child.id}`,\n\t\t\tkind: "async",\n\t\t\trunId: child.id,\n\t\t\tagent: reviewLabel ? `review · ${reviewLabel}` : child.agent ?? child.mode ?? "nested agent",\n\t\t\tstate: child.state,\n\t\t\tupdatedAt: child.lastUpdate ?? child.endedAt ?? child.startedAt ?? run.lastUpdate ?? run.startedAt,\n\t\t\trun,\n\t\t\tnested: child,\n\t\t\ttreePrefix,\n\t\t\t...(child.description ? { description: child.description } : {}),\n\t\t\t...(child.children?.length ? { nestedCount: countNestedChildren(child.children) } : {}),\n\t\t};\n\t\treturn [item, ...nestedFleetItems(run, child.children ?? [], [...ancestorLast, last])];\n\t});\n}',
+  ],
+]);
+
+patch(join(root, "src", "tui", "fleet.ts"), [
+  [
+    '\tif (run.steps.length === 0) {\n\t\treturn [{ key: `async:${run.id}`, kind: "async", runId: run.id, agent: run.mode, state: run.state, updatedAt, run, ...(description ? { description } : {}) }];\n\t}',
+    '\tif (run.steps.length === 0) {\n\t\tconst parent: FleetItem = { key: `async:${run.id}`, kind: "async", runId: run.id, agent: run.mode, state: run.state, updatedAt, run, ...(description ? { description } : {}) };\n\t\tif (!run.nestedChildren?.length) return [parent];\n\t\treturn [{ ...parent, nestedCount: countNestedChildren(run.nestedChildren) }, ...nestedFleetItems(run, run.nestedChildren)];\n\t}',
+  ],
+  [
+    'function asyncDetail(item: Extract<FleetItem, { kind: "async" }>): string[] {\n\tconst status = readStatus(item.run.asyncDir);',
+    'function asyncDetail(item: Extract<FleetItem, { kind: "async" }>): string[] {\n\tif (item.nested) {\n\t\tconst child = item.nested;\n\t\tconst sessionFile = child.sessionFile ?? child.steps?.find((step) => step.sessionFile)?.sessionFile;\n\t\treturn [\n\t\t\t`Nested run: ${child.id}`,\n\t\t\t`Parent: ${child.parentAgent ?? child.parentRunId}`,\n\t\t\t`State: ${child.state}`,\n\t\t\t`Depth: ${child.depth}`,\n\t\t\tchild.mode ? `Mode: ${child.mode}` : undefined,\n\t\t\tchild.currentTool ? `Current tool: ${child.currentTool}${child.currentPath ? ` · ${shortenPath(child.currentPath)}` : ""}` : undefined,\n\t\t\tchild.turnCount !== undefined ? `Turns: ${child.turnCount}` : undefined,\n\t\t\tchild.toolCount !== undefined ? `Tools: ${child.toolCount}` : undefined,\n\t\t\tchild.startedAt !== undefined ? `Started: ${new Date(child.startedAt).toISOString()}` : undefined,\n\t\t\tchild.endedAt !== undefined ? `Ended: ${new Date(child.endedAt).toISOString()}` : undefined,\n\t\t\tsessionFile ? `Session: ${sessionFile}` : undefined,\n\t\t\tchild.error ? `Error: ${child.error}` : undefined,\n\t\t\t"",\n\t\t\t"Nested agent activity",\n\t\t\tchild.state === "running" ? "This child is live. Status and elapsed time refresh automatically." : "The nested child has settled; its session path is retained above.",\n\t\t].filter((line): line is string => line !== undefined);\n\t}\n\tconst status = readStatus(item.run.asyncDir);',
+  ],
+  [
+    '\tconst step = item.step ?? (item.run.steps.length === 1 ? item.run.steps[0] : undefined);',
+    '\tif (item.nested) return undefined;\n\tconst step = item.step ?? (item.run.steps.length === 1 ? item.run.steps[0] : undefined);',
+  ],
+  [
+    'if (item.kind === "async") return contextModeLabel(item.step?.context ?? item.run.context);',
+    'if (item.kind === "async") return item.nested ? undefined : contextModeLabel(item.step?.context ?? item.run.context);',
+  ],
+  [
+    'return item.kind === "foreground-active" ? item.control.mode : item.run.mode;',
+    'return item.kind === "foreground-active" ? item.control.mode : item.kind === "async" && item.nested ? item.nested.mode ?? "nested" : item.run.mode;',
+  ],
+  [
+    'if (item.kind === "async") return "background";',
+    'if (item.kind === "async") return item.nested ? "nested child" : "background";',
+  ],
+  [
+    '\t} else {\n\t\tmodel = item.step?.model;\n\t\ttokens = item.step?.tokens?.total ?? (item.index === undefined ? item.run.totalTokens?.total : undefined);\n\t\ttools = item.step?.toolCount ?? (item.index === undefined ? item.run.toolCount : undefined);\n\t\tconst terminalRun = item.state !== "queued" && item.state !== "running" && item.state !== "pending";\n\t\tconst endTime = item.run.endedAt ?? (terminalRun ? item.run.lastUpdate : undefined) ?? Date.now();\n\t\tdurationMs = item.step?.durationMs ?? Math.max(0, endTime - item.run.startedAt);\n\t}',
+    '\t} else if (item.nested) {\n\t\ttokens = item.nested.totalTokens?.total;\n\t\ttools = item.nested.toolCount;\n\t\tconst terminalRun = item.state !== "queued" && item.state !== "running" && item.state !== "pending";\n\t\tconst startTime = item.nested.startedAt ?? item.updatedAt;\n\t\tconst endTime = item.nested.endedAt ?? (terminalRun ? item.nested.lastUpdate : undefined) ?? Date.now();\n\t\tdurationMs = Math.max(0, endTime - startTime);\n\t} else {\n\t\tmodel = item.step?.model;\n\t\ttokens = item.step?.tokens?.total ?? (item.index === undefined ? item.run.totalTokens?.total : undefined);\n\t\ttools = item.step?.toolCount ?? (item.index === undefined ? item.run.toolCount : undefined);\n\t\tconst terminalRun = item.state !== "queued" && item.state !== "running" && item.state !== "pending";\n\t\tconst endTime = item.run.endedAt ?? (terminalRun ? item.run.lastUpdate : undefined) ?? Date.now();\n\t\tdurationMs = item.step?.durationMs ?? Math.max(0, endTime - item.run.startedAt);\n\t}',
+  ],
+  [
+    'if (item.kind !== "async") return { reason: "Fleet controls are available for current-session top-level async runs only." };\n\t\tif (!isActionableAsyncState',
+    'if (item.kind !== "async" || item.nested) return { reason: "Fleet controls are available for current-session top-level async runs only." };\n\t\tif (!isActionableAsyncState',
+  ],
+  [
+    'const context = item.kind === "async" ? contextModeBadge(this.theme, item.step?.context ?? item.run.context) : item.kind === "foreground-recent" ? contextModeBadge(this.theme, item.child.context) : "";\n\t\t\tconst agent = index === this.selected ? this.theme.bold(item.agent) : item.agent;\n\t\t\tconst identity = item.description?.replace(/\\s+/g, " ").trim() || item.runId.slice(0, 8);\n\t\t\tconst left = `${marker} ${statusGlyph(item, this.theme)} ${agent}${context} ${this.theme.fg("dim", `· ${identity}`)}`;',
+    'const context = item.kind === "async" && !item.nested ? contextModeBadge(this.theme, item.step?.context ?? item.run.context) : item.kind === "foreground-recent" ? contextModeBadge(this.theme, item.child.context) : "";\n\t\t\tconst agent = index === this.selected ? this.theme.bold(item.agent) : item.agent;\n\t\t\tconst identity = item.nested ? item.runId.slice(0, 8) : item.description?.replace(/\\s+/g, " ").trim() || item.runId.slice(0, 8);\n\t\t\tconst descendants = item.nestedCount ? this.theme.fg("dim", ` (+${item.nestedCount} agent${item.nestedCount === 1 ? "" : "s"})`) : "";\n\t\t\tconst left = `${marker} ${item.treePrefix ?? ""}${statusGlyph(item, this.theme)} ${agent}${context}${descendants} ${this.theme.fg("dim", `· ${identity}`)}`;',
+  ],
+]);
+
+patch(join(root, "src", "tui", "fleet-status.ts"), [
+  [
+    'type { AsyncJobStep, FleetViewPlacement, SubagentState }',
+    'type { AsyncJobState, AsyncJobStep, FleetViewPlacement, SubagentState }',
+  ],
+  [
+    '\ttokens: number;\n};',
+    '\ttokens: number;\n\tnestedCount?: number;\n};',
+  ],
+  [
+    'export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
+    'function nestedCount(children: AsyncJobState["nestedChildren"]): number {\n\treturn (children ?? []).reduce((count, child) => count + 1 + nestedCount(child.children), 0);\n}\n\nfunction nestedCountForStep(job: AsyncJobState, index: number, stepCount: number): number {\n\tconst children = (job.nestedChildren ?? []).filter((child) => child.parentStepIndex === index\n\t\t|| (stepCount === 1 && child.parentStepIndex === undefined));\n\treturn nestedCount(children);\n}\n\nexport function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
+  ],
+  [
+    '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t});',
+    '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t\t...(nestedCount(job.nestedChildren) > 0 ? { nestedCount: nestedCount(job.nestedChildren) } : {}),\n\t\t\t});',
+  ],
+  [
+    '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t});',
+    '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t\t...(nestedCountForStep(job, index, steps.length) > 0 ? { nestedCount: nestedCountForStep(job, index, steps.length) } : {}),\n\t\t\t});',
+  ],
+  [
+    'const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${description ? `  ${description}` : ""}`;',
+    'const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;\n\t\tconst descendants = entry.nestedCount ? theme.fg("dim", ` (+${entry.nestedCount} agent${entry.nestedCount === 1 ? "" : "s"})`) : "";\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${descendants}${description ? `  ${description}` : ""}`;',
+  ],
+  [
+    '\t\t\t\tentry.tokens,\n\t\t\t]),',
+    '\t\t\t\tentry.tokens,\n\t\t\t\tentry.nestedCount,\n\t\t\t]),',
   ],
 ]);
 
