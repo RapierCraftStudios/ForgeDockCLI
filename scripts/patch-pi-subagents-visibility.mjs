@@ -83,6 +83,21 @@ patch(join(root, "src", "extension", "fanout-child.ts"), [
   ],
 ]);
 
+// ForgeDock's controller bridge runs inside the child-safe issue-worker process.
+// Fresh V2 delegation is already registered there, but persisted-session resume
+// uses pi-subagents' RPC seam. Register that seam against the same child-local
+// executor; otherwise a resume request has no listener and waits forever.
+patch(join(root, "src", "extension", "fanout-child.ts"), [
+  [
+    'import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";',
+    'import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";\nimport { registerSubagentRpcBridge } from "./rpc.ts";',
+  ],
+  [
+    '\tregisterPromptTemplateDelegationBridge({\n\t\tevents: pi.events,\n\t\tgetContext: () => lastContext,\n\t\texecute: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.execute(requestId, params, signal, onUpdate, ctx),\n\t\texecuteVersioned: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.executeDelegated(requestId, params, signal, onUpdate, ctx),\n\t});\n\n\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
+    '\tregisterPromptTemplateDelegationBridge({\n\t\tevents: pi.events,\n\t\tgetContext: () => lastContext,\n\t\texecute: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.execute(requestId, params, signal, onUpdate, ctx),\n\t\texecuteVersioned: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.executeDelegated(requestId, params, signal, onUpdate, ctx),\n\t});\n\tregisterSubagentRpcBridge({\n\t\tevents: pi.events,\n\t\tgetContext: () => lastContext,\n\t\texecute: (requestId, params, signal, onUpdate, ctx) =>\n\t\t\texecutor.execute(requestId, params, signal, onUpdate, ctx),\n\t\tstate,\n\t});\n\n\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
+  ],
+]);
+
 // Preserve nested foreground children as first-class fleet data. ForgeDock's
 // issue worker is itself an async child, so reviewer grandchildren otherwise
 // collapse into a registry-only implementation detail.

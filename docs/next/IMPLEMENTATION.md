@@ -123,7 +123,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Expose one semantic native tool per command, activate only the invoked workflow schema, and let the selected model resolve natural-language intent without runtime Markdown loading
 - [x] Bundle pinned `pi-subagents`, launch visible parallel issue workers, and preserve the typed controller as the only mutation authority
 - [x] Surface nested reviewer grandchildren as selectable fleet-tree rows and summarize them as `(+N agents)` on the parent status row
-- [x] Resume incomplete nested reviewers through the package-owned RPC/session lease lifecycle, with structured-output recovery and no controller polling loop
+- [x] Resume incomplete nested reviewers through the package-owned RPC/session lease lifecycle, including child-safe issue-worker RPC registration, bounded handshake failure, structured-output recovery, and no controller polling loop
 - [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
 - [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
 - [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
@@ -162,7 +162,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- ForgeDock Next suite: 193 passing, 0 failing. Legacy suite: 1,813 passing, 0 failing, 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
+- ForgeDock Next suite: 195 passing, 0 failing. Legacy suite: 1,813 passing, 0 failing, 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
 
 ## Resolved environment and dependency blockers
 

@@ -15,6 +15,8 @@ const SUBAGENT_DELEGATION_CANCEL_EVENT = "prompt-template:subagent:cancel";
 const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const SUBAGENT_RPC_HANDSHAKE_MS = 30_000;
+const SUBAGENT_RPC_LATE_REPLY_CLEANUP_MS = 30_000;
 
 interface NestedAgentRequest {
   ownerRunId: string;
@@ -249,42 +251,60 @@ interface SubagentRpcReply {
   error?: { message?: string };
 }
 
-function subagentRpc(
+export function subagentRpc(
   pi: ExtensionAPI,
   method: "resume",
   params: unknown,
   signal: AbortSignal,
   onLateReply?: (reply: SubagentRpcReply) => void,
+  handshakeMs = SUBAGENT_RPC_HANDSHAKE_MS,
 ): Promise<SubagentRpcReply> {
   const requestId = crypto.randomUUID();
   const replyEvent = `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`;
   return new Promise((resolve, reject) => {
     let settled = false;
-    let aborted = false;
+    let awaitingLateReply = false;
+    let dispatched = false;
+    let lateCleanupTimer: NodeJS.Timeout | undefined;
     const unsubscribe = pi.events.on(replyEvent, (raw) => {
       const reply = raw as SubagentRpcReply;
-      if (aborted) {
+      if (awaitingLateReply) {
+        if (lateCleanupTimer) clearTimeout(lateCleanupTimer);
         if (typeof unsubscribe === "function") unsubscribe();
         onLateReply?.(reply);
         return;
       }
       if (settled) return;
       settled = true;
+      clearTimeout(handshakeTimer);
       signal.removeEventListener("abort", abort);
       if (typeof unsubscribe === "function") unsubscribe();
       resolve(reply);
     });
-    const abort = () => {
+    const rejectHandshake = (error: Error) => {
       if (settled) return;
       settled = true;
-      aborted = true;
+      clearTimeout(handshakeTimer);
       signal.removeEventListener("abort", abort);
-      if (!onLateReply && typeof unsubscribe === "function") unsubscribe();
-      reject(signal.reason instanceof Error ? signal.reason : new Error("Nested reviewer resume cancelled"));
+      awaitingLateReply = Boolean(onLateReply && dispatched);
+      if (awaitingLateReply) {
+        lateCleanupTimer = setTimeout(() => {
+          if (typeof unsubscribe === "function") unsubscribe();
+        }, SUBAGENT_RPC_LATE_REPLY_CLEANUP_MS);
+        lateCleanupTimer.unref?.();
+      } else if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
+      reject(error);
     };
+    const abort = () => rejectHandshake(signal.reason instanceof Error ? signal.reason : new Error("Nested reviewer resume cancelled"));
+    const handshakeTimer = setTimeout(() => rejectHandshake(new Error(`Nested reviewer resume RPC did not acknowledge within ${handshakeMs}ms`)), handshakeMs);
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
-    else pi.events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId, method, params, source: { extension: "forgedock" } });
+    else {
+      dispatched = true;
+      pi.events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId, method, params, source: { extension: "forgedock" } });
+    }
   });
 }
 

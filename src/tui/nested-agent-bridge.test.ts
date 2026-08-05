@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { startNestedAgentBridge } from "./nested-agent-bridge.js";
+import { startNestedAgentBridge, subagentRpc } from "./nested-agent-bridge.js";
 
 class FakeEvents {
   handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -49,6 +49,16 @@ class FakeEvents {
     for (const handler of this.handlers.get(name) ?? []) handler(data);
   }
 }
+
+test("missing child-local RPC acknowledgement fails the transport handshake instead of hanging", async () => {
+  const events = new FakeEvents();
+  events.autoRespondRpc = false;
+  await assert.rejects(
+    subagentRpc({ events } as unknown as ExtensionAPI, "resume", { id: "missing", message: "continue" }, new AbortController().signal, undefined, 10),
+    /did not acknowledge/,
+  );
+  assert.equal([...events.handlers.values()].flat().length, 0);
+});
 
 test("controller reviewer tasks use the child-safe nested delegation protocol", async () => {
   const events = new FakeEvents();

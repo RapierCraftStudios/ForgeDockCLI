@@ -30,6 +30,7 @@ describe("bundled subagent live visibility", () => {
     const fleetStatus = readFileSync(resolve("node_modules/pi-subagents/src/tui/fleet-status.ts"), "utf8");
     const nestedEvents = readFileSync(resolve("node_modules/pi-subagents/src/runs/shared/nested-events.ts"), "utf8");
     const executor = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/subagent-executor.ts"), "utf8");
+    const fanoutChild = readFileSync(resolve("node_modules/pi-subagents/src/extension/fanout-child.ts"), "utf8");
     assert.match(fleet, /nestedFleetItems/);
     assert.match(fleet, /treePrefix/);
     assert.match(fleet, /review · \$\{reviewLabel\}/);
@@ -38,6 +39,47 @@ describe("bundled subagent live visibility", () => {
     assert.match(fleetStatus, /\(\+\$\{entry\.nestedCount\} agent/);
     assert.match(nestedEvents, /stringValue\(raw\.description, 2048\)/);
     assert.match(executor, /description: foregroundDescription\.slice\(0, 2048\)/);
+    assert.match(fanoutChild, /registerSubagentRpcBridge\([\s\S]*?executor\.execute/);
+  });
+
+  it("registers the resume RPC seam inside child-safe issue workers", async () => {
+    const previousChild = process.env.PI_SUBAGENT_CHILD;
+    const previousFanout = process.env.PI_SUBAGENT_FANOUT_CHILD;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    process.env.PI_SUBAGENT_FANOUT_CHILD = "1";
+    try {
+      const handlers = new Map<string, Array<(data: unknown) => void>>();
+      const events = {
+        on(name: string, handler: (data: unknown) => void) {
+          handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+          return () => handlers.set(name, (handlers.get(name) ?? []).filter((candidate) => candidate !== handler));
+        },
+        emit(name: string, data: unknown) {
+          for (const handler of handlers.get(name) ?? []) handler(data);
+        },
+      };
+      const pi = {
+        events,
+        on: () => undefined,
+        registerTool: () => undefined,
+      };
+      const jiti = createJiti(import.meta.url, { interopDefault: true });
+      const loaded = await jiti.import(resolve("node_modules/pi-subagents/src/extension/fanout-child.ts")) as unknown;
+      const register = typeof loaded === "function" ? loaded : (loaded as { default?: unknown }).default;
+      assert.equal(typeof register, "function");
+      (register as (pi: unknown) => void)(pi);
+      const requestId = crypto.randomUUID();
+      const reply = new Promise<any>((resolveReply) => events.on(`subagents:rpc:v1:reply:${requestId}`, resolveReply));
+      events.emit("subagents:rpc:v1:request", { version: 1, requestId, method: "ping", source: { extension: "forgedock-test" } });
+      const result = await reply;
+      assert.equal(result.success, true);
+      assert.ok(result.data.methods.includes("resume"));
+    } finally {
+      if (previousChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = previousChild;
+      if (previousFanout === undefined) delete process.env.PI_SUBAGENT_FANOUT_CHILD;
+      else process.env.PI_SUBAGENT_FANOUT_CHILD = previousFanout;
+    }
   });
 
   it("flattens reviewer grandchildren immediately beneath their issue-worker parent", async () => {
