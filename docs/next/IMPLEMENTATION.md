@@ -1,6 +1,6 @@
 # ForgeDock Next implementation status
 
-This is the execution tracker for the greenfield rewrite described in [`../forgedock-next.html`](../forgedock-next.html).
+This is the execution tracker for the greenfield rewrite described in [`../forgedock-next.html`](../forgedock-next.html). The normative contract for the Verifiable Workflow Authority & Portability milestone is [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md); this tracker records implementation status and evidence, but does not redefine that contract.
 
 ## Rules
 
@@ -10,6 +10,27 @@ This is the execution tracker for the greenfield rewrite described in [`../forge
 - GitHub artifacts are durable truth; local state and Pi sessions are operational aids.
 - No phase is reported complete until its acceptance tests pass.
 - Private AlterLab issue content must not be copied into this repository.
+- A contract slice remains pending until its named executable evidence gate passes; documentation review alone is not completion evidence.
+
+<a id="verifiable-authority-contract"></a>
+## Verifiable authority & portability contract map
+
+The following are the subsequent implementation slices currently represented in this tracker. Stable anchors are normative in [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md); no slice below is marked complete by this documentation change.
+
+| Slice | Status in this tracker | Normative anchors | Evidence gate before completion |
+| --- | --- | --- | --- |
+| Protected envelope, canonical bytes, digest/signature, and chain verification | Pending | [`#protected-envelope`](VERIFIABLE-WORKFLOW-AUTHORITY.md#protected-envelope), [`#canonical-bytes`](VERIFIABLE-WORKFLOW-AUTHORITY.md#canonical-bytes), [`#digest-and-signature`](VERIFIABLE-WORKFLOW-AUTHORITY.md#digest-and-signature), [`#chain-rules`](VERIFIABLE-WORKFLOW-AUTHORITY.md#chain-rules) | Golden canonical-byte vectors plus malformed, signature, predecessor, and chain-gap tests; build and focused test output. |
+| Idempotent publication reconciliation after a crash between push and state commit | Pending (see slice 2 below) | [`#authority-boundary`](VERIFIABLE-WORKFLOW-AUTHORITY.md#authority-boundary), [`#capability-discovery`](VERIFIABLE-WORKFLOW-AUTHORITY.md#capability-discovery), [`#workflow-events`](VERIFIABLE-WORKFLOW-AUTHORITY.md#workflow-events) | Crash/restart tests prove envelope-ID idempotency, durable decision reconciliation, exact-SHA recheck, and no duplicated host side effect. |
+| Controller identity, key lifecycle, and historical verification | Pending | [`#controller-identity`](VERIFIABLE-WORKFLOW-AUTHORITY.md#controller-identity), [`#identity-rotation-loss`](VERIFIABLE-WORKFLOW-AUTHORITY.md#identity-rotation-loss) | Custody, dual-sign transition, loss, revocation, historical verification, and secret-exclusion tests. |
+| Delegation, attenuation, and one-shot replay | Pending | [`#delegation`](VERIFIABLE-WORKFLOW-AUTHORITY.md#delegation) | Closed-vocabulary/default-deny, binding, expiry, depth, attenuation, nonce-CAS, replay, and restart tests. |
+| Canonical subjects, host capabilities, adapter conformance, and operation gates | Pending | [`#subject-capabilities`](VERIFIABLE-WORKFLOW-AUTHORITY.md#subject-capabilities), [`#canonical-subject`](VERIFIABLE-WORKFLOW-AUTHORITY.md#canonical-subject), [`#capability-discovery`](VERIFIABLE-WORKFLOW-AUTHORITY.md#capability-discovery) | Subject vectors and conformance tests for publish, review, merge, CAS, and unsupported-host denial. |
+| Workflow event bus and stable view model (including run timeline, review desk, and orchestration board) | Pending (see slice 5 below) | [`#workflow-events`](VERIFIABLE-WORKFLOW-AUTHORITY.md#workflow-events), [`#event-envelope`](VERIFIABLE-WORKFLOW-AUTHORITY.md#event-envelope), [`#verification-states`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification-states) | Per-run ordering/correlation, commit-before-event, duplicate, unknown-version, verification-state rendering, and non-authority consumer tests. |
+| Cross-machine/GitHub-backed lease coordination | Pending (see slice 4 below) | [`#leases`](VERIFIABLE-WORKFLOW-AUTHORITY.md#leases), [`#lease-protocol`](VERIFIABLE-WORKFLOW-AUTHORITY.md#lease-protocol) | CAS race, heartbeat, expiry, stale takeover, fencing sequence, split-brain, restart, and unsupported-host tests. |
+| Portable bundle export/import and offline verification | Pending | [`#portable-bundles`](VERIFIABLE-WORKFLOW-AUTHORITY.md#portable-bundles), [`#bundle-format`](VERIFIABLE-WORKFLOW-AUTHORITY.md#bundle-format), [`#offline-import`](VERIFIABLE-WORKFLOW-AUTHORITY.md#offline-import) | Deterministic bytes, size limits, secret exclusion, offline limitations, revalidation, and archival-only import tests. |
+| Restart/reconciliation and merge-sequencing integration tests | Pending (see slice 4 below) | [`#authority-boundary`](VERIFIABLE-WORKFLOW-AUTHORITY.md#authority-boundary), [`#capability-discovery`](VERIFIABLE-WORKFLOW-AUTHORITY.md#capability-discovery), [`#leases`](VERIFIABLE-WORKFLOW-AUTHORITY.md#leases), [`#compatibility`](VERIFIABLE-WORKFLOW-AUTHORITY.md#compatibility) | Interrupted workers, stale decisions, host head changes, fencing failures, and merge ordering are replayed from durable evidence without optimistic mutation. |
+| Legacy artifact read compatibility and migration gates | Pending (see slice 6 below) | [`#compatibility`](VERIFIABLE-WORKFLOW-AUTHORITY.md#compatibility), [`#verification-states`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification-states) | Fixtures for every compatibility row and observable read/verify/gate/import outcomes, including mixed/degraded fail-closed behavior. |
+
+The existing checked items in slices 0–5 describe the pre-contract v2/local baseline where applicable. They do not constitute evidence for the protected profile. The pending tracker items **Idempotent publication reconciliation after a crash between push and state commit**, **Cross-machine/GitHub-backed lease coordination**, **Restart/reconciliation and merge-sequencing integration tests**, **Workflow event bus and stable view model**, and **Legacy artifact read compatibility** are the concrete follow-up entries for the corresponding rows above; run timeline, review desk, orchestration board, and capability diagnostics are projections of the event/capability rows. The other rows require separately tracked follow-up issues before implementation begins.
 
 ## Vertical slices
 

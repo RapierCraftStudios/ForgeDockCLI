@@ -192,6 +192,7 @@
       <a href="#review">review-pr</a>
       <a href="#orchestrate">orchestrate</a>
       <a href="#artifacts">Artifacts & state</a>
+      <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#status">Verifiable authority</a>
       <a href="#bloat">Removal decisions</a>
       <a href="#tui">Branded TUI & DX</a>
       <a href="#neutrality">No lock-in</a>
@@ -371,7 +372,8 @@ while (capacity.available && ready.length) {
     <section id="artifacts">
       <div class="eyebrow">Durable memory</div>
       <h2>Six artifacts replace annotation sprawl</h2>
-      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The JSON is authoritative for machines; the Markdown remains useful to people.</p>
+      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The current v2 JSON is structurally readable; protected authenticity, exact bindings, and portability are defined by the normative <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#protected-envelope">protected-envelope contract</a>, not by a projection or model claim.</p>
+      <div class="callout"><strong>Approved trust direction:</strong> the typed controller alone authorizes transitions, publication, verification gates, review, merge, and closure. Protected artifacts carry canonical bytes, controller identity, predecessor links, and exact repository/subject/run/action/SHA bindings. Host adapters must advertise and pass capability gates; models, local state, events, leases, and imported bundles can inform or coordinate work but can never authorize a host mutation. <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#trust-boundaries">Read the trust boundaries</a>.</div>
       <div class="grid three">
         <div class="card"><span class="num">01</span><h3>Intent</h3><p>Problem, desired outcome, constraints, source, acceptance hints, links, and dependency declarations.</p></div>
         <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
@@ -402,7 +404,7 @@ while (capacity.available && ready.length) {
         <div class="card"><h3>GitHub must be enough to…</h3><ul class="clean"><li>Understand why work was attempted</li><li>See what was proved and planned</li><li>Audit what changed and how it was verified</li><li>Know exactly which SHA was reviewed</li><li>Determine the terminal outcome</li></ul></div>
         <div class="card"><h3>Local state may improve…</h3><ul class="clean"><li>Fast status queries and TUI rendering</li><li>Streaming event history and cost tracking</li><li>In-flight process recovery</li><li>Workspace bookkeeping</li><li>Session continuation within one role</li></ul></div>
       </div>
-      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
+      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. Existing v2 records remain readable as <code>legacy-unprotected</code> evidence, while protected records use the <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md#compatibility">explicit compatibility matrix</a>. Mixed, malformed, incomplete, unverifiable, and chain-gap sets fail closed for required trust gates. Legacy sentinels/labels can be projected during a bounded transition period, then removed; imported bundles remain archival evidence rather than competing authority.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
         <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
