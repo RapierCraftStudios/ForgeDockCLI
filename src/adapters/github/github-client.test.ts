@@ -53,19 +53,33 @@ describe("GitHub durable artifact projection", () => {
       kind: "Intent", runId: id, subject, producer: { role: "test" },
       payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
     }, { id, createdAt: "2026-01-01T00:00:00.000Z" });
-    const issue = makeArtifact("issue", { repo: "A/B", issue: 2 });
+    const encodeLegacyArtifact = (id: string, subject: Omit<Subject, "forge">) => {
+      const artifact = {
+        schema: "forgedock.artifact/v2",
+        kind: "Intent",
+        id,
+        runId: id,
+        subject,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        producer: { role: "test" },
+        payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+      };
+      const encoded = Buffer.from(JSON.stringify(artifact), "utf8").toString("base64url");
+      return `<!-- FORGEDOCK:ARTIFACT v2 b64:${encoded} -->`;
+    };
+    const legacyIssue = encodeLegacyArtifact("legacy-issue", { repo: "A/B", issue: 2 });
     const pull = makeArtifact("pull", { repo: "a/b", pr: 3 });
     const both = makeArtifact("both", { repo: "a/b", issue: 2, pr: 3 });
     const wrongIssue = makeArtifact("wrong-issue", { repo: "a/b", issue: 99 });
     const wrongPull = makeArtifact("wrong-pull", { repo: "a/b", pr: 99 });
-    const wrongRepo = makeArtifact("wrong-repo", { repo: "other/repo", issue: 2 });
-    const embedded = [issue, pull, both, wrongIssue, wrongPull, wrongRepo].map(renderArtifactComment).join("\n");
+    const legacyWrongRepo = encodeLegacyArtifact("legacy-wrong-repo", { repo: "other/repo", issue: 2 });
+    const embedded = [legacyIssue, pull, both, wrongIssue, wrongPull, legacyWrongRepo].map((value) => typeof value === "string" ? value : renderArtifactComment(value)).join("\n");
     client.comments.set("a/b#pr3", [embedded]);
     client.comments.set("a/b#i2", [embedded]);
 
     assert.deepEqual(
       (await repository.list({ repo: " A/B ", issue: 2, pr: 3 })).map((artifact) => artifact.id),
-      [issue.id, pull.id, both.id],
+      ["legacy-issue", pull.id, both.id],
     );
   });
 });
