@@ -7,7 +7,9 @@ const NonEmptyString = Type.String({ minLength: 1 });
 const IsoDateTime = Type.String({ format: "date-time" });
 const Sha = Type.String({ pattern: "^[0-9a-fA-F]{7,64}$" });
 
+/** The serialized subject shape.  Inputs are accepted through normalizeSubject below. */
 export const SubjectSchema = Type.Object({
+  forge: Type.Literal("github"),
   repo: NonEmptyString,
   issue: Type.Optional(Type.Integer({ minimum: 1 })),
   pr: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -172,7 +174,15 @@ export const ArtifactPayloadSchemas = {
 } as const satisfies Record<string, TSchema>;
 
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
-export type Subject = Static<typeof SubjectSchema>;
+export type CanonicalSubject = Static<typeof SubjectSchema>;
+/** Legacy-compatible subject input used by ports and old run fixtures. */
+export interface Subject {
+  repo: string;
+  forge?: string;
+  issue?: number;
+  pr?: number;
+}
+export type SubjectInput = Subject;
 export type Producer = Static<typeof ProducerSchema>;
 export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
@@ -190,12 +200,69 @@ export interface ArtifactPayloadByKind {
   Outcome: OutcomePayload;
 }
 
+/** Normalize the legacy raw subject form at every ingress boundary. */
+export function normalizeSubject(input: unknown): CanonicalSubject {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Subject must be an object");
+  const value = input as Record<string, unknown>;
+  if (Object.keys(value).some((key) => !["forge", "repo", "issue", "pr"].includes(key))) throw new Error("Subject contains unknown fields");
+  if (value.forge !== undefined && value.forge !== "github") throw new Error("Unsupported subject forge");
+  if (typeof value.repo !== "string") throw new Error("Subject repository is required");
+  const repo = value.repo.trim().toLowerCase();
+  const parts = repo.split("/");
+  if (parts.length !== 2 || parts.some((part) => !/^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/.test(part))) {
+    throw new Error("Subject repository must be a GitHub owner/name identity");
+  }
+  const result: { forge: "github"; repo: string; issue?: number; pr?: number } = { forge: "github", repo };
+  for (const field of ["issue", "pr"] as const) {
+    const number = value[field];
+    if (number === undefined) continue;
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) {
+      throw new Error(`Subject ${field} must be a positive safe integer`);
+    }
+    result[field] = number;
+  }
+  if (result.issue === undefined && result.pr === undefined) throw new Error("Subject must identify an issue or pull request");
+  return result;
+}
+
+/** Stable, collision-free identity for a canonical subject. */
+export function subjectIdentityKey(input: SubjectInput | CanonicalSubject): string {
+  const subject = normalizeSubject(input);
+  return JSON.stringify([subject.forge, subject.repo, subject.issue ?? null, subject.pr ?? null]);
+}
+
+/** Backwards-friendly name for callers that persist a subject index. */
+export const subjectKey = subjectIdentityKey;
+
+function isCanonicalSubject(value: unknown): value is CanonicalSubject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const subject = value as Record<string, unknown>;
+  if (Object.keys(subject).some((key) => !["forge", "repo", "issue", "pr"].includes(key))) return false;
+  const validIssue = subject.issue === undefined || (typeof subject.issue === "number" && Number.isSafeInteger(subject.issue) && subject.issue > 0);
+  const validPr = subject.pr === undefined || (typeof subject.pr === "number" && Number.isSafeInteger(subject.pr) && subject.pr > 0);
+  const hasTarget = subject.issue !== undefined || subject.pr !== undefined;
+  return subject.forge === "github"
+    && typeof subject.repo === "string"
+    && subject.repo === subject.repo.trim().toLowerCase()
+    && subject.repo.split("/").length === 2
+    && subject.repo.split("/").every((part) => /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/.test(part))
+    && hasTarget && validIssue && validPr;
+}
+
+export function normalizeArtifact(value: unknown): DurableArtifact {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Artifact must be an object");
+  const candidate = value as Record<string, unknown>;
+  const normalized = { ...candidate, subject: normalizeSubject(candidate.subject) };
+  assertArtifact(normalized);
+  return normalized;
+}
+
 export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends ArtifactKind ? {
   schema: "forgedock.artifact/v2";
   kind: K;
   id: string;
   runId: string;
-  subject: Subject;
+  subject: CanonicalSubject;
   createdAt: string;
   producer: Producer;
   payload: ArtifactPayloadByKind[K];
@@ -204,7 +271,7 @@ export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends A
 export type ArtifactInput<K extends ArtifactKind> = K extends ArtifactKind ? {
   kind: K;
   runId: string;
-  subject: Subject;
+  subject: SubjectInput;
   producer: Producer;
   payload: ArtifactPayloadByKind[K];
 } : never;
@@ -218,7 +285,7 @@ export function createArtifact<K extends ArtifactKind>(
     kind: input.kind,
     id: options.id ?? `art_${crypto.randomUUID()}`,
     runId: input.runId,
-    subject: input.subject,
+    subject: normalizeSubject(input.subject),
     createdAt: options.createdAt ?? new Date().toISOString(),
     producer: input.producer,
     payload: input.payload,
@@ -234,7 +301,9 @@ export function assertArtifact(value: unknown): asserts value is DurableArtifact
   if (!candidate.kind || !(candidate.kind in ArtifactPayloadSchemas)) throw new Error("Unknown artifact kind");
   if (typeof candidate.id !== "string" || !candidate.id) throw new Error("Artifact id is required");
   if (typeof candidate.runId !== "string" || !candidate.runId) throw new Error("Artifact runId is required");
-  if (!Check(SubjectSchema, candidate.subject)) throw validationError("subject", SubjectSchema, candidate.subject);
+  if (!isCanonicalSubject(candidate.subject) || !Check(SubjectSchema, candidate.subject)) {
+    throw validationError("subject", SubjectSchema, candidate.subject);
+  }
   if (!Check(ProducerSchema, candidate.producer)) throw validationError("producer", ProducerSchema, candidate.producer);
   if (typeof candidate.createdAt !== "string" || Number.isNaN(Date.parse(candidate.createdAt))) {
     throw new Error("Artifact createdAt must be an ISO timestamp");

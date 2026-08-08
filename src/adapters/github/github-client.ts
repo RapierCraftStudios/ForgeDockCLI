@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
-import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
+import { normalizeArtifact, normalizeSubject, type ArtifactKind, type DurableArtifact, type SubjectInput } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import type { DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
@@ -103,14 +103,15 @@ export class GitHubClient implements ForgeHost {
     };
   }
 
-  async listIssueComments(subject: Subject): Promise<string[]> {
+  async listIssueComments(subject: SubjectInput): Promise<string[]> {
     return (await this.listIssueCommentSnapshots(subject)).map((comment) => comment.body);
   }
 
-  async listIssueCommentSnapshots(subject: Subject): Promise<GitHubIssueComment[]> {
-    const number = subject.pr ?? subject.issue;
+  async listIssueCommentSnapshots(subject: SubjectInput): Promise<GitHubIssueComment[]> {
+    const canonical = normalizeSubject(subject);
+    const number = canonical.pr ?? canonical.issue;
     if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
-    const result = await this.gh(["api", `repos/${subject.repo}/issues/${number}/comments?per_page=100`, "--paginate", "--slurp"]);
+    const result = await this.gh(["api", `repos/${canonical.repo}/issues/${number}/comments?per_page=100`, "--paginate", "--slurp"]);
     const pages = JSON.parse(result) as Array<Array<{ body?: string; created_at?: string; html_url?: string; user?: { login?: string } }>>;
     return pages.flat().map((comment) => {
       const body = comment.body ?? "";
@@ -124,24 +125,26 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  async postIssueComment(subject: Subject, body: string): Promise<void> {
-    const number = subject.pr ?? subject.issue;
+  async postIssueComment(subject: SubjectInput, body: string): Promise<void> {
+    const canonical = normalizeSubject(subject);
+    const number = canonical.pr ?? canonical.issue;
     if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
     await this.gh(
-      ["api", `repos/${subject.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
+      ["api", `repos/${canonical.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
       JSON.stringify({ body }),
     );
   }
 
   async projectRunState(state: RunState): Promise<void> {
-    const issue = state.subject.issue;
+    const subject = normalizeSubject(state.subject);
+    const issue = subject.issue;
     if (!issue) return;
-    await this.ensureWorkflowLabels(state.subject.repo);
+    await this.ensureWorkflowLabels(subject.repo);
     const target = workflowLabelForState(state.state);
-    const labelResult = await this.gh(["issue", "view", String(issue), "--repo", state.subject.repo, "--json", "labels"]);
+    const labelResult = await this.gh(["issue", "view", String(issue), "--repo", subject.repo, "--json", "labels"]);
     const current = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
     const remove = current.filter((label) => WORKFLOW_LABEL_NAMES.includes(label as (typeof WORKFLOW_LABEL_NAMES)[number]) && label !== target);
-    const args = ["issue", "edit", String(issue), "--repo", state.subject.repo];
+    const args = ["issue", "edit", String(issue), "--repo", subject.repo];
     if (target && !current.includes(target)) args.push("--add-label", target);
     if (remove.length) args.push("--remove-label", remove.join(","));
     if ((target && !current.includes(target)) || remove.length) await this.gh(args);
@@ -385,20 +388,22 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
-    const targets: Subject[] = artifact.subject.pr && artifact.subject.issue
-      ? [{ repo: artifact.subject.repo, pr: artifact.subject.pr }, { repo: artifact.subject.repo, issue: artifact.subject.issue }]
-      : [artifact.subject];
+    const canonical = normalizeArtifact(artifact);
+    const targets: SubjectInput[] = canonical.subject.pr && canonical.subject.issue
+      ? [{ forge: "github", repo: canonical.subject.repo, pr: canonical.subject.pr }, { forge: "github", repo: canonical.subject.repo, issue: canonical.subject.issue }]
+      : [canonical.subject];
     for (const target of targets) {
       const comments = await this.client.listIssueComments(target);
-      const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
-      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(artifact));
+      const exists = comments.flatMap(findArtifacts).some((item) => item.id === canonical.id);
+      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(canonical));
     }
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
-    const targets: Subject[] = subject.pr && subject.issue
-      ? [{ repo: subject.repo, pr: subject.pr }, { repo: subject.repo, issue: subject.issue }]
-      : [subject];
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+    const canonical = normalizeSubject(subject);
+    const targets: SubjectInput[] = canonical.pr && canonical.issue
+      ? [{ forge: "github", repo: canonical.repo, pr: canonical.pr }, { forge: "github", repo: canonical.repo, issue: canonical.issue }]
+      : [canonical];
     const found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
     const unique = new Map(found.map((artifact) => [artifact.id, artifact]));
     return [...unique.values()].filter((artifact) => !kind || artifact.kind === kind);

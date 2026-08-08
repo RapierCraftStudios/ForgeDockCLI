@@ -34,6 +34,13 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("decodes legacy v2 subjects into canonical GitHub subjects", () => {
+    const artifact = intent();
+    const legacy = { ...artifact, subject: { repo: "Acme/Widget", issue: 42 } };
+    const marker = `<!-- FORGEDOCK:ARTIFACT v2 b64:${Buffer.from(JSON.stringify(legacy), "utf8").toString("base64url")} -->`;
+    assert.deepEqual(decodeArtifactMarker(marker).subject, artifact.subject);
+  });
+
   it("never renders a baseline-equivalent required failure as passed", () => {
     const outcome = createArtifact({
       kind: "Outcome",

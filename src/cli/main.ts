@@ -2,7 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
+import { createArtifact, normalizeSubject, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } from "../core/ports/repositories.js";
 import { decideSubjectAdmission, workOnDeliveryArtifacts } from "../core/state/admission.js";
@@ -65,7 +65,8 @@ async function status(argv: string[]): Promise<void> {
     if (!/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
     const github = new GitHubClient(process.cwd());
     const issue = await github.getIssue(Number(issueValue), option(argv, "--repo"));
-    const artifacts = await new GitHubArtifactRepository(github).list({ repo: issue.repo, issue: issue.number });
+    const subject = normalizeSubject({ repo: issue.repo, issue: issue.number });
+    const artifacts = await new GitHubArtifactRepository(github).list(subject);
     const deliveryArtifacts = workOnDeliveryArtifacts(artifacts);
     const reconciled = reconcileLatestRunArtifacts(deliveryArtifacts.length ? deliveryArtifacts : artifacts);
     const result = { subject: `${issue.repo}#${issue.number}`, ...reconciled };
@@ -117,7 +118,7 @@ async function workOn(argv: string[]): Promise<void> {
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
   const runId = `run_${crypto.randomUUID()}`;
-  const subject = { repo: issue.repo, issue: issue.number };
+  const subject = normalizeSubject({ repo: issue.repo, issue: issue.number });
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
@@ -125,7 +126,7 @@ async function workOn(argv: string[]): Promise<void> {
   if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
   if (dependencyIssues.includes(issue.number)) throw new Error(`Issue #${issue.number} cannot depend on itself`);
   for (const dependency of dependencyIssues) {
-    const dependencyArtifacts = await authoritativeArtifacts.list({ repo: issue.repo, issue: dependency });
+    const dependencyArtifacts = await authoritativeArtifacts.list(normalizeSubject({ repo: issue.repo, issue: dependency }));
     const reconciled = reconcileLatestRunArtifacts(dependencyArtifacts);
     if (reconciled.state !== "completed") {
       throw new Error(`Dependency #${dependency} is ${reconciled.state}, not completed; refusing to start #${issue.number}`);
@@ -348,7 +349,7 @@ async function resetIssue(argv: string[]): Promise<void> {
   const github = new GitHubClient(process.cwd());
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const repository = new GitHubArtifactRepository(github);
-  const all = await repository.list({ repo: issue.repo, issue: issue.number });
+  const all = await repository.list(normalizeSubject({ repo: issue.repo, issue: issue.number }));
   const latestRun = latestRunArtifacts(all);
   if (!latestRun) {
     await github.clearWorkflowLabels(issue.repo, issue.number);
@@ -359,7 +360,7 @@ async function resetIssue(argv: string[]): Promise<void> {
   const priorOutcome = latestArtifact(latestRun.artifacts, "Outcome");
   if (priorOutcome?.payload.status !== "abandoned") {
     await repository.append(createArtifact({
-      kind: "Outcome", runId: latestRun.runId, subject: { repo: issue.repo, issue: issue.number },
+      kind: "Outcome", runId: latestRun.runId, subject: normalizeSubject({ repo: issue.repo, issue: issue.number }),
       producer: { role: "controller", runtime: "forgedock" },
       payload: { status: "abandoned", reason, childIssues: [] },
     }));
@@ -458,7 +459,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         catch (error) { controller.abort(error); }
       }, 20_000);
       try {
-        const subject = { repo: repository.repo, issue: item.issue };
+        const subject = normalizeSubject({ repo: repository.repo, issue: item.issue });
         const admission = decideSubjectAdmission(await artifacts.list(subject), { rerun: argv.includes("--rerun") });
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
@@ -487,7 +488,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         }
         const issue = await github.getIssue(item.issue, repository.repo);
         const intent = createArtifact({
-          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
+          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: normalizeSubject({ repo: repository.repo, issue: item.issue }),
           producer: { role: "controller", runtime: "forgedock" },
           payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
         });
