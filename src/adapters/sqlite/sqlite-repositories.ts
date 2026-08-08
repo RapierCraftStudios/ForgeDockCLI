@@ -8,47 +8,55 @@ import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 import { ConcurrentRunUpdateError, type ArtifactRepository, type RunRepository } from "../../core/ports/repositories.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
+const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.#database = new DatabaseSync(path);
-    this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    this.#database.exec(`
-      CREATE TABLE IF NOT EXISTS runs (
-        run_id TEXT PRIMARY KEY,
-        version INTEGER NOT NULL,
-        state_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS transitions (
-        run_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        record_json TEXT NOT NULL,
-        PRIMARY KEY (run_id, sequence),
-        FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-      );
-      CREATE TABLE IF NOT EXISTS artifacts (
-        artifact_id TEXT PRIMARY KEY,
-        subject_key TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        artifact_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS artifacts_subject_kind ON artifacts(subject_key, kind);
-      CREATE TABLE IF NOT EXISTS leases (
-        item_id TEXT PRIMARY KEY,
-        owner TEXT NOT NULL,
-        token TEXT NOT NULL,
-        acquired_at INTEGER NOT NULL,
-        heartbeat_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS schema_meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-    `);
-    this.migrateArtifactSubjectIndex();
+    const database = new DatabaseSync(path);
+    this.#database = database;
+    try {
+      this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`);
+      this.#database.exec(`
+        CREATE TABLE IF NOT EXISTS runs (
+          run_id TEXT PRIMARY KEY,
+          version INTEGER NOT NULL,
+          state_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS transitions (
+          run_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          record_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, sequence),
+          FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS artifacts (
+          artifact_id TEXT PRIMARY KEY,
+          subject_key TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          artifact_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS artifacts_subject_kind ON artifacts(subject_key, kind);
+        CREATE TABLE IF NOT EXISTS leases (
+          item_id TEXT PRIMARY KEY,
+          owner TEXT NOT NULL,
+          token TEXT NOT NULL,
+          acquired_at INTEGER NOT NULL,
+          heartbeat_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS schema_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+      `);
+      this.migrateArtifactSubjectIndex();
+    } catch (error) {
+      this.#database.close();
+      throw error;
+    }
   }
 
   private migrateArtifactSubjectIndex(): void {
@@ -56,8 +64,17 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     const applied = this.#database.prepare("SELECT value FROM schema_meta WHERE key = ?").get("artifact_subject_index") as { value: string } | undefined;
     if (applied?.value === version) return;
 
-    this.#database.exec("BEGIN IMMEDIATE");
     try {
+      // busy_timeout lets another opener finish its migration instead of making
+      // this constructor fail with a transient SQLITE_BUSY.
+      this.#database.exec("BEGIN IMMEDIATE");
+      // The pre-lock read is only a fast path. Re-check while holding the write
+      // lock so concurrent openers do not repeat or race the migration.
+      const lockedApplied = this.#database.prepare("SELECT value FROM schema_meta WHERE key = ?").get("artifact_subject_index") as { value: string } | undefined;
+      if (lockedApplied?.value === version) {
+        this.#database.exec("COMMIT");
+        return;
+      }
       const rows = this.#database.prepare("SELECT artifact_id, artifact_json FROM artifacts ORDER BY rowid").all() as Array<{ artifact_id: string; artifact_json: string }>;
       const update = this.#database.prepare("UPDATE artifacts SET subject_key = ? WHERE artifact_id = ?");
       for (const row of rows) {
@@ -70,7 +87,9 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         .run("artifact_subject_index", version);
       this.#database.exec("COMMIT");
     } catch (error) {
-      this.#database.exec("ROLLBACK");
+      // BEGIN IMMEDIATE can fail before a transaction is established; do not
+      // replace the useful SQLite error with a secondary ROLLBACK error.
+      try { this.#database.exec("ROLLBACK"); } catch { /* no active transaction */ }
       throw error;
     }
   }

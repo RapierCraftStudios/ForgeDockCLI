@@ -3,6 +3,14 @@ import { describe, it } from "node:test";
 import { InvalidTransitionError, attachArtifact, createRun, transition } from "./machine.js";
 
 describe("workflow state machine", () => {
+  it("canonicalizes newly created run subjects before persistence", () => {
+    assert.deepEqual(createRun({ workflow: "work-on", subject: { repo: " ACME/Widget ", issue: 7 } }).subject, {
+      forge: "github",
+      repo: "acme/widget",
+      issue: 7,
+    });
+  });
+
   it("routes confirmed work through the controlled happy path", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 7 }, runId: "run_7", now: "2026-01-01T00:00:00.000Z" });
     for (const event of [

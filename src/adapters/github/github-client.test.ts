@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
+import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import { GitHubArtifactRepository, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
@@ -41,5 +42,30 @@ describe("GitHub durable artifact projection", () => {
     assert.equal(client.comments.get("a/b#pr3")?.length, 1);
     assert.equal(client.comments.get("a/b#i2")?.length, 1);
     assert.equal((await repository.list(artifact.subject)).length, 1);
+    assert.equal((await repository.list(artifact.subject, "ReviewVerdict")).length, 1);
+    assert.equal((await repository.list(artifact.subject, "Intent")).length, 0);
+  });
+
+  it("filters embedded artifacts by canonical subject while retaining issue/PR overlap", async () => {
+    const client = new CommentClient();
+    const repository = new GitHubArtifactRepository(client);
+    const makeArtifact = (id: string, subject: Subject) => createArtifact({
+      kind: "Intent", runId: id, subject, producer: { role: "test" },
+      payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+    }, { id, createdAt: "2026-01-01T00:00:00.000Z" });
+    const issue = makeArtifact("issue", { repo: "A/B", issue: 2 });
+    const pull = makeArtifact("pull", { repo: "a/b", pr: 3 });
+    const both = makeArtifact("both", { repo: "a/b", issue: 2, pr: 3 });
+    const wrongIssue = makeArtifact("wrong-issue", { repo: "a/b", issue: 99 });
+    const wrongPull = makeArtifact("wrong-pull", { repo: "a/b", pr: 99 });
+    const wrongRepo = makeArtifact("wrong-repo", { repo: "other/repo", issue: 2 });
+    const embedded = [issue, pull, both, wrongIssue, wrongPull, wrongRepo].map(renderArtifactComment).join("\n");
+    client.comments.set("a/b#pr3", [embedded]);
+    client.comments.set("a/b#i2", [embedded]);
+
+    assert.deepEqual(
+      (await repository.list({ repo: " A/B ", issue: 2, pr: 3 })).map((artifact) => artifact.id),
+      [issue.id, pull.id, both.id],
+    );
   });
 });

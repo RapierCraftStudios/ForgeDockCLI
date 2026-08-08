@@ -405,7 +405,16 @@ export class GitHubArtifactRepository implements ArtifactRepository {
       ? [{ forge: "github", repo: canonical.repo, pr: canonical.pr }, { forge: "github", repo: canonical.repo, issue: canonical.issue }]
       : [canonical];
     const found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
-    const unique = new Map(found.map((artifact) => [artifact.id, artifact]));
+    const matching = found.filter((artifact) => subjectMatches(artifact.subject, canonical));
+    const unique = new Map(matching.map((artifact) => [artifact.id, artifact]));
     return [...unique.values()].filter((artifact) => !kind || artifact.kind === kind);
   }
+}
+
+function subjectMatches(left: SubjectInput, right: SubjectInput): boolean {
+  const artifact = normalizeSubject(left);
+  const query = normalizeSubject(right);
+  if (artifact.forge !== query.forge || artifact.repo !== query.repo) return false;
+  return (query.issue !== undefined && artifact.issue === query.issue)
+    || (query.pr !== undefined && artifact.pr === query.pr);
 }
