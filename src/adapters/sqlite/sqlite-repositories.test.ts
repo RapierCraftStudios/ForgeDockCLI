@@ -1,4 +1,9 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
@@ -24,6 +29,25 @@ describe("SQLite operational repositories", () => {
       assert.equal((await store.list(subject))[0]?.id, artifact.id);
       assert.equal((await store.load(run.runId))?.state, "investigating");
       assert.deepEqual((await store.history(run.runId)).map((record) => record.event), ["START_INVESTIGATION"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("matches canonical artifact subjects without merging unrelated targets", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const make = (id: string, subject: { repo: string; issue?: number; pr?: number }) => createArtifact({
+        kind: "Intent", runId: id, subject, producer: { role: "test" },
+        payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+      }, { id, createdAt: "2026-01-01T00:00:00.000Z" });
+      const issue = make("sqlite-issue", { repo: "Acme/Widget", issue: 1 });
+      const pull = make("sqlite-pull", { repo: "acme/widget", pr: 2 });
+      const both = make("sqlite-both", { repo: "acme/widget", issue: 1, pr: 2 });
+      const unrelated = make("sqlite-unrelated", { repo: "acme/widget", issue: 9 });
+      for (const artifact of [issue, pull, both, unrelated]) await store.append(artifact);
+      assert.deepEqual((await store.list({ repo: " acme/widget ", issue: 1 })).map((artifact) => artifact.id), [issue.id, both.id]);
+      assert.deepEqual((await store.list({ repo: "acme/widget", issue: 1, pr: 2 })).map((artifact) => artifact.id), [issue.id, pull.id, both.id]);
     } finally {
       store.close();
     }
@@ -67,6 +91,56 @@ describe("SQLite operational repositories", () => {
       await assert.rejects(store.commit(0, first.state, first.record), ConcurrentRunUpdateError);
     } finally {
       store.close();
+    }
+  });
+
+  it("waits for a concurrent opener and rechecks the migration marker", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-sqlite-"));
+    const path = join(directory, "concurrent.sqlite");
+    const fixture = new DatabaseSync(path);
+    const moduleUrl = new URL("./sqlite-repositories.js", import.meta.url).href;
+    const script = `
+      const { SqliteRepositories } = await import(${JSON.stringify(moduleUrl)});
+      console.log("ready");
+      const repository = new SqliteRepositories(process.argv[1]);
+      repository.close();
+    `;
+    const children: Array<{
+      ready: Promise<void>;
+      done: Promise<{ code: number | null; stderr: string }>;
+    }> = [];
+
+    try {
+      fixture.exec("PRAGMA journal_mode = WAL; CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, kind TEXT NOT NULL, artifact_json TEXT NOT NULL);");
+      fixture.prepare("INSERT INTO artifacts VALUES (?, ?, ?, ?)").run("legacy", "legacy-key", "Intent", JSON.stringify({ subject: { repo: "acme/widget", issue: 1 } }));
+      fixture.exec("BEGIN IMMEDIATE");
+
+      for (let index = 0; index < 2; index += 1) {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script, path], { stdio: ["ignore", "pipe", "pipe"] });
+        let output = "";
+        let stderr = "";
+        const ready = new Promise<void>((resolve, reject) => {
+          child.stdout.on("data", (chunk: Buffer) => {
+            output += chunk.toString();
+            if (output.includes("ready")) resolve();
+          });
+          child.once("error", reject);
+        });
+        const done = new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+          child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+          child.once("error", reject);
+          child.once("close", (code) => resolve({ code, stderr }));
+        });
+        children.push({ ready, done });
+      }
+      await Promise.all(children.map((child) => child.ready));
+      fixture.exec("COMMIT");
+      const results = await Promise.all(children.map((child) => child.done));
+      assert.deepEqual(results.map((result) => result.code), [0, 0]);
+      assert.equal(results.some((result) => /SQLITE_BUSY|database is locked/i.test(result.stderr)), false);
+    } finally {
+      try { fixture.close(); } catch { /* already closed */ }
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

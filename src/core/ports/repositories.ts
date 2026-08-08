@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
+import { normalizeArtifact, normalizeSubject, type ArtifactKind, type DurableArtifact, type SubjectInput } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 
 export interface ArtifactRepository {
   append(artifact: DurableArtifact): Promise<void>;
-  list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]>;
+  list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]>;
 }
 
 export interface RunRepository {
@@ -24,7 +24,7 @@ export class CachedArtifactRepository implements ArtifactRepository {
     await this.cache.append(artifact);
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
     const artifacts = await this.authoritative.list(subject, kind);
     for (const artifact of artifacts) await this.cache.append(artifact);
     return artifacts;
@@ -40,15 +40,17 @@ export class ProjectedRunRepository implements RunRepository {
   ) {}
 
   async create(state: RunState): Promise<void> {
-    await this.inner.create(state);
-    await this.tryProject(state);
+    const canonical = canonicalRunState(state);
+    await this.inner.create(canonical);
+    await this.tryProject(canonical);
   }
 
   load(runId: string): Promise<RunState | undefined> { return this.inner.load(runId); }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
-    await this.inner.commit(expectedVersion, state, record);
-    await this.tryProject(state);
+    const canonical = canonicalRunState(state);
+    await this.inner.commit(expectedVersion, canonical, record);
+    await this.tryProject(canonical);
   }
 
   history(runId: string): Promise<TransitionRecord[]> { return this.inner.history(runId); }
@@ -63,14 +65,16 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   readonly artifacts: DurableArtifact[] = [];
 
   async append(artifact: DurableArtifact): Promise<void> {
-    if (this.artifacts.some((item) => item.id === artifact.id)) return;
-    this.artifacts.push(structuredClone(artifact));
+    const canonical = normalizeArtifact(artifact);
+    if (this.artifacts.some((item) => item.id === canonical.id)) return;
+    this.artifacts.push(structuredClone(canonical));
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+    const canonical = normalizeSubject(subject);
     return this.artifacts
-      .filter((artifact) => sameSubject(artifact.subject, subject) && (!kind || artifact.kind === kind))
-      .map((artifact) => structuredClone(artifact));
+      .filter((artifact) => subjectMatches(artifact.subject, canonical) && (!kind || artifact.kind === kind))
+      .map((artifact) => structuredClone(normalizeArtifact(artifact)));
   }
 }
 
@@ -79,14 +83,15 @@ export class InMemoryRunRepository implements RunRepository {
   readonly records = new Map<string, TransitionRecord[]>();
 
   async create(state: RunState): Promise<void> {
-    if (this.runs.has(state.runId)) throw new Error(`Run already exists: ${state.runId}`);
-    this.runs.set(state.runId, structuredClone(state));
-    this.records.set(state.runId, []);
+    const canonical = canonicalRunState(state);
+    if (this.runs.has(canonical.runId)) throw new Error(`Run already exists: ${canonical.runId}`);
+    this.runs.set(canonical.runId, structuredClone(canonical));
+    this.records.set(canonical.runId, []);
   }
 
   async load(runId: string): Promise<RunState | undefined> {
     const state = this.runs.get(runId);
-    return state ? structuredClone(state) : undefined;
+    return state ? structuredClone(canonicalRunState(state)) : undefined;
   }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
@@ -98,13 +103,18 @@ export class InMemoryRunRepository implements RunRepository {
     if (state.version !== expectedVersion + 1 || record.sequence !== state.version) {
       throw new Error("Run commit must advance exactly one version");
     }
-    this.runs.set(state.runId, structuredClone(state));
-    this.records.get(state.runId)?.push(structuredClone(record));
+    const canonical = canonicalRunState(state);
+    this.runs.set(canonical.runId, structuredClone(canonical));
+    this.records.get(canonical.runId)?.push(structuredClone(record));
   }
 
   async history(runId: string): Promise<TransitionRecord[]> {
     return (this.records.get(runId) ?? []).map((record) => structuredClone(record));
   }
+}
+
+function canonicalRunState(state: RunState): RunState {
+  return { ...state, subject: normalizeSubject(state.subject) };
 }
 
 export class ConcurrentRunUpdateError extends Error {
@@ -114,6 +124,10 @@ export class ConcurrentRunUpdateError extends Error {
   }
 }
 
-function sameSubject(left: Subject, right: Subject): boolean {
-  return left.repo === right.repo && left.issue === right.issue && left.pr === right.pr;
+function subjectMatches(left: SubjectInput, right: SubjectInput): boolean {
+  const artifact = normalizeSubject(left);
+  const query = normalizeSubject(right);
+  if (artifact.forge !== query.forge || artifact.repo !== query.repo) return false;
+  return (query.issue !== undefined && artifact.issue === query.issue)
+    || (query.pr !== undefined && artifact.pr === query.pr);
 }
