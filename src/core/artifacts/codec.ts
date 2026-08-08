@@ -8,6 +8,7 @@ import {
   type IntentPayload,
   type InvestigationPayload,
   type OutcomePayload,
+  type RemediationBlockedPayload,
   type ReviewVerdictPayload,
 } from "./schema.js";
 
@@ -103,6 +104,17 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         payload.reviewPlan ? `### Review plan\n**Risk:** \`${payload.reviewPlan.riskTier}\` · **Specialist budget:** ${payload.reviewPlan.specialistBudget}\n${payload.reviewPlan.selected.map((selection) => `- **${selection.role}** · score ${selection.score}${selection.required ? " · required" : ""} — ${selection.reasons.join("; ")}`).join("\n")}${payload.reviewPlan.skipped.length ? `\n\n**Skipped specialists**\n${payload.reviewPlan.skipped.map((selection) => `- **${selection.role}** · score ${selection.score} · ${selection.reason}${selection.evidence.length ? ` — ${selection.evidence.join("; ")}` : " — no qualifying evidence"}`).join("\n")}` : ""}` : "",
         payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
+      ].filter(Boolean).join("\n\n");
+    }
+    case "RemediationBlocked": {
+      const payload = artifact.payload as RemediationBlockedPayload;
+      return [heading, meta, "", `**Status:** \`${payload.status}\` · **Reason:** \`${payload.reason}\``,
+        `**Parent:** issue #${payload.parentIssue} · PR #${payload.pullRequest} · head \`${payload.headSha}\``,
+        `**Branch:** \`${payload.headBranch}\` → \`${payload.baseBranch}\` · depth ${payload.remediationDepth}/${payload.maxRemediationDepth}`,
+        listSection("Findings", payload.findings.map((finding) => `**${finding.severity.toUpperCase()} · ${finding.title}** — ${finding.location ?? "location not recorded"}\n${finding.evidence}\nRemediation: ${finding.remediation}`)),
+        listSection("Child issues", payload.childIssues.map((issue) => `#${issue}`)),
+        listSection("Approved paths", payload.approvedPaths.map(code)),
+        listSection("Child outcomes", payload.childOutcomeIds.map(code)),
       ].filter(Boolean).join("\n\n");
     }
     case "Outcome": {

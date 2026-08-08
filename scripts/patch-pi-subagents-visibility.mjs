@@ -80,6 +80,7 @@ patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
     '\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
     '\tlet lastContext: ExtensionContext | null = null;\n\tpi.on("session_start", (_event, ctx) => {\n\t\tlastContext = ctx;\n\t\tstate.baseCwd = ctx.cwd;\n\t\tstate.currentSessionId = ctx.sessionManager.getSessionId() ?? null;\n\t\tstate.parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;\n\t\tstate.lastUiContext = ctx;\n\t});\n\tregisterPromptTemplateDelegationBridge({\n\t\tevents: pi.events,\n\t\tgetContext: () => lastContext,\n\t\texecute: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.execute(requestId, params, signal, onUpdate, ctx),\n\t\texecuteVersioned: (requestId, params, signal, ctx, onUpdate) =>\n\t\t\texecutor.executeDelegated(requestId, params, signal, onUpdate, ctx),\n\t});\n\n\tconst tool: ToolDefinition<typeof SubagentParams, Details> = {',
+    '\tlet lastContext: ExtensionContext | null = null;',
   ],
 ]);
 
@@ -208,8 +209,11 @@ patch(join(root, "src", "tui", "fleet-status.ts"), [
 function patch(file, replacements) {
   let source = readFileSync(file, "utf8");
   let changed = false;
-  for (const [before, after] of replacements) {
-    if (source.includes(after)) continue;
+  for (const [before, after, appliedMarker = after] of replacements) {
+    // Some patches deliberately extend an earlier inserted block. In that case
+    // the full earlier `after` text no longer survives contiguously, so use a
+    // stable marker to keep repeated postinstall runs idempotent.
+    if (source.includes(appliedMarker)) continue;
     const count = source.split(before).length - 1;
     if (count !== 1) throw new Error(`ForgeDock visibility patch could not find one expected block in ${file}; found ${count}`);
     source = source.replace(before, after);

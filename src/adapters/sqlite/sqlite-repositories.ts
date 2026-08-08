@@ -6,9 +6,10 @@ import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 import { ConcurrentRunUpdateError, type ArtifactRepository, type RunRepository } from "../../core/ports/repositories.js";
+import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
@@ -43,6 +44,15 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS run_telemetry (
+        telemetry_key TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        session_ref TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        receipt_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS run_telemetry_run ON run_telemetry(run_id, created_at);
     `);
   }
 
@@ -84,6 +94,19 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   listRuns(limit = 50): RunState[] {
     const rows = this.#database.prepare("SELECT state_json FROM runs ORDER BY rowid DESC LIMIT ?").all(limit);
     return rows.map((row) => JSON.parse(String((row as { state_json: string }).state_json)) as RunState);
+  }
+
+  async recordTelemetry(receipt: AgentRunReceipt): Promise<void> {
+    this.#database.prepare(`
+      INSERT INTO run_telemetry (telemetry_key, run_id, task_id, session_ref, created_at, receipt_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(telemetry_key) DO NOTHING
+    `).run(receipt.key, receipt.runId, receipt.taskId, receipt.sessionRef, receipt.timing.completedAt, JSON.stringify(receipt));
+  }
+
+  listTelemetry(runId: string): AgentRunReceipt[] {
+    const rows = this.#database.prepare("SELECT receipt_json FROM run_telemetry WHERE run_id = ? ORDER BY rowid").all(runId);
+    return rows.map((row) => JSON.parse(String((row as { receipt_json: string }).receipt_json)) as AgentRunReceipt);
   }
 
   rebuildRun(state: RunState): void {

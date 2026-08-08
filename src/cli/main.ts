@@ -10,22 +10,33 @@ import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
+import { scopeManifestFor, TelemetryAgentRuntime, type AgentEvent, type AgentRuntime, type RuntimePreflightOptions } from "../runtime/agent-runtime.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
-import type { AgentEvent } from "../runtime/agent-runtime.js";
+import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
-import { readForgeDockConfig, resolveAutoMerge } from "../core/config/forgedock-config.js";
+import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { assertRunFollowsLane, classifyIssueLane, laneEvidence, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
-import { parseBatchMemberIssues } from "../workflows/orchestrate/batching.js";
-import { runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
+import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
+import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
+import { materializeClaimDependencies, runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
+import { orchestrationEventFromSchedule } from "../workflows/orchestrate/events.js";
+import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
+import { AgentEventStreamWriter } from "./agent-event-stream.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
+import { parseOrchestrationIssueNumbers } from "./argument-parser.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
+const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
 
 await main(args).catch((error: unknown) => {
+  agentEventStream.finish();
   const message = error instanceof Error ? error.message : String(error);
   console.error(`${statusGlyph("failed", mode)} ${message}`);
   process.exitCode = 1;
@@ -61,40 +72,68 @@ async function main(argv: string[]): Promise<void> {
 }
 
 async function status(argv: string[]): Promise<void> {
-  const issueValue = option(argv, "--issue");
-  if (issueValue !== undefined) {
-    if (!/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
-    const github = new GitHubClient(process.cwd());
-    const issue = await github.getIssue(Number(issueValue), option(argv, "--repo"));
-    const artifacts = await new GitHubArtifactRepository(github).list({ repo: issue.repo, issue: issue.number });
-    const deliveryArtifacts = workOnDeliveryArtifacts(artifacts);
-    const reconciled = reconcileLatestRunArtifacts(deliveryArtifacts.length ? deliveryArtifacts : artifacts);
-    const result = { subject: `${issue.repo}#${issue.number}`, ...reconciled };
-    if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    else {
-      process.stdout.write(`${renderHeader({ subtitle: "status · reconstructed from GitHub" })}\n\n`);
-      process.stdout.write(`${statusGlyph(reconciled.state === "completed" ? "passed" : reconciled.state === "blocked" ? "blocked" : "active", mode)} ${result.subject} · ${reconciled.state}\n`);
-      for (const warning of reconciled.warnings) process.stdout.write(`  warning: ${warning}\n`);
-    }
-    return;
-  }
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   try {
+    const issueValue = option(argv, "--issue");
+    if (issueValue !== undefined) {
+      if (!/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
+      const github = new GitHubClient(process.cwd());
+      const issue = await github.getIssue(Number(issueValue), option(argv, "--repo"));
+      const artifacts = await new GitHubArtifactRepository(github).list({ repo: issue.repo, issue: issue.number });
+      const deliveryArtifacts = workOnDeliveryArtifacts(artifacts);
+      const reconciled = reconcileLatestRunArtifacts(deliveryArtifacts.length ? deliveryArtifacts : artifacts);
+      const configured = readForgeDockConfig(process.cwd());
+      const telemetry = summarizeTelemetry(reconciled.runId ? store.listTelemetry(reconciled.runId) : []);
+      const localRun = reconciled.runId ? store.listRuns().find((run) => run.runId === reconciled.runId) : undefined;
+      const controllerTiming = localRun
+        ? summarizeControllerTiming(localRun.createdAt, await store.history(localRun.runId))
+        : undefined;
+      const result = {
+        subject: `${issue.repo}#${issue.number}`,
+        policy: resolveOrchestrationConfig(configured),
+        policySources: orchestrationConfigSources(configured),
+        telemetry,
+        ...(controllerTiming !== undefined ? { controllerTiming } : {}),
+        ...reconciled,
+      };
+      if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+      else {
+        process.stdout.write(`${renderHeader({ subtitle: "status · reconstructed from GitHub" })}\n\n`);
+        process.stdout.write(`${statusGlyph(reconciled.state === "completed" ? "passed" : reconciled.state === "blocked" ? "blocked" : "active", mode)} ${result.subject} · ${reconciled.state}\n`);
+        renderTelemetryLine(telemetry);
+        if (controllerTiming !== undefined) renderControllerTimingLine(controllerTiming);
+        for (const warning of reconciled.warnings) process.stdout.write(`  warning: ${warning}\n`);
+      }
+      return;
+    }
+
     const runs = store.listRuns();
+    const configured = readForgeDockConfig(process.cwd());
+    const policy = resolveOrchestrationConfig(configured);
+    const policySources = orchestrationConfigSources(configured);
+    const runsWithTelemetry = await Promise.all(runs.map(async (run) => ({
+      ...run,
+      telemetry: summarizeTelemetry(store.listTelemetry(run.runId)),
+      controllerTiming: summarizeControllerTiming(run.createdAt, await store.history(run.runId)),
+    })));
     if (argv.includes("--json")) {
-      process.stdout.write(`${JSON.stringify(runs, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ policy, policySources, runs: runsWithTelemetry }, null, 2)}\n`);
       return;
     }
     process.stdout.write(`${renderHeader({ subtitle: "status · local operational cache" })}\n\n`);
+    process.stdout.write(`Effective orchestration: batching=${policy.batchingPolicy}, scope=${policy.scopeExpansion}, maxParallel=${policy.maxParallel}, remediation=${policy.maxRemediationCycles}/${policy.maxRemediationDepth}/${policy.maxRemediationChildren}\n`);
+    process.stdout.write(`Policy sources: ${Object.entries(policySources).map(([key, source]) => `${key}=${source}`).join(", ")}\n\n`);
     if (!runs.length) {
       process.stdout.write("No local runs. Durable semantic artifacts may still exist on GitHub.\n");
       return;
     }
-    for (const run of runs) {
+    for (const run of runsWithTelemetry) {
       const subject = `${run.subject.repo}${run.subject.issue ? `#${run.subject.issue}` : ""}${run.subject.pr ? ` PR#${run.subject.pr}` : ""}`;
       const state = run.state === "completed" ? "passed" : run.state === "blocked" || run.state === "failed" ? "blocked" : "active";
       process.stdout.write(`${statusGlyph(state, mode)} ${run.runId} · ${subject} · ${run.state} · v${run.version}\n`);
+      renderTelemetryLine(run.telemetry, "  ");
+      renderControllerTimingLine(run.controllerTiming, "  ");
     }
   } finally {
     store.close();
@@ -113,6 +152,14 @@ async function workOn(argv: string[]): Promise<void> {
   if (dryRun && through !== "investigate") throw new Error("--dry-run must be paired with --through investigate; full work-on creates a branch and PR");
   if (argv.includes("--rerun") && argv.includes("--resume")) throw new Error("--rerun and --resume are mutually exclusive recovery policies");
   const autoMerge = commandAutoMerge(argv);
+  const configuredNext = readForgeDockConfig(process.cwd());
+  const scopeExpansionOption = option(argv, "--scope-expansion");
+  if (scopeExpansionOption !== undefined && scopeExpansionOption !== "scope-locked" && scopeExpansionOption !== "recursive") throw new Error("--scope-expansion must be scope-locked or recursive");
+  const remediationCyclesOption = option(argv, "--max-remediation-cycles");
+  const effectiveOrchestration = resolveOrchestrationConfig(configuredNext, {
+    ...(scopeExpansionOption !== undefined ? { scopeExpansion: scopeExpansionOption } : {}),
+    ...(remediationCyclesOption !== undefined ? { maxRemediationCycles: Number(remediationCyclesOption) } : {}),
+  });
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
@@ -120,12 +167,17 @@ async function workOn(argv: string[]): Promise<void> {
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
+  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github);
+  const baseRef = `origin/${lane.targetBranch}`;
+  const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
+  const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
   const subjectEvidence = issueSubjectEvidence(issue);
+  subjectEvidence.push(laneEvidence(lane));
   if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
   if (dependencyIssues.includes(issue.number)) throw new Error(`Issue #${issue.number} cannot depend on itself`);
   for (const dependency of dependencyIssues) {
@@ -144,6 +196,7 @@ async function workOn(argv: string[]): Promise<void> {
   }
   const priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
   let resumeRunId: string | undefined;
+  let resumeCheckpoint: string | undefined;
   let resumeArtifacts: DurableArtifact[] = [];
   if (!dryRun) {
     const admission = decideSubjectAdmission(priorArtifacts, { rerun: argv.includes("--rerun") });
@@ -159,6 +212,7 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Existing run ${admission.runId} has a recoverable ${admission.checkpoint} checkpoint. Re-run with --resume to continue it; reset only if you intentionally want to abandon its durable work`);
       }
       resumeRunId = admission.runId;
+      resumeCheckpoint = admission.checkpoint;
       resumeArtifacts = admission.artifacts;
     }
   }
@@ -189,10 +243,10 @@ async function workOn(argv: string[]): Promise<void> {
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const runs = dryRun ? store : projectRunsToGitHub(store, github);
-  const runtime = new PiAgentRuntime({
+  const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
-  });
+  }, store);
   const onAgentEvent = (event: AgentEvent) => writeAgentEvent(event);
   const leaseItem = `issue-${issue.number}`;
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
@@ -201,6 +255,12 @@ async function workOn(argv: string[]): Promise<void> {
   let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
+    if (resumeCheckpoint !== "completion") {
+      await preflightRuntime(runtime, {
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+      });
+    }
     const lease = store.acquire(leaseItem, leaseOwner, 60_000);
     if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
     leaseToken = lease.token;
@@ -215,25 +275,61 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
       }
       const runArtifacts = resumeArtifacts.filter((artifact) => artifact.runId === resumeRunId);
+      const priorRemediationCycles = Math.max(0, runArtifacts.filter((artifact) => artifact.kind === "BuildResult").length - 1);
       const intentArtifact = latestArtifact(runArtifacts, "Intent");
       const investigation = latestArtifact(runArtifacts, "Investigation");
       const packet = latestArtifact(runArtifacts, "BuildPacket");
       if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
+      const remediationCheckpoint = latestArtifact(runArtifacts, "RemediationBlocked");
       const checkpointArtifact = admission.checkpoint === "verification"
         ? latestArtifact(runArtifacts, "Outcome")
         : admission.checkpoint === "publication"
           ? latestArtifact(runArtifacts, "BuildResult")
-          : packet;
+          : admission.checkpoint === "completion"
+            ? latestArtifact(runArtifacts, "ReviewVerdict")
+            : admission.checkpoint === "remediation"
+              ? (admission.state === "blocked" ? latestArtifact(runArtifacts, "Outcome") : latestArtifact(runArtifacts, "ReviewVerdict"))
+              : packet;
       const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
       for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
+      const recoveredScopeManifest = scopeManifestFor("build-packet", {
+        affectedFiles: packet.payload.expectedPaths,
+        writePaths: packet.payload.expectedPaths,
+        metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+      });
       const failedOutcome = admission.state === "failed" ? latestArtifact(runArtifacts, "Outcome") : undefined;
+      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
+      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
+      const openPullRequest = retainedBuildResult
+        ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
+        : undefined;
+      const checkpointPullRequest = admission.checkpoint === "completion" && priorVerdict?.subject.pr
+        ? await github.getPullRequest(issue.repo, priorVerdict.subject.pr)
+        : openPullRequest;
+      if (admission.checkpoint === "remediation" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, Review Verdict, and open PR required for remediation resume`);
+      }
+      if (admission.checkpoint === "remediation" && remediationCheckpoint?.kind === "RemediationBlocked" && remediationCheckpoint.payload.status === "terminal") {
+        throw new Error(`Run ${resumeRunId} has a terminal recursive-remediation checkpoint; human intervention is required`);
+      }
+      if (admission.checkpoint === "completion" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for completion resume`);
+      }
+      if (checkpointPullRequest && checkpointPullRequest.baseBranch !== lane.targetBranch) {
+        throw new Error(
+          `Existing PR #${checkpointPullRequest.number} targets ${checkpointPullRequest.baseBranch}, but issue #${issue.number} classifies to ${lane.targetBranch}; refusing cross-lane resume`,
+        );
+      }
+      const frozenTarget = runTargetForLane(lane);
       const recoveredRun = {
         schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
         state: admission.state, attempt: 1, version: 0,
+        ...frozenTarget,
         createdAt: intentArtifact.createdAt, updatedAt: checkpointArtifact?.createdAt ?? packet.createdAt,
         artifactIds,
+        scopeManifest: recoveredScopeManifest,
         ...(admission.state === "blocked" && checkpointArtifact?.kind === "Outcome" ? { blockedReason: checkpointArtifact.payload.reason } : {}),
         ...(failedOutcome?.kind === "Outcome" && failedOutcome.payload.status === "failed" ? { failure: failedOutcome.payload.reason } : {}),
       };
@@ -241,27 +337,37 @@ async function workOn(argv: string[]): Promise<void> {
       if (!run) {
         await store.create(recoveredRun);
         run = recoveredRun;
-      } else if (run.state !== admission.state) {
+      } else if (run.state !== admission.state
+        || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)) {
         process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${run.state}) from durable GitHub state (${admission.state})\n`);
         store.rebuildRun(recoveredRun);
         run = recoveredRun;
+      } else if (run.targetBranch) {
+        assertRunFollowsLane(run, lane);
+        if (!run.scopeManifest) run = { ...run, scopeManifest: recoveredScopeManifest };
+      } else {
+        run = { ...run, ...frozenTarget, scopeManifest: recoveredScopeManifest };
       }
 
-      const baseRef = `origin/${localRepository.defaultBranch}`;
       const git = new GitWorktreeManager(process.cwd());
       const verifier = new ProcessVerificationRunner();
-      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
-      if (admission.checkpoint === "build" || admission.checkpoint === "publication") {
-        workspace = await git.recover({
+      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion") {
+        const recoveryInput = {
           runId: resumeRunId,
           issue: issue.number,
           baseRef,
-          ...(admission.checkpoint === "publication" && retainedBuildResult?.payload.baseSha
+          ...(admission.checkpoint !== "build" && retainedBuildResult?.payload.baseSha
             ? { baseSha: retainedBuildResult.payload.baseSha }
             : {}),
-        });
+        };
+        if (admission.checkpoint === "completion") {
+          try { workspace = await git.recover(recoveryInput); }
+          catch (error) { process.stderr.write(`warning: completion will proceed without retained-worktree cleanup: ${error instanceof Error ? error.message : String(error)}\n`); }
+        } else {
+          workspace = await git.recover(recoveryInput);
+        }
       } else {
         outcome = latestArtifact(runArtifacts, "Outcome");
         if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
@@ -275,34 +381,92 @@ async function workOn(argv: string[]): Promise<void> {
         };
         if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
       }
-      const verification = discoverVerificationCommands(process.cwd(), baseRef);
-      const baselineChecks = admission.checkpoint === "publication"
+      const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), baseRef);
+      const baselineChecks = admission.checkpoint === "publication" || admission.checkpoint === "completion"
         ? undefined
         : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
-        run, intent: intentArtifact, investigation, packet, workspace,
-        baseBranch: localRepository.defaultBranch, verification,
+        run, intent: intentArtifact, investigation, packet, workspace: workspace!,
+        baseBranch: lane.targetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
+        priorRemediationCycles,
         subjectEvidence,
         ...(batchMembers.length ? { batchMembers } : {}),
+        ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
         autoMerge,
         ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent };
-      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
-      const result = admission.checkpoint === "build"
-        ? await resumeBuildWorkOn(common, dependencies)
-        : admission.checkpoint === "publication"
-          ? await resumePublicationWorkOn({
-            ...common,
-            buildResult: retainedBuildResult!,
-            ...(priorVerdict ? { priorVerdict } : {}),
-          }, dependencies)
-          : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
+      const result = admission.checkpoint === "completion"
+        ? await resumeCompletionWorkOn({
+          run,
+          verdict: priorVerdict!,
+          pullRequest: checkpointPullRequest!,
+          ...(workspace ? { workspace } : {}),
+          ...(batchMembers.length ? { batchMembers } : {}),
+          autoMerge,
+        }, dependencies)
+        : admission.checkpoint === "build"
+          ? await resumeBuildWorkOn(common, dependencies)
+          : admission.checkpoint === "publication"
+            ? await resumePublicationWorkOn({
+              ...common,
+              buildResult: retainedBuildResult!,
+              ...(priorVerdict ? { priorVerdict } : {}),
+            }, dependencies)
+            : admission.checkpoint === "remediation"
+              ? remediationCheckpoint?.kind === "RemediationBlocked"
+                ? await (async () => {
+                  let checkpoint = remediationCheckpoint;
+                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
+                  if (checkpoint.payload.status === "awaiting-dispatch") {
+                    const dispatched = await supervisor.begin({
+                      parentRun: run,
+                      parentPullRequest: checkpointPullRequest!,
+                      packetArtifact: packet,
+                      verdictArtifact: priorVerdict!,
+                      reason: checkpoint.payload.reason,
+                      remediationDepth: checkpoint.payload.remediationDepth,
+                      maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
+                      findings: checkpoint.payload.findings.map((finding) => ({
+                        id: finding.id,
+                        severity: finding.severity,
+                        title: finding.title,
+                        evidence: finding.evidence,
+                        ...(finding.location ? { location: finding.location } : {}),
+                        remediation: finding.remediation,
+                        ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
+                      })),
+                    });
+                    checkpoint = dispatched.checkpoint;
+                  }
+                  if (checkpoint.payload.status === "children-running") {
+                    const childOutcomes = (await Promise.all(checkpoint.payload.childIssues.map(async (childIssue) =>
+                      authoritativeArtifacts.list({ repo: issue.repo, issue: childIssue })))).flat()
+                      .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged");
+                    checkpoint = await supervisor.reconcileChildren({ checkpoint, childOutcomes, parentPullRequest: checkpointPullRequest! });
+                  }
+                  if (checkpoint.payload.status !== "ready-to-resume") {
+                    throw new Error(`Recursive remediation checkpoint ${checkpoint.payload.checkpointKey} is ${checkpoint.payload.status}; child Outcomes or parent branch proof are still pending`);
+                  }
+                  return resumeExpandedReviewWorkOn({
+                    ...common,
+                    priorVerdict: priorVerdict!,
+                    checkpoint,
+                    pullRequest: checkpointPullRequest!,
+                  }, dependencies);
+                })()
+                : await resumeReviewWorkOn({
+                  ...common,
+                  buildResult: retainedBuildResult!,
+                  priorVerdict: priorVerdict!,
+                  pullRequest: checkpointPullRequest!,
+                }, dependencies)
+              : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
       process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
       if (result.run.state !== "completed") process.exitCode = 2;
@@ -312,7 +476,11 @@ async function workOn(argv: string[]): Promise<void> {
     if (through === "investigate") {
       process.stdout.write(`${statusGlyph("active", mode)} Investigating ${issue.repo}#${issue.number} — ${issue.title}\n`);
       const result = await investigateWorkItem({
-        intent, priorArtifacts, cwd: process.cwd(),
+        intent, priorArtifacts, cwd: process.cwd(), target: runTargetForLane(lane),
+        scopeHints: {
+          affectedFiles: affectedFilesFromIssueBody(issue.body),
+          metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+        },
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
@@ -322,8 +490,7 @@ async function workOn(argv: string[]): Promise<void> {
       return;
     }
 
-    const baseRef = `origin/${localRepository.defaultBranch}`;
-    const verification = discoverVerificationCommands(process.cwd(), baseRef);
+    const verification = verificationPolicy ?? discoverVerificationCommands(process.cwd(), baseRef);
     const git = new GitWorktreeManager(process.cwd());
     const verifier = new ProcessVerificationRunner();
     const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId, baseRef });
@@ -332,13 +499,21 @@ async function workOn(argv: string[]): Promise<void> {
       intent,
       priorArtifacts,
       repoPath: process.cwd(),
-      baseBranch: localRepository.defaultBranch,
-      baseRef,
+      lane,
+      scopeHints: {
+        affectedFiles: affectedFilesFromIssueBody(issue.body),
+        metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+      },
       verification,
       baselineChecks,
       subjectEvidence,
       ...(batchMembers.length ? { batchMembers } : {}),
+      ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
       autoMerge,
+      scopeExpansion: effectiveOrchestration.scopeExpansion,
+      maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
+      maxRemediationDepth: effectiveOrchestration.maxRemediationDepth,
+      maxRemediationChildren: effectiveOrchestration.maxRemediationChildren,
       ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
@@ -348,6 +523,7 @@ async function workOn(argv: string[]): Promise<void> {
       git,
       verifier,
       host: github,
+      telemetry: store,
       onAgentEvent,
     });
     const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
@@ -413,11 +589,16 @@ async function reviewPr(argv: string[]): Promise<void> {
   // Standalone review is advisory and read-only. Its operational state must not
   // replace the issue delivery controller's workflow-label projection.
   const runs = store;
-  const runtime = new PiAgentRuntime({
+  const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
-  });
+  }, store);
   try {
+    await preflightRuntime(runtime, {
+      ...(provider !== undefined ? { provider } : {}),
+      ...(model !== undefined ? { model } : {}),
+      role: "reviewer",
+    });
     const result = await reviewExistingPullRequest({
       repo, pr: Number(prArg),
       ...(issueValue !== undefined ? { issue: Number(issueValue) } : {}),
@@ -440,38 +621,119 @@ async function reviewPr(argv: string[]): Promise<void> {
 
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
-  const issueNumbers = argv.filter((arg) => /^\d+$/.test(arg)).map(Number);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--max-parallel N] [--dry-run] [--auto-merge | --no-auto-merge] [--rerun]");
-  const maxParallelValue = option(argv, "--max-parallel") ?? "2";
+  const issueNumbers = parseOrchestrationIssueNumbers(argv);
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-parallel N] [--dry-run] [--confirm]");
+  const config = readForgeDockConfig(process.cwd());
+  const maxParallelValue = option(argv, "--max-parallel");
+  const requestedBatching = option(argv, "--batching");
+  if (requestedBatching !== undefined && !["aggressive", "conservative", "none"].includes(requestedBatching)) throw new Error("--batching must be aggressive, conservative, or none");
+  const effective = resolveOrchestrationConfig(config, {
+    ...(requestedBatching ? { batchingPolicy: requestedBatching as "aggressive" | "conservative" | "none" } : {}),
+    ...(maxParallelValue ? { maxParallel: Number(maxParallelValue) } : {}),
+    ...(option(argv, "--scope-expansion") ? { scopeExpansion: option(argv, "--scope-expansion") as "scope-locked" | "recursive" } : {}),
+    ...(option(argv, "--max-remediation-cycles") ? { maxRemediationCycles: Number(option(argv, "--max-remediation-cycles")) } : {}),
+  });
+  if (maxParallelValue !== undefined && (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1)) throw new Error("--max-parallel must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
-  if (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1) throw new Error("--max-parallel must be a positive integer");
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
   const github = new GitHubClient(process.cwd());
   const repository = await github.getRepository();
-  const items = loadOrchestrationItems(issueNumbers, repository.repo);
+  const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
+  const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
+  const milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
+    ? await github.listBranches(repository.repo, "milestone/")
+    : [];
+  const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
+  for (const issue of issueSnapshots) {
+    routedIssues.set(issue.number, {
+      issue,
+      lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches),
+    });
+  }
+  await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
+    .map((branch) => github.getBranchHead(repository.repo, branch)));
+  const items: BatchableWorkItem[] = baseItems.map((item) => {
+    const observed = requiredIssueRoute(routedIssues, item.issue).issue;
+    const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+    const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
+    return {
+      ...item,
+      repository: repository.repo,
+      targetBranch: lane.targetBranch,
+      ...(observed.milestone ? { milestone: observed.milestone } : {}),
+      labels: observed.labels,
+      title: observed.title,
+      summary: observed.body.slice(0, 4_000),
+      affectedFiles: affectedFilesFromIssueBody(observed.body),
+      riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
+      ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
+    };
+  });
+  const priorityOption = option(argv, "--priority");
+  const milestoneOption = option(argv, "--milestone");
+  const assembly = assembleWorkUnits(items, {
+    policy: effective.batchingPolicy,
+    maxBatchSize: effective.maxBatchSize,
+    maxSensitiveBatchSize: effective.maxSensitiveBatchSize,
+    ...(priorityOption !== undefined ? { priorities: priorityOption.split(",") } : {}),
+    ...(milestoneOption !== undefined ? { milestone: milestoneOption } : {}),
+    ...(argv.includes("--no-milestone") ? { noMilestone: true } : {}),
+  });
+  const virtualBase = Math.max(...issueNumbers) + 1;
+  const virtualBatches = assembly.groups.map((group, index) => ({ groupId: group.id, issue: virtualBase + index, title: `Proposed batch ${index + 1}`, summary: "Proposed batch" }));
+  const proposed = materializeClaimDependencies(contractBatchGroups(assembly.selected, assembly.groups, virtualBatches));
   if (argv.includes("--dry-run")) {
-    for (const item of items) process.stdout.write(`${item.id} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
+    for (const item of proposed.items) {
+      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+      process.stdout.write(`${item.id} · ${lane.kind} → ${lane.targetBranch} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
+    }
+    process.stdout.write(`batching=${assembly.policy.policy} groups=${assembly.groups.length} ungrouped=${assembly.ungrouped.length} excluded=${assembly.excluded.length}\n`);
     return;
   }
-
+  if (!argv.includes("--confirm")) throw new Error("orchestrate requires --confirm after the authoritative work-unit proposal (use --dry-run to inspect it)");
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
-  const runtime = new PiAgentRuntime({
-    ...(provider !== undefined ? { provider } : {}),
-    ...(model !== undefined ? { model } : {}),
-  });
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const runtime = createCliRuntime({
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+  }, store);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   const runs = projectRunsToGitHub(store, github);
   const git = new GitWorktreeManager(process.cwd());
   const verifier = new ProcessVerificationRunner();
-  const verification = discoverVerificationCommands(process.cwd());
-  const outcomes = new Map<string, string>();
-  const skipped = new Map<string, string>();
   try {
+    await preflightRuntime(runtime, {
+      ...(provider !== undefined ? { provider } : {}),
+      ...(model !== undefined ? { model } : {}),
+    });
+    // Validate the frozen verification policy before any batch issue is created.
+    discoverVerificationCommands(process.cwd(), `origin/${repository.defaultBranch}`);
+    const materializedResult = assembly.groups.length
+      ? await materializeBatchGroups({
+        repo: repository.repo,
+        groups: assembly.groups,
+        items: assembly.selected,
+        host: github,
+        expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, { targetBranch: value.lane.targetBranch, lane: value.lane.kind }])),
+      })
+      : { groups: [], materialized: [], validatedItems: items };
+    const contracted = contractBatchGroups(assembly.selected, materializedResult.groups, materializedResult.materialized);
+    for (const materialized of materializedResult.materialized) {
+      const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
+      const member = group?.members[0];
+      if (group && member) {
+        const lane = requiredIssueRoute(routedIssues, member.issue).lane;
+        const batchIssue = await github.getIssue(materialized.issue, repository.repo);
+        routedIssues.set(materialized.issue, { issue: batchIssue, lane });
+      }
+    }
+    const scheduleItems = materializeClaimDependencies(contracted);
+    const outcomes = new Map<string, string>();
+    const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
-    const schedule = await runSchedule(items, Number(maxParallelValue), async (item) => {
+    const schedule = await runSchedule(scheduleItems.items, effective.maxParallel, async (item) => {
       const lease = store.acquire(item.id, owner, 60_000);
       if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
       const controller = new AbortController();
@@ -507,35 +769,55 @@ async function orchestrate(argv: string[]): Promise<void> {
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
         }
-        const issue = await github.getIssue(item.issue, repository.repo);
+        const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
         const intent = createArtifact({
           kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
           producer: { role: "controller", runtime: "forgedock" },
           payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
         });
-        process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started\n`);
+        const baseRef = `origin/${lane.targetBranch}`;
+        const verification = discoverVerificationCommands(process.cwd(), baseRef);
+        process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
         const result = await executeWorkOn({
-          intent, repoPath: process.cwd(), baseBranch: repository.defaultBranch, baseRef: `origin/${repository.defaultBranch}`,
+          intent, repoPath: process.cwd(), lane,
           verification, autoMerge, signal: controller.signal,
+          subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
         }, {
-          runtime, artifacts, runs, git, verifier, host: github,
+          runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
           onAgentEvent: (event) => writeAgentEvent(event, item.id),
         });
         outcomes.set(item.id, result.run.state);
         process.stdout.write(`${statusGlyph(result.run.state === "completed" || result.run.state === "merging" ? "passed" : "blocked", mode)} ${item.id} ${result.run.state}\n`);
+        if (result.run.state === "blocked") {
+          const reconciled = reconcileLatestRunArtifacts(await artifacts.list(subject));
+          if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
+            return { status: "suspended", error: `Recursive remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey} is active` };
+          }
+        }
         if (result.run.state !== "completed") throw new Error(`${item.id} ended in ${result.run.state}; dependents remain blocked`);
       } finally {
         clearInterval(heartbeat);
         store.release(item.id, lease.token);
       }
+    }, {
+      onEvent: (scheduleEvent) => {
+        const snapshot = buildOrchestrationSnapshot({
+          orchestrationId: `cli-${process.pid}`,
+          items: scheduleItems.items,
+          result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
+        });
+        const event = orchestrationEventFromSchedule(scheduleEvent, snapshot);
+        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} suspended=${snapshot.suspendedNodes.length}\n`);
+      },
     });
     const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked");
+    const suspended = [...schedule.status.entries()].filter(([, status]) => status === "suspended");
     const completed = [...schedule.status.values()].filter((status) => status === "completed").length;
-    process.stdout.write(`\nOrchestration complete · ${completed - skipped.size} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed\n`);
+    process.stdout.write(`\nOrchestration complete · ${completed - skipped.size} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${suspended.length} suspended\n`);
     for (const [id, state] of outcomes) process.stdout.write(`  ${id}: ${state}\n`);
-    if (failed.length) process.exitCode = 2;
+    if (failed.length || suspended.length) process.exitCode = 2;
   } finally {
     await runtime.close();
     store.close();
@@ -551,6 +833,12 @@ function projectRunsToGitHub(runs: RunRepository, github: GitHubClient): RunRepo
       process.stderr.write(`warning: GitHub label projection failed for ${state.subject.repo}#${state.subject.issue ?? "?"} at ${state.state}: ${message}\n`);
     },
   );
+}
+
+function requiredIssueRoute<T>(routes: ReadonlyMap<number, T>, issue: number): T {
+  const route = routes.get(issue);
+  if (!route) throw new Error(`Issue #${issue} has no authoritative lane classification`);
+  return route;
 }
 
 function loadOrchestrationItems(issueNumbers: number[], repo: string): ScheduledWorkItem[] {
@@ -607,7 +895,15 @@ async function collectBaselineChecks(input: {
   runId: string;
   baseRef: string;
 }): Promise<CheckResult[]> {
-  const workspace = await input.git.create({ runId: `${input.runId}-baseline`, issue: input.issue, baseRef: input.baseRef });
+  const identity = { runId: `${input.runId}-baseline`, issue: input.issue, baseRef: input.baseRef };
+  let workspace;
+  try {
+    workspace = await input.git.create(identity);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (!/branch named .+ already exists|already checked out|path .+ already exists/i.test(reason)) throw error;
+    workspace = await input.git.recover(identity);
+  }
   try {
     return await input.verifier.run(input.verification.map((command) => ({ ...command, cwd: workspace.path })));
   } finally {
@@ -616,16 +912,7 @@ async function collectBaselineChecks(input: {
 }
 
 function writeAgentEvent(event: AgentEvent, prefix?: string): void {
-  const task = prefix ? `${prefix} · ${event.taskId}` : event.taskId;
-  if (event.type === "session.started") {
-    process.stdout.write(`  ${statusGlyph("active", mode)} ${task} · ${event.provider}/${event.model}\n`);
-  } else if (event.type === "tool.started") {
-    process.stdout.write(`    ${statusGlyph("active", mode)} ${task} · ${event.tool}\n`);
-  } else if (event.type === "artifact.submitted") {
-    process.stdout.write(`  ${statusGlyph("passed", mode)} ${task} · artifact submitted\n`);
-  } else if (event.type === "session.completed") {
-    process.stdout.write(`  ${statusGlyph("passed", mode)} ${task} · session complete\n`);
-  }
+  agentEventStream.write(event, prefix);
 }
 
 function configuredMaxReviewSpecialists(): number | undefined {
@@ -636,6 +923,29 @@ function configuredMaxReviewSpecialists(): number | undefined {
     return parsed;
   }
   return readForgeDockConfig(process.cwd()).maxReviewSpecialists;
+}
+
+function createCliRuntime(options: { provider?: string; model?: string }, telemetry: TelemetryRepository): AgentRuntime {
+  const inner = new PiAgentRuntime({
+    ...(options.provider !== undefined ? { provider: options.provider } : {}),
+    ...(options.model !== undefined ? { model: options.model } : {}),
+  });
+  return new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
+}
+
+async function preflightRuntime(runtime: AgentRuntime, options: RuntimePreflightOptions): Promise<void> {
+  if (!runtime.preflight) throw new Error("Configured agent runtime does not support preflight; refusing to publish or dispatch semantic work");
+  await runtime.preflight(options);
+}
+
+function renderTelemetryLine(summary: ReturnType<typeof summarizeTelemetry>, prefix = ""): void {
+  const tokens = summary.totalTokens ?? "unavailable";
+  const cost = summary.estimatedCostUsd === undefined ? "unavailable" : `$${summary.estimatedCostUsd.toFixed(4)}`;
+  process.stdout.write(`${prefix}telemetry: tasks=${summary.taskCount} active=${summary.activeMs}ms queue=${summary.queueMs}ms retries=${summary.retries} tokens=${tokens} cost=${cost}\n`);
+}
+
+function renderControllerTimingLine(summary: ReturnType<typeof summarizeControllerTiming>, prefix = ""): void {
+  process.stdout.write(`${prefix}controller timing: active=${summary.activeMs}ms queued=${summary.queuedMs}ms human-held=${summary.humanHeldMs}ms phases=${summary.phases.length}\n`);
 }
 
 function commandAutoMerge(argv: string[]): boolean {
@@ -677,11 +987,11 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--no-auto-merge] [--resume] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--max-parallel N] [--dry-run] [--no-auto-merge] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--dry-run|--confirm]\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo]\n\n");
   process.stdout.write("Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
   process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");

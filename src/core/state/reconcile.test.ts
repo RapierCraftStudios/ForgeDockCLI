@@ -20,12 +20,14 @@ describe("GitHub artifact reconciliation", () => {
     assert.equal(reconcileArtifacts([intent, investigation, packet, build, verdict]).state, "merging");
   });
 
-  it("continues past a blocked checkpoint when a resumed build result is newer", () => {
-    const blocked = createArtifact({
-      ...common, kind: "Outcome", payload: { status: "blocked", reason: "base test failure", childIssues: [] },
-    }, { createdAt: "2026-01-01T00:00:00.000Z" });
-    const resumedBuild = { ...build, createdAt: "2026-01-01T00:01:00.000Z" };
-    assert.equal(reconcileArtifacts([intent, investigation, packet, blocked, resumedBuild] as DurableArtifact[]).state, "publishing");
+  it("continues past an interrupted checkpoint when a resumed build result is newer", () => {
+    for (const status of ["blocked", "failed"] as const) {
+      const interrupted = createArtifact({
+        ...common, kind: "Outcome", payload: { status, reason: "transient interruption", childIssues: [] },
+      }, { createdAt: "2026-01-01T00:00:00.000Z" });
+      const resumedBuild = { ...build, createdAt: "2026-01-01T00:01:00.000Z" };
+      assert.equal(reconcileArtifacts([intent, investigation, packet, interrupted, resumedBuild] as DurableArtifact[]).state, "publishing");
+    }
   });
 
   it("fails safe on an inconsistent merged outcome", () => {

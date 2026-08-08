@@ -22,6 +22,19 @@ describe("workflow state machine", () => {
     assert.equal(run.version, 9);
   });
 
+  it("freezes lane identity and target branch across transitions", () => {
+    const target = {
+      lane: "feature" as const,
+      targetBranch: "milestone/verifiable-workflow-authority",
+      milestone: { number: 1, title: "Verifiable Workflow Authority & Portability" },
+    };
+    const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 6 }, target });
+    const started = transition(run, "START_INVESTIGATION").state;
+    assert.equal(started.lane, "feature");
+    assert.equal(started.targetBranch, target.targetBranch);
+    assert.deepEqual(started.milestone, target.milestone);
+  });
+
   it("makes invalid and decomposed investigations terminal", () => {
     const started = transition(createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 1 } }), "START_INVESTIGATION").state;
     assert.equal(transition(started, "INVESTIGATION_INVALID").state.state, "invalid");
@@ -45,6 +58,46 @@ describe("workflow state machine", () => {
     assert.equal(resumed.state, "verifying");
     assert.equal(resumed.attempt, 2);
     assert.equal(resumed.blockedReason, undefined);
+  });
+
+  it("reassesses an exhausted review budget before authorizing more remediation", () => {
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED", "BLOCK",
+    ] as const) {
+      run = transition(run, event, event === "BLOCK" ? { reason: "Remediation budget exhausted after 2 cycle(s)" } : {}).state;
+    }
+    const resumed = transition(run, "RESUME_REVIEW").state;
+    assert.equal(resumed.state, "reviewing");
+    assert.equal(resumed.attempt, 2);
+    assert.equal(resumed.blockedReason, undefined);
+  });
+
+  it("allows the exact controller-authored expanded review resume", () => {
+    const queued = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 11 }, target: { lane: "fast", targetBranch: "main" } });
+    const blocked = transition(queued, "BLOCK", { reason: "recursive remediation" }).state;
+    const resumed = transition(blocked, "RESUME_EXPANDED_REVIEW", { headSha: "a".repeat(40) }).state;
+    assert.equal(resumed.state, "reviewing");
+    assert.equal(resumed.blockedReason, undefined);
+  });
+
+  it("records typed interruption recovery within remediation and completion", () => {
+    let remediation = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 9 } });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) remediation = transition(remediation, event).state;
+    assert.equal(transition(remediation, "RESUME_REMEDIATION").state.state, "remediating");
+
+    let completion = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 10 } });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED",
+    ] as const) completion = transition(completion, event).state;
+    const resumed = transition(completion, "RESUME_COMPLETION").state;
+    assert.equal(resumed.state, "merging");
+    assert.equal(resumed.attempt, 2);
   });
 
   it("permits only typed publication recovery from a failed revision projection", () => {

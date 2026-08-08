@@ -32,6 +32,10 @@ export type TransitionEvent =
   | "VERIFICATION_PASSED"
   | "VERIFICATION_FAILED"
   | "RESUME_VERIFICATION"
+  | "RESUME_REVIEW"
+  | "RESUME_EXPANDED_REVIEW"
+  | "RESUME_REMEDIATION"
+  | "RESUME_COMPLETION"
   | "RESUME_PUBLICATION"
   | "RECOVER_REVISION_PUBLICATION"
   | "PR_PUBLISHED"
@@ -45,12 +49,29 @@ export type TransitionEvent =
   | "FAIL"
   | "CANCEL";
 
+export interface RunTarget {
+  lane: "fast" | "feature";
+  targetBranch: string;
+  milestone?: { number: number; title: string };
+}
+
+export interface PersistedScopeManifest {
+  readRoots: readonly string[];
+  writeRoots: readonly string[];
+  writePaths?: readonly string[];
+  source: "issue-hints" | "build-packet" | "remediation";
+}
+
 export interface RunState {
   schema: "forgedock.run/v1";
   runId: string;
   workflow: Workflow;
   subject: Subject;
   state: RunStateName;
+  lane?: RunTarget["lane"];
+  targetBranch?: string;
+  milestone?: RunTarget["milestone"];
+  scopeManifest?: PersistedScopeManifest;
   attempt: number;
   version: number;
   createdAt: string;
@@ -99,13 +120,13 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     FAIL: "failed",
     CANCEL: "cancelled",
   },
-  remediating: { REMEDIATION_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
-  merging: { MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  remediating: { RESUME_REMEDIATION: "remediating", REMEDIATION_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  merging: { RESUME_COMPLETION: "merging", MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   closing: { CLOSE_COMPLETED: "completed", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   completed: {},
   invalid: {},
   decomposed: {},
-  blocked: { RESUME_VERIFICATION: "verifying" },
+  blocked: { RESUME_VERIFICATION: "verifying", RESUME_REVIEW: "reviewing", RESUME_EXPANDED_REVIEW: "reviewing" },
   // A failed revision publication may be recovered only through the distinct
   // proof-checked controller path; ordinary publication resume is insufficient.
   failed: { RECOVER_REVISION_PUBLICATION: "publishing" },
@@ -121,14 +142,24 @@ export function createRun(input: {
   subject: Subject;
   runId?: string;
   now?: string;
+  target?: RunTarget;
+  scopeManifest?: PersistedScopeManifest;
 }): RunState {
   const now = input.now ?? new Date().toISOString();
+  if (input.target && !input.target.targetBranch.trim()) throw new Error("Run target branch is required");
+  if (input.target?.lane === "feature" && !input.target.milestone) throw new Error("Feature-lane runs require milestone identity");
   return {
     schema: "forgedock.run/v1",
     runId: input.runId ?? `run_${crypto.randomUUID()}`,
     workflow: input.workflow,
     subject: input.subject,
     state: input.workflow === "review-pr" ? "reviewing" : "queued",
+    ...(input.target ? {
+      lane: input.target.lane,
+      targetBranch: input.target.targetBranch,
+      ...(input.target.milestone ? { milestone: input.target.milestone } : {}),
+    } : {}),
+    ...(input.scopeManifest ? { scopeManifest: input.scopeManifest } : {}),
     attempt: 1,
     version: 0,
     createdAt: now,
@@ -156,7 +187,7 @@ export function transition(
     updatedAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
-  if (event === "RESUME_VERIFICATION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION") {
+  if (event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

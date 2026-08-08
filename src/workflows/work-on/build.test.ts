@@ -39,7 +39,7 @@ describe("builder boundary", () => {
 
     assert.equal(built.run.state, "verifying");
     assert.equal(built.submission.summary, "Added the guard");
-    assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "edit", "write"]);
+    assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "edit", "write"]);
     assert.ok(!runtime.tasks[2]?.tools.includes("bash"));
   });
 });

@@ -7,7 +7,30 @@ const START = "# FORGEDOCK:NEXT-CONFIG:START";
 const END = "# FORGEDOCK:NEXT-CONFIG:END";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const DEFAULT_AUTO_MERGE = true;
+export const DEFAULT_ORCHESTRATION = {
+  batchingPolicy: "aggressive" as const,
+  maxBatchSize: 8,
+  maxSensitiveBatchSize: 3,
+  scopeExpansion: "scope-locked" as const,
+  maxRemediationCycles: 2,
+  maxRemediationDepth: 2,
+  maxRemediationChildren: 8,
+  maxParallel: 4,
+  autoMerge: DEFAULT_AUTO_MERGE,
+};
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export type BatchingPolicy = "aggressive" | "conservative" | "none";
+export type ScopeExpansion = "scope-locked" | "recursive";
+
+export interface ForgeDockOrchestrationPatch {
+  batching?: { policy?: BatchingPolicy; maxBatchSize?: number; maxSensitiveBatchSize?: number };
+  scopeExpansion?: ScopeExpansion;
+  maxRemediationCycles?: number;
+  maxRemediationDepth?: number;
+  maxRemediationChildren?: number;
+  maxParallel?: number;
+  autoMerge?: boolean;
+}
 
 export interface ForgeDockNextConfig {
   workerModel?: string;
@@ -15,8 +38,31 @@ export interface ForgeDockNextConfig {
   reviewerModel?: string;
   reviewerThinking?: ThinkingLevel;
   maxReviewSpecialists?: number;
+  /** Flat resolved fields are used by controllers; YAML is rendered nested. */
+  batchingPolicy?: BatchingPolicy;
+  maxBatchSize?: number;
+  maxSensitiveBatchSize?: number;
+  scopeExpansion?: ScopeExpansion;
+  maxRemediationCycles?: number;
+  maxRemediationDepth?: number;
+  maxRemediationChildren?: number;
   maxParallel?: number;
   autoMerge?: boolean;
+  orchestration?: ForgeDockOrchestrationPatch;
+}
+
+export type OrchestrationConfigSource = "invocation" | "forge.yaml" | "default";
+
+export interface EffectiveOrchestrationConfig {
+  batchingPolicy: BatchingPolicy;
+  maxBatchSize: number;
+  maxSensitiveBatchSize: number;
+  scopeExpansion: ScopeExpansion;
+  maxRemediationCycles: number;
+  maxRemediationDepth: number;
+  maxRemediationChildren: number;
+  maxParallel: number;
+  autoMerge: boolean;
 }
 
 export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
@@ -26,15 +72,31 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
   const managed = managedBlock(raw);
   if (!managed) return {};
   const value = (key: string) => new RegExp(`^\\s*${key}:\\s*(.+?)\\s*$`, "m").exec(managed)?.[1];
-  return compact({
-    workerModel: parseString(value("worker_model")),
-    workerThinking: parseThinking(value("worker_thinking")),
-    reviewerModel: parseString(value("reviewer_model")),
-    reviewerThinking: parseThinking(value("reviewer_thinking")),
-    maxReviewSpecialists: parsePositiveInteger(value("max_review_specialists")),
-    maxParallel: parsePositiveInteger(value("max_parallel")),
-    autoMerge: parseBoolean(value("auto_merge")),
+  const parsed = <T>(key: string, parser: (raw: string) => T | undefined): T | undefined => {
+    const raw = value(key);
+    if (raw === undefined) return undefined;
+    const result = parser(raw);
+    if (result === undefined) throw new Error(`Invalid ForgeDock setting ${key}: ${raw}`);
+    return result;
+  };
+  const config = compact({
+    workerModel: parsed("worker_model", parseString),
+    workerThinking: parsed("worker_thinking", parseThinking),
+    reviewerModel: parsed("reviewer_model", parseString),
+    reviewerThinking: parsed("reviewer_thinking", parseThinking),
+    maxReviewSpecialists: parsed("max_review_specialists", parsePositiveInteger),
+    batchingPolicy: parsed("policy", parseBatchingPolicy),
+    maxBatchSize: parsed("max_batch_size", parsePositiveInteger),
+    maxSensitiveBatchSize: parsed("max_sensitive_batch_size", parsePositiveInteger),
+    scopeExpansion: parsed("scope_expansion", parseScopeExpansion),
+    maxRemediationCycles: parsed("max_remediation_cycles", parsePositiveInteger),
+    maxRemediationDepth: parsed("max_remediation_depth", parseNonNegativeInteger),
+    maxRemediationChildren: parsed("max_remediation_children", parsePositiveInteger),
+    maxParallel: parsed("max_parallel", parsePositiveInteger),
+    autoMerge: parsed("auto_merge", parseBoolean),
   }) as ForgeDockNextConfig;
+  validatePatch(config, false);
+  return config;
 }
 
 export function ensureForgeDockConfig(cwd: string): { path: string; created: boolean } {
@@ -48,7 +110,8 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
   validatePatch(patch);
   const path = join(cwd, "forge.yaml");
   const current = readForgeDockConfig(cwd);
-  const config = compact({ ...current, ...patch });
+  const normalizedPatch = flattenOrchestrationPatch(patch);
+  const config = compact({ ...current, ...normalizedPatch });
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "# forge.yaml — ForgeDock project configuration\n";
   const rendered = renderManagedBlock(config);
   const start = existing.indexOf(START);
@@ -66,6 +129,47 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
 
 export function resolveAutoMerge(requested: boolean | undefined, configured: boolean | undefined): boolean {
   return requested ?? configured ?? DEFAULT_AUTO_MERGE;
+}
+
+export function resolveOrchestrationConfig(
+  configured: ForgeDockNextConfig = {},
+  overrides: Partial<ForgeDockNextConfig> = {},
+): EffectiveOrchestrationConfig {
+  const merged = flattenOrchestrationPatch({ ...configured, ...overrides });
+  const result: EffectiveOrchestrationConfig = {
+    batchingPolicy: merged.batchingPolicy ?? DEFAULT_ORCHESTRATION.batchingPolicy,
+    maxBatchSize: merged.maxBatchSize ?? DEFAULT_ORCHESTRATION.maxBatchSize,
+    maxSensitiveBatchSize: merged.maxSensitiveBatchSize ?? DEFAULT_ORCHESTRATION.maxSensitiveBatchSize,
+    scopeExpansion: merged.scopeExpansion ?? DEFAULT_ORCHESTRATION.scopeExpansion,
+    maxRemediationCycles: merged.maxRemediationCycles ?? DEFAULT_ORCHESTRATION.maxRemediationCycles,
+    maxRemediationDepth: merged.maxRemediationDepth ?? DEFAULT_ORCHESTRATION.maxRemediationDepth,
+    maxRemediationChildren: merged.maxRemediationChildren ?? DEFAULT_ORCHESTRATION.maxRemediationChildren,
+    maxParallel: merged.maxParallel ?? DEFAULT_ORCHESTRATION.maxParallel,
+    autoMerge: merged.autoMerge ?? DEFAULT_ORCHESTRATION.autoMerge,
+  };
+  validateEffectiveOrchestration(result);
+  return result;
+}
+
+export function orchestrationConfigSources(
+  configured: ForgeDockNextConfig = {},
+  overrides: Partial<ForgeDockNextConfig> = {},
+): Record<keyof EffectiveOrchestrationConfig, OrchestrationConfigSource> {
+  const configuredFlat = flattenOrchestrationPatch(configured);
+  const overrideFlat = flattenOrchestrationPatch(overrides);
+  const source = (key: keyof EffectiveOrchestrationConfig): OrchestrationConfigSource =>
+    overrideFlat[key] !== undefined ? "invocation" : configuredFlat[key] !== undefined ? "forge.yaml" : "default";
+  return {
+    batchingPolicy: source("batchingPolicy"),
+    maxBatchSize: source("maxBatchSize"),
+    maxSensitiveBatchSize: source("maxSensitiveBatchSize"),
+    scopeExpansion: source("scopeExpansion"),
+    maxRemediationCycles: source("maxRemediationCycles"),
+    maxRemediationDepth: source("maxRemediationDepth"),
+    maxRemediationChildren: source("maxRemediationChildren"),
+    maxParallel: source("maxParallel"),
+    autoMerge: source("autoMerge"),
+  };
 }
 
 export function splitConfiguredModel(value: string | undefined): { provider: string; model: string } | undefined {
@@ -91,22 +195,39 @@ function managedBlock(raw: string): string | undefined {
 function renderManagedBlock(config: ForgeDockNextConfig): string {
   const hasAgents = config.workerModel !== undefined || config.workerThinking !== undefined
     || config.reviewerModel !== undefined || config.reviewerThinking !== undefined || config.maxReviewSpecialists !== undefined;
-  const hasOrchestration = config.maxParallel !== undefined || config.autoMerge !== undefined;
+  const hasBatching = config.batchingPolicy !== undefined || config.maxBatchSize !== undefined || config.maxSensitiveBatchSize !== undefined;
+  const hasOrchestration = hasBatching || config.scopeExpansion !== undefined || config.maxRemediationCycles !== undefined
+    || config.maxRemediationDepth !== undefined || config.maxRemediationChildren !== undefined
+    || config.maxParallel !== undefined || config.autoMerge !== undefined;
   const lines = [START, "next:", hasAgents ? "  agents:" : "  agents: {}"];
   if (config.workerModel !== undefined) lines.push(`    worker_model: ${JSON.stringify(config.workerModel)}`);
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
   if (config.reviewerModel !== undefined) lines.push(`    reviewer_model: ${JSON.stringify(config.reviewerModel)}`);
   if (config.reviewerThinking !== undefined) lines.push(`    reviewer_thinking: ${JSON.stringify(config.reviewerThinking)}`);
   if (config.maxReviewSpecialists !== undefined) lines.push(`    max_review_specialists: ${config.maxReviewSpecialists}`);
-  lines.push(hasOrchestration ? "  orchestration:" : "  orchestration: {}");
-  if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
-  if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
+  if (!hasOrchestration) {
+    lines.push("  orchestration: {}");
+  } else {
+    lines.push("  orchestration:");
+    if (hasBatching) {
+      lines.push("    batching:");
+      if (config.batchingPolicy !== undefined) lines.push(`      policy: ${JSON.stringify(config.batchingPolicy)}`);
+      if (config.maxBatchSize !== undefined) lines.push(`      max_batch_size: ${config.maxBatchSize}`);
+      if (config.maxSensitiveBatchSize !== undefined) lines.push(`      max_sensitive_batch_size: ${config.maxSensitiveBatchSize}`);
+    }
+    if (config.scopeExpansion !== undefined) lines.push(`    scope_expansion: ${JSON.stringify(config.scopeExpansion)}`);
+    if (config.maxRemediationCycles !== undefined) lines.push(`    max_remediation_cycles: ${config.maxRemediationCycles}`);
+    if (config.maxRemediationDepth !== undefined) lines.push(`    max_remediation_depth: ${config.maxRemediationDepth}`);
+    if (config.maxRemediationChildren !== undefined) lines.push(`    max_remediation_children: ${config.maxRemediationChildren}`);
+    if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
+    if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
+  }
   lines.push(END);
   return lines.join("\n");
 }
 
-function validatePatch(patch: ForgeDockNextConfig): void {
-  if (!Object.values(patch).some((value) => value !== undefined)) throw new Error("At least one ForgeDock setting is required");
+function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
+  if (requireValue && !Object.values(patch).some((value) => value !== undefined)) throw new Error("At least one ForgeDock setting is required");
   for (const model of [patch.workerModel, patch.reviewerModel]) {
     if (model !== undefined && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._@:/-]+$/.test(model)) {
       throw new Error(`Model must use provider/model form: ${model}`);
@@ -121,6 +242,53 @@ function validatePatch(patch: ForgeDockNextConfig): void {
   if (patch.maxParallel !== undefined && (!Number.isInteger(patch.maxParallel) || patch.maxParallel < 1 || patch.maxParallel > 20)) {
     throw new Error("maxParallel must be an integer from 1 to 20");
   }
+  if (patch.batchingPolicy !== undefined && !["aggressive", "conservative", "none"].includes(patch.batchingPolicy)) throw new Error("batchingPolicy must be aggressive, conservative, or none");
+  if (patch.scopeExpansion !== undefined && !["scope-locked", "recursive"].includes(patch.scopeExpansion)) throw new Error("scopeExpansion must be scope-locked or recursive");
+  for (const [name, value] of [["maxBatchSize", patch.maxBatchSize], ["maxSensitiveBatchSize", patch.maxSensitiveBatchSize], ["maxRemediationCycles", patch.maxRemediationCycles], ["maxRemediationChildren", patch.maxRemediationChildren]] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > 100)) throw new Error(`${name} must be a positive integer from 1 to 100`);
+  }
+  if (patch.maxRemediationDepth !== undefined && (!Number.isSafeInteger(patch.maxRemediationDepth) || patch.maxRemediationDepth < 0 || patch.maxRemediationDepth > 100)) {
+    throw new Error("maxRemediationDepth must be an integer from 0 to 100");
+  }
+  if (patch.maxSensitiveBatchSize !== undefined && patch.maxBatchSize !== undefined && patch.maxSensitiveBatchSize > patch.maxBatchSize) throw new Error("maxSensitiveBatchSize must be less than or equal to maxBatchSize");
+  const nested = patch.orchestration;
+  if (nested?.batching?.maxBatchSize !== undefined && (!Number.isSafeInteger(nested.batching.maxBatchSize) || nested.batching.maxBatchSize < 1 || nested.batching.maxBatchSize > 100)) throw new Error("orchestration.batching.maxBatchSize must be a positive integer");
+  if (nested?.batching?.maxSensitiveBatchSize !== undefined && (!Number.isSafeInteger(nested.batching.maxSensitiveBatchSize) || nested.batching.maxSensitiveBatchSize < 1 || nested.batching.maxSensitiveBatchSize > 100)) throw new Error("orchestration.batching.maxSensitiveBatchSize must be a positive integer");
+  if (nested?.batching?.maxSensitiveBatchSize !== undefined && nested.batching.maxBatchSize !== undefined && nested.batching.maxSensitiveBatchSize > nested.batching.maxBatchSize) {
+    throw new Error("orchestration.batching.maxSensitiveBatchSize must be less than or equal to maxBatchSize");
+  }
+  if (nested?.maxRemediationCycles !== undefined && (!Number.isSafeInteger(nested.maxRemediationCycles) || nested.maxRemediationCycles < 1 || nested.maxRemediationCycles > 100)) throw new Error("maxRemediationCycles must be a positive integer");
+  if (nested?.maxRemediationDepth !== undefined && (!Number.isSafeInteger(nested.maxRemediationDepth) || nested.maxRemediationDepth < 0 || nested.maxRemediationDepth > 100)) throw new Error("maxRemediationDepth must be an integer from 0 to 100");
+  if (nested?.maxRemediationChildren !== undefined && (!Number.isSafeInteger(nested.maxRemediationChildren) || nested.maxRemediationChildren < 1 || nested.maxRemediationChildren > 100)) throw new Error("maxRemediationChildren must be a positive integer");
+  if (nested?.maxParallel !== undefined && (!Number.isSafeInteger(nested.maxParallel) || nested.maxParallel < 1 || nested.maxParallel > 20)) throw new Error("maxParallel must be an integer from 1 to 20");
+}
+
+function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextConfig {
+  const nested = patch.orchestration;
+  if (!nested) return { ...patch };
+  const result: ForgeDockNextConfig = { ...patch };
+  delete result.orchestration;
+  if (result.batchingPolicy === undefined && nested.batching?.policy !== undefined) result.batchingPolicy = nested.batching.policy;
+  if (result.maxBatchSize === undefined && nested.batching?.maxBatchSize !== undefined) result.maxBatchSize = nested.batching.maxBatchSize;
+  if (result.maxSensitiveBatchSize === undefined && nested.batching?.maxSensitiveBatchSize !== undefined) result.maxSensitiveBatchSize = nested.batching.maxSensitiveBatchSize;
+  if (result.scopeExpansion === undefined && nested.scopeExpansion !== undefined) result.scopeExpansion = nested.scopeExpansion;
+  if (result.maxRemediationCycles === undefined && nested.maxRemediationCycles !== undefined) result.maxRemediationCycles = nested.maxRemediationCycles;
+  if (result.maxRemediationDepth === undefined && nested.maxRemediationDepth !== undefined) result.maxRemediationDepth = nested.maxRemediationDepth;
+  if (result.maxRemediationChildren === undefined && nested.maxRemediationChildren !== undefined) result.maxRemediationChildren = nested.maxRemediationChildren;
+  if (result.maxParallel === undefined && nested.maxParallel !== undefined) result.maxParallel = nested.maxParallel;
+  if (result.autoMerge === undefined && nested.autoMerge !== undefined) result.autoMerge = nested.autoMerge;
+  return result;
+}
+
+function validateEffectiveOrchestration(config: EffectiveOrchestrationConfig): void {
+  if (!["aggressive", "conservative", "none"].includes(config.batchingPolicy)) throw new Error("Invalid effective batching policy");
+  if (!["scope-locked", "recursive"].includes(config.scopeExpansion)) throw new Error("Invalid effective scope expansion");
+  if (!Number.isSafeInteger(config.maxBatchSize) || config.maxBatchSize < 1) throw new Error("Invalid effective maxBatchSize");
+  if (!Number.isSafeInteger(config.maxSensitiveBatchSize) || config.maxSensitiveBatchSize < 1 || config.maxSensitiveBatchSize > config.maxBatchSize) throw new Error("Invalid effective sensitive batch cap");
+  if (!Number.isSafeInteger(config.maxRemediationCycles) || config.maxRemediationCycles < 1) throw new Error("Invalid effective remediation cycle limit");
+  if (!Number.isSafeInteger(config.maxRemediationDepth) || config.maxRemediationDepth < 0) throw new Error("Invalid effective remediation depth");
+  if (!Number.isSafeInteger(config.maxRemediationChildren) || config.maxRemediationChildren < 1) throw new Error("Invalid effective remediation child limit");
+  if (!Number.isSafeInteger(config.maxParallel) || config.maxParallel < 1) throw new Error("Invalid effective maxParallel");
 }
 
 function parseString(value: string | undefined): string | undefined {
@@ -138,10 +306,25 @@ function parseThinking(value: string | undefined): ThinkingLevel | undefined {
   return THINKING_LEVELS.find((level) => level === parsed);
 }
 
+function parseBatchingPolicy(value: string | undefined): BatchingPolicy | undefined {
+  const parsed = parseString(value);
+  return parsed === "aggressive" || parsed === "conservative" || parsed === "none" ? parsed : undefined;
+}
+
+function parseScopeExpansion(value: string | undefined): ScopeExpansion | undefined {
+  const parsed = parseString(value);
+  return parsed === "scope-locked" || parsed === "recursive" ? parsed : undefined;
+}
+
 function parsePositiveInteger(value: string | undefined): number | undefined {
-  if (!value || !/^\d+$/.test(value)) return undefined;
+  const parsed = parseNonNegativeInteger(value);
+  return parsed !== undefined && parsed > 0 ? parsed : undefined;
+}
+
+function parseNonNegativeInteger(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined;
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function parseBoolean(value: string | undefined): boolean | undefined {

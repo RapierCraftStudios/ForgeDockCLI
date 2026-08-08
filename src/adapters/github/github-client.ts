@@ -5,8 +5,14 @@ import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
-import type { DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
+import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
+import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
+
+export function repositoryFromRemote(remote: string): string | undefined {
+  const match = /github\.com[/:]([^/\s:]+)\/([^/\s]+?)(?:\.git)?$/i.exec(remote.trim().replace(/\/+$/, ""));
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
 
 const WORKFLOW_LABELS = [
   { name: "workflow:investigating", color: "1D76DB", description: "ForgeDock investigation is active" },
@@ -70,7 +76,7 @@ export interface BatchIssueInput {
   repo: string;
   title: string;
   body: string;
-  priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3";
+  priorityLabel: "priority:P0" | "P0" | "priority:P1" | "P1" | "priority:P2" | "P2" | "priority:P3" | "P3";
   milestone?: string;
 }
 
@@ -85,7 +91,10 @@ export class GitHubClient implements ForgeHost {
   }
 
   async getRepository(repo?: string): Promise<{ repo: string; defaultBranch: string }> {
-    const result = await this.gh(["repo", "view", ...(repo ? [repo] : []), "--json", "nameWithOwner,defaultBranchRef"]);
+    // gh defaults to the first remote, which can be `upstream` in a staging
+    // worktree. ForgeDock targets the checkout's origin, not the source fork.
+    const originRepo = repo ?? await this.resolveOriginRepository();
+    const result = await this.gh(["repo", "view", ...(originRepo ? [originRepo] : []), "--json", "nameWithOwner,defaultBranchRef"]);
     const parsed = JSON.parse(result) as { nameWithOwner?: string; defaultBranchRef?: { name?: string } };
     if (!parsed.nameWithOwner || !parsed.defaultBranchRef?.name) throw new Error("Unable to resolve GitHub repository and default branch");
     return { repo: parsed.nameWithOwner, defaultBranch: parsed.defaultBranchRef.name };
@@ -152,6 +161,14 @@ export class GitHubClient implements ForgeHost {
     }
   }
 
+  async publishIssueComment(input: { repo: string; issue: number; marker: string; body: string }): Promise<void> {
+    if (!input.body.includes(input.marker)) throw new Error("Issue comment is missing its idempotency marker");
+    const comments = await this.listIssueComments({ repo: input.repo, issue: input.issue });
+    if (!comments.some((comment) => comment.includes(input.marker))) {
+      await this.postIssueComment({ repo: input.repo, issue: input.issue }, input.body);
+    }
+  }
+
   async materializeReviewFinding(input: {
     repo: string;
     sourceIssue?: number;
@@ -187,6 +204,11 @@ export class GitHubClient implements ForgeHost {
       `**Confidence:** ${input.finding.confidence.toUpperCase()}`,
       `**Severity:** ${input.finding.severity.toUpperCase()}`,
       `**Controller disposition:** ${input.finding.blocking ? "blocking" : "non-blocking"}`,
+      ...(input.finding.scopeDisposition ? [`**Scope disposition:** ${input.finding.scopeDisposition}`] : []),
+      ...(input.finding.scopeRationale ? [`**Scope rationale:** ${boundedGitHubText(input.finding.scopeRationale, 3_000)}`] : []),
+      ...(input.finding.matchedAcceptanceCriteria?.length
+        ? [`**Matched acceptance criteria:** ${input.finding.matchedAcceptanceCriteria.map((criterion) => boundedGitHubText(criterion, 1_000)).join("; ")}`]
+        : []),
       "",
       "## Affected Files",
       "",
@@ -226,6 +248,22 @@ export class GitHubClient implements ForgeHost {
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
     return { repo: input.repo, number, title, body, url, state: "OPEN" };
+  }
+
+  async reconcileReviewFindings(input: {
+    repo: string;
+    pullRequest: PullRequestSnapshot;
+    runId: string;
+    activeFindings: readonly ReviewFindingInput[];
+  }): Promise<readonly number[]> {
+    const stale = reviewFindingReconciliationCandidates(await this.listAllIssues(input.repo), input);
+    for (const issue of stale) {
+      await this.gh([
+        "issue", "close", String(issue.number), "--repo", input.repo, "--reason", "completed",
+        "--comment", `Superseded by the authoritative Review Verdict for PR #${input.pullRequest.number} at ${input.pullRequest.headSha}; this finding is no longer active.`,
+      ]);
+    }
+    return stale.map((issue) => issue.number);
   }
 
   private async ensureReviewFindingLabels(repo: string): Promise<void> {
@@ -333,6 +371,67 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
+  async materializeRemediationChildren(input: {
+    repo: string;
+    parentRunId: string;
+    parentIssue: number;
+    parentPullRequest: number;
+    headSha: string;
+    headBranch: string;
+    baseBranch: string;
+    checkpointKey: string;
+    remediationDepth: number;
+    findings: readonly {
+      id: string;
+      title: string;
+      evidence: string;
+      location: string;
+      remediation: string;
+      acceptanceCriterion: string;
+    }[];
+  }): Promise<IssueSnapshot[]> {
+    if (!input.findings.length) return [];
+    const existing = await this.listAllIssues(input.repo);
+    const byMarker = new Map(existing.flatMap((issue) => {
+      const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
+      return match?.[1] ? [[match[1], issue] as const] : [];
+    }));
+    const created: IssueSnapshot[] = [];
+    for (const finding of input.findings) {
+      const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
+      const existingIssue = byMarker.get(marker);
+      if (existingIssue) {
+        created.push(existingIssue);
+        continue;
+      }
+      const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
+      const body = [
+        "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
+        `**Parent issue:** #${input.parentIssue}`,
+        `**Parent PR:** #${input.parentPullRequest}`,
+        `**Parent delivery branch:** \`${boundedGitHubCode(input.headBranch)}\``,
+        `**Original target branch:** \`${boundedGitHubCode(input.baseBranch)}\``,
+        `**Parent head SHA:** \`${boundedGitHubCode(input.headSha)}\``,
+        `**Parent run:** \`${boundedGitHubCode(input.parentRunId)}\``,
+        `**Checkpoint:** \`${boundedGitHubCode(input.checkpointKey)}\``,
+        `**Remediation depth:** ${input.remediationDepth}`,
+        `**Finding ID:** \`${boundedGitHubCode(finding.id)}\``,
+        "", "## Evidence", "", boundedGitHubText(finding.evidence, 6_000),
+        "", "## Location", "", `- \`${boundedGitHubCode(finding.location)}\``,
+        "", "## Acceptance Criteria", "", `- [ ] ${boundedGitHubText(finding.acceptanceCriterion, 2_000)}`,
+        "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
+        "", marker,
+      ].join("\n");
+      const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
+      const number = Number(url.split("/").at(-1));
+      if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
+      const issue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
+      byMarker.set(marker, issue);
+      created.push(issue);
+    }
+    return created;
+  }
+
   async createPullRequest(input: {
     repo: string; issue: number; headBranch: string; baseBranch: string; title: string; body: string;
   }): Promise<PullRequestSnapshot> {
@@ -366,14 +465,31 @@ export class GitHubClient implements ForgeHost {
     return value.object.sha;
   }
 
+  async listBranches(repo: string, prefix: string): Promise<BranchSnapshot[]> {
+    if (!prefix || !/^[A-Za-z0-9._/-]+$/u.test(prefix) || prefix.includes("..") || prefix.startsWith("/")) {
+      throw new Error(`Invalid Git branch prefix: '${prefix}'`);
+    }
+    const encodedPrefix = prefix.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+    const result = await this.gh(["api", `repos/${repo}/git/matching-refs/heads/${encodedPrefix}`]);
+    const values = JSON.parse(result) as Array<{ ref?: string; object?: { sha?: string } }>;
+    const refPrefix = "refs/heads/";
+    return values.flatMap((value) => {
+      if (!value.ref?.startsWith(refPrefix) || !value.object?.sha) return [];
+      return [{ name: value.ref.slice(refPrefix.length), headSha: value.object.sha }];
+    });
+  }
+
   async getPullRequestDiff(repo: string, number: number): Promise<string> {
     return this.gh(["pr", "diff", String(number), "--repo", repo]);
   }
 
-  async mergePullRequest(repo: string, number: number, expectedHeadSha: string): Promise<void> {
+  async mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void> {
     const current = await this.getPullRequest(repo, number);
     if (current.headSha !== expectedHeadSha) {
       throw new Error(`Pull request head changed: reviewed ${expectedHeadSha}, current ${current.headSha}`);
+    }
+    if (current.baseBranch !== expectedBaseBranch) {
+      throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${current.baseBranch}`);
     }
     await this.gh([
       "pr", "merge", String(number), "--repo", repo, "--merge", "--delete-branch",
@@ -389,8 +505,15 @@ export class GitHubClient implements ForgeHost {
   async materializeBatchIssue(input: BatchIssueInput): Promise<IssueSnapshot> {
     const marker = /<!-- FORGEDOCK:BATCH ([0-9-]+) -->/.exec(input.body)?.[0];
     if (!marker) throw new Error("Batch issue body is missing its deterministic FORGEDOCK:BATCH marker");
+    const incomingContract = parseBatchContract(input.body);
     const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.state === "OPEN" && issue.body.includes(marker));
-    if (existing) return existing;
+    if (existing) {
+      const existingContract = parseBatchContract(existing.body);
+      if (JSON.stringify(existingContract) !== JSON.stringify(incomingContract)) {
+        throw new Error(`Existing batch marker ${marker} has a different member contract`);
+      }
+      return existing;
+    }
 
     await this.gh([
       "label", "create", "batch", "--repo", input.repo, "--color", "C2E0C6",
@@ -446,6 +569,36 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
+  private async resolveOriginRepository(): Promise<string | undefined> {
+    try {
+      return repositoryFromRemote(await this.git(["config", "--get", "remote.origin.url"]));
+    } catch {
+      return undefined;
+    }
+  }
+
+  private git(args: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("git", args, {
+        cwd: this.cwd,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) resolve(stdout.trim());
+        else reject(new Error(`git ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`));
+      });
+    });
+  }
+
   private gh(args: string[], input?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn("gh", args, {
@@ -469,6 +622,23 @@ export class GitHubClient implements ForgeHost {
       else child.stdin.end();
     });
   }
+}
+
+export function reviewFindingReconciliationCandidates(
+  issues: readonly IssueSnapshot[],
+  input: { repo: string; pullRequest: PullRequestSnapshot; runId: string; activeFindings: readonly ReviewFindingInput[] },
+): IssueSnapshot[] {
+  const activeMarkers = new Set(input.activeFindings.flatMap((finding) => [
+    reviewFindingMarker(input.repo, input.pullRequest.number, finding),
+    legacyReviewFindingMarker(input.repo, input.pullRequest.number, finding),
+  ]));
+  const runMarker = `**Run:** \`${input.runId}\``;
+  const sourceMarker = `**Source:** PR #${input.pullRequest.number} `;
+  return issues.filter((issue) => issue.state === "OPEN"
+    && issue.body.includes(runMarker)
+    && issue.body.includes(sourceMarker)
+    && /<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->/.test(issue.body)
+    && ![...activeMarkers].some((marker) => issue.body.includes(marker)));
 }
 
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
@@ -516,6 +686,12 @@ function decompositionMarker(repo: string, parentIssue: number, title: string): 
   return createHash("sha256").update(`${repo.toLowerCase()}#${parentIssue}\n${title.trim().toLowerCase()}`).digest("hex");
 }
 
+function remediationChildMarker(repo: string, parentRunId: string, parentIssue: number, parentPullRequest: number, headSha: string, findingId: string): string {
+  return createHash("sha256").update([
+    repo.toLowerCase(), parentRunId, String(parentIssue), String(parentPullRequest), headSha.toLowerCase(), findingId,
+  ].join("\n")).digest("hex");
+}
+
 function orderDecompositionChildren(children: DecompositionChild[]): DecompositionChild[] {
   const byTitle = new Map<string, DecompositionChild>();
   for (const child of children) {
@@ -541,9 +717,10 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
-    const targets: Subject[] = artifact.subject.pr && artifact.subject.issue
-      ? [{ repo: artifact.subject.repo, pr: artifact.subject.pr }, { repo: artifact.subject.repo, issue: artifact.subject.issue }]
-      : [artifact.subject];
+    const canonical = canonicalSubject(artifact.subject);
+    const targets: Subject[] = canonical.pr && canonical.issue
+      ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
+      : [canonical];
     for (const target of targets) {
       const comments = await this.client.listIssueComments(target);
       const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
@@ -552,11 +729,24 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
-    const targets: Subject[] = subject.pr && subject.issue
-      ? [{ repo: subject.repo, pr: subject.pr }, { repo: subject.repo, issue: subject.issue }]
-      : [subject];
+    const canonical = canonicalSubject(subject);
+    const targets: Subject[] = canonical.pr && canonical.issue
+      ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
+      : [canonical];
     const found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
     const unique = new Map(found.map((artifact) => [artifact.id, artifact]));
-    return [...unique.values()].filter((artifact) => !kind || artifact.kind === kind);
+    return [...unique.values()]
+      .filter((artifact) => !kind || artifact.kind === kind)
+      .filter((artifact) => subjectMatches(artifact.subject, subject));
   }
+}
+
+function canonicalSubject(subject: Subject): Subject {
+  return { ...subject, repo: subject.repo.trim().toLowerCase() };
+}
+
+function subjectMatches(left: Subject, right: Subject): boolean {
+  if (left.repo.trim().toLowerCase() !== right.repo.trim().toLowerCase()) return false;
+  return (right.issue !== undefined && left.issue === right.issue)
+    || (right.pr !== undefined && left.pr === right.pr);
 }

@@ -6,6 +6,7 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "./investigate.js";
+import { assertRunTargetsBranch } from "./lane.js";
 
 export async function publishRemediationRevision(
   input: { run: RunState; pullRequest: PullRequestSnapshot; buildResult: DurableArtifact<"BuildResult">; workspace: GitWorkspace },
@@ -14,12 +15,14 @@ export async function publishRemediationRevision(
   if (input.run.state !== "publishing") throw new Error(`Revision publication requires publishing state, found ${input.run.state}`);
   let run = input.run;
   try {
+    assertRunTargetsBranch(run, input.pullRequest.baseBranch);
     const workspaceHead = await dependencies.git.head(input.workspace);
     if (workspaceHead !== input.buildResult.payload.headSha) {
       throw new Error(`Remediation workspace head ${workspaceHead} does not match verified build ${input.buildResult.payload.headSha}`);
     }
     await dependencies.git.push(input.workspace);
     const observed = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+    assertRunTargetsBranch(run, observed.baseBranch);
     if (observed.headBranch !== input.workspace.branch) {
       throw new Error(`Published PR branch ${observed.headBranch} does not match remediation branch ${input.workspace.branch}`);
     }

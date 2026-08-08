@@ -63,6 +63,17 @@ describe("lean orchestration scheduler", () => {
     await schedule;
   });
 
+  it("keeps dependents queued while a recursive parent is suspended and emits lifecycle events", async () => {
+    const events: string[] = [];
+    const result = await runSchedule([
+      { id: "parent", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "child", issue: 2, priority: 1, dependencies: ["parent"], claims: [] },
+    ], 1, async () => ({ status: "suspended", error: "children running" }), { onEvent: (event) => events.push(event.type) });
+    assert.equal(result.status.get("parent"), "suspended");
+    assert.equal(result.status.get("child"), "queued");
+    assert.ok(events.includes("suspended"));
+  });
+
   it("blocks dependents when a prerequisite fails", async () => {
     const result = await runSchedule([
       { id: "a", issue: 1, priority: 1, dependencies: [], claims: [] },

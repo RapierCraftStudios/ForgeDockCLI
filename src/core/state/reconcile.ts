@@ -7,6 +7,7 @@ export interface ReconciledSemanticState {
   state: RunStateName;
   warnings: string[];
   artifactIds: string[];
+  remediationCheckpoint?: DurableArtifact<"RemediationBlocked">;
 }
 
 export interface ReconciledSubjectState extends ReconciledSemanticState {
@@ -33,16 +34,23 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const warnings: string[] = [];
   const outcome = latest.get("Outcome") as DurableArtifact<"Outcome"> | undefined;
   const verdict = latest.get("ReviewVerdict") as DurableArtifact<"ReviewVerdict"> | undefined;
+  const remediationCheckpoint = latest.get("RemediationBlocked") as DurableArtifact<"RemediationBlocked"> | undefined;
   const build = latest.get("BuildResult") as DurableArtifact<"BuildResult"> | undefined;
   const packet = latest.get("BuildPacket") as DurableArtifact<"BuildPacket"> | undefined;
   const investigation = latest.get("Investigation") as DurableArtifact<"Investigation"> | undefined;
   const intent = latest.get("Intent");
 
   let state: RunStateName = "queued";
-  const blockedOutcomeSuperseded = outcome?.payload.status === "blocked"
+  const checkpointIsLatest = remediationCheckpoint !== undefined
+    && (!outcome || Date.parse(remediationCheckpoint.createdAt) >= Date.parse(outcome.createdAt));
+  if (checkpointIsLatest) {
+    state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
+    if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");
+  }
+  const interruptedOutcomeSuperseded = (outcome?.payload.status === "blocked" || outcome?.payload.status === "failed")
     && build !== undefined
     && Date.parse(build.createdAt) > Date.parse(outcome.createdAt);
-  if (outcome && !blockedOutcomeSuperseded) {
+  if (!checkpointIsLatest && outcome && !interruptedOutcomeSuperseded) {
     state = outcome.payload.status === "merged" ? "completed"
       : outcome.payload.status === "invalid" ? "invalid"
         : outcome.payload.status === "decomposed" ? "decomposed"
@@ -53,27 +61,32 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
       warnings.push("Merged Outcome has no approving Review Verdict");
       state = "blocked";
     }
-  } else if (verdict) {
+  } else if (!checkpointIsLatest && verdict) {
     state = verdict.payload.disposition === "approve" ? "merging"
       : verdict.payload.disposition === "request_changes" ? "remediating" : "blocked";
     if (!build || build.payload.headSha !== verdict.payload.headSha) {
       warnings.push("Review Verdict does not match a durable Build Result SHA");
       state = "blocked";
     }
-  } else if (build) {
+  } else if (!checkpointIsLatest && build) {
     state = "publishing";
     if (!packet) warnings.push("Build Result exists without a Build Packet");
-  } else if (packet) {
+  } else if (!checkpointIsLatest && packet) {
     state = "building";
     if (!investigation || investigation.payload.outcome !== "confirmed") {
       warnings.push("Build Packet exists without a confirmed Investigation");
       state = "blocked";
     }
-  } else if (investigation) {
+  } else if (!checkpointIsLatest && investigation) {
     state = investigation.payload.outcome === "confirmed" ? "preparing"
       : investigation.payload.outcome === "invalid" ? "invalid" : "decomposed";
-  } else if (intent) {
+  } else if (!checkpointIsLatest && intent) {
     state = "investigating";
   }
-  return { state, warnings, artifactIds: ordered.map((artifact) => artifact.id) };
+  return {
+    state,
+    warnings,
+    artifactIds: ordered.map((artifact) => artifact.id),
+    ...(remediationCheckpoint ? { remediationCheckpoint } : {}),
+  };
 }

@@ -3,7 +3,7 @@
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
+import { scopeManifestFor, type AgentEventSink, type AgentRuntime } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export async function prepareBuildPacket(
@@ -34,11 +34,18 @@ export async function prepareBuildPacket(
         "Every acceptance criterion must be observable and testable.",
         "Include implementation-specific history and consistency constraints only when relevant.",
         "Expected paths are claims for conflict detection, not permission to broaden scope.",
-        "Verification commands are plans; the controller decides which commands may execute.",
+        "Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
       context: [input.intent, input.investigation],
-      workspace: { cwd: input.cwd, mode: "read-only" },
+      workspace: {
+        cwd: input.cwd,
+        mode: "read-only",
+        scope: scopeManifestFor("issue-hints", {
+          affectedFiles: input.investigation.payload.affectedSurfaces,
+          metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+        }),
+      },
       tools: ["read", "grep", "find", "ls"],
       outputSchema: BuildPacketPayloadSchema,
       modelPolicy: {

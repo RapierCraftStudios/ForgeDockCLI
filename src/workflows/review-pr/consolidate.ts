@@ -94,6 +94,15 @@ function consolidateCluster(cluster: FindingCluster, blockingSeverities: Readonl
   const evidence = combineSourceText(cluster.sources, (source) => source.finding.evidence, 12_000);
   const remediation = combineSourceText(cluster.sources, (source) => source.finding.remediation, 8_000);
   const intentRelevance = combineSourceText(cluster.sources, (source) => source.finding.intentRelevance, 8_000);
+  const scopeRationale = combineSourceText(cluster.sources, (source) => source.finding.scopeRationale, 8_000);
+  const matchedAcceptanceCriteria = unique(cluster.sources.flatMap((source) => source.finding.matchedAcceptanceCriteria));
+  const matchedPriorFindingIds = unique(cluster.sources.flatMap((source) => source.finding.matchedPriorFindingIds));
+  const scopeDisposition = cluster.sources.some((source) => source.finding.scopeDisposition === "in_scope")
+    ? "in_scope" as const
+    : cluster.sources.some((source) => source.finding.scopeDisposition === "follow_up")
+      ? "follow_up" as const
+      : "rejected" as const;
+  const introducedByRemediation = cluster.sources.some((source) => source.finding.introducedByRemediation);
   const stableIdentity = [
     findingPaths(representative.finding).sort().join(","),
     [...conceptTags(representative.finding)].sort().join(","),
@@ -109,6 +118,11 @@ function consolidateCluster(cluster: FindingCluster, blockingSeverities: Readonl
     evidence,
     intentRelevance,
     remediation,
+    scopeDisposition,
+    scopeRationale,
+    matchedAcceptanceCriteria,
+    matchedPriorFindingIds,
+    introducedByRemediation,
     sourceFindingIds,
     ...(sourceSessionRefs.length ? { sourceSessionRefs } : {}),
     reviewerRoles,

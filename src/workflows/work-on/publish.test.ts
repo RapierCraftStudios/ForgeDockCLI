@@ -23,6 +23,7 @@ class PublishHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   input?: { body: string };
   existing?: PullRequestSnapshot;
+  branchHead = sha;
   createCount = 0;
   async findOpenPullRequest(): Promise<PullRequestSnapshot | undefined> { return this.existing; }
   async createPullRequest(input: { repo: string; issue: number; headBranch: string; baseBranch: string; title: string; body: string }): Promise<PullRequestSnapshot> {
@@ -30,7 +31,11 @@ class PublishHost implements ForgeHost {
     this.input = input;
     return { repo: input.repo, number: 3, title: input.title, body: input.body, url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: input.headBranch, baseBranch: input.baseBranch };
   }
-  async getPullRequest(): Promise<PullRequestSnapshot> { throw new Error("unused"); }
+  async getPullRequest(): Promise<PullRequestSnapshot> {
+    if (!this.existing) throw new Error("unused");
+    return this.existing;
+  }
+  async getBranchHead(): Promise<string> { return this.branchHead; }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
@@ -38,7 +43,12 @@ class PublishHost implements ForgeHost {
   async closeIssue(): Promise<void> {}
 }
 async function publishingRun(runs: InMemoryRunRepository): Promise<RunState> {
-  let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 2 }, runId: "run_publish" });
+  let run = createRun({
+    workflow: "work-on",
+    subject: { repo: "a/b", issue: 2 },
+    runId: "run_publish",
+    target: { lane: "fast", targetBranch: "main" },
+  });
   await runs.create(run);
   for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED"] as TransitionEvent[]) {
     const next = transition(run, event, { headSha: sha }); await runs.commit(run.version, next.state, next.record); run = next.state;
@@ -54,7 +64,7 @@ describe("PR publication", () => {
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
     const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [{ criterion: "Pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [] } });
     const git = new PublishGit(); const host = new PublishHost();
-    const result = await publishPullRequest({ run, intent, packet, buildResult, workspace, baseBranch: "main" }, { git, host, runs });
+    const result = await publishPullRequest({ run, intent, packet, buildResult, workspace }, { git, host, runs });
     assert.equal(result.run.state, "reviewing");
     assert.equal(git.pushed, true);
     assert.match(host.input?.body ?? "", /Build Packet/);
@@ -70,7 +80,7 @@ describe("PR publication", () => {
     const git = new PublishGit();
     git.observedHead = "a".repeat(40);
     await assert.rejects(
-      publishPullRequest({ run, intent, packet, buildResult, workspace, baseBranch: "main" }, { git, host: new PublishHost(), runs }),
+      publishPullRequest({ run, intent, packet, buildResult, workspace }, { git, host: new PublishHost(), runs }),
       /does not match verified build/,
     );
     assert.equal(git.pushed, false);
@@ -83,10 +93,27 @@ describe("PR publication", () => {
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
     const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
     const host = new PublishHost();
-    host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "main" };
-    const result = await publishPullRequest({ run, intent, packet, buildResult, workspace, baseBranch: "main" }, { git: new PublishGit(), host, runs });
+    host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: "c".repeat(40), headBranch: workspace.branch, baseBranch: "main" };
+    const result = await publishPullRequest({ run, intent, packet, buildResult, workspace }, { git: new PublishGit(), host, runs });
     assert.equal(result.pullRequest.url, host.existing.url);
+    assert.equal(result.pullRequest.headSha, sha);
     assert.equal(host.createCount, 0);
+  });
+
+  it("rejects an existing delivery PR that targets a different lane before pushing", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await publishingRun(runs);
+    const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const host = new PublishHost();
+    host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "milestone/other" };
+    const git = new PublishGit();
+    await assert.rejects(
+      publishPullRequest({ run, intent, packet, buildResult, workspace }, { git, host, runs }),
+      /targets main, not milestone\/other/,
+    );
+    assert.equal(git.pushed, false);
   });
 
   it("keeps large durable artifacts out of GitHub's bounded PR body", () => {

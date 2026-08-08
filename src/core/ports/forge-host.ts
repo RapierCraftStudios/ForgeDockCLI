@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+export interface IssueMilestone {
+  number: number;
+  title: string;
+}
+
 export interface IssueSnapshot {
   repo: string;
   number: number;
@@ -7,6 +12,13 @@ export interface IssueSnapshot {
   body: string;
   url: string;
   state: "OPEN" | "CLOSED";
+  labels?: readonly string[];
+  milestone?: IssueMilestone;
+}
+
+export interface BranchSnapshot {
+  name: string;
+  headSha: string;
 }
 
 export interface DecompositionChild {
@@ -28,6 +40,11 @@ export interface ReviewFindingInput {
   sourceFindingIds?: readonly string[];
   sourceSessionRefs?: readonly string[];
   reviewerRoles?: readonly string[];
+  scopeDisposition?: "in_scope" | "follow_up" | "rejected";
+  scopeRationale?: string;
+  matchedAcceptanceCriteria?: readonly string[];
+  matchedPriorFindingIds?: readonly string[];
+  introducedByRemediation?: boolean;
 }
 
 export interface PullRequestSnapshot {
@@ -43,6 +60,39 @@ export interface PullRequestSnapshot {
 }
 
 export interface ForgeHost {
+  getIssue?(number: number, repo?: string): Promise<IssueSnapshot>;
+  materializeBatchIssue?(input: {
+    repo: string;
+    title: string;
+    body: string;
+    priorityLabel: "priority:P0" | "P0" | "priority:P1" | "P1" | "priority:P2" | "P2" | "priority:P3" | "P3";
+    milestone?: string;
+  }): Promise<IssueSnapshot>;
+  publishIssueComment?(input: {
+    repo: string;
+    issue: number;
+    marker: string;
+    body: string;
+  }): Promise<void>;
+  materializeRemediationChildren?(input: {
+    repo: string;
+    parentRunId: string;
+    parentIssue: number;
+    parentPullRequest: number;
+    headSha: string;
+    headBranch: string;
+    baseBranch: string;
+    checkpointKey: string;
+    remediationDepth: number;
+    findings: readonly {
+      id: string;
+      title: string;
+      evidence: string;
+      location: string;
+      remediation: string;
+      acceptanceCriterion: string;
+    }[];
+  }): Promise<IssueSnapshot[]>;
   materializeDecomposition(input: {
     repo: string;
     parentIssue: number;
@@ -60,6 +110,8 @@ export interface ForgeHost {
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
   /** Read the Git ref directly when a PR projection may lag a successful push. */
   getBranchHead?(repo: string, branch: string): Promise<string>;
+  /** Enumerate a bounded ref namespace for deterministic lane classification. */
+  listBranches?(repo: string, prefix: string): Promise<BranchSnapshot[]>;
   getPullRequestDiff(repo: string, number: number): Promise<string>;
   publishPullRequestComment(input: {
     repo: string;
@@ -76,6 +128,13 @@ export interface ForgeHost {
     reviewerRoles: readonly string[];
     finding: ReviewFindingInput;
   }): Promise<IssueSnapshot>;
-  mergePullRequest(repo: string, number: number, expectedHeadSha: string): Promise<void>;
+  /** Close review-finding projections superseded by the latest authoritative verdict. */
+  reconcileReviewFindings?(input: {
+    repo: string;
+    pullRequest: PullRequestSnapshot;
+    runId: string;
+    activeFindings: readonly ReviewFindingInput[];
+  }): Promise<readonly number[]>;
+  mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void>;
   closeIssue(repo: string, number: number, reason: string): Promise<void>;
 }

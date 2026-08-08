@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
+import { scopeManifestFor } from "./agent-runtime.js";
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
   const server = createServer(handler);
@@ -57,7 +58,7 @@ test("the controller rejects a malformed nested structured result even after bri
   try {
     await assert.rejects(runtime.run({
       id: "run:review:sha:correctness", role: "reviewer", objective: "Review", instructions: "Read only", context: [],
-      workspace: { cwd: process.cwd(), mode: "read-only" }, tools: ["read"],
+      workspace: { cwd: process.cwd(), mode: "read-only", scope: scopeManifestFor("issue-hints", { metadataRoots: ["."] }) }, tools: ["read"],
       outputSchema: Type.Object({ summary: Type.String() }), modelPolicy: {},
     }), /invalid structured result/i);
   } finally {

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
-import forgedockExtension, { executeController, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
+import forgedockExtension, { executeController, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import { buildNativeCommandPrompt, resolveIssueWorkerRecovery, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
 
 interface FakePiState {
@@ -162,20 +162,28 @@ test("runtime diagnostic verifies the real bundled subagent RPC bridge", async (
   assert.match(notices[0] ?? "", /C:\/checkout\/forgedock/);
 });
 
-test("idle TUI does not reserve space for a persistent ForgeDock help widget", async () => {
+test("idle TUI shows actionable workflow entrypoints without reserving a help widget", async () => {
   const state = fakePi();
   const widgets: string[] = [];
-  await state.handlers.get("session_start")?.[0]?.({}, {
+  const statuses: string[] = [];
+  const ctx = {
     mode: "tui",
     cwd: process.cwd(),
     hasUI: true,
     ui: {
       setTitle: () => undefined,
-      setStatus: () => undefined,
+      setStatus: (_key: string, text: string) => statuses.push(text),
       setWidget: (key: string) => widgets.push(key),
     },
-  });
+  };
+  await state.handlers.get("session_start")?.[0]?.({}, ctx);
   assert.deepEqual(widgets, []);
+  assert.equal(statuses.at(-1), FORGEDOCK_READY_STATUS);
+  assert.match(statuses.at(-1) ?? "", /\/work-on · \/review-pr · \/orchestrate/);
+  assert.doesNotMatch(statuses.at(-1) ?? "", /semantic-tools|authoritative/i);
+
+  await state.handlers.get("agent_end")?.[0]?.({}, ctx);
+  assert.equal(statuses.at(-1), FORGEDOCK_READY_STATUS);
 });
 
 test("busy sessions queue native workflow intent as a follow-up", async () => {
@@ -324,7 +332,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.equal(spawnRequest.params.agent, "forgedock-issue-worker");
   assert.match(spawnRequest.params.model, /^openai-codex\/gpt-worker(?::[a-z]+)?$/);
   assert.equal(spawnRequest.params.chain, undefined);
-  assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"dependencies":\[\]/);
+  assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"repo":"[^"]+","dependencies":\[\]/);
   assert.match(spawnRequest.params.task, /"autoMerge":true/);
   assert.match(spawnRequest.params.task, /"resume":true/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);

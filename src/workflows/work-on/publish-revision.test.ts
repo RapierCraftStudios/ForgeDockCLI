@@ -42,7 +42,12 @@ class LaggingPrHost implements ForgeHost {
 describe("remediation revision publication", () => {
   it("uses the directly observed branch ref when GitHub's PR projection briefly lags the push", async () => {
     const runs = new InMemoryRunRepository();
-    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 6 }, runId: "run_revision" });
+    let run = createRun({
+      workflow: "work-on",
+      subject: { repo: "a/b", issue: 6 },
+      runId: "run_revision",
+      target: { lane: "fast", targetBranch: "main" },
+    });
     await runs.create(run);
     for (const event of [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",

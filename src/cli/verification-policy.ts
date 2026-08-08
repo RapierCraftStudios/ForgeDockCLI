@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { VerificationCommand } from "../core/ports/verification.js";
@@ -12,11 +13,61 @@ export function discoverVerificationCommands(
   const manifest = readPackageManifest(cwd, baseRef);
   const scripts = manifest.scripts ?? {};
   const npm = npmInvocation();
-  const commands: Array<Omit<VerificationCommand, "cwd">> = [];
-  if (scripts.build) commands.push({ id: "build", command: npm.command, args: [...npm.prefix, "run", "build"], timeoutMs: 10 * 60_000, required: true });
-  if (scripts.test) commands.push({ id: "test", command: npm.command, args: [...npm.prefix, "test"], timeoutMs: 20 * 60_000, required: true });
-  if (!commands.length) throw new Error("No required verification commands detected; define package.json scripts.build or scripts.test");
-  return commands;
+  const commands: Array<Omit<VerificationCommand, "cwd">> = [
+    { id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 2 * 60_000, required: true },
+  ];
+  const scriptOrder = ["lint", "typecheck", "check", "build", "docs:build", "test"] as const;
+  for (const script of scriptOrder) {
+    if (!scripts[script]) continue;
+    commands.push({
+      id: script,
+      command: npm.command,
+      args: script === "test" ? [...npm.prefix, "test"] : [...npm.prefix, "run", script],
+      timeoutMs: script === "test" ? 20 * 60_000 : 10 * 60_000,
+      required: true,
+    });
+  }
+  if (commands.length === 1) {
+    throw new Error("No required package verification commands detected; define a lint, typecheck, check, build, docs:build, or test script");
+  }
+  const planId = createVerificationPlanId(baseRef, scripts, commands);
+  const coverage = nestedScriptCoverage(scripts, commands.map((command) => command.id));
+  return commands.map((command) => {
+    const coveredBy = coverage.get(command.id);
+    return coveredBy?.length
+      ? { ...command, planId, coveredBy }
+      : { ...command, planId };
+  });
+}
+
+function createVerificationPlanId(baseRef: string | undefined, scripts: Record<string, string>, commands: readonly Pick<VerificationCommand, "id" | "command" | "args" | "timeoutMs" | "required">[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      baseRef: baseRef ?? "working-tree",
+      scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
+      commands,
+    }))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function nestedScriptCoverage(scripts: Record<string, string>, selectedIds: readonly string[]): Map<string, string[]> {
+  const selected = new Set(selectedIds);
+  const coverage = new Map<string, string[]>();
+  for (const parent of selected) {
+    for (const child of referencedScripts(scripts[parent] ?? "")) {
+      if (child === parent || !selected.has(child)) continue;
+      const parents = coverage.get(child) ?? [];
+      if (!parents.includes(parent)) parents.push(parent);
+      coverage.set(child, parents.sort());
+    }
+  }
+  return coverage;
+}
+
+function referencedScripts(command: string): string[] {
+  const matches = command.matchAll(/\b(?:npm(?:\.cmd)?\s+(?:run\s+)?|pnpm\s+(?:run\s+)?|yarn\s+(?:run\s+)?|bun\s+(?:run\s+)?)([A-Za-z0-9:_-]+)/gi);
+  return [...matches].map((match) => match[1]!.toLowerCase());
 }
 
 function readPackageManifest(cwd: string, baseRef?: string): { scripts?: Record<string, string> } {

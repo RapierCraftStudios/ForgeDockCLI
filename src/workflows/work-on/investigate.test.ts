@@ -64,6 +64,7 @@ describe("work-on investigation", () => {
     assert.equal(result.investigation.payload.outcome, "confirmed");
     assert.equal(deps.artifacts.artifacts.map((artifact) => artifact.kind).join(","), "Intent,Investigation");
     assert.deepEqual(runtime.tasks[0]?.tools, ["read", "grep", "find", "ls"]);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /missing implementation.*confirmed, not invalid/);
     assert.equal(runtime.tasks[0]?.workspace.mode, "read-only");
     assert.deepEqual((await deps.runs.history(result.run.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED",

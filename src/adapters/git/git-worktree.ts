@@ -21,10 +21,10 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   async create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace> {
     const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
-    if (input.baseRef.startsWith("origin/")) {
-      await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
-    }
-    const baseSha = (await this.git(["rev-parse", input.baseRef], this.#repo)).trim();
+    const fetchedBase = input.baseRef.startsWith("origin/")
+      ? await this.fetchOriginBase(input.baseRef)
+      : input.baseRef;
+    const baseSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
     await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
     await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
     await this.installDependencies(path);
@@ -34,9 +34,9 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   async recover(input: { runId: string; issue: number; baseRef: string; baseSha?: string }): Promise<GitWorkspace> {
     const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
-    if (input.baseRef.startsWith("origin/")) {
-      await this.git(["fetch", "origin", input.baseRef.slice("origin/".length)], this.#repo);
-    }
+    const fetchedBase = input.baseRef.startsWith("origin/")
+      ? await this.fetchOriginBase(input.baseRef)
+      : input.baseRef;
     if (existsSync(path)) {
       const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
       const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
@@ -48,13 +48,18 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       const branchExists = await this.branchExists(branch);
       await this.git(branchExists
         ? ["worktree", "add", path, branch]
-        : ["worktree", "add", "-b", branch, path, input.baseRef], this.#repo);
+        : ["worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
     }
     await this.installDependencies(path);
     const configuredBaseSha = await this.configuredBaseSha(branch);
     const baseSha = input.baseSha
       ?? configuredBaseSha
       ?? (await this.git(["merge-base", input.baseRef, "HEAD"], path)).trim();
+    try {
+      await this.git(["merge-base", "--is-ancestor", baseSha, input.baseRef], path);
+    } catch (error) {
+      throw new Error(`Frozen base ${baseSha} does not belong to target ref ${input.baseRef}`, { cause: error });
+    }
     try {
       await this.git(["merge-base", "--is-ancestor", baseSha, "HEAD"], path);
     } catch (error) {
@@ -133,6 +138,13 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const path = resolve(this.#root, `issue-${input.issue}-${suffix}`);
     assertInside(this.#root, path);
     return { branch, path };
+  }
+
+  private async fetchOriginBase(baseRef: string): Promise<string> {
+    const branch = baseRef.slice("origin/".length);
+    const remoteRef = `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
+    await this.git(["fetch", "origin", remoteRef], this.#repo);
+    return `origin/${branch}`;
   }
 
   private async branchExists(branch: string): Promise<boolean> {

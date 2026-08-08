@@ -9,13 +9,32 @@ export interface ScheduledWorkItem {
   priority: number;
   dependencies: readonly string[];
   claims: readonly string[];
+  memberIssues?: readonly number[];
+  title?: string;
+  summary?: string;
 }
 
-export type ScheduledStatus = "queued" | "running" | "completed" | "failed" | "blocked";
+export type ScheduledStatus = "queued" | "running" | "completed" | "failed" | "blocked" | "suspended";
+export type ScheduleWorkerResult = void | {
+  status: "completed" | "blocked" | "suspended" | "failed";
+  error?: Error | string;
+};
 export interface ScheduleResult {
   status: Map<string, ScheduledStatus>;
   errors: Map<string, Error>;
   startOrder: string[];
+}
+export interface ScheduleEvent {
+  type: "queued" | "started" | "completed" | "failed" | "blocked" | "suspended" | "resumed";
+  itemId?: string;
+  status: ReadonlyMap<string, ScheduledStatus>;
+  errors: ReadonlyMap<string, Error>;
+}
+export type ScheduleEventSink = (event: ScheduleEvent) => void;
+export interface RunScheduleOptions {
+  onEvent?: ScheduleEventSink;
+  /** IDs being retried from a durable orchestration attempt. */
+  resumedItemIds?: readonly string[];
 }
 
 export interface ClaimSerializationEdge {
@@ -77,7 +96,8 @@ export function buildSchedulePreview(items: readonly ScheduledWorkItem[]): Sched
 export async function runSchedule(
   items: readonly ScheduledWorkItem[],
   maxParallel: number,
-  worker: (item: ScheduledWorkItem) => Promise<void>,
+  worker: (item: ScheduledWorkItem) => Promise<ScheduleWorkerResult>,
+  options: RunScheduleOptions = {},
 ): Promise<ScheduleResult> {
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
   validateGraph(items);
@@ -86,12 +106,21 @@ export async function runSchedule(
   const errors = new Map<string, Error>();
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
+  const emit = (type: ScheduleEvent["type"], itemId?: string) => options.onEvent?.({
+    type, ...(itemId ? { itemId } : {}), status: new Map(status), errors: new Map(errors),
+  });
+  for (const item of items) emit("queued", item.id);
+  for (const itemId of options.resumedItemIds ?? []) {
+    if (!byId.has(itemId)) throw new Error(`Cannot resume unknown scheduled item ${itemId}`);
+    emit("resumed", itemId);
+  }
 
-  while ([...status.values()].some((value) => value === "queued" || value === "running")) {
+  while (running.size || items.some((item) => status.get(item.id) === "queued")) {
     for (const item of items) {
       if (status.get(item.id) !== "queued") continue;
       if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked")) {
         status.set(item.id, "blocked");
+        emit("blocked", item.id);
       }
     }
 
@@ -106,11 +135,31 @@ export async function runSchedule(
       if (activeItems.some((active) => claimsConflict(item.claims, active.claims))) continue;
       status.set(item.id, "running");
       startOrder.push(item.id);
+      emit("started", item.id);
       const promise = worker(item)
-        .then(() => { status.set(item.id, "completed"); })
+        .then((result) => {
+          const outcome = result ?? { status: "completed" as const };
+          if (outcome.status === "failed") {
+            status.set(item.id, "failed");
+            errors.set(item.id, asError(outcome.error ?? "scheduled worker failed"));
+            emit("failed", item.id);
+          } else if (outcome.status === "blocked") {
+            status.set(item.id, "blocked");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            emit("blocked", item.id);
+          } else if (outcome.status === "suspended") {
+            status.set(item.id, "suspended");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            emit("suspended", item.id);
+          } else {
+            status.set(item.id, "completed");
+            emit("completed", item.id);
+          }
+        })
         .catch((error: unknown) => {
           status.set(item.id, "failed");
           errors.set(item.id, error instanceof Error ? error : new Error(String(error)));
+          emit("failed", item.id);
         })
         .finally(() => { running.delete(item.id); });
       running.set(item.id, promise);
@@ -120,12 +169,15 @@ export async function runSchedule(
       await Promise.race(running.values());
       continue;
     }
-    const stranded = items.filter((item) => status.get(item.id) === "queued");
-    if (stranded.length) {
-      for (const item of stranded) status.set(item.id, "blocked");
-    }
+    // A suspended prerequisite intentionally leaves its dependents queued so a
+    // supervisor can resume the same DAG after durable child work completes.
+    break;
   }
   return { status, errors, startOrder };
+}
+
+function asError(value: Error | string): Error {
+  return value instanceof Error ? value : new Error(value);
 }
 
 export function claimsConflict(left: readonly string[], right: readonly string[]): boolean {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
+import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
@@ -24,6 +25,30 @@ describe("SQLite operational repositories", () => {
       assert.equal((await store.list(subject))[0]?.id, artifact.id);
       assert.equal((await store.load(run.runId))?.state, "investigating");
       assert.deepEqual((await store.history(run.runId)).map((record) => record.event), ["START_INVESTIGATION"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("persists telemetry receipts idempotently for status projections", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const receipt: AgentRunReceipt = {
+        key: "run_telemetry:task:session",
+        runId: "run_telemetry",
+        taskId: "run_telemetry:investigation:1",
+        phase: "investigation",
+        role: "investigator",
+        sessionRef: "session",
+        sessionLineage: ["session"],
+        provider: "test",
+        model: "model",
+        timing: { queuedAt: "2026-01-01T00:00:00.000Z", startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:01.000Z", activeMs: 1_000, queueMs: 0, retryCount: 0 },
+        usage: { source: "unavailable" },
+      };
+      await store.recordTelemetry(receipt);
+      await store.recordTelemetry(receipt);
+      assert.deepEqual(store.listTelemetry(receipt.runId), [receipt]);
     } finally {
       store.close();
     }

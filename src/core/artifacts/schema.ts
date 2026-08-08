@@ -83,6 +83,8 @@ export const BuildPacketPayloadSchema = Type.Object({
 
 export const CheckResultSchema = Type.Object({
   command: NonEmptyString,
+  planId: Type.Optional(NonEmptyString),
+  coveredBy: Type.Optional(Type.Array(NonEmptyString)),
   status: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("skipped")]),
   exitCode: Type.Optional(Type.Integer()),
   durationMs: Type.Integer({ minimum: 0 }),
@@ -128,6 +130,14 @@ export const FindingSchema = Type.Object({
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  /** Reviewer-declared semantic relationship to the frozen Build Packet. */
+  scopeDisposition: Type.Optional(Type.Union([
+    Type.Literal("in_scope"), Type.Literal("follow_up"), Type.Literal("rejected"),
+  ])),
+  scopeRationale: Type.Optional(NonEmptyString),
+  matchedAcceptanceCriteria: Type.Optional(Type.Array(NonEmptyString)),
+  matchedPriorFindingIds: Type.Optional(Type.Array(NonEmptyString)),
+  introducedByRemediation: Type.Optional(Type.Boolean()),
 });
 
 const ReviewerRoleSchema = Type.Union([
@@ -168,6 +178,14 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   findings: Type.Array(FindingSchema),
   checks: Type.Array(CheckResultSchema),
   reviewPlan: Type.Optional(ReviewPlanSchema),
+  scopeAdjudication: Type.Optional(Type.Object({
+    sessionRef: NonEmptyString,
+    decisions: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      disposition: Type.Union([Type.Literal("accept"), Type.Literal("follow_up"), Type.Literal("reject")]),
+      rationale: NonEmptyString,
+    })),
+  })),
   supersedes: Type.Optional(NonEmptyString),
 });
 
@@ -195,6 +213,39 @@ export const OutcomePayloadSchema = Type.Object({
   })),
 });
 
+export const RemediationBlockedPayloadSchema = Type.Object({
+  checkpointKey: NonEmptyString,
+  checkpointSequence: Type.Integer({ minimum: 1 }),
+  status: Type.Union([
+    Type.Literal("awaiting-dispatch"), Type.Literal("children-running"),
+    Type.Literal("ready-to-resume"), Type.Literal("terminal"),
+  ]),
+  parentRunId: NonEmptyString,
+  parentIssue: Type.Integer({ minimum: 1 }),
+  pullRequest: Type.Integer({ minimum: 1 }),
+  headSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  packetArtifactId: NonEmptyString,
+  verdictArtifactId: NonEmptyString,
+  reason: Type.Union([Type.Literal("scope-violation"), Type.Literal("remediation-budget")]),
+  findings: Type.Array(Type.Object({
+    id: NonEmptyString,
+    severity: Type.Union([Type.Literal("critical"), Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
+    title: NonEmptyString,
+    evidence: NonEmptyString,
+    location: Type.Optional(NonEmptyString),
+    remediation: NonEmptyString,
+    acceptanceCriterion: Type.Optional(NonEmptyString),
+  })),
+  childIssues: Type.Array(Type.Integer({ minimum: 1 })),
+  childRunIds: Type.Array(NonEmptyString),
+  approvedPaths: Type.Array(NonEmptyString),
+  childOutcomeIds: Type.Array(NonEmptyString),
+  remediationDepth: Type.Integer({ minimum: 0 }),
+  maxRemediationDepth: Type.Integer({ minimum: 0 }),
+});
+
 export const ArtifactPayloadSchemas = {
   Intent: IntentPayloadSchema,
   Investigation: InvestigationPayloadSchema,
@@ -202,6 +253,7 @@ export const ArtifactPayloadSchemas = {
   BuildResult: BuildResultPayloadSchema,
   ReviewVerdict: ReviewVerdictPayloadSchema,
   Outcome: OutcomePayloadSchema,
+  RemediationBlocked: RemediationBlockedPayloadSchema,
 } as const satisfies Record<string, TSchema>;
 
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
@@ -213,6 +265,7 @@ export type BuildPacketPayload = Static<typeof BuildPacketPayloadSchema>;
 export type BuildResultPayload = Static<typeof BuildResultPayloadSchema>;
 export type ReviewVerdictPayload = Static<typeof ReviewVerdictPayloadSchema>;
 export type OutcomePayload = Static<typeof OutcomePayloadSchema>;
+export type RemediationBlockedPayload = Static<typeof RemediationBlockedPayloadSchema>;
 
 export interface ArtifactPayloadByKind {
   Intent: IntentPayload;
@@ -221,6 +274,7 @@ export interface ArtifactPayloadByKind {
   BuildResult: BuildResultPayload;
   ReviewVerdict: ReviewVerdictPayload;
   Outcome: OutcomePayload;
+  RemediationBlocked: RemediationBlockedPayload;
 }
 
 export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends ArtifactKind ? {

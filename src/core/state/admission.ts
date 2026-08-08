@@ -6,7 +6,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing" | "failed"; checkpoint: "build" | "verification" | "publication"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging"; checkpoint: "build" | "verification" | "remediation" | "publication" | "completion"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -48,39 +48,75 @@ export function decideSubjectAdmission(
   // A fresh rerun is an explicit human/controller authorization to abandon a
   // terminal checkpoint. It never overrides an in-flight nonterminal run.
   if (options.rerun && terminalStates.has(reconciled.state)) return { action: "start" };
-  if (reconciled.state === "building") {
-    const intent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
-    const investigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
-    const packet = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
-    if (intent && investigation && packet) {
+
+  const hasIntent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
+  const hasInvestigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
+  const hasPacket = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
+  const build = latestOfKind(latest.artifacts, "BuildResult");
+  const verdict = latestOfKind(latest.artifacts, "ReviewVerdict");
+  const outcome = latestOfKind(latest.artifacts, "Outcome");
+  const remediationCheckpoint = latestOfKind(latest.artifacts, "RemediationBlocked");
+  const deliveryContext = hasIntent && hasInvestigation && hasPacket;
+  if (remediationCheckpoint && (remediationCheckpoint.payload.status === "awaiting-dispatch" || remediationCheckpoint.payload.status === "children-running" || remediationCheckpoint.payload.status === "ready-to-resume")) {
+    return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "remediation", artifacts: latest.artifacts };
+  }
+  const buildTime = build ? Date.parse(build.createdAt) : 0;
+  const verdictTime = verdict ? Date.parse(verdict.createdAt) : 0;
+  const outcomeTime = outcome ? Date.parse(outcome.createdAt) : 0;
+
+  if (reconciled.state === "building" && deliveryContext) {
+    return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
+  }
+
+  // A verification failure is authoritative only while no newer verified build
+  // supersedes it. This avoids replaying stale retained evidence after a resume.
+  const pendingVerificationFailure = outcome?.payload.status === "blocked"
+    && outcome.payload.failureEvidence !== undefined
+    && outcomeTime >= buildTime;
+  if (pendingVerificationFailure) {
+    const noChangeAttempt = /^Builder produced no repository changes$/i.test(outcome.payload.reason);
+    if (noChangeAttempt && deliveryContext && build && verdict
+      && verdict.payload.disposition === "request_changes" && verdict.payload.headSha === build.payload.headSha) {
+      return { action: "resume", runId: latest.runId, state: "remediating", checkpoint: "remediation", artifacts: latest.artifacts };
+    }
+    if (noChangeAttempt && deliveryContext && !verdict) {
       return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
     }
+    return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
   }
-  if (reconciled.state === "blocked") {
-    // Recovery evidence belongs to one specific blocked checkpoint. Never reuse
-    // an older verification Outcome after a newer review/budget block superseded it.
-    const blocked = latestOfKind(latest.artifacts, "Outcome");
-    if (blocked?.payload.status === "blocked" && blocked.payload.failureEvidence) {
-      return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
-    }
-  }
-  if (reconciled.state === "publishing" || reconciled.state === "failed") {
-    const intent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
-    const investigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
-    const packet = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
-    const build = latestOfKind(latest.artifacts, "BuildResult");
-    const verdict = latestOfKind(latest.artifacts, "ReviewVerdict");
-    const failure = latestOfKind(latest.artifacts, "Outcome");
-    if (intent && investigation && packet && build && !verdict) {
-      return { action: "resume", runId: latest.runId, state: "publishing", checkpoint: "publication", artifacts: latest.artifacts };
-    }
-    const expectedPublishedHead = failure?.kind === "Outcome" && failure.payload.status === "failed"
-      ? /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i.exec(failure.payload.reason)?.[1]
+
+  // A newer verified head means build/remediation and verification completed,
+  // but publication or review did not durably finish. Republishing is
+  // idempotent and starts an entirely fresh review without replaying build.
+  const verifiedAfterLatestVerdict = build && (!verdict || buildTime > verdictTime);
+  if (deliveryContext && verifiedAfterLatestVerdict && outcome?.payload.status !== "merged") {
+    const expectedPublishedHead = outcome?.payload.status === "failed"
+      ? /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i.exec(outcome.payload.reason)?.[1]
       : undefined;
-    const verifiedAfterReview = build && verdict && Date.parse(build.createdAt) > Date.parse(verdict.createdAt);
-    if (reconciled.state === "failed" && intent && investigation && packet && verifiedAfterReview
-      && expectedPublishedHead?.toLowerCase() === build.payload.headSha.toLowerCase()) {
-      return { action: "resume", runId: latest.runId, state: "failed", checkpoint: "publication", artifacts: latest.artifacts };
+    const provenRevisionRecovery = expectedPublishedHead?.toLowerCase() === build.payload.headSha.toLowerCase();
+    return {
+      action: "resume", runId: latest.runId,
+      state: provenRevisionRecovery ? "failed" : "publishing",
+      checkpoint: "publication", artifacts: latest.artifacts,
+    };
+  }
+
+  const matchingReviewedHead = build && verdict && verdict.payload.headSha === build.payload.headSha;
+  if (deliveryContext && matchingReviewedHead && verdict.payload.disposition === "approve"
+    && outcome?.payload.status !== "merged") {
+    return { action: "resume", runId: latest.runId, state: "merging", checkpoint: "completion", artifacts: latest.artifacts };
+  }
+
+  if (deliveryContext && matchingReviewedHead && verdict.payload.disposition === "request_changes") {
+    const reviewBudgetExhausted = outcome?.payload.status === "blocked"
+      && /^Remediation budget exhausted after \d+ cycle\(s\)$/i.test(outcome.payload.reason);
+    const interruptedRemediation = !outcome || outcome.payload.status === "failed" || verdictTime > outcomeTime;
+    if (reviewBudgetExhausted || interruptedRemediation) {
+      return {
+        action: "resume", runId: latest.runId,
+        state: reviewBudgetExhausted ? "blocked" : "remediating",
+        checkpoint: "remediation", artifacts: latest.artifacts,
+      };
     }
   }
   if (terminalStates.has(reconciled.state)) {

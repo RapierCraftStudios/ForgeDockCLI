@@ -3,8 +3,8 @@
 import { createArtifact, InvestigationPayloadSchema, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
-import { attachArtifact, createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
-import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
+import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
+import { scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 
 export interface InvestigateDependencies {
   runtime: AgentRuntime;
@@ -21,6 +21,8 @@ export interface InvestigateInput {
   provider?: string;
   model?: string;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  target?: RunTarget;
+  scopeHints?: ScopeHints;
   signal?: AbortSignal;
 }
 
@@ -35,7 +37,16 @@ export async function investigateWorkItem(
   input: InvestigateInput,
   dependencies: InvestigateDependencies,
 ): Promise<InvestigateResult> {
-  let run = createRun({ workflow: "work-on", subject: input.intent.subject, runId: input.intent.runId });
+  const scopeManifest = scopeManifestFor("issue-hints", input.scopeHints ?? {
+    metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+  });
+  let run = createRun({
+    workflow: "work-on",
+    subject: input.intent.subject,
+    runId: input.intent.runId,
+    ...(input.target ? { target: input.target } : {}),
+    scopeManifest,
+  });
   run = attachArtifact(run, "Intent", input.intent.id);
   await dependencies.artifacts.append(input.intent);
   await dependencies.runs.create(run);
@@ -54,12 +65,17 @@ export async function investigateWorkItem(
       instructions: [
         "Inspect the relevant implementation and tests before deciding.",
         "Every evidence item must identify a concrete repository source such as a path, symbol, test, or command result.",
-        "Choose invalid when the claim is already fixed, superseded, unreproducible, or contradicted by evidence.",
+        "Choose invalid only when positive repository or issue evidence proves the claim is already fixed, superseded, unreproducible, or contradicted; an enhancement/refactor with missing implementation is confirmed, not invalid.",
+        "Absence of a matching implementation or test is evidence that a requested change may be needed, never sufficient evidence that the issue is invalid. Describe the missing contract as the root cause when the request is confirmed.",
         "Choose decompose only when independently deliverable outcomes need separate acceptance and review.",
         "Do not modify files or perform GitHub writes.",
       ].join("\n"),
       context: [input.intent, ...(input.priorArtifacts ?? [])],
-      workspace: { cwd: input.cwd, mode: "read-only" },
+      workspace: {
+        cwd: input.cwd,
+        mode: "read-only",
+        scope: scopeManifest,
+      },
       tools: ["read", "grep", "find", "ls"],
       outputSchema: InvestigationPayloadSchema,
       modelPolicy,

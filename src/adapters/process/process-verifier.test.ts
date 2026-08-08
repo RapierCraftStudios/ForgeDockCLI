@@ -20,6 +20,26 @@ describe("deterministic process verification", () => {
     assert.match(result?.summary ?? "", /verified/);
   });
 
+  it("records nested coverage as passed evidence without spawning the covered command", async () => {
+    const runner = isolatedRunner();
+    const [covered, parent] = await runner.run([
+      {
+        id: "build", command: process.execPath, args: ["-e", "process.exit(17)"],
+        cwd: process.cwd(), timeoutMs: 5_000, required: true, planId: "plan-1", coveredBy: ["test"],
+      },
+      {
+        id: "test", command: process.execPath, args: ["-e", "console.log('parent ran')"],
+        cwd: process.cwd(), timeoutMs: 5_000, required: true, planId: "plan-1",
+      },
+    ]);
+    assert.equal(covered?.status, "passed");
+    assert.equal(covered?.durationMs, 0);
+    assert.deepEqual(covered?.coveredBy, ["test"]);
+    assert.match(covered?.summary ?? "", /not executed twice/);
+    assert.equal(parent?.status, "passed");
+    assert.match(parent?.summary ?? "", /parent ran/);
+  });
+
   it("does not expose orchestrator child identity to verification commands", async () => {
     const runner = isolatedRunner({ ...process.env, PI_SUBAGENT_CHILD_AGENT: "forgedock-issue-worker" });
     const [result] = await runner.run([{

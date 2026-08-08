@@ -61,6 +61,23 @@ function artifacts(run: RunState) {
 }
 
 const clean: ReviewerSubmission = { summary: "No blocking defects", findings: [] };
+const inScope = {
+  scopeDisposition: "in_scope" as const,
+  scopeRationale: "Directly matches the frozen acceptance criterion.",
+  matchedAcceptanceCriteria: ["Concurrent updates pass"],
+  matchedPriorFindingIds: [] as string[],
+  introducedByRemediation: false,
+};
+const acceptAdjudication = (task: AgentTask<unknown>) => ({
+  decisions: [...task.objective.matchAll(/"id": "(review-[a-f0-9]{16})"/g)].map((match) => ({
+    findingId: match[1]!, disposition: "accept", rationale: "Directly required by the frozen criterion.",
+  })),
+});
+const followUpAdjudication = (task: AgentTask<unknown>) => ({
+  decisions: [...task.objective.matchAll(/"id": "(review-[a-f0-9]{16})"/g)].map((match) => ({
+    findingId: match[1]!, disposition: "follow_up", rationale: "Requires a new adjacent protocol guarantee.",
+  })),
+});
 
 describe("fresh-context PR review", () => {
   it("routes risk specialists and approves only the frozen SHA", async () => {
@@ -107,18 +124,20 @@ describe("fresh-context PR review", () => {
     const runtime = new FakeAgentRuntime([{
       summary: "Coordination defect",
       findings: [{
+        ...inScope,
         id: "lease-1", severity: "high", confidence: "high", blocking: true,
         title: "Stale lease holder can commit", evidence: "A reassigned worker is not fenced", location: "src/worker.ts:20",
         intentRelevance: "Permits stale writes", remediation: "Fence commits with the active lease epoch",
       }],
-    }, clean]);
+    }, clean, acceptAdjudication]);
     const result = await reviewPullRequest({
       run, pullRequest: pr, intent: context.intent, investigation: context.investigation,
       packet: packetWithoutConcurrency, buildResult, workspace: process.cwd(), maxReviewSpecialists: 1,
     }, { runtime, host: new PlainHost(), artifacts: new InMemoryArtifactRepository(), runs });
     assert.deepEqual(result.reviewPlan.selected.map(({ role }) => role), ["correctness", "concurrency"]);
-    assert.equal(runtime.tasks.length, 2);
+    assert.equal(runtime.tasks.length, 3);
     assert.ok(runtime.tasks.some((task) => task.id.includes(":concurrency")));
+    assert.ok(runtime.tasks.some((task) => task.role === "adjudicator"));
   });
 
   it("retries one operationally failed reviewer in fresh context without discarding successful peers", async () => {
@@ -143,6 +162,7 @@ describe("fresh-context PR review", () => {
     const resumedOutput: ReviewerSubmission = {
       summary: "Resumed with one advisory",
       findings: [{
+        ...inScope,
         id: "resume-note", severity: "low", confidence: "high", blocking: false,
         title: "Document lock ownership", evidence: "Ownership is implicit", location: "src/lock.ts:5",
         intentRelevance: "Clarifies maintenance", remediation: "Add a focused comment",
@@ -171,6 +191,7 @@ describe("fresh-context PR review", () => {
     const runtime = new ResumableRuntime([
       async () => { throw new AgentRunError("WebSocket error before result", { sessionRef: "persisted-review", resumable: true }); },
       clean,
+      acceptAdjudication,
     ]);
     const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
@@ -231,11 +252,12 @@ describe("fresh-context PR review", () => {
     const events: string[] = [];
     const host = new FakeHost(events);
     const finding = {
-      id: "ordered-1", severity: "low" as const, confidence: "high" as const, blocking: false,
+      ...inScope,
+      id: "ordered-1", severity: "high" as const, confidence: "high" as const, blocking: false,
       title: "Follow-up documentation", evidence: "One edge case is not documented", location: "src/lock.ts:20",
       intentRelevance: "Clarifies the accepted behavior", remediation: "Add a focused note",
     };
-    const runtime = new FakeAgentRuntime([{ summary: "Advisory", findings: [finding] }, clean]);
+    const runtime = new FakeAgentRuntime([{ summary: "Advisory", findings: [finding] }, clean, acceptAdjudication]);
     const backing = new InMemoryArtifactRepository();
     const projectedArtifacts = {
       append: async (artifact: Parameters<typeof backing.append>[0]) => {
@@ -260,11 +282,12 @@ describe("fresh-context PR review", () => {
       const run = await reviewingRun(runs);
       const context = artifacts(run);
       const finding = {
+        ...inScope,
         id: "f1", severity, confidence: "high" as const, blocking: false,
         title: "Lock releases before write", evidence: "src/lock.ts releases before await save", location: "src/lock.ts:20",
         intentRelevance: "Reintroduces the reported race", remediation: "Keep save inside lock",
       };
-      const runtime = new FakeAgentRuntime([{ summary: "Blocking", findings: [finding] }, clean]);
+      const runtime = new FakeAgentRuntime([{ summary: "Blocking", findings: [finding] }, clean, acceptAdjudication]);
       const host = new FakeHost();
       const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
@@ -279,12 +302,35 @@ describe("fresh-context PR review", () => {
     });
   }
 
+  it("lets an independent scope adjudicator prevent a plausible adjacent concern from blocking delivery", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const finding = {
+      ...inScope,
+      id: "adjacent-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Adjacent lease protocol is incomplete", evidence: "The lease profile lacks takeover", location: "src/lock.ts:20",
+      intentRelevance: "Adjacent to the guarded update", remediation: "Define a new takeover protocol",
+    };
+    const host = new FakeHost();
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([{ summary: "Adjacent concern", findings: [finding] }, clean, followUpAdjudication]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "merging");
+    assert.equal(result.verdict.payload.findings[0]?.blocking, false);
+    assert.equal(result.verdict.payload.findings[0]?.scopeDisposition, "follow_up");
+    assert.equal(result.verdict.payload.scopeAdjudication?.decisions[0]?.disposition, "follow_up");
+    assert.equal(host.findingIssues.length, 0);
+  });
+
   it("renders bounded provisional reviewer reports without allowing nested comment markers", () => {
     const body = renderReviewerSubmissionComment({
       runId: "run-1", pullRequest: 4, headSha: sha, role: "security",
       submission: {
         summary: "Checked trust boundaries <!-- injected -->",
         findings: [{
+          ...inScope,
           id: "security-1", severity: "low", confidence: "medium", blocking: false,
           title: "Advisory", evidence: "Evidence", location: "src/lock.ts:2",
           intentRelevance: "Relevant", remediation: "Document it",
@@ -300,6 +346,7 @@ describe("fresh-context PR review", () => {
       submission: {
         summary: "large report",
         findings: Array.from({ length: 10 }, (_, index) => ({
+          ...inScope,
           id: `large-${index}`, severity: "low" as const, confidence: "medium" as const, blocking: false,
           title: `Finding ${index}`, evidence: "e".repeat(8_000), intentRelevance: "i".repeat(4_000), remediation: "r".repeat(4_000),
         })),

@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, updateForgeDockConfig } from "./forgedock-config.js";
+import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, updateForgeDockConfig } from "./forgedock-config.js";
 
 describe("ForgeDock Next project configuration", () => {
   it("bootstraps a valid minimal forge.yaml exactly once", () => {
@@ -71,6 +71,30 @@ describe("ForgeDock Next project configuration", () => {
     assert.equal(resolveAutoMerge(undefined, false), false);
     assert.equal(resolveAutoMerge(false, true), false);
     assert.equal(resolveAutoMerge(true, false), true);
+  });
+
+  it("round-trips nested orchestration policy and applies invocation precedence", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
+    try {
+      updateForgeDockConfig(cwd, {
+        orchestration: {
+          batching: { policy: "conservative", maxBatchSize: 6, maxSensitiveBatchSize: 2 },
+          scopeExpansion: "recursive", maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 2,
+        },
+      });
+      const raw = readFileSync(join(cwd, "forge.yaml"), "utf8");
+      assert.match(raw, /batching:/);
+      assert.match(raw, /policy: "conservative"/);
+      const config = readForgeDockConfig(cwd);
+      assert.equal(config.batchingPolicy, "conservative");
+      assert.equal(config.scopeExpansion, "recursive");
+      assert.deepEqual(resolveOrchestrationConfig(config, { batchingPolicy: "none", maxParallel: 1 }), {
+        batchingPolicy: "none", maxBatchSize: 6, maxSensitiveBatchSize: 2, scopeExpansion: "recursive",
+        maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 1, autoMerge: true,
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("applies a configured thinking suffix idempotently", () => {

@@ -22,9 +22,20 @@ export class ProcessVerificationRunner implements VerificationRunner {
   async run(commands: readonly VerificationCommand[], signal?: AbortSignal): Promise<CheckResult[]> {
     const release = await acquireVerificationLock(this.#lockPath, signal);
     try {
-      const results: CheckResult[] = [];
+        const results: CheckResult[] = [];
       for (const command of commands) {
         if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted");
+        if (command.coveredBy?.length) {
+          results.push({
+            command: [command.command, ...command.args].join(" "),
+            ...(command.planId !== undefined ? { planId: command.planId } : {}),
+            coveredBy: [...command.coveredBy],
+            status: "passed",
+            durationMs: 0,
+            summary: `Covered by ${command.coveredBy.join(", ")}; nested verification was not executed twice.`,
+          });
+          continue;
+        }
         const result = await runOne(command, this.#environment, signal);
         results.push(result);
         if (command.required && result.status === "failed") break;
@@ -139,6 +150,7 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       const failureSignatures = status === "failed" ? extractFailureSignatures(output, timedOut) : [];
       resolve({
         command: [spec.command, ...spec.args].join(" "),
+        ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
         status,
         ...(typeof code === "number" ? { exitCode: code } : {}),
         durationMs,

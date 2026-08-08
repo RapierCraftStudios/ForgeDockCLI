@@ -1,0 +1,58 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { describe, it } from "node:test";
+import { createSandboxedTools, WorkspaceGuard } from "./sandboxed-tools.js";
+import { scopeManifestFor } from "./agent-runtime.js";
+
+describe("scope manifests", () => {
+  it("limits reads and writes to declared roots while retaining lexical and symlink guards", async () => {
+    const root = await mkdtemp(join(tmpdir(), "forgedock-scope-"));
+    const allowed = join(root, "src");
+    const denied = join(root, "secrets");
+    await mkdir(allowed);
+    await mkdir(denied);
+    await writeFile(join(allowed, "a.ts"), "export const a = 1;\n");
+    await writeFile(join(allowed, "b.ts"), "export const b = 1;\n");
+    await writeFile(join(denied, "secret.txt"), "secret\n");
+    const guard = await WorkspaceGuard.create(root, { readRoots: ["src"], writeRoots: ["src"], source: "build-packet" });
+    await guard.existing("src/a.ts");
+    await assert.rejects(guard.existing("secrets/secret.txt"), /outside the assigned scope/);
+    await assert.rejects(guard.writable("secrets/new.txt"), /outside the assigned scope/);
+    const packetGuard = await WorkspaceGuard.create(root, { readRoots: ["src"], writeRoots: [], writePaths: ["src/a.ts"], source: "build-packet" });
+    await packetGuard.writable("src/a.ts");
+    await assert.rejects(packetGuard.writable("src/b.ts"), /outside the assigned scope/);
+    const tools = await createSandboxedTools(root, ["read"], { readRoots: ["src"], writeRoots: [], source: "build-packet" });
+    assert.ok(tools.some((tool) => tool.name === "read"));
+    const link = join(root, "src", "outside");
+    try {
+      await symlink(denied, link, "junction");
+      await assert.rejects(guard.existing("src/outside/secret.txt"));
+    } catch {
+      // Symlink creation can be disabled on constrained Windows runners.
+    }
+  });
+
+  it("derives bounded metadata roots for issue hints", () => {
+    const manifest = scopeManifestFor("issue-hints", { affectedFiles: ["src/api/a.ts"], metadataRoots: ["package.json", "forge.yaml"] });
+    assert.ok(manifest.readRoots.includes("src/api"));
+    assert.ok(manifest.readRoots.includes("package.json"));
+    assert.deepEqual(manifest.writeRoots, []);
+  });
+
+  it("does not turn semantic claims into nonexistent filesystem roots", () => {
+    const manifest = scopeManifestFor("issue-hints", { claims: ["main", "component:api", "src/core"], metadataRoots: ["package.json"] });
+    assert.ok(manifest.readRoots.includes("src/core"));
+    assert.ok(manifest.readRoots.includes("package.json"));
+    assert.ok(!manifest.readRoots.includes("."));
+    assert.ok(!manifest.readRoots.includes("main"));
+    assert.ok(!manifest.readRoots.includes("component:api"));
+  });
+
+  it("keeps remediation line locations as exact writable files", () => {
+    const manifest = scopeManifestFor("remediation", { writePaths: ["src/core/state.ts:42"] });
+    assert.deepEqual(manifest.writePaths, ["src/core/state.ts"]);
+    assert.deepEqual(manifest.writeRoots, []);
+  });
+});
