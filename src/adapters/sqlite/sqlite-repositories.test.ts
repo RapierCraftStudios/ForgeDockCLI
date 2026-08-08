@@ -34,6 +34,25 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("matches canonical artifact subjects without merging unrelated targets", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const make = (id: string, subject: { repo: string; issue?: number; pr?: number }) => createArtifact({
+        kind: "Intent", runId: id, subject, producer: { role: "test" },
+        payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+      }, { id, createdAt: "2026-01-01T00:00:00.000Z" });
+      const issue = make("sqlite-issue", { repo: "Acme/Widget", issue: 1 });
+      const pull = make("sqlite-pull", { repo: "acme/widget", pr: 2 });
+      const both = make("sqlite-both", { repo: "acme/widget", issue: 1, pr: 2 });
+      const unrelated = make("sqlite-unrelated", { repo: "acme/widget", issue: 9 });
+      for (const artifact of [issue, pull, both, unrelated]) await store.append(artifact);
+      assert.deepEqual((await store.list({ repo: " acme/widget ", issue: 1 })).map((artifact) => artifact.id), [issue.id, both.id]);
+      assert.deepEqual((await store.list({ repo: "acme/widget", issue: 1, pr: 2 })).map((artifact) => artifact.id), [issue.id, pull.id, both.id]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("rebuilds divergent operational run state from durable authority", async () => {
     const store = new SqliteRepositories(":memory:");
     try {
@@ -92,7 +111,7 @@ describe("SQLite operational repositories", () => {
     }> = [];
 
     try {
-      fixture.exec("CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, kind TEXT NOT NULL, artifact_json TEXT NOT NULL);");
+      fixture.exec("PRAGMA journal_mode = WAL; CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, kind TEXT NOT NULL, artifact_json TEXT NOT NULL);");
       fixture.prepare("INSERT INTO artifacts VALUES (?, ?, ?, ?)").run("legacy", "legacy-key", "Intent", JSON.stringify({ subject: { repo: "acme/widget", issue: 1 } }));
       fixture.exec("BEGIN IMMEDIATE");
 
