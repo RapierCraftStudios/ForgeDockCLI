@@ -4,7 +4,7 @@ import { Type, type Static } from "typebox";
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRuntime } from "../../runtime/agent-runtime.js";
+import { scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export const BuilderSubmissionSchema = Type.Object({
@@ -25,6 +25,7 @@ export async function buildWorkItem(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
+    scopeHints?: ScopeHints;
     worktree: string;
     provider?: string;
     model?: string;
@@ -52,7 +53,12 @@ export async function buildWorkItem(
         cwd: input.worktree,
         mode: "write",
         scope: scopeManifestFor("build-packet", {
-          affectedFiles: input.packet.payload.expectedPaths,
+          affectedFiles: [
+            ...(input.scopeHints?.affectedFiles ?? []),
+            ...input.investigation.payload.affectedSurfaces,
+            ...input.packet.payload.expectedPaths,
+          ],
+          ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
           writePaths: input.packet.payload.expectedPaths,
           metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
         }),

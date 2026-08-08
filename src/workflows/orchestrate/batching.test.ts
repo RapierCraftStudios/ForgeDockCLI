@@ -87,6 +87,13 @@ describe("orchestration work-unit batching", () => {
     assert.deepEqual(affectedFilesFromIssueBody(body), ["src/core/a.ts", "src/core/b.ts"]);
   });
 
+  it("accepts bounded glob paths and ignores unsafe or unbounded paths", () => {
+    const body = [
+      "## Affected Files", "- `src/**/*.ts`", "- `src/components/*.tsx`", "- `**/*.md`", "- `../outside.ts`", "- `/etc/passwd`",
+    ].join("\n");
+    assert.deepEqual(affectedFilesFromIssueBody(body), ["src/**/*.ts", "src/components/*.tsx"]);
+  });
+
   it("renders and parses durable batch membership", () => {
     const group = planIssueBatches([item(7), item(8)]).groups[0]!;
     const body = renderBatchIssueBody(group);

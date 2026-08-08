@@ -31,15 +31,19 @@ describe("builder boundary", () => {
       kind: "Intent", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
       payload: { title: "Guard", problem: "Race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
-    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
-    const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     const built = await buildWorkItem({
-      run: prepared.run, intent, investigation: investigated.investigation, packet: prepared.packet, worktree: process.cwd(),
+      run: prepared.run, intent, investigation: investigated.investigation, packet: prepared.packet, scopeHints, worktree: process.cwd(),
     }, { runtime, runs });
 
     assert.equal(built.run.state, "verifying");
     assert.equal(built.submission.summary, "Added the guard");
     assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "edit", "write"]);
     assert.ok(!runtime.tasks[2]?.tools.includes("bash"));
+    assert.ok(runtime.tasks[2]?.workspace.scope.readRoots.includes("src"));
+    assert.deepEqual(runtime.tasks[2]?.workspace.scope.writeRoots, []);
+    assert.deepEqual(runtime.tasks[2]?.workspace.scope.writePaths, ["src/a.ts"]);
   });
 });

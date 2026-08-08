@@ -258,7 +258,17 @@ export function parseBatchContract(body: string): BatchMemberContract[] {
 export function affectedFilesFromIssueBody(body: string): string[] {
   const section = /^#{2,3}\s+(?:Affected Files|Deliverables|Files to change)\s*$([\s\S]*?)(?=^#{1,3}\s+|(?![\s\S]))/im.exec(body)?.[1] ?? "";
   const backticked = [...section.matchAll(/`([^`\r\n]+)`/g)].map((match) => match[1]!.trim());
-  return unique(backticked.filter((path) => /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@+-]+)+$/.test(path)));
+  return unique(backticked.map(normalizeAffectedPath).filter((path): path is string => path !== undefined));
+}
+
+function normalizeAffectedPath(value: string): string | undefined {
+  const path = value.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/:\d+(?::\d+)?$/, "").replace(/\/$/, "").trim();
+  if (!path || path === "." || path.startsWith("/") || /^[A-Za-z]:\//.test(path) || path.includes(":")) return undefined;
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined;
+  const globIndex = path.search(/[*?[{]/);
+  if (globIndex >= 0 && !path.slice(0, globIndex).replace(/\/$/, "")) return undefined;
+  return path;
 }
 
 export function inferBatchRiskClass(title: string, body: string, labels: readonly string[]): BatchRiskClass {

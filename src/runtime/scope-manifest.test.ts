@@ -50,6 +50,24 @@ describe("scope manifests", () => {
     assert.ok(!manifest.readRoots.includes("component:api"));
   });
 
+  it("derives bounded roots from globs without granting the repository root", () => {
+    const manifest = scopeManifestFor("issue-hints", {
+      affectedFiles: ["src/**/*.ts", "**/*.md", "../outside.ts", "/etc/passwd"],
+      metadataRoots: ["package.json"],
+    });
+    assert.ok(manifest.readRoots.includes("src"));
+    assert.ok(manifest.readRoots.includes("package.json"));
+    assert.ok(!manifest.readRoots.includes("."));
+    assert.ok(!manifest.readRoots.some((root) => root.includes("*")));
+  });
+
+  it("rejects globbed exact write paths", () => {
+    assert.throws(
+      () => scopeManifestFor("build-packet", { writePaths: ["src/**/*.ts"] }),
+      /concrete repository-relative files/,
+    );
+  });
+
   it("keeps remediation line locations as exact writable files", () => {
     const manifest = scopeManifestFor("remediation", { writePaths: ["src/core/state.ts:42"] });
     assert.deepEqual(manifest.writePaths, ["src/core/state.ts"]);

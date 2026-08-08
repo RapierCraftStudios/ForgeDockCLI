@@ -9,6 +9,8 @@ export interface ScheduledWorkItem {
   priority: number;
   dependencies: readonly string[];
   claims: readonly string[];
+  /** Bounded issue-derived paths retained through scheduling for worker scope hints. */
+  affectedFiles?: readonly string[];
   memberIssues?: readonly number[];
   title?: string;
   summary?: string;

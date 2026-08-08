@@ -31,15 +31,18 @@ describe("Build Packet preparation", () => {
       kind: "Intent", runId: "run_packet", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
       payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
-    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({
-      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
     }, { runtime, artifacts, runs });
 
     assert.equal(prepared.run.state, "building");
     assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
     assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
     assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
+    assert.ok(runtime.tasks[0]?.workspace.scope.readRoots.includes("src"));
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
     ]);

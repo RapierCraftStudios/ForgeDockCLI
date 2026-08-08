@@ -30,22 +30,27 @@ export interface WorkspaceGrant {
   scope: ScopeManifest;
 }
 
+const GLOB_PATTERN = /[*?[{]/;
+
 /** Build a bounded manifest from issue/packet evidence; never grants an unbounded root by default. */
 export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints = {}): ScopeManifest {
   const pathClaims = (hints.claims ?? []).filter((claim) => {
     const normalized = normalizeScopePath(claim);
     // Claims also carry semantic scheduler labels such as component:api or
     // finding:review-1; only path-shaped claims can become filesystem roots.
-    return normalized === "." || normalized.includes("/") || (!normalized.includes(":") && normalized.includes("."));
+    return normalized !== "." && (normalized.includes("/") || (!normalized.includes(":") && normalized.includes(".")));
   });
   const paths = [...(hints.affectedFiles ?? []), ...pathClaims]
+    .map((value) => scopeDirectory(stripLocation(value)))
+    .filter((value): value is string => Boolean(value) && isSafeRelativeScopePath(value));
+  const metadataRoots = [...(hints.metadataRoots ?? [])]
     .map(normalizeScopePath)
-    .filter(Boolean);
-  const metadataRoots = [...(hints.metadataRoots ?? [])].map(normalizeScopePath).filter(Boolean);
+    .filter((value): value is string => Boolean(value) && isSafeRelativeScopePath(value));
   const writePaths = [...(hints.writePaths ?? [])]
-    .map((value) => normalizeScopePath(value.replace(/:\d+(?::\d+)?$/, "")))
+    .map((value) => normalizeScopePath(stripLocation(value)))
     .filter(Boolean);
-  const readRoots = [...new Set([...paths.map(scopeDirectory), ...metadataRoots])].filter(Boolean);
+  assertConcreteScopePaths(writePaths);
+  const readRoots = [...new Set([...paths, ...metadataRoots])];
   return {
     readRoots,
     writeRoots: [],
@@ -54,13 +59,39 @@ export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints 
   };
 }
 
+/** Build Packet and remediation writes must name concrete repository-relative files. */
+export function assertConcreteScopePaths(paths: readonly string[]): void {
+  const invalid = paths.filter((path) => !isConcreteScopePath(path));
+  if (invalid.length) {
+    throw new Error(`Scope write paths must be concrete repository-relative files: ${invalid.join(", ")}`);
+  }
+}
+
+export function isConcreteScopePath(value: string): boolean {
+  const normalized = normalizeScopePath(value);
+  return Boolean(normalized) && normalized !== "." && isSafeRelativeScopePath(normalized) && !GLOB_PATTERN.test(normalized);
+}
+
 function normalizeScopePath(value: string): string {
-  return value.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "").trim();
+  return value.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/$/, "").trim();
+}
+
+function stripLocation(value: string): string {
+  return value.replace(/:\d+(?::\d+)?$/, "");
+}
+
+function isSafeRelativeScopePath(value: string): boolean {
+  if (!value || value === ".") return value === ".";
+  if (value.startsWith("/") || /^[A-Za-z]:\//.test(value) || value.includes(":")) return false;
+  const segments = value.split("/");
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
 function scopeDirectory(value: string): string {
   const normalized = normalizeScopePath(value);
-  if (!normalized || normalized === ".") return ".";
+  if (!normalized || normalized === "." || !isSafeRelativeScopePath(normalized)) return "";
+  const globIndex = normalized.search(GLOB_PATTERN);
+  if (globIndex >= 0) return normalized.slice(0, globIndex).replace(/\/$/, "");
   // Paths with a filename extension are treated as file claims; nested files
   // expose only their containing directory while packet writes remain exact.
   const final = normalized.split("/").at(-1) ?? normalized;

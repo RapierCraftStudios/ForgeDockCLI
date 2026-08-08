@@ -3,7 +3,7 @@
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRuntime } from "../../runtime/agent-runtime.js";
+import { assertConcreteScopePaths, scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export async function prepareBuildPacket(
@@ -12,6 +12,7 @@ export async function prepareBuildPacket(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     cwd: string;
+    scopeHints?: ScopeHints;
     provider?: string;
     model?: string;
     signal?: AbortSignal;
@@ -33,7 +34,8 @@ export async function prepareBuildPacket(
       instructions: [
         "Every acceptance criterion must be observable and testable.",
         "Include implementation-specific history and consistency constraints only when relevant.",
-        "Expected paths are claims for conflict detection, not permission to broaden scope.",
+        "Expected paths must be concrete repository-relative files and are the frozen write/conflict boundary; never emit globs, absolute paths, traversal, or line-location suffixes.",
+        "When a shared interface or contract changes, include every affected implementation and test-double path that may need edits, especially all paths declared by the issue. The builder cannot edit a path omitted from this packet.",
         "Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
@@ -42,7 +44,11 @@ export async function prepareBuildPacket(
         cwd: input.cwd,
         mode: "read-only",
         scope: scopeManifestFor("issue-hints", {
-          affectedFiles: input.investigation.payload.affectedSurfaces,
+          affectedFiles: [
+            ...(input.scopeHints?.affectedFiles ?? []),
+            ...input.investigation.payload.affectedSurfaces,
+          ],
+          ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
           metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
         }),
       },
@@ -57,6 +63,8 @@ export async function prepareBuildPacket(
       ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
     });
 
+    if (!result.output.expectedPaths.length) throw new Error("Build Packet must declare at least one concrete expected path");
+    assertConcreteScopePaths(result.output.expectedPaths);
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,

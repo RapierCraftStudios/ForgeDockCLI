@@ -127,11 +127,13 @@ export async function workOn(
       intent: input.intent,
       investigation: investigated.investigation,
       cwd: workspace.path,
+      ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       ...runtimeOptions,
     }, agentDependencies);
     run = prepared.run;
     const continued = await continueBuildDelivery({
       run, intent: input.intent, investigation: investigated.investigation, packet: prepared.packet, workspace,
+      ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       baseBranch: deliveryBranch, verification: input.verification,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -223,6 +225,7 @@ async function continueBuildDelivery(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
+    scopeHints?: ScopeHints;
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -252,6 +255,7 @@ async function continueBuildDelivery(
   let run = input.run;
   const built = await buildWorkItem({
     run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+    ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
     worktree: input.workspace.path, ...runtimeOptions,
   }, {
     runtime: dependencies.runtime,

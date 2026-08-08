@@ -34,6 +34,7 @@ import { parseOrchestrationIssueNumbers } from "./argument-parser.js";
 const args = process.argv.slice(2);
 const mode = colorMode();
 const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
+const STANDARD_SCOPE_METADATA_ROOTS = ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"] as const;
 
 await main(args).catch((error: unknown) => {
   agentEventStream.finish();
@@ -479,7 +480,7 @@ async function workOn(argv: string[]): Promise<void> {
         intent, priorArtifacts, cwd: process.cwd(), target: runTargetForLane(lane),
         scopeHints: {
           affectedFiles: affectedFilesFromIssueBody(issue.body),
-          metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+          metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
         },
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
@@ -502,7 +503,7 @@ async function workOn(argv: string[]): Promise<void> {
       lane,
       scopeHints: {
         affectedFiles: affectedFilesFromIssueBody(issue.body),
-        metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+        metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
       },
       verification,
       baselineChecks,
@@ -781,6 +782,11 @@ async function orchestrate(argv: string[]): Promise<void> {
         const result = await executeWorkOn({
           intent, repoPath: process.cwd(), lane,
           verification, autoMerge, signal: controller.signal,
+          scopeHints: {
+            affectedFiles: item.affectedFiles ?? [],
+            claims: item.claims,
+            metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
+          },
           subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),

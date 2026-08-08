@@ -14,7 +14,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import type { ScopeManifest, ToolGrant } from "./agent-runtime.js";
+import { isConcreteScopePath, type ScopeManifest, type ToolGrant } from "./agent-runtime.js";
 
 /**
  * Replaces Pi's local filesystem tools with worktree-confined operations.
@@ -270,6 +270,9 @@ async function resolveScopeRoots(root: string, roots: readonly string[], allowMi
 async function resolveScopePaths(root: string, paths: readonly string[]): Promise<string[]> {
   const resolved: string[] = [];
   for (const value of paths) {
+    if (!isConcreteScopePath(value)) {
+      throw new Error(`Scope write paths must be concrete repository-relative files: ${value}`);
+    }
     const lexical = resolve(root, value);
     try {
       const existing = await realpath(lexical);
