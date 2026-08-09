@@ -3,7 +3,15 @@
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import { assertConcreteScopePaths, scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
+import {
+  canonicalizeConcreteScopePaths,
+  isConcreteScopePath,
+  scopeDiscoveryRoots,
+  scopeManifestFor,
+  type AgentEventSink,
+  type AgentRuntime,
+  type ScopeHints,
+} from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export async function prepareBuildPacket(
@@ -27,6 +35,10 @@ export async function prepareBuildPacket(
   if (input.run.state !== "preparing") throw new Error(`Build Packet requires preparing state, found ${input.run.state}`);
   let run = input.run;
   try {
+    const affectedScope = [
+      ...(input.scopeHints?.affectedFiles ?? []),
+      ...input.investigation.payload.affectedSurfaces,
+    ];
     const result = await dependencies.runtime.run<BuildPacketPayload>({
       id: `${run.runId}:build-packet:${run.attempt}`,
       role: "packet-author",
@@ -44,12 +56,12 @@ export async function prepareBuildPacket(
         cwd: input.cwd,
         mode: "read-only",
         scope: scopeManifestFor("issue-hints", {
-          affectedFiles: [
-            ...(input.scopeHints?.affectedFiles ?? []),
-            ...input.investigation.payload.affectedSurfaces,
-          ],
+          affectedFiles: affectedScope,
           ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
-          metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+          metadataRoots: [
+            "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md",
+            ...scopeDiscoveryRoots(affectedScope),
+          ],
         }),
       },
       tools: ["read", "grep", "find", "ls"],
@@ -64,13 +76,19 @@ export async function prepareBuildPacket(
     });
 
     if (!result.output.expectedPaths.length) throw new Error("Build Packet must declare at least one concrete expected path");
-    assertConcreteScopePaths(result.output.expectedPaths);
+    const declaredPaths = canonicalizeConcreteScopePaths(
+      (input.scopeHints?.affectedFiles ?? []).filter(isConcreteScopePath),
+    );
+    const expectedPaths = canonicalizeConcreteScopePaths([
+      ...result.output.expectedPaths,
+      ...declaredPaths,
+    ]);
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
       subject: run.subject,
       producer: { role: "packet-author", runtime: "pi-compatible", provider: result.provider, model: result.model },
-      payload: result.output,
+      payload: { ...result.output, expectedPaths },
     });
     await dependencies.artifacts.append(packet);
     run = attachArtifact(run, "BuildPacket", packet.id);

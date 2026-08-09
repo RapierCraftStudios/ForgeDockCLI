@@ -86,7 +86,7 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
   if (grants.includes("write")) {
     tools.push(createWriteTool(cwd, { operations: {
       writeFile: async (path, content) => writeFile(await guard.writable(path), content, "utf8"),
-      mkdir: async (path) => mkdir(await guard.writable(path), { recursive: true }).then(() => undefined),
+      mkdir: async (path) => mkdir(await guard.writableDirectory(path), { recursive: true }).then(() => undefined),
     } }) as unknown as ToolDefinition);
   }
   return tools;
@@ -218,6 +218,17 @@ export class WorkspaceGuard {
       }
     }
     throw new Error(`Workspace path has no parent inside the worktree: ${path}`);
+  }
+
+  async writableDirectory(path: string): Promise<string> {
+    if (!this.writePaths.length) return this.writable(path);
+    const candidate = this.lexical(path);
+    if (!this.writePaths.some((writePath) => samePathOrUnder(candidate, writePath))) {
+      throw new Error(`Tool write directory is outside the assigned scope: ${candidate}`);
+    }
+    const nearest = await existingOrNearest(candidate);
+    this.assertInside(nearest);
+    return candidate;
   }
 
   async searchRoot(path: string | undefined): Promise<string> {

@@ -145,6 +145,26 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(uncoveredVerificationCommands(["Run `git diff --check`.", "Run `npm test`."], [
       { id: "diff-check" }, { id: "test" },
     ]), []);
+    assert.deepEqual(
+      uncoveredVerificationCommands(["`node --test test/contract.test.js`"], [{ id: "test" }]),
+      ["node --test test/contract.test.js"],
+    );
+  });
+
+  it("compares canonical packet paths with Git paths", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = packet(run);
+    const result = await verifyAndCommit({
+      run,
+      packet: { ...frozen, payload: { ...frozen.payload, expectedPaths: ["src\\a.ts"] } },
+      submission, workspace, commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "publishing");
+    assert.deepEqual(result.buildResult?.payload.changedPaths, ["src/a.ts"]);
   });
 
   it("blocks paths outside the frozen Build Packet before commit", async () => {

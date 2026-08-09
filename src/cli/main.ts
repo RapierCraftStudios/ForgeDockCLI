@@ -284,8 +284,9 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
       const remediationCheckpoint = latestArtifact(runArtifacts, "RemediationBlocked");
+      const latestOutcome = latestArtifact(runArtifacts, "Outcome");
       const checkpointArtifact = admission.checkpoint === "verification"
-        ? latestArtifact(runArtifacts, "Outcome")
+        ? latestOutcome
         : admission.checkpoint === "publication"
           ? latestArtifact(runArtifacts, "BuildResult")
           : admission.checkpoint === "completion"
@@ -300,7 +301,7 @@ async function workOn(argv: string[]): Promise<void> {
         writePaths: packet.payload.expectedPaths,
         metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
       });
-      const failedOutcome = admission.state === "failed" ? latestArtifact(runArtifacts, "Outcome") : undefined;
+      const failedOutcome = admission.state === "failed" ? latestOutcome : undefined;
       const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
       const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
       const openPullRequest = retainedBuildResult
@@ -389,6 +390,9 @@ async function workOn(argv: string[]): Promise<void> {
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace: workspace!,
+        ...(admission.checkpoint === "build" && latestOutcome?.payload.status === "blocked" && latestOutcome.payload.failureEvidence
+          ? { priorVerificationFailure: latestOutcome }
+          : {}),
         baseBranch: lane.targetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         priorRemediationCycles,

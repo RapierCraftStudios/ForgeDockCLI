@@ -51,7 +51,8 @@ export function decideSubjectAdmission(
 
   const hasIntent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
   const hasInvestigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
-  const hasPacket = latest.artifacts.some((artifact) => artifact.kind === "BuildPacket");
+  const packet = latestOfKind(latest.artifacts, "BuildPacket");
+  const hasPacket = packet !== undefined;
   const build = latestOfKind(latest.artifacts, "BuildResult");
   const verdict = latestOfKind(latest.artifacts, "ReviewVerdict");
   const outcome = latestOfKind(latest.artifacts, "Outcome");
@@ -70,17 +71,40 @@ export function decideSubjectAdmission(
 
   // A verification failure is authoritative only while no newer verified build
   // supersedes it. This avoids replaying stale retained evidence after a resume.
-  const pendingVerificationFailure = outcome?.payload.status === "blocked"
-    && outcome.payload.failureEvidence !== undefined
+  const verificationFailureOutcome = outcome?.payload.status === "blocked" && outcome.payload.failureEvidence !== undefined
+    ? outcome
+    : undefined;
+  const pendingVerificationFailure = verificationFailureOutcome !== undefined
     && outcomeTime >= buildTime;
   if (pendingVerificationFailure) {
-    const noChangeAttempt = /^Builder produced no repository changes$/i.test(outcome.payload.reason);
+    const verificationFailureEvidence = verificationFailureOutcome.payload.failureEvidence!;
+    const noChangeAttempt = /^Builder produced no repository changes$/i.test(verificationFailureOutcome.payload.reason);
     if (noChangeAttempt && deliveryContext && build && verdict
       && verdict.payload.disposition === "request_changes" && verdict.payload.headSha === build.payload.headSha) {
       return { action: "resume", runId: latest.runId, state: "remediating", checkpoint: "remediation", artifacts: latest.artifacts };
     }
     if (noChangeAttempt && deliveryContext && !verdict) {
       return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
+    }
+    const expectedPaths = new Set(packet?.payload.expectedPaths.map(normalizeRepoPath) ?? []);
+    const repairableVerification = deliveryContext
+      && packet !== undefined
+      && /^Required verification failed(?::|$)/i.test(verificationFailureOutcome.payload.reason)
+      && verificationFailureEvidence.changedPaths.every((path) => expectedPaths.has(normalizeRepoPath(path)));
+    if (repairableVerification) {
+      const failedBuildAttempts = latest.artifacts.filter((artifact) => artifact.kind === "Outcome"
+        && artifact.payload.status === "blocked"
+        && artifact.payload.failureEvidence !== undefined
+        && /^Required verification failed(?::|$)/i.test(artifact.payload.reason)).length;
+      if (failedBuildAttempts <= 2) {
+        return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
+      }
+      return {
+        action: "block",
+        runId: latest.runId,
+        state: "blocked",
+        reason: `Verification repair budget exhausted after ${failedBuildAttempts - 1} repair attempt(s)`,
+      };
     }
     return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
   }
@@ -128,6 +152,10 @@ export function decideSubjectAdmission(
     state: reconciled.state,
     reason: `Existing run ${latest.runId} is ${reconciled.state} and has no controller-supported durable resume checkpoint; reset it before starting another run`,
   };
+}
+
+function normalizeRepoPath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/$/, "");
 }
 
 function latestOfKind<K extends DurableArtifact["kind"]>(

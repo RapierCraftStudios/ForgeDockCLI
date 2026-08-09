@@ -12,7 +12,11 @@ const openPr: PullRequestSnapshot = { repo: "a/b", number: 9, title: "Fix", body
 class CompletionHost implements ForgeHost {
   async getIssue(number: number, repo = "a/b") { return { repo, number, title: `Issue ${number}`, body: "", url: `https://github.test/${repo}/issues/${number}`, state: "OPEN" as const }; }
   async materializeBatchIssue(input: { repo: string; title: string; body: string; priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3" }) { return { repo: input.repo, number: 100, title: input.title, body: input.body, url: `https://github.test/${input.repo}/issues/100`, state: "OPEN" as const }; }
-  async publishIssueComment(): Promise<void> {}
+  failIssueComment = false;
+  failClose = false;
+  async publishIssueComment(): Promise<void> {
+    if (this.failIssueComment) throw new Error("trajectory publication unavailable");
+  }
   async materializeRemediationChildren() { return []; }
   async materializeDecomposition() { return []; }
   snapshot = { ...openPr };
@@ -29,7 +33,10 @@ class CompletionHost implements ForgeHost {
     this.mergeBase = base;
     this.snapshot.state = "MERGED";
   }
-  async closeIssue(_repo: string, issue: number): Promise<void> { this.closes.push(issue); }
+  async closeIssue(_repo: string, issue: number): Promise<void> {
+    if (this.failClose) throw new Error("issue closure unavailable");
+    this.closes.push(issue);
+  }
 }
 
 async function mergingRun(runs: InMemoryRunRepository): Promise<RunState> {
@@ -80,6 +87,34 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 1);
     assert.equal(host.mergeBase, "main");
     assert.deepEqual(host.closes, [2]);
+  });
+
+  it("does not publish a terminal Outcome when trajectory publication fails after merge", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.failIssueComment = true;
+    const artifacts = new InMemoryArtifactRepository();
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      /trajectory publication unavailable/,
+    );
+    assert.equal(host.snapshot.state, "MERGED");
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
+  it("does not publish a terminal Outcome when issue closure fails after merge", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.failClose = true;
+    const artifacts = new InMemoryArtifactRepository();
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      /issue closure unavailable/,
+    );
+    assert.equal(host.snapshot.state, "MERGED");
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
   });
 
   it("refuses merge when the PR target changes after approval", async () => {

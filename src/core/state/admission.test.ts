@@ -123,6 +123,48 @@ describe("subject run admission", () => {
     }
   });
 
+  it("routes an in-packet verification failure back through a bounded builder repair", () => {
+    const runId = "run_build_repair";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const blocked = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "Required verification failed: npm test (exit 1)", childIssues: [],
+        failureEvidence: {
+          branch: "forgedock/issue-1", workspacePath: "/tmp/issue-1", builderSummary: "first attempt",
+          changedPaths: ["docs/a.md"], checks: [{ command: "npm test", status: "failed", durationMs: 1 }],
+        },
+      },
+    });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "building");
+      assert.equal(decision.checkpoint, "build");
+    }
+  });
+
+  it("keeps out-of-packet verification failures at the human checkpoint", () => {
+    const runId = "run_scope_block";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const blocked = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "Diff contains paths outside the Build Packet: unrelated.ts", childIssues: [],
+        failureEvidence: {
+          branch: "forgedock/issue-1", workspacePath: "/tmp/issue-1", builderSummary: "expanded scope",
+          changedPaths: ["docs/a.md", "unrelated.ts"], checks: [],
+        },
+      },
+    });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "blocked");
+      assert.equal(decision.checkpoint, "verification");
+    }
+  });
+
   it("resumes publication after a verified build failed before review", () => {
     const runId = "run_publish";
     const decision = decideSubjectAdmission([

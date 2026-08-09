@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -27,6 +27,41 @@ describe("runtime workspace confinement", () => {
     const guard = await WorkspaceGuard.create(root);
     await assert.rejects(guard.existing("link/secret.txt"), /escapes/);
     await assert.rejects(guard.writable("link/new.txt"), /escapes/);
+  });
+
+  it("creates packet-authorized new files without widening sibling writes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-new-file-"));
+    try {
+      const scope = {
+        readRoots: ["."],
+        writeRoots: [],
+        writePaths: ["generated/contracts/host.ts"],
+        source: "build-packet" as const,
+      };
+      const write = (await createSandboxedTools(root, ["write"], scope)).find((tool) => tool.name === "write");
+      assert.ok(write);
+      await write.execute("write-new", {
+        path: "generated/contracts/host.ts",
+        content: "export const host = true;\n",
+      }, undefined, undefined, {} as never);
+      assert.equal(readFileSync(join(root, "generated", "contracts", "host.ts"), "utf8"), "export const host = true;\n");
+      await assert.rejects(
+        write.execute("write-sibling", {
+          path: "generated/contracts/other.ts",
+          content: "export const other = true;\n",
+        }, undefined, undefined, {} as never),
+        /outside the assigned scope/,
+      );
+      await assert.rejects(
+        write.execute("write-unrelated", {
+          path: "unrelated/other.ts",
+          content: "export const other = true;\n",
+        }, undefined, undefined, {} as never),
+        /outside the assigned scope/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("defaults reviewer grep patterns to literal matching unless regex mode is explicit", async () => {

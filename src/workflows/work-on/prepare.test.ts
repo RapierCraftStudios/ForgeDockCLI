@@ -47,4 +47,23 @@ describe("Build Packet preparation", () => {
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
     ]);
   });
+
+  it("canonicalizes packet paths and retains every concrete issue-declared path", async () => {
+    const runtime = new FakeAgentRuntime([investigation, { ...packet, expectedPaths: ["src\\a.ts"] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_paths", subject: { repo: "a/b", issue: 2 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const scopeHints = { affectedFiles: ["src/a.ts", "test/a.test.ts"], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
+    }, { runtime, artifacts, runs });
+
+    assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("test"));
+  });
 });

@@ -176,6 +176,7 @@ export async function resumeBuildWorkOn(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
+    priorVerificationFailure?: DurableArtifact<"Outcome">;
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -226,6 +227,7 @@ async function continueBuildDelivery(
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
     scopeHints?: ScopeHints;
+    priorVerificationFailure?: DurableArtifact<"Outcome">;
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -256,6 +258,7 @@ async function continueBuildDelivery(
   const built = await buildWorkItem({
     run, intent: input.intent, investigation: input.investigation, packet: input.packet,
     ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
+    ...(input.priorVerificationFailure !== undefined ? { priorVerificationFailure: input.priorVerificationFailure } : {}),
     worktree: input.workspace.path, ...runtimeOptions,
   }, {
     runtime: dependencies.runtime,

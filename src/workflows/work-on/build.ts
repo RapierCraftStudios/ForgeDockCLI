@@ -26,6 +26,7 @@ export async function buildWorkItem(
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
     scopeHints?: ScopeHints;
+    priorVerificationFailure?: DurableArtifact<"Outcome">;
     worktree: string;
     provider?: string;
     model?: string;
@@ -39,16 +40,26 @@ export async function buildWorkItem(
     const result = await dependencies.runtime.run<BuilderSubmission>({
       id: `${run.runId}:build:${run.attempt}`,
       role: "builder",
-      objective: "Implement exactly the accepted Build Packet in the assigned worktree.",
+      objective: input.priorVerificationFailure
+        ? `Repair the in-packet implementation after controller verification failed: ${input.priorVerificationFailure.payload.reason}`
+        : "Implement exactly the accepted Build Packet in the assigned worktree.",
       instructions: [
         "Read the affected code before editing.",
+        ...(input.priorVerificationFailure ? [
+          "This is a bounded repair of the retained implementation. Use the controller-recorded failed checks as evidence and change only frozen Build Packet paths.",
+        ] : []),
         "Do not expand scope or perform unrelated cleanup.",
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "The controller runs verification and owns git publication after your edits.",
         "Report paths and criterion coverage accurately; the controller will independently inspect the diff.",
       ].join("\n"),
-      context: [input.intent, input.investigation, input.packet],
+      context: [
+        input.intent,
+        input.investigation,
+        input.packet,
+        ...(input.priorVerificationFailure ? [input.priorVerificationFailure] : []),
+      ],
       workspace: {
         cwd: input.worktree,
         mode: "write",

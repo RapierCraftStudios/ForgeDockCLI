@@ -141,15 +141,27 @@ describe("complete work-on trajectory", () => {
     }
     for (const artifact of [intent, investigationArtifact, packetArtifact]) await artifacts.append(artifact);
 
+    const priorVerificationFailure = createArtifact({
+      kind: "Outcome", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "Required verification failed: npm test (exit 1)", childIssues: [],
+        failureEvidence: {
+          branch: workspace.branch, workspacePath: workspace.path, builderSummary: "first attempt",
+          changedPaths: ["src/a.js"], checks: [{ command: "npm test", status: "failed", durationMs: 1 }],
+        },
+      },
+    });
     const runtime = new FakeAgentRuntime([submission, { summary: "Approved", findings: [] }]);
     const resumed = await resumeBuildWorkOn({
-      run, intent, investigation: investigationArtifact, packet: packetArtifact,
+      run, intent, investigation: investigationArtifact, packet: packetArtifact, priorVerificationFailure,
       workspace, baseBranch: "main", autoMerge: true,
       verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
+    assert.match(runtime.tasks[0]?.objective ?? "", /controller verification failed/);
+    assert.ok(runtime.tasks[0]?.context.some((artifact) => artifact.kind === "Outcome"));
   });
 
   it("resumes publication without replaying build or verification", async () => {

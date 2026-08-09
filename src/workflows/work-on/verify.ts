@@ -5,6 +5,7 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
+import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import type { BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
@@ -40,8 +41,9 @@ export async function verifyAndCommit(
     const uncoveredPlan = uncoveredVerificationCommands(input.packet.payload.verificationPlan, input.commands);
     const observedChecks = uncoveredPlan.length ? [] : await dependencies.verifier.run(input.commands, input.signal);
     const checks = observedChecks.map((check, index) => compareWithBaseline(check, input.baselineChecks?.[index]));
-    const changedPaths = await dependencies.git.changedPaths(input.workspace);
-    const unexpected = changedPaths.filter((path) => !input.packet.payload.expectedPaths.includes(path));
+    const changedPaths = canonicalizeConcreteScopePaths(await dependencies.git.changedPaths(input.workspace));
+    const expectedPaths = new Set(canonicalizeConcreteScopePaths(input.packet.payload.expectedPaths));
+    const unexpected = changedPaths.filter((path) => !expectedPaths.has(path));
     const requiredFailure = input.commands.some((command, index) => command.required && checks[index]?.status !== "passed");
     const failure = !changedPaths.length
       ? "Builder produced no repository changes"
@@ -88,7 +90,7 @@ export async function verifyAndCommit(
 
     const headSha = await dependencies.git.commit(input.workspace, `forge: implement issue ${run.subject.issue ?? "work item"}`);
     const revisionChangedPaths = dependencies.git.revisionChangedPaths
-      ? [...new Set([...(await dependencies.git.revisionChangedPaths(input.workspace)), ...changedPaths])].sort()
+      ? canonicalizeConcreteScopePaths([...(await dependencies.git.revisionChangedPaths(input.workspace)), ...changedPaths]).sort()
       : changedPaths;
     const evidenceSummary = checks.length
       ? `Required verification passed: ${checks.map((check) => check.command).join(", ")}`
@@ -151,8 +153,7 @@ export function uncoveredVerificationCommands(
       // Read-only diff inspection remains semantic reviewer evidence. Other
       // explicitly requested executable tools are unsupported rather than
       // silently represented as having run.
-      if (/^(?:node|npx|pnpm|yarn|python|python3|pytest|cargo|go|make)\b/i.test(candidate)
-        && /^\s*(?:run|execute)/i.test(step)) {
+      if (/^(?:node|npx|pnpm|yarn|python|python3|pytest|cargo|go|make)\b/i.test(candidate)) {
         uncovered.add(candidate);
       }
     }

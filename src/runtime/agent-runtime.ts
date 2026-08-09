@@ -46,15 +46,14 @@ export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints 
   const metadataRoots = [...(hints.metadataRoots ?? [])]
     .map(normalizeScopePath)
     .filter((value): value is string => Boolean(value) && isSafeRelativeScopePath(value));
-  const writePaths = [...(hints.writePaths ?? [])]
-    .map((value) => normalizeScopePath(stripLocation(value)))
-    .filter(Boolean);
-  assertConcreteScopePaths(writePaths);
+  const writePaths = canonicalizeConcreteScopePaths(
+    [...(hints.writePaths ?? [])].map(stripLocation),
+  );
   const readRoots = [...new Set([...paths, ...metadataRoots])];
   return {
     readRoots,
     writeRoots: [],
-    ...(writePaths.length ? { writePaths: [...new Set(writePaths)] } : {}),
+    ...(writePaths.length ? { writePaths } : {}),
     source,
   };
 }
@@ -65,6 +64,23 @@ export function assertConcreteScopePaths(paths: readonly string[]): void {
   if (invalid.length) {
     throw new Error(`Scope write paths must be concrete repository-relative files: ${invalid.join(", ")}`);
   }
+}
+
+/** Canonical representation shared by packet grants and Git diff comparisons. */
+export function canonicalizeConcreteScopePaths(paths: readonly string[]): string[] {
+  const normalized = paths.map(normalizeScopePath).filter(Boolean);
+  assertConcreteScopePaths(normalized);
+  return [...new Set(normalized)];
+}
+
+/** Top-level, non-root read boundaries used to discover cross-directory consumers. */
+export function scopeDiscoveryRoots(paths: readonly string[]): string[] {
+  const roots = paths
+    .map((value) => scopeDirectory(stripLocation(value)))
+    .filter((value) => Boolean(value) && value !== "." && isSafeRelativeScopePath(value))
+    .map((value) => value.split("/")[0]!)
+    .filter((value) => value !== ".");
+  return [...new Set(roots)];
 }
 
 export function isConcreteScopePath(value: string): boolean {

@@ -64,8 +64,6 @@ export async function completeWorkItem(
         childIssues: childIssues.map((child) => `issue-${child}`),
       },
     });
-    await dependencies.artifacts.append(outcome);
-    run = attachArtifact(run, "Outcome", outcome.id);
     const childOutcomes: Array<{ issue: number; artifact: DurableArtifact<"Outcome"> }> = [];
     for (const childIssue of childIssues) {
       const childOutcome = createArtifact({
@@ -82,7 +80,6 @@ export async function completeWorkItem(
           batchParent: issue,
         },
       });
-      await dependencies.artifacts.append(childOutcome);
       childOutcomes.push({ issue: childIssue, artifact: childOutcome });
     }
 
@@ -131,6 +128,12 @@ export async function completeWorkItem(
       await dependencies.host.closeIssue(run.subject.repo, childIssue, `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`);
     }
     await dependencies.host.closeIssue(run.subject.repo, issue, `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`);
+    // A merged Outcome is the durable terminal projection. Publish it only
+    // after every idempotent trajectory and closure side effect succeeds, so
+    // an interruption remains recoverable from the approving verdict.
+    for (const child of childOutcomes) await dependencies.artifacts.append(child.artifact);
+    await dependencies.artifacts.append(outcome);
+    run = attachArtifact(run, "Outcome", outcome.id);
     const closed = transition(run, "CLOSE_COMPLETED");
     await dependencies.runs.commit(run.version, closed.state, closed.record);
     return { run: closed.state, awaitingHuman: false, outcome };
