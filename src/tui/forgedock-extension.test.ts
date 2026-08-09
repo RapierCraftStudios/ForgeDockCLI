@@ -631,6 +631,7 @@ test("orchestration scope resolution binds an exact milestone to its open member
   const calls: string[] = [];
   const scope = await resolveOrchestrationInvocationScope("throwaway-milestone --auto", process.cwd(), {
     async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number) { return { number, title: "throwaway-milestone", state: "open" as const }; },
     async getIssue(number) { return { number, state: "OPEN" as const }; },
     async listOpenIssueNumbersForMilestone(title) { calls.push(title); return [129]; },
   });
@@ -642,6 +643,24 @@ test("orchestration scope resolution binds an exact milestone to its open member
     noMilestone: false,
   });
   assert.deepEqual(calls, ["throwaway-milestone"]);
+});
+
+test("orchestration scope resolves a GitHub milestone URL before selecting open members", async () => {
+  const calls: Array<string | number> = [];
+  const scope = await resolveOrchestrationInvocationScope("https://github.com/a/b/milestone/1", process.cwd(), {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number) { calls.push(number); return { number, title: "Milestone One", state: "open" as const }; },
+    async getIssue(number) { return { number, state: "OPEN" as const }; },
+    async listOpenIssueNumbersForMilestone(title) { calls.push(title); return [7, 8]; },
+  });
+  assert.deepEqual(scope, {
+    rawArgs: "https://github.com/a/b/milestone/1",
+    issueNumbers: [7, 8],
+    repository: "a/b",
+    milestone: "Milestone One",
+    noMilestone: false,
+  });
+  assert.deepEqual(calls, [1, "Milestone One"]);
 });
 
 test("orchestration tool rejects source-issue substitution before dispatch", async () => {

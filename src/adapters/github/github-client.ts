@@ -100,6 +100,16 @@ export class GitHubClient implements ForgeHost {
     return { repo: parsed.nameWithOwner, defaultBranch: parsed.defaultBranchRef.name };
   }
 
+  async getMilestone(number: number, repo?: string): Promise<{ number: number; title: string; state: "open" | "closed" }> {
+    const resolvedRepo = repo ?? await this.resolveRepository();
+    const result = await this.gh(["api", `repos/${resolvedRepo}/milestones/${number}`]);
+    const milestone = JSON.parse(result) as { number?: number; title?: string; state?: string };
+    if (milestone.number !== number || !milestone.title || (milestone.state !== "open" && milestone.state !== "closed")) {
+      throw new Error(`Unable to resolve milestone #${number} in ${resolvedRepo}`);
+    }
+    return { number, title: milestone.title, state: milestone.state };
+  }
+
   async listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]> {
     const resolvedRepo = repo ?? await this.resolveRepository();
     const result = await this.gh([

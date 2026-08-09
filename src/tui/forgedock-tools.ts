@@ -71,6 +71,7 @@ export interface OrchestrationInvocationScope {
 
 interface OrchestrationScopeResolverHost {
   getRepository(): Promise<{ repo: string; defaultBranch: string }>;
+  getMilestone(number: number, repo?: string): Promise<{ number: number; title: string; state: "open" | "closed" }>;
   getIssue(number: number, repo?: string): Promise<{ number: number; state: "OPEN" | "CLOSED"; milestone?: { number: number; title: string } }>;
   listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]>;
 }
@@ -114,9 +115,20 @@ export async function resolveOrchestrationInvocationScope(
       noMilestone: milestone === undefined,
     };
   }
-  const issueNumbers = await host.listOpenIssueNumbersForMilestone(selector, repository.repo);
-  if (!issueNumbers.length) throw new Error(`No open issues are assigned to exact milestone '${selector}'`);
-  return { rawArgs, issueNumbers, repository: repository.repo, milestone: selector, noMilestone: false };
+  let milestoneTitle = selector;
+  const milestoneUrl = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/milestone\/(\d+)\/?(?:[?#].*)?$/i.exec(selector);
+  if (milestoneUrl) {
+    const urlRepository = `${milestoneUrl[1]}/${milestoneUrl[2]}`;
+    if (urlRepository.toLowerCase() !== repository.repo.toLowerCase()) {
+      throw new Error(`Milestone URL repository ${urlRepository} conflicts with controller checkout ${repository.repo}`);
+    }
+    const milestoneNumber = Number(milestoneUrl[3]);
+    const milestone = await host.getMilestone(milestoneNumber, repository.repo);
+    milestoneTitle = milestone.title;
+  }
+  const issueNumbers = await host.listOpenIssueNumbersForMilestone(milestoneTitle, repository.repo);
+  if (!issueNumbers.length) throw new Error(`No open issues are assigned to exact milestone '${milestoneTitle}'`);
+  return { rawArgs, issueNumbers, repository: repository.repo, milestone: milestoneTitle, noMilestone: false };
 }
 
 export function workflowCommandDisplay(command: WorkflowCommand): string {
