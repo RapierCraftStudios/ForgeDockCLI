@@ -7,6 +7,7 @@ import { attachArtifact, createRun, transition, type RunState, type RunTarget, t
 import {
   scopeDiscoveryRoots,
   scopeManifestFor,
+  STANDARD_SCOPE_DISCOVERY_ROOTS,
   STANDARD_SCOPE_METADATA_ROOTS,
   type AgentEventSink,
   type AgentRuntime,
@@ -49,6 +50,7 @@ export async function investigateWorkItem(
   const scopeManifest = scopeManifestFor("issue-hints", {
     ...scopeHints,
     metadataRoots: [
+      ...STANDARD_SCOPE_DISCOVERY_ROOTS,
       ...STANDARD_SCOPE_METADATA_ROOTS,
       ...(scopeHints.metadataRoots ?? []),
       ...scopeDiscoveryRoots(affectedFiles),

@@ -9,6 +9,7 @@ import {
   scopeDiscoveryRoots,
   scopeManifestFor,
   scopeManifestForBuildPacket,
+  STANDARD_SCOPE_DISCOVERY_ROOTS,
   STANDARD_SCOPE_METADATA_ROOTS,
   type AgentEventSink,
   type AgentRuntime,
@@ -61,6 +62,7 @@ export async function prepareBuildPacket(
           affectedFiles: affectedScope,
           ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
           metadataRoots: [
+            ...STANDARD_SCOPE_DISCOVERY_ROOTS,
             ...STANDARD_SCOPE_METADATA_ROOTS,
             ...scopeDiscoveryRoots(affectedScope),
           ],

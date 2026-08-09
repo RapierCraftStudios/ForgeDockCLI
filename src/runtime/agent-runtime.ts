@@ -30,6 +30,17 @@ export interface WorkspaceGrant {
   scope: ScopeManifest;
 }
 
+export const STANDARD_SCOPE_DISCOVERY_ROOTS = [
+  "src",
+  "bin",
+  "packages",
+  "scripts",
+  "test",
+  "tests",
+  "migrations",
+  "docs",
+] as const;
+
 export const STANDARD_SCOPE_METADATA_ROOTS = [
   "package.json",
   "package-lock.json",
