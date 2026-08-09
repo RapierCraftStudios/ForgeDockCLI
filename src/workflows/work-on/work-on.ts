@@ -6,16 +6,20 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import type { TelemetryRepository } from "../../core/ports/telemetry.js";
+import {
+  isRepairableVerificationFailure,
+  MAX_VERIFICATION_REPAIR_ATTEMPTS,
+} from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
-import { buildWorkItem } from "./build.js";
+import { buildWorkItem, type BuilderSubmission } from "./build.js";
 import { completeWorkItem } from "./complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
-import { verifyAndCommit } from "./verify.js";
+import { verifyAndCommit, type VerificationResult } from "./verify.js";
 import { materializeReviewFindings, reviewPullRequest } from "../review-pr/review.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
@@ -42,6 +46,15 @@ export interface WorkOnResult {
   awaitingHuman?: boolean;
 }
 
+interface ScopeExpansionOptions {
+  scopeExpansion?: "scope-locked" | "recursive";
+  parentRemediation?: ParentRemediationTarget;
+  maxRemediationDepth?: number;
+  maxRemediationChildren?: number;
+  remediationDepth?: number;
+  approvedPaths?: readonly string[];
+}
+
 export async function workOn(
   input: {
     intent: DurableArtifact<"Intent">;
@@ -57,6 +70,7 @@ export async function workOn(
     maxRemediationCycles?: number;
     maxRemediationDepth?: number;
     maxRemediationChildren?: number;
+    remediationDepth?: number;
     scopeExpansion?: "scope-locked" | "recursive";
     parentRemediation?: ParentRemediationTarget;
     maxReviewSpecialists?: number;
@@ -88,9 +102,12 @@ export async function workOn(
       assertParentRemediationTarget(input.parentRemediation);
       if (dependencies.host.getBranchHead) {
         const currentParentHead = await dependencies.host.getBranchHead(input.intent.subject.repo, input.parentRemediation.parentBranch);
-        if (currentParentHead !== input.parentRemediation.parentHeadSha) {
-          throw new Error(`Parent remediation branch ${input.parentRemediation.parentBranch} moved from ${input.parentRemediation.parentHeadSha} to ${currentParentHead}`);
+        if (!/^[0-9a-f]{7,64}$/i.test(currentParentHead)) {
+          throw new Error(`Parent remediation branch ${input.parentRemediation.parentBranch} has no authoritative head SHA`);
         }
+        // Sibling remediation PRs may already have advanced the parent branch.
+        // The active checkpoint authorizes the branch, while final parent
+        // verification proves the complete expanded revision and exact scope.
       }
     }
     const deliveryBranch = input.parentRemediation?.parentBranch ?? input.lane.targetBranch;
@@ -142,6 +159,7 @@ export async function workOn(
       ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
       ...(input.maxRemediationDepth !== undefined ? { maxRemediationDepth: input.maxRemediationDepth } : {}),
       ...(input.maxRemediationChildren !== undefined ? { maxRemediationChildren: input.maxRemediationChildren } : {}),
+      ...(input.remediationDepth !== undefined ? { remediationDepth: input.remediationDepth } : {}),
       ...(input.scopeExpansion !== undefined ? { scopeExpansion: input.scopeExpansion } : {}),
       ...(input.parentRemediation !== undefined ? { parentRemediation: input.parentRemediation } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
@@ -170,6 +188,30 @@ export async function workOn(
   }
 }
 
+async function appendVerificationRepairCheckpoint(
+  run: RunState,
+  failure: DurableArtifact<"Outcome">,
+  repairAttempt: number,
+  dependencies: Pick<WorkOnDependencies, "artifacts">,
+): Promise<{ run: RunState; outcome: DurableArtifact<"Outcome"> }> {
+  const failureEvidence = failure.payload.failureEvidence;
+  if (!failureEvidence) throw new Error("Verification repair requires durable failure evidence");
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: run.runId,
+    subject: run.subject,
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      status: "blocked",
+      reason: `Verification repair attempt ${repairAttempt} dispatched: ${failure.payload.reason}`,
+      childIssues: [],
+      failureEvidence: { ...failureEvidence, repairAttempt },
+    },
+  });
+  await dependencies.artifacts.append(outcome);
+  return { run: attachArtifact(run, "Outcome", outcome.id), outcome };
+}
+
 export async function resumeBuildWorkOn(
   input: {
     run: RunState;
@@ -177,6 +219,8 @@ export async function resumeBuildWorkOn(
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
+    priorVerificationRepairAttempts?: number;
+    repairContext?: readonly DurableArtifact[];
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -185,9 +229,15 @@ export async function resumeBuildWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    priorRemediationCycles?: number;
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    scopeExpansion?: "scope-locked" | "recursive";
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
+    parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -196,10 +246,41 @@ export async function resumeBuildWorkOn(
   assertRunTargetsBranch(input.run, input.baseBranch);
   let run = input.run;
   try {
+    let priorVerificationFailure = input.priorVerificationFailure;
+    let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
+    if (priorVerificationFailure) {
+      const dispatchedAttempt = priorVerificationFailure.payload.failureEvidence?.repairAttempt;
+      if (dispatchedAttempt !== undefined) {
+        if (dispatchedAttempt > MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+          throw new Error(`Invalid verification repair attempt ${dispatchedAttempt}`);
+        }
+        // A durable dispatch checkpoint may survive a crash before its builder
+        // starts. Resume that same attempt instead of spending another slot.
+        repairAttempts = Math.max(repairAttempts, dispatchedAttempt);
+      } else {
+        if (repairAttempts >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+          throw new Error(`Verification repair budget exhausted after ${MAX_VERIFICATION_REPAIR_ATTEMPTS} repair attempt(s)`);
+        }
+        const checkpoint = await appendVerificationRepairCheckpoint(
+          run,
+          priorVerificationFailure,
+          repairAttempts + 1,
+          dependencies,
+        );
+        run = checkpoint.run;
+        priorVerificationFailure = checkpoint.outcome;
+        repairAttempts += 1;
+      }
+    }
     const resumed = transition(run, "RESUME_BUILD", { reason: `Resuming frozen Build Packet in retained workspace ${input.workspace.path}` });
     await dependencies.runs.commit(run.version, resumed.state, resumed.record);
     run = resumed.state;
-    const result = await continueBuildDelivery({ ...input, run }, dependencies);
+    const result = await continueBuildDelivery({
+      ...input,
+      run,
+      priorVerificationRepairAttempts: repairAttempts,
+      ...(priorVerificationFailure ? { priorVerificationFailure } : {}),
+    }, dependencies);
     run = result.run;
     return result;
   } catch (error) {
@@ -220,6 +301,92 @@ export async function resumeBuildWorkOn(
   }
 }
 
+async function verifyWithBuilderRepairs(
+  input: {
+    run: RunState;
+    intent: DurableArtifact<"Intent">;
+    investigation: DurableArtifact<"Investigation">;
+    packet: DurableArtifact<"BuildPacket">;
+    submission: BuilderSubmission;
+    repairContext?: readonly DurableArtifact[];
+    priorVerificationRepairAttempts?: number;
+    workspace: GitWorkspace;
+    commands: readonly VerificationCommand[];
+    baselineChecks?: readonly CheckResult[];
+    subjectEvidence?: readonly string[];
+    provider?: string;
+    model?: string;
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<VerificationResult> {
+  let run = input.run;
+  let submission = input.submission;
+  let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
+  const runtimeOptions = {
+    ...(input.provider !== undefined ? { provider: input.provider } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  };
+  while (true) {
+    const verified = await verifyAndCommit({
+      run,
+      packet: input.packet,
+      submission,
+      workspace: input.workspace,
+      commands: input.commands,
+      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, {
+      verifier: dependencies.verifier,
+      git: dependencies.git,
+      artifacts: dependencies.artifacts,
+      runs: dependencies.runs,
+    });
+    run = verified.run;
+    if (verified.buildResult || !isRepairableVerificationFailure(input.packet, verified.outcome)) return verified;
+
+    if (repairAttempts >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+      const reason = `Verification repair budget exhausted after ${MAX_VERIFICATION_REPAIR_ATTEMPTS} repair attempt(s)`;
+      const exhausted = transition(run, "VERIFICATION_REPAIR_EXHAUSTED", { reason });
+      await dependencies.runs.commit(run.version, exhausted.state, exhausted.record);
+      return { ...verified, run: exhausted.state };
+    }
+
+    const nextRepairAttempt = repairAttempts + 1;
+    const checkpoint = await appendVerificationRepairCheckpoint(
+      run,
+      verified.outcome!,
+      nextRepairAttempt,
+      dependencies,
+    );
+    run = checkpoint.run;
+    const repair = transition(run, "VERIFICATION_REPAIR_REQUESTED", {
+      reason: `Repairing retained verification failure ${nextRepairAttempt} of ${MAX_VERIFICATION_REPAIR_ATTEMPTS}`,
+    });
+    await dependencies.runs.commit(run.version, repair.state, repair.record);
+    run = repair.state;
+    repairAttempts = nextRepairAttempt;
+    const repaired = await buildWorkItem({
+      run,
+      intent: input.intent,
+      investigation: input.investigation,
+      packet: input.packet,
+      priorVerificationFailure: checkpoint.outcome,
+      ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
+      worktree: input.workspace.path,
+      ...runtimeOptions,
+    }, {
+      runtime: dependencies.runtime,
+      runs: dependencies.runs,
+      ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+    });
+    run = repaired.run;
+    submission = repaired.submission;
+  }
+}
+
 async function continueBuildDelivery(
   input: {
     run: RunState;
@@ -228,6 +395,8 @@ async function continueBuildDelivery(
     packet: DurableArtifact<"BuildPacket">;
     scopeHints?: ScopeHints;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
+    priorVerificationRepairAttempts?: number;
+    repairContext?: readonly DurableArtifact[];
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -236,8 +405,10 @@ async function continueBuildDelivery(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    priorRemediationCycles?: number;
     maxRemediationDepth?: number;
     maxRemediationChildren?: number;
+    remediationDepth?: number;
     scopeExpansion?: "scope-locked" | "recursive";
     parentRemediation?: ParentRemediationTarget;
     maxReviewSpecialists?: number;
@@ -255,10 +426,12 @@ async function continueBuildDelivery(
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   };
   let run = input.run;
+  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
   const built = await buildWorkItem({
     run, intent: input.intent, investigation: input.investigation, packet: input.packet,
     ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
     ...(input.priorVerificationFailure !== undefined ? { priorVerificationFailure: input.priorVerificationFailure } : {}),
+    ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
     worktree: input.workspace.path, ...runtimeOptions,
   }, {
     runtime: dependencies.runtime,
@@ -266,16 +439,23 @@ async function continueBuildDelivery(
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
   run = built.run;
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
-  let verified = await verifyAndCommit({
-    run, packet: input.packet, submission: built.submission, workspace: input.workspace, commands,
+  const initialVerification = await verifyWithBuilderRepairs({
+    run,
+    intent: input.intent,
+    investigation: input.investigation,
+    packet: input.packet,
+    submission: built.submission,
+    ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
+    priorVerificationRepairAttempts: input.priorVerificationRepairAttempts ?? 0,
+    workspace: input.workspace,
+    commands,
     ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
     ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-    ...(input.signal !== undefined ? { signal: input.signal } : {}),
-  }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
-  run = verified.run;
-  if (!verified.buildResult) return { run };
-  let buildResult = verified.buildResult;
+    ...runtimeOptions,
+  }, dependencies);
+  run = initialVerification.run;
+  if (!initialVerification.buildResult) return { run };
+  let buildResult = initialVerification.buildResult;
 
   const published = await publishPullRequest({
     run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
@@ -285,7 +465,7 @@ async function continueBuildDelivery(
   let pullRequest = published.pullRequest;
   let verdict: DurableArtifact<"ReviewVerdict">;
   let priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined;
-  let cycle = 0;
+  let cycle = input.priorRemediationCycles ?? 0;
 
   while (true) {
     const reviewed = await reviewPullRequest({
@@ -302,19 +482,16 @@ async function continueBuildDelivery(
     run = reviewed.run;
     verdict = reviewed.verdict;
     priorVerdict = verdict;
-    if (run.state === "merging") break;
-    const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+    const scopeViolation = blockingFindingOutsidePacket(
+      verdict, input.packet, undefined, input.scopeExpansion === "recursive",
+    );
     if (scopeViolation) {
-      if (input.scopeExpansion === "recursive" && input.parentRemediation === undefined) {
-        run = await blockForRecursiveRemediation(run, pullRequest, input.packet, verdict, dependencies, {
-          ...(input.maxRemediationDepth !== undefined ? { maxDepth: input.maxRemediationDepth } : {}),
-          ...(input.maxRemediationChildren !== undefined ? { maxChildren: input.maxRemediationChildren } : {}),
-        });
-      } else {
-        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
-      }
+      run = await blockForScopeViolation(
+        run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
+      );
       return { run, pullRequest };
     }
+    if (run.state === "merging") break;
 
     cycle++;
     if (cycle > (input.maxRemediationCycles ?? 2)) {
@@ -329,15 +506,22 @@ async function continueBuildDelivery(
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
     run = remediated.run;
-    verified = await verifyAndCommit({
-      run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+    const remediationVerification = await verifyWithBuilderRepairs({
+      run,
+      intent: input.intent,
+      investigation: input.investigation,
+      packet: input.packet,
+      submission: remediated.submission,
+      repairContext: [buildResult, verdict],
+      workspace: input.workspace,
+      commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
-    run = verified.run;
-    if (!verified.buildResult) return { run, pullRequest };
-    buildResult = verified.buildResult;
+      ...runtimeOptions,
+    }, dependencies);
+    run = remediationVerification.run;
+    if (!remediationVerification.buildResult) return { run, pullRequest };
+    buildResult = remediationVerification.buildResult;
     const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
     });
@@ -369,6 +553,10 @@ export async function resumeWorkOn(
     autoMerge?: boolean;
     maxRemediationCycles?: number;
     priorRemediationCycles?: number;
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    scopeExpansion?: "scope-locked" | "recursive";
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
@@ -379,6 +567,9 @@ export async function resumeWorkOn(
 ): Promise<WorkOnResult> {
   const evidence = input.outcome.payload.failureEvidence;
   if (input.run.state !== "blocked" || !evidence) throw new Error("Only a blocked verification run with retained evidence can resume");
+  if (!evidence.criterionCoverage) {
+    throw new Error("Legacy verification evidence lacks builder criterion coverage and must resume through a bounded builder repair");
+  }
   assertRunTargetsBranch(input.run, input.baseBranch);
   if (evidence.workspacePath !== input.workspace.path || evidence.branch !== input.workspace.branch) {
     throw new Error("Recovery workspace does not match the durable failure evidence");
@@ -395,21 +586,24 @@ export async function resumeWorkOn(
   const submission = {
     summary: evidence.builderSummary,
     changedPaths: evidence.changedPaths,
-    criterionCoverage: input.packet.payload.acceptanceCriteria.map((criterion) => ({
-      criterion,
-      implementation: `Retained implementation resumed from ${input.workspace.branch}; executable verification is re-run before publication.`,
-    })),
-    decisions: [],
-    residualRisks: [],
+    criterionCoverage: evidence.criterionCoverage,
+    decisions: evidence.decisions ?? [],
+    residualRisks: evidence.residualRisks ?? [],
   };
   const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
   try {
-    let verified = await verifyAndCommit({
-      run, packet: input.packet, submission, workspace: input.workspace, commands,
+    let verified = await verifyWithBuilderRepairs({
+      run,
+      intent: input.intent,
+      investigation: input.investigation,
+      packet: input.packet,
+      submission,
+      workspace: input.workspace,
+      commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      ...runtimeOptions,
+    }, dependencies);
     run = verified.run;
     if (!verified.buildResult) return { run };
     let buildResult = verified.buildResult;
@@ -437,12 +631,16 @@ export async function resumeWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
-      if (run.state === "merging") break;
-      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      const scopeViolation = blockingFindingOutsidePacket(
+        verdict, input.packet, undefined, input.scopeExpansion === "recursive",
+      );
       if (scopeViolation) {
-        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+        run = await blockForScopeViolation(
+          run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
+        );
         return { run, pullRequest };
       }
+      if (run.state === "merging") break;
       cycle++;
       if (cycle > (input.maxRemediationCycles ?? 2)) {
         run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
@@ -456,12 +654,19 @@ export async function resumeWorkOn(
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       });
       run = remediated.run;
-      verified = await verifyAndCommit({
-        run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+      verified = await verifyWithBuilderRepairs({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        submission: remediated.submission,
+        repairContext: [buildResult, verdict],
+        workspace: input.workspace,
+        commands,
         ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
         ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+        ...runtimeOptions,
+      }, dependencies);
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
@@ -512,6 +717,11 @@ export async function resumeReviewWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    priorRemediationCycles?: number;
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    scopeExpansion?: "scope-locked" | "recursive";
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
@@ -551,8 +761,10 @@ export async function resumeReviewWorkOn(
   let buildResult = input.buildResult;
   let pullRequest = input.pullRequest;
   let verdict = input.priorVerdict;
-  let cycle = 1;
-  const remediationLimit = budgetBlocked ? 1 : (input.maxRemediationCycles ?? 2);
+  const exhaustedCycleCount = Number(/^Remediation budget exhausted after (\d+) cycle\(s\)$/i
+    .exec(input.run.blockedReason ?? "")?.[1] ?? 0);
+  let cycle = Math.max(0, input.priorRemediationCycles ?? (interruptedRemediation ? 1 : exhaustedCycleCount));
+  const remediationLimit = input.maxRemediationCycles ?? 2;
   try {
     if (budgetBlocked) {
       const reassessed = await reviewPullRequest({
@@ -568,6 +780,15 @@ export async function resumeReviewWorkOn(
       });
       run = reassessed.run;
       verdict = reassessed.verdict;
+      const scopeViolation = blockingFindingOutsidePacket(
+        verdict, input.packet, undefined, input.scopeExpansion === "recursive",
+      );
+      if (scopeViolation) {
+        run = await blockForScopeViolation(
+          run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
+        );
+        return { run, pullRequest };
+      }
       if (run.state === "merging") {
         const completed = await completeWorkItem({
           run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
@@ -576,11 +797,17 @@ export async function resumeReviewWorkOn(
         run = completed.run;
         return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
       }
-      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
-      if (scopeViolation) {
-        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+      if (cycle >= remediationLimit) {
+        run = await blockForReviewFindings(
+          run,
+          pullRequest,
+          verdict,
+          dependencies,
+          `Remediation budget exhausted after ${cycle} cycle(s)`,
+        );
         return { run, pullRequest };
       }
+      cycle += 1;
     }
 
     const firstRemediation = await remediateReview({
@@ -591,12 +818,19 @@ export async function resumeReviewWorkOn(
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
     run = firstRemediation.run;
-    let verified = await verifyAndCommit({
-      run, packet: input.packet, submission: firstRemediation.submission, workspace: input.workspace, commands,
+    let verified = await verifyWithBuilderRepairs({
+      run,
+      intent: input.intent,
+      investigation: input.investigation,
+      packet: input.packet,
+      submission: firstRemediation.submission,
+      repairContext: [buildResult, verdict],
+      workspace: input.workspace,
+      commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      ...runtimeOptions,
+    }, dependencies);
     run = verified.run;
     if (!verified.buildResult) return { run, pullRequest };
     buildResult = verified.buildResult;
@@ -620,12 +854,16 @@ export async function resumeReviewWorkOn(
       });
       run = reviewed.run;
       verdict = reviewed.verdict;
-      if (run.state === "merging") break;
-      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      const scopeViolation = blockingFindingOutsidePacket(
+        verdict, input.packet, undefined, input.scopeExpansion === "recursive",
+      );
       if (scopeViolation) {
-        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+        run = await blockForScopeViolation(
+          run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
+        );
         return { run, pullRequest };
       }
+      if (run.state === "merging") break;
       cycle++;
       if (cycle > remediationLimit) {
         run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
@@ -639,12 +877,19 @@ export async function resumeReviewWorkOn(
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       });
       run = remediated.run;
-      verified = await verifyAndCommit({
-        run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+      verified = await verifyWithBuilderRepairs({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        submission: remediated.submission,
+        repairContext: [buildResult, verdict],
+        workspace: input.workspace,
+        commands,
         ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
         ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+        ...runtimeOptions,
+      }, dependencies);
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
@@ -702,6 +947,11 @@ export async function resumeExpandedReviewWorkOn(
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
+    scopeExpansion?: "scope-locked" | "recursive";
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -716,9 +966,14 @@ export async function resumeExpandedReviewWorkOn(
     checkpoint: input.checkpoint,
     pullRequest: input.pullRequest,
     commands,
-    workspacePath: input.workspace.path,
+    workspace: input.workspace,
     verifier: dependencies.verifier,
-  }, { host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs });
+  }, {
+    host: dependencies.host,
+    git: dependencies.git,
+    artifacts: dependencies.artifacts,
+    runs: dependencies.runs,
+  });
   if (!proof.buildResult || proof.run.state !== "reviewing") return { run: proof.run, pullRequest: input.pullRequest };
 
   const reviewed = await reviewPullRequest({
@@ -742,9 +997,25 @@ export async function resumeExpandedReviewWorkOn(
     runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
+  const expandedViolation = blockingFindingOutsidePacket(
+    reviewed.verdict, input.packet, input.checkpoint, input.scopeExpansion === "recursive",
+  );
+  if (expandedViolation && input.scopeExpansion === "recursive") {
+    await new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }).terminalize(input.checkpoint);
+    return {
+      run: await blockForScopeViolation(reviewed.run, input.pullRequest, input.packet, reviewed.verdict, expandedViolation, {
+        scopeExpansion: input.scopeExpansion,
+        ...(input.maxRemediationDepth !== undefined ? { maxRemediationDepth: input.maxRemediationDepth } : {}),
+        ...(input.maxRemediationChildren !== undefined ? { maxRemediationChildren: input.maxRemediationChildren } : {}),
+        ...(input.remediationDepth !== undefined ? { remediationDepth: input.remediationDepth } : {}),
+        ...(input.parentRemediation !== undefined ? { parentRemediation: input.parentRemediation } : {}),
+        approvedPaths: input.checkpoint.payload.approvedPaths,
+      }, dependencies),
+      pullRequest: input.pullRequest,
+    };
+  }
   if (reviewed.run.state !== "merging") {
-    const violation = blockingFindingOutsidePacket(reviewed.verdict, input.packet, input.checkpoint);
-    const reason = violation ?? "Fresh expanded-scope review requested additional changes";
+    const reason = expandedViolation ?? "Fresh expanded-scope review requested additional changes";
     await new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }).terminalize(input.checkpoint);
     return { run: await blockForReviewFindings(reviewed.run, input.pullRequest, reviewed.verdict, dependencies, reason), pullRequest: input.pullRequest };
   }
@@ -776,6 +1047,10 @@ export async function resumePublicationWorkOn(
     autoMerge?: boolean;
     maxRemediationCycles?: number;
     priorRemediationCycles?: number;
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    scopeExpansion?: "scope-locked" | "recursive";
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
@@ -793,7 +1068,7 @@ export async function resumePublicationWorkOn(
     const expectedHead = /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i
       .exec(input.run.failure ?? "")?.[1];
     if (!input.priorVerdict
-      || Date.parse(input.buildResult.createdAt) <= Date.parse(input.priorVerdict.createdAt)
+      || input.priorVerdict.payload.headSha === input.buildResult.payload.headSha
       || expectedHead?.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()) {
       throw new Error("Failed run does not carry proof of a newer verified remediation head after a stale PR projection");
     }
@@ -838,12 +1113,16 @@ export async function resumePublicationWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
-      if (run.state === "merging") break;
-      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      const scopeViolation = blockingFindingOutsidePacket(
+        verdict, input.packet, undefined, input.scopeExpansion === "recursive",
+      );
       if (scopeViolation) {
-        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+        run = await blockForScopeViolation(
+          run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
+        );
         return { run, pullRequest };
       }
+      if (run.state === "merging") break;
       cycle++;
       if (cycle > (input.maxRemediationCycles ?? 2)) {
         run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
@@ -857,12 +1136,19 @@ export async function resumePublicationWorkOn(
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       });
       run = remediated.run;
-      const verified = await verifyAndCommit({
-        run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+      const verified = await verifyWithBuilderRepairs({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        submission: remediated.submission,
+        repairContext: [buildResult, verdict],
+        workspace: input.workspace,
+        commands,
         ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
         ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+        ...runtimeOptions,
+      }, dependencies);
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
@@ -950,13 +1236,15 @@ function blockingFindingOutsidePacket(
   verdict: DurableArtifact<"ReviewVerdict">,
   packet: DurableArtifact<"BuildPacket">,
   checkpoint?: DurableArtifact<"RemediationBlocked">,
+  includeEligibleFollowUps = false,
 ): string | undefined {
   const expected = [
     ...packet.payload.expectedPaths,
     ...(checkpoint?.payload.status === "ready-to-resume" ? checkpoint.payload.approvedPaths : []),
   ].map((path) => normalizeRepoPath(path));
   const violations = verdict.payload.findings
-    .filter((finding) => finding.blocking && finding.location)
+    .filter((finding) => finding.location
+      && (finding.blocking || (includeEligibleFollowUps && finding.scopeDisposition === "follow_up")))
     .map((finding) => ({ finding, path: repositoryPathFromLocation(finding.location!) }))
     .filter(({ path }) => path !== undefined && !expected.some((allowed) => pathMatchesExpectation(path!, allowed)));
   if (!violations.length) return undefined;
@@ -976,7 +1264,6 @@ function pathMatchesExpectation(path: string, expected: string): boolean {
 export function shouldAppendFailureOutcome(existing: readonly DurableArtifact[], runId: string, reason: string): boolean {
   const latestFailure = existing
     .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.runId === runId && artifact.kind === "Outcome" && artifact.payload.status === "failed")
-    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
     .at(-1);
   return latestFailure?.payload.reason !== reason;
 }
@@ -993,19 +1280,41 @@ async function appendFailureOutcome(run: RunState, reason: string, dependencies:
   }));
 }
 
+async function blockForScopeViolation(
+  run: RunState,
+  pullRequest: PullRequestSnapshot,
+  packet: DurableArtifact<"BuildPacket">,
+  verdict: DurableArtifact<"ReviewVerdict">,
+  scopeViolation: string,
+  options: ScopeExpansionOptions,
+  dependencies: WorkOnDependencies,
+): Promise<RunState> {
+  if (options.scopeExpansion === "recursive") {
+    return blockForRecursiveRemediation(run, pullRequest, packet, verdict, dependencies, {
+      ...(options.remediationDepth !== undefined ? { depth: options.remediationDepth } : {}),
+      ...(options.maxRemediationDepth !== undefined ? { maxDepth: options.maxRemediationDepth } : {}),
+      ...(options.maxRemediationChildren !== undefined ? { maxChildren: options.maxRemediationChildren } : {}),
+      ...(options.approvedPaths !== undefined ? { approvedPaths: options.approvedPaths } : {}),
+    });
+  }
+  return blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+}
+
 async function blockForRecursiveRemediation(
   run: RunState,
   pullRequest: PullRequestSnapshot,
   packet: DurableArtifact<"BuildPacket">,
   verdict: DurableArtifact<"ReviewVerdict">,
   dependencies: WorkOnDependencies,
-  limits: { maxDepth?: number; maxChildren?: number },
+  limits: { depth?: number; maxDepth?: number; maxChildren?: number; approvedPaths?: readonly string[] },
 ): Promise<RunState> {
   const supervisor = new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }, {
     ...(limits.maxDepth !== undefined ? { maxDepth: limits.maxDepth } : {}),
     ...(limits.maxChildren !== undefined ? { maxChildren: limits.maxChildren } : {}),
   });
-  const findings: RemediationFindingInput[] = verdict.payload.findings.filter((finding) => finding.blocking && finding.location).map((finding) => ({
+  const findings: RemediationFindingInput[] = verdict.payload.findings
+    .filter((finding) => finding.location && (finding.blocking || finding.scopeDisposition === "follow_up"))
+    .map((finding) => ({
     id: finding.id,
     severity: finding.severity,
     title: finding.title,
@@ -1021,8 +1330,10 @@ async function blockForRecursiveRemediation(
     verdictArtifact: verdict,
     reason: "scope-violation",
     findings,
+    ...(limits.depth !== undefined ? { remediationDepth: limits.depth } : {}),
     ...(limits.maxDepth !== undefined ? { maxRemediationDepth: limits.maxDepth } : {}),
     ...(limits.maxChildren !== undefined ? { maxRemediationChildren: limits.maxChildren } : {}),
+    ...(limits.approvedPaths !== undefined ? { approvedPaths: limits.approvedPaths } : {}),
   });
   const reason = result.childIssues.length
     ? `Recursive remediation suspended with checkpoint ${result.checkpoint.payload.checkpointKey}; child issues: ${result.childIssues.map((issue) => `#${issue}`).join(", ")}`

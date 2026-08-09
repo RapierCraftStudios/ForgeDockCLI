@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
-import { GitHubArtifactRepository, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -83,6 +83,45 @@ describe("GitHub review finding projection", () => {
       reviewFindingMarker("a/b", 57, finding),
       reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Response variants are missing" }),
     );
+  });
+});
+
+describe("GitHub issue closure", () => {
+  function closeClient(closeChangesState: boolean) {
+    let state: "OPEN" | "CLOSED" = "OPEN";
+    const comments: Array<{ body: string }> = [];
+    let closeCalls = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({ number: 2, title: "Issue", body: "", url: "https://github.test/a/b/issues/2", state, labels: [], milestone: null });
+      }
+      if (args[0] === "issue" && args[1] === "close") {
+        closeCalls += 1;
+        if (closeChangesState) state = "CLOSED";
+        return "";
+      }
+      if (args[0] === "api" && args.some((arg) => arg === "POST")) {
+        comments.push({ body: JSON.parse(input ?? "{}").body as string });
+        return "{}";
+      }
+      if (args[0] === "api") return JSON.stringify([comments]);
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    return { client, comments, closeCalls: () => closeCalls };
+  }
+
+  it("confirms authoritative closure and deduplicates its audit comment", async () => {
+    const fixture = closeClient(true);
+    await fixture.client.closeIssue("a/b", 2, "Done");
+    await fixture.client.closeIssue("a/b", 2, "Done");
+    assert.equal(fixture.closeCalls(), 1);
+    assert.equal(fixture.comments.length, 1);
+  });
+
+  it("rejects a close command that leaves authoritative GitHub state open", async () => {
+    const fixture = closeClient(false);
+    await assert.rejects(fixture.client.closeIssue("a/b", 2, "Done"), /authoritative GitHub state is OPEN/);
   });
 });
 

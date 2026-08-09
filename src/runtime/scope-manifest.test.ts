@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import { createSandboxedTools, WorkspaceGuard } from "./sandboxed-tools.js";
-import { scopeManifestFor } from "./agent-runtime.js";
+import { scopeManifestFor, scopeManifestForBuildPacket } from "./agent-runtime.js";
 
 describe("scope manifests", () => {
   it("limits reads and writes to declared roots while retaining lexical and symlink guards", async () => {
@@ -39,6 +39,21 @@ describe("scope manifests", () => {
     assert.ok(manifest.readRoots.includes("src/api"));
     assert.ok(manifest.readRoots.includes("package.json"));
     assert.deepEqual(manifest.writeRoots, []);
+  });
+
+  it("derives top-level discovery reads and exact writes from a frozen Build Packet", () => {
+    const manifest = scopeManifestForBuildPacket([
+      "src/core/ports/forge-host.ts",
+      "src/adapters/github/github-client.ts",
+    ]);
+    assert.ok(manifest.readRoots.includes("src"));
+    assert.ok(manifest.readRoots.includes("package.json"));
+    assert.ok(!manifest.readRoots.includes("."));
+    assert.deepEqual(manifest.writeRoots, []);
+    assert.deepEqual(manifest.writePaths, [
+      "src/core/ports/forge-host.ts",
+      "src/adapters/github/github-client.ts",
+    ]);
   });
 
   it("does not turn semantic claims into nonexistent filesystem roots", () => {

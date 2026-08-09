@@ -29,6 +29,31 @@ describe("runtime workspace confinement", () => {
     await assert.rejects(guard.writable("link/new.txt"), /escapes/);
   });
 
+  it("executes grep against the validated real path and rejects symlink escapes", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "forgedock-grep-symlink-"));
+    const root = join(parent, "worktree");
+    const allowed = join(root, "allowed");
+    const outside = join(parent, "outside");
+    mkdirSync(root); mkdirSync(allowed); mkdirSync(outside);
+    writeFileSync(join(allowed, "inside.ts"), "export const inside = true;\n");
+    writeFileSync(join(outside, "secret.ts"), "export const secret = true;\n");
+    try {
+      symlinkSync(allowed, join(root, "alias"), process.platform === "win32" ? "junction" : "dir");
+      symlinkSync(outside, join(allowed, "escape"), process.platform === "win32" ? "junction" : "dir");
+      const scope = { readRoots: ["allowed"], writeRoots: [], source: "build-packet" as const };
+      const grep = (await createSandboxedTools(root, ["grep"], scope)).find((tool) => tool.name === "grep");
+      assert.ok(grep);
+      const result = await grep.execute("grep-real", { pattern: "inside", path: "alias" }, undefined, undefined, {} as never);
+      assert.match((result.content[0] as { text: string }).text, /inside\.ts/);
+      await assert.rejects(
+        grep.execute("grep-escape", { pattern: "secret", path: "allowed/escape" }, undefined, undefined, {} as never),
+        /escapes the assigned workspace|outside the assigned scope/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it("creates packet-authorized new files without widening sibling writes", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-new-file-"));
     try {
@@ -64,14 +89,22 @@ describe("runtime workspace confinement", () => {
     }
   });
 
-  it("defaults reviewer grep patterns to literal matching unless regex mode is explicit", async () => {
+  it("honors grep regex defaults and explicit literal matching", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-grep-"));
     try {
-      writeFileSync(join(root, "suite.test.ts"), 'const marker = `describe("forge (Act II)")`;\n');
+      writeFileSync(join(root, "suite.test.ts"), 'const marker = `describe("forge (Act II)") alpha7`;\n');
       const grep = (await createSandboxedTools(root, ["grep"])).find((tool) => tool.name === "grep");
       assert.ok(grep);
-      const result = await grep.execute("grep-1", { pattern: 'describe("forge (Act II)")', path: "." }, undefined, undefined, {} as never);
-      assert.match((result.content[0] as { text: string }).text, /suite\.test\.ts/);
+      const regexResult = await grep.execute("grep-regex", { pattern: "alpha[0-9]", path: "." }, undefined, undefined, {} as never);
+      assert.match((regexResult.content[0] as { text: string }).text, /suite\.test\.ts/);
+      const literalResult = await grep.execute(
+        "grep-literal",
+        { pattern: 'describe("forge (Act II)")', path: ".", literal: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      assert.match((literalResult.content[0] as { text: string }).text, /suite\.test\.ts/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

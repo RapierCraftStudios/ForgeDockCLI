@@ -10,7 +10,18 @@ const sha = "c".repeat(40);
 const openPr: PullRequestSnapshot = { repo: "a/b", number: 9, title: "Fix", body: "", url: "https://github.test/a/b/pull/9", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
 
 class CompletionHost implements ForgeHost {
-  async getIssue(number: number, repo = "a/b") { return { repo, number, title: `Issue ${number}`, body: "", url: `https://github.test/${repo}/issues/${number}`, state: "OPEN" as const }; }
+  closedIssues = new Set<number>();
+  staleClosureProof = false;
+  async getIssue(number: number, repo = "a/b") {
+    return {
+      repo,
+      number,
+      title: `Issue ${number}`,
+      body: "",
+      url: `https://github.test/${repo}/issues/${number}`,
+      state: this.closedIssues.has(number) ? "CLOSED" as const : "OPEN" as const,
+    };
+  }
   async materializeBatchIssue(input: { repo: string; title: string; body: string; priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3" }) { return { repo: input.repo, number: 100, title: input.title, body: input.body, url: `https://github.test/${input.repo}/issues/100`, state: "OPEN" as const }; }
   failIssueComment = false;
   failClose = false;
@@ -36,6 +47,7 @@ class CompletionHost implements ForgeHost {
   async closeIssue(_repo: string, issue: number): Promise<void> {
     if (this.failClose) throw new Error("issue closure unavailable");
     this.closes.push(issue);
+    if (!this.staleClosureProof) this.closedIssues.add(issue);
   }
 }
 
@@ -112,6 +124,20 @@ describe("merge and close authority", () => {
     await assert.rejects(
       completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
       /issue closure unavailable/,
+    );
+    assert.equal(host.snapshot.state, "MERGED");
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
+  it("does not publish a terminal Outcome when closure returns an OPEN proof", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.staleClosureProof = true;
+    const artifacts = new InMemoryArtifactRepository();
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      /authoritative host state is OPEN/,
     );
     assert.equal(host.snapshot.state, "MERGED");
     assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);

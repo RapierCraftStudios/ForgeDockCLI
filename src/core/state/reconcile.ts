@@ -15,12 +15,16 @@ export interface ReconciledSubjectState extends ReconciledSemanticState {
 }
 
 export function reconcileLatestRunArtifacts(artifacts: readonly DurableArtifact[]): ReconciledSubjectState {
-  const byRun = new Map<string, DurableArtifact[]>();
-  for (const artifact of artifacts) byRun.set(artifact.runId, [...(byRun.get(artifact.runId) ?? []), artifact]);
-  const latest = [...byRun.entries()]
-    .map(([runId, values]) => ({ runId, values, timestamp: Math.max(...values.map((artifact) => Date.parse(artifact.createdAt) || 0)) }))
-    .sort((left, right) => right.timestamp - left.timestamp || right.runId.localeCompare(left.runId))[0];
-  return latest ? { runId: latest.runId, ...reconcileArtifacts(latest.values) } : reconcileArtifacts([]);
+  let latestRunId: string | undefined;
+  for (const artifact of artifacts) {
+    if (artifact.kind === "Intent") latestRunId = artifact.runId;
+  }
+  latestRunId ??= artifacts.at(-1)?.runId;
+  if (!latestRunId) return reconcileArtifacts([]);
+  return {
+    runId: latestRunId,
+    ...reconcileArtifacts(artifacts.filter((artifact) => artifact.runId === latestRunId)),
+  };
 }
 
 /**
@@ -28,7 +32,7 @@ export function reconcileLatestRunArtifacts(artifacts: readonly DurableArtifact[
  * In-flight activity is intentionally never inferred from a chat/session log.
  */
 export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): ReconciledSemanticState {
-  const ordered = [...artifacts].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+  const ordered = [...artifacts];
   const latest = new Map<string, DurableArtifact>();
   for (const artifact of ordered) latest.set(artifact.kind, artifact);
   const warnings: string[] = [];
@@ -40,16 +44,20 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const investigation = latest.get("Investigation") as DurableArtifact<"Investigation"> | undefined;
   const intent = latest.get("Intent");
 
+  const outcomeIndex = lastArtifactIndex(ordered, "Outcome");
+  const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
+  const buildIndex = lastArtifactIndex(ordered, "BuildResult");
+
   let state: RunStateName = "queued";
   const checkpointIsLatest = remediationCheckpoint !== undefined
-    && (!outcome || Date.parse(remediationCheckpoint.createdAt) >= Date.parse(outcome.createdAt));
+    && remediationCheckpointIndex >= outcomeIndex;
   if (checkpointIsLatest) {
     state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
     if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");
   }
   const interruptedOutcomeSuperseded = (outcome?.payload.status === "blocked" || outcome?.payload.status === "failed")
     && build !== undefined
-    && Date.parse(build.createdAt) > Date.parse(outcome.createdAt);
+    && buildIndex > outcomeIndex;
   if (!checkpointIsLatest && outcome && !interruptedOutcomeSuperseded) {
     state = outcome.payload.status === "merged" ? "completed"
       : outcome.payload.status === "invalid" ? "invalid"
@@ -89,4 +97,11 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     artifactIds: ordered.map((artifact) => artifact.id),
     ...(remediationCheckpoint ? { remediationCheckpoint } : {}),
   };
+}
+
+function lastArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    if (artifacts[index]?.kind === kind) return index;
+  }
+  return -1;
 }

@@ -4,7 +4,14 @@ import { createArtifact, InvestigationPayloadSchema, type DurableArtifact, type 
 import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
+import {
+  scopeDiscoveryRoots,
+  scopeManifestFor,
+  STANDARD_SCOPE_METADATA_ROOTS,
+  type AgentEventSink,
+  type AgentRuntime,
+  type ScopeHints,
+} from "../../runtime/agent-runtime.js";
 
 export interface InvestigateDependencies {
   runtime: AgentRuntime;
@@ -37,8 +44,15 @@ export async function investigateWorkItem(
   input: InvestigateInput,
   dependencies: InvestigateDependencies,
 ): Promise<InvestigateResult> {
-  const scopeManifest = scopeManifestFor("issue-hints", input.scopeHints ?? {
-    metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
+  const scopeHints = input.scopeHints ?? {};
+  const affectedFiles = scopeHints.affectedFiles ?? [];
+  const scopeManifest = scopeManifestFor("issue-hints", {
+    ...scopeHints,
+    metadataRoots: [
+      ...STANDARD_SCOPE_METADATA_ROOTS,
+      ...(scopeHints.metadataRoots ?? []),
+      ...scopeDiscoveryRoots(affectedFiles),
+    ],
   });
   let run = createRun({
     workflow: "work-on",

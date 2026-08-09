@@ -3,7 +3,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../artifacts/schema.js";
-import { decideSubjectAdmission } from "./admission.js";
+import {
+  decideSubjectAdmission,
+  latestArtifactOfKind,
+  latestDeliveryRunArtifacts,
+  reviewRemediationCycleCount,
+} from "./admission.js";
 
 const subject = { repo: "a/b", issue: 1 };
 
@@ -25,6 +30,44 @@ function outcome(runId: string, createdAt: string, status: "invalid" | "decompos
     subject,
     producer: { role: "controller" },
     payload: { status, reason: status, childIssues: [] },
+  });
+  return { ...artifact, createdAt };
+}
+
+function repairOutcome(
+  runId: string,
+  createdAt: string,
+  options: {
+    reason?: string;
+    regression?: boolean;
+    repairAttempt?: number;
+    failureClass?: "command" | "infrastructure" | "timeout";
+  } = {},
+): DurableArtifact<"Outcome"> {
+  const artifact = createArtifact({
+    kind: "Outcome", runId, subject, producer: { role: "controller" },
+    payload: {
+      status: "blocked",
+      reason: options.reason ?? "Required verification failed: npm test (exit 1)",
+      childIssues: [],
+      failureEvidence: {
+        branch: "forgedock/issue-1",
+        workspacePath: "/tmp/issue-1",
+        builderSummary: "attempt",
+        changedPaths: ["docs/a.md"],
+        criterionCoverage: [{ criterion: "documented", implementation: "Added documentation" }],
+        decisions: [],
+        residualRisks: [],
+        ...(options.repairAttempt !== undefined ? { repairAttempt: options.repairAttempt } : {}),
+        checks: [{
+          command: "npm test",
+          status: "failed",
+          durationMs: 1,
+          ...(options.failureClass !== undefined ? { failureClass: options.failureClass } : {}),
+          ...(options.regression !== undefined ? { regression: options.regression } : {}),
+        }],
+      },
+    },
   });
   return { ...artifact, createdAt };
 }
@@ -76,11 +119,12 @@ describe("subject run admission", () => {
 
   it("blocks a newer interrupted run even when an older run was terminal", () => {
     const artifacts = [
-      intent("run_terminal", "2026-01-01T00:00:00.000Z"),
-      outcome("run_terminal", "2026-01-01T00:01:00.000Z", "decomposed"),
+      intent("run_terminal", "2099-01-01T00:00:00.000Z"),
+      outcome("run_terminal", "2099-01-01T00:01:00.000Z", "decomposed"),
       intent("run_interrupted", "2026-01-02T00:00:00.000Z"),
     ];
-    const decision = decideSubjectAdmission(artifacts);
+    assert.equal(latestDeliveryRunArtifacts(artifacts)?.runId, "run_interrupted");
+    const decision = decideSubjectAdmission(artifacts, { rerun: true });
     assert.equal(decision.action, "block");
     if (decision.action === "block") {
       assert.equal(decision.runId, "run_interrupted");
@@ -142,6 +186,172 @@ describe("subject run admission", () => {
       assert.equal(decision.state, "building");
       assert.equal(decision.checkpoint, "build");
     }
+  });
+
+  it("resumes after one durable repair dispatch but blocks after the second", () => {
+    const runId = "run_repair_budget";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const first = repairOutcome(runId, "2026-01-01T00:01:00.000Z");
+    const firstDispatch = repairOutcome(runId, "2026-01-01T00:02:00.000Z", {
+      reason: "Verification repair attempt 1 dispatched: Required verification failed",
+      repairAttempt: 1,
+    });
+    const afterFirst = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, first, firstDispatch]);
+    assert.equal(afterFirst.action, "resume");
+    const secondDispatch = repairOutcome(runId, "2026-01-01T00:03:00.000Z", {
+      reason: "Verification repair attempt 2 dispatched: Required verification failed",
+      repairAttempt: 2,
+    });
+    const exhausted = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, first, firstDispatch, secondDispatch,
+    ]);
+    assert.equal(exhausted.action, "block");
+    if (exhausted.action === "block") assert.match(exhausted.reason, /exhausted after 2 repair attempt/);
+  });
+
+  it("counts every request-changes verdict as a durable remediation cycle", () => {
+    const runId = "run_review_cycles";
+    const requestChanges = (headSha: string) => createArtifact({
+      kind: "ReviewVerdict",
+      runId,
+      subject,
+      producer: { role: "controller" },
+      payload: {
+        headSha,
+        disposition: "request_changes",
+        reviewerRoles: ["correctness"],
+        findings: [],
+        checks: [],
+      },
+    });
+    const approved = createArtifact({
+      kind: "ReviewVerdict",
+      runId,
+      subject,
+      producer: { role: "controller" },
+      payload: {
+        headSha: "c".repeat(40),
+        disposition: "approve",
+        reviewerRoles: ["correctness"],
+        findings: [],
+        checks: [],
+      },
+    });
+    assert.equal(reviewRemediationCycleCount([
+      requestChanges("a".repeat(40)),
+      approved,
+      requestChanges("b".repeat(40)),
+    ]), 2);
+  });
+
+  it("selects the latest artifact by durable publication order instead of worker timestamps", () => {
+    const runId = "run_artifact_order";
+    const first = repairOutcome(runId, "2099-01-01T00:00:00.000Z");
+    const dispatched = repairOutcome(runId, "2026-01-01T00:00:00.000Z", { repairAttempt: 1 });
+    assert.equal(latestArtifactOfKind([first, dispatched], "Outcome")?.id, dispatched.id);
+  });
+
+  it("does not replay a recursive checkpoint superseded by a merged Outcome", () => {
+    const runId = "run_recursive_complete";
+    const delivery = publicationArtifacts(runId);
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(build?.kind === "BuildResult");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict",
+      runId,
+      subject,
+      producer: { role: "controller" },
+      payload: {
+        headSha: build.payload.headSha,
+        disposition: "approve",
+        reviewerRoles: ["correctness"],
+        findings: [],
+        checks: [],
+      },
+    });
+    const checkpoint = createArtifact({
+      kind: "RemediationBlocked",
+      runId,
+      subject,
+      producer: { role: "controller" },
+      payload: {
+        checkpointKey: "c".repeat(64), checkpointSequence: 3, status: "ready-to-resume",
+        parentRunId: runId, parentIssue: 1, pullRequest: 9, headSha: "a".repeat(40),
+        headBranch: "forgedock/parent", baseBranch: "main", packetArtifactId: "art_packet",
+        verdictArtifactId: "art_verdict", reason: "scope-violation", findings: [], childIssues: [30],
+        childRunIds: [], approvedPaths: ["docs/a.md"], childOutcomeIds: ["art_child"],
+        remediationDepth: 0, maxRemediationDepth: 2,
+      },
+    });
+    const parentProof = createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: { ...build.payload, summary: "Expanded parent revision verified" },
+    });
+    const interrupted = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, checkpoint, parentProof,
+    ]);
+    assert.equal(interrupted.action, "resume");
+    if (interrupted.action === "resume") assert.equal(interrupted.checkpoint, "remediation");
+
+    const merged = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "merged", reason: "completed", finalSha: build.payload.headSha,
+        prUrl: "https://example.test/pr/9", childIssues: [],
+      },
+    });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, checkpoint, parentProof, merged,
+    ]);
+    assert.deepEqual(decision, { action: "skip", runId, state: "completed" });
+  });
+
+  it("uses durable artifact order instead of skewed worker timestamps for supersession", () => {
+    const runId = "run_skewed_repair";
+    const delivery = publicationArtifacts(runId);
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(build?.kind === "BuildResult");
+    const preBuildFailure = repairOutcome(runId, "2099-01-01T00:00:00.000Z");
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      ...delivery.filter((artifact) => artifact.kind !== "BuildResult"),
+      preBuildFailure,
+      { ...build, createdAt: "2025-01-01T00:00:00.000Z" },
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") assert.equal(decision.checkpoint, "publication");
+  });
+
+  it("does not send an unchanged baseline failure to a builder repair loop", () => {
+    const runId = "run_known_baseline";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const blocked = repairOutcome(runId, "2026-01-01T00:01:00.000Z", { regression: false });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") assert.equal(decision.checkpoint, "verification");
+  });
+
+  it("keeps verification infrastructure failures out of the builder repair loop", () => {
+    const runId = "run_infrastructure_failure";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const blocked = repairOutcome(runId, "2026-01-01T00:01:00.000Z", {
+      failureClass: "infrastructure",
+      repairAttempt: 1,
+    });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") assert.equal(decision.checkpoint, "verification");
+  });
+
+  it("treats incomplete criterion coverage as a repairable builder failure", () => {
+    const runId = "run_coverage_repair";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const blocked = repairOutcome(runId, "2026-01-01T00:01:00.000Z", {
+      reason: "Builder criterion coverage is incomplete: missing documented",
+    });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") assert.equal(decision.checkpoint, "build");
   });
 
   it("keeps out-of-packet verification failures at the human checkpoint", () => {
@@ -360,7 +570,7 @@ describe("subject run admission", () => {
     assert.deepEqual(decideSubjectAdmission(artifacts, { rerun: true }), { action: "start" });
   });
 
-  it("retries the responsible remediator when verification proves it produced no changes", () => {
+  it("routes a no-change remediation through the bounded packet builder with review context", () => {
     const runId = "run_no_change_remediation";
     const delivery = publicationArtifacts(runId).map((artifact, index) => ({
       ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
@@ -382,8 +592,8 @@ describe("subject run admission", () => {
     const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked]);
     assert.equal(decision.action, "resume");
     if (decision.action === "resume") {
-      assert.equal(decision.state, "remediating");
-      assert.equal(decision.checkpoint, "remediation");
+      assert.equal(decision.state, "building");
+      assert.equal(decision.checkpoint, "build");
     }
   });
 

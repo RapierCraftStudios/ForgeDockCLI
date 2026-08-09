@@ -20,10 +20,24 @@ class EndToEndGit implements GitWorkspaceManager {
   createdFrom?: string;
   async create(input: { baseRef: string }): Promise<GitWorkspace> { this.createdFrom = input.baseRef; return workspace; }
   async changedPaths(): Promise<string[]> { return ["src/a.js"]; }
+  async revisionChangedPaths(): Promise<string[]> { return ["src/a.js"]; }
+  async syncToRemoteHead(): Promise<void> {}
+  async isAncestor(): Promise<boolean> { return true; }
+  async prepareWorkspaceDependencies(): Promise<void> {}
+  async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { return sha; }
   async push(): Promise<void> {}
   async head(): Promise<string> { return sha; }
   async remove(): Promise<void> { this.removed = true; }
+}
+class SequencedEndToEndGit extends EndToEndGit {
+  #index = 0;
+  constructor(readonly pathSequence: readonly (readonly string[])[]) { super(); }
+  override async changedPaths(): Promise<string[]> {
+    const paths = this.pathSequence[Math.min(this.#index, this.pathSequence.length - 1)] ?? [];
+    this.#index += 1;
+    return [...paths];
+  }
 }
 class EndToEndVerifier implements VerificationRunner {
   async run(): Promise<CheckResult[]> { return [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 10, outputDigest: "f".repeat(64) }]; }
@@ -33,21 +47,30 @@ class EndToEndHost implements ForgeHost {
   snapshot: PullRequestSnapshot = { repo: "a/b", number: 11, title: "Fix", body: "", url: "https://github.test/a/b/pull/11", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "main" };
   issueClosed = false;
   findingIssues = 0;
+  remediationChildDepths: number[] = [];
   async createPullRequest(input: { baseBranch: string }): Promise<PullRequestSnapshot> {
     this.snapshot.baseBranch = input.baseBranch;
     return { ...this.snapshot };
   }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.js b/src/a.js\n+guard();"; }
+  async getBranchHead(): Promise<string> { return sha; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() {
     this.findingIssues++;
     return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const };
   }
+  async materializeRemediationChildren(input: { remediationDepth: number }) {
+    this.remediationChildDepths.push(input.remediationDepth);
+    return [{ repo: "a/b", number: 30, title: "child", body: "", url: "https://github.test/a/b/issues/30", state: "OPEN" as const }];
+  }
   async mergePullRequest(_repo: string, _number: number, expected: string, expectedBase: string): Promise<void> {
     assert.equal(expected, sha);
     assert.equal(expectedBase, this.snapshot.baseBranch);
     this.snapshot.state = "MERGED";
+  }
+  async getIssue(number: number, repo = "a/b") {
+    return { repo, number, title: "Issue", body: "", url: `https://github.test/${repo}/issues/${number}`, state: this.issueClosed ? "CLOSED" as const : "OPEN" as const };
   }
   async closeIssue(): Promise<void> { this.issueClosed = true; }
 }
@@ -89,8 +112,8 @@ describe("complete work-on trajectory", () => {
     assert.equal(shouldAppendFailureOutcome([failed], runId, "read failed: optional path missing"), true);
   });
 
-  it("retains the worktree when verification blocks delivery", async () => {
-    const runtime = new FakeAgentRuntime([investigation, packet, submission]);
+  it("retains the worktree after exhausting two automatic verification repairs", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
@@ -108,8 +131,68 @@ describe("complete work-on trajectory", () => {
     }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(result.run.state, "blocked");
     assert.equal(git.removed, false);
-    const outcome = artifacts.artifacts.find((artifact) => artifact.kind === "Outcome");
-    assert.equal(outcome?.kind === "Outcome" ? outcome.payload.failureEvidence?.workspacePath : undefined, workspace.path);
+    const outcomes = artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome");
+    assert.equal(outcomes.length, 5);
+    assert.deepEqual(outcomes.flatMap((outcome) => outcome.kind === "Outcome" && outcome.payload.failureEvidence?.repairAttempt !== undefined
+      ? [outcome.payload.failureEvidence.repairAttempt]
+      : []), [1, 2]);
+    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.failureEvidence?.workspacePath : undefined, workspace.path);
+    assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 3);
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-3), [
+      "BUILD_COMPLETED", "VERIFICATION_FAILED", "VERIFICATION_REPAIR_EXHAUSTED",
+    ]);
+  });
+
+  it("repairs a no-change build automatically within the same bounded budget", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, { summary: "Approved", findings: [] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new SequencedEndToEndGit([[], ["src/a.js"]]);
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_no_change_repair", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const result = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(result.run.state, "completed");
+    assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 2);
+    const repairAttempts = artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined
+      ? [artifact.payload.failureEvidence.repairAttempt]
+      : []);
+    assert.deepEqual(repairAttempts, [1]);
+  });
+
+  it("repairs a verification failure automatically without another CLI invocation", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, { summary: "Approved", findings: [] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_auto_repair", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    let verificationCalls = 0;
+    const verifier: VerificationRunner = {
+      async run() {
+        verificationCalls += 1;
+        return verificationCalls === 1
+          ? [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 10, summary: "test failed" }]
+          : [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 10 }];
+      },
+    };
+    const result = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier, host });
+    assert.equal(result.run.state, "completed");
+    assert.equal(verificationCalls, 2);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "builder", "reviewer"]);
+    assert.match(runtime.tasks[3]?.objective ?? "", /controller verification failed/);
+    assert.ok((await runs.history(intent.runId)).some((record) => record.event === "VERIFICATION_REPAIR_REQUESTED"));
   });
 
   it("resumes an interrupted building run from its frozen packet and retained worktree", async () => {
@@ -162,6 +245,70 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
     assert.match(runtime.tasks[0]?.objective ?? "", /controller verification failed/);
     assert.ok(runtime.tasks[0]?.context.some((artifact) => artifact.kind === "Outcome"));
+    assert.deepEqual(artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined
+      ? [artifact.payload.failureEvidence.repairAttempt]
+      : []), [1]);
+  });
+
+  it("resumes an already-dispatched verification repair without spending another attempt", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_dispatched_repair_resume", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({
+      kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation,
+    });
+    const packetArtifact = createArtifact({
+      kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet,
+    });
+    const dispatchedRepair = createArtifact({
+      kind: "Outcome", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "Verification repair attempt 1 dispatched: Required verification failed", childIssues: [],
+        failureEvidence: {
+          branch: workspace.branch, workspacePath: workspace.path, builderSummary: "first attempt",
+          changedPaths: ["src/a.js"], repairAttempt: 1,
+          checks: [{ command: "npm test", status: "failed", failureClass: "command", durationMs: 1 }],
+        },
+      },
+    });
+    let run = attachArtifact(createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget }), "Intent", intent.id);
+    await runs.create(run);
+    for (const [event, artifact] of [
+      ["START_INVESTIGATION", undefined],
+      ["INVESTIGATION_CONFIRMED", investigationArtifact],
+      ["BUILD_PACKET_READY", packetArtifact],
+    ] as const) {
+      if (artifact) run = attachArtifact(run, artifact.kind, artifact.id);
+      const advanced = transition(run, event);
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    for (const artifact of [intent, investigationArtifact, packetArtifact, dispatchedRepair]) await artifacts.append(artifact);
+
+    const runtime = new FakeAgentRuntime([submission, { summary: "Approved", findings: [] }]);
+    const resumed = await resumeBuildWorkOn({
+      run,
+      intent,
+      investigation: investigationArtifact,
+      packet: packetArtifact,
+      priorVerificationFailure: dispatchedRepair,
+      priorVerificationRepairAttempts: 1,
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+
+    assert.equal(resumed.run.state, "completed");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
+    assert.deepEqual(artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined
+      ? [artifact.payload.failureEvidence.repairAttempt]
+      : []), [1]);
   });
 
   it("resumes publication without replaying build or verification", async () => {
@@ -298,10 +445,79 @@ describe("complete work-on trajectory", () => {
     assert.equal(resumed.run.state, "completed");
     assert.equal(host.findingIssues, 0, "transient blocking findings remediated in the same run must not create follow-up issues");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator", "remediator", "reviewer"]);
+    const remediator = runtime.tasks.find((task) => task.role === "remediator");
+    assert.deepEqual(remediator?.workspace.scope.writeRoots, []);
+    assert.deepEqual(remediator?.workspace.scope.writePaths, packet.expectedPaths);
+    assert.ok(remediator?.workspace.scope.readRoots.includes("src"));
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-7), [
       "REVIEW_CHANGES_REQUESTED", "REMEDIATION_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED",
       "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("automatically repairs controller verification after review remediation", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_remediation_repair", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation });
+    const packetArtifact = createArtifact({ kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+      },
+    });
+    const finding = {
+      id: "correctness-repair", severity: "high" as const, confidence: "high" as const, blocking: true,
+      scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen guard criterion.",
+      matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
+      title: "Guard is incomplete", evidence: "One accepted case is absent", location: "src/a.js:1",
+      intentRelevance: "The frozen criterion requires it", remediation: "Complete the guard",
+    };
+    let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED"] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    const runtime = new FakeAgentRuntime([
+      { summary: "Changes required", findings: [finding] },
+      acceptAdjudication,
+      submission,
+      submission,
+      { summary: "Approved after verification repair", findings: [] },
+    ]);
+    let checks = 0;
+    const verifier: VerificationRunner = {
+      async run() {
+        checks += 1;
+        return checks === 1
+          ? [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 1, summary: "whitespace" }]
+          : [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }];
+      },
+    };
+    const resumed = await resumePublicationWorkOn({
+      run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
+      workspace, baseBranch: "main", autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier, host });
+    assert.equal(
+      resumed.run.state,
+      "completed",
+      JSON.stringify(artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome").map((artifact) => artifact.payload)),
+    );
+    assert.equal(checks, 2);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator", "remediator", "builder", "reviewer"]);
+    assert.ok(runtime.tasks[3]?.context.some((artifact) => artifact.kind === "ReviewVerdict"));
+    assert.ok(runtime.tasks[3]?.context.some((artifact) => artifact.kind === "Outcome"));
   });
 
   it("reassesses a review-budget block without blindly replaying its stale remediation", async () => {
@@ -356,6 +572,63 @@ describe("complete work-on trajectory", () => {
     ]);
   });
 
+  it("does not grant another remediation when an exhausted-budget reassessment still requests changes", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_review_budget_repeat", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation });
+    const packetArtifact = createArtifact({ kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+      },
+    });
+    const finding = {
+      id: "budget-repeat", severity: "high" as const, confidence: "high" as const, blocking: true,
+      scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
+      matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
+      title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
+    };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: { headSha: sha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding], checks: [] },
+    });
+    let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED", "BLOCK",
+    ] as const) {
+      const advanced = transition(run, event, event === "BLOCK" ? { reason: "Remediation budget exhausted after 2 cycle(s)" } : { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    const repeatedFinding = { ...finding, matchedPriorFindingIds: [finding.id] };
+    const runtime = new FakeAgentRuntime([
+      { summary: "Changes still required", findings: [repeatedFinding] },
+      acceptAdjudication,
+    ]);
+    const resumed = await resumeReviewWorkOn({
+      run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
+      pullRequest: host.snapshot, workspace, baseBranch: "main", autoMerge: true,
+      maxRemediationCycles: 2, priorRemediationCycles: 2,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+
+    assert.equal(resumed.run.state, "blocked");
+    assert.match(resumed.run.blockedReason ?? "", /Remediation budget exhausted after 2 cycle/);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
+  });
+
   it("resumes approved completion idempotently without replaying any agent phase", async () => {
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
@@ -400,13 +673,10 @@ describe("complete work-on trajectory", () => {
       kind: "Intent", runId: "run_resume", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
       payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
     });
-    const failedVerifier: VerificationRunner = {
-      async run() { return [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 10, failureSignatures: ["not ok - existing"] }]; },
-    };
     const blocked = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
-    }, { runtime: initialRuntime, artifacts, runs, git, verifier: failedVerifier, host });
+      verification: [],
+    }, { runtime: initialRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(blocked.run.state, "blocked");
 
     const investigationArtifact = artifacts.artifacts.find((artifact) => artifact.kind === "Investigation");
@@ -427,6 +697,58 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
       "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("preserves the remediation budget when verification resumes after a failed remediation", async () => {
+    const initialRuntime = new FakeAgentRuntime([investigation, packet, submission]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_resume_budget", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const blocked = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
+      verification: [],
+    }, { runtime: initialRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(blocked.run.state, "blocked");
+
+    const investigationArtifact = artifacts.artifacts.find((artifact) => artifact.kind === "Investigation");
+    const packetArtifact = artifacts.artifacts.find((artifact) => artifact.kind === "BuildPacket");
+    const outcome = artifacts.artifacts.find((artifact) => artifact.kind === "Outcome");
+    assert.ok(investigationArtifact?.kind === "Investigation");
+    assert.ok(packetArtifact?.kind === "BuildPacket");
+    assert.ok(outcome?.kind === "Outcome");
+    const finding = {
+      id: "budget-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
+      matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
+      title: "Guard is still incomplete", evidence: "One accepted case is missing", location: "src/a.js:1",
+      intentRelevance: "The frozen criterion requires it", remediation: "Complete the guard",
+    };
+    const resumedRuntime = new FakeAgentRuntime([
+      { summary: "Changes still required", findings: [finding] },
+      acceptAdjudication,
+    ]);
+    const resumed = await resumeWorkOn({
+      run: blocked.run,
+      intent,
+      investigation: investigationArtifact,
+      packet: packetArtifact,
+      outcome,
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      maxRemediationCycles: 1,
+      priorRemediationCycles: 1,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+
+    assert.equal(resumed.run.state, "blocked");
+    assert.match(resumed.run.blockedReason ?? "", /Remediation budget exhausted after 1 cycle/);
+    assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
   });
 
   it("downgrades a concern outside the frozen Build Packet instead of expanding remediation", async () => {
@@ -465,6 +787,80 @@ describe("complete work-on trajectory", () => {
     const verdict = artifacts.artifacts.find((artifact) => artifact.kind === "ReviewVerdict");
     assert.equal(verdict?.kind === "ReviewVerdict" ? verdict.payload.findings[0]?.scopeDisposition : undefined, "follow_up");
     assert.equal(verdict?.kind === "ReviewVerdict" ? verdict.payload.findings[0]?.blocking : undefined, false);
+  });
+
+  it("routes an authorized remediation child PR back into the parent delivery branch", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, { summary: "Approved", findings: [] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_child_route", subject: { repo: "a/b", issue: 30 }, producer: { role: "controller" },
+      payload: { title: "Fix child", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const result = await workOn({
+      intent,
+      repoPath: process.cwd(),
+      lane: fastLane,
+      autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      parentRemediation: {
+        parentRunId: "run_parent",
+        parentIssue: 8,
+        parentPullRequest: 11,
+        parentBranch: "forgedock/parent",
+        parentHeadSha: sha,
+        findingId: "finding-1",
+        findingLocation: "src/a.js",
+        remediationDepth: 1,
+        maxRemediationDepth: 2,
+      },
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(result.run.state, "completed");
+    assert.equal(result.run.targetBranch, "forgedock/parent");
+    assert.equal(git.createdFrom, "origin/forgedock/parent");
+    assert.equal(host.snapshot.baseBranch, "forgedock/parent");
+  });
+
+  it("allows an authorized remediation child to dispatch the configured next recursive level", async () => {
+    const finding = {
+      id: "nested-scope", severity: "high" as const, confidence: "high" as const, blocking: true,
+      scopeDisposition: "in_scope" as const, scopeRationale: "Required by the frozen behavior.",
+      matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
+      title: "Nested delivery path is required", evidence: "The accepted path still fails",
+      location: "src/nested.js:1", intentRelevance: "Required by the criterion", remediation: "Fix the nested path",
+    };
+    const runtime = new FakeAgentRuntime([
+      investigation, packet, submission,
+      { summary: "Changes required", findings: [finding] },
+      { summary: "Scope confirmed", findings: [finding] },
+      acceptAdjudication,
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_nested_child", subject: { repo: "a/b", issue: 30 }, producer: { role: "controller" },
+      payload: { title: "Fix child", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const result = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
+      scopeExpansion: "recursive", remediationDepth: 1, maxRemediationDepth: 2, maxRemediationChildren: 2,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      parentRemediation: {
+        parentRunId: "run_parent", parentIssue: 8, parentPullRequest: 11,
+        parentBranch: "forgedock/parent", parentHeadSha: sha,
+        findingId: "finding-1", findingLocation: "src/a.js",
+        remediationDepth: 1, maxRemediationDepth: 2,
+      },
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(result.run.state, "blocked");
+    assert.deepEqual(host.remediationChildDepths, [2]);
+    const checkpoint = artifacts.artifacts.findLast((artifact) => artifact.kind === "RemediationBlocked");
+    assert.equal(checkpoint?.kind === "RemediationBlocked" ? checkpoint.payload.remediationDepth : undefined, 1);
+    assert.equal(checkpoint?.kind === "RemediationBlocked" ? checkpoint.payload.status : undefined, "children-running");
   });
 
   it("crosses all six quality artifacts with separate agent sessions", async () => {

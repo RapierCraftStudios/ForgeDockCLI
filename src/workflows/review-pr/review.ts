@@ -56,6 +56,7 @@ export async function reviewPullRequest(
     blockingSeverities?: readonly ("critical" | "high" | "medium" | "low")[];
     maxReviewSpecialists?: number;
     findingIssuePolicy?: FindingIssuePolicy;
+    deliveryRunId?: string;
     signal?: AbortSignal;
   },
   dependencies: {
@@ -72,6 +73,15 @@ export async function reviewPullRequest(
     const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
     if (frozen.headSha !== input.pullRequest.headSha || frozen.headSha !== input.buildResult.payload.headSha) {
       throw new Error("Cannot start review: PR head does not match the verified Build Result");
+    }
+    const buildTargetBranch = input.buildResult.payload.targetBranch ?? input.run.targetBranch;
+    const expectedDeliveryRunId = input.deliveryRunId ?? input.run.runId;
+    if (input.buildResult.runId !== expectedDeliveryRunId
+      || input.buildResult.subject.repo !== input.run.subject.repo
+      || input.buildResult.subject.issue !== input.run.subject.issue
+      || input.buildResult.payload.branch !== frozen.headBranch
+      || buildTargetBranch !== frozen.baseBranch) {
+      throw new Error("Cannot start review: PR branches or run identity do not match the verified Build Result delivery route");
     }
     const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
     let reviewPlan = planReviewPanel({
@@ -204,9 +214,7 @@ export async function reviewPullRequest(
 
     if (new Set(sessionRefs).size !== sessionRefs.length) throw new Error("Reviewer sessions were not independent");
     const after = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
-    if (after.headSha !== frozen.headSha) {
-      throw new Error(`PR head changed during review: ${frozen.headSha} -> ${after.headSha}`);
-    }
+    assertPullRequestRouteStable(frozen, after, "during reviewer execution");
 
     const blocking = new Set<ReviewerSubmission["findings"][number]["severity"]>(input.blockingSeverities ?? ["critical", "high", "medium"]);
     const consolidated = consolidateReviewerFindings(reviewerResults, blocking);
@@ -223,6 +231,8 @@ export async function reviewPullRequest(
     const adjudicated = adjudication ? applyScopeAdjudication(consolidated, adjudication.output.decisions) : consolidated;
     const findings = applyFindingScopePolicy(adjudicated, input.packet, input.priorVerdict);
     const disposition = findings.some((finding) => finding.blocking) ? "request_changes" as const : "approve" as const;
+    const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
+    assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
     const findingIssuePolicy = input.findingIssuePolicy ?? "all";
     if (findingIssuePolicy === "all" || (findingIssuePolicy === "approved-only" && disposition === "approve")) {
       await materializeReviewFindings({ run, pullRequest: frozen, findings }, dependencies.host);
@@ -235,6 +245,8 @@ export async function reviewPullRequest(
         activeFindings: findings.filter(shouldMaterializeFinding),
       });
     }
+    const publicationSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
+    assertPullRequestRouteStable(frozen, publicationSnapshot, "immediately before verdict publication");
     const subject = { repo: run.subject.repo, ...(run.subject.issue ? { issue: run.subject.issue } : {}), pr: frozen.number };
     const verdict = createArtifact({
       kind: "ReviewVerdict",
@@ -243,6 +255,8 @@ export async function reviewPullRequest(
       producer: { role: "controller", runtime: "forgedock" },
       payload: {
         headSha: frozen.headSha,
+        headBranch: frozen.headBranch,
+        baseBranch: frozen.baseBranch,
         disposition,
         reviewerRoles: roles,
         findings,
@@ -264,6 +278,22 @@ export async function reviewPullRequest(
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+  }
+}
+
+function assertPullRequestRouteStable(
+  frozen: PullRequestSnapshot,
+  current: PullRequestSnapshot,
+  phase: string,
+): void {
+  if (current.headSha !== frozen.headSha
+    || current.headBranch !== frozen.headBranch
+    || current.baseBranch !== frozen.baseBranch
+    || current.state !== frozen.state) {
+    throw new Error(
+      `PR delivery route changed ${phase}: ${frozen.headBranch}@${frozen.headSha} -> ${frozen.baseBranch} (${frozen.state})`
+      + ` became ${current.headBranch}@${current.headSha} -> ${current.baseBranch} (${current.state})`,
+    );
   }
 }
 

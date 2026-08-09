@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../artifacts/schema.js";
-import { reconcileArtifacts } from "./reconcile.js";
+import { reconcileArtifacts, reconcileLatestRunArtifacts } from "./reconcile.js";
 
 const common = { runId: "run_reconcile", subject: { repo: "a/b", issue: 1 }, producer: { role: "test" } };
 const intent = createArtifact({ ...common, kind: "Intent", payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
@@ -24,10 +24,24 @@ describe("GitHub artifact reconciliation", () => {
     for (const status of ["blocked", "failed"] as const) {
       const interrupted = createArtifact({
         ...common, kind: "Outcome", payload: { status, reason: "transient interruption", childIssues: [] },
-      }, { createdAt: "2026-01-01T00:00:00.000Z" });
+      }, { createdAt: "2099-01-01T00:00:00.000Z" });
       const resumedBuild = { ...build, createdAt: "2026-01-01T00:01:00.000Z" };
       assert.equal(reconcileArtifacts([intent, investigation, packet, interrupted, resumedBuild] as DurableArtifact[]).state, "publishing");
     }
+  });
+
+  it("selects the latest semantic run by durable Intent publication order", () => {
+    const oldIntent = { ...intent, runId: "run_old", createdAt: "2099-01-01T00:00:00.000Z" };
+    const oldOutcome = createArtifact({
+      ...common,
+      runId: "run_old",
+      kind: "Outcome",
+      payload: { status: "invalid", reason: "old terminal run", childIssues: [] },
+    }, { createdAt: "2099-01-01T00:01:00.000Z" });
+    const newIntent = { ...intent, id: "art_new_intent", runId: "run_new", createdAt: "2026-01-01T00:00:00.000Z" };
+    const result = reconcileLatestRunArtifacts([oldIntent, oldOutcome, newIntent] as DurableArtifact[]);
+    assert.equal(result.runId, "run_new");
+    assert.equal(result.state, "investigating");
   });
 
   it("fails safe on an inconsistent merged outcome", () => {

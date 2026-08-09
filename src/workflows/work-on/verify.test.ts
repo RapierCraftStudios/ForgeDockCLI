@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
@@ -16,11 +19,23 @@ const submission: BuilderSubmission = {
 };
 
 class FakeGit implements GitWorkspaceManager {
-  constructor(readonly paths: string[], readonly revisionPaths = paths) {}
+  committed = false;
+  dependenciesPrepared = false;
+  constructor(
+    readonly paths: string[],
+    readonly revisionPaths: string[] = [],
+    readonly committedRevisionPaths = [...new Set([...revisionPaths, ...paths])],
+  ) {}
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return this.paths; }
-  async revisionChangedPaths(): Promise<string[]> { return this.revisionPaths; }
-  async commit(): Promise<string> { return "a".repeat(40); }
+  async revisionChangedPaths(): Promise<string[]> {
+    return this.committed ? this.committedRevisionPaths : this.revisionPaths;
+  }
+  async syncToRemoteHead(): Promise<void> {}
+  async isAncestor(): Promise<boolean> { return true; }
+  async prepareWorkspaceDependencies(): Promise<void> { this.dependenciesPrepared = true; }
+  async committedContentMatches(): Promise<boolean> { return true; }
+  async commit(): Promise<string> { this.committed = true; return "a".repeat(40); }
   async push(): Promise<void> {}
   async head(): Promise<string> { return "a".repeat(40); }
   async remove(): Promise<void> {}
@@ -31,7 +46,12 @@ class FakeVerifier implements VerificationRunner {
 }
 
 async function verifyingRun(runs: InMemoryRunRepository): Promise<RunState> {
-  let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 1 }, runId: `run_verify_${crypto.randomUUID()}` });
+  let run = createRun({
+    workflow: "work-on",
+    subject: { repo: "a/b", issue: 1 },
+    runId: `run_verify_${crypto.randomUUID()}`,
+    target: { lane: "fast", targetBranch: "main" },
+  });
   await runs.create(run);
   for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED"] as TransitionEvent[]) {
     const next = transition(run, event);
@@ -59,12 +79,17 @@ describe("verification and commit barrier", () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
+    const git = new FakeGit(["src/a.ts"]);
+    const verifier: VerificationRunner = {
+      async run() {
+        assert.equal(git.dependenciesPrepared, true, "changed lockfile state is installed before verification");
+        return [passed];
+      },
+    };
     const result = await verifyAndCommit({
       run, packet: packet(run), submission, workspace, commands: [command],
       subjectEvidence: ["GitHub issue #1 labels: pipeline-probe", "GitHub issue #1 body: Depends on #5"],
-    }, {
-      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
-    });
+    }, { verifier, git, artifacts, runs });
     assert.equal(result.run.state, "publishing");
     assert.equal(result.buildResult?.payload.headSha, "a".repeat(40));
     assert.equal(result.buildResult?.payload.baseSha, workspace.baseSha);
@@ -72,16 +97,128 @@ describe("verification and commit barrier", () => {
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
   });
 
-  it("records the complete delivery revision after a partial remediation attempt", async () => {
+  it("blocks when raw committed blobs differ from the verified worktree content", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    class FilteredGit extends FakeGit {
+      override async committedContentMatches(): Promise<boolean> { return false; }
+    }
+    const result = await verifyAndCommit({
+      run, packet: packet(run), submission, workspace, commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]), git: new FilteredGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /Raw committed blobs do not match/);
+    assert.equal(result.buildResult, undefined);
+  });
+
+  it("validates and records the complete delivery revision after a partial remediation attempt", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = packet(run);
+    const completePaths = ["SECURITY.md", "docs/contract.md", "src/a.ts"];
+    const result = await verifyAndCommit({
+      run,
+      packet: { ...frozen, payload: { ...frozen.payload, expectedPaths: completePaths } },
+      submission: { ...submission, changedPaths: completePaths },
+      workspace,
+      commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]),
+      git: new FakeGit(["src/a.ts"], ["SECURITY.md", "docs/contract.md"]),
+      artifacts, runs,
+    });
+    assert.deepEqual(result.buildResult?.payload.changedPaths, completePaths);
+  });
+
+  it("rejects an out-of-packet path already committed on the delivery branch", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const verifier: VerificationRunner = { async run() { throw new Error("verification must not execute"); } };
+    const result = await verifyAndCommit({
+      run,
+      packet: packet(run),
+      submission: { ...submission, changedPaths: ["SECURITY.md", "src/a.ts"] },
+      workspace,
+      commands: [command],
+    }, {
+      verifier,
+      git: new FakeGit(["src/a.ts"], ["SECURITY.md"]),
+      artifacts,
+      runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /delivery revision contains paths outside the Build Packet.*SECURITY\.md/i);
+    assert.equal(result.buildResult, undefined);
+  });
+
+  it("rejects a remediation report that omits retained committed paths", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = packet(run);
+    const result = await verifyAndCommit({
+      run,
+      packet: { ...frozen, payload: { ...frozen.payload, expectedPaths: ["docs/contract.md", "src/a.ts"] } },
+      submission,
+      workspace,
+      commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]),
+      git: new FakeGit(["src/a.ts"], ["docs/contract.md"]),
+      artifacts,
+      runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /delivery revision.*omitted docs\/contract\.md/i);
+    assert.equal(result.buildResult, undefined);
+  });
+
+  it("blocks when verification mutates an allowed file after observing it", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-content-"));
+    const localWorkspace = { ...workspace, path: directory };
+    mkdirSync(join(directory, "src"), { recursive: true });
+    writeFileSync(join(directory, "src", "a.ts"), "export const value = 1;\n");
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      const git = new FakeGit(["src/a.ts"]);
+      const verifier: VerificationRunner = {
+        async run() {
+          writeFileSync(join(directory, "src", "a.ts"), "export const value = 2;\n");
+          return [passed];
+        },
+      };
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: localWorkspace, commands: [command],
+      }, { verifier, git, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.match(result.outcome?.payload.reason ?? "", /verification commands changed.*untested results/i);
+      assert.equal(git.committed, false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when the committed revision gains an unreported out-of-packet path", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
     const result = await verifyAndCommit({ run, packet: packet(run), submission, workspace, commands: [command] }, {
       verifier: new FakeVerifier([passed]),
-      git: new FakeGit(["src/a.ts"], ["SECURITY.md", "docs/contract.md", "src/a.ts"]),
-      artifacts, runs,
+      git: new FakeGit(["src/a.ts"], [], ["outside.ts", "src/a.ts"]),
+      artifacts,
+      runs,
     });
-    assert.deepEqual(result.buildResult?.payload.changedPaths, ["SECURITY.md", "docs/contract.md", "src/a.ts"]);
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /committed delivery revision contains paths outside the Build Packet.*outside\.ts/i);
+    assert.deepEqual(result.outcome?.payload.failureEvidence?.changedPaths, ["outside.ts", "src/a.ts"]);
+    assert.equal(result.buildResult, undefined);
   });
 
   it("retains unchanged baseline-failure evidence without treating a required failure as passed", async () => {
@@ -123,6 +260,9 @@ describe("verification and commit barrier", () => {
       baseSha: workspace.baseSha,
       builderSummary: submission.summary,
       changedPaths: ["src/a.ts"],
+      criterionCoverage: submission.criterionCoverage,
+      decisions: submission.decisions,
+      residualRisks: submission.residualRisks,
       checks: [failed],
     });
   });
@@ -143,12 +283,90 @@ describe("verification and commit barrier", () => {
     assert.match(result.outcome?.payload.reason ?? "", /docs:build/);
     assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
     assert.deepEqual(uncoveredVerificationCommands(["Run `git diff --check`.", "Run `npm test`."], [
-      { id: "diff-check" }, { id: "test" },
+      { id: "diff-check", command: "git", args: ["diff", "--check"] }, command,
     ]), []);
     assert.deepEqual(
-      uncoveredVerificationCommands(["`node --test test/contract.test.js`"], [{ id: "test" }]),
+      uncoveredVerificationCommands(["`node --test test/contract.test.js`"], [command]),
       ["node --test test/contract.test.js"],
     );
+    assert.deepEqual(
+      uncoveredVerificationCommands([
+        "Run `bun test`.",
+        "Run `deno test`.",
+        "Execute `bash scripts/check.sh`.",
+        "Run `dotnet test`.",
+        "Run `npm test -- --coverage`.",
+        "custom-check --strict",
+        "`scripts/check`",
+        "Check `scripts/custom-check` exits zero.",
+        "Check scripts/custom-check",
+        "Ensure `scripts/custom-check` completes successfully.",
+        "Confirm `scripts/custom-check` is green.",
+        "Confirm that npm test works",
+        "Confirm that `scripts/custom-check` works",
+      ], [command]),
+      [
+        "bun test",
+        "deno test",
+        "bash scripts/check.sh",
+        "dotnet test",
+        "npm test -- --coverage",
+        "custom-check --strict",
+        "scripts/check",
+        "scripts/custom-check",
+        "Check scripts/custom-check",
+        "Confirm that npm test works",
+      ],
+    );
+    assert.deepEqual(
+      uncoveredVerificationCommands(["Run `npm test`."], [{ id: "test", command: "npm", args: ["--version"] }]),
+      ["npm test"],
+    );
+    assert.deepEqual(uncoveredVerificationCommands([
+      "Inspect `src/a.ts` manually.",
+      "Inspect `bin/forgedock-terminal` manually.",
+      "Inspect `Dockerfile` manually.",
+    ], [command]), []);
+  });
+
+  it("rejects out-of-packet paths before executing repository commands", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const verifier: VerificationRunner = { async run() { throw new Error("verification must not execute"); } };
+    const result = await verifyAndCommit({ run, packet: packet(run), submission, workspace, commands: [command] }, {
+      verifier, git: new FakeGit(["src/a.ts", "outside.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /outside the Build Packet/);
+    assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
+  });
+
+  it("blocks incomplete criterion coverage instead of manufacturing passed evidence", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const incomplete = { ...submission, criterionCoverage: [] };
+    const result = await verifyAndCommit({ run, packet: packet(run), submission: incomplete, workspace, commands: [command] }, {
+      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /criterion coverage is incomplete.*Preserves state/);
+    assert.equal(result.buildResult, undefined);
+    assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
+  });
+
+  it("blocks an inaccurate builder change report before verification", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const inaccurate = { ...submission, changedPaths: ["src/other.ts"] };
+    const result = await verifyAndCommit({ run, packet: packet(run), submission: inaccurate, workspace, commands: [command] }, {
+      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /change report does not match.*omitted src\/a\.ts.*reported unchanged src\/other\.ts/);
+    assert.equal(result.buildResult, undefined);
   });
 
   it("compares canonical packet paths with Git paths", async () => {

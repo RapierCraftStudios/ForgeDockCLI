@@ -62,9 +62,9 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Build Packet author policy and durable artifact
 - [x] Git worktree adapter and branch ownership
 - [x] Builder session with workspace-only mutation rights and no shell/GitHub grant
-- [x] Verification command runner, output digests, and fail-closed required gates
+- [x] Credential-isolated verification runner with normalized/redacted output digests; every frozen required command executes independently with fail-closed evidence
 - [x] Scope-drift check against expected paths
-- [x] Branch push and PR publication with verified-SHA assertion
+- [x] Hook-disabled branch push and PR publication with verified-SHA, raw committed-blob, and asserted Git-tree checks; repository clean filters are rejected
 - [x] End-to-end six-artifact trajectory test through merge and closure
 - [x] Auto-merge default after successful verification and independent approval, with explicit `--no-auto-merge` opt-out
 - [ ] Idempotent publication reconciliation after a crash between push and state commit
@@ -73,7 +73,11 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
 - [x] Verification-stage resume from retained workspaces without replaying investigation or build
 - [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
-- [x] Frozen verification-plan coverage: controller-approved diff/package commands execute or the Build Result blocks instead of claiming unobserved success
+- [x] Frozen verification-plan coverage: every controller-approved diff/package command executes and contributes evidence instead of stopping after the first failure or claiming unobserved success
+- [x] Same-invocation verification recovery: in-packet build and post-review remediation failures receive at most two evidence-backed builder repairs, with durable crash-resume budgets and no scope widening
+- [x] Truthful Build Results require controller-observed changed paths to match the worker report and explicit coverage for every frozen acceptance criterion
+- [x] Frozen Build Packet scope replaces issue-hint authority durably, grants only bounded discovery reads plus exact writes, and is rebuilt deterministically on resume
+- [x] Terminal merged Outcomes remain unpublished until idempotent trajectory projection and authoritative re-read proof that every parent/member issue is closed
 
 ### 3. Independent `review-pr` — executable core and CLI implemented
 
@@ -84,8 +88,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Soft specialist budget with concrete-surface override, bounded reviewer slices, and one finding-triggered adaptive escalation wave
 - [x] Structured findings, deterministic blocking policy, semantic cross-reviewer consolidation, and source/session lineage
 - [x] Build-Packet semantic scope adjudication and post-remediation continuity gating prevent newly discovered adjacent concerns from expanding the active delivery
-- [x] SHA freshness invalidation before and after review
-- [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results retain the complete delivery path set against an immutable base SHA persisted across recovery
+- [x] Full head SHA, head branch, base branch, and PR-state freshness invalidation before, during, and immediately before verdict publication; standalone review preserves explicit delivery-run lineage
+- [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results validate rename-complete delivery paths and stable content against frozen scope, an immutable base SHA, and the asserted committed tree across recovery
 - [x] Policy-controlled auto-merge default with explicit per-run or project-level opt-out
 - [x] Live GitHub review smoke test with parallel, independently inspectable nested reviewer sessions
 - [x] Per-reviewer provisional PR comments and a controller-authoritative consolidated Review Verdict; create follow-up issues only for unresolved blockers or independently corroborated high-risk follow-ups, and close stale projections after a superseding verdict
@@ -109,7 +113,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Compatible ordinary and P2/P3 review findings sharing a bounded concern surface contract into one durable batch issue and one work-on agent
 - [x] Strict machine-readable member contracts are parsed before batch execution
 - [x] Successful batch completion projects a typed merged Outcome and protocol trajectory receipt to each member before closing the member issues
-- [x] Durable recursive-remediation checkpoints, deterministic child issue materialization, parent-branch targeting, and exact expanded-review transition
+- [x] Durable recursive-remediation checkpoints, checkpoint-authorized nested child targeting with frozen depth/child limits, synchronized parent-SHA and child-commit ancestry verification, actual expanded-path proof, and exact expanded-review transition without replaying superseded checkpoints
 - [x] Explicit ScopeManifest enforcement across investigator, builder, remediator, and reviewer runtime tool grants
 - [x] Scheduler suspension statuses, typed event sinks, orchestration snapshots, and restartable remediation projections
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
@@ -140,8 +144,9 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Materialize issue-worker definitions with an absolute child-only ForgeDock extension path so strict subagent tool allowlists can actually load `forgedock_work_on`
 - [x] Project typed run transitions into auto-provisioned, mutually exclusive `workflow:*` GitHub labels without making labels authoritative
 - [x] Refresh explicitly configured GitHub App credentials at interactive terminal startup through a packaged cross-platform Node helper
-- [x] Serialize verification, bound Node test fanout, and terminate full subprocess trees on timeout/cancellation
+- [x] Serialize verification, bound Node test fanout, terminate full subprocess trees on timeout/cancellation, isolate credential-free verification homes, and redact credential-shaped durable output
 - [x] Keep subagent transcripts out of delivery worktrees and reject automatic remediation outside frozen Build Packet paths
+- [x] Correlate concurrent worker tool calls by call ID and retain only bounded, single-line, credential-redacted failure summaries in live controller logs
 - [x] Bootstrap `forge.yaml` on parent-terminal launch and preserve it through an isolated ForgeDock Next managed section with natural-language `/forgedock-config`, live-catalog model alias resolution, and all-subagent role updates
 - [x] Load explicit `FORGE.md` project guidance in the terminal and bounded typed workflow agents
 - [x] Provide token-bounded `devdocs/` memory retrieval with anchors, wiki links, backlinks, and an explicit reference-only authority boundary

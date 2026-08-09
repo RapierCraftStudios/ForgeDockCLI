@@ -91,6 +91,11 @@ export const CheckResultSchema = Type.Object({
   outputDigest: Type.Optional(Type.String()),
   summary: Type.Optional(Type.String()),
   failureSignatures: Type.Optional(Type.Array(NonEmptyString)),
+  failureClass: Type.Optional(Type.Union([
+    Type.Literal("command"),
+    Type.Literal("infrastructure"),
+    Type.Literal("timeout"),
+  ])),
   baselineStatus: Type.Optional(Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("skipped")])),
   baselineFailureSignatures: Type.Optional(Type.Array(NonEmptyString)),
   regression: Type.Optional(Type.Boolean()),
@@ -98,6 +103,7 @@ export const CheckResultSchema = Type.Object({
 
 export const BuildResultPayloadSchema = Type.Object({
   branch: NonEmptyString,
+  targetBranch: Type.Optional(NonEmptyString),
   headSha: Sha,
   baseSha: Type.Optional(Sha),
   changedPaths: Type.Array(NonEmptyString),
@@ -169,6 +175,8 @@ export const ReviewPlanSchema = Type.Object({
 
 export const ReviewVerdictPayloadSchema = Type.Object({
   headSha: Sha,
+  headBranch: Type.Optional(NonEmptyString),
+  baseBranch: Type.Optional(NonEmptyString),
   disposition: Type.Union([
     Type.Literal("approve"),
     Type.Literal("request_changes"),
@@ -209,6 +217,13 @@ export const OutcomePayloadSchema = Type.Object({
     baseSha: Type.Optional(Sha),
     builderSummary: NonEmptyString,
     changedPaths: Type.Array(NonEmptyString),
+    criterionCoverage: Type.Optional(Type.Array(Type.Object({
+      criterion: NonEmptyString,
+      implementation: NonEmptyString,
+    }))),
+    decisions: Type.Optional(Type.Array(Type.String())),
+    residualRisks: Type.Optional(Type.Array(Type.String())),
+    repairAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
     checks: Type.Array(CheckResultSchema),
   })),
 });
@@ -242,8 +257,10 @@ export const RemediationBlockedPayloadSchema = Type.Object({
   childRunIds: Type.Array(NonEmptyString),
   approvedPaths: Type.Array(NonEmptyString),
   childOutcomeIds: Type.Array(NonEmptyString),
+  childFinalShas: Type.Optional(Type.Array(Sha)),
   remediationDepth: Type.Integer({ minimum: 0 }),
   maxRemediationDepth: Type.Integer({ minimum: 0 }),
+  maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
 export const ArtifactPayloadSchemas = {

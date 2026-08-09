@@ -5,12 +5,27 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } from "../core/ports/repositories.js";
-import { decideSubjectAdmission, workOnDeliveryArtifacts } from "../core/state/admission.js";
+import {
+  decideSubjectAdmission,
+  latestArtifactOfKind,
+  latestDeliveryRunArtifacts,
+  reviewRemediationCycleCount,
+  verificationRepairAttemptCount,
+  workOnDeliveryArtifacts,
+} from "../core/state/admission.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
-import { scopeManifestFor, TelemetryAgentRuntime, type AgentEvent, type AgentRuntime, type RuntimePreflightOptions } from "../runtime/agent-runtime.js";
+import {
+  scopeManifestFor,
+  scopeManifestForBuildPacket,
+  STANDARD_SCOPE_METADATA_ROOTS,
+  TelemetryAgentRuntime,
+  type AgentEvent,
+  type AgentRuntime,
+  type RuntimePreflightOptions,
+} from "../runtime/agent-runtime.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
@@ -19,6 +34,7 @@ import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, reso
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
+import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
@@ -34,7 +50,6 @@ import { parseOrchestrationIssueNumbers } from "./argument-parser.js";
 const args = process.argv.slice(2);
 const mode = colorMode();
 const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
-const STANDARD_SCOPE_METADATA_ROOTS = ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"] as const;
 
 await main(args).catch((error: unknown) => {
   agentEventStream.finish();
@@ -157,9 +172,13 @@ async function workOn(argv: string[]): Promise<void> {
   const scopeExpansionOption = option(argv, "--scope-expansion");
   if (scopeExpansionOption !== undefined && scopeExpansionOption !== "scope-locked" && scopeExpansionOption !== "recursive") throw new Error("--scope-expansion must be scope-locked or recursive");
   const remediationCyclesOption = option(argv, "--max-remediation-cycles");
+  const remediationDepthOption = option(argv, "--max-remediation-depth");
+  const remediationChildrenOption = option(argv, "--max-remediation-children");
   const effectiveOrchestration = resolveOrchestrationConfig(configuredNext, {
     ...(scopeExpansionOption !== undefined ? { scopeExpansion: scopeExpansionOption } : {}),
     ...(remediationCyclesOption !== undefined ? { maxRemediationCycles: Number(remediationCyclesOption) } : {}),
+    ...(remediationDepthOption !== undefined ? { maxRemediationDepth: Number(remediationDepthOption) } : {}),
+    ...(remediationChildrenOption !== undefined ? { maxRemediationChildren: Number(remediationChildrenOption) } : {}),
   });
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
 
@@ -169,11 +188,13 @@ async function workOn(argv: string[]): Promise<void> {
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
   const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github);
-  const baseRef = `origin/${lane.targetBranch}`;
-  const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
+  const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts);
+  const deliveryTargetBranch = parentRemediation?.parentBranch ?? lane.targetBranch;
+  const baseRef = `origin/${deliveryTargetBranch}`;
+  const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
   const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
@@ -190,7 +211,7 @@ async function workOn(argv: string[]): Promise<void> {
     const dependencyIssue = await github.getIssue(dependency, issue.repo);
     const mergedOutcome = dependencyArtifacts
       .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged")
-      .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+      .at(-1);
     subjectEvidence.push(
       `Dependency #${dependency} admission: authoritative artifact state completed${reconciled.runId ? ` in run ${reconciled.runId}` : ""}; merged Outcome recorded ${mergedOutcome?.createdAt ?? "with no timestamp"}; issue state ${dependencyIssue.state}; labels ${dependencyIssue.labels.join(", ") || "none"}`,
     );
@@ -276,34 +297,31 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
       }
       const runArtifacts = resumeArtifacts.filter((artifact) => artifact.runId === resumeRunId);
-      const priorRemediationCycles = Math.max(0, runArtifacts.filter((artifact) => artifact.kind === "BuildResult").length - 1);
-      const intentArtifact = latestArtifact(runArtifacts, "Intent");
-      const investigation = latestArtifact(runArtifacts, "Investigation");
-      const packet = latestArtifact(runArtifacts, "BuildPacket");
+      const priorRemediationCycles = reviewRemediationCycleCount(runArtifacts);
+      const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
+      const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
+      const packet = latestArtifactOfKind(runArtifacts, "BuildPacket");
       if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
-      const remediationCheckpoint = latestArtifact(runArtifacts, "RemediationBlocked");
-      const latestOutcome = latestArtifact(runArtifacts, "Outcome");
+      const remediationCheckpoint = latestArtifactOfKind(runArtifacts, "RemediationBlocked");
+      const latestOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
       const checkpointArtifact = admission.checkpoint === "verification"
         ? latestOutcome
         : admission.checkpoint === "publication"
-          ? latestArtifact(runArtifacts, "BuildResult")
+          ? latestArtifactOfKind(runArtifacts, "BuildResult")
           : admission.checkpoint === "completion"
-            ? latestArtifact(runArtifacts, "ReviewVerdict")
+            ? latestArtifactOfKind(runArtifacts, "ReviewVerdict")
             : admission.checkpoint === "remediation"
-              ? (admission.state === "blocked" ? latestArtifact(runArtifacts, "Outcome") : latestArtifact(runArtifacts, "ReviewVerdict"))
+              ? (admission.state === "blocked" ? latestArtifactOfKind(runArtifacts, "Outcome") : latestArtifactOfKind(runArtifacts, "ReviewVerdict"))
               : packet;
       const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
       for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
-      const recoveredScopeManifest = scopeManifestFor("build-packet", {
-        affectedFiles: packet.payload.expectedPaths,
-        writePaths: packet.payload.expectedPaths,
-        metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
-      });
+      const recoveredScopeManifest = scopeManifestForBuildPacket(packet.payload.expectedPaths);
+      const priorVerificationRepairAttempts = verificationRepairAttemptCount(runArtifacts);
       const failedOutcome = admission.state === "failed" ? latestOutcome : undefined;
-      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
-      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
+      const retainedBuildResult = latestArtifactOfKind(runArtifacts, "BuildResult");
+      const priorVerdict = latestArtifactOfKind(runArtifacts, "ReviewVerdict");
       const openPullRequest = retainedBuildResult
         ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
         : undefined;
@@ -319,15 +337,19 @@ async function workOn(argv: string[]): Promise<void> {
       if (admission.checkpoint === "completion" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
         throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for completion resume`);
       }
-      if (checkpointPullRequest && checkpointPullRequest.baseBranch !== lane.targetBranch) {
+      if (checkpointPullRequest && checkpointPullRequest.baseBranch !== deliveryTargetBranch) {
         throw new Error(
-          `Existing PR #${checkpointPullRequest.number} targets ${checkpointPullRequest.baseBranch}, but issue #${issue.number} classifies to ${lane.targetBranch}; refusing cross-lane resume`,
+          `Existing PR #${checkpointPullRequest.number} targets ${checkpointPullRequest.baseBranch}, but issue #${issue.number} must deliver to ${deliveryTargetBranch}; refusing cross-target resume`,
         );
       }
-      const frozenTarget = runTargetForLane(lane);
+      const frozenTarget = parentRemediation
+        ? { ...runTargetForLane(lane), targetBranch: parentRemediation.parentBranch }
+        : runTargetForLane(lane);
       const recoveredRun = {
         schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
-        state: admission.state, attempt: 1, version: 0,
+        state: admission.state,
+        attempt: admission.checkpoint === "build" ? Math.max(1, priorVerificationRepairAttempts) : 1,
+        version: 0,
         ...frozenTarget,
         createdAt: intentArtifact.createdAt, updatedAt: checkpointArtifact?.createdAt ?? packet.createdAt,
         artifactIds,
@@ -340,13 +362,13 @@ async function workOn(argv: string[]): Promise<void> {
         await store.create(recoveredRun);
         run = recoveredRun;
       } else if (run.state !== admission.state
-        || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)) {
-        process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${run.state}) from durable GitHub state (${admission.state})\n`);
+        || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)
+        || JSON.stringify(run.scopeManifest ?? null) !== JSON.stringify(recoveredScopeManifest)) {
+        process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} state or scope (${run.state}) from durable GitHub authority (${admission.state})\n`);
         store.rebuildRun(recoveredRun);
         run = recoveredRun;
       } else if (run.targetBranch) {
         assertRunFollowsLane(run, lane);
-        if (!run.scopeManifest) run = { ...run, scopeManifest: recoveredScopeManifest };
       } else {
         run = { ...run, ...frozenTarget, scopeManifest: recoveredScopeManifest };
       }
@@ -371,7 +393,7 @@ async function workOn(argv: string[]): Promise<void> {
           workspace = await git.recover(recoveryInput);
         }
       } else {
-        outcome = latestArtifact(runArtifacts, "Outcome");
+        outcome = latestArtifactOfKind(runArtifacts, "Outcome");
         if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
           throw new Error(`Run ${resumeRunId} does not contain complete retained verification evidence`);
         }
@@ -391,11 +413,21 @@ async function workOn(argv: string[]): Promise<void> {
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace: workspace!,
         ...(admission.checkpoint === "build" && latestOutcome?.payload.status === "blocked" && latestOutcome.payload.failureEvidence
-          ? { priorVerificationFailure: latestOutcome }
+          ? {
+            priorVerificationFailure: latestOutcome,
+            priorVerificationRepairAttempts,
+            ...(retainedBuildResult && priorVerdict ? { repairContext: [retainedBuildResult, priorVerdict] } : {}),
+          }
           : {}),
-        baseBranch: lane.targetBranch, verification,
+        baseBranch: deliveryTargetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         priorRemediationCycles,
+        scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
+        maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
+        maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
+        maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+        remediationDepth: parentRemediation?.remediationDepth ?? 0,
+        ...(parentRemediation !== undefined ? { parentRemediation } : {}),
         subjectEvidence,
         ...(batchMembers.length ? { batchMembers } : {}),
         ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
@@ -437,6 +469,8 @@ async function workOn(argv: string[]): Promise<void> {
                       reason: checkpoint.payload.reason,
                       remediationDepth: checkpoint.payload.remediationDepth,
                       maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
+                      maxRemediationChildren: checkpoint.payload.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+                      approvedPaths: checkpoint.payload.approvedPaths,
                       findings: checkpoint.payload.findings.map((finding) => ({
                         id: finding.id,
                         severity: finding.severity,
@@ -460,6 +494,10 @@ async function workOn(argv: string[]): Promise<void> {
                   }
                   return resumeExpandedReviewWorkOn({
                     ...common,
+                    scopeExpansion: "recursive",
+                    remediationDepth: checkpoint.payload.remediationDepth,
+                    maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
+                    maxRemediationChildren: checkpoint.payload.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
                     priorVerdict: priorVerdict!,
                     checkpoint,
                     pullRequest: checkpointPullRequest!,
@@ -515,10 +553,12 @@ async function workOn(argv: string[]): Promise<void> {
       ...(batchMembers.length ? { batchMembers } : {}),
       ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
       autoMerge,
-      scopeExpansion: effectiveOrchestration.scopeExpansion,
+      scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
       maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
-      maxRemediationDepth: effectiveOrchestration.maxRemediationDepth,
-      maxRemediationChildren: effectiveOrchestration.maxRemediationChildren,
+      maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
+      maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+      remediationDepth: parentRemediation?.remediationDepth ?? 0,
+      ...(parentRemediation !== undefined ? { parentRemediation } : {}),
       ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
@@ -549,14 +589,14 @@ async function resetIssue(argv: string[]): Promise<void> {
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const repository = new GitHubArtifactRepository(github);
   const all = await repository.list({ repo: issue.repo, issue: issue.number });
-  const latestRun = latestRunArtifacts(all);
+  const latestRun = latestDeliveryRunArtifacts(all);
   if (!latestRun) {
     await github.clearWorkflowLabels(issue.repo, issue.number);
     process.stdout.write(`Reset ${issue.repo}#${issue.number}; no durable run existed.\n`);
     return;
   }
   const reason = option(argv, "--reason") ?? "User-requested pipeline reset before a clean rerun; prior comments remain durable audit history.";
-  const priorOutcome = latestArtifact(latestRun.artifacts, "Outcome");
+  const priorOutcome = latestArtifactOfKind(latestRun.artifacts, "Outcome");
   if (priorOutcome?.payload.status !== "abandoned") {
     await repository.append(createArtifact({
       kind: "Outcome", runId: latestRun.runId, subject: { repo: issue.repo, issue: issue.number },
@@ -564,8 +604,8 @@ async function resetIssue(argv: string[]): Promise<void> {
       payload: { status: "abandoned", reason, childIssues: [] },
     }));
   }
-  const verdict = latestArtifact(latestRun.artifacts, "ReviewVerdict");
-  const buildResult = latestArtifact(latestRun.artifacts, "BuildResult");
+  const verdict = latestArtifactOfKind(latestRun.artifacts, "ReviewVerdict");
+  const buildResult = latestArtifactOfKind(latestRun.artifacts, "BuildResult");
   const pr = verdict?.subject.pr
     ? await github.getPullRequest(issue.repo, verdict.subject.pr)
     : buildResult ? await github.findOpenPullRequest(issue.repo, buildResult.payload.branch) : undefined;
@@ -627,9 +667,11 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-parallel N] [--dry-run] [--confirm]");
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--dry-run] [--confirm]");
   const config = readForgeDockConfig(process.cwd());
   const maxParallelValue = option(argv, "--max-parallel");
+  const remediationDepthValue = option(argv, "--max-remediation-depth");
+  const remediationChildrenValue = option(argv, "--max-remediation-children");
   const requestedBatching = option(argv, "--batching");
   if (requestedBatching !== undefined && !["aggressive", "conservative", "none"].includes(requestedBatching)) throw new Error("--batching must be aggressive, conservative, or none");
   const effective = resolveOrchestrationConfig(config, {
@@ -637,8 +679,12 @@ async function orchestrate(argv: string[]): Promise<void> {
     ...(maxParallelValue ? { maxParallel: Number(maxParallelValue) } : {}),
     ...(option(argv, "--scope-expansion") ? { scopeExpansion: option(argv, "--scope-expansion") as "scope-locked" | "recursive" } : {}),
     ...(option(argv, "--max-remediation-cycles") ? { maxRemediationCycles: Number(option(argv, "--max-remediation-cycles")) } : {}),
+    ...(remediationDepthValue !== undefined ? { maxRemediationDepth: Number(remediationDepthValue) } : {}),
+    ...(remediationChildrenValue !== undefined ? { maxRemediationChildren: Number(remediationChildrenValue) } : {}),
   });
   if (maxParallelValue !== undefined && (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1)) throw new Error("--max-parallel must be a positive integer");
+  if (remediationDepthValue !== undefined && !/^\d+$/.test(remediationDepthValue)) throw new Error("--max-remediation-depth must be a non-negative integer");
+  if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
   const github = new GitHubClient(process.cwd());
@@ -765,6 +811,12 @@ async function orchestrate(argv: string[]): Promise<void> {
           const dependencies = item.dependencies.map(issueNumberFromScheduledId);
           if (dependencies.length) resumeArgs.push("--depends-on", dependencies.join(","));
           resumeArgs.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
+          resumeArgs.push(
+            "--scope-expansion", effective.scopeExpansion,
+            "--max-remediation-cycles", String(effective.maxRemediationCycles),
+            "--max-remediation-depth", String(effective.maxRemediationDepth),
+            "--max-remediation-children", String(effective.maxRemediationChildren),
+          );
           if (provider !== undefined) resumeArgs.push("--provider", provider);
           if (model !== undefined) resumeArgs.push("--model", model);
           await workOn(resumeArgs);
@@ -775,17 +827,24 @@ async function orchestrate(argv: string[]): Promise<void> {
           return;
         }
         const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
+        const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
         const intent = createArtifact({
           kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
           producer: { role: "controller", runtime: "forgedock" },
           payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
         });
-        const baseRef = `origin/${lane.targetBranch}`;
+        const baseRef = `origin/${parentRemediation?.parentBranch ?? lane.targetBranch}`;
         const verification = discoverVerificationCommands(process.cwd(), baseRef);
         process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
         const result = await executeWorkOn({
           intent, repoPath: process.cwd(), lane,
           verification, autoMerge, signal: controller.signal,
+          scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
+          maxRemediationCycles: effective.maxRemediationCycles,
+          maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
+          maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effective.maxRemediationChildren,
+          remediationDepth: parentRemediation?.remediationDepth ?? 0,
+          ...(parentRemediation !== undefined ? { parentRemediation } : {}),
           scopeHints: {
             affectedFiles: item.affectedFiles ?? [],
             claims: item.claims,
@@ -880,21 +939,6 @@ function issueSubjectEvidence(issue: { number: number; body: string; labels: rea
     `GitHub issue #${issue.number} labels: ${issue.labels.length ? issue.labels.join(", ") : "none"}`,
     `GitHub issue #${issue.number} body: ${compactBody || "(empty)"}`,
   ];
-}
-
-function latestRunArtifacts(artifacts: readonly DurableArtifact[]): { runId: string; artifacts: DurableArtifact[] } | undefined {
-  const byRun = new Map<string, DurableArtifact[]>();
-  for (const artifact of artifacts) byRun.set(artifact.runId, [...(byRun.get(artifact.runId) ?? []), artifact]);
-  return [...byRun.entries()]
-    .map(([runId, values]) => ({ runId, artifacts: values, timestamp: Math.max(...values.map((artifact) => Date.parse(artifact.createdAt) || 0)) }))
-    .sort((left, right) => right.timestamp - left.timestamp || right.runId.localeCompare(left.runId))
-    .map(({ runId, artifacts: values }) => ({ runId, artifacts: values }))[0];
-}
-
-function latestArtifact<K extends ArtifactKind>(artifacts: readonly DurableArtifact[], kind: K): DurableArtifact<K> | undefined {
-  return artifacts
-    .filter((artifact): artifact is DurableArtifact<K> => artifact.kind === kind)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
 }
 
 async function collectBaselineChecks(input: {

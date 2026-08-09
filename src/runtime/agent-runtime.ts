@@ -30,6 +30,16 @@ export interface WorkspaceGrant {
   scope: ScopeManifest;
 }
 
+export const STANDARD_SCOPE_METADATA_ROOTS = [
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "tsconfig.json",
+  "forge.yaml",
+  "FORGE.md",
+] as const;
+
 const GLOB_PATTERN = /[*?[{]/;
 
 /** Build a bounded manifest from issue/packet evidence; never grants an unbounded root by default. */
@@ -56,6 +66,16 @@ export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints 
     ...(writePaths.length ? { writePaths } : {}),
     source,
   };
+}
+
+/** Derive one deterministic read/write authority from a frozen Build Packet. */
+export function scopeManifestForBuildPacket(expectedPaths: readonly string[]): ScopeManifest {
+  const writePaths = canonicalizeConcreteScopePaths(expectedPaths);
+  return scopeManifestFor("build-packet", {
+    affectedFiles: writePaths,
+    metadataRoots: [...STANDARD_SCOPE_METADATA_ROOTS, ...scopeDiscoveryRoots(writePaths)],
+    writePaths,
+  });
 }
 
 /** Build Packet and remediation writes must name concrete repository-relative files. */
@@ -137,8 +157,8 @@ export type AgentEvent =
   | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string }
   | { type: "thinking.delta"; taskId: string; text: string }
   | { type: "text.delta"; taskId: string; text: string }
-  | { type: "tool.started"; taskId: string; tool: string; args?: unknown }
-  | { type: "tool.completed"; taskId: string; tool: string; isError: boolean }
+  | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown }
+  | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string }
   | { type: "artifact.submitted"; taskId: string }
   | { type: "session.completed"; taskId: string; sessionRef: string };
 

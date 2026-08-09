@@ -135,7 +135,7 @@ export function trajectoryReceiptFromArtifacts(input: {
 }): TrajectoryReceipt {
   const latest = <K extends DurableArtifact["kind"]>(kind: K): Extract<DurableArtifact, { kind: K }> | undefined => input.artifacts
     .filter((artifact): artifact is Extract<DurableArtifact, { kind: K }> => artifact.kind === kind)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
+    .at(-1);
   const build = latest("BuildResult");
   const verdict = latest("ReviewVerdict");
   const outcome = latest("Outcome");

@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
+import { boundedToolErrorSummary, PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
 import { scopeManifestFor } from "./agent-runtime.js";
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
@@ -68,6 +68,26 @@ test("the controller rejects a malformed nested structured result even after bri
     else process.env.FORGEDOCK_NESTED_AGENT_TOKEN = previousToken;
     await endpoint.close();
   }
+});
+
+test("tool error summaries expose only allowlisted classifications", () => {
+  const arbitrary = boundedToolErrorSummary({
+    content: [{
+      type: "text",
+      text: `Edit failed\n token=github_pat_${"a".repeat(80)} C:\\Users\\secret\\key.pem -----BEGIN PRIVATE KEY-----`,
+    }],
+  });
+  assert.equal(arbitrary, "Tool execution failed; inspect the scoped arguments and retry");
+  assert.doesNotMatch(arbitrary, /github_pat_|Users|PRIVATE KEY|\n/);
+  assert.equal(
+    boundedToolErrorSummary({ content: [{ type: "text", text: "oldText occurs 3 times and is not unique" }] }),
+    "Edit target text was not unique",
+  );
+  assert.equal(
+    boundedToolErrorSummary({ content: [{ type: "text", text: "Tool write path is outside the assigned scope: C:\\secret" }] }),
+    "Path is outside the assigned workspace scope",
+  );
+  assert.equal(boundedToolErrorSummary({ content: [{ type: "image", data: "secret" }] }), undefined);
 });
 
 test("nested reviewer transport still honors explicit cancellation", async () => {

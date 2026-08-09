@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitWorkspace, GitWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -104,20 +106,115 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   async revisionChangedPaths(workspace: GitWorkspace): Promise<string[]> {
     const baseSha = workspace.baseSha
       ?? (await this.git(["merge-base", workspace.baseRef, "HEAD"], workspace.path)).trim();
-    const output = await this.git(["diff", "--name-only", "-z", `${baseSha}..HEAD`], workspace.path);
+    const output = await this.git(["diff", "--no-renames", "--name-only", "-z", `${baseSha}..HEAD`], workspace.path);
     return [...new Set(output.split("\0").filter((path) => path && !isOperationalPath(path)))].sort();
+  }
+
+  async syncToRemoteHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
+    const dirty = await this.changedPaths(workspace);
+    if (dirty.length) throw new Error(`Cannot synchronize dirty retained workspace: ${dirty.join(", ")}`);
+    await this.git(["fetch", "--no-tags", "origin", workspace.branch], workspace.path);
+    const fetched = (await this.git(["rev-parse", "FETCH_HEAD"], workspace.path)).trim();
+    if (fetched.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      throw new Error(`Fetched parent branch head ${fetched} does not match authoritative PR head ${expectedHeadSha}`);
+    }
+    const current = await this.head(workspace);
+    if (current.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      try {
+        await this.git(["merge-base", "--is-ancestor", current, expectedHeadSha], workspace.path);
+      } catch (error) {
+        throw new Error(`Retained workspace ${current} cannot fast-forward to parent head ${expectedHeadSha}`, { cause: error });
+      }
+      await this.git(["merge", "--ff-only", expectedHeadSha], workspace.path);
+    }
+    const synchronized = await this.head(workspace);
+    if (synchronized.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      throw new Error(`Retained workspace synchronized to ${synchronized}, expected ${expectedHeadSha}`);
+    }
+  }
+
+  async isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean> {
+    try {
+      await this.git(["merge-base", "--is-ancestor", ancestorSha, descendantSha], workspace.path);
+      return true;
+    } catch (error) {
+      const cause = (error as Error & { cause?: { code?: number | string } }).cause;
+      if (cause?.code === 1 || cause?.code === "1") return false;
+      throw error;
+    }
+  }
+
+  async committedContentMatches(
+    workspace: GitWorkspace,
+    paths: readonly string[],
+    expectedDigest: string,
+    revision: string,
+  ): Promise<boolean> {
+    const hash = createHash("sha256");
+    for (const path of [...paths].sort()) {
+      hash.update(path).update("\0");
+      const entry = (await this.git(["--literal-pathspecs", "ls-tree", "-z", revision, "--", path], workspace.path))
+        .split("\0")[0];
+      if (!entry) {
+        hash.update("deleted\0");
+        continue;
+      }
+      const parsed = /^(\d+)\s+(\S+)\s+([0-9a-f]+)\t/.exec(entry);
+      if (!parsed || parsed[2] !== "blob") throw new Error(`Committed delivery path is not a blob: ${path}`);
+      const mode = parsed[1]!;
+      const blob = await this.gitBuffer(["cat-file", "blob", parsed[3]!], workspace.path);
+      hash.update(mode === "100755" ? "1" : "0").update("\0");
+      if (mode === "120000") hash.update("symlink\0").update(blob).update("\0");
+      else hash.update("file\0").update(blob).update("\0");
+    }
+    if (hash.digest("hex") === expectedDigest) return true;
+
+    // Git's built-in text/EOL normalization may legitimately make raw blobs
+    // differ from worktree bytes. After rejecting executable clean filters,
+    // compare Git's canonical object IDs without allowing repository code to run.
+    await this.assertNoCleanFilters(workspace, paths);
+    for (const path of [...paths].sort()) {
+      const entry = (await this.git(["--literal-pathspecs", "ls-tree", "-z", revision, "--", path], workspace.path))
+        .split("\0")[0];
+      if (!entry) {
+        if (existsSync(join(workspace.path, path))) return false;
+        continue;
+      }
+      const parsed = /^(\d+)\s+(\S+)\s+([0-9a-f]+)\t/.exec(entry);
+      if (!parsed || parsed[2] !== "blob") return false;
+      const worktreeObject = (await this.git([
+        "--literal-pathspecs", "hash-object", `--path=${path}`, "--", path,
+      ], workspace.path)).trim();
+      if (worktreeObject !== parsed[3]) return false;
+    }
+    return true;
+  }
+
+  async prepareWorkspaceDependencies(workspace: GitWorkspace): Promise<void> {
+    await this.installDependencies(workspace.path);
   }
 
   async commit(workspace: GitWorkspace, message: string): Promise<string> {
     const paths = await this.changedPaths(workspace);
     if (!paths.length) throw new Error("Builder produced no repository changes");
+    await this.assertNoCleanFilters(workspace, paths);
     await this.git(["add", "--all", "--", ...paths], workspace.path);
-    await this.git(["commit", "-m", message], workspace.path);
+    const expectedTree = (await this.git(["write-tree"], workspace.path)).trim();
+    const disabledHooksPath = process.platform === "win32" ? "NUL" : "/dev/null";
+    await this.git(["-c", `core.hooksPath=${disabledHooksPath}`, "commit", "--no-verify", "-m", message], workspace.path);
+    const committedTree = (await this.git(["rev-parse", "HEAD^{tree}"], workspace.path)).trim();
+    if (committedTree !== expectedTree) {
+      throw new Error(`Committed tree ${committedTree} does not match verified staged tree ${expectedTree}`);
+    }
     return this.head(workspace);
   }
 
   async push(workspace: GitWorkspace): Promise<void> {
-    await this.git(["push", "--set-upstream", "origin", workspace.branch], workspace.path);
+    const disabledHooksPath = process.platform === "win32" ? "NUL" : "/dev/null";
+    await this.git([
+      "-c", `core.hooksPath=${disabledHooksPath}`,
+      "push", "--no-verify", "--set-upstream", "origin", workspace.branch,
+    ], workspace.path);
   }
 
   async head(workspace: GitWorkspace): Promise<string> {
@@ -172,12 +269,47 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         .find((candidate): candidate is string => Boolean(candidate && existsSync(candidate)))
       : undefined;
     if (process.platform === "win32" && !npmCli) throw new Error("Unable to locate npm-cli.js while preparing isolated worktree dependencies");
-    const args = [...(npmCli ? [npmCli] : []), "ci", "--no-audit", "--no-fund"];
+    const args = [...(npmCli ? [npmCli] : []), "ci", "--ignore-scripts", "--no-audit", "--no-fund"];
     try {
-      await execFileAsync(command, args, { cwd: worktreePath, encoding: "utf8", windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+      await execFileAsync(command, args, {
+        cwd: worktreePath,
+        env: verificationEnvironment(process.env),
+        encoding: "utf8",
+        windowsHide: true,
+        maxBuffer: 10 * 1024 * 1024,
+      });
     } catch (error) {
       const detail = error as Error & { stderr?: string };
       throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+    }
+  }
+
+  private async assertNoCleanFilters(workspace: GitWorkspace, paths: readonly string[]): Promise<void> {
+    const attributes = (await this.git([
+      "--literal-pathspecs", "check-attr", "-z", "filter", "--", ...paths,
+    ], workspace.path)).split("\0");
+    for (let index = 0; index + 2 < attributes.length; index += 3) {
+      const path = attributes[index]!;
+      const value = attributes[index + 2]!;
+      if (value && value !== "unspecified" && value !== "unset") {
+        throw new Error(`Repository clean filter '${value}' is not permitted for controller commit path ${path}`);
+      }
+    }
+  }
+
+  private async gitBuffer(args: string[], cwd: string): Promise<Buffer> {
+    try {
+      const { stdout } = await execFileAsync("git", args, {
+        cwd,
+        encoding: null,
+        windowsHide: true,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+    } catch (error) {
+      const detail = error as Error & { stderr?: Buffer | string };
+      const stderr = Buffer.isBuffer(detail.stderr) ? detail.stderr.toString("utf8") : detail.stderr;
+      throw new Error(`git ${args[0] ?? ""} failed in ${basename(cwd)}: ${stderr?.trim() || detail.message}`, { cause: error });
     }
   }
 

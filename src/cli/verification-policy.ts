@@ -31,13 +31,9 @@ export function discoverVerificationCommands(
     throw new Error("No required package verification commands detected; define a lint, typecheck, check, build, docs:build, or test script");
   }
   const planId = createVerificationPlanId(baseRef, scripts, commands);
-  const coverage = nestedScriptCoverage(scripts, commands.map((command) => command.id));
-  return commands.map((command) => {
-    const coveredBy = coverage.get(command.id);
-    return coveredBy?.length
-      ? { ...command, planId, coveredBy }
-      : { ...command, planId };
-  });
+  // Every frozen command executes independently. Inferring nested coverage from
+  // shell text is unsafe: an echo/comment can mention a command without running it.
+  return commands.map((command) => ({ ...command, planId }));
 }
 
 function createVerificationPlanId(baseRef: string | undefined, scripts: Record<string, string>, commands: readonly Pick<VerificationCommand, "id" | "command" | "args" | "timeoutMs" | "required">[]): string {
@@ -49,25 +45,6 @@ function createVerificationPlanId(baseRef: string | undefined, scripts: Record<s
     }))
     .digest("hex")
     .slice(0, 16);
-}
-
-function nestedScriptCoverage(scripts: Record<string, string>, selectedIds: readonly string[]): Map<string, string[]> {
-  const selected = new Set(selectedIds);
-  const coverage = new Map<string, string[]>();
-  for (const parent of selected) {
-    for (const child of referencedScripts(scripts[parent] ?? "")) {
-      if (child === parent || !selected.has(child)) continue;
-      const parents = coverage.get(child) ?? [];
-      if (!parents.includes(parent)) parents.push(parent);
-      coverage.set(child, parents.sort());
-    }
-  }
-  return coverage;
-}
-
-function referencedScripts(command: string): string[] {
-  const matches = command.matchAll(/\b(?:npm(?:\.cmd)?\s+(?:run\s+)?|pnpm\s+(?:run\s+)?|yarn\s+(?:run\s+)?|bun\s+(?:run\s+)?)([A-Za-z0-9:_-]+)/gi);
-  return [...matches].map((match) => match[1]!.toLowerCase());
 }
 
 function readPackageManifest(cwd: string, baseRef?: string): { scripts?: Record<string, string> } {

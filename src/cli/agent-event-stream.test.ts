@@ -30,15 +30,29 @@ test("shows bounded tool arguments and completion in the live stream", () => {
   stream.writer.write({
     type: "tool.started",
     taskId: "build:1",
+    toolCallId: "call-read-1234567890",
     tool: "read",
     args: { path: "src/example.ts", offset: 10, secretPayload: "must-not-render" },
   });
-  stream.writer.write({ type: "tool.completed", taskId: "build:1", tool: "read", isError: false });
-  stream.writer.write({ type: "tool.started", taskId: "build:1", tool: "submit_artifact", args: { huge: "must-not-render" } });
+  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-read-1234567890", tool: "read", isError: false });
+  stream.writer.write({
+    type: "tool.started", taskId: "build:1", toolCallId: "call-submit-1", tool: "submit_artifact", args: { huge: "must-not-render" },
+  });
 
-  assert.match(stream.output(), /◆ build:1 · read · path="src\/example\.ts" offset=10/);
-  assert.match(stream.output(), /✓ build:1 · read complete/);
+  assert.match(stream.output(), /◆ build:1 · read\[d-1234567890\] · path="src\/example\.ts" offset=10/);
+  assert.match(stream.output(), /✓ build:1 · read\[d-1234567890\] complete/);
   assert.doesNotMatch(stream.output(), /secretPayload|must-not-render|huge/);
+});
+
+test("attributes concurrent tool failures by call id and renders bounded evidence", () => {
+  const stream = capture();
+  stream.writer.write({ type: "tool.started", taskId: "build:1", toolCallId: "call-a", tool: "edit", args: { path: "src/a.ts" } });
+  stream.writer.write({ type: "tool.started", taskId: "build:1", toolCallId: "call-b", tool: "edit", args: { path: "src/b.ts" } });
+  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-b", tool: "edit", isError: true, errorSummary: "oldText was not unique" });
+  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-a", tool: "edit", isError: false });
+
+  assert.match(stream.output(), /edit\[call-b\] failed · oldText was not unique/);
+  assert.match(stream.output(), /edit\[call-a\] complete/);
 });
 
 test("keeps concurrent task streams readable instead of interleaving open lines", () => {

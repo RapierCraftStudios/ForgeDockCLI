@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 
 const AGENT_TRANSPORT_PREFIXES = ["PI_SUBAGENT_", "PI_SUBAGENTS_"] as const;
@@ -40,7 +40,10 @@ export function withoutAgentTransportEnvironment(environment: NodeJS.ProcessEnv)
  */
 export function verificationEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const clean = withoutAgentTransportEnvironment(environment);
-  if (process.platform !== "win32") return clean;
+  for (const name of Object.keys(clean)) {
+    if (isSensitiveVerificationVariable(name, clean[name])) delete clean[name];
+  }
+  if (process.platform !== "win32") return isolateVerificationHome(clean);
 
   const gitRoot = discoverGitForWindowsRoot(clean);
   const userHome = environmentValue(clean, "USERPROFILE") ?? homedir();
@@ -69,7 +72,7 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
     if (!environmentValue(clean, "MSYSTEM")) clean.MSYSTEM = "MINGW64";
   }
   if (!environmentValue(clean, "USERPROFILE")) clean.USERPROFILE = userHome;
-  return clean;
+  return isolateVerificationHome(clean);
 }
 
 /**
@@ -176,6 +179,46 @@ function uniquePathEntries(entries: readonly string[]): string[] {
     unique.push(entry);
   }
   return unique;
+}
+
+function isolateVerificationHome(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const root = join(tmpdir(), "forgedock-verification-home");
+  mkdirSync(root, { recursive: true });
+  const config = join(root, ".config");
+  const appData = join(root, "AppData", "Roaming");
+  const localAppData = join(root, "AppData", "Local");
+  for (const path of [config, appData, localAppData]) mkdirSync(path, { recursive: true });
+  setEnvironmentValue(environment, "HOME", root);
+  setEnvironmentValue(environment, "USERPROFILE", root);
+  setEnvironmentValue(environment, "XDG_CONFIG_HOME", config);
+  setEnvironmentValue(environment, "APPDATA", appData);
+  setEnvironmentValue(environment, "LOCALAPPDATA", localAppData);
+  setEnvironmentValue(environment, "GH_CONFIG_DIR", join(config, "gh"));
+  setEnvironmentValue(environment, "DOCKER_CONFIG", join(config, "docker"));
+  setEnvironmentValue(environment, "AZURE_CONFIG_DIR", join(config, "azure"));
+  setEnvironmentValue(environment, "GNUPGHOME", join(config, "gnupg"));
+  setEnvironmentValue(environment, "NPM_CONFIG_USERCONFIG", join(root, ".npmrc"));
+  setEnvironmentValue(environment, "GIT_CONFIG_GLOBAL", join(root, ".gitconfig"));
+  return environment;
+}
+
+function isSensitiveVerificationVariable(name: string, value: string | undefined): boolean {
+  const upperName = name.toUpperCase();
+  const normalized = name.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  const segments = upperName.split(/[^A-Z0-9]+/).filter(Boolean);
+  const credentialConfigVariables = new Set([
+    "DOCKER_CONFIG", "KUBECONFIG", "NETRC", "PIP_CONFIG_FILE",
+    "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
+    "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH_COMMAND",
+  ]);
+  return credentialConfigVariables.has(upperName)
+    || upperName.startsWith("GIT_CONFIG_")
+    || [
+    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "PRIVATEKEY",
+    "ACCESSKEY", "CREDENTIAL", "AUTH", "COOKIE", "JWT",
+  ].some((marker) => normalized.includes(marker))
+    || segments.includes("PAT")
+    || (value !== undefined && /^[a-z][a-z0-9+.-]*:\/\/[^/\s@]+@/i.test(value));
 }
 
 function setEnvironmentValue(environment: NodeJS.ProcessEnv, name: string, value: string): void {

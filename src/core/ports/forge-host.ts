@@ -136,5 +136,6 @@ export interface ForgeHost {
     activeFindings: readonly ReviewFindingInput[];
   }): Promise<readonly number[]>;
   mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void>;
+  /** Request closure; the controller independently re-reads getIssue before terminal publication. */
   closeIssue(repo: string, number: number, reason: string): Promise<void>;
 }

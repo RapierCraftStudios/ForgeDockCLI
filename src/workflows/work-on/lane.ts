@@ -27,6 +27,7 @@ export interface ParentRemediationTarget {
   findingLocation?: string;
   remediationDepth: number;
   maxRemediationDepth: number;
+  maxRemediationChildren?: number;
 }
 
 export interface IssueLaneBranchReader {
@@ -159,6 +160,10 @@ export function assertParentRemediationTarget(target: ParentRemediationTarget): 
     throw new Error("Parent remediation target requires a repository-relative finding location");
   }
   if (!Number.isSafeInteger(target.remediationDepth) || target.remediationDepth < 1 || target.remediationDepth > target.maxRemediationDepth) throw new Error("Parent remediation depth is outside its configured bound");
+  if (target.maxRemediationChildren !== undefined
+    && (!Number.isSafeInteger(target.maxRemediationChildren) || target.maxRemediationChildren < 1)) {
+    throw new Error("Parent remediation child limit is invalid");
+  }
 }
 
 export function assertRunTargetsBranch(run: RunState, branch: string): void {

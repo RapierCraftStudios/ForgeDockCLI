@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
@@ -34,27 +34,57 @@ describe("isolated Git worktrees", () => {
     assert.deepEqual(recovered, workspace);
     assert.equal(readFileSync(join(recovered.path, "feature.txt"), "utf8"), "partial implementation\n");
     writeFileSync(join(workspace.path, "feature.txt"), "implemented\n");
+    renameSync(join(workspace.path, "README.md"), join(workspace.path, "GUIDE.md"));
     mkdirSync(join(workspace.path, "docs", "pipeline-probes"), { recursive: true });
     writeFileSync(join(workspace.path, "docs", "pipeline-probes", "receipt.md"), "probe\n");
     mkdirSync(join(workspace.path, ".pi-subagents", "artifacts"), { recursive: true });
     writeFileSync(join(workspace.path, ".pi-subagents", "artifacts", "review.jsonl"), "operational\n");
     mkdirSync(join(workspace.path, ".forgedock"), { recursive: true });
     writeFileSync(join(workspace.path, ".forgedock", "state.db"), "operational\n");
-    assert.deepEqual(await manager.changedPaths(workspace), ["docs/pipeline-probes/receipt.md", "feature.txt"]);
+    assert.deepEqual(await manager.changedPaths(workspace), ["GUIDE.md", "README.md", "docs/pipeline-probes/receipt.md", "feature.txt"]);
+    const hooks = git(repo, "rev-parse", "--git-path", "hooks");
+    const preCommit = join(repo, hooks, "pre-commit");
+    writeFileSync(preCommit, "#!/bin/sh\nprintf 'hook-mutated\\n' > feature.txt\ngit add feature.txt\n");
+    chmodSync(preCommit, 0o755);
     const sha = await manager.commit(workspace, "feat: implement issue 12");
     assert.match(sha, /^[0-9a-f]{40,64}$/);
+    assert.equal(git(workspace.path, "show", `${sha}:feature.txt`), "implemented", "controller commits disable repository hooks");
     assert.equal(await manager.head(workspace), sha);
-    assert.deepEqual(await manager.revisionChangedPaths(workspace), ["docs/pipeline-probes/receipt.md", "feature.txt"]);
+    assert.deepEqual(await manager.revisionChangedPaths(workspace), ["GUIDE.md", "README.md", "docs/pipeline-probes/receipt.md", "feature.txt"]);
     const recoveredAfterCommit = await manager.recover({ runId: "run_test", issue: 12, baseRef: "HEAD" });
     assert.equal(recoveredAfterCommit.baseSha, workspace.baseSha);
-    assert.deepEqual(await manager.revisionChangedPaths(recoveredAfterCommit), ["docs/pipeline-probes/receipt.md", "feature.txt"]);
+    assert.deepEqual(await manager.revisionChangedPaths(recoveredAfterCommit), ["GUIDE.md", "README.md", "docs/pipeline-probes/receipt.md", "feature.txt"]);
     assert.deepEqual(git(workspace.path, "show", "--pretty=", "--name-only").split(/\r?\n/).filter(Boolean).sort(), [
+      "GUIDE.md",
       "docs/pipeline-probes/receipt.md",
       "feature.txt",
     ]);
     await manager.remove(workspace);
     assert.equal(existsSync(join(repo, "vendor", "example", "index.js")), true);
     assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), new RegExp(workspace.branch.replaceAll("/", "\\/")));
+  });
+
+  it("detects clean-filter transformations between verified bytes and committed blobs", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-filter-"));
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    git(repo, "config", "filter.corrupt.clean", "sed s/VERIFIED/MALICIOUS/g");
+    writeFileSync(join(repo, ".gitattributes"), "src/a.txt filter=corrupt\n");
+    git(repo, "add", ".gitattributes");
+    git(repo, "commit", "-m", "base");
+    const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+    const workspace = await manager.create({ runId: "run_filter", issue: 14, baseRef: "HEAD" });
+    mkdirSync(join(workspace.path, "src"), { recursive: true });
+    const path = "src/a.txt";
+    writeFileSync(join(workspace.path, path), "VERIFIED\n");
+    await assert.rejects(
+      manager.commit(workspace, "test clean filter"),
+      /Repository clean filter 'corrupt' is not permitted/,
+    );
+    assert.equal(readFileSync(join(workspace.path, path), "utf8"), "VERIFIED\n");
+    await manager.remove(workspace);
   });
 
   it("uses the fetched origin tip instead of a stale remote-tracking ref", async () => {
@@ -73,15 +103,24 @@ describe("isolated Git worktrees", () => {
     git(repo, "remote", "add", "origin", remote);
     git(repo, "push", "-u", "origin", "main");
     writeFileSync(join(repo, "README.md"), "fetched\n");
-    git(repo, "commit", "-am", "remote update");
+    mkdirSync(join(repo, ".githooks"));
+    writeFileSync(join(repo, ".githooks", "pre-push"), "#!/bin/sh\nexit 91\n");
+    chmodSync(join(repo, ".githooks", "pre-push"), 0o755);
+    git(repo, "add", "README.md", ".githooks/pre-push");
+    git(repo, "update-index", "--chmod=+x", ".githooks/pre-push");
+    git(repo, "commit", "-m", "remote update");
     const fetchedSha = git(repo, "rev-parse", "HEAD");
     git(repo, "push", "origin", "main");
     git(repo, "update-ref", "refs/remotes/origin/main", baseSha);
+    git(repo, "config", "core.hooksPath", ".githooks");
 
     const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
     const workspace = await manager.create({ runId: "run_fetch", issue: 13, baseRef: "origin/main" });
     assert.equal(workspace.baseSha, fetchedSha);
     assert.equal(readFileSync(join(workspace.path, "README.md"), "utf8"), "fetched\n");
+    assert.equal(await manager.isAncestor(workspace, baseSha, fetchedSha), true);
+    assert.equal(await manager.isAncestor(workspace, fetchedSha, baseSha), false);
+    await manager.push(workspace);
     await manager.remove(workspace);
   });
 

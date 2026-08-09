@@ -125,9 +125,19 @@ export async function completeWorkItem(
       body: renderTrajectoryComment(parentReceipt),
     });
     for (const childIssue of childIssues) {
-      await dependencies.host.closeIssue(run.subject.repo, childIssue, `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`);
+      await dependencies.host.closeIssue(
+        run.subject.repo,
+        childIssue,
+        `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`,
+      );
+      await assertClosedIssue(dependencies.host, run.subject.repo, childIssue);
     }
-    await dependencies.host.closeIssue(run.subject.repo, issue, `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`);
+    await dependencies.host.closeIssue(
+      run.subject.repo,
+      issue,
+      `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`,
+    );
+    await assertClosedIssue(dependencies.host, run.subject.repo, issue);
     // A merged Outcome is the durable terminal projection. Publish it only
     // after every idempotent trajectory and closure side effect succeeds, so
     // an interruption remains recoverable from the approving verdict.
@@ -142,6 +152,17 @@ export async function completeWorkItem(
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+  }
+}
+
+async function assertClosedIssue(host: ForgeHost, expectedRepo: string, expectedNumber: number): Promise<void> {
+  if (!host.getIssue) throw new Error("Issue closure confirmation requires authoritative getIssue support");
+  const issue = await host.getIssue(expectedNumber, expectedRepo);
+  if (issue.repo.toLowerCase() !== expectedRepo.toLowerCase() || issue.number !== expectedNumber) {
+    throw new Error(`Issue closure proof identified ${issue.repo}#${issue.number}, expected ${expectedRepo}#${expectedNumber}`);
+  }
+  if (issue.state !== "CLOSED") {
+    throw new Error(`Issue #${expectedNumber} close command completed but authoritative host state is ${issue.state}`);
   }
 }
 

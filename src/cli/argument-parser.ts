@@ -2,7 +2,7 @@
 
 const ORCHESTRATE_VALUE_OPTIONS = new Set([
   "--batching", "--priority", "--milestone", "--scope-expansion", "--max-remediation-cycles",
-  "--max-parallel", "--provider", "--model",
+  "--max-remediation-depth", "--max-remediation-children", "--max-parallel", "--provider", "--model",
 ]);
 
 export function parseOrchestrationIssueNumbers(argv: readonly string[]): number[] {

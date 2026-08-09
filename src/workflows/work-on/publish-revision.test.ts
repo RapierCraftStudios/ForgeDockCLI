@@ -20,6 +20,11 @@ const stalePr: PullRequestSnapshot = {
 class RevisionGit implements GitWorkspaceManager {
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return ["docs/a.md"]; }
+  async revisionChangedPaths(): Promise<string[]> { return ["docs/a.md"]; }
+  async syncToRemoteHead(): Promise<void> {}
+  async isAncestor(): Promise<boolean> { return true; }
+  async prepareWorkspaceDependencies(): Promise<void> {}
+  async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { return verifiedSha; }
   async push(): Promise<void> {}
   async head(): Promise<string> { return verifiedSha; }

@@ -36,10 +36,13 @@ export class AgentEventStreamWriter {
       this.#write(`  ${statusGlyph("active", this.#mode)} ${task} · ${event.provider}/${event.model}\n`);
     } else if (event.type === "tool.started") {
       const args = toolArgPreview(event.tool, event.args);
-      this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${event.tool}${args ? ` · ${args}` : ""}\n`);
+      const call = toolCallPreview(event.toolCallId);
+      this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${event.tool}[${call}]${args ? ` · ${args}` : ""}\n`);
     } else if (event.type === "tool.completed") {
       const status = event.isError ? "failed" : "passed";
-      this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool} ${event.isError ? "failed" : "complete"}\n`);
+      const call = toolCallPreview(event.toolCallId);
+      const error = event.isError && event.errorSummary ? ` · ${event.errorSummary}` : "";
+      this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool}[${call}] ${event.isError ? "failed" : "complete"}${error}\n`);
     } else if (event.type === "artifact.submitted") {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted\n`);
     } else if (event.type === "session.completed") {
@@ -80,6 +83,10 @@ export class AgentEventStreamWriter {
     if (this.#stream?.lineOpen) this.#write("\n");
     this.#stream = undefined;
   }
+}
+
+function toolCallPreview(value: string): string {
+  return value.length > 12 ? value.slice(-12) : value;
 }
 
 function toolArgPreview(tool: string, args: unknown): string | undefined {

@@ -8,6 +8,8 @@ import {
   isConcreteScopePath,
   scopeDiscoveryRoots,
   scopeManifestFor,
+  scopeManifestForBuildPacket,
+  STANDARD_SCOPE_METADATA_ROOTS,
   type AgentEventSink,
   type AgentRuntime,
   type ScopeHints,
@@ -59,7 +61,7 @@ export async function prepareBuildPacket(
           affectedFiles: affectedScope,
           ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
           metadataRoots: [
-            "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md",
+            ...STANDARD_SCOPE_METADATA_ROOTS,
             ...scopeDiscoveryRoots(affectedScope),
           ],
         }),
@@ -92,7 +94,9 @@ export async function prepareBuildPacket(
     });
     await dependencies.artifacts.append(packet);
     run = attachArtifact(run, "BuildPacket", packet.id);
-    const advanced = transition(run, "BUILD_PACKET_READY");
+    const advanced = transition(run, "BUILD_PACKET_READY", {
+      scopeManifest: scopeManifestForBuildPacket(expectedPaths),
+    });
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {

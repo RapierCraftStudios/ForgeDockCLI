@@ -4,7 +4,7 @@ import { Type, type Static } from "typebox";
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
+import { scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export const BuilderSubmissionSchema = Type.Object({
@@ -27,6 +27,7 @@ export async function buildWorkItem(
     packet: DurableArtifact<"BuildPacket">;
     scopeHints?: ScopeHints;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
+    repairContext?: readonly DurableArtifact[];
     worktree: string;
     provider?: string;
     model?: string;
@@ -51,28 +52,21 @@ export async function buildWorkItem(
         "Do not expand scope or perform unrelated cleanup.",
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
-        "The controller runs verification and owns git publication after your edits.",
-        "Report paths and criterion coverage accurately; the controller will independently inspect the diff.",
+        "The controller runs every verification command and owns git publication after your edits; do not claim that checks ran in this session.",
+        "Before submitting, re-read changed files for malformed edits and whitespace damage.",
+        "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",
       ].join("\n"),
       context: [
         input.intent,
         input.investigation,
         input.packet,
+        ...(input.repairContext ?? []),
         ...(input.priorVerificationFailure ? [input.priorVerificationFailure] : []),
       ],
       workspace: {
         cwd: input.worktree,
         mode: "write",
-        scope: scopeManifestFor("build-packet", {
-          affectedFiles: [
-            ...(input.scopeHints?.affectedFiles ?? []),
-            ...input.investigation.payload.affectedSurfaces,
-            ...input.packet.payload.expectedPaths,
-          ],
-          ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
-          writePaths: input.packet.payload.expectedPaths,
-          metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
-        }),
+        scope: scopeManifestForBuildPacket(input.packet.payload.expectedPaths),
       },
       tools: ["read", "grep", "find", "ls", "compute", "edit", "write"],
       outputSchema: BuilderSubmissionSchema,

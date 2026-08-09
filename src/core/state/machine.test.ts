@@ -49,6 +49,44 @@ describe("workflow state machine", () => {
     assert.equal(resumed.attempt, 2);
   });
 
+  it("atomically replaces issue-hint scope when the Build Packet freezes", () => {
+    let run = createRun({
+      workflow: "work-on",
+      subject: { repo: "a/b", issue: 8 },
+      scopeManifest: { readRoots: ["src/core"], writeRoots: [], source: "issue-hints" },
+    });
+    run = transition(run, "START_INVESTIGATION").state;
+    run = transition(run, "INVESTIGATION_CONFIRMED").state;
+    const packetScope = {
+      readRoots: ["src"],
+      writeRoots: [],
+      writePaths: ["src/core/a.ts"],
+      source: "build-packet" as const,
+    };
+    run = transition(run, "BUILD_PACKET_READY", { scopeManifest: packetScope }).state;
+    assert.deepEqual(run.scopeManifest, packetScope);
+    assert.throws(() => transition(run, "BUILD_COMPLETED", { scopeManifest: packetScope }), /only when the Build Packet freezes/);
+  });
+
+  it("routes two verification repairs before recording deterministic exhaustion", () => {
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_FAILED"] as const) {
+      run = transition(run, event, event === "VERIFICATION_FAILED" ? { reason: "failed" } : {}).state;
+    }
+    run = transition(run, "VERIFICATION_REPAIR_REQUESTED").state;
+    assert.equal(run.state, "building");
+    assert.equal(run.attempt, 2);
+    run = transition(run, "BUILD_COMPLETED").state;
+    run = transition(run, "VERIFICATION_FAILED", { reason: "failed again" }).state;
+    run = transition(run, "VERIFICATION_REPAIR_REQUESTED").state;
+    assert.equal(run.attempt, 3);
+    run = transition(run, "BUILD_COMPLETED").state;
+    run = transition(run, "VERIFICATION_FAILED", { reason: "still failed" }).state;
+    run = transition(run, "VERIFICATION_REPAIR_EXHAUSTED", { reason: "Verification repair budget exhausted after 2 repair attempt(s)" }).state;
+    assert.equal(run.state, "blocked");
+    assert.match(run.blockedReason ?? "", /exhausted after 2/);
+  });
+
   it("resumes a retained verification workspace without replaying investigation or build", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
     for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_FAILED"] as const) {

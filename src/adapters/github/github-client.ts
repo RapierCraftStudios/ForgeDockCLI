@@ -498,8 +498,16 @@ export class GitHubClient implements ForgeHost {
   }
 
   async closeIssue(repo: string, number: number, reason: string): Promise<void> {
-    await this.postIssueComment({ repo, issue: number }, reason);
-    await this.gh(["issue", "close", String(number), "--repo", repo]);
+    const marker = `<!-- FORGEDOCK:CLOSE repo=${repo.toLowerCase()} issue=${number} -->`;
+    await this.publishIssueComment({ repo, issue: number, marker, body: `${reason}\n\n${marker}` });
+    let issue = await this.getIssue(number, repo);
+    if (issue.state !== "CLOSED") {
+      await this.gh(["issue", "close", String(number), "--repo", repo]);
+      issue = await this.getIssue(number, repo);
+    }
+    if (issue.state !== "CLOSED") {
+      throw new Error(`Issue #${number} close command completed but authoritative GitHub state is ${issue.state}`);
+    }
   }
 
   async materializeBatchIssue(input: BatchIssueInput): Promise<IssueSnapshot> {

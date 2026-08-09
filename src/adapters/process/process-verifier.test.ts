@@ -20,7 +20,7 @@ describe("deterministic process verification", () => {
     assert.match(result?.summary ?? "", /verified/);
   });
 
-  it("records nested coverage as passed evidence without spawning the covered command", async () => {
+  it("executes every required command even when coverage metadata is present", async () => {
     const runner = isolatedRunner();
     const [covered, parent] = await runner.run([
       {
@@ -32,10 +32,9 @@ describe("deterministic process verification", () => {
         cwd: process.cwd(), timeoutMs: 5_000, required: true, planId: "plan-1",
       },
     ]);
-    assert.equal(covered?.status, "passed");
-    assert.equal(covered?.durationMs, 0);
-    assert.deepEqual(covered?.coveredBy, ["test"]);
-    assert.match(covered?.summary ?? "", /not executed twice/);
+    assert.equal(covered?.status, "failed");
+    assert.equal(covered?.exitCode, 17);
+    assert.ok((covered?.durationMs ?? 0) >= 0);
     assert.equal(parent?.status, "passed");
     assert.match(parent?.summary ?? "", /parent ran/);
   });
@@ -49,6 +48,30 @@ describe("deterministic process verification", () => {
     }]);
     assert.equal(result?.status, "passed");
     assert.match(result?.summary ?? "", /controller environment/);
+  });
+
+  it("does not expose controller credentials to verification commands", async () => {
+    const runner = isolatedRunner({
+      ...process.env,
+      AUDIT_SECRET: "fd-secret-proof",
+      GH_TOKEN: "github-token",
+      OPENAI_API_KEY: "provider-key",
+    });
+    const script = [
+      "if(process.env.AUDIT_SECRET||process.env.GH_TOKEN||process.env.OPENAI_API_KEY) process.exit(42);",
+      "if(!process.env.HOME||!process.env.NPM_CONFIG_USERCONFIG?.startsWith(process.env.HOME)) process.exit(43);",
+      "console.log('GH_TOKEN=ghp_hardcodedproof');",
+      "console.log('https://user:password@example.test/simple');",
+      "console.log('github_pat_abcdefgh\\u001b[31mijklmnop');",
+      "console.log('credentials sealed')",
+    ].join("");
+    const [result] = await runner.run([{
+      id: "sealed-credentials", command: process.execPath, args: ["-e", script],
+      cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.equal(result?.status, "passed");
+    assert.match(result?.summary ?? "", /credentials sealed/);
+    assert.doesNotMatch(result?.summary ?? "", /ghp_hardcodedproof|user:password|github_pat_abcdefghijklmnop/);
   });
 
   it("resolves Git Bash rather than the Windows or WSL launcher in headed verification", async () => {
@@ -128,6 +151,7 @@ describe("deterministic process verification", () => {
         cwd: process.cwd(), timeoutMs: 500, required: true,
       }]);
       assert.equal(result?.status, "failed");
+      assert.equal(result?.failureClass, "timeout");
       assert.equal(result?.summary, "Timed out");
       assert.ok(existsSync(pidFile), "parent recorded the descendant pid before timeout");
       descendantPid = Number(readFileSync(pidFile, "utf8"));
@@ -138,15 +162,30 @@ describe("deterministic process verification", () => {
     }
   });
 
-  it("stops after a required failure", async () => {
+  it("records spawn failures and continues through the remaining verification plan", async () => {
+    const runner = isolatedRunner();
+    const results = await runner.run([
+      { id: "missing", command: `forgedock-missing-${randomUUID()}`, args: [], cwd: process.cwd(), timeoutMs: 5_000, required: true },
+      { id: "after-spawn-error", command: process.execPath, args: ["-e", "process.exit(0)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
+    ]);
+    assert.equal(results.length, 2);
+    assert.equal(results[0]?.status, "failed");
+    assert.equal(results[0]?.failureClass, "infrastructure");
+    assert.match(results[0]?.summary ?? "", /Failed to start verification command \(ENOENT\)/);
+    assert.equal(results[1]?.status, "passed");
+  });
+
+  it("collects every required check so one repair receives complete failure evidence", async () => {
     const runner = isolatedRunner();
     const results = await runner.run([
       { id: "fail", command: process.execPath, args: ["-e", "process.exit(3)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
-      { id: "never", command: process.execPath, args: ["-e", "process.exit(0)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
+      { id: "after-failure", command: process.execPath, args: ["-e", "process.exit(0)"], cwd: process.cwd(), timeoutMs: 5_000, required: true },
     ]);
-    assert.equal(results.length, 1);
+    assert.equal(results.length, 2);
     assert.equal(results[0]?.status, "failed");
+    assert.equal(results[0]?.failureClass, "command");
     assert.equal(results[0]?.exitCode, 3);
+    assert.equal(results[1]?.status, "passed");
   });
 });
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ArtifactKind, DurableArtifact } from "../../core/artifacts/schema.js";
+import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -23,13 +23,12 @@ export async function reviewExistingPullRequest(
   const issue = input.issue ?? linkedIssue(pullRequest.body);
   if (!issue) throw new Error("PR does not identify its original issue; pass --issue <number>");
   const source = await dependencies.artifacts.list({ repo: input.repo, issue });
-  const intent = latest(source, "Intent");
-  const investigation = latest(source, "Investigation");
-  const packet = latest(source, "BuildPacket");
-  const buildResult = latest(source, "BuildResult");
-  if (buildResult.payload.headSha !== pullRequest.headSha) {
-    throw new Error(`Latest Build Result is ${buildResult.payload.headSha}, but PR head is ${pullRequest.headSha}`);
-  }
+  const { intent, investigation, packet, buildResult } = reviewArtifactsForHead(
+    source,
+    pullRequest.headSha,
+    pullRequest.headBranch,
+    pullRequest.baseBranch,
+  );
 
   let run = createRun({ workflow: "review-pr", subject: { repo: input.repo, issue, pr: input.pr } });
   run = { ...run, headSha: pullRequest.headSha };
@@ -39,6 +38,7 @@ export async function reviewExistingPullRequest(
   try {
     return await reviewPullRequest({
       run, pullRequest, intent, investigation, packet, buildResult, workspace: workspace.path,
+      deliveryRunId: buildResult.runId,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
@@ -52,12 +52,41 @@ export async function reviewExistingPullRequest(
   }
 }
 
-function latest<K extends ArtifactKind>(artifacts: DurableArtifact[], kind: K): DurableArtifact<K> {
-  const matching = artifacts.filter((artifact): artifact is DurableArtifact<K> => artifact.kind === kind)
-    .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
-  const artifact = matching[0];
-  if (!artifact) throw new Error(`Required ${kind} artifact is missing from the linked issue`);
-  return artifact;
+export function reviewArtifactsForHead(
+  artifacts: readonly DurableArtifact[],
+  headSha: string,
+  headBranch?: string,
+  baseBranch?: string,
+): {
+  intent: DurableArtifact<"Intent">;
+  investigation: DurableArtifact<"Investigation">;
+  packet: DurableArtifact<"BuildPacket">;
+  buildResult: DurableArtifact<"BuildResult">;
+} {
+  const buildResult = artifacts
+    .filter((artifact): artifact is DurableArtifact<"BuildResult"> =>
+      artifact.kind === "BuildResult"
+      && artifact.payload.headSha.toLowerCase() === headSha.toLowerCase()
+      && (headBranch === undefined || artifact.payload.branch === headBranch))
+    .at(-1);
+  if (!buildResult) throw new Error(`No durable Build Result matches pull request head ${headSha}${headBranch ? ` on ${headBranch}` : ""}`);
+  if (baseBranch !== undefined && buildResult.payload.targetBranch !== baseBranch) {
+    throw new Error(`Build Result target ${buildResult.payload.targetBranch ?? "unknown"} does not match pull request base ${baseBranch}`);
+  }
+  const runArtifacts = artifacts.filter((artifact) => artifact.runId === buildResult.runId);
+  const required = <K extends DurableArtifact["kind"]>(kind: K): Extract<DurableArtifact, { kind: K }> => {
+    const artifact = runArtifacts
+      .filter((candidate): candidate is Extract<DurableArtifact, { kind: K }> => candidate.kind === kind)
+      .at(-1);
+    if (!artifact) throw new Error(`Required ${kind} artifact is missing from delivery run ${buildResult.runId}`);
+    return artifact;
+  };
+  return {
+    intent: required("Intent"),
+    investigation: required("Investigation"),
+    packet: required("BuildPacket"),
+    buildResult,
+  };
 }
 
 function linkedIssue(body: string): number | undefined {

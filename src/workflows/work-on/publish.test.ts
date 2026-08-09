@@ -14,6 +14,11 @@ class PublishGit implements GitWorkspaceManager {
   observedHead = sha;
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return ["src/a.ts"]; }
+  async revisionChangedPaths(): Promise<string[]> { return ["src/a.ts"]; }
+  async syncToRemoteHead(): Promise<void> {}
+  async isAncestor(): Promise<boolean> { return true; }
+  async prepareWorkspaceDependencies(): Promise<void> {}
+  async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { return sha; }
   async push(): Promise<void> { this.pushed = true; }
   async head(): Promise<string> { return this.observedHead; }

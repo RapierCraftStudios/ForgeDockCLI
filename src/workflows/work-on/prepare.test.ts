@@ -39,6 +39,11 @@ describe("Build Packet preparation", () => {
 
     assert.equal(prepared.run.state, "building");
     assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
+    assert.equal(prepared.run.scopeManifest?.source, "build-packet");
+    assert.deepEqual(prepared.run.scopeManifest?.writeRoots, []);
+    assert.deepEqual(prepared.run.scopeManifest?.writePaths, ["src/a.ts", "test/a.test.ts"]);
+    assert.ok(prepared.run.scopeManifest?.readRoots.includes("src"));
+    assert.ok(prepared.run.scopeManifest?.readRoots.includes("test"));
     assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
     assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
     assert.ok(runtime.tasks[0]?.workspace.scope.readRoots.includes("src"));

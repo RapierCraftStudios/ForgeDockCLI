@@ -462,15 +462,51 @@ function buildPrompt<T>(task: AgentTask<T>): string {
   ].join("\n");
 }
 
+export function boundedToolErrorSummary(result: unknown): string | undefined {
+  let text: string | undefined;
+  if (result instanceof Error) text = result.message;
+  if (!text && isRecord(result) && Array.isArray(result.content)) {
+    const chunks = result.content.flatMap((item) =>
+      isRecord(item) && item.type === "text" && typeof item.text === "string" ? [item.text] : []);
+    if (chunks.length) text = chunks.join(" ");
+  }
+  if (!text) return undefined;
+  const normalized = text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  const safeClassifications: ReadonlyArray<readonly [RegExp, string]> = [
+    [/outside the assigned scope|escapes the assigned workspace|no parent inside the worktree/i, "Path is outside the assigned workspace scope"],
+    [/oldText.*(?:not found|no match)|could not find (?:the )?exact text/i, "Edit target text was not found"],
+    [/oldText.*(?:unique|multiple)|multiple matches|not unique|occurs \d+ times/i, "Edit target text was not unique"],
+    [/path not found|\bENOENT\b|no such file/i, "Path was not found"],
+    [/\bEACCES\b|\bEPERM\b|permission denied|read-only/i, "Filesystem permission was denied"],
+    [/invalid.*(?:regular expression|regex)|unterminated.*pattern/i, "Search pattern is invalid"],
+    [/operation aborted|\baborted\b/i, "Tool operation was aborted"],
+    [/timed?\s*out|\btimeout\b/i, "Tool operation timed out"],
+    [/\bEISDIR\b|is a directory/i, "Expected a file but received a directory"],
+    [/\bENOTDIR\b|not a directory/i, "Expected a directory but received a file"],
+    [/artifact was already submitted/i, "Artifact was already submitted"],
+  ];
+  return safeClassifications.find(([pattern]) => pattern.test(normalized))?.[1]
+    ?? "Tool execution failed; inspect the scoped arguments and retry";
+}
+
 function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink): void {
   if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
     emit({ type: "thinking.delta", taskId, text: event.assistantMessageEvent.delta });
   } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
     emit({ type: "text.delta", taskId, text: event.assistantMessageEvent.delta });
   } else if (event.type === "tool_execution_start") {
-    emit({ type: "tool.started", taskId, tool: event.toolName, args: event.args });
+    emit({ type: "tool.started", taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args });
   } else if (event.type === "tool_execution_end") {
-    emit({ type: "tool.completed", taskId, tool: event.toolName, isError: event.isError });
+    const errorSummary = event.isError ? boundedToolErrorSummary(event.result) : undefined;
+    emit({
+      type: "tool.completed",
+      taskId,
+      toolCallId: event.toolCallId,
+      tool: event.toolName,
+      isError: event.isError,
+      ...(errorSummary !== undefined ? { errorSummary } : {}),
+    });
   }
 }
 

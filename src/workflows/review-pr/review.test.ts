@@ -55,7 +55,7 @@ function artifacts(run: RunState) {
     scope: ["Lock update"], acceptanceCriteria: ["Concurrent updates pass"], context: [], implementationPlan: ["Use lock"], expectedPaths: ["src/lock.ts"], verificationPlan: ["npm test"], risks: [{ risk: "concurrency race", mitigation: "lock" }], outOfScope: [],
   } });
   const buildResult = createArtifact({ ...common, kind: "BuildResult", producer: { role: "controller" }, payload: {
-    branch: "fix", headSha: sha, changedPaths: ["src/lock.ts"], summary: "Locked", acceptanceEvidence: [{ criterion: "Concurrent updates pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }], decisions: [], residualRisks: [],
+    branch: "fix", targetBranch: "main", headSha: sha, changedPaths: ["src/lock.ts"], summary: "Locked", acceptanceEvidence: [{ criterion: "Concurrent updates pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }], decisions: [], residualRisks: [],
   } });
   return { intent, investigation, packet, buildResult };
 }
@@ -93,11 +93,28 @@ describe("fresh-context PR review", () => {
     assert.deepEqual(result.verdict.payload.reviewerRoles, ["correctness", "concurrency"]);
     assert.deepEqual(result.reviewPlan.selected.map(({ role }) => role), ["correctness", "concurrency"]);
     assert.equal(result.verdict.payload.reviewPlan?.riskTier, "high");
+    assert.equal(result.verdict.payload.headBranch, "fix");
+    assert.equal(result.verdict.payload.baseBranch, "main");
     assert.equal(new Set(result.sessionRefs).size, 2);
     assert.equal(host.comments.length, 2);
     assert.deepEqual(host.comments.map(({ body }) => /Independent Review · ([^\n]+)/.exec(body)?.[1]).sort(), ["concurrency", "correctness"]);
     assert.ok(host.comments.every(({ body, marker }) => body.includes(marker) && body.includes("consolidated Review Verdict remains authoritative") && body.includes("Session lineage")));
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
+  });
+
+  it("fails closed when the PR target branch changes during review", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new FakeAgentRuntime([clean, clean]);
+    const host = new FakeHost();
+    host.snapshots = [pr, { ...pr, baseBranch: "release" }];
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+        runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /PR delivery route changed during reviewer execution/,
+    );
   });
 
   it("launches one bounded adaptive escalation wave when correctness exposes a new specialist surface", async () => {

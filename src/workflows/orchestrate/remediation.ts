@@ -3,10 +3,13 @@
 import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
+import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
+import { uncoveredVerificationCommands } from "../work-on/verify.js";
 
 export const DEFAULT_REMEDIATION_LIMITS = {
   maxCycles: 2,
@@ -34,6 +37,7 @@ export interface RemediationBlockedInput {
   remediationDepth?: number;
   maxRemediationDepth?: number;
   maxRemediationChildren?: number;
+  approvedPaths?: readonly string[];
 }
 
 export interface RemediationCheckpointResult {
@@ -62,11 +66,19 @@ export class RemediationSupervisor {
     const depth = input.remediationDepth ?? 0;
     const maxDepth = input.maxRemediationDepth ?? this.limits.maxDepth ?? DEFAULT_REMEDIATION_LIMITS.maxDepth;
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
-    const eligible = actionableFindings(input.findings).slice(0, maxChildren);
-    const checkpointKey = remediationCheckpointKey(input.parentRun.runId, input.parentPullRequest.number, input.parentPullRequest.headSha, input.findings);
+    const actionable = actionableFindings(input.findings);
+    const eligible = actionable.slice(0, maxChildren);
+    const authorizedInput = {
+      ...input,
+      findings: eligible,
+      remediationDepth: depth,
+      maxRemediationDepth: maxDepth,
+      maxRemediationChildren: maxChildren,
+    };
+    const checkpointKey = remediationCheckpointKey(input.parentRun.runId, input.parentPullRequest.number, input.parentPullRequest.headSha, eligible);
     const sequence = await nextCheckpointSequence(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
-    const base = remediationPayload(input, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
-    if (depth >= maxDepth || eligible.length === 0 || input.findings.length > maxChildren) {
+    const base = remediationPayload(authorizedInput, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
+    if (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren) {
       const terminal = createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
       await this.dependencies.artifacts.append(terminal);
       return { checkpoint: terminal, childIssues: [] };
@@ -114,13 +126,16 @@ export class RemediationSupervisor {
     if (!expected.size || input.parentPullRequest.headSha === checkpoint.headSha) return input.checkpoint;
     const merged = input.childOutcomes.filter((outcome) => outcome.payload.status === "merged" && outcome.subject.issue && expected.has(outcome.subject.issue));
     if (merged.length !== expected.size) return input.checkpoint;
-    const approvedPaths = [...new Set(checkpoint.findings.flatMap((finding) => finding.location ? [repositoryPathFromLocation(finding.location) ?? finding.location] : []))].slice(0, 100);
+    const childFinalShas = merged.map((outcome) => outcome.payload.finalSha);
+    if (childFinalShas.some((sha) => sha === undefined)) return input.checkpoint;
+    const approvedPaths = [...checkpoint.approvedPaths];
     const next = createCheckpointFromExisting(input.checkpoint, {
       ...checkpoint,
       checkpointSequence: checkpoint.checkpointSequence + 1,
       status: "ready-to-resume",
       approvedPaths,
       childOutcomeIds: merged.map((outcome) => outcome.id),
+      childFinalShas: childFinalShas as string[],
     });
     await this.dependencies.artifacts.append(next);
     return next;
@@ -170,9 +185,14 @@ export async function verifyParentRevision(input: {
   checkpoint: DurableArtifact<"RemediationBlocked">;
   pullRequest: PullRequestSnapshot;
   commands: readonly VerificationCommand[];
-  workspacePath: string;
+  workspace: GitWorkspace;
   verifier: VerificationRunner;
-}, dependencies: { host: ForgeHost; artifacts: ArtifactRepository; runs: RunRepository }): Promise<{
+}, dependencies: {
+  host: ForgeHost;
+  git: GitWorkspaceManager;
+  artifacts: ArtifactRepository;
+  runs: RunRepository;
+}): Promise<{
   run: RunState;
   buildResult?: DurableArtifact<"BuildResult">;
   checks: CheckResult[];
@@ -183,10 +203,52 @@ export async function verifyParentRevision(input: {
   if (current.headBranch !== input.checkpoint.payload.headBranch || current.baseBranch !== input.checkpoint.payload.baseBranch) {
     throw new Error("Parent PR branch target changed during remediation");
   }
-  const checks = await input.verifier.run(input.commands);
-  const failed = checks.some((check, index) => input.commands[index]?.required && check.status !== "passed");
   if (current.headSha === input.checkpoint.payload.headSha) {
     throw new Error(`Parent branch head did not advance after child remediation: ${current.headSha}`);
+  }
+  const uncoveredPlan = uncoveredVerificationCommands(input.packet.payload.verificationPlan, input.commands);
+  if (uncoveredPlan.length) {
+    throw new Error(`Parent revision verification does not cover the frozen plan: ${uncoveredPlan.join(", ")}`);
+  }
+  if (!input.commands.some((command) => command.required)) {
+    throw new Error("Parent revision verification requires at least one controller-approved required command");
+  }
+
+  await dependencies.git.syncToRemoteHead(input.workspace, current.headSha);
+  const childFinalShas = input.checkpoint.payload.childFinalShas ?? [];
+  if (childFinalShas.length !== input.checkpoint.payload.childOutcomeIds.length) {
+    throw new Error("Parent revision proof requires a captured final SHA for every child Outcome");
+  }
+  for (const childFinalSha of childFinalShas) {
+    if (!await dependencies.git.isAncestor(input.workspace, childFinalSha, current.headSha)) {
+      throw new Error(`Parent revision ${current.headSha} does not contain remediated child ${childFinalSha}`);
+    }
+  }
+  const localHead = await dependencies.git.head(input.workspace);
+  if (localHead.toLowerCase() !== current.headSha.toLowerCase()) {
+    throw new Error(`Retained workspace head ${localHead} does not match parent PR head ${current.headSha}`);
+  }
+  const revisionChangedPaths = canonicalizeConcreteScopePaths(
+    await dependencies.git.revisionChangedPaths(input.workspace),
+  ).sort();
+  const approvedPaths = new Set(canonicalizeConcreteScopePaths(input.checkpoint.payload.approvedPaths));
+  const unexpectedPaths = revisionChangedPaths.filter((path) => !approvedPaths.has(path));
+  if (unexpectedPaths.length) {
+    throw new Error(`Parent remediation revision contains paths outside controller-approved scope: ${unexpectedPaths.join(", ")}`);
+  }
+  await dependencies.git.prepareWorkspaceDependencies(input.workspace);
+
+  const checks = await input.verifier.run(input.commands);
+  const failed = input.commands.some((command, index) => command.required && checks[index]?.status !== "passed");
+  const postVerificationHead = await dependencies.git.head(input.workspace);
+  const refreshed = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+  if (postVerificationHead.toLowerCase() !== current.headSha.toLowerCase()
+    || refreshed.headSha.toLowerCase() !== current.headSha.toLowerCase()) {
+    throw new Error(`Parent branch changed while verification ran: local ${postVerificationHead}, remote ${refreshed.headSha}, expected ${current.headSha}`);
+  }
+  const verificationSideEffects = await dependencies.git.changedPaths(input.workspace);
+  if (verificationSideEffects.length) {
+    throw new Error(`Parent verification mutated the retained workspace: ${verificationSideEffects.join(", ")}`);
   }
   if (failed) {
     if (input.run.state === "blocked") return { run: input.run, checks };
@@ -201,10 +263,16 @@ export async function verifyParentRevision(input: {
     producer: { role: "controller", runtime: "forgedock" },
     payload: {
       branch: current.headBranch,
+      targetBranch: current.baseBranch,
       headSha: current.headSha,
-      changedPaths: [...input.checkpoint.payload.approvedPaths],
-      summary: `Parent revision ${current.headSha} verified after recursive remediation child merges.`,
-      acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => ({ criterion, status: "passed" as const, evidence: `Verified at ${current.headSha} without a synthetic builder commit.` })),
+      ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
+      changedPaths: revisionChangedPaths,
+      summary: `Parent revision ${current.headSha} verified locally after recursive remediation child merges.`,
+      acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => ({
+        criterion,
+        status: "passed" as const,
+        evidence: `Controller verification passed in the synchronized retained workspace at ${current.headSha}.`,
+      })),
       checks,
       decisions: [`Child Outcomes: ${input.checkpoint.payload.childOutcomeIds.join(", ")}`],
       residualRisks: [],
@@ -264,10 +332,18 @@ function remediationPayload(
     })),
     childIssues: [...childIssues],
     childRunIds: [...childRunIds],
-    approvedPaths: [],
+    approvedPaths: [...new Set([
+      ...(input.approvedPaths ?? []),
+      ...input.packetArtifact.payload.expectedPaths,
+      ...input.findings.flatMap((finding) => finding.location
+        ? [repositoryPathFromLocation(finding.location) ?? finding.location]
+        : []),
+    ])].slice(0, 100),
     childOutcomeIds: [...childOutcomeIds],
+    childFinalShas: [],
     remediationDepth,
     maxRemediationDepth,
+    ...(input.maxRemediationChildren !== undefined ? { maxRemediationChildren: input.maxRemediationChildren } : {}),
   };
 }
 

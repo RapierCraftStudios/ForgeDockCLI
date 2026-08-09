@@ -42,10 +42,9 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
       const [toolCallId, supplied, signal, onUpdate] = args;
       let params = supplied;
       const scoped = params as typeof params & { path?: string; cwd?: string; searchPath?: string };
-      await guard.searchRoot(scoped.path ?? scoped.cwd ?? scoped.searchPath);
-      if (params.literal === undefined) {
-        params = { ...params, literal: true };
-      } else if (params.literal === false) {
+      const validatedSearchRoot = await guard.searchRoot(scoped.path ?? scoped.cwd ?? scoped.searchPath);
+      params = { ...params, path: validatedSearchRoot };
+      if (params.literal !== true) {
         try { new RegExp(params.pattern); }
         catch { params = { ...params, literal: true }; }
       }

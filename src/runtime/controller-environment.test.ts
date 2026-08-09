@@ -38,6 +38,36 @@ describe("controller environment boundary", () => {
     assert.equal(environment.PI_INTERCOM_SESSION_ID, undefined);
   });
 
+  it("removes controller credentials and isolates verification config homes", () => {
+    const environment = verificationEnvironment({
+      PATH: process.env.PATH,
+      AUDIT_SECRET: "fd-secret-proof",
+      GH_TOKEN: "github-token",
+      GITHUB_PAT: "github-pat",
+      PIP_INDEX_URL: "https://user:password@example.test/simple",
+      DOCKER_AUTH_CONFIG: '{"auths":{"registry.example":{"auth":"proof"}}}',
+      DOCKER_CONFIG: "C:/controller/docker",
+      GIT_ASKPASS: "C:/controller/askpass.exe",
+      OPENAI_API_KEY: "provider-key",
+      FORGEDOCK_NESTED_AGENT_TOKEN: "nested-token",
+      SAFE_FLAG: "visible",
+    });
+    assert.equal(environment.AUDIT_SECRET, undefined);
+    assert.equal(environment.GH_TOKEN, undefined);
+    assert.equal(environment.GITHUB_PAT, undefined);
+    assert.equal(environment.PIP_INDEX_URL, undefined);
+    assert.equal(environment.DOCKER_AUTH_CONFIG, undefined);
+    assert.notEqual(environment.DOCKER_CONFIG, "C:/controller/docker");
+    assert.ok(environment.DOCKER_CONFIG?.startsWith(environment.HOME ?? ""));
+    assert.equal(environment.GIT_ASKPASS, undefined);
+    assert.equal(environment.OPENAI_API_KEY, undefined);
+    assert.equal(environment.FORGEDOCK_NESTED_AGENT_TOKEN, undefined);
+    assert.equal(environment.SAFE_FLAG, "visible");
+    assert.notEqual(environment.HOME, homedir());
+    assert.equal(environment.HOME, environment.USERPROFILE);
+    assert.ok(environment.NPM_CONFIG_USERCONFIG?.startsWith(environment.HOME ?? ""));
+  });
+
   it("puts discovered Git Bash and user tools ahead of ambiguous Windows launchers", () => {
     if (process.platform !== "win32") return;
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;

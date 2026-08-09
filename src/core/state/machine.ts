@@ -31,6 +31,8 @@ export type TransitionEvent =
   | "RESUME_BUILD"
   | "VERIFICATION_PASSED"
   | "VERIFICATION_FAILED"
+  | "VERIFICATION_REPAIR_REQUESTED"
+  | "VERIFICATION_REPAIR_EXHAUSTED"
   | "RESUME_VERIFICATION"
   | "RESUME_REVIEW"
   | "RESUME_EXPANDED_REVIEW"
@@ -126,7 +128,13 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
   completed: {},
   invalid: {},
   decomposed: {},
-  blocked: { RESUME_VERIFICATION: "verifying", RESUME_REVIEW: "reviewing", RESUME_EXPANDED_REVIEW: "reviewing" },
+  blocked: {
+    VERIFICATION_REPAIR_REQUESTED: "building",
+    VERIFICATION_REPAIR_EXHAUSTED: "blocked",
+    RESUME_VERIFICATION: "verifying",
+    RESUME_REVIEW: "reviewing",
+    RESUME_EXPANDED_REVIEW: "reviewing",
+  },
   // A failed revision publication may be recovered only through the distinct
   // proof-checked controller path; ordinary publication resume is insufficient.
   failed: { RECOVER_REVISION_PUBLICATION: "publishing" },
@@ -175,8 +183,11 @@ export function canTransition(state: RunState, event: TransitionEvent): boolean 
 export function transition(
   state: RunState,
   event: TransitionEvent,
-  options: { now?: string; reason?: string; headSha?: string } = {},
+  options: { now?: string; reason?: string; headSha?: string; scopeManifest?: PersistedScopeManifest } = {},
 ): { state: RunState; record: TransitionRecord } {
+  if (options.scopeManifest !== undefined && event !== "BUILD_PACKET_READY") {
+    throw new Error(`Scope authority can be replaced only when the Build Packet freezes, not during ${event}`);
+  }
   const next = transitions[state.state][event];
   if (!next) throw new InvalidTransitionError(state.state, event);
   const now = options.now ?? new Date().toISOString();
@@ -187,7 +198,8 @@ export function transition(
     updatedAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
-  if (event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION") {
+  if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
+  if (event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

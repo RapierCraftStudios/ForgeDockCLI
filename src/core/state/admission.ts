@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DurableArtifact } from "../artifacts/schema.js";
+import type { CheckResult } from "../ports/verification.js";
 import { reconcileArtifacts } from "./reconcile.js";
 import { terminalStates, type RunStateName } from "./machine.js";
 
@@ -20,28 +21,72 @@ export function workOnDeliveryArtifacts(artifacts: readonly DurableArtifact[]): 
   return artifacts.filter((artifact) => runIds.has(artifact.runId));
 }
 
+export function latestDeliveryRunArtifacts(
+  artifacts: readonly DurableArtifact[],
+): { runId: string; artifacts: DurableArtifact[] } | undefined {
+  const deliveryArtifacts = workOnDeliveryArtifacts(artifacts);
+  let latestRunId: string | undefined;
+  for (const artifact of deliveryArtifacts) {
+    if (artifact.kind === "Intent") latestRunId = artifact.runId;
+  }
+  if (!latestRunId) return undefined;
+  return {
+    runId: latestRunId,
+    artifacts: deliveryArtifacts.filter((artifact) => artifact.runId === latestRunId),
+  };
+}
+
+export function reviewRemediationCycleCount(artifacts: readonly DurableArtifact[]): number {
+  return artifacts.filter((artifact) =>
+    artifact.kind === "ReviewVerdict" && artifact.payload.disposition === "request_changes").length;
+}
+
+export const MAX_VERIFICATION_REPAIR_ATTEMPTS = 2;
+
+export function isRepairableVerificationFailure(
+  packet: DurableArtifact<"BuildPacket"> | undefined,
+  outcome: DurableArtifact<"Outcome"> | undefined,
+): boolean {
+  if (!packet || !outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) return false;
+  const evidence = outcome.payload.failureEvidence;
+  const reason = outcome.payload.reason;
+  const noChanges = /^Builder produced no repository changes$/i.test(reason);
+  const dispatchedRepair = evidence.repairAttempt !== undefined;
+  const legacyBuilderEvidence = evidence.criterionCoverage === undefined;
+  const recognizedFailure = dispatchedRepair
+    || legacyBuilderEvidence
+    || noChanges
+    || /^Required verification failed(?::|$)/i.test(reason)
+    || /^Builder (?:criterion coverage is incomplete|change report does not match)/i.test(reason);
+  if (!recognizedFailure) return false;
+  const changedPaths = evidence.changedPaths.map(normalizeRepoPath);
+  if (!changedPaths.length && !noChanges && !dispatchedRepair) return false;
+  const expectedPaths = new Set(packet.payload.expectedPaths.map(normalizeRepoPath));
+  if (!changedPaths.every((path) => expectedPaths.has(path))) return false;
+  if (noChanges) return true;
+  const failedChecks = evidence.checks.filter((check) => check.status === "failed");
+  return failedChecks.length === 0 || failedChecks.some(isRepairableCheckFailure);
+}
+
+export function verificationRepairAttemptCount(artifacts: readonly DurableArtifact[]): number {
+  let latestSuccessfulBuildIndex = -1;
+  for (let index = 0; index < artifacts.length; index++) {
+    if (artifacts[index]?.kind === "BuildResult") latestSuccessfulBuildIndex = index;
+  }
+  return Math.max(0, ...artifacts
+    .slice(latestSuccessfulBuildIndex + 1)
+    .flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined
+      ? [artifact.payload.failureEvidence.repairAttempt]
+      : []));
+}
+
 export function decideSubjectAdmission(
   artifacts: readonly DurableArtifact[],
   options: { rerun?: boolean } = {},
 ): SubjectAdmissionDecision {
   if (artifacts.length === 0) return { action: "start" };
 
-  const byRun = new Map<string, DurableArtifact[]>();
-  for (const artifact of workOnDeliveryArtifacts(artifacts)) {
-    const runArtifacts = byRun.get(artifact.runId) ?? [];
-    runArtifacts.push(artifact);
-    byRun.set(artifact.runId, runArtifacts);
-  }
-  const deliveryRuns = [...byRun.entries()];
-  if (deliveryRuns.length === 0) return { action: "start" };
-
-  const latest = deliveryRuns
-    .map(([runId, runArtifacts]) => ({
-      runId,
-      artifacts: runArtifacts,
-      timestamp: Math.max(...runArtifacts.map((artifact) => Date.parse(artifact.createdAt) || 0)),
-    }))
-    .sort((left, right) => right.timestamp - left.timestamp || right.runId.localeCompare(left.runId))[0];
+  const latest = latestDeliveryRunArtifacts(artifacts);
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
@@ -51,59 +96,53 @@ export function decideSubjectAdmission(
 
   const hasIntent = latest.artifacts.some((artifact) => artifact.kind === "Intent");
   const hasInvestigation = latest.artifacts.some((artifact) => artifact.kind === "Investigation" && artifact.payload.outcome === "confirmed");
-  const packet = latestOfKind(latest.artifacts, "BuildPacket");
+  const packet = latestArtifactOfKind(latest.artifacts, "BuildPacket");
   const hasPacket = packet !== undefined;
-  const build = latestOfKind(latest.artifacts, "BuildResult");
-  const verdict = latestOfKind(latest.artifacts, "ReviewVerdict");
-  const outcome = latestOfKind(latest.artifacts, "Outcome");
-  const remediationCheckpoint = latestOfKind(latest.artifacts, "RemediationBlocked");
+  const build = latestArtifactOfKind(latest.artifacts, "BuildResult");
+  const verdict = latestArtifactOfKind(latest.artifacts, "ReviewVerdict");
+  const outcome = latestArtifactOfKind(latest.artifacts, "Outcome");
+  const remediationCheckpoint = latestArtifactOfKind(latest.artifacts, "RemediationBlocked");
   const deliveryContext = hasIntent && hasInvestigation && hasPacket;
-  if (remediationCheckpoint && (remediationCheckpoint.payload.status === "awaiting-dispatch" || remediationCheckpoint.payload.status === "children-running" || remediationCheckpoint.payload.status === "ready-to-resume")) {
+  const latestBuildIndex = lastArtifactIndex(latest.artifacts, "BuildResult");
+  const latestVerdictIndex = lastArtifactIndex(latest.artifacts, "ReviewVerdict");
+  const latestOutcomeIndex = lastArtifactIndex(latest.artifacts, "Outcome");
+  const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
+  const remediationCheckpointIsPending = remediationCheckpoint !== undefined
+    && (remediationCheckpoint.payload.status === "ready-to-resume"
+      ? latestRemediationCheckpointIndex > Math.max(latestVerdictIndex, latestOutcomeIndex)
+      : latestRemediationCheckpointIndex > Math.max(latestBuildIndex, latestVerdictIndex, latestOutcomeIndex));
+  if (remediationCheckpoint && remediationCheckpointIsPending
+    && (remediationCheckpoint.payload.status === "awaiting-dispatch"
+      || remediationCheckpoint.payload.status === "children-running"
+      || remediationCheckpoint.payload.status === "ready-to-resume")) {
     return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "remediation", artifacts: latest.artifacts };
   }
-  const buildTime = build ? Date.parse(build.createdAt) : 0;
-  const verdictTime = verdict ? Date.parse(verdict.createdAt) : 0;
-  const outcomeTime = outcome ? Date.parse(outcome.createdAt) : 0;
 
   if (reconciled.state === "building" && deliveryContext) {
     return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
   }
 
-  // A verification failure is authoritative only while no newer verified build
-  // supersedes it. This avoids replaying stale retained evidence after a resume.
-  const verificationFailureOutcome = outcome?.payload.status === "blocked" && outcome.payload.failureEvidence !== undefined
-    ? outcome
+  // Repository order is durable publication order. Use it rather than worker
+  // clocks so equal/skewed timestamps cannot replay superseded failures.
+  const sequencedOutcome = latestOutcomeIndex >= 0 ? latest.artifacts[latestOutcomeIndex] : undefined;
+  const verificationFailureOutcome = sequencedOutcome?.kind === "Outcome"
+    && sequencedOutcome.payload.status === "blocked"
+    && sequencedOutcome.payload.failureEvidence !== undefined
+    ? sequencedOutcome
     : undefined;
   const pendingVerificationFailure = verificationFailureOutcome !== undefined
-    && outcomeTime >= buildTime;
+    && latestOutcomeIndex >= latestBuildIndex;
   if (pendingVerificationFailure) {
-    const verificationFailureEvidence = verificationFailureOutcome.payload.failureEvidence!;
-    const noChangeAttempt = /^Builder produced no repository changes$/i.test(verificationFailureOutcome.payload.reason);
-    if (noChangeAttempt && deliveryContext && build && verdict
-      && verdict.payload.disposition === "request_changes" && verdict.payload.headSha === build.payload.headSha) {
-      return { action: "resume", runId: latest.runId, state: "remediating", checkpoint: "remediation", artifacts: latest.artifacts };
-    }
-    if (noChangeAttempt && deliveryContext && !verdict) {
-      return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
-    }
-    const expectedPaths = new Set(packet?.payload.expectedPaths.map(normalizeRepoPath) ?? []);
-    const repairableVerification = deliveryContext
-      && packet !== undefined
-      && /^Required verification failed(?::|$)/i.test(verificationFailureOutcome.payload.reason)
-      && verificationFailureEvidence.changedPaths.every((path) => expectedPaths.has(normalizeRepoPath(path)));
-    if (repairableVerification) {
-      const failedBuildAttempts = latest.artifacts.filter((artifact) => artifact.kind === "Outcome"
-        && artifact.payload.status === "blocked"
-        && artifact.payload.failureEvidence !== undefined
-        && /^Required verification failed(?::|$)/i.test(artifact.payload.reason)).length;
-      if (failedBuildAttempts <= 2) {
+    if (deliveryContext && isRepairableVerificationFailure(packet, verificationFailureOutcome)) {
+      const repairAttempts = verificationRepairAttemptCount(latest.artifacts);
+      if (repairAttempts < MAX_VERIFICATION_REPAIR_ATTEMPTS) {
         return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
       }
       return {
         action: "block",
         runId: latest.runId,
         state: "blocked",
-        reason: `Verification repair budget exhausted after ${failedBuildAttempts - 1} repair attempt(s)`,
+        reason: `Verification repair budget exhausted after ${MAX_VERIFICATION_REPAIR_ATTEMPTS} repair attempt(s)`,
       };
     }
     return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
@@ -112,7 +151,7 @@ export function decideSubjectAdmission(
   // A newer verified head means build/remediation and verification completed,
   // but publication or review did not durably finish. Republishing is
   // idempotent and starts an entirely fresh review without replaying build.
-  const verifiedAfterLatestVerdict = build && (!verdict || buildTime > verdictTime);
+  const verifiedAfterLatestVerdict = build && latestBuildIndex > latestVerdictIndex;
   if (deliveryContext && verifiedAfterLatestVerdict && outcome?.payload.status !== "merged") {
     const expectedPublishedHead = outcome?.payload.status === "failed"
       ? /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i.exec(outcome.payload.reason)?.[1]
@@ -134,7 +173,7 @@ export function decideSubjectAdmission(
   if (deliveryContext && matchingReviewedHead && verdict.payload.disposition === "request_changes") {
     const reviewBudgetExhausted = outcome?.payload.status === "blocked"
       && /^Remediation budget exhausted after \d+ cycle\(s\)$/i.test(outcome.payload.reason);
-    const interruptedRemediation = !outcome || outcome.payload.status === "failed" || verdictTime > outcomeTime;
+    const interruptedRemediation = !outcome || outcome.payload.status === "failed" || latestVerdictIndex > latestOutcomeIndex;
     if (reviewBudgetExhausted || interruptedRemediation) {
       return {
         action: "resume", runId: latest.runId,
@@ -154,16 +193,33 @@ export function decideSubjectAdmission(
   };
 }
 
+function isRepairableCheckFailure(check: CheckResult): boolean {
+  if (check.regression === false || check.failureClass === "infrastructure") return false;
+  // Backward compatibility for failure evidence written before failureClass
+  // became part of the durable check schema.
+  return !(check.failureClass === undefined
+    && check.exitCode === undefined
+    && /^Failed to start verification command \([^)]+\)$/i.test(check.summary ?? ""));
+}
+
+function lastArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    if (artifacts[index]?.kind === kind) return index;
+  }
+  return -1;
+}
+
 function normalizeRepoPath(path: string): string {
   return path.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/$/, "");
 }
 
-function latestOfKind<K extends DurableArtifact["kind"]>(
+export function latestArtifactOfKind<K extends DurableArtifact["kind"]>(
   artifacts: readonly DurableArtifact[],
   kind: K,
 ): Extract<DurableArtifact, { kind: K }> | undefined {
-  return artifacts
-    .filter((artifact): artifact is Extract<DurableArtifact, { kind: K }> => artifact.kind === kind)
-    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt))
-    .at(-1);
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === kind) return artifact as Extract<DurableArtifact, { kind: K }>;
+  }
+  return undefined;
 }

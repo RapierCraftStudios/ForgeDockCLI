@@ -44,13 +44,13 @@ describe("verification policy discovery", () => {
     ]);
   });
 
-  it("retains nested checks as covered evidence without scheduling duplicate execution", () => {
+  it("never infers execution coverage from package-script prose", () => {
     const repo = mkdtempSync(join(tmpdir(), "forgedock-policy-nested-"));
     execFileSync("git", ["init", repo], { stdio: "ignore" });
     git(repo, "config", "user.name", "ForgeDock Test");
     git(repo, "config", "user.email", "forgedock@example.invalid");
     writeFileSync(join(repo, "package.json"), JSON.stringify({
-      scripts: { build: "tsc -p tsconfig.json", test: "npm run build && node --test" },
+      scripts: { build: "tsc -p tsconfig.json", test: "echo npm run build && node --test" },
     }));
     git(repo, "add", "package.json");
     git(repo, "commit", "-m", "base");
@@ -60,6 +60,6 @@ describe("verification policy discovery", () => {
     const test = commands.find(({ id }) => id === "test");
     assert.ok(build?.planId);
     assert.equal(build?.planId, test?.planId);
-    assert.deepEqual(build?.coveredBy, ["test"]);
+    assert.equal(build?.coveredBy, undefined);
   });
 });

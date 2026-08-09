@@ -6,7 +6,8 @@ describe("orchestrate argument parsing", () => {
   it("does not treat numeric option values as issue numbers", () => {
     assert.deepEqual(parseOrchestrationIssueNumbers([
       "7", "--confirm", "--rerun", "--no-auto-merge", "--batching", "none",
-      "--max-parallel", "1", "--max-remediation-cycles", "2", "--milestone", "1",
+      "--max-parallel", "1", "--max-remediation-cycles", "2", "--max-remediation-depth", "1",
+      "--max-remediation-children", "3", "--milestone", "1",
       "--provider", "openai-codex", "--model", "gpt-5.6-luna",
     ]), [7]);
   });
