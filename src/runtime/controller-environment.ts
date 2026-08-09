@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 
 const AGENT_TRANSPORT_PREFIXES = ["PI_SUBAGENT_", "PI_SUBAGENTS_"] as const;
 export const FORGEDOCK_VERIFICATION_PATH = "FORGEDOCK_VERIFICATION_PATH";
+const FORGEDOCK_VERIFICATION_HOME = "FORGEDOCK_VERIFICATION_HOME_V1";
 const AGENT_TRANSPORT_KEYS = new Set([
   "PI_INTERCOM_SESSION_ID",
 ]);
@@ -81,7 +82,12 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
  * reconstruct the same package-safe prefix from this inherited manifest.
  */
 export function sealVerificationEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const sealed = verificationEnvironment(environment);
+  const scoped = { ...environment };
+  for (const name of Object.keys(scoped)) {
+    if (name.toUpperCase() === FORGEDOCK_VERIFICATION_HOME) delete scoped[name];
+  }
+  scoped[FORGEDOCK_VERIFICATION_HOME] = mkdtempSync(join(tmpdir(), "forgedock-verification-home-"));
+  const sealed = verificationEnvironment(scoped);
   const path = environmentValue(sealed, "PATH");
   if (path) sealed[FORGEDOCK_VERIFICATION_PATH] = path;
   return sealed;
@@ -182,7 +188,9 @@ function uniquePathEntries(entries: readonly string[]): string[] {
 }
 
 function isolateVerificationHome(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const root = join(tmpdir(), "forgedock-verification-home");
+  const root = environmentValue(environment, FORGEDOCK_VERIFICATION_HOME)
+    ?? mkdtempSync(join(tmpdir(), "forgedock-verification-home-"));
+  environment[FORGEDOCK_VERIFICATION_HOME] = root;
   mkdirSync(root, { recursive: true });
   const config = join(root, ".config");
   const appData = join(root, "AppData", "Roaming");
@@ -198,7 +206,18 @@ function isolateVerificationHome(environment: NodeJS.ProcessEnv): NodeJS.Process
   setEnvironmentValue(environment, "AZURE_CONFIG_DIR", join(config, "azure"));
   setEnvironmentValue(environment, "GNUPGHOME", join(config, "gnupg"));
   setEnvironmentValue(environment, "NPM_CONFIG_USERCONFIG", join(root, ".npmrc"));
-  setEnvironmentValue(environment, "GIT_CONFIG_GLOBAL", join(root, ".gitconfig"));
+  const gitConfig = join(root, ".gitconfig");
+  writeFileSync(gitConfig, [
+    "[user]",
+    "\tname = ForgeDock Verification",
+    "\temail = verification@forgedock.invalid",
+    "[commit]",
+    "\tgpgSign = false",
+    "[tag]",
+    "\tgpgSign = false",
+    "",
+  ].join("\n"), { encoding: "utf8", mode: 0o600 });
+  setEnvironmentValue(environment, "GIT_CONFIG_GLOBAL", gitConfig);
   return environment;
 }
 

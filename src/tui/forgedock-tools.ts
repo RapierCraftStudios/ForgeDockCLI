@@ -64,6 +64,7 @@ export type WorkflowCommand = keyof typeof WORKFLOW_TOOLS;
 export interface OrchestrationInvocationScope {
   rawArgs: string;
   issueNumbers: readonly number[];
+  repository?: string;
   milestone?: string;
   noMilestone: boolean;
 }
@@ -108,13 +109,14 @@ export async function resolveOrchestrationInvocationScope(
     return {
       rawArgs,
       issueNumbers,
+      repository: repository.repo,
       ...(milestone ? { milestone } : {}),
       noMilestone: milestone === undefined,
     };
   }
   const issueNumbers = await host.listOpenIssueNumbersForMilestone(selector, repository.repo);
   if (!issueNumbers.length) throw new Error(`No open issues are assigned to exact milestone '${selector}'`);
-  return { rawArgs, issueNumbers, milestone: selector, noMilestone: false };
+  return { rawArgs, issueNumbers, repository: repository.repo, milestone: selector, noMilestone: false };
 }
 
 export function workflowCommandDisplay(command: WorkflowCommand): string {
@@ -375,7 +377,9 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const maxParallel = Math.min(effective.maxParallel, Math.max(1, issues.length));
       const autoMerge = effective.autoMerge;
       let github: GitHubClient | undefined;
-      let repository: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined;
+      let repository: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined = boundScope.repository
+        ? { repo: boundScope.repository, defaultBranch: "" }
+        : undefined;
       let milestoneFilter = boundScope.milestone;
       const noMilestoneFilter = boundScope.noMilestone;
       const milestoneByIssue = new Map<number, string | undefined>();
@@ -385,7 +389,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       // the pure plan before applying the filter.
       if (milestoneFilter) {
         github = new GitHubClient(ctx.cwd);
-        repository = await github.getRepository();
+        repository ??= await github.getRepository();
         const observedIssues = await Promise.all(issues.map((issue) => github!.getIssue(issue, repository!.repo)));
         for (const observed of observedIssues) milestoneByIssue.set(observed.number, observed.milestone?.title);
         const mismatched = observedIssues

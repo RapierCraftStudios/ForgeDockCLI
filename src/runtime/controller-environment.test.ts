@@ -39,8 +39,11 @@ describe("controller environment boundary", () => {
   });
 
   it("removes controller credentials and isolates verification config homes", () => {
+    const controllerHome = "C:/controller/home";
     const environment = verificationEnvironment({
       PATH: process.env.PATH,
+      HOME: controllerHome,
+      USERPROFILE: controllerHome,
       AUDIT_SECRET: "fd-secret-proof",
       GH_TOKEN: "github-token",
       GITHUB_PAT: "github-pat",
@@ -69,9 +72,15 @@ describe("controller environment boundary", () => {
     assert.equal(environment.OPENAI_API_KEY, undefined);
     assert.equal(environment.FORGEDOCK_NESTED_AGENT_TOKEN, undefined);
     assert.equal(environment.SAFE_FLAG, "visible");
-    assert.notEqual(environment.HOME, homedir());
+    assert.notEqual(environment.HOME, controllerHome);
     assert.equal(environment.HOME, environment.USERPROFILE);
     assert.ok(environment.NPM_CONFIG_USERCONFIG?.startsWith(environment.HOME ?? ""));
+    assert.ok(environment.GIT_CONFIG_GLOBAL?.startsWith(environment.HOME ?? ""));
+    const identity = spawnSync("git", ["config", "--global", "--get", "user.email"], {
+      env: environment, encoding: "utf8", windowsHide: true,
+    });
+    assert.equal(identity.status, 0, identity.stderr || identity.error?.message);
+    assert.equal(identity.stdout.trim(), "verification@forgedock.invalid");
   });
 
   it("puts discovered Git Bash and user tools ahead of ambiguous Windows launchers", () => {

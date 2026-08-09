@@ -323,7 +323,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   try {
     const tool = state.tools.get("forgedock_orchestrate");
     assert.ok(tool);
-    bindOrchestrationInvocation(state.pi, { rawArgs: "7,8", issueNumbers: [7, 8], noMilestone: true });
+    bindOrchestrationInvocation(state.pi, { rawArgs: "7,8", issueNumbers: [7, 8], repository: "a/b", noMilestone: true });
     const result = await tool.execute("call-1", {
       issueNumbers: [7, 8],
       executionPlan: [
@@ -637,6 +637,7 @@ test("orchestration scope resolution binds an exact milestone to its open member
   assert.deepEqual(scope, {
     rawArgs: "throwaway-milestone --auto",
     issueNumbers: [129],
+    repository: "a/b",
     milestone: "throwaway-milestone",
     noMilestone: false,
   });
