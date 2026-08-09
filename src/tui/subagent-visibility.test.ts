@@ -19,6 +19,16 @@ interface TranscriptEvent {
 }
 
 describe("bundled subagent live visibility", () => {
+  it("reapplies the version-pinned visibility patch before every supported test entrypoint", () => {
+    const manifest = JSON.parse(readFileSync(resolve("package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    assert.equal(manifest.scripts?.["patch:pi-subagents"], "node scripts/patch-pi-subagents-visibility.mjs");
+    assert.equal(manifest.scripts?.pretest, "npm run patch:pi-subagents");
+    assert.equal(manifest.scripts?.["pretest:next"], "npm run patch:pi-subagents");
+    assert.equal(manifest.scripts?.["pretest:legacy"], "npm run patch:pi-subagents");
+  });
+
   it("forces operational artifacts into temp storage instead of delivery worktrees", () => {
     const extension = readFileSync(resolve("node_modules/pi-subagents/src/extension/index.ts"), "utf8");
     const defaults = readFileSync(resolve("node_modules/pi-subagents/src/shared/types.ts"), "utf8");
