@@ -117,7 +117,10 @@ describe("isolated Git worktrees", () => {
     const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
     const workspace = await manager.create({ runId: "run_fetch", issue: 13, baseRef: "origin/main" });
     assert.equal(workspace.baseSha, fetchedSha);
-    assert.equal(readFileSync(join(workspace.path, "README.md"), "utf8"), "fetched\n");
+    assert.equal(
+      readFileSync(join(workspace.path, "README.md"), "utf8").replaceAll("\r\n", "\n"),
+      "fetched\n",
+    );
     assert.equal(await manager.isAncestor(workspace, baseSha, fetchedSha), true);
     assert.equal(await manager.isAncestor(workspace, fetchedSha, baseSha), false);
     await manager.push(workspace);
