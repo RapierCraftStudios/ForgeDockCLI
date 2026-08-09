@@ -61,6 +61,62 @@ export const HIDDEN_SUBAGENT_TOOLS = new Set(["subagent", "subagent_wait", "suba
 
 export type WorkflowCommand = keyof typeof WORKFLOW_TOOLS;
 
+export interface OrchestrationInvocationScope {
+  rawArgs: string;
+  issueNumbers: readonly number[];
+  milestone?: string;
+  noMilestone: boolean;
+}
+
+interface OrchestrationScopeResolverHost {
+  getRepository(): Promise<{ repo: string; defaultBranch: string }>;
+  getIssue(number: number, repo?: string): Promise<{ number: number; state: "OPEN" | "CLOSED"; milestone?: { number: number; title: string } }>;
+  listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]>;
+}
+
+const pendingOrchestrationScopes = new WeakMap<ExtensionAPI, OrchestrationInvocationScope>();
+
+export function bindOrchestrationInvocation(pi: ExtensionAPI, scope: OrchestrationInvocationScope): void {
+  if (pendingOrchestrationScopes.has(pi)) throw new Error("A deterministic /orchestrate invocation is already awaiting execution");
+  pendingOrchestrationScopes.set(pi, {
+    ...scope,
+    issueNumbers: [...scope.issueNumbers].sort((left, right) => left - right),
+  });
+}
+
+export function clearOrchestrationInvocation(pi: ExtensionAPI): void {
+  pendingOrchestrationScopes.delete(pi);
+}
+
+export async function resolveOrchestrationInvocationScope(
+  rawArgs: string,
+  cwd: string,
+  host: OrchestrationScopeResolverHost = new GitHubClient(cwd),
+): Promise<OrchestrationInvocationScope> {
+  const optionStart = rawArgs.search(/\s--[a-z]/i);
+  const selector = (optionStart >= 0 ? rawArgs.slice(0, optionStart) : rawArgs).trim();
+  if (!selector) throw new Error("/orchestrate requires an exact issue-number set or exact milestone title");
+  const repository = await host.getRepository();
+  if (/^\d+(?:[\s,]+\d+)*$/.test(selector)) {
+    const issueNumbers = [...new Set(selector.split(/[\s,]+/).filter(Boolean).map(Number))].sort((left, right) => left - right);
+    const issues = await Promise.all(issueNumbers.map((issue) => host.getIssue(issue, repository.repo)));
+    const closed = issues.filter((issue) => issue.state !== "OPEN").map((issue) => issue.number);
+    if (closed.length) throw new Error(`Orchestration issues must be open: ${closed.map((issue) => `#${issue}`).join(", ")}`);
+    const milestones = [...new Set(issues.map((issue) => issue.milestone?.title))];
+    if (milestones.length !== 1) throw new Error("Selected issues must all belong to the same milestone lane or all have no milestone");
+    const milestone = milestones[0];
+    return {
+      rawArgs,
+      issueNumbers,
+      ...(milestone ? { milestone } : {}),
+      noMilestone: milestone === undefined,
+    };
+  }
+  const issueNumbers = await host.listOpenIssueNumbersForMilestone(selector, repository.repo);
+  if (!issueNumbers.length) throw new Error(`No open issues are assigned to exact milestone '${selector}'`);
+  return { rawArgs, issueNumbers, milestone: selector, noMilestone: false };
+}
+
 export function workflowCommandDisplay(command: WorkflowCommand): string {
   return command === "status" ? "/forgedock-status" : `/${command}`;
 }
@@ -256,7 +312,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
     label: "ForgeDock orchestrate",
     description: "Validate an evidence-backed issue DAG, aggregate compatible P2/P3 review findings into batch work units, derive serialization edges, and stream visible workers as predecessors complete. Each child uses the typed work-on controller and can escalate decisions to this supervisor session.",
     parameters: Type.Object({
-      issueNumbers: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, description: "Concrete unique issue numbers resolved by the parent model" }),
+      issueNumbers: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1, description: "Concrete unique issue numbers copied from the controller-bound invocation scope" }),
       executionPlan: Type.Optional(Type.Array(Type.Object({
         issue: Type.Integer({ minimum: 1 }),
         title: Type.String(),
@@ -290,8 +346,24 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
-      const issues = [...new Set(params.issueNumbers)];
-      if (issues.length !== params.issueNumbers.length) throw new Error("issueNumbers must be unique");
+      const boundScope = pendingOrchestrationScopes.get(pi);
+      if (!boundScope) throw new Error("forgedock_orchestrate requires a deterministic scope bound by the interactive /orchestrate command");
+      const suppliedIssues = [...new Set(params.issueNumbers)].sort((left, right) => left - right);
+      if (suppliedIssues.length !== params.issueNumbers.length) throw new Error("issueNumbers must be unique");
+      if (suppliedIssues.length !== boundScope.issueNumbers.length
+        || suppliedIssues.some((issue, index) => issue !== boundScope.issueNumbers[index])) {
+        throw new Error(
+          `Orchestration issue substitution rejected: invocation is bound to ${boundScope.issueNumbers.map((issue) => `#${issue}`).join(", ")}; received ${suppliedIssues.map((issue) => `#${issue}`).join(", ")}`,
+        );
+      }
+      if (params.milestone !== undefined && params.milestone !== boundScope.milestone) {
+        throw new Error(`Orchestration milestone substitution rejected: invocation is bound to '${boundScope.milestone ?? "no milestone"}'`);
+      }
+      if (params.noMilestone === true && !boundScope.noMilestone) {
+        throw new Error(`Orchestration cannot drop bound milestone '${boundScope.milestone}'`);
+      }
+      clearOrchestrationInvocation(pi);
+      const issues = [...boundScope.issueNumbers];
       const config = readForgeDockConfig(ctx.cwd);
       const effective = resolveOrchestrationConfig(config, {
         ...(params.batching ? { batchingPolicy: params.batching as "aggressive" | "conservative" | "none" } : {}),
@@ -304,7 +376,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const autoMerge = effective.autoMerge;
       let github: GitHubClient | undefined;
       let repository: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined;
-      let milestoneFilter = params.milestone;
+      let milestoneFilter = boundScope.milestone;
+      const noMilestoneFilter = boundScope.noMilestone;
       const milestoneByIssue = new Map<number, string | undefined>();
       // Natural-language milestone URLs are commonly resolved to a numeric
       // milestone identifier by the supervisor. Assembly compares titles, so
@@ -315,11 +388,11 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
         repository = await github.getRepository();
         const observedIssues = await Promise.all(issues.map((issue) => github!.getIssue(issue, repository!.repo)));
         for (const observed of observedIssues) milestoneByIssue.set(observed.number, observed.milestone?.title);
-        if (/^\d+$/.test(milestoneFilter)) {
-          const milestoneNumber = Number(milestoneFilter);
-          const matching = observedIssues.find((observed) => observed.milestone?.number === milestoneNumber);
-          if (!matching?.milestone) throw new Error(`Milestone #${milestoneFilter} is not assigned to the selected issue set`);
-          milestoneFilter = matching.milestone.title;
+        const mismatched = observedIssues
+          .filter((observed) => observed.milestone?.title !== milestoneFilter)
+          .map((observed) => `#${observed.number}`);
+        if (mismatched.length) {
+          throw new Error(`Bound milestone '${milestoneFilter}' does not contain selected issues: ${mismatched.join(", ")}`);
         }
       }
       const discoveredItems = buildVisibleOrchestrationPlan(issues, params.executionPlan, params.issueBriefs).map((item) => {
@@ -333,7 +406,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
         maxSensitiveBatchSize: effective.maxSensitiveBatchSize,
         ...(params.priority ? { priorities: params.priority } : {}),
         ...(milestoneFilter ? { milestone: milestoneFilter } : {}),
-        ...(params.noMilestone ? { noMilestone: true } : {}),
+        ...(noMilestoneFilter ? { noMilestone: true } : {}),
         scopeExpansion: effective.scopeExpansion,
         maxRemediationCycles: effective.maxRemediationCycles,
       });
@@ -667,12 +740,18 @@ export function deactivateWorkflowTools(pi: ExtensionAPI): void {
   pi.setActiveTools(pi.getActiveTools().filter((name) => !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name)));
 }
 
-export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: string): string {
+export function buildNativeCommandPrompt(
+  command: WorkflowCommand,
+  rawArgs: string,
+  orchestrationScope?: OrchestrationInvocationScope,
+): string {
   const tool = WORKFLOW_TOOLS[command];
   if (command === "orchestrate") {
     return [
       `The user invoked /orchestrate ${rawArgs}`.trim(),
-      "Interpret the request naturally. Resolve repository identity from the current checkout's GitHub remote, which is authoritative; never infer it from the ForgeDock package name or repository metadata. Use ordinary read-only GitHub tools to resolve it to a concrete eligible issue-number set; do not load Markdown command specs and do not pass natural-language words as issue numbers.",
+      orchestrationScope
+        ? `The controller has already resolved and bound this invocation to issueNumbers=[${orchestrationScope.issueNumbers.join(",")}] and ${orchestrationScope.milestone ? `milestone='${orchestrationScope.milestone}'` : "noMilestone=true"}. This binding is authoritative. Do not substitute provenance, parent, dependency, or source issue numbers.`
+        : "No deterministic orchestration binding is present. Do not call the orchestration tool; ask the user to invoke /orchestrate again with exact issue numbers or one exact milestone title.",
       "Infer an evidence-backed execution DAG from issue bodies, labels, explicit dependency links, and likely file/component overlap. Do not invent dependencies: use an empty dependsOn list when none is supported. For every item include exact observed labels, scoped affectedFiles, concise path/component claims, priority, and any exact Source PR, FORGE:CLASS, or risk class evidence.",
       "Batching is a bounded efficiency policy: aggressive may contract compatible ordinary issues, conservative retains compatible P2/P3 review findings, and none keeps every selected issue separate. DAG ready sets and topological levels are never called batches.",
       "Pass priority=[P0..P3], milestone, or noMilestone only when the user requested those filters; pass scopeExpansion and remediation bounds as explicit policy options. Invocation policy overrides forge.yaml and workers cannot override the resolved values.",

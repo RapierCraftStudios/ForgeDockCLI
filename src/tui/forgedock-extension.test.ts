@@ -8,7 +8,15 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import forgedockExtension, { executeController, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
-import { buildNativeCommandPrompt, resolveIssueWorkerRecovery, resolveModelReference, VisibleDagDelegator } from "./forgedock-tools.js";
+import {
+  bindOrchestrationInvocation,
+  buildNativeCommandPrompt,
+  resolveIssueWorkerRecovery,
+  resolveModelReference,
+  resolveOrchestrationInvocationScope,
+  VisibleDagDelegator,
+  type OrchestrationInvocationScope,
+} from "./forgedock-tools.js";
 
 interface FakePiState {
   pi: ExtensionAPI;
@@ -20,7 +28,15 @@ interface FakePiState {
   emitted: Array<{ event: string; data: any }>;
 }
 
-function fakePi(initialActive = ["read", "bash", "subagent", "subagent_wait", "subagent_supervisor"]): FakePiState {
+function fakePi(
+  initialActive = ["read", "bash", "subagent", "subagent_wait", "subagent_supervisor"],
+  resolveOrchestrationScope: (rawArgs: string, cwd: string) => Promise<OrchestrationInvocationScope> = async (rawArgs) => ({
+    rawArgs,
+    issueNumbers: [129],
+    milestone: "throwaway-milestone",
+    noMilestone: false,
+  }),
+): FakePiState {
   const tools = new Map<string, ToolDefinition>();
   const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
   const handlers = new Map<string, Array<(event: any, ctx?: any) => unknown>>();
@@ -57,7 +73,7 @@ function fakePi(initialActive = ["read", "bash", "subagent", "subagent_wait", "s
     },
   } as unknown as ExtensionAPI;
   Object.assign(state, { pi, tools, commands, handlers, sent, active, emitted });
-  forgedockExtension(pi);
+  forgedockExtension(pi, { resolveOrchestrationScope });
   return state;
 }
 
@@ -85,9 +101,9 @@ test("commands lazily activate separate semantic native tools without loading Ma
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration"]);
 
-  await state.commands.get("orchestrate")?.("all open enhancement issues --dry-run", commandContext());
+  await state.commands.get("orchestrate")?.("throwaway-milestone --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
-  assert.match(state.sent[0]?.content ?? "", /resolve it to a concrete eligible issue-number set/);
+  assert.match(state.sent[0]?.content ?? "", /bound this invocation to issueNumbers=\[129\].*milestone='throwaway-milestone'/);
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
@@ -307,6 +323,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   try {
     const tool = state.tools.get("forgedock_orchestrate");
     assert.ok(tool);
+    bindOrchestrationInvocation(state.pi, { rawArgs: "7,8", issueNumbers: [7, 8], noMilestone: true });
     const result = await tool.execute("call-1", {
       issueNumbers: [7, 8],
       executionPlan: [
@@ -343,6 +360,7 @@ test("headless orchestration requires explicit dispatch authorization", async ()
   const state = fakePi();
   const tool = state.tools.get("forgedock_orchestrate");
   assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
   await assert.rejects(() => tool.execute("headless", {
     issueNumbers: [7],
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
@@ -595,11 +613,50 @@ test("shell fallback cannot impose a wall-clock timeout on lifecycle controllers
   assert.equal(isLifecycleControllerShellCommand("npm run next -- work-on 6 --rerun"), true);
 });
 
-test("native command prompts preserve natural-language intent", () => {
-  const prompt = buildNativeCommandPrompt("orchestrate", "all open issues except blocked");
-  assert.match(prompt, /\/orchestrate all open issues except blocked/);
-  assert.match(prompt, /concrete eligible issue-number set/);
+test("native command prompts preserve deterministic orchestration bindings", () => {
+  const prompt = buildNativeCommandPrompt("orchestrate", "throwaway-milestone", {
+    rawArgs: "throwaway-milestone",
+    issueNumbers: [129],
+    milestone: "throwaway-milestone",
+    noMilestone: false,
+  });
+  assert.match(prompt, /\/orchestrate throwaway-milestone/);
+  assert.match(prompt, /issueNumbers=\[129\].*milestone='throwaway-milestone'/);
   assert.match(prompt, /Never invoke forgedock-next, dist\/cli\/main\.js, or another lifecycle controller through bash\/shell/);
   assert.match(buildNativeCommandPrompt("work-on", "6 --resume"), /Never invoke the lifecycle CLI through bash\/shell or add a wall-clock timeout/);
   assert.doesNotMatch(prompt, /invocationToken|\.md/);
+});
+
+test("orchestration scope resolution binds an exact milestone to its open members", async () => {
+  const calls: string[] = [];
+  const scope = await resolveOrchestrationInvocationScope("throwaway-milestone --auto", process.cwd(), {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getIssue(number) { return { number, state: "OPEN" as const }; },
+    async listOpenIssueNumbersForMilestone(title) { calls.push(title); return [129]; },
+  });
+  assert.deepEqual(scope, {
+    rawArgs: "throwaway-milestone --auto",
+    issueNumbers: [129],
+    milestone: "throwaway-milestone",
+    noMilestone: false,
+  });
+  assert.deepEqual(calls, ["throwaway-milestone"]);
+});
+
+test("orchestration tool rejects source-issue substitution before dispatch", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, {
+    rawArgs: "throwaway-milestone",
+    issueNumbers: [129],
+    milestone: "throwaway-milestone",
+    noMilestone: false,
+  });
+  await assert.rejects(() => tool.execute("substitution", {
+    issueNumbers: [110],
+    executionPlan: [{ issue: 110, title: "Source", summary: "Wrong source issue", dependsOn: [], claims: ["src"], labels: [] }],
+    milestone: "throwaway-milestone",
+    dryRun: true,
+  }, undefined, undefined, commandContext() as any), /issue substitution rejected.*#129.*#110/);
 });

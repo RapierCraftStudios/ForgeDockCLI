@@ -12,10 +12,14 @@ import {
   ORCHESTRATION_RESUME_TOOL,
   WORKFLOW_TOOLS,
   activateOnly,
+  bindOrchestrationInvocation,
   buildNativeCommandPrompt,
+  clearOrchestrationInvocation,
   deactivateWorkflowTools,
   inspectSubagentRuntime,
   registerForgeDockTools,
+  resolveOrchestrationInvocationScope,
+  type OrchestrationInvocationScope,
   type WorkflowCommand,
   workflowCommandDisplay,
 } from "./forgedock-tools.js";
@@ -25,8 +29,16 @@ export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /work-on · /revie
 const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 
-export default function forgedockExtension(pi: ExtensionAPI): void {
+interface ForgeDockExtensionDependencies {
+  resolveOrchestrationScope?: (rawArgs: string, cwd: string) => Promise<OrchestrationInvocationScope>;
+}
+
+export default function forgedockExtension(
+  pi: ExtensionAPI,
+  dependencies: ForgeDockExtensionDependencies = {},
+): void {
   const backgroundTasks = registerForgeDockTools(pi);
+  const resolveOrchestrationScope = dependencies.resolveOrchestrationScope ?? resolveOrchestrationInvocationScope;
 
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
@@ -80,6 +92,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", (_event, ctx) => {
+    clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
     if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
@@ -88,7 +101,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     await backgroundTasks.shutdown();
   });
 
-  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
+  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow, resolveOrchestrationScope);
 
   pi.registerCommand("forgedock-status", {
     description: "Show typed ForgeDock issue/run status",
@@ -177,7 +190,11 @@ export function isLifecycleControllerShellCommand(command: string): boolean {
   return directEntry.test(command) || packageScript.test(command);
 }
 
-function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
+function registerWorkflow(
+  pi: ExtensionAPI,
+  workflow: Workflow,
+  resolveOrchestrationScope: (rawArgs: string, cwd: string) => Promise<OrchestrationInvocationScope>,
+): void {
   pi.registerCommand(workflow, {
     description: workflowDescription(workflow),
     handler: async (args, ctx) => {
@@ -189,7 +206,22 @@ function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
       // Orchestration confirms the resolved DAG and proposed work-unit batches inside
       // its native tool; a pre-resolution confirmation would be both vague and duplicate.
       if (workflow !== "orchestrate" && !await confirmWorkflow(workflow, normalized, ctx)) return;
-      await queueNativeWorkflow(pi, workflow, normalized, ctx);
+      let orchestrationScope: OrchestrationInvocationScope | undefined;
+      if (workflow === "orchestrate") {
+        try {
+          orchestrationScope = await resolveOrchestrationScope(normalized, ctx.cwd);
+          bindOrchestrationInvocation(pi, orchestrationScope);
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          return;
+        }
+      }
+      try {
+        await queueNativeWorkflow(pi, workflow, normalized, ctx, orchestrationScope);
+      } catch (error) {
+        if (workflow === "orchestrate") clearOrchestrationInvocation(pi);
+        throw error;
+      }
     },
   });
 }
@@ -199,11 +231,12 @@ async function queueNativeWorkflow(
   command: WorkflowCommand,
   rawArgs: string,
   ctx: ExtensionCommandContext,
+  orchestrationScope?: OrchestrationInvocationScope,
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
   activateOnly(pi, [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
-  const prompt = buildNativeCommandPrompt(command, rawArgs);
+  const prompt = buildNativeCommandPrompt(command, rawArgs, orchestrationScope);
   if (ctx.isIdle()) pi.sendUserMessage(prompt);
   else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 }

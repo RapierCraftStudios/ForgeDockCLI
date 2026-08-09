@@ -100,6 +100,19 @@ export class GitHubClient implements ForgeHost {
     return { repo: parsed.nameWithOwner, defaultBranch: parsed.defaultBranchRef.name };
   }
 
+  async listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]> {
+    const resolvedRepo = repo ?? await this.resolveRepository();
+    const result = await this.gh([
+      "issue", "list", "--repo", resolvedRepo, "--state", "open",
+      "--milestone", title, "--limit", "1000", "--json", "number,milestone",
+    ]);
+    const issues = JSON.parse(result) as Array<{ number?: number; milestone?: { title?: string } | null }>;
+    return issues
+      .filter((issue) => issue.milestone?.title === title && Number.isSafeInteger(issue.number))
+      .map((issue) => issue.number!)
+      .sort((left, right) => left - right);
+  }
+
   async getIssue(number: number, repo?: string): Promise<GitHubIssue> {
     const resolvedRepo = repo ?? await this.resolveRepository();
     const result = await this.gh([
