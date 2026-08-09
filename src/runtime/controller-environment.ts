@@ -211,8 +211,15 @@ function isSensitiveVerificationVariable(name: string, value: string | undefined
     "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
     "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH_COMMAND",
   ]);
+  const executableLoaderVariables = new Set([
+    "NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV", "ZDOTDIR",
+    "PYTHONHOME", "PYTHONPATH", "RUBYOPT", "RUBYLIB", "PERL5OPT", "PERL5LIB",
+    "LUA_PATH", "LUA_CPATH", "GIT_EXEC_PATH",
+  ]);
   return credentialConfigVariables.has(upperName)
+    || executableLoaderVariables.has(upperName)
     || upperName.startsWith("GIT_CONFIG_")
+    || upperName.startsWith("NPM_CONFIG_")
     || [
     "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "PRIVATEKEY",
     "ACCESSKEY", "CREDENTIAL", "AUTH", "COOKIE", "JWT",

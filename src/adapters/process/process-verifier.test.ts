@@ -60,9 +60,7 @@ describe("deterministic process verification", () => {
     const script = [
       "if(process.env.AUDIT_SECRET||process.env.GH_TOKEN||process.env.OPENAI_API_KEY) process.exit(42);",
       "if(!process.env.HOME||!process.env.NPM_CONFIG_USERCONFIG?.startsWith(process.env.HOME)) process.exit(43);",
-      "console.log('GH_TOKEN=ghp_hardcodedproof');",
-      "console.log('https://user:password@example.test/simple');",
-      "console.log('github_pat_abcdefgh\\u001b[31mijklmnop');",
+      "console.log('GH_TOKEN=ghp_hardcodedproof https://user:password@example.test/simple github_pat_abcdefgh\\u001b[31mijklmnop github_pat_qrst\\u009b31muvwxyz12');",
       "console.log('credentials sealed')",
     ].join("");
     const [result] = await runner.run([{
@@ -71,7 +69,10 @@ describe("deterministic process verification", () => {
     }]);
     assert.equal(result?.status, "passed");
     assert.match(result?.summary ?? "", /credentials sealed/);
-    assert.doesNotMatch(result?.summary ?? "", /ghp_hardcodedproof|user:password|github_pat_abcdefghijklmnop/);
+    assert.doesNotMatch(
+      result?.summary ?? "",
+      /ghp_hardcodedproof|user:password|github_pat_abcdefghijklmnop|github_pat_qrstuvwxyz12/,
+    );
   });
 
   it("resolves Git Bash rather than the Windows or WSL launcher in headed verification", async () => {

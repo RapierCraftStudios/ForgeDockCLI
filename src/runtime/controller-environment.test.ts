@@ -48,6 +48,9 @@ describe("controller environment boundary", () => {
       DOCKER_AUTH_CONFIG: '{"auths":{"registry.example":{"auth":"proof"}}}',
       DOCKER_CONFIG: "C:/controller/docker",
       GIT_ASKPASS: "C:/controller/askpass.exe",
+      NPM_CONFIG_GLOBALCONFIG: "C:/controller/npmrc",
+      NODE_OPTIONS: "--require=C:/controller/loader.js",
+      BASH_ENV: "C:/controller/bash-env.sh",
       OPENAI_API_KEY: "provider-key",
       FORGEDOCK_NESTED_AGENT_TOKEN: "nested-token",
       SAFE_FLAG: "visible",
@@ -60,6 +63,9 @@ describe("controller environment boundary", () => {
     assert.notEqual(environment.DOCKER_CONFIG, "C:/controller/docker");
     assert.ok(environment.DOCKER_CONFIG?.startsWith(environment.HOME ?? ""));
     assert.equal(environment.GIT_ASKPASS, undefined);
+    assert.equal(environment.NPM_CONFIG_GLOBALCONFIG, undefined);
+    assert.equal(environment.NODE_OPTIONS, undefined);
+    assert.equal(environment.BASH_ENV, undefined);
     assert.equal(environment.OPENAI_API_KEY, undefined);
     assert.equal(environment.FORGEDOCK_NESTED_AGENT_TOKEN, undefined);
     assert.equal(environment.SAFE_FLAG, "visible");
