@@ -176,10 +176,12 @@ export class RemediationSupervisor {
   private async acquireAdmission(leaseKey: string): Promise<{ token?: string; release: () => Promise<void> }> {
     if (!this.dependencies.lease) return { release: await acquireProcessAdmission(leaseKey) };
     const owner = admissionOwner();
-    const started = Date.now();
     let lease;
+    // The lease TTL is an ownership/recovery interval, not a waiter deadline.
+    // A healthy owner renews it while materializing children, so a concurrent
+    // begin must remain queued until that owner releases and the checkpoint can
+    // be re-read below. If the owner dies, lease expiry still permits recovery.
     while (!(lease = this.dependencies.lease.acquire(leaseKey, owner, REMEDIATION_LEASE_TTL_MS))) {
-      if (Date.now() - started > REMEDIATION_LEASE_TTL_MS) throw new Error(`Timed out waiting for remediation lease ${leaseKey}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const token = lease.token;
