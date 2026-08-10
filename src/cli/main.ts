@@ -517,6 +517,7 @@ async function workOn(argv: string[]): Promise<void> {
                       packetArtifact: packet,
                       verdictArtifact: priorVerdict!,
                       reason: checkpoint.payload.reason,
+                      resumeCheckpoint: checkpoint,
                       remediationDepth: checkpoint.payload.remediationDepth,
                       maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
                       maxRemediationChildren: checkpoint.payload.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,

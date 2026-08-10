@@ -20,9 +20,11 @@ export const DEFAULT_REMEDIATION_LIMITS = {
 
 const REMEDIATION_LEASE_TTL_MS = 60_000;
 const REMEDIATION_LEASE_HEARTBEAT_MS = 20_000;
+const REMEDIATION_READ_RETRIES = 8;
+const REMEDIATION_READ_RETRY_DELAY_MS = 50;
 interface RemediationLease {
   token: string;
-  heartbeat: { stop(): void; error(): unknown };
+  heartbeat: { stop(): void; error(): unknown; assertHealthy(): void; signal: AbortSignal };
 }
 const remediationAdmissionLocks = new Map<string, Promise<void>>();
 
@@ -47,6 +49,8 @@ export interface RemediationBlockedInput {
   maxRemediationDepth?: number;
   maxRemediationChildren?: number;
   approvedPaths?: readonly string[];
+  /** Durable recovery must reuse this exact awaiting admission, never the live PR head. */
+  resumeCheckpoint?: DurableArtifact<"RemediationBlocked">;
 }
 
 export interface RemediationCheckpointResult {
@@ -80,7 +84,21 @@ export class RemediationSupervisor {
   async begin(input: RemediationBlockedInput): Promise<RemediationCheckpointResult> {
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
     const eligible = actionableFindings(input.findings).slice(0, maxChildren);
-    const checkpointKey = remediationCheckpointKey(
+    const resume = input.resumeCheckpoint;
+    if (resume) {
+      if (resume.kind !== "RemediationBlocked" || resume.runId !== input.parentRun.runId
+        || resume.payload.parentRunId !== input.parentRun.runId
+        || resume.payload.pullRequest !== input.parentPullRequest.number) {
+        throw new Error("Remediation recovery checkpoint does not belong to this run or pull request");
+      }
+      if (resume.payload.status !== "awaiting-dispatch") {
+        return { checkpoint: resume, childIssues: [...resume.payload.childIssues] };
+      }
+      if (resume.payload.headSha.toLowerCase() !== input.parentPullRequest.headSha.toLowerCase()) {
+        throw new Error(`Remediation awaiting checkpoint is anchored to head ${resume.payload.headSha}, but the live PR is ${input.parentPullRequest.headSha}`);
+      }
+    }
+    const checkpointKey = resume?.payload.checkpointKey ?? remediationCheckpointKey(
       input.parentRun.runId,
       input.parentPullRequest.number,
       input.parentPullRequest.headSha,
@@ -90,9 +108,9 @@ export class RemediationSupervisor {
       const leaseKey = remediationLeaseKey(input, checkpointKey);
       const lease = await this.acquireLease(leaseKey);
       try {
-        const result = await this.beginLocked(input, checkpointKey);
-        const heartbeatError = lease?.heartbeat.error();
-        if (heartbeatError) throw heartbeatError;
+        lease?.heartbeat.assertHealthy();
+        const result = await this.beginLocked(input, checkpointKey, lease);
+        lease?.heartbeat.assertHealthy();
         return result;
       } finally {
         lease?.heartbeat.stop();
@@ -101,7 +119,8 @@ export class RemediationSupervisor {
     });
   }
 
-  private async beginLocked(input: RemediationBlockedInput, checkpointKey: string): Promise<RemediationCheckpointResult> {
+  private async beginLocked(input: RemediationBlockedInput, checkpointKey: string, lease?: RemediationLease): Promise<RemediationCheckpointResult> {
+    lease?.heartbeat.assertHealthy();
     const depth = input.remediationDepth ?? 0;
     const maxDepth = input.maxRemediationDepth ?? this.limits.maxDepth ?? DEFAULT_REMEDIATION_LIMITS.maxDepth;
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
@@ -134,14 +153,21 @@ export class RemediationSupervisor {
     );
     if (!existing && (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren)) {
       const terminal = createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
+      lease?.heartbeat.assertHealthy();
       await this.dependencies.artifacts.append(terminal);
+      lease?.heartbeat.assertHealthy();
       return { checkpoint: await persistedCheckpoint(this.dependencies.artifacts, terminal), childIssues: [] };
     }
 
     const awaiting = existing ?? createCheckpoint(input, base);
-    if (!existing) await this.dependencies.artifacts.append(awaiting);
+    if (!existing) {
+      lease?.heartbeat.assertHealthy();
+      await this.dependencies.artifacts.append(awaiting);
+      lease?.heartbeat.assertHealthy();
+    }
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
-    const children = await this.dependencies.host.materializeRemediationChildren({
+    lease?.heartbeat.assertHealthy();
+    const materializationInput = {
       repo: input.parentRun.subject.repo,
       parentRunId: base.parentRunId,
       parentIssue: base.parentIssue,
@@ -159,7 +185,10 @@ export class RemediationSupervisor {
         remediation: finding.remediation,
         acceptanceCriterion: finding.acceptanceCriterion,
       }] : []),
-    });
+      ...(lease ? { signal: lease.heartbeat.signal } : {}),
+    };
+    const children = await this.dependencies.host.materializeRemediationChildren(materializationInput);
+    lease?.heartbeat.assertHealthy();
     const childIssues = normalizeChildIssues(children.map((child) => child.number));
     const running = createCheckpointFromExisting(awaiting, {
       ...base,
@@ -167,8 +196,11 @@ export class RemediationSupervisor {
       status: "children-running",
       childIssues,
     });
+    lease?.heartbeat.assertHealthy();
     await this.dependencies.artifacts.append(running);
+    lease?.heartbeat.assertHealthy();
     const persisted = await persistedCheckpoint(this.dependencies.artifacts, running);
+    lease?.heartbeat.assertHealthy();
     return { checkpoint: persisted, childIssues: [...persisted.payload.childIssues] };
   }
 
@@ -181,15 +213,26 @@ export class RemediationSupervisor {
       lease = repository.acquire(itemId, this.leaseOwner, REMEDIATION_LEASE_TTL_MS);
     }
     let heartbeatError: unknown;
+    const controller = new AbortController();
+    const recordHeartbeatFailure = (error: unknown): void => {
+      heartbeatError ??= error;
+      controller.abort(error);
+    };
     const timer = setInterval(() => {
       try { repository.heartbeat(itemId, lease!.token, REMEDIATION_LEASE_TTL_MS); }
-      catch (error) { heartbeatError = error; }
+      catch (error) { recordHeartbeatFailure(error); }
     }, REMEDIATION_LEASE_HEARTBEAT_MS);
     return {
       ...lease,
       heartbeat: {
         stop: () => clearInterval(timer),
         error: () => heartbeatError,
+        signal: controller.signal,
+        assertHealthy: () => {
+          if (heartbeatError) throw heartbeatError;
+          try { repository.heartbeat(itemId, lease!.token, REMEDIATION_LEASE_TTL_MS); }
+          catch (error) { recordHeartbeatFailure(error); throw error; }
+        },
       },
     };
   }
@@ -403,7 +446,7 @@ function remediationPayload(
     packetArtifactId: input.packetArtifact.id,
     verdictArtifactId: input.verdictArtifact.id,
     reason: input.reason,
-    findings: input.findings.slice(0, 32).map((finding) => ({
+    findings: input.findings.map((finding) => ({
       id: finding.id, severity: finding.severity, title: finding.title, evidence: finding.evidence.slice(0, 8_000),
       ...(finding.location ? { location: finding.location } : {}), remediation: finding.remediation.slice(0, 4_000),
       ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
@@ -491,7 +534,21 @@ async function persistedCheckpoint(
   artifacts: ArtifactRepository,
   checkpoint: DurableArtifact<"RemediationBlocked">,
 ): Promise<DurableArtifact<"RemediationBlocked">> {
-  return await latestCheckpoint(artifacts, checkpoint.subject, checkpoint.payload.checkpointKey) ?? checkpoint;
+  for (let attempt = 0; attempt < REMEDIATION_READ_RETRIES; attempt += 1) {
+    const observed = await latestCheckpoint(artifacts, checkpoint.subject, checkpoint.payload.checkpointKey);
+    if (observed?.id === checkpoint.id
+      && observed.payload.checkpointSequence === checkpoint.payload.checkpointSequence
+      && observed.payload.status === checkpoint.payload.status
+      && JSON.stringify(observed.payload.childIssues) === JSON.stringify(checkpoint.payload.childIssues)) {
+      return observed;
+    }
+    if (attempt + 1 < REMEDIATION_READ_RETRIES) {
+      await new Promise((resolve) => setTimeout(resolve, REMEDIATION_READ_RETRY_DELAY_MS * (attempt + 1)));
+    }
+  }
+  // The append has succeeded and the expected transition is immutable. Never
+  // project the preceding awaiting checkpoint after an authority read lag.
+  return checkpoint;
 }
 
 async function nextCheckpointSequence(artifacts: ArtifactRepository, subject: { repo: string; issue?: number }, key: string): Promise<number> {

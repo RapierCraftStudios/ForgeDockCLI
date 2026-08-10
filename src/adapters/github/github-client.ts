@@ -80,10 +80,32 @@ export interface BatchIssueInput {
   milestone?: string;
 }
 
+interface RemediationChildInput {
+  repo: string;
+  parentRunId: string;
+  parentIssue: number;
+  parentPullRequest: number;
+  headSha: string;
+  headBranch: string;
+  baseBranch: string;
+  checkpointKey: string;
+  remediationDepth: number;
+  findings: readonly {
+    id: string;
+    title: string;
+    evidence: string;
+    location: string;
+    remediation: string;
+    acceptanceCriterion: string;
+  }[];
+  signal?: AbortSignal;
+}
+
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
   private readonly remediationMarkerLocks = new Map<string, Promise<void>>();
+  private readonly remediationMarkerSnapshots = new Map<string, IssueSnapshot>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -425,33 +447,22 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  async materializeRemediationChildren(input: {
-    repo: string;
-    parentRunId: string;
-    parentIssue: number;
-    parentPullRequest: number;
-    headSha: string;
-    headBranch: string;
-    baseBranch: string;
-    checkpointKey: string;
-    remediationDepth: number;
-    findings: readonly {
-      id: string;
-      title: string;
-      evidence: string;
-      location: string;
-      remediation: string;
-      acceptanceCriterion: string;
-    }[];
-  }): Promise<IssueSnapshot[]> {
+  async materializeRemediationChildren(input: RemediationChildInput): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
     const created: IssueSnapshot[] = [];
     for (const finding of input.findings) {
       const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
-      const issue = await this.withRemediationMarkerLock(`${input.repo.toLowerCase()}:${marker}`, async () => {
-        const existing = (await this.listAllIssues(input.repo)).find((candidate) => candidate.body.includes(marker));
-        if (existing) return existing;
+      const lockKey = `${input.repo.toLowerCase()}:${marker}`;
+      const issue = await this.withRemediationMarkerLock(lockKey, async () => {
+        const retained = this.remediationMarkerSnapshots.get(lockKey);
+        if (retained) return retained;
+        const existing = await this.findRemediationChild(input, marker, finding.id);
+        if (existing) {
+          this.remediationMarkerSnapshots.set(lockKey, existing);
+          return existing;
+        }
         const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
+        throwIfAborted(input.signal);
         const body = [
           "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
           `**Parent issue:** #${input.parentIssue}`,
@@ -469,20 +480,15 @@ export class GitHubClient implements ForgeHost {
           "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
           "", marker,
         ].join("\n");
+        throwIfAborted(input.signal);
         const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
         const number = Number(url.split("/").at(-1));
         if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
         // The create response is not a complete authoritative snapshot. Re-read
         // the issue so every same-marker caller returns the same projection.
-        const snapshot = await this.getIssue(number, input.repo);
-        return {
-          repo: snapshot.repo,
-          number: snapshot.number,
-          title: snapshot.title,
-          body: snapshot.body,
-          url: snapshot.url,
-          state: snapshot.state === "CLOSED" ? ("CLOSED" as const) : ("OPEN" as const),
-        };
+        const projected = await this.readRemediationIssue(number, input, marker, finding.id);
+        this.remediationMarkerSnapshots.set(lockKey, projected);
+        return projected;
       });
       created.push(issue);
     }
@@ -614,6 +620,32 @@ export class GitHubClient implements ForgeHost {
     const current = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
     const remove = current.filter((label) => WORKFLOW_LABEL_NAMES.includes(label as (typeof WORKFLOW_LABEL_NAMES)[number]));
     if (remove.length) await this.gh(["issue", "edit", String(issue), "--repo", repo, "--remove-label", remove.join(",")]);
+  }
+
+  private async findRemediationChild(input: RemediationChildInput, marker: string, findingId: string): Promise<IssueSnapshot | undefined> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      throwIfAborted(input.signal);
+      const candidate = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker));
+      if (candidate) return this.readRemediationIssue(candidate.number, input, marker, findingId);
+      if (attempt < 7) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+    return undefined;
+  }
+
+  private async readRemediationIssue(number: number, input: RemediationChildInput, marker: string, findingId: string): Promise<IssueSnapshot> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      throwIfAborted(input.signal);
+      try {
+        const snapshot = remediationChildSnapshot(await this.getIssue(number, input.repo));
+        assertRemediationChildContract(snapshot, input, marker, findingId);
+        return snapshot;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 7) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(`Unable to read remediation issue #${number}`);
   }
 
   private async withRemediationMarkerLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -754,6 +786,10 @@ function reviewFindingPath(location: string | undefined): string | undefined {
   return /(?:^|\s)(\.?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@+-]+)+)/.exec(normalized)?.[1]?.replace(/^\.\//, "");
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Remediation lease was lost");
+}
+
 function boundedGitHubText(value: string, maximum: number): string {
   const normalized = value.replaceAll("\u0000", "").replace(/<!--[\s\S]*?-->/g, "[comment omitted]").trim();
   return normalized.length <= maximum ? normalized : `${normalized.slice(0, maximum - 1)}…`;
@@ -768,9 +804,38 @@ function decompositionMarker(repo: string, parentIssue: number, title: string): 
 }
 
 function remediationChildMarker(repo: string, parentRunId: string, parentIssue: number, parentPullRequest: number, headSha: string, findingId: string): string {
-  return createHash("sha256").update([
+  const digest = createHash("sha256").update([
     repo.toLowerCase(), parentRunId, String(parentIssue), String(parentPullRequest), headSha.toLowerCase(), findingId,
   ].join("\n")).digest("hex");
+  return `<!-- FORGEDOCK:REMEDIATION_CHILD ${digest} -->`;
+}
+
+function remediationChildSnapshot(snapshot: IssueSnapshot): IssueSnapshot {
+  return {
+    repo: snapshot.repo,
+    number: snapshot.number,
+    title: snapshot.title,
+    body: snapshot.body,
+    url: snapshot.url,
+    state: snapshot.state === "CLOSED" ? "CLOSED" : "OPEN",
+  };
+}
+
+function assertRemediationChildContract(snapshot: IssueSnapshot, input: RemediationChildInput, marker: string, findingId: string): void {
+  const required = [
+    marker,
+    `**Parent issue:** #${input.parentIssue}`,
+    `**Parent PR:** #${input.parentPullRequest}`,
+    `**Parent head SHA:** \`${boundedGitHubCode(input.headSha)}\``,
+    `**Parent run:** \`${boundedGitHubCode(input.parentRunId)}\``,
+    `**Checkpoint:** \`${boundedGitHubCode(input.checkpointKey)}\``,
+  ];
+  if (snapshot.state !== "OPEN" || required.some((token) => !snapshot.body.includes(token))) {
+    throw new Error(`Issue #${snapshot.number} does not match the remediation child contract for ${marker}`);
+  }
+  if (!snapshot.body.includes(`**Finding ID:** \`${boundedGitHubCode(findingId)}\``)) {
+    throw new Error(`Issue #${snapshot.number} does not match finding ${findingId} in remediation checkpoint ${input.checkpointKey}`);
+  }
 }
 
 function orderDecompositionChildren(children: DecompositionChild[]): DecompositionChild[] {
@@ -795,6 +860,8 @@ function orderDecompositionChildren(children: DecompositionChild[]): Decompositi
 }
 
 export class GitHubArtifactRepository implements ArtifactRepository {
+  private readonly recentArtifacts = new Map<string, DurableArtifact>();
+
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
@@ -807,6 +874,7 @@ export class GitHubArtifactRepository implements ArtifactRepository {
       const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
       if (!exists) await this.client.postIssueComment(target, renderArtifactComment(artifact));
     }
+    this.recentArtifacts.set(artifact.id, artifact);
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
@@ -814,8 +882,14 @@ export class GitHubArtifactRepository implements ArtifactRepository {
     const targets: Subject[] = canonical.pr && canonical.issue
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
       : [canonical];
-    const found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
-    const unique = new Map(found.map((artifact) => [artifact.id, artifact]));
+    let found: DurableArtifact[] = [];
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
+      const visible = found.some((artifact) => (!kind || artifact.kind === kind) && subjectMatches(artifact.subject, subject));
+      if (visible || attempt === 7 || kind !== "RemediationBlocked") break;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+    const unique = new Map([...found, ...this.recentArtifacts.values()].map((artifact) => [artifact.id, artifact]));
     return [...unique.values()]
       .filter((artifact) => !kind || artifact.kind === kind)
       .filter((artifact) => subjectMatches(artifact.subject, subject));
