@@ -1,13 +1,16 @@
 import { Container, Text } from "@earendil-works/pi-tui";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { Type } from "typebox";
+import { renderDiff } from "../../modes/interactive/components/diff.js";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { getLanguageFromPath, highlightCode } from "../../modes/interactive/theme/theme.js";
+import { generateDiffString } from "./edit-diff.js";
 import { withFileMutationQueue } from "./file-mutation-queue.js";
 import { resolveToCwd } from "./path-utils.js";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
+import { formatSize } from "./truncate.js";
 const writeSchema = Type.Object({
     path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
     content: Type.String({ description: "Content to write to the file" }),
@@ -15,6 +18,7 @@ const writeSchema = Type.Object({
 const defaultWriteOperations = {
     writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
     mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => { }),
+    readFile: (path) => fsReadFile(path),
 };
 class WriteCallRenderComponent extends Text {
     cache;
@@ -23,6 +27,8 @@ class WriteCallRenderComponent extends Text {
     }
 }
 const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
+const WRITE_DIFF_MAX_CHARS = 1_000_000;
+const WRITE_DIFF_MAX_LINES = 4_000;
 function highlightSingleLine(line, lang) {
     const highlighted = highlightCode(line, lang);
     return highlighted[0] ?? "";
@@ -95,6 +101,11 @@ function formatWriteCall(args, options, theme, cache, cwd) {
     const fileContent = str(args?.content);
     const pathDisplay = renderToolPath(rawPath, theme, cwd);
     let text = `${theme.fg("toolTitle", theme.bold("write"))} ${pathDisplay}`;
+    if (fileContent !== null && fileContent && !options.expanded) {
+        const lineCount = normalizeDisplayText(fileContent).split("\n").length;
+        const size = formatSize(Buffer.byteLength(fileContent, "utf8"));
+        return `${text}${theme.fg("muted", ` (${lineCount} ${lineCount === 1 ? "line" : "lines"} · ${size})`)}`;
+    }
     if (fileContent === null) {
         text += `\n\n${theme.fg("error", "[invalid content arg - expected string]")}`;
     }
@@ -117,7 +128,7 @@ function formatWriteCall(args, options, theme, cache, cwd) {
 }
 function formatWriteResult(result, theme) {
     if (!result.isError) {
-        return undefined;
+        return result.details?.diff ? `\n${renderDiff(result.details.diff)}` : undefined;
     }
     const output = result.content
         .filter((c) => c.type === "text")
@@ -141,6 +152,16 @@ export function createWriteToolDefinition(cwd, options) {
             const absolutePath = resolveToCwd(path, cwd);
             const dir = dirname(absolutePath);
             return withFileMutationQueue(absolutePath, async () => {
+                let previousContent;
+                if (ops.readFile) {
+                    try {
+                        previousContent = (await ops.readFile(absolutePath)).toString("utf8");
+                    }
+                    catch {
+                        // Diff metadata is best-effort and must never alter write authority.
+                        previousContent = undefined;
+                    }
+                }
                 // Do not reject from an abort event listener here: that would release the
                 // mutation queue while an in-flight filesystem operation may still finish.
                 // Checking signal.aborted after each await observes the same aborts while
@@ -156,9 +177,18 @@ export function createWriteToolDefinition(cwd, options) {
                 // Write the file contents.
                 await ops.writeFile(absolutePath, content);
                 throwIfAborted();
+                const canRenderDiff = previousContent !== undefined
+                    && previousContent !== content
+                    && previousContent.length <= WRITE_DIFF_MAX_CHARS
+                    && content.length <= WRITE_DIFF_MAX_CHARS
+                    && previousContent.split("\n", WRITE_DIFF_MAX_LINES + 1).length <= WRITE_DIFF_MAX_LINES
+                    && content.split("\n", WRITE_DIFF_MAX_LINES + 1).length <= WRITE_DIFF_MAX_LINES;
+                const change = canRenderDiff && previousContent !== undefined
+                    ? generateDiffString(previousContent, content)
+                    : undefined;
                 return {
                     content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
-                    details: undefined,
+                    details: change ? { diff: change.diff, firstChangedLine: change.firstChangedLine } : undefined,
                 };
             });
         },

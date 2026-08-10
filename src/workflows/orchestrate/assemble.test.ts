@@ -42,6 +42,18 @@ describe("shared work-unit assembly", () => {
     assert.deepEqual(none.ungrouped.map((member) => member.issue), [1, 2]);
   });
 
+  it("keeps recoverable needs-human prerequisites as singleton work units", () => {
+    const result = assembleWorkUnits([
+      item(110, { labels: ["enhancement", "needs-human"], affectedFiles: [] }),
+      item(111, { dependencies: ["issue-110"] }),
+      item(112, { labels: ["enhancement", "operator-only"] }),
+    ], DEFAULT_BATCHING_OPTIONS);
+    assert.deepEqual(result.selected.map((member) => member.issue), [110, 111]);
+    assert.ok(result.ungrouped.some((member) => member.issue === 110));
+    assert.ok(result.excluded.some(({ item: member, reason }) => member.issue === 110 && reason === "recovery-state"));
+    assert.ok(result.excluded.some(({ item: member, reason }) => member.issue === 112 && reason === "human-or-batch-state"));
+  });
+
   it("filters before grouping and rejects mutually exclusive milestone selectors", () => {
     const result = assembleWorkUnits([
       item(1, { labels: ["enhancement", "priority:P1"], milestone: "release" }),

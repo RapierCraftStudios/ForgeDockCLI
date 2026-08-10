@@ -48,6 +48,7 @@ declare module "@earendil-works/pi-tui" {
     interface Keybindings extends AppKeybindings {
     }
 }
+export declare function defaultImagePasteKeys(platform?: NodeJS.Platform): KeyId[];
 export declare const KEYBINDINGS: {
     readonly "tui.editor.cursorUp": {
         readonly defaultKeys: "up";
@@ -234,7 +235,7 @@ export declare const KEYBINDINGS: {
         readonly description: "Restore queued messages";
     };
     readonly "app.clipboard.pasteImage": {
-        readonly defaultKeys: "alt+v" | "ctrl+v";
+        readonly defaultKeys: KeyId[];
         readonly description: "Paste image from clipboard (text fallback)";
     };
     readonly "app.session.new": {

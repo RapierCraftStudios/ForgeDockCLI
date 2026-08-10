@@ -56,9 +56,10 @@ export function assembleWorkUnits(
   }
 
   const orderedFiltered = selected.sort(compareItems);
-  // Human/operator state is not a dispatchable work unit. Other non-batchable
-  // risks remain selected as singleton work; `excluded` explains why they
-  // were not eligible for contraction rather than silently dropping delivery.
+  // Explicit operator-only and pre-materialized batch state is not a
+  // dispatchable work unit. Recoverable needs-human/blocked state remains a
+  // selected singleton so typed work-on admission can resume its checkpoint.
+  // Other non-batchable risks likewise remain selected as singleton work.
   const orderedSelected = orderedFiltered.filter((item) => {
     const reason = singletonReason(item, policy.policy);
     if (reason === "human-or-batch-state") {
@@ -209,7 +210,8 @@ function conservativeGroups(items: readonly BatchableWorkItem[], options: Batchi
 
 function singletonReason(item: BatchableWorkItem, policy: BatchingPolicy): string | undefined {
   if (item.memberIssues?.length && item.memberIssues.some((issue) => issue !== item.issue)) return "already-batched";
-  if (item.labels.some((label) => ["needs-human", "blocked", "operator-only", "batch"].includes(label))) return "human-or-batch-state";
+  if (item.labels.some((label) => ["operator-only", "batch"].includes(label))) return "human-or-batch-state";
+  if (item.labels.some((label) => ["needs-human", "blocked"].includes(label))) return "recovery-state";
   const risk = item.riskClass ?? "routine";
   if (risk === "billing") return "billing";
   if (item.affectedFiles.some((file) => /(?:^|\/)migrations?\//i.test(file) || /(?:^|\/)(?:\.env(?:\.[^/]+)?|docker-compose[^/]*|compose[^/]*|index\.[^/]+|main\.[^/]+)$/i.test(file))) {

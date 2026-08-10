@@ -237,8 +237,10 @@ async function queueNativeWorkflow(
   activateOnly(pi, [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs, orchestrationScope);
-  if (ctx.isIdle()) pi.sendUserMessage(prompt);
-  else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  // Slash-command dispatch itself occupies Pi's prompt pipeline, so ctx.isIdle()
+  // can race with the transition into streaming. followUp is safe while idle
+  // and guarantees the native workflow prompt is queued when that race occurs.
+  pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 }
 
 function workflowDescription(workflow: Workflow): string {

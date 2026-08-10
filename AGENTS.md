@@ -42,9 +42,11 @@ Examples:
 - `commands/review-pr.md` -> `forge-review-pr`
 - `commands/work-on/investigate.md` -> `forge-work-on-investigate`
 
-## Runtime Rules
+## Legacy Codex Adapter Rules
 
-- Treat `commands/**/*.md` as the authoritative workflow spec.
+These rules apply only when maintaining or invoking the installed legacy Codex adapter (`install-codex.sh`, `.agents/skills/**`, or `commands/**`). They do not apply to ForgeDock Next's native interactive `/work-on`, `/review-pr`, or `/orchestrate` routes, which must use the typed controllers in `src/` and must not load legacy Markdown command specs.
+
+- Within the legacy adapter, treat `commands/**/*.md` as the authoritative workflow spec.
 - Preserve GitHub labels, structured comments, branch conventions, and changelog discipline across runtimes.
 - Prefer Codex-native tools for shell, file, git, and web work rather than emulating Claude-specific mechanics.
 - Translate `Skill(...)`, `Agent(...)`, and `Task(...)` semantics into Codex-native continuation and sub-agent behavior instead of skipping phases.
@@ -57,12 +59,14 @@ Examples:
 - The Codex layer should wrap the existing command system, not fork it into a separate copy.
 - Repo-local Codex skills may override repo defaults from shared command specs when Forge-specific behavior differs from project-specific upstream assumptions.
 
-## First References
+## Legacy Codex Adapter References
 
-Read these first when operating ForgeDock from Codex:
+Only when maintaining or invoking the legacy Codex adapter, read:
 - `docs/CODEX.md`
 - `README.md`
 - the relevant file in `commands/`
+
+Native ForgeDock Next interactive workflows must not read these adapter references merely because `/work-on`, `/review-pr`, or `/orchestrate` was invoked.
 
 Notable commands for security work:
 - `commands/security-audit.md` — periodic security posture audit (4-phase checklist against repo files, not diffs)

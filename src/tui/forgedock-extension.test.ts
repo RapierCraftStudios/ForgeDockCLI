@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { renderArtifactComment } from "../core/artifacts/codec.js";
+import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import forgedockExtension, { executeController, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
@@ -103,6 +105,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
 
   await state.commands.get("orchestrate")?.("throwaway-milestone --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
+  assert.deepEqual(state.sent[0]?.options, { deliverAs: "followUp" });
   assert.match(state.sent[0]?.content ?? "", /bound this invocation to issueNumbers=\[129\].*milestone='throwaway-milestone'/);
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
@@ -454,6 +457,31 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   await delegator.shutdown();
 });
 
+test("visible DAG refuses to retry terminally decomposed work", async () => {
+  const state = fakePi();
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "decomposed-run" } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = new VisibleDagDelegator(state.pi);
+  const run = await delegator.start({
+    items: [{ id: "issue-7", issue: 7, title: "Seven", summary: "Seven", priority: 1, dependencies: [], claims: [], labels: ["workflow:decomposed"], affectedFiles: [], memberIssues: [7] }],
+    maxParallel: 1,
+    taskFor: () => ({ agent: "forgedock-issue-worker", task: "Deliver issue #7", cwd: process.cwd() }),
+    assertCompleted: async () => ({ status: "skipped", error: "authoritative child scope required" }),
+    onComplete: () => undefined,
+  });
+  originalEmit("subagent:async-complete", { runId: "decomposed-run" });
+  await run.completion;
+  await assert.rejects(() => delegator.resume(run.id), /terminally decomposed work.*invoke \/orchestrate again/);
+  await delegator.shutdown();
+});
+
 test("visible DAG recovery applies an explicitly authorized fresh rerun to the failed issue", async () => {
   const state = fakePi();
   const originalEmit = state.pi.events.emit.bind(state.pi.events);
@@ -622,6 +650,7 @@ test("native command prompts preserve deterministic orchestration bindings", () 
   });
   assert.match(prompt, /\/orchestrate throwaway-milestone/);
   assert.match(prompt, /issueNumbers=\[129\].*milestone='throwaway-milestone'/);
+  assert.match(prompt, /Do not load legacy Markdown command specs or Codex adapter documentation/);
   assert.match(prompt, /Never invoke forgedock-next, dist\/cli\/main\.js, or another lifecycle controller through bash\/shell/);
   assert.match(buildNativeCommandPrompt("work-on", "6 --resume"), /Never invoke the lifecycle CLI through bash\/shell or add a wall-clock timeout/);
   assert.doesNotMatch(prompt, /invocationToken|\.md/);
@@ -632,7 +661,7 @@ test("orchestration scope resolution binds an exact milestone to its open member
   const scope = await resolveOrchestrationInvocationScope("throwaway-milestone --auto", process.cwd(), {
     async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
     async getMilestone(number) { return { number, title: "throwaway-milestone", state: "open" as const }; },
-    async getIssue(number) { return { number, state: "OPEN" as const }; },
+    async getIssue(number) { return { number, state: "OPEN" as const, milestone: { number: 1, title: "throwaway-milestone" } }; },
     async listOpenIssueNumbersForMilestone(title) { calls.push(title); return [129]; },
   });
   assert.deepEqual(scope, {
@@ -650,7 +679,7 @@ test("orchestration scope resolves a GitHub milestone URL before selecting open 
   const scope = await resolveOrchestrationInvocationScope("https://github.com/a/b/milestone/1", process.cwd(), {
     async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
     async getMilestone(number) { calls.push(number); return { number, title: "Milestone One", state: "open" as const }; },
-    async getIssue(number) { return { number, state: "OPEN" as const }; },
+    async getIssue(number) { return { number, state: "OPEN" as const, milestone: { number: 1, title: "Milestone One" } }; },
     async listOpenIssueNumbersForMilestone(title) { calls.push(title); return [7, 8]; },
   });
   assert.deepEqual(scope, {
@@ -661,6 +690,51 @@ test("orchestration scope resolves a GitHub milestone URL before selecting open 
     noMilestone: false,
   });
   assert.deepEqual(calls, [1, "Milestone One"]);
+});
+
+test("milestone scope replaces an authoritative decomposed parent with same-milestone children", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-decomposed",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      status: "decomposed",
+      reason: "Split into independently verifiable work",
+      childIssues: ["#110 — First child (https://github.test/a/b/issues/110)", "#111 — Second child (https://github.test/a/b/issues/111)"],
+    },
+  });
+  const scope = await resolveOrchestrationInvocationScope("Milestone One", process.cwd(), {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number) { return { number, title: "Milestone One", state: "open" as const }; },
+    async getIssue(number) {
+      return number === 7
+        ? { number, state: "OPEN" as const, labels: ["workflow:decomposed"], milestone: { number: 1, title: "Milestone One" }, comments: [{ body: renderArtifactComment(outcome) }] }
+        : { number, state: "OPEN" as const, labels: number === 110 ? ["needs-human"] : [], milestone: { number: 1, title: "Milestone One" }, comments: [] };
+    },
+    async listOpenIssueNumbersForMilestone() { return [7, 8, 110, 111]; },
+  });
+  assert.deepEqual(scope.issueNumbers, [8, 110, 111]);
+});
+
+test("milestone scope fails closed when a decomposition child is outside the bound milestone", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-decomposed",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#110 — Child"] },
+  });
+  await assert.rejects(() => resolveOrchestrationInvocationScope("Milestone One", process.cwd(), {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number) { return { number, title: "Milestone One", state: "open" as const }; },
+    async getIssue(number) {
+      return number === 7
+        ? { number, state: "OPEN" as const, labels: ["workflow:decomposed"], milestone: { number: 1, title: "Milestone One" }, comments: [{ body: renderArtifactComment(outcome) }] }
+        : { number, state: "OPEN" as const, labels: [], comments: [] };
+    },
+    async listOpenIssueNumbersForMilestone() { return [7]; },
+  }), /#110 is not assigned to milestone 'Milestone One'/);
 });
 
 test("orchestration tool rejects source-issue substitution before dispatch", async () => {

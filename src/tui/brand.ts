@@ -56,7 +56,7 @@ export function renderHeader(options: {
   const mode = options.mode ?? colorMode(options.env, options.output);
   const mark = renderMark(options.compact === false ? "hero" : "compact", mode);
   const wordmark = ember("F O R G E D O C K", mode);
-  const subtitle = options.subtitle ?? "provider-neutral delivery · GitHub memory";
+  const subtitle = options.subtitle ?? "provider-neutral software delivery with GitHub as durable institutional memory";
   return `${mark.join("\n")}\n${wordmark}\n${dim(subtitle, mode)}`;
 }
 

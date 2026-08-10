@@ -1,4 +1,4 @@
-import { Box, Container, Markdown } from "@earendil-works/pi-tui";
+import { Box, Container, Image, Markdown, Spacer } from "@earendil-works/pi-tui";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -10,11 +10,17 @@ export class UserMessageComponent extends Container {
     text;
     markdownTheme;
     outputPad;
-    constructor(text, markdownTheme = getMarkdownTheme(), outputPad = 1) {
+    images;
+    showImages;
+    imageWidthCells;
+    constructor(text, markdownTheme = getMarkdownTheme(), outputPad = 1, images = [], showImages = true, imageWidthCells = 60) {
         super();
         this.text = text;
         this.markdownTheme = markdownTheme;
         this.outputPad = outputPad;
+        this.images = [...images];
+        this.showImages = showImages;
+        this.imageWidthCells = imageWidthCells;
         this.rebuild();
     }
     setOutputPad(padding) {
@@ -28,6 +34,12 @@ export class UserMessageComponent extends Container {
             color: (content) => theme.fg("userMessageText", content),
         }, { preserveOrderedListMarkers: true, preserveBackslashEscapes: true }));
         this.addChild(contentBox);
+        if (this.showImages) {
+            for (const image of this.images) {
+                this.addChild(new Spacer(1));
+                this.addChild(new Image(image.data, image.mimeType, { fallbackColor: (content) => theme.fg("userMessageText", content) }, { maxWidthCells: this.imageWidthCells }));
+            }
+        }
     }
     render(width) {
         const lines = super.render(width);

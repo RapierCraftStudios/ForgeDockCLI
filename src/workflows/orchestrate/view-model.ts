@@ -28,7 +28,7 @@ export function buildOrchestrationSnapshot(input: {
     orchestrationId: input.orchestrationId,
     nodes,
     readyNodes: nodes.filter((node) => node.status === "queued" && node.dependencies.every((dependency) => status.get(dependency) === "completed")).map((node) => node.id),
-    blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed").map((node) => node.id),
+    blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed" || node.status === "skipped").map((node) => node.id),
     suspendedNodes: nodes.filter((node) => node.status === "suspended").map((node) => node.id),
     activeLeases: [...(input.activeLeases ?? [])].map((lease) => lease.itemId),
     remediationCheckpoints: [...(input.remediationCheckpoints ?? [])].map((artifact) => ({
@@ -65,6 +65,7 @@ function statusGlyph(status: ScheduledStatus): string {
     case "running": return "◆";
     case "blocked":
     case "failed": return "■";
+    case "skipped": return "↷";
     case "suspended": return "Ⅱ";
     default: return "·";
   }

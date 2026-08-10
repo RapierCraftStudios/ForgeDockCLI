@@ -798,7 +798,10 @@ async function orchestrate(argv: string[]): Promise<void> {
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
           outcomes.set(item.id, admission.state);
-          process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} skipped · existing run ${admission.runId} is ${admission.state}\n`);
+          process.stdout.write(`${statusGlyph(admission.state === "decomposed" ? "blocked" : "passed", mode)} ${item.id} skipped · existing run ${admission.runId} is ${admission.state}\n`);
+          if (admission.state === "decomposed") {
+            return { status: "skipped", error: `${item.id} is decomposed; rerun orchestration to freeze its authoritative child scope` };
+          }
           return;
         }
         if (admission.action === "block") {
@@ -865,6 +868,10 @@ async function orchestrate(argv: string[]): Promise<void> {
             return { status: "suspended", error: `Recursive remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey} is active` };
           }
         }
+        if (result.run.state === "decomposed") {
+          return { status: "skipped", error: `${item.id} decomposed during orchestration; rerun orchestration to freeze its authoritative child scope` };
+        }
+        if (result.run.state === "invalid") return;
         if (result.run.state !== "completed") throw new Error(`${item.id} ended in ${result.run.state}; dependents remain blocked`);
       } finally {
         clearInterval(heartbeat);
@@ -881,10 +888,11 @@ async function orchestrate(argv: string[]): Promise<void> {
         process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
-    const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked");
+    const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked" || status === "skipped");
     const suspended = [...schedule.status.entries()].filter(([, status]) => status === "suspended");
     const completed = [...schedule.status.values()].filter((status) => status === "completed").length;
-    process.stdout.write(`\nOrchestration complete · ${completed - skipped.size} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${suspended.length} suspended\n`);
+    const satisfiedExisting = [...skipped.values()].filter((state) => state === "completed" || state === "invalid").length;
+    process.stdout.write(`\nOrchestration complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${suspended.length} suspended\n`);
     for (const [id, state] of outcomes) process.stdout.write(`  ${id}: ${state}\n`);
     if (failed.length || suspended.length) process.exitCode = 2;
   } finally {

@@ -337,6 +337,7 @@ export class GitHubClient implements ForgeHost {
     const ordered = orderDecompositionChildren(input.children);
     const parent = await this.getIssue(input.parentIssue, input.repo);
     const inheritedLabels = parent.labels.filter((label) => !label.startsWith("workflow:") && label !== "needs-human");
+    const inheritedMilestone = parent.milestone;
     const existing = await this.listAllIssues(input.repo);
     const byMarker = new Map(existing.flatMap((issue) => {
       const match = /<!-- FORGEDOCK:DECOMPOSITION ([a-f0-9]{64}) -->/.exec(issue.body);
@@ -378,11 +379,24 @@ export class GitHubClient implements ForgeHost {
         ].join("\n");
         const args = ["issue", "create", "--repo", input.repo, "--title", child.title, "--body-file", "-"];
         for (const label of inheritedLabels) args.push("--label", label);
+        if (inheritedMilestone) args.push("--milestone", inheritedMilestone.title);
         const url = (await this.gh(args, body)).trim();
         const number = Number(url.split("/").at(-1));
         if (!Number.isSafeInteger(number) || number < 1) throw new Error(`GitHub did not return a child issue number for '${child.title}'`);
-        issue = { repo: input.repo, number, title: child.title, body, url, state: "OPEN" };
+        issue = await this.getIssue(number, input.repo);
         byMarker.set(marker, issue);
+      } else {
+        issue = await this.getIssue(issue.number, input.repo);
+        if (inheritedMilestone && issue.milestone?.number !== inheritedMilestone.number) {
+          await this.gh([
+            "issue", "edit", String(issue.number), "--repo", input.repo,
+            "--milestone", inheritedMilestone.title,
+          ]);
+          issue = await this.getIssue(issue.number, input.repo);
+        }
+      }
+      if (inheritedMilestone && issue.milestone?.number !== inheritedMilestone.number) {
+        throw new Error(`Decomposition child #${issue.number} did not inherit milestone '${inheritedMilestone.title}' from parent #${input.parentIssue}`);
       }
       materialized.set(child.title, issue);
     }

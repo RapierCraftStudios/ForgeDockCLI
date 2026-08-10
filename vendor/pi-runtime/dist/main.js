@@ -18,7 +18,7 @@ import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from
 import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.js";
 import { createAgentSessionRuntime } from "./core/agent-session-runtime.js";
 import { createAgentSessionFromServices, createAgentSessionServices, } from "./core/agent-session-services.js";
-import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
+import { formatNoModelsAvailableMessage, modelFallbackMessageForInteractiveStartup, } from "./core/auth-guidance.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.js";
 import { resolveCliModel, resolveModelScope } from "./core/model-resolver.js";
@@ -705,7 +705,7 @@ export async function main(args, options) {
         const interactiveMode = new InteractiveMode(runtime, {
             migratedProviders,
             forgeDockOnboarding,
-            modelFallbackMessage,
+            modelFallbackMessage: modelFallbackMessageForInteractiveStartup(modelFallbackMessage, forgeDockOnboarding),
             autoTrustOnReloadCwd,
             initialMessage,
             initialImages,

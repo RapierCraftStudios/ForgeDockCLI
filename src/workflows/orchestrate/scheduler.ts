@@ -16,9 +16,9 @@ export interface ScheduledWorkItem {
   summary?: string;
 }
 
-export type ScheduledStatus = "queued" | "running" | "completed" | "failed" | "blocked" | "suspended";
+export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended";
 export type ScheduleWorkerResult = void | {
-  status: "completed" | "blocked" | "suspended" | "failed";
+  status: "completed" | "skipped" | "blocked" | "suspended" | "failed";
   error?: Error | string;
 };
 export interface ScheduleResult {
@@ -27,7 +27,7 @@ export interface ScheduleResult {
   startOrder: string[];
 }
 export interface ScheduleEvent {
-  type: "queued" | "started" | "completed" | "failed" | "blocked" | "suspended" | "resumed";
+  type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "resumed";
   itemId?: string;
   status: ReadonlyMap<string, ScheduledStatus>;
   errors: ReadonlyMap<string, Error>;
@@ -120,7 +120,7 @@ export async function runSchedule(
   while (running.size || items.some((item) => status.get(item.id) === "queued")) {
     for (const item of items) {
       if (status.get(item.id) !== "queued") continue;
-      if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked")) {
+      if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked" || status.get(id) === "skipped")) {
         status.set(item.id, "blocked");
         emit("blocked", item.id);
       }
@@ -145,6 +145,10 @@ export async function runSchedule(
             status.set(item.id, "failed");
             errors.set(item.id, asError(outcome.error ?? "scheduled worker failed"));
             emit("failed", item.id);
+          } else if (outcome.status === "skipped") {
+            status.set(item.id, "skipped");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            emit("skipped", item.id);
           } else if (outcome.status === "blocked") {
             status.set(item.id, "blocked");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));

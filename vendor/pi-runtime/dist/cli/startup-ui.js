@@ -128,11 +128,13 @@ export async function showFirstTimeSetup(settingsManager) {
     const ui = await createStartupTui(settingsManager);
     return new Promise((resolve) => {
         let settled = false;
+        let component;
         const finish = async (result) => {
             if (settled) {
                 return;
             }
             settled = true;
+            component?.dispose();
             if (result) {
                 settingsManager.setTheme(result.theme);
                 settingsManager.setEnableAnalytics(result.shareAnalytics);
@@ -146,12 +148,13 @@ export async function showFirstTimeSetup(settingsManager) {
             ui.start();
             const detectedTheme = await detectTerminalThemeForAuto({ ui, timeoutMs: 100 });
             setTheme(detectedTheme);
-            const component = new FirstTimeSetupComponent({
+            component = new FirstTimeSetupComponent({
                 detectedTheme,
                 onThemePreview: (themeName) => {
                     setTheme(themeName);
                     ui.requestRender();
                 },
+                onRender: () => ui.requestRender(),
                 onSubmit: (result) => void finish(result),
                 onCancel: () => void finish(undefined),
             });

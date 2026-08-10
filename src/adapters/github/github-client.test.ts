@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
@@ -83,6 +84,82 @@ describe("GitHub review finding projection", () => {
       reviewFindingMarker("a/b", 57, finding),
       reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Response variants are missing" }),
     );
+  });
+});
+
+describe("GitHub decomposition materialization", () => {
+  it("inherits and authoritatively verifies the parent milestone on new children", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "issue" && args[1] === "view") {
+        const number = Number(args[2]);
+        return JSON.stringify({
+          number,
+          title: number === 7 ? "Parent" : "Child",
+          body: "",
+          url: `https://github.test/a/b/issues/${number}`,
+          state: "OPEN",
+          labels: number === 7 ? [{ name: "enhancement" }] : [{ name: "enhancement" }],
+          milestone: { number: 1, title: "Milestone One" },
+        });
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") return "https://github.test/a/b/issues/110\n";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const children = await client.materializeDecomposition({
+      repo: "a/b",
+      parentIssue: 7,
+      children: [{ title: "Child", outcome: "Deliver child", dependsOn: [] }],
+    });
+
+    const create = calls.find((args) => args[0] === "issue" && args[1] === "create");
+    assert.ok(create);
+    assert.deepEqual(create.slice(create.indexOf("--milestone")), ["--milestone", "Milestone One"]);
+    assert.equal(children[0]?.milestone?.number, 1);
+  });
+
+  it("repairs a marker-matched child that predates milestone inheritance", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    let repaired = false;
+    const marker = createHash("sha256").update("a/b#7\nchild").digest("hex");
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "issue" && args[1] === "view") {
+        const number = Number(args[2]);
+        return JSON.stringify({
+          number,
+          title: number === 7 ? "Parent" : "Child",
+          body: number === 7 ? "" : `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`,
+          url: `https://github.test/a/b/issues/${number}`,
+          state: "OPEN",
+          labels: [],
+          milestone: number === 7 || repaired ? { number: 1, title: "Milestone One" } : null,
+        });
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) {
+        return JSON.stringify([[{ number: 110, title: "Child", body: `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`, html_url: "https://github.test/a/b/issues/110", state: "open" }]]);
+      }
+      if (args[0] === "issue" && args[1] === "edit") { repaired = true; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const children = await client.materializeDecomposition({
+      repo: "a/b",
+      parentIssue: 7,
+      children: [{ title: "Child", outcome: "Deliver child", dependsOn: [] }],
+    });
+
+    const edit = calls.find((args) => args[0] === "issue" && args[1] === "edit");
+    assert.ok(edit);
+    assert.deepEqual(edit.slice(edit.indexOf("--milestone")), ["--milestone", "Milestone One"]);
+    assert.equal(children[0]?.milestone?.number, 1);
   });
 });
 

@@ -2,6 +2,9 @@ import { TUI_KEYBINDINGS, KeybindingsManager as TuiKeybindingsManager, } from "@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getAgentDir } from "../config.js";
+export function defaultImagePasteKeys(platform = process.platform) {
+    return platform === "win32" ? ["ctrl+v", "alt+v", "ctrl+alt+v"] : ["ctrl+v"];
+}
 export const KEYBINDINGS = {
     ...TUI_KEYBINDINGS,
     "app.interrupt": { defaultKeys: "escape", description: "Cancel or abort" },
@@ -50,7 +53,7 @@ export const KEYBINDINGS = {
         description: "Restore queued messages",
     },
     "app.clipboard.pasteImage": {
-        defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
+        defaultKeys: defaultImagePasteKeys(),
         description: "Paste image from clipboard (text fallback)",
     },
     "app.session.new": { defaultKeys: [], description: "Start a new session" },

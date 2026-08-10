@@ -17,6 +17,13 @@ describe("ForgeDock Chrome & Ember brand", () => {
     assert.doesNotMatch(renderHeader({ mode: "none" }), /\x1b/);
   });
 
+  it("uses a complete default product description", () => {
+    assert.match(
+      renderHeader({ mode: "none" }),
+      /provider-neutral software delivery with GitHub as durable institutional memory/,
+    );
+  });
+
   it("supports truecolor and 256-color terminals", () => {
     assert.match(ember("FORGE", "truecolor"), /38;2/);
     assert.match(ember("FORGE", "256"), /38;5/);

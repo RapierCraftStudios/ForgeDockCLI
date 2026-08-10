@@ -74,6 +74,18 @@ describe("lean orchestration scheduler", () => {
     assert.ok(events.includes("suspended"));
   });
 
+  it("keeps decomposed work terminally skipped and blocks its frozen dependents", async () => {
+    const events: string[] = [];
+    const result = await runSchedule([
+      { id: "parent", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 2, priority: 1, dependencies: ["parent"], claims: [] },
+    ], 1, async () => ({ status: "skipped", error: "authoritative child scope required" }), { onEvent: (event) => events.push(event.type) });
+    assert.equal(result.status.get("parent"), "skipped");
+    assert.equal(result.status.get("dependent"), "blocked");
+    assert.match(result.errors.get("parent")?.message ?? "", /child scope/);
+    assert.ok(events.includes("skipped"));
+  });
+
   it("blocks dependents when a prerequisite fails", async () => {
     const result = await runSchedule([
       { id: "a", issue: 1, priority: 1, dependencies: [], claims: [] },

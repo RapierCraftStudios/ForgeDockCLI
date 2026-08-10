@@ -10,6 +10,8 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { findArtifacts } from "../core/artifacts/codec.js";
+import type { DurableArtifact } from "../core/artifacts/schema.js";
 import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
@@ -69,10 +71,18 @@ export interface OrchestrationInvocationScope {
   noMilestone: boolean;
 }
 
+interface OrchestrationScopeIssue {
+  number: number;
+  state: "OPEN" | "CLOSED";
+  labels?: readonly string[];
+  milestone?: { number: number; title: string };
+  comments?: readonly { body: string }[];
+}
+
 interface OrchestrationScopeResolverHost {
   getRepository(): Promise<{ repo: string; defaultBranch: string }>;
   getMilestone(number: number, repo?: string): Promise<{ number: number; title: string; state: "open" | "closed" }>;
-  getIssue(number: number, repo?: string): Promise<{ number: number; state: "OPEN" | "CLOSED"; milestone?: { number: number; title: string } }>;
+  getIssue(number: number, repo?: string): Promise<OrchestrationScopeIssue>;
   listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]>;
 }
 
@@ -126,9 +136,84 @@ export async function resolveOrchestrationInvocationScope(
     const milestone = await host.getMilestone(milestoneNumber, repository.repo);
     milestoneTitle = milestone.title;
   }
-  const issueNumbers = await host.listOpenIssueNumbersForMilestone(milestoneTitle, repository.repo);
-  if (!issueNumbers.length) throw new Error(`No open issues are assigned to exact milestone '${milestoneTitle}'`);
+  const milestoneMembers = await host.listOpenIssueNumbersForMilestone(milestoneTitle, repository.repo);
+  if (!milestoneMembers.length) throw new Error(`No open issues are assigned to exact milestone '${milestoneTitle}'`);
+  const issueNumbers = await resolveEligibleMilestoneIssues(milestoneMembers, milestoneTitle, repository.repo, host);
   return { rawArgs, issueNumbers, repository: repository.repo, milestone: milestoneTitle, noMilestone: false };
+}
+
+async function resolveEligibleMilestoneIssues(
+  issueNumbers: readonly number[],
+  milestoneTitle: string,
+  repo: string,
+  host: Pick<OrchestrationScopeResolverHost, "getIssue">,
+): Promise<number[]> {
+  const queue = [...new Set(issueNumbers)].sort((left, right) => left - right)
+    .map((number) => ({ number, lineage: [] as number[] }));
+  const processed = new Set<number>();
+  const eligible = new Set<number>();
+
+  while (queue.length) {
+    const entry = queue.shift()!;
+    if (processed.has(entry.number)) continue;
+    processed.add(entry.number);
+    const issue = await host.getIssue(entry.number, repo);
+    if (issue.state !== "OPEN") throw new Error(`Milestone '${milestoneTitle}' contains non-open issue #${issue.number}`);
+    if (issue.milestone?.title !== milestoneTitle) {
+      throw new Error(`Decomposition child #${issue.number} is not assigned to milestone '${milestoneTitle}'; repair its milestone before orchestration`);
+    }
+
+    const labels = new Set(issue.labels ?? []);
+    const artifacts = (issue.comments ?? []).flatMap((comment) => findArtifacts(comment.body));
+    const reconciled = reconcileLatestRunArtifacts(artifacts);
+    const decomposed = reconciled.state === "decomposed" || labels.has("workflow:decomposed");
+    if (decomposed) {
+      if (reconciled.state !== "decomposed" || !reconciled.runId) {
+        throw new Error(`Issue #${issue.number} is labeled workflow:decomposed but has no authoritative decomposed Outcome`);
+      }
+      const outcome = latestRunOutcome(artifacts, reconciled.runId);
+      if (outcome?.payload.status !== "decomposed") {
+        throw new Error(`Issue #${issue.number} has no authoritative decomposed Outcome`);
+      }
+      const children = outcome.payload.childIssues.map((reference) => {
+        const match = /^#(\d+)\b/.exec(reference.trim());
+        const child = Number(match?.[1]);
+        if (!Number.isSafeInteger(child) || child < 1) {
+          throw new Error(`Issue #${issue.number} has malformed decomposition child reference '${reference}'`);
+        }
+        if (child === issue.number || entry.lineage.includes(child)) {
+          throw new Error(`Decomposition cycle detected through issue #${child}`);
+        }
+        return child;
+      });
+      if (!children.length) throw new Error(`Issue #${issue.number} is decomposed but records no child issues`);
+      for (const child of children.sort((left, right) => left - right)) {
+        queue.push({ number: child, lineage: [...entry.lineage, issue.number] });
+      }
+      continue;
+    }
+
+    if (reconciled.state === "completed" || reconciled.state === "invalid"
+      || labels.has("workflow:merged") || labels.has("workflow:invalid")) continue;
+    // Recoverable blocked/failed issues remain eligible. Their exact durable
+    // checkpoint is handled by work-on admission after the scope is frozen.
+    eligible.add(issue.number);
+  }
+
+  const resolved = [...eligible].sort((left, right) => left - right);
+  if (!resolved.length) throw new Error(`Milestone '${milestoneTitle}' has no eligible issues after terminal-state resolution`);
+  return resolved;
+}
+
+function latestRunOutcome(
+  artifacts: readonly DurableArtifact[],
+  runId: string,
+): DurableArtifact<"Outcome"> | undefined {
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
+    if (artifact?.runId === runId && artifact.kind === "Outcome") return artifact;
+  }
+  return undefined;
 }
 
 export function workflowCommandDisplay(command: WorkflowCommand): string {
@@ -504,14 +589,17 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
         assertCompleted: async (item) => {
           repository ??= await github.getRepository();
           const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: repository.repo, issue: item.issue }));
-          if (reconciled.state === "completed") return;
+          if (reconciled.state === "completed" || reconciled.state === "invalid") return;
+          if (reconciled.state === "decomposed") {
+            return { status: "skipped", error: `#${item.issue} decomposed into authoritative child work; invoke /orchestrate again to freeze the replacement scope` };
+          }
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
           throw new Error(`#${item.issue} ended in ${reconciled.state}; its DAG dependents remain blocked`);
         },
         onComplete: (result, orchestrationId) => {
-          const failures = [...result.status.values()].filter((status) => status === "failed" || status === "blocked" || status === "suspended").length;
+          const failures = [...result.status.values()].filter((status) => status === "failed" || status === "blocked" || status === "suspended" || status === "skipped").length;
           ctx.ui.setStatus("forgedock", failures
             ? `■ Orchestration ${orchestrationId} · ${failures} need attention`
             : `✓ Orchestration ${orchestrationId} complete`);
@@ -768,6 +856,7 @@ export function buildNativeCommandPrompt(
       orchestrationScope
         ? `The controller has already resolved and bound this invocation to issueNumbers=[${orchestrationScope.issueNumbers.join(",")}] and ${orchestrationScope.milestone ? `milestone='${orchestrationScope.milestone}'` : "noMilestone=true"}. This binding is authoritative. Do not substitute provenance, parent, dependency, or source issue numbers.`
         : "No deterministic orchestration binding is present. Do not call the orchestration tool; ask the user to invoke /orchestrate again with exact issue numbers or one exact milestone title.",
+      "Use read-only GitHub evidence for DAG discovery. Do not load legacy Markdown command specs or Codex adapter documentation.",
       "Infer an evidence-backed execution DAG from issue bodies, labels, explicit dependency links, and likely file/component overlap. Do not invent dependencies: use an empty dependsOn list when none is supported. For every item include exact observed labels, scoped affectedFiles, concise path/component claims, priority, and any exact Source PR, FORGE:CLASS, or risk class evidence.",
       "Batching is a bounded efficiency policy: aggressive may contract compatible ordinary issues, conservative retains compatible P2/P3 review findings, and none keeps every selected issue separate. DAG ready sets and topological levels are never called batches.",
       "Pass priority=[P0..P3], milestone, or noMilestone only when the user requested those filters; pass scopeExpansion and remediation bounds as explicit policy options. Invocation policy overrides forge.yaml and workers cannot override the resolved values.",
@@ -1145,6 +1234,10 @@ export class VisibleDagDelegator {
       : "No failed or blocked orchestration DAG is available to resume in this supervisor session");
     if (stored.running) throw new Error(`Orchestration DAG ${stored.id} is still running`);
     if (!stored.result) throw new Error(`Orchestration DAG ${stored.id} has no completed scheduling attempt to resume`);
+    const skipped = [...stored.result.status].filter(([, status]) => status === "skipped").map(([id]) => id);
+    if (skipped.length) {
+      throw new Error(`Orchestration DAG ${stored.id} contains terminally decomposed work (${skipped.join(", ")}); invoke /orchestrate again to freeze its authoritative child scope`);
+    }
     const completed = new Set([...stored.result.status].filter(([, status]) => status === "completed").map(([id]) => id));
     const remainingIds = new Set(stored.input.items.filter((item) => !completed.has(item.id)).map((item) => item.id));
     if (!remainingIds.size) throw new Error(`Orchestration DAG ${stored.id} is already complete`);
@@ -1238,7 +1331,7 @@ function mergeScheduleResults(
   const errors = new Map(previous.errors);
   for (const [id, value] of attempt.status) {
     status.set(id, value);
-    if (value === "completed") errors.delete(id);
+    if (value === "completed" || value === "skipped") errors.delete(id);
   }
   for (const [id, error] of attempt.errors) errors.set(id, error);
   return { status, errors, startOrder: [...previous.startOrder, ...attempt.startOrder] };
