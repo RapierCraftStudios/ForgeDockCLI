@@ -16,7 +16,8 @@ name: CI
 # desired, correct signal — it is not masked or auto-passed.
 
 on:
-  pull_request:
+  pull_request: {}
+  workflow_dispatch: {}
   push:
     branches:
       - staging
