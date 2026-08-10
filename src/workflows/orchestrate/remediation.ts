@@ -191,9 +191,17 @@ export class RemediationSupervisor {
 
     const awaiting = existing ?? createCheckpoint(input, base);
     if (!existing) {
-      lease?.heartbeat.assertHealthy();
-      await appendRemediationCheckpoint(this.dependencies.artifacts, awaiting, lease);
-      lease?.heartbeat.assertHealthy();
+      try {
+        lease?.heartbeat.assertHealthy();
+        await appendRemediationCheckpoint(this.dependencies.artifacts, awaiting, lease);
+        lease?.heartbeat.assertHealthy();
+      } catch (error) {
+        // The awaiting artifact is the recovery boundary.  Keep the durable
+        // lease from being released when publication may have crossed the
+        // remote side-effect boundary but its outcome is not observable.
+        if (lease) throw new RemediationHandoffPendingError(awaiting.id);
+        throw error;
+      }
     }
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
     lease?.heartbeat.assertHealthy();
@@ -217,8 +225,18 @@ export class RemediationSupervisor {
       }] : []),
       ...(lease ? { signal: lease.heartbeat.signal } : {}),
     };
-    const children = await this.dependencies.host.materializeRemediationChildren(materializationInput);
-    lease?.heartbeat.assertHealthy();
+    let children: Awaited<ReturnType<NonNullable<ForgeHost["materializeRemediationChildren"]>>>;
+    try {
+      children = await this.dependencies.host.materializeRemediationChildren(materializationInput);
+      lease?.heartbeat.assertHealthy();
+    } catch (error) {
+      // A GitHub request can have been accepted even when cancellation or a
+      // heartbeat failure makes its result unavailable.  The awaiting
+      // checkpoint is the recovery record; never release the admission as if
+      // this were an ordinary, fully-known failure.
+      if (lease) throw new RemediationHandoffPendingError(awaiting.id);
+      throw error;
+    }
     const childIssues = normalizeChildIssues(children.map((child) => child.number));
     const running = createCheckpointFromExisting(awaiting, {
       ...base,
@@ -226,12 +244,21 @@ export class RemediationSupervisor {
       status: "children-running",
       childIssues,
     });
-    lease?.heartbeat.assertHealthy();
-    await appendRemediationCheckpoint(this.dependencies.artifacts, running, lease);
-    lease?.heartbeat.assertHealthy();
-    const persisted = await persistedCheckpoint(this.dependencies.artifacts, running);
-    lease?.heartbeat.assertHealthy();
-    return { checkpoint: persisted, childIssues: [...persisted.payload.childIssues] };
+    try {
+      lease?.heartbeat.assertHealthy();
+      await appendRemediationCheckpoint(this.dependencies.artifacts, running, lease);
+      const persisted = await persistedCheckpoint(this.dependencies.artifacts, running);
+      lease?.heartbeat.assertHealthy();
+      return { checkpoint: persisted, childIssues: [...persisted.payload.childIssues] };
+    } catch (error) {
+      // Publication is another irreversible side effect.  A post-write lease
+      // check cannot roll it back, so leave the exact awaiting admission for
+      // marker/checkpoint reconciliation instead of releasing the lease.
+      if (lease && !(error instanceof RemediationHandoffPendingError)) {
+        throw new RemediationHandoffPendingError(awaiting.id);
+      }
+      throw error;
+    }
   }
 
   private async acquireLease(itemId: string): Promise<RemediationLease | undefined> {
@@ -648,11 +675,26 @@ async function listRemediationArtifacts(
   subject: { repo: string; issue?: number; pr?: number },
   expected?: { id?: string; checkpointSequence?: number; status?: string },
 ): Promise<DurableArtifact<"RemediationBlocked">[]> {
-  const consistent = (artifacts as ConsistencyAwareArtifactRepository).listConsistent;
+  // CachedArtifactRepository deliberately has no consistency method in the
+  // core port.  Its authoritative member is nevertheless the only valid
+  // source for admission/recovery reads; calling list() on the wrapper would
+  // merge the process-local recent-artifacts projection back into the result.
+  const authoritative = unwrapAuthoritativeArtifacts(artifacts);
+  const consistent = (authoritative as ConsistencyAwareArtifactRepository).listConsistent;
   const values = consistent
-    ? await consistent.call(artifacts as ConsistencyAwareArtifactRepository, subject, "RemediationBlocked", expected)
-    : await artifacts.list(subject, "RemediationBlocked");
+    ? await consistent.call(authoritative as ConsistencyAwareArtifactRepository, subject, "RemediationBlocked", expected)
+    : await authoritative.list(subject, "RemediationBlocked");
   return values.filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> => artifact.kind === "RemediationBlocked");
+}
+
+function unwrapAuthoritativeArtifacts(artifacts: ArtifactRepository): ArtifactRepository {
+  let current = artifacts as ArtifactRepository & { authoritative?: ArtifactRepository };
+  const seen = new Set<ArtifactRepository>();
+  while (current.authoritative && current.authoritative !== current && !seen.has(current)) {
+    seen.add(current);
+    current = current.authoritative as ArtifactRepository & { authoritative?: ArtifactRepository };
+  }
+  return current;
 }
 
 async function latestCheckpoint(
@@ -676,10 +718,11 @@ async function persistedCheckpoint(
     checkpointSequence: checkpoint.payload.checkpointSequence,
     status: checkpoint.payload.status,
   };
-  const consistent = (artifacts as ConsistencyAwareArtifactRepository).listConsistent;
+  const authoritative = unwrapAuthoritativeArtifacts(artifacts);
+  const consistent = (authoritative as ConsistencyAwareArtifactRepository).listConsistent;
   if (consistent) {
     try {
-      const observed = await listRemediationArtifacts(artifacts, checkpoint.subject, expected);
+      const observed = await listRemediationArtifacts(authoritative, checkpoint.subject, expected);
       const match = observed.find((candidate) => candidate.id === checkpoint.id
         && candidate.payload.checkpointSequence === checkpoint.payload.checkpointSequence
         && candidate.payload.status === checkpoint.payload.status
@@ -710,7 +753,7 @@ async function persistedCheckpoint(
 
 async function nextCheckpointSequence(artifacts: ArtifactRepository, subject: { repo: string; issue?: number }, key: string): Promise<number> {
   if (!subject.issue) return 1;
-  const existing = await artifacts.list({ repo: subject.repo, issue: subject.issue }, "RemediationBlocked");
-  const values = existing.filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> => artifact.kind === "RemediationBlocked" && artifact.payload.checkpointKey === key);
+  const existing = await listRemediationArtifacts(artifacts, { repo: subject.repo, issue: subject.issue });
+  const values = existing.filter((artifact) => artifact.payload.checkpointKey === key);
   return Math.max(0, ...values.map((artifact) => artifact.payload.checkpointSequence)) + 1;
 }

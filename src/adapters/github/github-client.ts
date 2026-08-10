@@ -104,7 +104,11 @@ interface RemediationChildInput {
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
-  private readonly remediationMarkerLocks = new Map<string, Promise<void>>();
+  // Keep the completed result with the in-flight lock.  A queued caller must
+  // not perform a second marker lookup after the creator has succeeded: issue
+  // listings can lag behind direct issue reads.  Static scope also covers
+  // multiple GitHubClient instances in one controller process.
+  private static readonly remediationMarkerLocks = new Map<string, Promise<IssueSnapshot>>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -484,7 +488,7 @@ export class GitHubClient implements ForgeHost {
         // The create response is not a complete authoritative snapshot. Re-read
         // the issue so every same-marker caller returns an authoritative projection.
         return this.readRemediationIssue(number, input, marker, finding.id);
-      });
+      }, (shared) => this.readRemediationIssueOnce(shared.number, input, marker, finding.id));
       created.push(issue);
     }
     return created;
@@ -664,17 +668,22 @@ export class GitHubClient implements ForgeHost {
     throw lastError instanceof Error ? lastError : new Error(`Unable to read remediation issue #${number}`);
   }
 
-  private async withRemediationMarkerLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.remediationMarkerLocks.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
-    this.remediationMarkerLocks.set(key, current);
-    await previous;
+  private async withRemediationMarkerLock(
+    key: string,
+    operation: () => Promise<IssueSnapshot>,
+    validateShared?: (issue: IssueSnapshot) => Promise<IssueSnapshot>,
+  ): Promise<IssueSnapshot> {
+    const previous = GitHubClient.remediationMarkerLocks.get(key);
+    if (previous) {
+      const issue = await previous;
+      return validateShared ? validateShared(issue) : issue;
+    }
+    const current = operation();
+    GitHubClient.remediationMarkerLocks.set(key, current);
     try {
-      return await operation();
+      return await current;
     } finally {
-      release();
-      if (this.remediationMarkerLocks.get(key) === current) this.remediationMarkerLocks.delete(key);
+      if (GitHubClient.remediationMarkerLocks.get(key) === current) GitHubClient.remediationMarkerLocks.delete(key);
     }
   }
 

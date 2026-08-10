@@ -109,10 +109,10 @@ describe("GitHub review finding projection", () => {
 
 describe("GitHub remediation materialization", () => {
   it("serializes concurrent same-marker creation and returns one snapshot", async () => {
-    const client = new GitHubClient();
+    const clients: [GitHubClient, GitHubClient] = [new GitHubClient(), new GitHubClient()];
     let creations = 0;
     let issueBody = "";
-    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+    const fakeGh = async (args: string[], input?: string) => {
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) {
         return JSON.stringify([[...(issueBody ? [{ number: 101, title: "Child", body: issueBody, html_url: "https://github.test/a/b/issues/101", state: "open" }] : [])]]);
       }
@@ -126,15 +126,16 @@ describe("GitHub remediation materialization", () => {
       }
       if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
-    } });
+    };
+    for (const client of clients) Object.defineProperty(client, "gh", { value: fakeGh });
     const input = {
       repo: "a/b", parentRunId: "run-parent", parentIssue: 7, parentPullRequest: 9, headSha: "a".repeat(40),
       headBranch: "forge/parent", baseBranch: "main", checkpointKey: "b".repeat(64), remediationDepth: 1,
       findings: [{ id: "finding-1", title: "Fix", evidence: "evidence", location: "src/a.ts", remediation: "fix", acceptanceCriterion: "fixed" }],
     };
     const [first, second] = await Promise.all([
-      client.materializeRemediationChildren(input),
-      client.materializeRemediationChildren(input),
+      clients[0].materializeRemediationChildren(input),
+      clients[1].materializeRemediationChildren(input),
     ]);
     assert.equal(creations, 1);
     assert.deepEqual(first, second);

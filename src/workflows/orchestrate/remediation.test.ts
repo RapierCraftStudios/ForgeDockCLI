@@ -4,7 +4,7 @@ import { createArtifact, type DurableArtifact } from "../../core/artifacts/schem
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
+import { CachedArtifactRepository, InMemoryArtifactRepository, InMemoryRunRepository, type ArtifactRepository } from "../../core/ports/repositories.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { reconcileArtifacts } from "../../core/state/reconcile.js";
 import { RemediationSupervisor, verifyParentRevision } from "./remediation.js";
@@ -83,6 +83,49 @@ describe("durable recursive remediation", () => {
     assert.deepEqual(second.childIssues, first.childIssues);
     const latest = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 }, checkpointKey: first.checkpoint.payload.checkpointKey });
     assert.deepEqual(latest?.payload.childIssues, first.childIssues);
+  });
+
+  it("uses the authoritative read barrier when the artifact repository is cached", async () => {
+    const { run, packet, verdict } = context();
+    const stored: DurableArtifact[] = [];
+    let visible = false;
+    let consistentReads = 0;
+    const authoritative = {
+      async append(artifact: DurableArtifact) {
+        if (!stored.some((item) => item.id === artifact.id)) stored.push(structuredClone(artifact));
+        setTimeout(() => { visible = true; }, 5);
+      },
+      async list(_subject: unknown, kind?: string) {
+        return (visible ? stored : []).filter((artifact) => !kind || artifact.kind === kind).map((artifact) => structuredClone(artifact));
+      },
+      async listConsistent(_subject: unknown, _kind: "RemediationBlocked", expected?: { id?: string }) {
+        consistentReads += 1;
+        if (!expected) return (visible ? stored : []).map((artifact) => structuredClone(artifact));
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          const values = (visible ? stored : []).filter((artifact) => !expected?.id || artifact.id === expected.id);
+          if (values.length) return values.map((artifact) => structuredClone(artifact));
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        throw new Error("authoritative projection did not become visible");
+      },
+    } as unknown as ArtifactRepository & { listConsistent: (subject: unknown, kind: "RemediationBlocked", expected?: { id?: string }) => Promise<DurableArtifact[]> };
+    const host = {
+      async materializeRemediationChildren() {
+        return [{ repo: "owner/repo", number: 30, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const first = await new RemediationSupervisor({
+      host, artifacts: new CachedArtifactRepository(authoritative, new InMemoryArtifactRepository()),
+    }).begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{
+      id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug",
+    }] });
+    const second = await new RemediationSupervisor({
+      host, artifacts: new CachedArtifactRepository(authoritative, new InMemoryArtifactRepository()),
+    }).begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{
+      id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug",
+    }] });
+    assert.deepEqual(second.childIssues, first.childIssues);
+    assert.ok(consistentReads > 0);
   });
 
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {
