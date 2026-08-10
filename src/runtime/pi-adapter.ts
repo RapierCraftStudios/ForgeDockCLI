@@ -31,6 +31,7 @@ import type {
   ModelPolicy,
 } from "./agent-runtime.js";
 import { createSandboxedTools } from "./sandboxed-tools.js";
+import { assertRuntimeInstallAsync } from "./runtime-install.js";
 
 export interface PiRuntimeOptions {
   agentDir?: string;
@@ -57,6 +58,7 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async preflight(options: RuntimePreflightOptions = {}): Promise<{ provider: string; model: string }> {
+    await assertRuntimeInstallAsync();
     const configuredReviewer = splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL);
     const worker = {
       provider: options.provider ?? this.#options.provider ?? process.env.PI_PROVIDER,
@@ -87,6 +89,7 @@ export class PiAgentRuntime implements AgentRuntime {
     task: AgentTask<T>,
     options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {},
   ): Promise<AgentRunResult<T>> {
+    await assertRuntimeInstallAsync();
     assertToolPolicy(task);
     const emit = options.onEvent ?? (() => undefined);
     const startedAt = Date.now();

@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitWorkspace, GitWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const execFileAsync = promisify(execFile);
+const dependencyInstallLocks = new Map<string, Promise<void>>();
+const DEPENDENCY_LOCK_STALE_MS = 2 * 60 * 60 * 1_000;
+const DEPENDENCY_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
+
+type DependencyStamp = {
+  schema: "forgedock.dependencies/v1";
+  fingerprint: string;
+  installedAt: string;
+};
+
+type DependencyLease = {
+  lockPath: string;
+  ownerPath: string;
+  token: string;
+  heartbeat: NodeJS.Timeout;
+};
 
 export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager {
   readonly #repo: string;
@@ -52,7 +68,6 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         ? ["worktree", "add", path, branch]
         : ["worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
     }
-    await this.installDependencies(path);
     const configuredBaseSha = await this.configuredBaseSha(branch);
     const baseSha = input.baseSha
       ?? configuredBaseSha
@@ -68,6 +83,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       throw new Error(`Frozen base ${baseSha} is not an ancestor of retained workspace ${branch}`, { cause: error });
     }
     await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+    await this.installDependencies(path);
     return { path, branch, baseRef: input.baseRef, baseSha };
   }
 
@@ -263,6 +279,47 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
 
   private async installDependencies(worktreePath: string): Promise<void> {
     if (!existsSync(join(worktreePath, "package-lock.json"))) return;
+    const path = resolve(worktreePath);
+    this.assertDependencyInstallTarget(path);
+    const key = process.platform === "win32" ? path.toLowerCase() : path;
+    const previous = dependencyInstallLocks.get(key) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.withDependencyInstallLock(path, () => this.installDependenciesExclusive(path)));
+    dependencyInstallLocks.set(key, current);
+    try {
+      await current;
+    } finally {
+      if (dependencyInstallLocks.get(key) === current) dependencyInstallLocks.delete(key);
+    }
+  }
+
+  private assertDependencyInstallTarget(worktreePath: string): void {
+    if (worktreePath === this.#repo) {
+      throw new Error(`Refusing to run npm ci in the controller checkout ${worktreePath}; dependency installation is worktree-only`);
+    }
+    assertInside(this.#root, worktreePath);
+    if (!existsSync(join(worktreePath, ".git"))) {
+      throw new Error(`Refusing to prepare dependencies outside a managed Git worktree: ${worktreePath}`);
+    }
+  }
+
+  private async installDependenciesExclusive(worktreePath: string): Promise<void> {
+    const stampPath = join(worktreePath, ".forgedock", "dependency-install.json");
+    const fingerprint = await this.dependencyFingerprint(worktreePath);
+    if (await this.dependenciesReady(stampPath, fingerprint, worktreePath)) {
+      try {
+        await this.applyPinnedDependencyPatch(worktreePath);
+        return;
+      } catch (error) {
+        await rm(stampPath, { force: true });
+        throw error;
+      }
+    }
+
+    // npm ci is intentionally destructive. Remove our success receipt first so
+    // an interrupted install can never be mistaken for a healthy tree later.
+    await rm(stampPath, { force: true });
     const command = process.platform === "win32" ? process.execPath : "npm";
     const npmCli = process.platform === "win32"
       ? [process.env.npm_execpath, join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")]
@@ -281,6 +338,155 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     } catch (error) {
       const detail = error as Error & { stderr?: string };
       throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+    }
+
+    await this.assertInstalledDependencies(worktreePath);
+    await this.applyPinnedDependencyPatch(worktreePath);
+    await this.assertInstalledDependencies(worktreePath);
+    await mkdir(dirname(stampPath), { recursive: true });
+    const stamp: DependencyStamp = {
+      schema: "forgedock.dependencies/v1",
+      fingerprint,
+      installedAt: new Date().toISOString(),
+    };
+    await writeFile(stampPath, `${JSON.stringify(stamp)}\n`, "utf8");
+  }
+
+  private async withDependencyInstallLock<T>(worktreePath: string, operation: () => Promise<T>): Promise<T> {
+    const lease = await this.acquireDependencyInstallLock(worktreePath);
+    try {
+      return await operation();
+    } finally {
+      await this.releaseDependencyInstallLock(lease);
+    }
+  }
+
+  private async acquireDependencyInstallLock(worktreePath: string): Promise<DependencyLease> {
+    const lockPath = join(worktreePath, ".forgedock", "dependencies-install.lock");
+    const ownerPath = join(lockPath, "owner.json");
+    await mkdir(dirname(lockPath), { recursive: true });
+    const startedAt = Date.now();
+    const token = randomUUID();
+    for (;;) {
+      try {
+        await mkdir(lockPath);
+        try {
+          await writeFile(ownerPath, JSON.stringify({ pid: process.pid, token, startedAt }), "utf8");
+        } catch (error) {
+          await rm(lockPath, { recursive: true, force: true });
+          throw error;
+        }
+        const heartbeat = setInterval(() => {
+          void utimes(lockPath, new Date(), new Date()).catch(() => undefined);
+        }, 30_000);
+        return { lockPath, ownerPath, token, heartbeat };
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") throw error;
+        await this.reclaimStaleDependencyLock(lockPath, ownerPath);
+        if (Date.now() - startedAt > DEPENDENCY_LOCK_TIMEOUT_MS) {
+          throw new Error(`Timed out waiting for dependency installation lock in ${basename(worktreePath)}`);
+        }
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 250));
+      }
+    }
+  }
+
+  private async reclaimStaleDependencyLock(lockPath: string, ownerPath: string): Promise<void> {
+    try {
+      const age = Date.now() - (await stat(lockPath)).mtimeMs;
+      if (age <= DEPENDENCY_LOCK_STALE_MS || await dependencyOwnerAlive(ownerPath)) return;
+      await rm(lockPath, { recursive: true, force: true });
+    } catch {
+      // A competing process may have released or renewed the lock between checks.
+    }
+  }
+
+  private async releaseDependencyInstallLock(lease: DependencyLease): Promise<void> {
+    clearInterval(lease.heartbeat);
+    try {
+      const owner = JSON.parse(await readFile(lease.ownerPath, "utf8")) as { token?: unknown };
+      if (owner.token === lease.token) await rm(lease.lockPath, { recursive: true, force: true });
+    } catch {
+      // The lock may already have been reclaimed after a process failure.
+    }
+  }
+
+  private async dependencyFingerprint(worktreePath: string): Promise<string> {
+    const hash = createHash("sha256");
+    for (const relativePath of ["package.json", "package-lock.json", "npm-shrinkwrap.json", "vendor/pi-runtime/package.json"]) {
+      const path = join(worktreePath, relativePath);
+      if (!existsSync(path)) continue;
+      hash.update(relativePath).update("\0").update(await readFile(path)).update("\0");
+    }
+    return hash.digest("hex");
+  }
+
+  private async dependenciesReady(stampPath: string, fingerprint: string, worktreePath: string): Promise<boolean> {
+    let stamp: DependencyStamp;
+    try {
+      stamp = JSON.parse(await readFile(stampPath, "utf8")) as DependencyStamp;
+    } catch {
+      return false;
+    }
+    if (stamp.schema !== "forgedock.dependencies/v1" || stamp.fingerprint !== fingerprint) return false;
+    try {
+      await this.assertInstalledDependencies(worktreePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async assertInstalledDependencies(worktreePath: string): Promise<void> {
+    let lock: { packages?: Record<string, { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; optionalDependencies?: Record<string, string> }> };
+    try {
+      lock = JSON.parse(await readFile(join(worktreePath, "package-lock.json"), "utf8")) as typeof lock;
+    } catch (error) {
+      throw new Error(`Cannot inspect package-lock.json while preparing ${basename(worktreePath)}`, { cause: error });
+    }
+    const root = lock.packages?.[""] ?? {};
+    const optional = new Set(Object.keys(root.optionalDependencies ?? {}));
+    const direct = new Set([
+      ...Object.keys(root.dependencies ?? {}),
+      ...Object.keys(root.devDependencies ?? {}),
+    ]);
+    const failures: string[] = [];
+    for (const name of direct) {
+      if (optional.has(name)) continue;
+      const packageRoot = join(worktreePath, "node_modules", ...name.split("/"));
+      const manifestPath = join(packageRoot, "package.json");
+      try {
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { main?: unknown };
+        if (typeof manifest.main === "string" && !existsSync(join(packageRoot, manifest.main))) {
+          failures.push(`${name} main entry ${manifest.main} is missing`);
+        }
+      } catch {
+        failures.push(`${name} package manifest is missing or unreadable`);
+      }
+    }
+    if (failures.length) {
+      throw new Error(`Dependency installation is incomplete in ${worktreePath}: ${failures.join("; ")}`);
+    }
+  }
+
+  private async applyPinnedDependencyPatch(worktreePath: string): Promise<void> {
+    // Dependency installation deliberately skips arbitrary lifecycle scripts.
+    // ForgeDock still needs its one pinned, source-controlled pi-subagents
+    // visibility patch before any controller verification command runs.
+    const pinnedPatch = join(worktreePath, "scripts", "patch-pi-subagents-visibility.mjs");
+    if (!existsSync(pinnedPatch)) return;
+    try {
+      await execFileAsync(process.execPath, [pinnedPatch], {
+        cwd: worktreePath,
+        env: verificationEnvironment(process.env),
+        encoding: "utf8",
+        windowsHide: true,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    } catch (error) {
+      const detail = error as Error & { stderr?: string };
+      throw new Error(`Pinned pi-subagents visibility patch failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
     }
   }
 
@@ -326,6 +532,17 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       const detail = error as Error & { stderr?: string };
       throw new Error(`git ${args[0] ?? ""} failed in ${basename(cwd)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
     }
+  }
+}
+
+async function dependencyOwnerAlive(ownerPath: string): Promise<boolean> {
+  try {
+    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown };
+    if (typeof owner.pid !== "number") return false;
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 

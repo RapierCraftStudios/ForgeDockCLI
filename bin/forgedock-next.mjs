@@ -4,8 +4,8 @@
 
 import { existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REQUIRED = [22, 19, 0];
 
@@ -30,7 +30,21 @@ if (!isSupported(process.versions.node)) {
     process.exitCode = 1;
   }
 } else {
+  let runtimeError;
   try {
+    const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+    const dispatcherEntry = join(dirname(packageEntry), "core", "http-dispatcher.js");
+    if (!existsSync(dispatcherEntry)) throw new Error(`ForgeDock runtime installation is incomplete: HTTP dispatcher is missing at ${dispatcherEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`);
+    const undiciEntry = fileURLToPath(import.meta.resolve("undici", pathToFileURL(dispatcherEntry).href));
+    if (!existsSync(undiciEntry)) throw new Error(`ForgeDock runtime installation is incomplete: undici resolves to a missing file ${undiciEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`);
+    await import(pathToFileURL(dispatcherEntry).href);
+  } catch (error) {
+    runtimeError = error;
+  }
+  if (runtimeError) {
+    console.error(runtimeError instanceof Error ? runtimeError.message : String(runtimeError));
+    process.exitCode = 1;
+  } else try {
     await import("../dist/cli/main.js");
   } catch (error) {
     if (error?.code === "ERR_MODULE_NOT_FOUND" && String(error.message).includes("dist/cli/main.js")) {

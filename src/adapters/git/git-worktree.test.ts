@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { GitWorktreeManager } from "./git-worktree.js";
 
@@ -30,9 +31,52 @@ describe("isolated Git worktrees", () => {
     const workspace = await manager.create({ runId: "run_test", issue: 12, baseRef: "HEAD" });
     assert.equal(existsSync(join(workspace.path, "node_modules", "example", "package.json")), true);
     writeFileSync(join(workspace.path, "feature.txt"), "partial implementation\n");
+    // A success stamp must not hide a partial tree left by an interrupted npm
+    // operation. Recovery should reinstall the missing direct package entry.
+    const partialPackage = join(workspace.path, "node_modules", "example");
+    if (lstatSync(partialPackage).isSymbolicLink()) unlinkSync(partialPackage);
+    else rmSync(partialPackage, { recursive: true, force: true });
+    mkdirSync(partialPackage);
+    writeFileSync(join(partialPackage, "package.json"), JSON.stringify({ name: "example", version: "1.0.0", main: "index.js" }));
+    const staleDependencyLock = join(workspace.path, ".forgedock", "dependencies-install.lock");
+    mkdirSync(staleDependencyLock, { recursive: true });
+    const staleAt = new Date(Date.now() - 3 * 60 * 60 * 1_000);
+    utimesSync(staleDependencyLock, staleAt, staleAt);
     const recovered = await manager.recover({ runId: "run_test", issue: 12, baseRef: "HEAD" });
+    assert.equal(existsSync(staleDependencyLock), false, "a dead stale dependency lease must be reclaimed before reinstall");
+    assert.equal(existsSync(join(recovered.path, "node_modules", "example", "index.js")), true);
     assert.deepEqual(recovered, workspace);
     assert.equal(readFileSync(join(recovered.path, "feature.txt"), "utf8"), "partial implementation\n");
+
+    // The in-memory queue cannot serialize independent controller processes.
+    // Force two workers through the same worktree so the on-disk lease is the
+    // only protection against concurrent destructive npm ci operations.
+    const managerEntry = fileURLToPath(new URL("./git-worktree.js", import.meta.url));
+    const dependencyWorker = join(root, "prepare-dependencies.mjs");
+    writeFileSync(dependencyWorker, [
+      `import { GitWorktreeManager } from ${JSON.stringify(pathToFileURL(managerEntry).href)};`,
+      "const [repo, worktreeRoot, path] = process.argv.slice(2);",
+      "await new GitWorktreeManager(repo, worktreeRoot).prepareWorkspaceDependencies({ path, branch: 'forgedock/test', baseRef: 'HEAD', baseSha: 'HEAD' });",
+    ].join("\n"));
+    const dependencyStamp = join(workspace.path, ".forgedock", "dependency-install.json");
+    rmSync(dependencyStamp, { force: true });
+    const prepareInChild = () => new Promise<{ status: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [dependencyWorker, repo, join(root, "worktrees"), workspace.path], {
+        cwd: repo,
+        stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true,
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, stderr }));
+    });
+    const dependencyWorkers = await Promise.all([prepareInChild(), prepareInChild()]);
+    for (const result of dependencyWorkers) assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(join(workspace.path, "node_modules", "example", "index.js")), true);
+    assert.equal(existsSync(dependencyStamp), true);
+    assert.equal(existsSync(join(workspace.path, ".forgedock", "dependencies-install.lock")), false);
+
     writeFileSync(join(workspace.path, "feature.txt"), "implemented\n");
     renameSync(join(workspace.path, "README.md"), join(workspace.path, "GUIDE.md"));
     mkdirSync(join(workspace.path, "docs", "pipeline-probes"), { recursive: true });
@@ -62,6 +106,31 @@ describe("isolated Git worktrees", () => {
     await manager.remove(workspace);
     assert.equal(existsSync(join(repo, "vendor", "example", "index.js")), true);
     assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), new RegExp(workspace.branch.replaceAll("/", "\\/")));
+  });
+
+  it("applies only the pinned ForgeDock dependency patch after script-free installation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-patch-"));
+    const repo = join(root, "repo");
+    try {
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "patch-fixture", version: "1.0.0" }));
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: repo, stdio: "ignore", shell: process.platform === "win32" });
+      mkdirSync(join(repo, "scripts"), { recursive: true });
+      writeFileSync(join(repo, "scripts", "patch-pi-subagents-visibility.mjs"),
+        'import { mkdirSync, writeFileSync } from "node:fs"; mkdirSync("node_modules", { recursive: true }); writeFileSync("node_modules/.forgedock-patch", "applied");\n');
+      git(repo, "add", "README.md", "package.json", "package-lock.json", "scripts/patch-pi-subagents-visibility.mjs");
+      git(repo, "commit", "-m", "base");
+
+      const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+      const workspace = await manager.create({ runId: "run_patch", issue: 15, baseRef: "HEAD" });
+      assert.equal(readFileSync(join(workspace.path, "node_modules", ".forgedock-patch"), "utf8"), "applied");
+      await manager.remove(workspace);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("detects clean-filter transformations between verified bytes and committed blobs", async () => {
