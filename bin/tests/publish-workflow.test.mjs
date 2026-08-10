@@ -9,6 +9,13 @@ import { describe, it } from "node:test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const workflow = readFileSync(join(root, ".github", "workflows", "publish.yml"), "utf8");
 
+const pushPathsStart = workflow.indexOf("  push:");
+const pushPathsEnd = workflow.indexOf("  workflow_dispatch:", pushPathsStart);
+const pushPaths = workflow.slice(pushPathsStart, pushPathsEnd);
+const changedPathGuardStart = workflow.indexOf("- name: Check if publishable files changed");
+const changedPathGuardEnd = workflow.indexOf("- name: Use Node.js 24", changedPathGuardStart);
+const changedPathGuard = workflow.slice(changedPathGuardStart, changedPathGuardEnd);
+
 describe("npm publish workflow recovery", () => {
   it("reconciles repository versions when npm publication already succeeded", () => {
     assert.match(workflow, /REGISTRY_ALREADY_PUBLISHED=true/);
@@ -28,5 +35,14 @@ describe("npm publish workflow recovery", () => {
     assert.match(workflow, /git rebase origin\/main/);
     assert.match(workflow, /git push origin HEAD:main/);
     assert.match(workflow, /npm test/);
+  });
+
+  it("keeps Pi vendor trees publishable in both path contracts", () => {
+    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime/**"]) {
+      assert.ok(pushPaths.includes(`'${path}'`), `push paths must include ${path}`);
+    }
+    for (const path of ["vendor/pi", "vendor/pi/", "vendor/pi-runtime/"]) {
+      assert.ok(changedPathGuard.includes(` ${path} `), `changed-path guard must include ${path}`);
+    }
   });
 });
