@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition } from "../../core/state/machine.js";
@@ -48,11 +49,77 @@ describe("durable recursive remediation", () => {
     assert.deepEqual(first.childIssues, [30]);
     assert.deepEqual(first.checkpoint.payload.approvedPaths, ["src/a.ts"]);
     const second = await supervisor.begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{ id: "finding-1", severity: "high", title: "Fix adjacent bug", evidence: "evidence", location: "src/a.ts:10", remediation: "Add guard", acceptanceCriterion: "Fix the bug" }] });
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     assert.equal(second.childIssues[0], 30);
     const reconstructed = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 } });
     assert.equal(reconstructed?.payload.status, "children-running");
     assert.equal(reconcileArtifacts(await artifacts.list({ repo: "owner/repo", issue: 20 })).state, "blocked");
+  });
+
+  it("serializes concurrent admission behind the durable remediation lease", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const leases = new InMemoryLeaseRepository();
+    let materializations = 0;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredBarrier = new Promise<void>((resolve) => { entered = resolve; });
+    const materializationBarrier = new Promise<void>((resolve) => { release = resolve; });
+    const host = {
+      async materializeRemediationChildren() {
+        materializations += 1;
+        entered();
+        await materializationBarrier;
+        return [{ repo: "owner/repo", number: 30, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts, lease: leases });
+    const input = { parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation" as const, findings: [{
+      id: "finding-1", severity: "high" as const, title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug",
+    }] };
+    const first = supervisor.begin(input);
+    await enteredBarrier;
+    const second = supervisor.begin(input);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(materializations, 1);
+    release();
+    const [left, right] = await Promise.all([first, second]);
+    assert.deepEqual(left.childIssues, [30]);
+    assert.deepEqual(right.childIssues, [30]);
+    assert.equal(materializations, 1);
+  });
+
+  it("retains an awaiting checkpoint when materialization fails and resumes it on retry", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const leases = new InMemoryLeaseRepository();
+    let attempts = 0;
+    const host = {
+      async materializeRemediationChildren() {
+        attempts += 1;
+        if (attempts === 1) throw new Error("child creation interrupted");
+        return [{ repo: "owner/repo", number: 30, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts, lease: leases });
+    const input = {
+      parentRun: run,
+      parentPullRequest: pr,
+      packetArtifact: packet,
+      verdictArtifact: verdict,
+      reason: "scope-violation" as const,
+      findings: [{ id: "finding-1", severity: "high" as const, title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug" }],
+    };
+
+    await assert.rejects(supervisor.begin(input), /child creation interrupted/);
+    const awaiting = await supervisor.reconstruct({ subject: { repo: run.subject.repo, issue: run.subject.issue! } });
+    assert.equal(awaiting?.payload.status, "awaiting-dispatch");
+    assert.deepEqual(awaiting?.payload.childIssues, []);
+
+    const resumed = await supervisor.begin(input);
+    assert.equal(resumed.checkpoint.payload.status, "children-running");
+    assert.deepEqual(resumed.childIssues, [30]);
+    assert.equal(attempts, 2);
   });
 
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {

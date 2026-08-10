@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
+import type { LeaseRepository } from "../../core/ports/lease.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
@@ -49,7 +50,11 @@ export interface RemediationSupervisorDependencies {
   host: ForgeHost;
   artifacts: ArtifactRepository;
   runs?: RunRepository;
+  lease?: LeaseRepository;
 }
+
+const REMEDIATION_LEASE_TTL_MS = 60_000;
+const remediationProcessLocks = new Map<string, Promise<void>>();
 
 /**
  * Controller-owned recursive remediation coordinator. It writes immutable
@@ -68,52 +73,122 @@ export class RemediationSupervisor {
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
     const actionable = actionableFindings(input.findings);
     const eligible = actionable.slice(0, maxChildren);
-    const authorizedInput = {
-      ...input,
-      findings: eligible,
-      remediationDepth: depth,
-      maxRemediationDepth: maxDepth,
-      maxRemediationChildren: maxChildren,
-    };
     const checkpointKey = remediationCheckpointKey(input.parentRun.runId, input.parentPullRequest.number, input.parentPullRequest.headSha, eligible);
-    const sequence = await nextCheckpointSequence(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
-    const base = remediationPayload(authorizedInput, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
-    if (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren) {
-      const terminal = createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
-      await this.dependencies.artifacts.append(terminal);
-      return { checkpoint: terminal, childIssues: [] };
+    const leaseKey = remediationAdmissionKey(input.parentRun.subject.repo, input.parentRun.subject.issue ?? input.parentPullRequest.number, input.parentRun.runId, input.parentPullRequest, checkpointKey);
+    const admission = await this.acquireAdmission(leaseKey);
+    try {
+      // The lease covers the read/append/materialize/append sequence. A retry
+      // therefore elects the existing checkpoint before asking GitHub to act.
+      const existing = await latestCheckpoint(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
+      if (existing && (existing.payload.status === "terminal"
+        || existing.payload.status === "children-running"
+        || existing.payload.status === "ready-to-resume")) {
+        return { checkpoint: existing, childIssues: existing.payload.childIssues };
+      }
+
+      const authorizedInput = {
+        ...input,
+        findings: eligible,
+        remediationDepth: depth,
+        maxRemediationDepth: maxDepth,
+        maxRemediationChildren: maxChildren,
+      };
+      const sequence = existing?.payload.checkpointSequence
+        ?? (await nextCheckpointSequence(this.dependencies.artifacts, input.parentRun.subject, checkpointKey));
+      const base = existing?.payload ?? remediationPayload(authorizedInput, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
+      if (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren) {
+        const terminal = existing && existing.payload.status === "awaiting-dispatch"
+          ? createCheckpointFromExisting(existing, { ...base, status: "terminal", checkpointSequence: existing.payload.checkpointSequence + 1 })
+          : createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
+        await this.dependencies.artifacts.append(terminal);
+        return { checkpoint: terminal, childIssues: [] };
+      }
+      const awaiting = existing && existing.payload.status === "awaiting-dispatch"
+        ? existing
+        : createCheckpoint(input, base);
+      if (!existing) await this.dependencies.artifacts.append(awaiting);
+      if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
+
+      const children = await this.materializeChildren(input, awaiting, leaseKey, admission.token);
+      await this.assertLeaseHealthy(leaseKey, admission.token);
+      const childIssues = children.map((child) => child.number);
+      const running = createCheckpointFromExisting(awaiting, {
+        ...awaiting.payload,
+        checkpointSequence: awaiting.payload.checkpointSequence + 1,
+        status: "children-running",
+        childIssues,
+      });
+      await this.dependencies.artifacts.append(running);
+      return { checkpoint: running, childIssues };
+    } finally {
+      await admission.release();
     }
-    const awaiting = createCheckpoint(input, base);
-    await this.dependencies.artifacts.append(awaiting);
+  }
+
+  private async materializeChildren(
+    input: RemediationBlockedInput,
+    checkpoint: DurableArtifact<"RemediationBlocked">,
+    leaseKey: string,
+    leaseToken?: string,
+  ) {
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
-    const children = await this.dependencies.host.materializeRemediationChildren({
-      repo: input.parentRun.subject.repo,
-      parentRunId: input.parentRun.runId,
-      parentIssue: input.parentPullRequest.number === input.parentRun.subject.issue ? input.parentRun.subject.issue : input.parentRun.subject.issue ?? input.parentPullRequest.number,
-      parentPullRequest: input.parentPullRequest.number,
-      headSha: input.parentPullRequest.headSha,
-      headBranch: input.parentPullRequest.headBranch,
-      baseBranch: input.parentPullRequest.baseBranch,
-      checkpointKey,
-      remediationDepth: depth + 1,
-      findings: eligible.flatMap((finding) => finding.location && finding.acceptanceCriterion ? [{
-        id: finding.id,
-        title: finding.title,
-        evidence: finding.evidence,
-        location: finding.location,
-        remediation: finding.remediation,
-        acceptanceCriterion: finding.acceptanceCriterion,
-      }] : []),
-    });
-    const runningSequence = sequence + 1;
-    const running = createCheckpoint(input, {
-      ...base,
-      checkpointSequence: runningSequence,
-      status: "children-running",
-      childIssues: children.map((child) => child.number),
-    });
-    await this.dependencies.artifacts.append(running);
-    return { checkpoint: running, childIssues: children.map((child) => child.number) };
+    const heartbeat = this.startLeaseHeartbeat(leaseKey, leaseToken);
+    try {
+      return await this.dependencies.host.materializeRemediationChildren({
+        repo: input.parentRun.subject.repo,
+        parentRunId: checkpoint.payload.parentRunId,
+        parentIssue: checkpoint.payload.parentIssue,
+        parentPullRequest: checkpoint.payload.pullRequest,
+        headSha: checkpoint.payload.headSha,
+        headBranch: checkpoint.payload.headBranch,
+        baseBranch: checkpoint.payload.baseBranch,
+        checkpointKey: checkpoint.payload.checkpointKey,
+        remediationDepth: checkpoint.payload.remediationDepth + 1,
+        findings: checkpoint.payload.findings.flatMap((finding) => finding.location && finding.acceptanceCriterion ? [{
+          id: finding.id,
+          title: finding.title,
+          evidence: finding.evidence,
+          location: finding.location,
+          remediation: finding.remediation,
+          acceptanceCriterion: finding.acceptanceCriterion,
+        }] : []),
+      });
+    } finally {
+      heartbeat.stop();
+    }
+  }
+
+  private startLeaseHeartbeat(leaseKey: string, token?: string): { stop(): void } {
+    if (!this.dependencies.lease || !token) return { stop() {} };
+    let healthy = true;
+    const timer = setInterval(() => {
+      try { this.dependencies.lease!.heartbeat(leaseKey, token, REMEDIATION_LEASE_TTL_MS); }
+      catch { healthy = false; }
+    }, Math.floor(REMEDIATION_LEASE_TTL_MS / 3));
+    return { stop() { clearInterval(timer); if (!healthy) throw new Error(`Remediation lease lost: ${leaseKey}`); } };
+  }
+
+  private async assertLeaseHealthy(leaseKey: string, token?: string): Promise<void> {
+    if (!this.dependencies.lease || !token) return;
+    this.dependencies.lease.heartbeat(leaseKey, token, REMEDIATION_LEASE_TTL_MS);
+  }
+
+  private async acquireAdmission(leaseKey: string): Promise<{ token?: string; release: () => Promise<void> }> {
+    if (!this.dependencies.lease) return { release: await acquireProcessAdmission(leaseKey) };
+    const owner = admissionOwner();
+    let lease;
+    // The lease TTL is an ownership/recovery interval, not a waiter deadline.
+    // A healthy owner renews it while materializing children, so a concurrent
+    // begin must remain queued until that owner releases and the checkpoint can
+    // be re-read below. If the owner dies, lease expiry still permits recovery.
+    while (!(lease = this.dependencies.lease.acquire(leaseKey, owner, REMEDIATION_LEASE_TTL_MS))) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const token = lease.token;
+    return {
+      token,
+      release: async () => { this.dependencies.lease!.release(leaseKey, token); },
+    };
   }
 
   async reconcileChildren(input: {
@@ -368,6 +443,39 @@ function createCheckpointFromExisting(
     producer: existing.producer,
     payload,
   }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` });
+}
+
+function admissionOwner(): string {
+  return `remediation-${process.pid}-${crypto.randomUUID()}`;
+}
+
+async function acquireProcessAdmission(key: string): Promise<() => Promise<void>> {
+  const prior = remediationProcessLocks.get(key) ?? Promise.resolve();
+  let unlock!: () => void;
+  const current = prior.then(() => new Promise<void>((resolve) => { unlock = resolve; }));
+  remediationProcessLocks.set(key, current);
+  await prior;
+  return async () => {
+    unlock();
+    if (remediationProcessLocks.get(key) === current) remediationProcessLocks.delete(key);
+  };
+}
+
+function remediationAdmissionKey(repo: string, parentIssue: number, parentRunId: string, pullRequest: PullRequestSnapshot, checkpointKey: string): string {
+  return `remediation:${repo.toLowerCase()}:${parentIssue}:${parentRunId}:${pullRequest.number}:${pullRequest.headSha.toLowerCase()}:${checkpointKey}`;
+}
+
+async function latestCheckpoint(
+  artifacts: ArtifactRepository,
+  subject: { repo: string; issue?: number },
+  key: string,
+): Promise<DurableArtifact<"RemediationBlocked"> | undefined> {
+  if (!subject.issue) return undefined;
+  const existing = await artifacts.list({ repo: subject.repo, issue: subject.issue }, "RemediationBlocked");
+  return existing
+    .filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> => artifact.kind === "RemediationBlocked" && artifact.payload.checkpointKey === key)
+    .sort((left, right) => left.payload.checkpointSequence - right.payload.checkpointSequence)
+    .at(-1);
 }
 
 async function nextCheckpointSequence(artifacts: ArtifactRepository, subject: { repo: string; issue?: number }, key: string): Promise<number> {

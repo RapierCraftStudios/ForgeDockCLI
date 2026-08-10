@@ -17,15 +17,16 @@ export async function resolveParentRemediationTargetFromIssue(
     throw new Error(`Remediation child #${issue.number} has incomplete controller routing metadata`);
   }
   const checkpoints = await artifacts.list({ repo: issue.repo, issue: parentIssue }, "RemediationBlocked");
-  const checkpoint = checkpoints
+  const matchingCheckpoints = checkpoints
     .filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> =>
       artifact.kind === "RemediationBlocked"
       && artifact.payload.checkpointKey === checkpointKey
-      && artifact.payload.parentIssue === parentIssue
-      && artifact.payload.childIssues.includes(issue.number)
-      && (artifact.payload.status === "children-running" || artifact.payload.status === "ready-to-resume"))
-    .at(-1);
-  if (!checkpoint) {
+      && artifact.payload.parentIssue === parentIssue)
+    .sort((left, right) => right.payload.checkpointSequence - left.payload.checkpointSequence);
+  const checkpoint = matchingCheckpoints[0];
+  if (!checkpoint
+    || (checkpoint.payload.status !== "children-running" && checkpoint.payload.status !== "ready-to-resume")
+    || !checkpoint.payload.childIssues.includes(issue.number)) {
     throw new Error(`Remediation child #${issue.number} is not authorized by active checkpoint ${checkpointKey}`);
   }
   const finding = checkpoint.payload.findings.find((candidate) => candidate.id === findingId);
