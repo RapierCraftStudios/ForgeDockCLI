@@ -38,11 +38,11 @@ describe("npm publish workflow recovery", () => {
   });
 
   it("keeps Pi vendor trees publishable in both path contracts", () => {
-    for (const path of ["vendor/pi/**", "vendor/pi-runtime/**"]) {
+    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime/**"]) {
       assert.ok(pushPaths.includes(`'${path}'`), `push paths must include ${path}`);
     }
-    for (const path of ["vendor/pi/", "vendor/pi-runtime/"]) {
-      assert.ok(changedPathGuard.includes(path), `changed-path guard must include ${path}`);
+    for (const path of ["vendor/pi", "vendor/pi/", "vendor/pi-runtime/"]) {
+      assert.ok(changedPathGuard.includes(` ${path} `), `changed-path guard must include ${path}`);
     }
   });
 });
