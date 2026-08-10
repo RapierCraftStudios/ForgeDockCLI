@@ -23,6 +23,26 @@ describe("GitHub repository resolution", () => {
   });
 });
 
+describe("GitHub issue-search resolution", () => {
+  it("returns only open issue members for a decoded search query", async () => {
+    const client = new GitHubClient();
+    let received: string[] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      received = args;
+      return JSON.stringify([
+        { number: 9, state: "OPEN", milestone: null },
+        { number: 7, state: "CLOSED", milestone: null },
+        { number: 8, state: "OPEN", milestone: null },
+      ]);
+    } });
+    assert.deepEqual(await client.listOpenIssueNumbersForSearch("is:issue  state:open no:milestone", "a/b"), [8, 9]);
+    assert.deepEqual(received, [
+      "issue", "list", "--repo", "a/b", "--state", "open",
+      "--search", "is:issue state:open no:milestone", "--limit", "1000", "--json", "number,state,milestone",
+    ]);
+  });
+});
+
 describe("GitHub workflow label projection", () => {
   it("maps typed run states to the canonical legacy-compatible labels", () => {
     assert.equal(workflowLabelForState("investigating"), "workflow:investigating");

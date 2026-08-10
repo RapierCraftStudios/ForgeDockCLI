@@ -123,6 +123,22 @@ export class GitHubClient implements ForgeHost {
       .sort((left, right) => left - right);
   }
 
+  async listOpenIssueNumbersForSearch(query: string, repo?: string): Promise<number[]> {
+    const normalizedQuery = query.replace(/\s+/g, " ").trim();
+    if (!normalizedQuery) throw new Error("GitHub issue search query must not be blank");
+    if (normalizedQuery.length > 500) throw new Error("GitHub issue search query is too long");
+    const resolvedRepo = repo ?? await this.resolveRepository();
+    const result = await this.gh([
+      "issue", "list", "--repo", resolvedRepo, "--state", "open",
+      "--search", normalizedQuery, "--limit", "1000", "--json", "number,state,milestone",
+    ]);
+    const issues = JSON.parse(result) as Array<{ number?: number; state?: string; milestone?: { title?: string } | null }>;
+    return issues
+      .filter((issue) => issue.state?.toUpperCase() === "OPEN" && Number.isSafeInteger(issue.number))
+      .map((issue) => issue.number!)
+      .sort((left, right) => left - right);
+  }
+
   async getIssue(number: number, repo?: string): Promise<GitHubIssue> {
     const resolvedRepo = repo ?? await this.resolveRepository();
     const result = await this.gh([

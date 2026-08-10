@@ -18,8 +18,6 @@ import {
   deactivateWorkflowTools,
   inspectSubagentRuntime,
   registerForgeDockTools,
-  resolveOrchestrationInvocationScope,
-  type OrchestrationInvocationScope,
   type WorkflowCommand,
   workflowCommandDisplay,
 } from "./forgedock-tools.js";
@@ -29,16 +27,8 @@ export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /work-on · /revie
 const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 
-interface ForgeDockExtensionDependencies {
-  resolveOrchestrationScope?: (rawArgs: string, cwd: string) => Promise<OrchestrationInvocationScope>;
-}
-
-export default function forgedockExtension(
-  pi: ExtensionAPI,
-  dependencies: ForgeDockExtensionDependencies = {},
-): void {
+export default function forgedockExtension(pi: ExtensionAPI): void {
   const backgroundTasks = registerForgeDockTools(pi);
-  const resolveOrchestrationScope = dependencies.resolveOrchestrationScope ?? resolveOrchestrationInvocationScope;
 
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
@@ -101,7 +91,7 @@ export default function forgedockExtension(
     await backgroundTasks.shutdown();
   });
 
-  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow, resolveOrchestrationScope);
+  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
 
   pi.registerCommand("forgedock-status", {
     description: "Show typed ForgeDock issue/run status",
@@ -190,11 +180,7 @@ export function isLifecycleControllerShellCommand(command: string): boolean {
   return directEntry.test(command) || packageScript.test(command);
 }
 
-function registerWorkflow(
-  pi: ExtensionAPI,
-  workflow: Workflow,
-  resolveOrchestrationScope: (rawArgs: string, cwd: string) => Promise<OrchestrationInvocationScope>,
-): void {
+function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
   pi.registerCommand(workflow, {
     description: workflowDescription(workflow),
     handler: async (args, ctx) => {
@@ -206,18 +192,9 @@ function registerWorkflow(
       // Orchestration confirms the resolved DAG and proposed work-unit batches inside
       // its native tool; a pre-resolution confirmation would be both vague and duplicate.
       if (workflow !== "orchestrate" && !await confirmWorkflow(workflow, normalized, ctx)) return;
-      let orchestrationScope: OrchestrationInvocationScope | undefined;
-      if (workflow === "orchestrate") {
-        try {
-          orchestrationScope = await resolveOrchestrationScope(normalized, ctx.cwd);
-          bindOrchestrationInvocation(pi, orchestrationScope);
-        } catch (error) {
-          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-          return;
-        }
-      }
+      if (workflow === "orchestrate") bindOrchestrationInvocation(pi, { rawArgs: normalized });
       try {
-        await queueNativeWorkflow(pi, workflow, normalized, ctx, orchestrationScope);
+        await queueNativeWorkflow(pi, workflow, normalized, ctx);
       } catch (error) {
         if (workflow === "orchestrate") clearOrchestrationInvocation(pi);
         throw error;
@@ -231,12 +208,11 @@ async function queueNativeWorkflow(
   command: WorkflowCommand,
   rawArgs: string,
   ctx: ExtensionCommandContext,
-  orchestrationScope?: OrchestrationInvocationScope,
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
   activateOnly(pi, [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
-  const prompt = buildNativeCommandPrompt(command, rawArgs, orchestrationScope);
+  const prompt = buildNativeCommandPrompt(command, rawArgs);
   // Slash-command dispatch itself occupies Pi's prompt pipeline, so ctx.isIdle()
   // can race with the transition into streaming. followUp is safe while idle
   // and guarantees the native workflow prompt is queued when that race occurs.

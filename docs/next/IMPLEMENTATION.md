@@ -105,6 +105,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] In-memory and SQLite lease ownership, heartbeat, expiry, and stale recovery semantics
 - [x] Explicit issue-set CLI and dry-run plan
 - [x] Natural-language issue discovery produces a typed evidence-backed DAG with priorities, dependencies, and path/component claims
+- [x] Every native `/orchestrate` invocation performs model intent routing first; deterministic controller validation then freezes repository, URL/query membership, count, open-state, milestone, and decomposed-parent constraints before mutation
 - [x] Visible asynchronous workers stream the live DAG ready set without static topological phase barriers
 - [x] Same-session DAG resume preserves completed nodes and retries failed/blocked nodes through durable work-on checkpoint recovery; explicit fresh-rerun authorization is carried to selected failed nodes without repeating unsupported resume mode
 - [x] Interrupted building runs recover their deterministic retained worktree and continue from the frozen Build Packet
