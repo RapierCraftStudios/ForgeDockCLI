@@ -8,11 +8,20 @@ export interface ArtifactRepository {
   list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]>;
 }
 
+export interface RunProgressRecord {
+  runId: string;
+  phase: string;
+  message: string;
+  occurredAt: string;
+}
+
 export interface RunRepository {
   create(state: RunState): Promise<void>;
   load(runId: string): Promise<RunState | undefined>;
   commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void>;
   history(runId: string): Promise<TransitionRecord[]>;
+  recordProgress(progress: RunProgressRecord): Promise<void>;
+  listProgress(runId: string): Promise<RunProgressRecord[]>;
 }
 
 /** Writes authoritative storage first, then refreshes the rebuildable cache. */
@@ -52,10 +61,21 @@ export class ProjectedRunRepository implements RunRepository {
   }
 
   history(runId: string): Promise<TransitionRecord[]> { return this.inner.history(runId); }
+  recordProgress(progress: RunProgressRecord): Promise<void> { return this.inner.recordProgress(progress); }
+  listProgress(runId: string): Promise<RunProgressRecord[]> { return this.inner.listProgress(runId); }
 
   private async tryProject(state: RunState): Promise<void> {
-    try { await this.project(structuredClone(state)); }
-    catch (error) { this.onProjectionError(error, structuredClone(state)); }
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await this.project(structuredClone(state));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+      }
+    }
+    this.onProjectionError(lastError, structuredClone(state));
   }
 }
 
@@ -77,11 +97,13 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
 export class InMemoryRunRepository implements RunRepository {
   readonly runs = new Map<string, RunState>();
   readonly records = new Map<string, TransitionRecord[]>();
+  readonly progress = new Map<string, RunProgressRecord[]>();
 
   async create(state: RunState): Promise<void> {
     if (this.runs.has(state.runId)) throw new Error(`Run already exists: ${state.runId}`);
     this.runs.set(state.runId, structuredClone(state));
     this.records.set(state.runId, []);
+    this.progress.set(state.runId, []);
   }
 
   async load(runId: string): Promise<RunState | undefined> {
@@ -104,6 +126,15 @@ export class InMemoryRunRepository implements RunRepository {
 
   async history(runId: string): Promise<TransitionRecord[]> {
     return (this.records.get(runId) ?? []).map((record) => structuredClone(record));
+  }
+
+  async recordProgress(progress: RunProgressRecord): Promise<void> {
+    if (!this.runs.has(progress.runId)) throw new Error(`Unknown run: ${progress.runId}`);
+    this.progress.get(progress.runId)?.push(structuredClone(progress));
+  }
+
+  async listProgress(runId: string): Promise<RunProgressRecord[]> {
+    return (this.progress.get(runId) ?? []).map((record) => structuredClone(record));
   }
 }
 

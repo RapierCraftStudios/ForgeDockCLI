@@ -73,9 +73,11 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
 - [x] Verification-stage resume from retained workspaces without replaying investigation or build
 - [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
+- [x] Explicit staging-review source-branch evidence, immutable recovery base refs, and fail-closed cross-branch resume validation
 - [x] Frozen verification-plan coverage: every controller-approved diff/package command executes and contributes evidence instead of stopping after the first failure or claiming unobserved success
 - [x] Same-invocation verification recovery: in-packet build and post-review remediation failures receive at most two evidence-backed builder repairs, with durable crash-resume budgets and no scope widening
 - [x] Truthful Build Results require controller-observed changed paths to match the worker report and explicit coverage for every frozen acceptance criterion
+- [x] Stable criterion IDs plus verbatim builder contracts prevent model wording from changing frozen acceptance evidence
 - [x] Frozen Build Packet scope replaces issue-hint authority durably, grants only bounded discovery reads plus exact writes, and is rebuilt deterministically on resume
 - [x] Terminal merged Outcomes remain unpublished until idempotent trajectory projection and authoritative re-read proof that every parent/member issue is closed
 
@@ -119,6 +121,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Scheduler suspension statuses, typed event sinks, orchestration snapshots, and restartable remediation projections
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
 - [x] Durable same-checkout cross-process leases and heartbeats
+- [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
 - [ ] Cross-machine/GitHub-backed lease coordination
 - [ ] Promote Build Packet paths into live scheduler claims
 - [ ] Token/cost budgets in addition to worker concurrency
@@ -177,8 +180,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- ForgeDock Next suite: 255 passing, 0 failing. `npm run build` and `npm run docs:build` are green. With the staging shell's `jq` path available, the legacy invocation reaches 1,813 passing, 0 failing, and 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
-- Phase G in progress: agent receipts are persisted in SQLite and surfaced through `status --json`/trajectory comments, runtime preflight runs before semantic mutation, nested verification scripts produce covered evidence without duplicate execution, and packet/remediation writes are exact-path scoped.
+- ForgeDock Next suite: 336 passing, 0 failing. `npm run build` and `npm run docs:build` are green. With the staging shell's `jq` path available, the legacy invocation reaches 1,813 passing, 0 failing, and 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
+- Phase G in progress: agent receipts are persisted in SQLite and surfaced through `status --json`/trajectory comments, while controller progress is persisted and surfaced through `status --json`; runtime preflight runs before semantic mutation, nested verification scripts produce covered evidence without duplicate execution, and packet/remediation writes are exact-path scoped.
 
 ## Resolved environment and dependency blockers
 

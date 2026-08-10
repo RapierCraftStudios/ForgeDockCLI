@@ -12,7 +12,9 @@ import {
   STANDARD_SCOPE_DISCOVERY_ROOTS,
   STANDARD_SCOPE_METADATA_ROOTS,
   type AgentEventSink,
+  type AgentRunResult,
   type AgentRuntime,
+  type AgentTask,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
@@ -42,7 +44,7 @@ export async function prepareBuildPacket(
       ...(input.scopeHints?.affectedFiles ?? []),
       ...input.investigation.payload.affectedSurfaces,
     ];
-    const result = await dependencies.runtime.run<BuildPacketPayload>({
+    const result = await runPacketAuthorWithRecovery(dependencies.runtime, {
       id: `${run.runId}:build-packet:${run.attempt}`,
       role: "packet-author",
       objective: "Freeze a buildable, reviewable contract from the proven issue intent and investigation.",
@@ -106,5 +108,26 @@ export async function prepareBuildPacket(
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+  }
+}
+
+async function runPacketAuthorWithRecovery(
+  runtime: AgentRuntime,
+  task: AgentTask<BuildPacketPayload>,
+  options: { signal?: AbortSignal; onEvent?: AgentEventSink },
+): Promise<AgentRunResult<BuildPacketPayload>> {
+  try {
+    return await runtime.run(task, options);
+  } catch (error) {
+    if (!(error instanceof Error) || !/ended without calling submit_artifact/i.test(error.message)) throw error;
+    const retryTask: AgentTask<BuildPacketPayload> = {
+      ...task,
+      id: `${task.id}:submit-retry`,
+      instructions: [
+        task.instructions,
+        "The previous packet-author session ended without calling submit_artifact. This is the one bounded recovery attempt; preserve the evidence already gathered, finish the schema-valid Build Packet, and call submit_artifact exactly once as your final action.",
+      ].join("\n"),
+    };
+    return runtime.run(retryTask, options);
   }
 }

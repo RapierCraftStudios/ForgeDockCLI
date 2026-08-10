@@ -102,6 +102,8 @@ async function status(argv: string[]): Promise<void> {
       const configured = readForgeDockConfig(process.cwd());
       const telemetry = summarizeTelemetry(reconciled.runId ? store.listTelemetry(reconciled.runId) : []);
       const localRun = reconciled.runId ? store.listRuns().find((run) => run.runId === reconciled.runId) : undefined;
+      const progress = localRun ? await store.listProgress(localRun.runId) : [];
+      const latestProgress = progress.at(-1);
       const controllerTiming = localRun
         ? summarizeControllerTiming(localRun.createdAt, await store.history(localRun.runId))
         : undefined;
@@ -111,6 +113,7 @@ async function status(argv: string[]): Promise<void> {
         policySources: orchestrationConfigSources(configured),
         telemetry,
         ...(controllerTiming !== undefined ? { controllerTiming } : {}),
+        ...(latestProgress !== undefined ? { controllerProgress: { latest: latestProgress, count: progress.length } } : {}),
         ...reconciled,
       };
       if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -119,6 +122,7 @@ async function status(argv: string[]): Promise<void> {
         process.stdout.write(`${statusGlyph(reconciled.state === "completed" ? "passed" : reconciled.state === "blocked" ? "blocked" : "active", mode)} ${result.subject} · ${reconciled.state}\n`);
         renderTelemetryLine(telemetry);
         if (controllerTiming !== undefined) renderControllerTimingLine(controllerTiming);
+        if (latestProgress !== undefined) process.stdout.write(`  progress: ${latestProgress.phase} · ${latestProgress.message}\n`);
         for (const warning of reconciled.warnings) process.stdout.write(`  warning: ${warning}\n`);
       }
       return;
@@ -132,6 +136,7 @@ async function status(argv: string[]): Promise<void> {
       ...run,
       telemetry: summarizeTelemetry(store.listTelemetry(run.runId)),
       controllerTiming: summarizeControllerTiming(run.createdAt, await store.history(run.runId)),
+      controllerProgress: (await store.listProgress(run.runId)).at(-1),
     })));
     if (argv.includes("--json")) {
       process.stdout.write(`${JSON.stringify({ policy, policySources, runs: runsWithTelemetry }, null, 2)}\n`);
@@ -150,6 +155,7 @@ async function status(argv: string[]): Promise<void> {
       process.stdout.write(`${statusGlyph(state, mode)} ${run.runId} · ${subject} · ${run.state} · v${run.version}\n`);
       renderTelemetryLine(run.telemetry, "  ");
       renderControllerTimingLine(run.controllerTiming, "  ");
+      if (run.controllerProgress) process.stdout.write(`  progress: ${run.controllerProgress.phase} · ${run.controllerProgress.message}\n`);
     }
   } finally {
     store.close();
@@ -218,6 +224,7 @@ async function workOn(argv: string[]): Promise<void> {
   }
   const priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
   let resumeRunId: string | undefined;
+  let progressRunId = runId;
   let resumeCheckpoint: string | undefined;
   let resumeArtifacts: DurableArtifact[] = [];
   if (!dryRun) {
@@ -234,6 +241,7 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Existing run ${admission.runId} has a recoverable ${admission.checkpoint} checkpoint. Re-run with --resume to continue it; reset only if you intentionally want to abandon its durable work`);
       }
       resumeRunId = admission.runId;
+      progressRunId = resumeRunId;
       resumeCheckpoint = admission.checkpoint;
       resumeArtifacts = admission.artifacts;
     }
@@ -269,7 +277,16 @@ async function workOn(argv: string[]): Promise<void> {
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
   }, store);
-  const onAgentEvent = (event: AgentEvent) => writeAgentEvent(event);
+  const onAgentEvent = (event: AgentEvent) => {
+    writeAgentEvent(event);
+    if (event.type === "thinking.delta" || event.type === "text.delta") return;
+    void runs.recordProgress({
+      runId: progressRunId,
+      phase: event.type,
+      message: `Agent runtime event for ${event.taskId}`,
+      occurredAt: new Date().toISOString(),
+    }).catch(() => undefined);
+  };
   const leaseItem = `issue-${issue.number}`;
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
   const leaseController = new AbortController();
@@ -287,8 +304,15 @@ async function workOn(argv: string[]): Promise<void> {
     if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
     leaseToken = lease.token;
     leaseHeartbeat = setInterval(() => {
-      try { store.heartbeat(leaseItem, lease.token, 60_000); }
-      catch (error) { leaseController.abort(error); }
+      try {
+        store.heartbeat(leaseItem, lease.token, 60_000);
+        void runs.recordProgress({
+          runId: progressRunId,
+          phase: "controller.heartbeat",
+          message: "Controller lease renewed",
+          occurredAt: new Date().toISOString(),
+        }).catch(() => undefined);
+      } catch (error) { leaseController.abort(error); }
     }, 20_000);
 
     if (resumeRunId) {
@@ -322,6 +346,22 @@ async function workOn(argv: string[]): Promise<void> {
       const failedOutcome = admission.state === "failed" ? latestOutcome : undefined;
       const retainedBuildResult = latestArtifactOfKind(runArtifacts, "BuildResult");
       const priorVerdict = latestArtifactOfKind(runArtifacts, "ReviewVerdict");
+      const durableTargetBranch = retainedBuildResult?.payload.targetBranch
+        ?? latestOutcome?.payload.failureEvidence?.targetBranch
+        ?? deliveryTargetBranch;
+      if (durableTargetBranch !== deliveryTargetBranch) {
+        throw new Error(
+          `Durable run target ${durableTargetBranch} conflicts with current issue lane target ${deliveryTargetBranch}; refusing cross-branch recovery`,
+        );
+      }
+      const persistedBaseRef = latestOutcome?.payload.failureEvidence?.baseRef;
+      const expectedBaseRef = `origin/${durableTargetBranch}`;
+      if (persistedBaseRef !== undefined && persistedBaseRef !== expectedBaseRef) {
+        throw new Error(
+          `Durable run base ${persistedBaseRef} conflicts with target ${expectedBaseRef}; refusing cross-branch recovery`,
+        );
+      }
+      const recoveryBaseRef = persistedBaseRef ?? expectedBaseRef;
       const openPullRequest = retainedBuildResult
         ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
         : undefined;
@@ -381,7 +421,7 @@ async function workOn(argv: string[]): Promise<void> {
         const recoveryInput = {
           runId: resumeRunId,
           issue: issue.number,
-          baseRef,
+          baseRef: recoveryBaseRef,
           ...(admission.checkpoint !== "build" && retainedBuildResult?.payload.baseSha
             ? { baseSha: retainedBuildResult.payload.baseSha }
             : {}),
@@ -400,15 +440,15 @@ async function workOn(argv: string[]): Promise<void> {
         workspace = {
           path: outcome.payload.failureEvidence.workspacePath,
           branch: outcome.payload.failureEvidence.branch,
-          baseRef,
+          baseRef: recoveryBaseRef,
           ...(outcome.payload.failureEvidence.baseSha ? { baseSha: outcome.payload.failureEvidence.baseSha } : {}),
         };
         if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
       }
-      const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), baseRef);
+      const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), recoveryBaseRef);
       const baselineChecks = admission.checkpoint === "publication" || admission.checkpoint === "completion"
         ? undefined
-        : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
+        : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef: recoveryBaseRef });
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace: workspace!,
@@ -419,7 +459,7 @@ async function workOn(argv: string[]): Promise<void> {
             ...(retainedBuildResult && priorVerdict ? { repairContext: [retainedBuildResult, priorVerdict] } : {}),
           }
           : {}),
-        baseBranch: deliveryTargetBranch, verification,
+        baseBranch: durableTargetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         priorRemediationCycles,
         scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
@@ -445,6 +485,7 @@ async function workOn(argv: string[]): Promise<void> {
           pullRequest: checkpointPullRequest!,
           ...(workspace ? { workspace } : {}),
           ...(batchMembers.length ? { batchMembers } : {}),
+          ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
           autoMerge,
         }, dependencies)
         : admission.checkpoint === "build"

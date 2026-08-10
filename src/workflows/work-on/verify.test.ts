@@ -97,6 +97,24 @@ describe("verification and commit barrier", () => {
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
   });
 
+  it("resolves criterion coverage by stable packet IDs rather than model wording", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const result = await verifyAndCommit({
+      run,
+      packet: packet(run),
+      submission: {
+        ...submission,
+        criterionCoverage: [{ criterionId: "criterion-1", criterion: "Paraphrased by the builder", implementation: "Guard preserves state" }],
+      },
+      workspace,
+      commands: [command],
+    }, { verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
+    assert.equal(result.run.state, "publishing");
+    assert.equal(result.buildResult?.payload.acceptanceEvidence[0]?.criterion, "Preserves state");
+  });
+
   it("blocks when raw committed blobs differ from the verified worktree content", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
@@ -257,6 +275,8 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(result.outcome?.payload.failureEvidence, {
       branch: workspace.branch,
       workspacePath: workspace.path,
+      baseRef: workspace.baseRef,
+      targetBranch: "main",
       baseSha: workspace.baseSha,
       builderSummary: submission.summary,
       changedPaths: ["src/a.ts"],

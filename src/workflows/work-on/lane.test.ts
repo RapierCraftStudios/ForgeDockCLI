@@ -75,6 +75,48 @@ describe("issue lane classification", () => {
     assert.deepEqual(lane, { kind: "fast", targetBranch: "main", resolution: "repository-default" });
   });
 
+  it("honors explicit staging-review source branch evidence instead of defaulting to main", () => {
+    const stagingReview: IssueSnapshot = {
+      ...issueWithoutMilestone,
+      labels: ["staging-review"],
+      body: [
+        "**Code branch**: `staging`",
+        "**Worktree base**: `origin/staging`",
+      ].join("\n"),
+    };
+    assert.deepEqual(classifyIssueLane(stagingReview, "main"), {
+      kind: "fast", targetBranch: "staging", resolution: "explicit-source-branch",
+    });
+  });
+
+  it("accepts the documented Code branch evidence without requiring a duplicate Worktree base", () => {
+    assert.deepEqual(classifyIssueLane({
+      ...issueWithoutMilestone,
+      labels: ["staging-review"],
+      body: "**Code branch**: `staging`",
+    }, "main"), {
+      kind: "fast", targetBranch: "staging", resolution: "explicit-source-branch",
+    });
+  });
+
+  it("fails closed when a staging-review issue omits its source branch evidence", () => {
+    assert.throws(
+      () => classifyIssueLane({ ...issueWithoutMilestone, labels: ["staging-review"] }, "main"),
+      /requires explicit.*Worktree base/,
+    );
+  });
+
+  it("rejects conflicting staging-review code and worktree branches", () => {
+    assert.throws(
+      () => classifyIssueLane({
+        ...issueWithoutMilestone,
+        labels: ["staging-review"],
+        body: "**Code branch**: `staging`\n**Worktree base**: `origin/main`",
+      }, "main"),
+      /conflicts/,
+    );
+  });
+
   it("fails closed when the milestone branch is absent", () => {
     assert.throws(
       () => classifyIssueLane(issue, "main", []),

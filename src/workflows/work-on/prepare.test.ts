@@ -53,6 +53,29 @@ describe("Build Packet preparation", () => {
     ]);
   });
 
+  it("retries one packet-author session that ended before submit_artifact", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      new Error("Agent run_packet_recovery:build-packet:1 ended without calling submit_artifact"),
+      packet,
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_recovery", subject: { repo: "a/b", issue: 3 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
+    }, { runtime, artifacts, runs });
+
+    assert.equal(prepared.run.state, "building");
+    assert.equal(runtime.tasks.length, 3);
+    assert.equal(runtime.tasks[2]?.id, "run_packet_recovery:build-packet:1:submit-retry");
+    assert.match(runtime.tasks[2]?.instructions ?? "", /one bounded recovery attempt/);
+  });
+
   it("grants bounded source discovery when the issue has no concrete affected-file hints", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet]);
     const artifacts = new InMemoryArtifactRepository();

@@ -12,7 +12,7 @@ const packet = createArtifact({
   kind: "BuildPacket", runId, subject, producer: { role: "packet-author" },
   payload: {
     scope: ["Guard the update"], acceptanceCriteria: [criterion], context: [], implementationPlan: ["Edit src/a.ts"],
-    expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: ["Redesign deployment", "Lease and heartbeat behavior"],
+    expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: ["Redesign deployment", "Lease and heartbeat behavior", "Runtime/controller behavior"],
   },
 });
 
@@ -29,15 +29,18 @@ function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
 
 describe("review finding scope policy", () => {
   it("downgrades path and criterion expansion before remediation", () => {
-    const [outside, excludedTopic] = applyFindingScopePolicy([
+    const [outside, excludedTopic, excludedRuntime] = applyFindingScopePolicy([
       finding({ location: "deploy/production.yml:2", matchedAcceptanceCriteria: ["Invent a deployment contract"] }),
       finding({ title: "Lease heartbeat can expire", evidence: "The heartbeat generation stalls", remediation: "Redesign lease heartbeat generations" }),
+      finding({ title: "Runtime controller bypass", evidence: "The agent runtime skips the controller", remediation: "Redesign the runtime adapter" }),
     ], packet);
     assert.equal(outside?.scopeDisposition, "follow_up");
     assert.equal(outside?.blocking, false);
     assert.match(outside?.scopeRationale ?? "", /no exact frozen acceptance criterion|outside the frozen expected paths/);
     assert.equal(excludedTopic?.blocking, false);
     assert.match(excludedTopic?.scopeRationale ?? "", /excluded lease\/coordination behavior/);
+    assert.equal(excludedRuntime?.blocking, false);
+    assert.match(excludedRuntime?.scopeRationale ?? "", /excluded runtime\/controller behavior/);
   });
 
   it("prevents fresh concern expansion after remediation while preserving continuity and regressions", () => {

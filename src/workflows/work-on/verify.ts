@@ -56,6 +56,8 @@ export async function verifyAndCommit(
         failureEvidence: {
           branch: input.workspace.branch,
           workspacePath: input.workspace.path,
+          baseRef: input.workspace.baseRef,
+          ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
           ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
           builderSummary: input.submission.summary,
           changedPaths,
@@ -104,13 +106,26 @@ export async function verifyAndCommit(
         : undefined;
 
     const frozenCriteria = input.packet.payload.acceptanceCriteria;
+    const criterionById = new Map<string, string>(
+      frozenCriteria.map((criterion, index) => [`criterion-${index + 1}`, criterion] as const),
+    );
+    const resolvedCoverage = input.submission.criterionCoverage.map((coverage) => ({
+      coverage,
+      criterion: coverage.criterionId === undefined
+        ? coverage.criterion
+        : criterionById.get(coverage.criterionId),
+    }));
     const coverageCounts = new Map<string, number>();
-    for (const coverage of input.submission.criterionCoverage) {
-      coverageCounts.set(coverage.criterion, (coverageCounts.get(coverage.criterion) ?? 0) + 1);
+    for (const resolved of resolvedCoverage) {
+      if (resolved.criterion !== undefined) {
+        coverageCounts.set(resolved.criterion, (coverageCounts.get(resolved.criterion) ?? 0) + 1);
+      }
     }
     const missingCoverage = frozenCriteria.filter((criterion) => !coverageCounts.has(criterion));
     const duplicateCoverage = frozenCriteria.filter((criterion) => (coverageCounts.get(criterion) ?? 0) > 1);
-    const unknownCoverage = [...coverageCounts.keys()].filter((criterion) => !frozenCriteria.includes(criterion));
+    const unknownCoverage = resolvedCoverage
+      .filter((resolved) => resolved.criterion === undefined || !frozenCriteria.includes(resolved.criterion))
+      .map(({ coverage }) => coverage.criterionId ? `${coverage.criterionId} (${coverage.criterion})` : coverage.criterion);
     const coverageFailure = missingCoverage.length || duplicateCoverage.length || unknownCoverage.length
       ? `Builder criterion coverage is incomplete:${missingCoverage.length ? ` missing ${missingCoverage.join(" | ")}` : ""}${duplicateCoverage.length ? ` duplicated ${duplicateCoverage.join(" | ")}` : ""}${unknownCoverage.length ? ` unknown ${unknownCoverage.join(" | ")}` : ""}`
       : undefined;
@@ -187,7 +202,7 @@ export async function verifyAndCommit(
         changedPaths: revisionChangedPaths,
         summary: input.submission.summary,
         acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => {
-          const implementation = input.submission.criterionCoverage.find((item) => item.criterion === criterion)!.implementation;
+          const implementation = resolvedCoverage.find((item) => item.criterion === criterion)!.coverage.implementation;
           const controllerEvidence = input.subjectEvidence?.length
             ? ` Controller-observed subject evidence: ${input.subjectEvidence.join(" | ")}`
             : "";

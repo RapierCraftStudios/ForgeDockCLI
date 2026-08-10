@@ -83,6 +83,7 @@ export function shouldMaterializeFinding(finding: ReviewFinding): boolean {
 }
 
 const EXCLUDED_TOPICS: ReadonlyArray<{ name: string; pattern: RegExp }> = [
+  { name: "runtime/controller", pattern: /\b(?:runtime|controller|adapter|agent[- ]runtime|pi[- ]adapter)\b/i },
   { name: "lease/coordination", pattern: /\b(?:lease|heartbeat|fencing|takeover|coordination[- ]key)\b/i },
   { name: "event", pattern: /\b(?:event envelope|event schema|event stream|event ordering)\b/i },
   { name: "bundle", pattern: /\b(?:portable bundle|bundle profile|bundle member|manifest|archive)\b/i },

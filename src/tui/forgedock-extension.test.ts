@@ -350,6 +350,10 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.equal(spawnRequest.params.chain, undefined);
   assert.match(spawnRequest.params.task, /forgedock_work_on.*\{"issue":7,"repo":"[^"]+","dependencies":\[\]/);
   assert.match(spawnRequest.params.task, /"autoMerge":true/);
+  assert.match(spawnRequest.params.task, /"scopeExpansion":"scope-locked"/);
+  assert.match(spawnRequest.params.task, /"maxRemediationCycles":2/);
+  assert.match(spawnRequest.params.task, /"maxRemediationDepth":2/);
+  assert.match(spawnRequest.params.task, /"maxRemediationChildren":8/);
   assert.match(spawnRequest.params.task, /"resume":true/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);

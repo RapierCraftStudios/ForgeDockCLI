@@ -237,6 +237,7 @@ export async function resumeBuildWorkOn(
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
@@ -560,6 +561,7 @@ export async function resumeWorkOn(
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
@@ -679,6 +681,7 @@ export async function resumeWorkOn(
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
@@ -725,6 +728,7 @@ export async function resumeReviewWorkOn(
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
@@ -793,6 +797,7 @@ export async function resumeReviewWorkOn(
         const completed = await completeWorkItem({
           run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
           ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+          ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
         }, dependencies);
         run = completed.run;
         return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
@@ -903,6 +908,7 @@ export async function resumeReviewWorkOn(
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
@@ -1054,6 +1060,7 @@ export async function resumePublicationWorkOn(
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
     signal?: AbortSignal;
   },
@@ -1161,6 +1168,7 @@ export async function resumePublicationWorkOn(
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
@@ -1189,6 +1197,7 @@ export async function resumeCompletionWorkOn(
     pullRequest: PullRequestSnapshot;
     autoMerge?: boolean;
     batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
     workspace?: GitWorkspace;
   },
   dependencies: WorkOnDependencies,
@@ -1212,6 +1221,7 @@ export async function resumeCompletionWorkOn(
       verdict: input.verdict,
       autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest: input.pullRequest, awaitingHuman: completed.awaitingHuman };

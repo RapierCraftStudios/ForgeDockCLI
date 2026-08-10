@@ -555,6 +555,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       autoMerge: Type.Optional(Type.Boolean({ description: "Merge automatically after successful verification and independent approval; defaults enabled unless forge.yaml explicitly disables it" })),
       scopeExpansion: Type.Optional(Type.String({ enum: ["scope-locked", "recursive"] })),
       maxRemediationCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxRemediationDepth: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+      maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       resume: Type.Optional(Type.Boolean({ description: "Explicitly resume a controller-supported durable checkpoint instead of creating a new run" })),
       background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
@@ -580,6 +582,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       args.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
       if (params.scopeExpansion) args.push("--scope-expansion", params.scopeExpansion);
       if (params.maxRemediationCycles !== undefined) args.push("--max-remediation-cycles", String(params.maxRemediationCycles));
+      if (params.maxRemediationDepth !== undefined) args.push("--max-remediation-depth", String(params.maxRemediationDepth));
+      if (params.maxRemediationChildren !== undefined) args.push("--max-remediation-children", String(params.maxRemediationChildren));
       if (params.rerun) args.push("--rerun");
       if (params.resume) args.push("--resume");
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
@@ -700,6 +704,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       noMilestone: Type.Optional(Type.Boolean()),
       scopeExpansion: Type.Optional(Type.String({ enum: ["scope-locked", "recursive"] })),
       maxRemediationCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxRemediationDepth: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
+      maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       dryRun: Type.Optional(Type.Boolean()),
       autoMerge: Type.Optional(Type.Boolean({ description: "Merge each work unit automatically after successful verification and independent approval; defaults enabled unless forge.yaml explicitly disables it" })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
@@ -760,6 +766,8 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const effective = resolveOrchestrationConfig(config, {
         ...(params.batching ? { batchingPolicy: params.batching as "aggressive" | "conservative" | "none" } : {}),
         ...(params.maxRemediationCycles !== undefined ? { maxRemediationCycles: params.maxRemediationCycles } : {}),
+        ...(params.maxRemediationDepth !== undefined ? { maxRemediationDepth: params.maxRemediationDepth } : {}),
+        ...(params.maxRemediationChildren !== undefined ? { maxRemediationChildren: params.maxRemediationChildren } : {}),
         ...(params.scopeExpansion ? { scopeExpansion: params.scopeExpansion as "scope-locked" | "recursive" } : {}),
         ...(params.maxParallel !== undefined ? { maxParallel: params.maxParallel } : {}),
         ...(params.autoMerge !== undefined ? { autoMerge: params.autoMerge } : {}),
@@ -1340,7 +1348,7 @@ function buildIssueWorkerTask(
     brief ? `Issue brief — ${brief.title}: ${brief.summary}` : "No issue brief was supplied; escalate rather than guessing if the controller request is ambiguous.",
     "If scope, product intent, or a risky decision is genuinely ambiguous, call contact_supervisor with need_decision or interview_request and wait for the reply.",
     `Resolved controller policy (workers cannot override): batching=${options.batching}; scopeExpansion=${options.scopeExpansion}; maxRemediationCycles=${options.maxRemediationCycles}; maxRemediationDepth=${options.maxRemediationDepth}; maxRemediationChildren=${options.maxRemediationChildren}.`,
-    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, rerun: Boolean(options.rerun), resume: options.resume })}`,
+    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
 }

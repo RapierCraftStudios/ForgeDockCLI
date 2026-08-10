@@ -11,6 +11,7 @@ export const BuilderSubmissionSchema = Type.Object({
   summary: Type.String({ minLength: 1 }),
   changedPaths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
   criterionCoverage: Type.Array(Type.Object({
+    criterionId: Type.Optional(Type.String({ pattern: "^criterion-[1-9][0-9]*$" })),
     criterion: Type.String({ minLength: 1 }),
     implementation: Type.String({ minLength: 1 }),
   })),
@@ -53,6 +54,7 @@ export async function buildWorkItem(
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "The controller runs every verification command and owns git publication after your edits; do not claim that checks ran in this session.",
+        "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion and use implementation only for the concrete evidence.",
         "Before submitting, re-read changed files for malformed edits and whitespace damage.",
         "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",
       ].join("\n"),

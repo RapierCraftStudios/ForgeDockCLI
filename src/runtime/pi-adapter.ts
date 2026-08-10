@@ -168,6 +168,15 @@ export class PiAgentRuntime implements AgentRuntime {
     try {
       await session.prompt(buildPrompt(task));
       if (submitted === undefined) {
+        // A model may finish a useful read-only turn without invoking the
+        // structured-output tool. Keep the same context once, then fail closed
+        // so the workflow can apply its own bounded fresh-session recovery.
+        await session.prompt([
+          "You have not submitted the required structured result yet.",
+          "Do not continue exploring or editing. Use the evidence already gathered, produce a schema-valid result, and call submit_artifact exactly once now as your final action.",
+        ].join("\n"));
+      }
+      if (submitted === undefined) {
         throw new Error(`Agent ${task.id} ended without calling submit_artifact`);
       }
       emit({ type: "session.completed", taskId: task.id, sessionRef });

@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
-import { ConcurrentRunUpdateError, type ArtifactRepository, type RunRepository } from "../../core/ports/repositories.js";
+import { ConcurrentRunUpdateError, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
@@ -29,6 +29,15 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         PRIMARY KEY (run_id, sequence),
         FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS run_progress (
+        progress_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        message TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS run_progress_run ON run_progress(run_id, progress_id);
       CREATE TABLE IF NOT EXISTS artifacts (
         artifact_id TEXT PRIMARY KEY,
         subject_key TEXT NOT NULL,
@@ -113,6 +122,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       this.#database.prepare("DELETE FROM transitions WHERE run_id = ?").run(state.runId);
+      this.#database.prepare("DELETE FROM run_progress WHERE run_id = ?").run(state.runId);
       this.#database.prepare(`
         INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET version = excluded.version, state_json = excluded.state_json
@@ -151,6 +161,21 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   async history(runId: string): Promise<TransitionRecord[]> {
     const rows = this.#database.prepare("SELECT record_json FROM transitions WHERE run_id = ? ORDER BY sequence").all(runId);
     return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as TransitionRecord);
+  }
+
+  async recordProgress(progress: RunProgressRecord): Promise<void> {
+    this.#database.prepare(`
+      INSERT INTO run_progress (run_id, phase, message, occurred_at)
+      VALUES (?, ?, ?, ?)
+    `).run(progress.runId, progress.phase, progress.message, progress.occurredAt);
+  }
+
+  async listProgress(runId: string): Promise<RunProgressRecord[]> {
+    const rows = this.#database.prepare(`
+      SELECT run_id, phase, message, occurred_at
+      FROM run_progress WHERE run_id = ? ORDER BY progress_id
+    `).all(runId) as Array<{ run_id: string; phase: string; message: string; occurred_at: string }>;
+    return rows.map((row) => ({ runId: row.run_id, phase: row.phase, message: row.message, occurredAt: row.occurred_at }));
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {

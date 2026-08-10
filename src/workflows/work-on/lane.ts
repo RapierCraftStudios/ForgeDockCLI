@@ -7,7 +7,7 @@ export type IssueLane =
   | {
     kind: "fast";
     targetBranch: string;
-    resolution: "repository-default";
+    resolution: "repository-default" | "explicit-source-branch";
   }
   | {
     kind: "feature";
@@ -51,11 +51,18 @@ export function sanitizeMilestoneSlug(title: string): string {
 
 /** Pure classification over an authoritative issue snapshot and remote branch catalog. */
 export function classifyIssueLane(
-  issue: Pick<IssueSnapshot, "repo" | "number" | "milestone">,
+  issue: Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">,
   defaultBranch: string,
   milestoneBranches: readonly BranchSnapshot[] = [],
 ): IssueLane {
   assertBranchName(defaultBranch, "repository default branch");
+  const explicitSourceBranch = sourceBranchFromIssue(issue);
+  if (explicitSourceBranch) {
+    return { kind: "fast", targetBranch: explicitSourceBranch, resolution: "explicit-source-branch" };
+  }
+  if (isStagingReview(issue)) {
+    throw new Error(`Staging-review issue #${issue.number} requires explicit Code branch or Worktree base branch evidence`);
+  }
   if (!issue.milestone) {
     return { kind: "fast", targetBranch: defaultBranch, resolution: "repository-default" };
   }
@@ -106,7 +113,7 @@ export function classifyIssueLane(
 
 /** Resolve and revalidate a lane before any workspace or pull request exists. */
 export async function resolveIssueLane(
-  issue: Pick<IssueSnapshot, "repo" | "number" | "milestone">,
+  issue: Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">,
   defaultBranch: string,
   branches: IssueLaneBranchReader,
 ): Promise<IssueLane> {
@@ -119,7 +126,9 @@ export async function resolveIssueLane(
 export function laneEvidence(lane: IssueLane): string {
   return lane.kind === "feature"
     ? `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution}).`
-    : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
+    : lane.resolution === "explicit-source-branch"
+      ? `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`
+      : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
 }
 
 export function runTargetForLane(lane: IssueLane): RunTarget {
@@ -173,6 +182,31 @@ export function assertRunTargetsBranch(run: RunState, branch: string): void {
   if (run.targetBranch !== branch) {
     throw new Error(`Run ${run.runId} targets ${run.targetBranch}, not ${branch}`);
   }
+}
+
+function sourceBranchFromIssue(
+  issue: Pick<IssueSnapshot, "body" | "labels">,
+): string | undefined {
+  if (!isStagingReview(issue)) return undefined;
+  const body = issue.body ?? "";
+  const codeBranch = sourceBranchValue(/\*\*Code branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]);
+  const worktreeBase = sourceBranchValue(/\*\*Worktree base\*\*:\s*`?origin\/([^`\r\n]+)`?/i.exec(body)?.[1]);
+  const sourceBranch = worktreeBase ?? codeBranch;
+  if (!sourceBranch) return undefined;
+  if (codeBranch && worktreeBase && codeBranch !== worktreeBase) {
+    throw new Error(`Staging-review source branch evidence conflicts: code branch '${codeBranch}' versus worktree base 'origin/${worktreeBase}'`);
+  }
+  assertBranchName(sourceBranch, "staging-review source branch");
+  return sourceBranch;
+}
+
+function sourceBranchValue(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/^origin\//i, "");
+  return normalized || undefined;
+}
+
+function isStagingReview(issue: Pick<IssueSnapshot, "labels">): boolean {
+  return (issue.labels ?? []).some((label) => label.trim().toLowerCase() === "staging-review");
 }
 
 function assertBranchName(branch: string, label: string): void {

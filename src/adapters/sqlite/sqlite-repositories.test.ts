@@ -30,6 +30,21 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("persists controller progress without advancing the state-machine version", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 11 }, runId: "run_progress" });
+      await store.create(run);
+      await store.recordProgress({ runId: run.runId, phase: "controller.heartbeat", message: "Lease renewed", occurredAt: "2026-01-01T00:00:00.000Z" });
+      assert.equal((await store.load(run.runId))?.version, run.version);
+      assert.deepEqual(await store.listProgress(run.runId), [{
+        runId: run.runId, phase: "controller.heartbeat", message: "Lease renewed", occurredAt: "2026-01-01T00:00:00.000Z",
+      }]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists telemetry receipts idempotently for status projections", async () => {
     const store = new SqliteRepositories(":memory:");
     try {
@@ -61,9 +76,11 @@ describe("SQLite operational repositories", () => {
       await store.create(queued);
       const started = transition(queued, "START_INVESTIGATION");
       await store.commit(queued.version, started.state, started.record);
+      await store.recordProgress({ runId: queued.runId, phase: "controller.heartbeat", message: "stale", occurredAt: "2026-01-01T00:00:00.000Z" });
       store.rebuildRun({ ...queued, state: "building" });
       assert.equal((await store.load(queued.runId))?.state, "building");
       assert.deepEqual(await store.history(queued.runId), []);
+      assert.deepEqual(await store.listProgress(queued.runId), []);
     } finally {
       store.close();
     }

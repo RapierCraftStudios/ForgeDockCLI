@@ -214,10 +214,13 @@ export const OutcomePayloadSchema = Type.Object({
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,
     workspacePath: NonEmptyString,
+    baseRef: Type.Optional(NonEmptyString),
+    targetBranch: Type.Optional(NonEmptyString),
     baseSha: Type.Optional(Sha),
     builderSummary: NonEmptyString,
     changedPaths: Type.Array(NonEmptyString),
     criterionCoverage: Type.Optional(Type.Array(Type.Object({
+      criterionId: Type.Optional(Type.String({ pattern: "^criterion-[1-9][0-9]*$" })),
       criterion: NonEmptyString,
       implementation: NonEmptyString,
     }))),
