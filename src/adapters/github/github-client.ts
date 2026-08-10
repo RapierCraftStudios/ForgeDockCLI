@@ -645,6 +645,7 @@ export class GitHubClient implements ForgeHost {
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
+        windowsHide: true,
       });
       let stdout = "";
       let stderr = "";
@@ -667,6 +668,7 @@ export class GitHubClient implements ForgeHost {
         env: process.env,
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
+        windowsHide: true,
       });
       let stdout = "";
       let stderr = "";

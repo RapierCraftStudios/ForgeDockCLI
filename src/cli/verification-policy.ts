@@ -51,7 +51,7 @@ function readPackageManifest(cwd: string, baseRef?: string): { scripts?: Record<
   let source: string;
   try {
     source = baseRef
-      ? execFileSync("git", ["show", `${baseRef}:package.json`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+      ? execFileSync("git", ["show", `${baseRef}:package.json`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
       : readFileSync(join(cwd, "package.json"), "utf8");
   } catch (error) {
     const location = baseRef ? `${baseRef}:package.json` : join(cwd, "package.json");

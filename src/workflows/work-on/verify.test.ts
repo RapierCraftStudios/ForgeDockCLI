@@ -347,6 +347,9 @@ describe("verification and commit barrier", () => {
       "Inspect `bin/forgedock-terminal` manually.",
       "Inspect `Dockerfile` manually.",
     ], [command]), []);
+    assert.deepEqual(uncoveredVerificationCommands([
+      "Confirm controller lifecycle gates: independent approval, PR target branch, automatic merge, trajectory publication, and authoritative issue closure.",
+    ], [command]), []);
   });
 
   it("rejects out-of-packet paths before executing repository commands", async () => {

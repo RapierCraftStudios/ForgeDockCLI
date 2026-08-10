@@ -147,7 +147,7 @@ export function createGrepToolDefinition(cwd, options) {
                         if (glob)
                             args.push("--glob", glob);
                         args.push("--", pattern, searchPath);
-                        const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+                        const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
                         const rl = createInterface({ input: child.stdout });
                         let stderr = "";
                         let matchCount = 0;

@@ -234,8 +234,10 @@ export function uncoveredVerificationCommands(
   for (const step of plan) {
     const fenced = [...step.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim());
     const hasExecutableVerb = /^\s*(?:run|execute)\s+/i.test(step);
+    const hasControllerLifecycleEvidence = /^\s*(?:confirm|ensure|verify|check)\s+(?:the\s+)?controller\s+lifecycle\s+gates?\b/i.test(step);
     const hasManualEvidenceVerb = (/^\s*(?:inspect|review)\b/i.test(step)
-      || /^\s*(?:confirm|ensure|verify|check)\s+(?:that|the|whether)\b/i.test(step))
+      || /^\s*(?:confirm|ensure|verify|check)\s+(?:that|the|whether)\b/i.test(step)
+      || hasControllerLifecycleEvidence)
       && !hasExecutableVerb;
     const hasExecutionOutcome = /\b(?:exits?\s+(?:with\s+)?(?:zero|0)|returns?\s+(?:zero|0)|passes?|succeeds?|completes?(?:\s+successfully)?|runs?|works?|is\s+green)\b/i.test(step);
     const hasEmbeddedExecutable = /\b(?:git|npm(?:\.cmd)?|node|npx|pnpm|yarn|bun|deno|python|python3|pytest|cargo|go|make|bash|sh|zsh|pwsh|powershell|dotnet|java|mvn|gradle|ruby|bundle|php|composer|swift|cmake|ctest|meson|ninja|eslint|biome|ruff|tsc|vitest|jest)\b/i.test(step)
