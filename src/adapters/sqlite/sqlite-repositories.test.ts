@@ -30,6 +30,29 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("reconstructs an idempotent RemediationBlocked child set", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const subject = { repo: "acme/widget", issue: 9 };
+      const payload = {
+        checkpointKey: "a".repeat(64), checkpointSequence: 2, status: "children-running" as const,
+        parentRunId: "run_remediation", parentIssue: 9, pullRequest: 12, headSha: "b".repeat(40),
+        headBranch: "forge/parent", baseBranch: "main", packetArtifactId: "packet", verdictArtifactId: "verdict",
+        reason: "scope-violation" as const, findings: [{ id: "finding", severity: "high" as const, title: "Fix", evidence: "evidence", location: "src/a.ts", remediation: "fix", acceptanceCriterion: "fixed" }],
+        childIssues: [30, 31], childRunIds: [], approvedPaths: ["src/a.ts"], childOutcomeIds: [], childFinalShas: [],
+        remediationDepth: 0, maxRemediationDepth: 2,
+      };
+      const checkpoint = createArtifact({ kind: "RemediationBlocked", runId: "run_remediation", subject, producer: { role: "controller" }, payload });
+      await store.append(checkpoint);
+      await store.append(checkpoint);
+      const reconstructed = await store.list(subject, "RemediationBlocked");
+      assert.equal(reconstructed.length, 1);
+      assert.deepEqual(reconstructed[0]?.kind === "RemediationBlocked" ? reconstructed[0].payload.childIssues : [], [30, 31]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists controller progress without advancing the state-machine version", async () => {
     const store = new SqliteRepositories(":memory:");
     try {

@@ -83,6 +83,7 @@ export interface BatchIssueInput {
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
+  private readonly remediationMarkerLocks = new Map<string, Promise<void>>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -444,42 +445,45 @@ export class GitHubClient implements ForgeHost {
     }[];
   }): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
-    const existing = await this.listAllIssues(input.repo);
-    const byMarker = new Map(existing.flatMap((issue) => {
-      const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
-      return match?.[1] ? [[match[1], issue] as const] : [];
-    }));
     const created: IssueSnapshot[] = [];
     for (const finding of input.findings) {
       const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
-      const existingIssue = byMarker.get(marker);
-      if (existingIssue) {
-        created.push(existingIssue);
-        continue;
-      }
-      const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
-      const body = [
-        "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
-        `**Parent issue:** #${input.parentIssue}`,
-        `**Parent PR:** #${input.parentPullRequest}`,
-        `**Parent delivery branch:** \`${boundedGitHubCode(input.headBranch)}\``,
-        `**Original target branch:** \`${boundedGitHubCode(input.baseBranch)}\``,
-        `**Parent head SHA:** \`${boundedGitHubCode(input.headSha)}\``,
-        `**Parent run:** \`${boundedGitHubCode(input.parentRunId)}\``,
-        `**Checkpoint:** \`${boundedGitHubCode(input.checkpointKey)}\``,
-        `**Remediation depth:** ${input.remediationDepth}`,
-        `**Finding ID:** \`${boundedGitHubCode(finding.id)}\``,
-        "", "## Evidence", "", boundedGitHubText(finding.evidence, 6_000),
-        "", "## Location", "", `- \`${boundedGitHubCode(finding.location)}\``,
-        "", "## Acceptance Criteria", "", `- [ ] ${boundedGitHubText(finding.acceptanceCriterion, 2_000)}`,
-        "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
-        "", marker,
-      ].join("\n");
-      const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
-      const number = Number(url.split("/").at(-1));
-      if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
-      const issue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
-      byMarker.set(marker, issue);
+      const issue = await this.withRemediationMarkerLock(`${input.repo.toLowerCase()}:${marker}`, async () => {
+        const existing = (await this.listAllIssues(input.repo)).find((candidate) => candidate.body.includes(marker));
+        if (existing) return existing;
+        const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
+        const body = [
+          "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
+          `**Parent issue:** #${input.parentIssue}`,
+          `**Parent PR:** #${input.parentPullRequest}`,
+          `**Parent delivery branch:** \`${boundedGitHubCode(input.headBranch)}\``,
+          `**Original target branch:** \`${boundedGitHubCode(input.baseBranch)}\``,
+          `**Parent head SHA:** \`${boundedGitHubCode(input.headSha)}\``,
+          `**Parent run:** \`${boundedGitHubCode(input.parentRunId)}\``,
+          `**Checkpoint:** \`${boundedGitHubCode(input.checkpointKey)}\``,
+          `**Remediation depth:** ${input.remediationDepth}`,
+          `**Finding ID:** \`${boundedGitHubCode(finding.id)}\``,
+          "", "## Evidence", "", boundedGitHubText(finding.evidence, 6_000),
+          "", "## Location", "", `- \`${boundedGitHubCode(finding.location)}\``,
+          "", "## Acceptance Criteria", "", `- [ ] ${boundedGitHubText(finding.acceptanceCriterion, 2_000)}`,
+          "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
+          "", marker,
+        ].join("\n");
+        const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
+        const number = Number(url.split("/").at(-1));
+        if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
+        // The create response is not a complete authoritative snapshot. Re-read
+        // the issue so every same-marker caller returns the same projection.
+        const snapshot = await this.getIssue(number, input.repo);
+        return {
+          repo: snapshot.repo,
+          number: snapshot.number,
+          title: snapshot.title,
+          body: snapshot.body,
+          url: snapshot.url,
+          state: snapshot.state === "CLOSED" ? ("CLOSED" as const) : ("OPEN" as const),
+        };
+      });
       created.push(issue);
     }
     return created;
@@ -610,6 +614,20 @@ export class GitHubClient implements ForgeHost {
     const current = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
     const remove = current.filter((label) => WORKFLOW_LABEL_NAMES.includes(label as (typeof WORKFLOW_LABEL_NAMES)[number]));
     if (remove.length) await this.gh(["issue", "edit", String(issue), "--repo", repo, "--remove-label", remove.join(",")]);
+  }
+
+  private async withRemediationMarkerLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.remediationMarkerLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.remediationMarkerLocks.set(key, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.remediationMarkerLocks.get(key) === current) this.remediationMarkerLocks.delete(key);
+    }
   }
 
   private async listAllIssues(repo: string): Promise<IssueSnapshot[]> {

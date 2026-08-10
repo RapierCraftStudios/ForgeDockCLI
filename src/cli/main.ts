@@ -477,7 +477,10 @@ async function workOn(argv: string[]): Promise<void> {
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
+      const dependencies = {
+        runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent,
+        leaseRepository: store, leaseOwner,
+      };
       const result = admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
@@ -500,7 +503,13 @@ async function workOn(argv: string[]): Promise<void> {
               ? remediationCheckpoint?.kind === "RemediationBlocked"
                 ? await (async () => {
                   let checkpoint = remediationCheckpoint;
-                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
+                  const supervisor = new RemediationSupervisor({
+                    host: github,
+                    artifacts,
+                    runs,
+                    leaseRepository: store,
+                    leaseOwner,
+                  });
                   if (checkpoint.payload.status === "awaiting-dispatch") {
                     const dispatched = await supervisor.begin({
                       parentRun: run,
@@ -611,6 +620,8 @@ async function workOn(argv: string[]): Promise<void> {
       host: github,
       telemetry: store,
       onAgentEvent,
+      leaseRepository: store,
+      leaseOwner,
     });
     const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
     process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Run ${result.run.runId} · ${result.run.state}${suffix}\n`);
@@ -899,6 +910,8 @@ async function orchestrate(argv: string[]): Promise<void> {
           ...(model !== undefined ? { model } : {}),
         }, {
           runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+          leaseRepository: store,
+          leaseOwner: owner,
           onAgentEvent: (event) => writeAgentEvent(event, item.id),
         });
         outcomes.set(item.id, result.run.state);

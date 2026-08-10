@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition } from "../../core/state/machine.js";
@@ -48,11 +49,40 @@ describe("durable recursive remediation", () => {
     assert.deepEqual(first.childIssues, [30]);
     assert.deepEqual(first.checkpoint.payload.approvedPaths, ["src/a.ts"]);
     const second = await supervisor.begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{ id: "finding-1", severity: "high", title: "Fix adjacent bug", evidence: "evidence", location: "src/a.ts:10", remediation: "Add guard", acceptanceCriterion: "Fix the bug" }] });
-    assert.equal(calls.length, 2);
-    assert.equal(second.childIssues[0], 30);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(second.childIssues, first.childIssues);
+    assert.equal(second.checkpoint.id, first.checkpoint.id);
     const reconstructed = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 } });
     assert.equal(reconstructed?.payload.status, "children-running");
     assert.equal(reconcileArtifacts(await artifacts.list({ repo: "owner/repo", issue: 20 })).state, "blocked");
+  });
+
+  it("admits concurrent begins once and preserves the complete authoritative child set", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const leases = new InMemoryLeaseRepository();
+    let calls = 0;
+    const host = {
+      async materializeRemediationChildren() {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return [{ repo: "owner/repo", number: 30 + calls, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts, leaseRepository: leases, leaseOwner: "test-owner" });
+    const [first, second] = await Promise.all([
+      supervisor.begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{
+        id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug",
+      }] }),
+      supervisor.begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{
+        id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug",
+      }] }),
+    ]);
+    assert.equal(calls, 1);
+    assert.deepEqual(first.childIssues, [31]);
+    assert.deepEqual(second.childIssues, first.childIssues);
+    const latest = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 }, checkpointKey: first.checkpoint.payload.checkpointKey });
+    assert.deepEqual(latest?.payload.childIssues, first.childIssues);
   });
 
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {

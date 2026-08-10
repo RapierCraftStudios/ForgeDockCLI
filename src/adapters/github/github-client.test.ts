@@ -107,6 +107,41 @@ describe("GitHub review finding projection", () => {
   });
 });
 
+describe("GitHub remediation materialization", () => {
+  it("serializes concurrent same-marker creation and returns one snapshot", async () => {
+    const client = new GitHubClient();
+    let creations = 0;
+    let issueBody = "";
+    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) {
+        return JSON.stringify([[...(issueBody ? [{ number: 101, title: "Child", body: issueBody, html_url: "https://github.test/a/b/issues/101", state: "open" }] : [])]]);
+      }
+      if (args[0] === "issue" && args[1] === "create") {
+        creations += 1;
+        issueBody = input ?? "";
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({ number: 101, title: "Child", body: issueBody, url: "https://github.test/a/b/issues/101", state: "OPEN", labels: [], milestone: null });
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const input = {
+      repo: "a/b", parentRunId: "run-parent", parentIssue: 7, parentPullRequest: 9, headSha: "a".repeat(40),
+      headBranch: "forge/parent", baseBranch: "main", checkpointKey: "b".repeat(64), remediationDepth: 1,
+      findings: [{ id: "finding-1", title: "Fix", evidence: "evidence", location: "src/a.ts", remediation: "fix", acceptanceCriterion: "fixed" }],
+    };
+    const [first, second] = await Promise.all([
+      client.materializeRemediationChildren(input),
+      client.materializeRemediationChildren(input),
+    ]);
+    assert.equal(creations, 1);
+    assert.deepEqual(first, second);
+    assert.equal(first[0]?.number, 101);
+  });
+});
+
 describe("GitHub decomposition materialization", () => {
   it("inherits and authoritatively verifies the parent milestone on new children", async () => {
     const client = new GitHubClient();

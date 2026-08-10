@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import type { LeaseRepository } from "../../core/ports/lease.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -37,6 +38,8 @@ export interface WorkOnDependencies {
   verifier: VerificationRunner;
   host: ForgeHost;
   telemetry?: TelemetryRepository;
+  leaseRepository?: LeaseRepository;
+  leaseOwner?: string;
   onAgentEvent?: AgentEventSink;
 }
 
@@ -1007,7 +1010,13 @@ export async function resumeExpandedReviewWorkOn(
     reviewed.verdict, input.packet, input.checkpoint, input.scopeExpansion === "recursive",
   );
   if (expandedViolation && input.scopeExpansion === "recursive") {
-    await new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }).terminalize(input.checkpoint);
+    await new RemediationSupervisor({
+      host: dependencies.host,
+      artifacts: dependencies.artifacts,
+      runs: dependencies.runs,
+      ...(dependencies.leaseRepository ? { leaseRepository: dependencies.leaseRepository } : {}),
+      ...(dependencies.leaseOwner ? { leaseOwner: dependencies.leaseOwner } : {}),
+    }).terminalize(input.checkpoint);
     return {
       run: await blockForScopeViolation(reviewed.run, input.pullRequest, input.packet, reviewed.verdict, expandedViolation, {
         scopeExpansion: input.scopeExpansion,
@@ -1022,7 +1031,13 @@ export async function resumeExpandedReviewWorkOn(
   }
   if (reviewed.run.state !== "merging") {
     const reason = expandedViolation ?? "Fresh expanded-scope review requested additional changes";
-    await new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }).terminalize(input.checkpoint);
+    await new RemediationSupervisor({
+      host: dependencies.host,
+      artifacts: dependencies.artifacts,
+      runs: dependencies.runs,
+      ...(dependencies.leaseRepository ? { leaseRepository: dependencies.leaseRepository } : {}),
+      ...(dependencies.leaseOwner ? { leaseOwner: dependencies.leaseOwner } : {}),
+    }).terminalize(input.checkpoint);
     return { run: await blockForReviewFindings(reviewed.run, input.pullRequest, reviewed.verdict, dependencies, reason), pullRequest: input.pullRequest };
   }
   const completed = await completeWorkItem({
@@ -1318,7 +1333,13 @@ async function blockForRecursiveRemediation(
   dependencies: WorkOnDependencies,
   limits: { depth?: number; maxDepth?: number; maxChildren?: number; approvedPaths?: readonly string[] },
 ): Promise<RunState> {
-  const supervisor = new RemediationSupervisor({ host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs }, {
+  const supervisor = new RemediationSupervisor({
+    host: dependencies.host,
+    artifacts: dependencies.artifacts,
+    runs: dependencies.runs,
+    ...(dependencies.leaseRepository ? { leaseRepository: dependencies.leaseRepository } : {}),
+    ...(dependencies.leaseOwner ? { leaseOwner: dependencies.leaseOwner } : {}),
+  }, {
     ...(limits.maxDepth !== undefined ? { maxDepth: limits.maxDepth } : {}),
     ...(limits.maxChildren !== undefined ? { maxChildren: limits.maxChildren } : {}),
   });
