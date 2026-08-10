@@ -165,8 +165,19 @@ function conceptTags(finding: Finding): Set<string> {
 
 function findingPaths(finding: Finding): string[] {
   const text = `${finding.location ?? ""}\n${finding.evidence}`.replaceAll("\\", "/");
-  return unique([...text.matchAll(/(?:^|[\s`(])((?:\.?[A-Za-z0-9_.@+-]+\/)+[A-Za-z0-9_.@+-]+)(?=[:`),;\s]|$)/gm)]
-    .map((match) => match[1]!.replace(/^\.\//, "").toLowerCase()));
+  const paths: string[] = [];
+  for (const token of text.split(/[\s`(),;]+/g)) {
+    const colon = token.indexOf(":");
+    const candidate = (colon === -1 ? token : token.slice(0, colon)).replace(/^\.\//, "");
+    const segments = candidate.split("/");
+    if (segments.length < 2 || segments.some((segment) => !isPathSegment(segment))) continue;
+    paths.push(candidate.toLowerCase());
+  }
+  return unique(paths);
+}
+
+function isPathSegment(value: string): boolean {
+  return /^[A-Za-z0-9_.@+-]+$/.test(value);
 }
 
 function titleTokens(title: string): Set<string> {

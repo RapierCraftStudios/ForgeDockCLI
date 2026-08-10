@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ForgeHost, IssueSnapshot } from "../../core/ports/forge-host.js";
+import type { IssueSnapshot } from "../../core/ports/forge-host.js";
 import {
   affectedFilesFromIssueBody,
   batchExclusionReason,
@@ -171,7 +171,38 @@ function priorityLabel(items: readonly BatchableWorkItem[]): "priority:P0" | "P0
 }
 
 function safeTitle(value: string): string {
-  return value.replace(/<!--[\s\S]*?-->/g, "").replace(/[\r\n]+/g, " ").trim().slice(0, 120) || "compatible-work";
+  let sanitized = value;
+  let previous: string;
+  do {
+    previous = sanitized;
+    sanitized = stripHtmlComments(sanitized)
+      .replaceAll("--!>", "")
+      .replaceAll("-->", "");
+  } while (sanitized !== previous);
+  return sanitized.replace(/[\r\n]+/g, " ").trim().slice(0, 120) || "compatible-work";
+}
+
+function stripHtmlComments(value: string): string {
+  let result = "";
+  let cursor = 0;
+  while (cursor < value.length) {
+    const opener = value.indexOf("<!--", cursor);
+    if (opener === -1) {
+      result += value.slice(cursor);
+      break;
+    }
+    result += value.slice(cursor, opener);
+    let close = value.indexOf("-->", opener + 4);
+    let closeLength = 3;
+    const alternateClose = value.indexOf("--!>", opener + 4);
+    if (alternateClose !== -1 && (close === -1 || alternateClose < close)) {
+      close = alternateClose;
+      closeLength = 4;
+    }
+    if (close === -1) break;
+    cursor = close + closeLength;
+  }
+  return result;
 }
 
 function escapeRegExp(value: string): string {

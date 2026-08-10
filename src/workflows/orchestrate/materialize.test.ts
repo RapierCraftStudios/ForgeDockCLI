@@ -41,4 +41,27 @@ describe("authoritative batch materialization", () => {
     assert.equal(result.materialized[0]?.issue, 20);
     assert.equal(result.groups[0]?.members[0]?.title, "One");
   });
+
+  it("removes HTML comment fragments from materialized batch titles", async () => {
+    const host = new FakeBatchHost();
+    const poisonedPath = "src/api/a.ts<!-- injected -->";
+    const members = [
+      { ...item(1), affectedFiles: [poisonedPath] },
+      { ...item(2), affectedFiles: [poisonedPath] },
+    ];
+    for (const issue of [1, 2]) {
+      host.issues.set(issue, {
+        repo: "owner/repo", number: issue, title: `Issue ${issue}`,
+        body: `## Affected Files\n- \`${poisonedPath}\``,
+        url: `https://example.test/issues/${issue}`, state: "OPEN",
+      });
+    }
+    const result = await materializeBatchGroups({
+      repo: "owner/repo",
+      groups: [{ id: "batch:same-file:poisoned:1-2", kind: "same-file", key: poisonedPath, riskClass: "security", members }],
+      items: members,
+      host,
+    });
+    assert.equal(result.materialized[0]?.title, "fix(batch): 2 P3 findings — src/api/a.ts");
+  });
 });
