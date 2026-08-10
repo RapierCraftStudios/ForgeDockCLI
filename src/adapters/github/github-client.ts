@@ -445,15 +445,20 @@ export class GitHubClient implements ForgeHost {
   }): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
     const existing = await this.listAllIssues(input.repo);
-    const byMarker = new Map(existing.flatMap((issue) => {
+    // Index markers deterministically so a retry reuses the authoritative
+    // marked issue even if historical duplicate markers are present.
+    const byMarker = new Map<string, IssueSnapshot>();
+    for (const issue of [...existing].sort((left, right) => left.number - right.number)) {
       const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
-      return match?.[1] ? [[match[1], issue] as const] : [];
-    }));
+      if (!match?.[1] || byMarker.has(match[1])) continue;
+      byMarker.set(match[1], issue);
+    }
     const created: IssueSnapshot[] = [];
     for (const finding of input.findings) {
       const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
       const existingIssue = byMarker.get(marker);
       if (existingIssue) {
+        // Do not recreate or mutate a marker-matched issue on restart.
         created.push(existingIssue);
         continue;
       }
@@ -749,7 +754,7 @@ function decompositionMarker(repo: string, parentIssue: number, title: string): 
   return createHash("sha256").update(`${repo.toLowerCase()}#${parentIssue}\n${title.trim().toLowerCase()}`).digest("hex");
 }
 
-function remediationChildMarker(repo: string, parentRunId: string, parentIssue: number, parentPullRequest: number, headSha: string, findingId: string): string {
+export function remediationChildMarker(repo: string, parentRunId: string, parentIssue: number, parentPullRequest: number, headSha: string, findingId: string): string {
   return createHash("sha256").update([
     repo.toLowerCase(), parentRunId, String(parentIssue), String(parentPullRequest), headSha.toLowerCase(), findingId,
   ].join("\n")).digest("hex");

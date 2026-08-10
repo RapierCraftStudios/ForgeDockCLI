@@ -71,6 +71,28 @@ describe("remediation child routing", () => {
     });
   });
 
+  it("rejects a child that belongs only to a stale checkpoint", async () => {
+    const artifacts = await repository();
+    const prior = (await artifacts.list({ repo: "owner/repo", issue: 20 }, "RemediationBlocked"))[0];
+    assert.equal(prior?.kind, "RemediationBlocked");
+    if (!prior || prior.kind !== "RemediationBlocked") throw new Error("test fixture checkpoint missing");
+    await artifacts.append(createArtifact({
+      kind: "RemediationBlocked",
+      runId: prior.runId,
+      subject: prior.subject,
+      producer: prior.producer,
+      payload: { ...prior.payload, checkpointSequence: 3, childIssues: [31] },
+    }));
+    await assert.rejects(
+      resolveParentRemediationTargetFromIssue({ repo: "owner/repo", number: 30, body }, artifacts),
+      /not authorized by active checkpoint/,
+    );
+    const target = await resolveParentRemediationTargetFromIssue(
+      { repo: "owner/repo", number: 31, body }, artifacts,
+    );
+    assert.equal(target?.parentHeadSha, "a".repeat(40));
+  });
+
   it("rejects forged remediation prose for an issue absent from the checkpoint", async () => {
     await assert.rejects(
       resolveParentRemediationTargetFromIssue(

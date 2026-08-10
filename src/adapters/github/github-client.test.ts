@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
-import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, remediationChildMarker, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -180,6 +180,34 @@ describe("GitHub decomposition materialization", () => {
     assert.ok(edit);
     assert.deepEqual(edit.slice(edit.indexOf("--milestone")), ["--milestone", "Milestone One"]);
     assert.equal(children[0]?.milestone?.number, 1);
+  });
+});
+
+describe("GitHub remediation materialization", () => {
+  it("reuses an existing deterministic marker on retry", async () => {
+    const client = new GitHubClient();
+    const input = {
+      repo: "a/b", parentRunId: "run_parent", parentIssue: 20, parentPullRequest: 9,
+      headSha: "a".repeat(40), headBranch: "forge/parent", baseBranch: "main", checkpointKey: "c".repeat(64), remediationDepth: 1,
+      findings: [{ id: "finding-1", title: "Fix", evidence: "Evidence", location: "src/a.ts:1", remediation: "Guard", acceptanceCriterion: "Guard passes" }],
+    };
+    const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, "finding-1");
+    let issue: { number: number; title: string; body: string; html_url: string; state: string } | undefined;
+    let creates = 0;
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issue ? [issue] : []]);
+      if (args[0] === "issue" && args[1] === "create") {
+        creates += 1;
+        issue = { number: 40, title: "Child", body: `<!-- FORGEDOCK:REMEDIATION_CHILD ${marker} -->`, html_url: "https://github.test/a/b/issues/40", state: "open" };
+        return "https://github.test/a/b/issues/40\n";
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const first = await client.materializeRemediationChildren(input);
+    const second = await client.materializeRemediationChildren(input);
+    assert.deepEqual(first.map((child) => child.number), [40]);
+    assert.deepEqual(second.map((child) => child.number), [40]);
+    assert.equal(creates, 1);
   });
 });
 

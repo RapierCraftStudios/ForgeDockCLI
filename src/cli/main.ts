@@ -477,7 +477,7 @@ async function workOn(argv: string[]): Promise<void> {
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, lease: store, telemetry: store, onAgentEvent };
       const result = admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
@@ -500,7 +500,7 @@ async function workOn(argv: string[]): Promise<void> {
               ? remediationCheckpoint?.kind === "RemediationBlocked"
                 ? await (async () => {
                   let checkpoint = remediationCheckpoint;
-                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
+                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs, lease: store });
                   if (checkpoint.payload.status === "awaiting-dispatch") {
                     const dispatched = await supervisor.begin({
                       parentRun: run,
@@ -609,6 +609,7 @@ async function workOn(argv: string[]): Promise<void> {
       git,
       verifier,
       host: github,
+      lease: store,
       telemetry: store,
       onAgentEvent,
     });
@@ -898,7 +899,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
         }, {
-          runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+          runtime, artifacts, runs, git, verifier, host: github, lease: store, telemetry: store,
           onAgentEvent: (event) => writeAgentEvent(event, item.id),
         });
         outcomes.set(item.id, result.run.state);
