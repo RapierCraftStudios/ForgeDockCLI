@@ -30,13 +30,22 @@ if (!isSupported(process.versions.node)) {
   const subagentsEntry = fileURLToPath(import.meta.resolve("pi-subagents"));
   const controllerEntry = resolve(dirname(self), "forgedock-next.mjs");
   const packageRoot = resolve(dirname(self), "..");
+  let runtimeError;
+  try {
+    await assertRuntimeInstall(packageEntry);
+  } catch (error) {
+    runtimeError = error;
+  }
   const extensionEntry = resolve(packageRoot, "dist", "tui", "forgedock-extension.js");
   const workerAgentModule = resolve(packageRoot, "dist", "tui", "worker-agent.js");
   const configModule = resolve(packageRoot, "dist", "core", "config", "forgedock-config.js");
   const environmentModule = resolve(packageRoot, "dist", "runtime", "controller-environment.js");
   const workerAgentTemplate = resolve(packageRoot, "agents", "forgedock-issue-worker.md");
   const reviewerAgentTemplate = resolve(packageRoot, "agents", "forgedock-reviewer.md");
-  if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(configModule) || !existsSync(environmentModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
+  if (runtimeError) {
+    console.error(runtimeError instanceof Error ? runtimeError.message : String(runtimeError));
+    process.exitCode = 1;
+  } else if (!existsSync(terminalEntry) || !existsSync(extensionEntry) || !existsSync(workerAgentModule) || !existsSync(configModule) || !existsSync(environmentModule) || !existsSync(workerAgentTemplate) || !existsSync(reviewerAgentTemplate) || !existsSync(subagentsEntry)) {
     console.error("ForgeDock terminal has not been built. Run `npm run build:pi && npm run build` first.");
     process.exitCode = 1;
   } else {
@@ -67,6 +76,27 @@ if (!isSupported(process.versions.node)) {
       .join(delimiter);
     process.argv.splice(2, 0, "--extension", subagentsEntry, "--extension", extensionEntry);
     await import(pathToFileURL(terminalEntry).href);
+  }
+}
+
+async function assertRuntimeInstall(packageEntry) {
+  const dispatcherEntry = join(dirname(packageEntry), "core", "http-dispatcher.js");
+  if (!existsSync(dispatcherEntry)) {
+    throw new Error(`ForgeDock runtime installation is incomplete: HTTP dispatcher is missing at ${dispatcherEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`);
+  }
+  let undiciEntry;
+  try {
+    undiciEntry = fileURLToPath(import.meta.resolve("undici", pathToFileURL(dispatcherEntry).href));
+  } catch (error) {
+    throw new Error(`ForgeDock runtime installation is incomplete: undici cannot be resolved from ${dispatcherEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`, { cause: error });
+  }
+  if (!existsSync(undiciEntry)) {
+    throw new Error(`ForgeDock runtime installation is incomplete: undici resolves to a missing file ${undiciEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`);
+  }
+  try {
+    await import(pathToFileURL(dispatcherEntry).href);
+  } catch (error) {
+    throw new Error(`ForgeDock runtime installation is incomplete: the HTTP dispatcher or one of its imports cannot be loaded from ${dispatcherEntry}. Stop active ForgeDock controllers, repair the checkout with 'npm ci --ignore-scripts --no-audit --no-fund' and 'npm run build', then restart. Do not run npm ci in a live controller checkout.`, { cause: error });
   }
 }
 
