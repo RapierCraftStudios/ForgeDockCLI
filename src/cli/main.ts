@@ -222,7 +222,11 @@ async function workOn(argv: string[]): Promise<void> {
       `Dependency #${dependency} admission: authoritative artifact state completed${reconciled.runId ? ` in run ${reconciled.runId}` : ""}; merged Outcome recorded ${mergedOutcome?.createdAt ?? "with no timestamp"}; issue state ${dependencyIssue.state}; labels ${dependencyIssue.labels.join(", ") || "none"}`,
     );
   }
-  const priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
+  // Read the remediation kind through its bounded startup barrier before the
+  // untyped admission read. Otherwise an old verdict/failure projection can
+  // win while an awaiting checkpoint is still becoming visible, causing a
+  // fresh live-head key to be derived instead of recovering the stored key.
+  const priorArtifacts = dryRun ? [] : await listStartupArtifacts(authoritativeArtifacts, subject);
   let resumeRunId: string | undefined;
   let progressRunId = runId;
   let resumeCheckpoint: string | undefined;
@@ -370,6 +374,9 @@ async function workOn(argv: string[]): Promise<void> {
         : openPullRequest;
       if (admission.checkpoint === "remediation" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
         throw new Error(`Run ${resumeRunId} no longer has the Build Result, Review Verdict, and open PR required for remediation resume`);
+      }
+      if (admission.checkpoint === "remediation" && remediationCheckpoint?.kind !== "RemediationBlocked") {
+        throw new Error(`Run ${resumeRunId} has remediation admission evidence but its exact RemediationBlocked checkpoint is not visible; refusing live-head rekey`);
       }
       if (admission.checkpoint === "remediation" && remediationCheckpoint?.kind === "RemediationBlocked" && remediationCheckpoint.payload.status === "terminal") {
         throw new Error(`Run ${resumeRunId} has a terminal recursive-remediation checkpoint; human intervention is required`);
@@ -1071,6 +1078,16 @@ function commandAutoMerge(argv: string[]): boolean {
   if (enabled && disabled) throw new Error("--auto-merge and --no-auto-merge cannot be used together");
   const requested = enabled ? true : disabled ? false : undefined;
   return resolveAutoMerge(requested, readForgeDockConfig(process.cwd()).autoMerge);
+}
+
+async function listStartupArtifacts(
+  repository: GitHubArtifactRepository,
+  subject: { repo: string; issue: number },
+): Promise<DurableArtifact[]> {
+  const remediation = await repository.listConsistent(subject, "RemediationBlocked");
+  const all = await repository.list(subject);
+  const unique = new Map([...all, ...remediation].map((artifact) => [artifact.id, artifact]));
+  return [...unique.values()];
 }
 
 function option(argv: string[], name: string): string | undefined {

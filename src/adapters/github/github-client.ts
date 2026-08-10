@@ -105,7 +105,6 @@ export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
   private readonly remediationMarkerLocks = new Map<string, Promise<void>>();
-  private readonly remediationMarkerSnapshots = new Map<string, IssueSnapshot>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -205,12 +204,12 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  async postIssueComment(subject: Subject, body: string): Promise<void> {
+  async postIssueComment(subject: Subject, body: string, signal?: AbortSignal): Promise<void> {
     const number = subject.pr ?? subject.issue;
     if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
     await this.gh(
       ["api", `repos/${subject.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
-      JSON.stringify({ body }),
+      JSON.stringify({ body }), signal,
     );
   }
 
@@ -454,13 +453,11 @@ export class GitHubClient implements ForgeHost {
       const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
       const lockKey = `${input.repo.toLowerCase()}:${marker}`;
       const issue = await this.withRemediationMarkerLock(lockKey, async () => {
-        const retained = this.remediationMarkerSnapshots.get(lockKey);
-        if (retained) return retained;
+        // The lock is deliberately the only per-marker cache. Every caller
+        // must re-read the issue and revalidate the complete contract so a
+        // changed checkpoint or a closed child cannot be projected as OPEN.
         const existing = await this.findRemediationChild(input, marker, finding.id);
-        if (existing) {
-          this.remediationMarkerSnapshots.set(lockKey, existing);
-          return existing;
-        }
+        if (existing) return existing;
         const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
         throwIfAborted(input.signal);
         const body = [
@@ -481,14 +478,12 @@ export class GitHubClient implements ForgeHost {
           "", marker,
         ].join("\n");
         throwIfAborted(input.signal);
-        const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
+        const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body, input.signal)).trim();
         const number = Number(url.split("/").at(-1));
         if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
         // The create response is not a complete authoritative snapshot. Re-read
-        // the issue so every same-marker caller returns the same projection.
-        const projected = await this.readRemediationIssue(number, input, marker, finding.id);
-        this.remediationMarkerSnapshots.set(lockKey, projected);
-        return projected;
+        // the issue so every same-marker caller returns an authoritative projection.
+        return this.readRemediationIssue(number, input, marker, finding.id);
       });
       created.push(issue);
     }
@@ -623,13 +618,34 @@ export class GitHubClient implements ForgeHost {
   }
 
   private async findRemediationChild(input: RemediationChildInput, marker: string, findingId: string): Promise<IssueSnapshot | undefined> {
+    let lastContractError: unknown;
     for (let attempt = 0; attempt < 8; attempt += 1) {
       throwIfAborted(input.signal);
-      const candidate = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker));
-      if (candidate) return this.readRemediationIssue(candidate.number, input, marker, findingId);
+      const candidates = (await this.listAllIssues(input.repo)).filter((issue) => issue.body.includes(marker));
+      for (const candidate of candidates) {
+        try {
+          // A public marker is only a lookup hint. Validate every candidate
+          // independently and ignore malformed/closed candidates so one
+          // poisoned issue cannot prevent a legitimate child from being made.
+          return await this.readRemediationIssueOnce(candidate.number, input, marker, findingId);
+        } catch (error) {
+          lastContractError = error;
+        }
+      }
       if (attempt < 7) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
     }
+    // A candidate that has the marker but names another checkpoint is not safe
+    // to adopt. Creation below is still allowed for malformed public markers;
+    // the newly created issue is authoritative for this fully validated input.
+    void lastContractError;
     return undefined;
+  }
+
+  private async readRemediationIssueOnce(number: number, input: RemediationChildInput, marker: string, findingId: string): Promise<IssueSnapshot> {
+    throwIfAborted(input.signal);
+    const snapshot = remediationChildSnapshot(await this.getIssue(number, input.repo));
+    assertRemediationChildContract(snapshot, input, marker, findingId);
+    return snapshot;
   }
 
   private async readRemediationIssue(number: number, input: RemediationChildInput, marker: string, findingId: string): Promise<IssueSnapshot> {
@@ -711,8 +727,12 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  private gh(args: string[], input?: string): Promise<string> {
+  private gh(args: string[], input?: string, signal?: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason instanceof Error ? signal.reason : new Error("GitHub operation aborted"));
+        return;
+      }
       const child = spawn("gh", args, {
         cwd: this.cwd,
         env: process.env,
@@ -726,8 +746,24 @@ export class GitHubClient implements ForgeHost {
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => { stdout += chunk; });
       child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-      child.on("error", reject);
+      let settled = false;
+      const abort = () => {
+        if (settled) return;
+        settled = true;
+        child.kill();
+        signal?.removeEventListener("abort", abort);
+        reject(signal?.reason instanceof Error ? signal.reason : new Error("GitHub operation aborted"));
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      child.on("error", (error) => {
+        settled = true;
+        signal?.removeEventListener("abort", abort);
+        reject(error);
+      });
       child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", abort);
         if (code === 0) resolve(stdout);
         else reject(new Error(`gh ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`));
       });
@@ -865,19 +901,65 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
+    await this.appendFenced(artifact, () => undefined);
+  }
+
+  /** Publish with a caller-supplied ownership fence immediately before each
+   * durable comment write. Remediation uses this boundary with its lease token
+   * heartbeat; ordinary artifact callers pass a no-op fence. */
+  async appendFenced(artifact: DurableArtifact, assertOwnership: () => void, signal?: AbortSignal): Promise<void> {
     const canonical = canonicalSubject(artifact.subject);
     const targets: Subject[] = canonical.pr && canonical.issue
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
       : [canonical];
     for (const target of targets) {
+      assertOwnership();
       const comments = await this.client.listIssueComments(target);
       const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
-      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(artifact));
+      if (!exists) {
+        assertOwnership();
+        await this.client.postIssueComment(target, renderArtifactComment(artifact), signal);
+      }
     }
+    assertOwnership();
     this.recentArtifacts.set(artifact.id, artifact);
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+    const found = await this.readArtifacts(subject, kind, kind === "RemediationBlocked");
+    // This fallback is useful for ordinary callers after a successful append,
+    // but consistency-sensitive recovery uses listConsistent and never relies
+    // on this process-local projection.
+    const unique = new Map([...found, ...this.recentArtifacts.values()].map((artifact) => [artifact.id, artifact]));
+    return [...unique.values()]
+      .filter((artifact) => !kind || artifact.kind === kind)
+      .filter((artifact) => subjectMatches(artifact.subject, subject));
+  }
+
+  /**
+   * Read-after-write barrier for controller handoff. With no expectation this
+   * still performs the bounded RemediationBlocked visibility wait; with an
+   * expectation it returns only after that exact immutable transition is read
+   * from GitHub, not from recentArtifacts.
+   */
+  async listConsistent(
+    subject: Subject,
+    kind: ArtifactKind,
+    expected?: { id?: string; checkpointSequence?: number; status?: string },
+  ): Promise<DurableArtifact[]> {
+    const found = await this.readArtifacts(subject, kind, true, expected);
+    if (expected && !found.some((artifact) => artifactMatchesExpectation(artifact, expected))) {
+      throw new Error(`GitHub did not expose the expected ${kind} artifact transition`);
+    }
+    return found.filter((artifact) => artifact.kind === kind && subjectMatches(artifact.subject, subject));
+  }
+
+  private async readArtifacts(
+    subject: Subject,
+    kind: ArtifactKind | undefined,
+    retryUntilExpected: boolean,
+    expected?: { id?: string; checkpointSequence?: number; status?: string },
+  ): Promise<DurableArtifact[]> {
     const canonical = canonicalSubject(subject);
     const targets: Subject[] = canonical.pr && canonical.issue
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
@@ -885,14 +967,14 @@ export class GitHubArtifactRepository implements ArtifactRepository {
     let found: DurableArtifact[] = [];
     for (let attempt = 0; attempt < 8; attempt += 1) {
       found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
-      const visible = found.some((artifact) => (!kind || artifact.kind === kind) && subjectMatches(artifact.subject, subject));
-      if (visible || attempt === 7 || kind !== "RemediationBlocked") break;
+      const visible = expected
+        ? found.some((artifact) => artifactMatchesExpectation(artifact, expected) && subjectMatches(artifact.subject, subject))
+        : found.some((artifact) => (!kind || artifact.kind === kind) && subjectMatches(artifact.subject, subject));
+      const barrierSatisfied = expected ? visible : attempt === 7;
+      if (barrierSatisfied || attempt === 7 || !retryUntilExpected) break;
       await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
     }
-    const unique = new Map([...found, ...this.recentArtifacts.values()].map((artifact) => [artifact.id, artifact]));
-    return [...unique.values()]
-      .filter((artifact) => !kind || artifact.kind === kind)
-      .filter((artifact) => subjectMatches(artifact.subject, subject));
+    return found;
   }
 }
 
@@ -904,4 +986,14 @@ function subjectMatches(left: Subject, right: Subject): boolean {
   if (left.repo.trim().toLowerCase() !== right.repo.trim().toLowerCase()) return false;
   return (right.issue !== undefined && left.issue === right.issue)
     || (right.pr !== undefined && left.pr === right.pr);
+}
+
+function artifactMatchesExpectation(
+  artifact: DurableArtifact,
+  expected: { id?: string; checkpointSequence?: number; status?: string },
+): boolean {
+  if (expected.id !== undefined && artifact.id !== expected.id) return false;
+  const payload = artifact.payload as { checkpointSequence?: number; status?: string };
+  return (expected.checkpointSequence === undefined || payload.checkpointSequence === expected.checkpointSequence)
+    && (expected.status === undefined || payload.status === expected.status);
 }

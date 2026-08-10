@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
+import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { LeaseRepository } from "../../core/ports/lease.js";
@@ -22,9 +23,23 @@ const REMEDIATION_LEASE_TTL_MS = 60_000;
 const REMEDIATION_LEASE_HEARTBEAT_MS = 20_000;
 const REMEDIATION_READ_RETRIES = 8;
 const REMEDIATION_READ_RETRY_DELAY_MS = 50;
+const REMEDIATION_COMMENT_BUDGET = 60_000;
+interface ConsistencyAwareArtifactRepository extends ArtifactRepository {
+  listConsistent?(
+    subject: { repo: string; issue?: number; pr?: number },
+    kind: "RemediationBlocked",
+    expected?: { id?: string; checkpointSequence?: number; status?: string },
+  ): Promise<DurableArtifact[]>;
+}
 interface RemediationLease {
   token: string;
   heartbeat: { stop(): void; error(): unknown; assertHealthy(): void; signal: AbortSignal };
+}
+class RemediationHandoffPendingError extends Error {
+  constructor(checkpointId: string) {
+    super(`Remediation checkpoint ${checkpointId} was appended but is not yet visible to a fresh controller`);
+    this.name = "RemediationHandoffPendingError";
+  }
 }
 const remediationAdmissionLocks = new Map<string, Promise<void>>();
 
@@ -107,14 +122,21 @@ export class RemediationSupervisor {
     return withRemediationAdmissionLock(`${input.parentRun.subject.repo.toLowerCase()}:${checkpointKey}`, async () => {
       const leaseKey = remediationLeaseKey(input, checkpointKey);
       const lease = await this.acquireLease(leaseKey);
+      let releaseLease = true;
       try {
         lease?.heartbeat.assertHealthy();
         const result = await this.beginLocked(input, checkpointKey, lease);
         lease?.heartbeat.assertHealthy();
         return result;
+      } catch (error) {
+        // The running comment is durable even when GitHub has not exposed it
+        // to this controller yet. Do not hand the admission to a successor
+        // while only this process can know that transition exists.
+        if (error instanceof RemediationHandoffPendingError) releaseLease = false;
+        throw error;
       } finally {
         lease?.heartbeat.stop();
-        if (lease) this.dependencies.leaseRepository?.release(leaseKey, lease.token);
+        if (lease && releaseLease) this.dependencies.leaseRepository?.release(leaseKey, lease.token);
       }
     });
   }
@@ -126,7 +148,15 @@ export class RemediationSupervisor {
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
     const actionable = actionableFindings(input.findings);
     const eligible = actionable.slice(0, maxChildren);
-    const existing = await latestCheckpoint(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
+    const observed = await latestCheckpoint(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
+    // The CLI may have recovered an awaiting artifact from the startup barrier
+    // while a subsequent projection read is still stale. Prefer that exact
+    // stored sequence over deriving a new admission for the same key.
+    const resumed = input.resumeCheckpoint?.payload.checkpointKey === checkpointKey
+      && (!observed || input.resumeCheckpoint.payload.checkpointSequence >= observed.payload.checkpointSequence)
+      ? input.resumeCheckpoint
+      : undefined;
+    const existing = resumed ?? observed;
     if (existing && existing.payload.status !== "awaiting-dispatch") {
       return { checkpoint: existing, childIssues: [...existing.payload.childIssues] };
     }
@@ -154,7 +184,7 @@ export class RemediationSupervisor {
     if (!existing && (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren)) {
       const terminal = createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
       lease?.heartbeat.assertHealthy();
-      await this.dependencies.artifacts.append(terminal);
+      await appendRemediationCheckpoint(this.dependencies.artifacts, terminal, lease);
       lease?.heartbeat.assertHealthy();
       return { checkpoint: await persistedCheckpoint(this.dependencies.artifacts, terminal), childIssues: [] };
     }
@@ -162,7 +192,7 @@ export class RemediationSupervisor {
     const awaiting = existing ?? createCheckpoint(input, base);
     if (!existing) {
       lease?.heartbeat.assertHealthy();
-      await this.dependencies.artifacts.append(awaiting);
+      await appendRemediationCheckpoint(this.dependencies.artifacts, awaiting, lease);
       lease?.heartbeat.assertHealthy();
     }
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
@@ -197,7 +227,7 @@ export class RemediationSupervisor {
       childIssues,
     });
     lease?.heartbeat.assertHealthy();
-    await this.dependencies.artifacts.append(running);
+    await appendRemediationCheckpoint(this.dependencies.artifacts, running, lease);
     lease?.heartbeat.assertHealthy();
     const persisted = await persistedCheckpoint(this.dependencies.artifacts, running);
     lease?.heartbeat.assertHealthy();
@@ -469,26 +499,86 @@ function remediationPayload(
 }
 
 function createCheckpoint(input: RemediationBlockedInput, payload: RemediationBlockedPayload): DurableArtifact<"RemediationBlocked"> {
-  return createArtifact({
-    kind: "RemediationBlocked",
+  const artifactInput = {
+    kind: "RemediationBlocked" as const,
     runId: input.parentRun.runId,
     subject: input.parentRun.subject,
     producer: { role: "controller", runtime: "forgedock" },
-    payload,
-  }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` });
+  };
+  const artifact = createArtifact({ ...artifactInput, payload }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` });
+  return fitRemediationArtifact(artifact);
+}
+
+function fitRemediationArtifact(artifact: DurableArtifact<"RemediationBlocked">): DurableArtifact<"RemediationBlocked"> {
+  if (renderArtifactComment(artifact).length <= REMEDIATION_COMMENT_BUDGET) return artifact;
+
+  // GitHub's projection contains both Markdown and a base64 JSON envelope.
+  // Compact only bounded prose, never finding IDs, severity, locations, child
+  // IDs, or checkpoint metadata. The binary search makes the whole artifact
+  // budget deterministic at every supported child count.
+  let low = 1;
+  let high = 2_000;
+  let best: DurableArtifact<"RemediationBlocked"> | undefined;
+  while (low <= high) {
+    const perFindingBudget = Math.floor((low + high) / 2);
+    const compacted = compactRemediationPayload(artifact.payload, perFindingBudget);
+    const candidate = createArtifact({
+      kind: artifact.kind,
+      runId: artifact.runId,
+      subject: artifact.subject,
+      producer: artifact.producer,
+      payload: compacted,
+    }, { id: artifact.id });
+    if (renderArtifactComment(candidate).length <= REMEDIATION_COMMENT_BUDGET) {
+      best = candidate;
+      low = perFindingBudget + 1;
+    } else {
+      high = perFindingBudget - 1;
+    }
+  }
+  if (!best) throw new Error(`Remediation checkpoint ${artifact.id} exceeds the GitHub artifact comment budget`);
+  return best;
+}
+
+function compactRemediationPayload(payload: RemediationBlockedPayload, budget: number): RemediationBlockedPayload {
+  return {
+    ...payload,
+    findings: payload.findings.map((finding) => {
+      // Location is retained verbatim because it is the routing/scope field;
+      // only prose is compacted. The finding ID and severity are untouched by
+      // the spread below as well.
+      const values = [finding.title, finding.evidence, finding.remediation, finding.acceptanceCriterion]
+        .filter((value): value is string => value !== undefined);
+      const each = Math.max(1, Math.floor(budget / Math.max(1, values.length)));
+      return {
+        ...finding,
+        title: compactRemediationText(finding.title, each),
+        evidence: compactRemediationText(finding.evidence, each),
+        remediation: compactRemediationText(finding.remediation, each),
+        ...(finding.acceptanceCriterion !== undefined ? { acceptanceCriterion: compactRemediationText(finding.acceptanceCriterion, each) } : {}),
+      };
+    }),
+  };
+}
+
+function compactRemediationText(value: string, maximum: number): string {
+  const normalized = value.replaceAll("\u0000", "").trim();
+  if (normalized.length <= maximum) return normalized || "…";
+  if (maximum <= 1) return "…";
+  return `${normalized.slice(0, maximum - 1)}…`;
 }
 
 function createCheckpointFromExisting(
   existing: DurableArtifact<"RemediationBlocked">,
   payload: RemediationBlockedPayload,
 ): DurableArtifact<"RemediationBlocked"> {
-  return createArtifact({
+  return fitRemediationArtifact(createArtifact({
     kind: "RemediationBlocked",
     runId: existing.runId,
     subject: existing.subject,
     producer: existing.producer,
     payload,
-  }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` });
+  }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` }));
 }
 
 async function withRemediationAdmissionLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
@@ -518,14 +608,61 @@ function normalizeChildIssues(numbers: readonly number[]): number[] {
   return [...unique].sort((left, right) => left - right);
 }
 
+interface FencedArtifactRepository extends ArtifactRepository {
+  appendFenced?(artifact: DurableArtifact, assertOwnership: () => void, signal?: AbortSignal): Promise<void>;
+  authoritative?: ArtifactRepository;
+  cache?: ArtifactRepository;
+}
+
+async function appendRemediationCheckpoint(
+  artifacts: ArtifactRepository,
+  checkpoint: DurableArtifact<"RemediationBlocked">,
+  lease: RemediationLease | undefined,
+): Promise<void> {
+  const assertOwnership = () => lease?.heartbeat.assertHealthy();
+  assertOwnership();
+  const repository = artifacts as FencedArtifactRepository;
+  const fenced = repository.appendFenced;
+  if (fenced) {
+    await fenced.call(repository, checkpoint, assertOwnership, lease?.heartbeat.signal);
+  } else {
+    // CachedArtifactRepository intentionally exposes its authoritative and
+    // cache members. Fence the authoritative projection, then refresh the
+    // rebuildable cache only after the durable write succeeds.
+    const authoritative = repository.authoritative as FencedArtifactRepository | undefined;
+    if (authoritative?.appendFenced) {
+      await authoritative.appendFenced(checkpoint, assertOwnership, lease?.heartbeat.signal);
+      await repository.cache?.append(checkpoint);
+    } else {
+      await artifacts.append(checkpoint);
+    }
+  }
+  // A failed fence must never be converted into a successful child-set
+  // result. Repositories with appendFenced perform this check at publication;
+  // this postcondition also protects the ordinary test/cache repositories.
+  assertOwnership();
+}
+
+async function listRemediationArtifacts(
+  artifacts: ArtifactRepository,
+  subject: { repo: string; issue?: number; pr?: number },
+  expected?: { id?: string; checkpointSequence?: number; status?: string },
+): Promise<DurableArtifact<"RemediationBlocked">[]> {
+  const consistent = (artifacts as ConsistencyAwareArtifactRepository).listConsistent;
+  const values = consistent
+    ? await consistent.call(artifacts as ConsistencyAwareArtifactRepository, subject, "RemediationBlocked", expected)
+    : await artifacts.list(subject, "RemediationBlocked");
+  return values.filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> => artifact.kind === "RemediationBlocked");
+}
+
 async function latestCheckpoint(
   artifacts: ArtifactRepository,
   subject: { repo: string; issue?: number; pr?: number },
   key: string,
 ): Promise<DurableArtifact<"RemediationBlocked"> | undefined> {
-  const existing = await artifacts.list(subject, "RemediationBlocked");
+  const existing = await listRemediationArtifacts(artifacts, subject);
   return existing
-    .filter((artifact): artifact is DurableArtifact<"RemediationBlocked"> => artifact.kind === "RemediationBlocked" && artifact.payload.checkpointKey === key)
+    .filter((artifact) => artifact.payload.checkpointKey === key)
     .sort((left, right) => left.payload.checkpointSequence - right.payload.checkpointSequence)
     .at(-1);
 }
@@ -534,21 +671,41 @@ async function persistedCheckpoint(
   artifacts: ArtifactRepository,
   checkpoint: DurableArtifact<"RemediationBlocked">,
 ): Promise<DurableArtifact<"RemediationBlocked">> {
-  for (let attempt = 0; attempt < REMEDIATION_READ_RETRIES; attempt += 1) {
-    const observed = await latestCheckpoint(artifacts, checkpoint.subject, checkpoint.payload.checkpointKey);
-    if (observed?.id === checkpoint.id
-      && observed.payload.checkpointSequence === checkpoint.payload.checkpointSequence
-      && observed.payload.status === checkpoint.payload.status
-      && JSON.stringify(observed.payload.childIssues) === JSON.stringify(checkpoint.payload.childIssues)) {
-      return observed;
+  const expected = {
+    id: checkpoint.id,
+    checkpointSequence: checkpoint.payload.checkpointSequence,
+    status: checkpoint.payload.status,
+  };
+  const consistent = (artifacts as ConsistencyAwareArtifactRepository).listConsistent;
+  if (consistent) {
+    try {
+      const observed = await listRemediationArtifacts(artifacts, checkpoint.subject, expected);
+      const match = observed.find((candidate) => candidate.id === checkpoint.id
+        && candidate.payload.checkpointSequence === checkpoint.payload.checkpointSequence
+        && candidate.payload.status === checkpoint.payload.status
+        && JSON.stringify(candidate.payload.childIssues) === JSON.stringify(checkpoint.payload.childIssues));
+      if (match) return match;
+    } catch {
+      // The consistency-aware repository already performed its bounded wait.
+      // Preserve the durable append and retain the lease for handoff recovery.
     }
-    if (attempt + 1 < REMEDIATION_READ_RETRIES) {
-      await new Promise((resolve) => setTimeout(resolve, REMEDIATION_READ_RETRY_DELAY_MS * (attempt + 1)));
+  } else {
+    for (let attempt = 0; attempt < REMEDIATION_READ_RETRIES; attempt += 1) {
+      const observed = await listRemediationArtifacts(artifacts, checkpoint.subject, expected);
+      const match = observed.find((candidate) => candidate.id === checkpoint.id
+        && candidate.payload.checkpointSequence === checkpoint.payload.checkpointSequence
+        && candidate.payload.status === checkpoint.payload.status
+        && JSON.stringify(candidate.payload.childIssues) === JSON.stringify(checkpoint.payload.childIssues));
+      if (match) return match;
+      if (attempt + 1 < REMEDIATION_READ_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, REMEDIATION_READ_RETRY_DELAY_MS * (attempt + 1)));
+      }
     }
   }
-  // The append has succeeded and the expected transition is immutable. Never
-  // project the preceding awaiting checkpoint after an authority read lag.
-  return checkpoint;
+  // Never release admission while only a caller-local projection knows the
+  // running transition. The durable awaiting checkpoint remains recoverable;
+  // this owner fails and a later controller adopts the exact transition.
+  throw new RemediationHandoffPendingError(checkpoint.id);
 }
 
 async function nextCheckpointSequence(artifacts: ArtifactRepository, subject: { repo: string; issue?: number }, key: string): Promise<number> {
