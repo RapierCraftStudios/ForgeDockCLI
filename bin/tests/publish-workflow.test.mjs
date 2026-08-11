@@ -8,8 +8,26 @@ import { describe, it } from "node:test";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const workflow = readFileSync(join(root, ".github", "workflows", "publish.yml"), "utf8");
+const pushPathsStart = workflow.indexOf("  push:\n");
+const pushPathsEnd = workflow.indexOf("  workflow_dispatch:", pushPathsStart);
+const pushPaths = workflow.slice(pushPathsStart, pushPathsEnd);
+const changedGuardStart = workflow.indexOf("CHANGED=$(git diff --name-only");
+const changedGuardEnd = workflow.indexOf('\n            if [ -z "$CHANGED" ]', changedGuardStart);
+const changedPathGuard = workflow.slice(changedGuardStart, changedGuardEnd);
 
 describe("npm publish workflow recovery", () => {
+  it("includes Pi gitlink, source contents, and staged runtime in both publish path guards", () => {
+    assert.notEqual(pushPathsStart, -1);
+    assert.notEqual(pushPathsEnd, -1);
+    assert.notEqual(changedGuardStart, -1);
+    assert.notEqual(changedGuardEnd, -1);
+
+    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime/**"]) {
+      assert.ok(pushPaths.includes(`'${path}'`), `push.paths should include '${path}'`);
+      assert.ok(changedPathGuard.includes(`'${path}'`), `changed-path guard should include '${path}'`);
+    }
+    assert.doesNotMatch(changedPathGuard, /\.github\/workflows\/publish\.yml/);
+  });
   it("reconciles repository versions when npm publication already succeeded", () => {
     assert.match(workflow, /REGISTRY_ALREADY_PUBLISHED=true/);
     assert.match(workflow, /npm version "\$NEXT_VERSION" --no-git-tag-version --allow-same-version/);
