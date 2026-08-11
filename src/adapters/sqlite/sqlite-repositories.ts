@@ -4,7 +4,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
-import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
+import { migrateArtifact, normalizeSubject, subjectIdentityKey, subjectsMatch, type ArtifactKind, type DurableArtifact, type SubjectInput } from "../../core/artifacts/schema.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 import { ConcurrentRunUpdateError, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
@@ -54,7 +54,9 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         artifact_id TEXT PRIMARY KEY,
         subject_key TEXT NOT NULL,
         kind TEXT NOT NULL,
-        artifact_json TEXT NOT NULL
+        artifact_json TEXT NOT NULL,
+        canonical_repo_key TEXT,
+        canonical_subject_key TEXT
       );
       CREATE INDEX IF NOT EXISTS artifacts_subject_kind ON artifacts(subject_key, kind);
       CREATE TABLE IF NOT EXISTS leases (
@@ -75,25 +77,36 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE INDEX IF NOT EXISTS run_telemetry_run ON run_telemetry(run_id, created_at);
     `);
+    this.migrateArtifactsSchema();
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
-    assertArtifact(artifact);
+    const canonical = migrateArtifact(artifact);
+    const subject = normalizeSubject(canonical.subject);
     await withSqliteBusyRetry(() => this.#database.prepare(`
-      INSERT INTO artifacts (artifact_id, subject_key, kind, artifact_json)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO artifacts (artifact_id, subject_key, kind, artifact_json, canonical_repo_key, canonical_subject_key)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(artifact_id) DO NOTHING
-    `).run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact)));
+    `).run(canonical.id, legacySubjectKey(subject), canonical.kind, JSON.stringify(canonical), canonicalRepoKey(subject), subjectIdentityKey(subject)));
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
-    const rows = kind
-      ? this.#database.prepare("SELECT artifact_json FROM artifacts WHERE subject_key = ? AND kind = ? ORDER BY rowid").all(subjectKey(subject), kind)
-      : this.#database.prepare("SELECT artifact_json FROM artifacts WHERE subject_key = ? ORDER BY rowid").all(subjectKey(subject));
-    return rows.map((row) => {
-      const parsed: unknown = JSON.parse(String((row as { artifact_json: string }).artifact_json));
-      assertArtifact(parsed);
-      return parsed;
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+    const canonical = normalizeSubject(subject);
+    const legacyKeys = legacySubjectKeys(subject, canonical);
+    const sql = kind
+      ? "SELECT artifact_json FROM artifacts WHERE (canonical_repo_key = ? OR subject_key IN (?, ?)) AND kind = ? ORDER BY rowid"
+      : "SELECT artifact_json FROM artifacts WHERE (canonical_repo_key = ? OR subject_key IN (?, ?)) ORDER BY rowid";
+    const params = kind
+      ? [canonicalRepoKey(canonical), ...legacyKeys, kind]
+      : [canonicalRepoKey(canonical), ...legacyKeys];
+    const rows = this.#database.prepare(sql).all(...params);
+    return rows.flatMap((row) => {
+      try {
+        const parsed = migrateArtifact(JSON.parse(String((row as { artifact_json: string }).artifact_json)));
+        return subjectsMatch(parsed.subject, canonical) && (!kind || parsed.kind === kind) ? [parsed] : [];
+      } catch {
+        return [];
+      }
     });
   }
 
@@ -210,6 +223,28 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#database.close();
   }
 
+  private migrateArtifactsSchema(): void {
+    this.inTransaction(() => {
+      const columns = this.#database.prepare("PRAGMA table_info(artifacts)").all() as Array<{ name: string }>;
+      const names = new Set(columns.map((column) => column.name));
+      if (!names.has("canonical_repo_key")) this.#database.exec("ALTER TABLE artifacts ADD COLUMN canonical_repo_key TEXT");
+      if (!names.has("canonical_subject_key")) this.#database.exec("ALTER TABLE artifacts ADD COLUMN canonical_subject_key TEXT");
+      const rows = this.#database.prepare("SELECT artifact_id, artifact_json FROM artifacts WHERE canonical_repo_key IS NULL OR canonical_subject_key IS NULL").all() as Array<{ artifact_id: string; artifact_json: string }>;
+      const update = this.#database.prepare("UPDATE artifacts SET canonical_repo_key = ?, canonical_subject_key = ? WHERE artifact_id = ?");
+      for (const row of rows) {
+        try {
+          const artifact = migrateArtifact(JSON.parse(row.artifact_json));
+          const subject = normalizeSubject(artifact.subject);
+          update.run(canonicalRepoKey(subject), subjectIdentityKey(subject), row.artifact_id);
+        } catch {
+          // Do not delete or rewrite malformed historical rows during startup.
+        }
+      }
+    });
+    this.#database.exec("CREATE INDEX IF NOT EXISTS artifacts_canonical_repo ON artifacts(canonical_repo_key)");
+    this.#database.exec("CREATE INDEX IF NOT EXISTS artifacts_canonical_subject_kind ON artifacts(canonical_subject_key, kind)");
+  }
+
   private inTransaction<T>(operation: () => T): T {
     this.#database.exec("BEGIN IMMEDIATE");
     let active = true;
@@ -243,8 +278,17 @@ function isSqliteBusyError(error: unknown): boolean {
   return /database is locked|database is busy|SQLITE_(?:BUSY|LOCKED)/i.test(message);
 }
 
-function subjectKey(subject: Subject): string {
+function canonicalRepoKey(subject: SubjectInput): string {
+  const canonical = normalizeSubject(subject);
+  return `${canonical.forge}|${canonical.repo}`;
+}
+
+function legacySubjectKey(subject: SubjectInput): string {
   return `${subject.repo}|i:${subject.issue ?? ""}|p:${subject.pr ?? ""}`;
+}
+
+function legacySubjectKeys(input: SubjectInput, canonical: SubjectInput): [string, string] {
+  return [legacySubjectKey(input), legacySubjectKey(canonical)];
 }
 
 function leaseFromRow(row: Record<string, string | number>): Lease {

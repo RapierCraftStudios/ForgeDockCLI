@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -40,6 +41,35 @@ describe("SQLite operational repositories", () => {
       holder?.kill();
       store.close();
       await new Promise((resolve) => setTimeout(resolve, 100));
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("backfills legacy artifact lookup columns without rewriting cached artifact JSON", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-migration-"));
+    const path = join(root, "state.db");
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run_legacy", subject: { repo: "Acme/Widget", issue: 9 }, producer: { role: "controller" },
+      payload: { title: "Legacy", problem: "Cached", constraints: [], acceptanceHints: [], dependencies: [] },
+    }, { id: "art_legacy", createdAt: "2026-01-01T00:00:00.000Z" });
+    const legacy = { ...artifact, subject: { repo: "Acme/Widget", issue: 9 } };
+    const json = JSON.stringify(legacy);
+    const fixture = new DatabaseSync(path);
+    fixture.exec("CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, kind TEXT NOT NULL, artifact_json TEXT NOT NULL)");
+    fixture.prepare("INSERT INTO artifacts (artifact_id, subject_key, kind, artifact_json) VALUES (?, ?, ?, ?)").run("art_legacy", "Acme/Widget|i:9|p:", "Intent", json);
+    fixture.close();
+    const store = new SqliteRepositories(path);
+    try {
+      assert.deepEqual((await store.list({ forge: "github.com", repo: " acme/widget ", issue: 9 })).map((item) => item.id), ["art_legacy"]);
+      const check = new DatabaseSync(path);
+      try {
+        assert.equal((check.prepare("SELECT artifact_json FROM artifacts WHERE artifact_id = ?").get("art_legacy") as { artifact_json: string }).artifact_json, json);
+        assert.ok((check.prepare("SELECT canonical_subject_key FROM artifacts WHERE artifact_id = ?").get("art_legacy") as { canonical_subject_key: string }).canonical_subject_key);
+      } finally {
+        check.close();
+      }
+    } finally {
+      store.close();
       try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
     }
   });

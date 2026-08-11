@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ArtifactKind, Subject } from "../artifacts/schema.js";
+import { normalizeSubject, type ArtifactKind, type Subject, type SubjectInput } from "../artifacts/schema.js";
 
 export type Workflow = "work-on" | "review-pr" | "orchestrate";
 export type RunStateName =
@@ -147,7 +147,7 @@ export const terminalStates = new Set<RunStateName>([
 
 export function createRun(input: {
   workflow: Workflow;
-  subject: Subject;
+  subject: SubjectInput;
   runId?: string;
   now?: string;
   target?: RunTarget;
@@ -160,7 +160,7 @@ export function createRun(input: {
     schema: "forgedock.run/v1",
     runId: input.runId ?? `run_${crypto.randomUUID()}`,
     workflow: input.workflow,
-    subject: input.subject,
+    subject: normalizeSubject(input.subject),
     state: input.workflow === "review-pr" ? "reviewing" : "queued",
     ...(input.target ? {
       lane: input.target.lane,

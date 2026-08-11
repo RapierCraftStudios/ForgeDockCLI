@@ -6,11 +6,23 @@ import { Check, Errors } from "typebox/value";
 const NonEmptyString = Type.String({ minLength: 1 });
 const IsoDateTime = Type.String({ format: "date-time" });
 const Sha = Type.String({ pattern: "^[0-9a-fA-F]{7,64}$" });
+const ForgeHost = Type.String({ pattern: "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" });
+const Repository = Type.String({ pattern: "^[^/\\s]+/[^/\\s]+$" });
+const Locator = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
 
+/** The durable, normalized subject shape. */
 export const SubjectSchema = Type.Object({
+  forge: ForgeHost,
+  repo: Repository,
+  issue: Type.Optional(Locator),
+  pr: Type.Optional(Locator),
+});
+
+/** The pre-forge-qualified shape used by forgedock.artifact/v2 comments. */
+export const LegacySubjectSchema = Type.Object({
   repo: NonEmptyString,
-  issue: Type.Optional(Type.Integer({ minimum: 1 })),
-  pr: Type.Optional(Type.Integer({ minimum: 1 })),
+  issue: Type.Optional(Locator),
+  pr: Type.Optional(Locator),
 });
 
 export const ProducerSchema = Type.Object({
@@ -307,7 +319,10 @@ export const ArtifactPayloadSchemas = {
 } as const satisfies Record<string, TSchema>;
 
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
-export type Subject = Static<typeof SubjectSchema>;
+/** Inputs remain forge-optional so old GitHub callers can be upgraded at the boundary. */
+export type Subject = Omit<Static<typeof SubjectSchema>, "forge"> & { forge?: string };
+export type SubjectInput = Subject;
+export type LegacySubject = Static<typeof LegacySubjectSchema>;
 export type Producer = Static<typeof ProducerSchema>;
 export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
@@ -344,10 +359,74 @@ export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends A
 export type ArtifactInput<K extends ArtifactKind> = K extends ArtifactKind ? {
   kind: K;
   runId: string;
-  subject: Subject;
+  subject: SubjectInput;
   producer: Producer;
   payload: ArtifactPayloadByKind[K];
 } : never;
+
+const DEFAULT_FORGE = "github.com";
+
+/** Normalize and validate the one subject identity used by every adapter. */
+export function normalizeSubject(input: SubjectInput): Subject {
+  if (!input || typeof input !== "object") throw new Error("Subject must be an object");
+  if (typeof input.repo !== "string") throw new Error("Subject repository is required");
+  const repo = input.repo.trim().toLowerCase();
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) throw new Error("Subject repository must have owner/name shape");
+
+  const forgeValue = input.forge === undefined ? DEFAULT_FORGE : input.forge;
+  if (typeof forgeValue !== "string") throw new Error("Subject forge is required");
+  const forge = forgeValue.trim().toLowerCase().replace(/\.+$/u, "");
+  if (!forge || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(forge)) throw new Error("Subject forge must be a valid host");
+
+  const issue = validateLocator(input.issue, "issue");
+  const pr = validateLocator(input.pr, "pull request");
+  if (issue === undefined && pr === undefined) throw new Error("Subject requires an issue or pull request locator");
+  return {
+    forge,
+    repo,
+    ...(issue !== undefined ? { issue } : {}),
+    ...(pr !== undefined ? { pr } : {}),
+  };
+}
+
+/** Canonical key used for indexes and deterministic identity comparisons. */
+export function subjectIdentityKey(input: SubjectInput): string {
+  const subject = normalizeSubject(input);
+  return `${subject.forge}|${subject.repo}|i:${subject.issue ?? ""}|p:${subject.pr ?? ""}`;
+}
+
+/** Subjects overlap when forge/repository match and at least one locator matches. */
+export function subjectsMatch(left: SubjectInput, right: SubjectInput): boolean {
+  const a = normalizeSubject(left);
+  const b = normalizeSubject(right);
+  if (a.forge !== b.forge || a.repo !== b.repo) return false;
+  return (a.issue !== undefined && b.issue === a.issue) || (a.pr !== undefined && b.pr === a.pr);
+}
+
+/** Migrate a legacy v2 subject. Historical artifacts were emitted only by GitHub. */
+export function migrateLegacySubject(input: unknown): Subject {
+  if (!input || typeof input !== "object") throw new Error("Invalid legacy artifact subject");
+  const candidate = input as Record<string, unknown>;
+  if ("forge" in candidate && candidate.forge !== undefined) return normalizeSubject(candidate as SubjectInput);
+  return normalizeSubject({
+    repo: candidate.repo as string,
+    forge: DEFAULT_FORGE,
+    ...(candidate.issue !== undefined ? { issue: candidate.issue as number } : {}),
+    ...(candidate.pr !== undefined ? { pr: candidate.pr as number } : {}),
+  });
+}
+
+/** Validate a stored artifact, migrating only its subject representation in memory. */
+export function migrateArtifact(value: unknown): DurableArtifact {
+  if (!value || typeof value !== "object") throw new Error("Artifact must be an object");
+  const candidate = value as Record<string, unknown>;
+  const migrated = { ...candidate, subject: migrateLegacySubject(candidate.subject) };
+  assertArtifact(migrated);
+  return migrated;
+}
+
+/** Explicit alias for callers performing storage/artifact migration. */
+export const canonicalizeArtifact = migrateArtifact;
 
 export function createArtifact<K extends ArtifactKind>(
   input: ArtifactInput<K>,
@@ -358,7 +437,7 @@ export function createArtifact<K extends ArtifactKind>(
     kind: input.kind,
     id: options.id ?? `art_${crypto.randomUUID()}`,
     runId: input.runId,
-    subject: input.subject,
+    subject: normalizeSubject(input.subject),
     createdAt: options.createdAt ?? new Date().toISOString(),
     producer: input.producer,
     payload: input.payload,
@@ -375,12 +454,24 @@ export function assertArtifact(value: unknown): asserts value is DurableArtifact
   if (typeof candidate.id !== "string" || !candidate.id) throw new Error("Artifact id is required");
   if (typeof candidate.runId !== "string" || !candidate.runId) throw new Error("Artifact runId is required");
   if (!Check(SubjectSchema, candidate.subject)) throw validationError("subject", SubjectSchema, candidate.subject);
+  const subject = candidate.subject as Subject;
+  const canonicalSubject = normalizeSubject(subject);
+  if (subject.forge !== canonicalSubject.forge || subject.repo !== canonicalSubject.repo
+    || subject.issue !== canonicalSubject.issue || subject.pr !== canonicalSubject.pr) {
+    throw new Error("Artifact subject must be canonical");
+  }
   if (!Check(ProducerSchema, candidate.producer)) throw validationError("producer", ProducerSchema, candidate.producer);
   if (typeof candidate.createdAt !== "string" || Number.isNaN(Date.parse(candidate.createdAt))) {
     throw new Error("Artifact createdAt must be an ISO timestamp");
   }
   const payloadSchema = ArtifactPayloadSchemas[candidate.kind];
   if (!Check(payloadSchema, candidate.payload)) throw validationError("payload", payloadSchema, candidate.payload);
+}
+
+function validateLocator(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`Subject ${label} must be a positive safe integer`);
+  return value as number;
 }
 
 function validationError(label: string, schema: TSchema, value: unknown): Error {

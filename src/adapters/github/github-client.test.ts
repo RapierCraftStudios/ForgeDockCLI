@@ -223,6 +223,11 @@ describe("GitHub issue closure", () => {
 });
 
 describe("GitHub durable artifact projection", () => {
+  it("fails closed for a non-GitHub forge", async () => {
+    const repository = new GitHubArtifactRepository(new CommentClient());
+    await assert.rejects(repository.list({ forge: "forge.example", repo: "a/b", issue: 2 }), /does not support forge/);
+  });
+
   it("publishes cross-artifact review verdicts to both PR and issue idempotently", async () => {
     const client = new CommentClient();
     const repository = new GitHubArtifactRepository(client);

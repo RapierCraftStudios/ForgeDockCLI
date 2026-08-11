@@ -2,6 +2,7 @@
 
 import {
   assertArtifact,
+  migrateArtifact,
   type BuildPacketPayload,
   type BuildResultPayload,
   type DurableArtifact,
@@ -30,8 +31,7 @@ export function decodeArtifactMarker(marker: string): DurableArtifact {
   } catch (error) {
     throw new Error("ForgeDock artifact marker contains invalid JSON", { cause: error });
   }
-  assertArtifact(parsed);
-  return parsed;
+  return migrateArtifact(parsed);
 }
 
 export function findArtifacts(text: string): DurableArtifact[] {

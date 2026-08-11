@@ -2,8 +2,27 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createArtifact } from "../artifacts/schema.js";
 import { createRun, transition } from "../state/machine.js";
-import { InMemoryRunRepository, ProjectedRunRepository } from "./repositories.js";
+import { InMemoryArtifactRepository, InMemoryRunRepository, ProjectedRunRepository } from "./repositories.js";
+
+test("matches canonical subjects by forge and issue/PR overlap while filtering kind", async () => {
+  const repository = new InMemoryArtifactRepository();
+  const makeIntent = (id: string, subject: { forge?: string; repo: string; issue?: number; pr?: number }) => createArtifact({
+    kind: "Intent", runId: id, subject, producer: { role: "test" },
+    payload: { title: id, problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+  }, { id });
+  const makeInvestigation = (id: string, subject: { forge?: string; repo: string; issue?: number; pr?: number }) => createArtifact({
+    kind: "Investigation", runId: id, subject, producer: { role: "test" },
+    payload: { outcome: "confirmed", confidence: "high", summary: id, evidence: [{ claim: "claim", source: "test", detail: "detail" }], affectedSurfaces: [], risks: [], recommendation: "test" },
+  }, { id });
+  await repository.append(makeIntent("issue", { repo: "A/B", issue: 2 }));
+  await repository.append(makeIntent("pull", { repo: "a/b", pr: 3 }));
+  await repository.append(makeInvestigation("other-kind", { repo: "a/b", issue: 2, pr: 3 }));
+  await repository.append(makeIntent("other-forge", { forge: "forge.example", repo: "a/b", issue: 2 }));
+  assert.deepEqual((await repository.list({ forge: "github.com.", repo: " a/b ", issue: 2, pr: 3 })).map((artifact) => artifact.id), ["issue", "pull", "other-kind"]);
+  assert.deepEqual((await repository.list({ repo: "a/b", issue: 2 }, "Intent")).map((artifact) => artifact.id), ["issue"]);
+});
 
 test("run-state projection follows every committed typed transition without owning authority", async () => {
   const inner = new InMemoryRunRepository();

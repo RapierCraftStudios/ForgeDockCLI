@@ -27,6 +27,14 @@ describe("artifact codec", () => {
     assert.deepEqual(decodeArtifactMarker(marker), artifact);
   });
 
+  it("migrates legacy v2 subjects to the documented GitHub forge default", () => {
+    const artifact = intent();
+    const legacy = { ...artifact, subject: { repo: artifact.subject.repo, issue: artifact.subject.issue } };
+    const marker = `<!-- FORGEDOCK:ARTIFACT v2 b64:${Buffer.from(JSON.stringify(legacy), "utf8").toString("base64url")} -->`;
+    assert.deepEqual(decodeArtifactMarker(marker).subject, { forge: "github.com", repo: "acme/widget", issue: 42 });
+    assert.equal(findArtifacts(marker)[0]?.subject.forge, "github.com");
+  });
+
   it("renders readable markdown plus a machine marker", () => {
     const comment = renderArtifactComment(intent());
     assert.match(comment, /ForgeDock · Intent/);

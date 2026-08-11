@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
-import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
+import { migrateArtifact, normalizeSubject, subjectsMatch, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
@@ -166,9 +166,10 @@ export class GitHubClient implements ForgeHost {
   }
 
   async listIssueCommentSnapshots(subject: Subject): Promise<GitHubIssueComment[]> {
-    const number = subject.pr ?? subject.issue;
+    const canonical = githubSubject(subject);
+    const number = canonical.pr ?? canonical.issue;
     if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
-    const result = await this.gh(["api", `repos/${subject.repo}/issues/${number}/comments?per_page=100`, "--paginate", "--slurp"]);
+    const result = await this.gh(["api", `repos/${canonical.repo}/issues/${number}/comments?per_page=100`, "--paginate", "--slurp"]);
     const pages = JSON.parse(result) as Array<Array<{ body?: string; created_at?: string; html_url?: string; user?: { login?: string } }>>;
     return pages.flat().map((comment) => {
       const body = comment.body ?? "";
@@ -183,10 +184,10 @@ export class GitHubClient implements ForgeHost {
   }
 
   async postIssueComment(subject: Subject, body: string): Promise<void> {
-    const number = subject.pr ?? subject.issue;
-    if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
+    const canonical = githubSubject(subject);
+    const number = canonical.pr ?? canonical.issue;
     await this.gh(
-      ["api", `repos/${subject.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
+      ["api", `repos/${canonical.repo}/issues/${number}/comments`, "--method", "POST", "--input", "-"],
       JSON.stringify({ body }),
     );
   }
@@ -780,36 +781,35 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
-    const canonical = canonicalSubject(artifact.subject);
-    const targets: Subject[] = canonical.pr && canonical.issue
-      ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
+    const canonicalArtifact = migrateArtifact(artifact);
+    const canonical = githubSubject(canonicalArtifact.subject);
+    const { issue, pr } = canonical;
+    const targets: Subject[] = pr !== undefined && issue !== undefined
+      ? [{ forge: "github.com", repo: canonical.repo, pr }, { forge: "github.com", repo: canonical.repo, issue }]
       : [canonical];
     for (const target of targets) {
       const comments = await this.client.listIssueComments(target);
-      const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
-      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(artifact));
+      const exists = comments.flatMap(findArtifacts).some((item) => item.id === canonicalArtifact.id);
+      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(canonicalArtifact));
     }
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
-    const canonical = canonicalSubject(subject);
-    const targets: Subject[] = canonical.pr && canonical.issue
-      ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
+    const canonical = githubSubject(subject);
+    const { issue, pr } = canonical;
+    const targets: Subject[] = pr !== undefined && issue !== undefined
+      ? [{ forge: "github.com", repo: canonical.repo, pr }, { forge: "github.com", repo: canonical.repo, issue }]
       : [canonical];
     const found = (await Promise.all(targets.map(async (target) => (await this.client.listIssueComments(target)).flatMap(findArtifacts)))).flat();
     const unique = new Map(found.map((artifact) => [artifact.id, artifact]));
     return [...unique.values()]
       .filter((artifact) => !kind || artifact.kind === kind)
-      .filter((artifact) => subjectMatches(artifact.subject, subject));
+      .filter((artifact) => subjectsMatch(artifact.subject, canonical));
   }
 }
 
-function canonicalSubject(subject: Subject): Subject {
-  return { ...subject, repo: subject.repo.trim().toLowerCase() };
-}
-
-function subjectMatches(left: Subject, right: Subject): boolean {
-  if (left.repo.trim().toLowerCase() !== right.repo.trim().toLowerCase()) return false;
-  return (right.issue !== undefined && left.issue === right.issue)
-    || (right.pr !== undefined && left.pr === right.pr);
+function githubSubject(subject: Subject): Subject {
+  const canonical = normalizeSubject(subject);
+  if (canonical.forge !== "github.com") throw new Error(`GitHub adapter does not support forge '${canonical.forge}'`);
+  return canonical;
 }

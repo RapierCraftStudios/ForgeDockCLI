@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
+import { migrateArtifact, normalizeSubject, subjectsMatch, type ArtifactKind, type DurableArtifact, type SubjectInput } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 
 export interface ArtifactRepository {
   append(artifact: DurableArtifact): Promise<void>;
-  list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]>;
+  list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]>;
 }
 
 export interface RunProgressRecord {
@@ -33,7 +33,7 @@ export class CachedArtifactRepository implements ArtifactRepository {
     await this.cache.append(artifact);
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
     const artifacts = await this.authoritative.list(subject, kind);
     for (const artifact of artifacts) await this.cache.append(artifact);
     return artifacts;
@@ -83,13 +83,15 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   readonly artifacts: DurableArtifact[] = [];
 
   async append(artifact: DurableArtifact): Promise<void> {
-    if (this.artifacts.some((item) => item.id === artifact.id)) return;
-    this.artifacts.push(structuredClone(artifact));
+    const canonical = migrateArtifact(artifact);
+    if (this.artifacts.some((item) => item.id === canonical.id)) return;
+    this.artifacts.push(structuredClone(canonical));
   }
 
-  async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+  async list(subject: SubjectInput, kind?: ArtifactKind): Promise<DurableArtifact[]> {
+    const canonical = normalizeSubject(subject);
     return this.artifacts
-      .filter((artifact) => sameSubject(artifact.subject, subject) && (!kind || artifact.kind === kind))
+      .filter((artifact) => subjectsMatch(artifact.subject, canonical) && (!kind || artifact.kind === kind))
       .map((artifact) => structuredClone(artifact));
   }
 }
@@ -143,8 +145,4 @@ export class ConcurrentRunUpdateError extends Error {
     super(`Run ${runId} changed concurrently (expected v${expected}, found v${actual})`);
     this.name = "ConcurrentRunUpdateError";
   }
-}
-
-function sameSubject(left: Subject, right: Subject): boolean {
-  return left.repo === right.repo && left.issue === right.issue && left.pr === right.pr;
 }
