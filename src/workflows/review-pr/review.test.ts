@@ -4,9 +4,9 @@ import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
-import { AgentRunError, type AgentRunResult, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
+import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { isTransientReviewerTransportFailure, renderReviewerSubmissionComment, reviewPullRequest, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { isTransientReviewerTransportFailure, renderReviewerSubmissionComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -237,6 +237,34 @@ describe("fresh-context PR review", () => {
     assert.equal(runtime.tasks.length, 4);
     assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-3")));
     assert.equal(isTransientReviewerTransportFailure("read failed: optional path missing"), false);
+    assert.equal(isTransientReviewerTransportFailure("Codex error: Our servers are currently overloaded"), true);
+  });
+
+  it("bounds a hanging reviewer attempt and records retry progress", async () => {
+    class HangingRuntime extends FakeAgentRuntime {
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        return new Promise<AgentRunResult<T>>((_, reject) => {
+          const abort = () => reject(options.signal?.reason ?? new Error("aborted"));
+          options.signal?.addEventListener("abort", abort, { once: true });
+          if (options.signal?.aborted) abort();
+        });
+      }
+    }
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new HangingRuntime();
+    await assert.rejects(
+      reviewPullRequest({
+        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 25,
+      }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs }),
+      /timed out after 25ms/,
+    );
+    assert.equal(runtime.tasks.length, 8);
+    const progress = await runs.listProgress(run.runId);
+    assert.ok(progress.some(({ message }) => message.includes("timed out")));
+    assert.ok(progress.some(({ message }) => message.includes("retry 4/4 scheduled")));
   });
 
   it("runs independently selected reviewer roles concurrently", async () => {
@@ -372,6 +400,12 @@ describe("fresh-context PR review", () => {
     assert.ok(bounded.length <= 60_000);
     assert.match(bounded, /projection truncated/);
     assert.match(bounded, /FORGEDOCK:REVIEWER-SUBMISSION v1/);
+  });
+
+  it("validates reviewer attempt timeout overrides", () => {
+    assert.equal(resolveReviewerAttemptTimeoutMs(25), 25);
+    assert.throws(() => resolveReviewerAttemptTimeoutMs(0), /must be an integer/);
+    assert.throws(() => resolveReviewerAttemptTimeoutMs(Number.MAX_SAFE_INTEGER), /must be an integer/);
   });
 
   it("selects specialists from changed surfaces instead of a fixed fleet", () => {

@@ -9,6 +9,7 @@ import {
   type InvestigationPayload,
   type OutcomePayload,
   type RemediationBlockedPayload,
+  type VerificationAdjudicationPayload,
   type ReviewVerdictPayload,
 } from "./schema.js";
 
@@ -84,6 +85,9 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         listSection("Implementation plan", payload.implementationPlan, true),
         listSection("Expected paths", payload.expectedPaths.map(code)),
         listSection("Verification plan", payload.verificationPlan),
+        payload.controllerGates?.length
+          ? listSection("Controller-owned gates", payload.controllerGates.map((gate) => `**${gate.id}** — ${gate.description}`))
+          : "",
         listSection("Risks and mitigations", payload.risks.map((item) => `**${item.risk}** — ${item.mitigation}`)),
         listSection("Out of scope", payload.outOfScope),
       ].filter(Boolean).join("\n\n");
@@ -105,6 +109,10 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
       ].filter(Boolean).join("\n\n");
+    }
+    case "VerificationAdjudication": {
+      const payload = artifact.payload as VerificationAdjudicationPayload;
+      return [heading, meta, "", `**Checkpoint:** \`${payload.checkpoint}\` · **Decision:** \`${payload.decision}\``, `**Supersedes outcome:** \`${payload.supersedesOutcomeId}\``, `### Human rationale\n${payload.reason}`].join("\n\n");
     }
     case "RemediationBlocked": {
       const payload = artifact.payload as RemediationBlockedPayload;

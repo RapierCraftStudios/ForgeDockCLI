@@ -32,21 +32,22 @@ export class AgentEventStreamWriter {
     }
 
     this.finishDelta();
+    const milestone = observabilityPreview(event.observability);
     if (event.type === "session.started") {
-      this.#write(`  ${statusGlyph("active", this.#mode)} ${task} · ${event.provider}/${event.model}\n`);
+      this.#write(`  ${statusGlyph("active", this.#mode)} ${task} · ${event.provider}/${event.model}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "tool.started") {
       const args = toolArgPreview(event.tool, event.args);
       const call = toolCallPreview(event.toolCallId);
-      this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${event.tool}[${call}]${args ? ` · ${args}` : ""}\n`);
+      this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${event.tool}[${call}]${args ? ` · ${args}` : ""}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "tool.completed") {
       const status = event.isError ? "failed" : "passed";
       const call = toolCallPreview(event.toolCallId);
       const error = event.isError && event.errorSummary ? ` · ${event.errorSummary}` : "";
-      this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool}[${call}] ${event.isError ? "failed" : "complete"}${error}\n`);
+      this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool}[${call}] ${event.isError ? "failed" : "complete"}${error}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "artifact.submitted") {
-      this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted\n`);
+      this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "session.completed") {
-      this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · session complete\n`);
+      this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · session complete${milestone ? ` · ${milestone}` : ""}\n`);
     }
   }
 
@@ -83,6 +84,19 @@ export class AgentEventStreamWriter {
     if (this.#stream?.lineOpen) this.#write("\n");
     this.#stream = undefined;
   }
+}
+
+function observabilityPreview(observability: AgentEvent["observability"]): string {
+  if (!observability) return "";
+  return [
+    observability.phase,
+    observability.cycle ? `cycle ${observability.cycle.current}/${observability.cycle.total}` : "",
+    observability.activeChild ? `child ${observability.activeChild}` : "",
+    observability.reviewerRoles?.length ? `roles ${observability.reviewerRoles.join(",")}` : "",
+    observability.latestArtifacts?.buildResult ? `BuildResult ${observability.latestArtifacts.buildResult}` : "",
+    observability.latestArtifacts?.reviewVerdict ? `ReviewVerdict ${observability.latestArtifacts.reviewVerdict}` : "",
+    observability.remainingRemediationCycles !== undefined ? `remaining ${observability.remainingRemediationCycles}` : "",
+  ].filter(Boolean).join(" · ");
 }
 
 function toolCallPreview(value: string): string {

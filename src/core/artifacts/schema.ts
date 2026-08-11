@@ -64,6 +64,19 @@ export const InvestigationPayloadSchema = Type.Object({
   }), { minItems: 2 })),
 });
 
+export const ControllerVerificationGateIdSchema = Type.Union([
+  Type.Literal("staging-review"),
+  Type.Literal("workflow-lifecycle"),
+  Type.Literal("review-aggregation"),
+  Type.Literal("publication"),
+  Type.Literal("merge-closure"),
+]);
+
+export const ControllerVerificationGateSchema = Type.Object({
+  id: ControllerVerificationGateIdSchema,
+  description: NonEmptyString,
+});
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -74,6 +87,8 @@ export const BuildPacketPayloadSchema = Type.Object({
   implementationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
   expectedPaths: Type.Array(NonEmptyString),
   verificationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
+  /** Typed controller-owned gates; legacy prose remains readable for old packets. */
+  controllerGates: Type.Optional(Type.Array(ControllerVerificationGateSchema)),
   risks: Type.Array(Type.Object({
     risk: NonEmptyString,
     mitigation: NonEmptyString,
@@ -207,6 +222,13 @@ export const OutcomePayloadSchema = Type.Object({
     Type.Literal("abandoned"),
   ]),
   reason: NonEmptyString,
+  /** Invalid outcomes are provisional until the controller proves issue closure. */
+  issueClosure: Type.Optional(Type.Object({
+    status: Type.Union([Type.Literal("pending"), Type.Literal("completed")]),
+    repo: NonEmptyString,
+    issue: Type.Integer({ minimum: 1 }),
+    verifiedAt: Type.Optional(IsoDateTime),
+  })),
   finalSha: Type.Optional(Sha),
   prUrl: Type.Optional(Type.String()),
   childIssues: Type.Array(Type.String()),
@@ -229,6 +251,13 @@ export const OutcomePayloadSchema = Type.Object({
     repairAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
     checks: Type.Array(CheckResultSchema),
   })),
+});
+
+export const VerificationAdjudicationPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("verification"),
+  decision: Type.Literal("resume"),
+  supersedesOutcomeId: NonEmptyString,
+  reason: NonEmptyString,
 });
 
 export const RemediationBlockedPayloadSchema = Type.Object({
@@ -273,6 +302,7 @@ export const ArtifactPayloadSchemas = {
   BuildResult: BuildResultPayloadSchema,
   ReviewVerdict: ReviewVerdictPayloadSchema,
   Outcome: OutcomePayloadSchema,
+  VerificationAdjudication: VerificationAdjudicationPayloadSchema,
   RemediationBlocked: RemediationBlockedPayloadSchema,
 } as const satisfies Record<string, TSchema>;
 
@@ -282,9 +312,11 @@ export type Producer = Static<typeof ProducerSchema>;
 export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
 export type BuildPacketPayload = Static<typeof BuildPacketPayloadSchema>;
+export type ControllerVerificationGate = Static<typeof ControllerVerificationGateSchema>;
 export type BuildResultPayload = Static<typeof BuildResultPayloadSchema>;
 export type ReviewVerdictPayload = Static<typeof ReviewVerdictPayloadSchema>;
 export type OutcomePayload = Static<typeof OutcomePayloadSchema>;
+export type VerificationAdjudicationPayload = Static<typeof VerificationAdjudicationPayloadSchema>;
 export type RemediationBlockedPayload = Static<typeof RemediationBlockedPayloadSchema>;
 
 export interface ArtifactPayloadByKind {
@@ -294,6 +326,7 @@ export interface ArtifactPayloadByKind {
   BuildResult: BuildResultPayload;
   ReviewVerdict: ReviewVerdictPayload;
   Outcome: OutcomePayload;
+  VerificationAdjudication: VerificationAdjudicationPayload;
   RemediationBlocked: RemediationBlockedPayload;
 }
 

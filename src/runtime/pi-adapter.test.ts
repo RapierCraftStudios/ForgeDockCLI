@@ -70,6 +70,16 @@ test("the controller rejects a malformed nested structured result even after bri
   }
 });
 
+test("verification agency requires a frozen controller-approved plan", async () => {
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  await assert.rejects(runtime.run({
+    id: "run:build:verify-policy", role: "builder", objective: "Build", instructions: "Use the approved checks", context: [],
+    workspace: { cwd: process.cwd(), mode: "write", scope: scopeManifestFor("build-packet", { writePaths: ["src/a.ts"], metadataRoots: ["package.json"] }) },
+    tools: ["read", "verify", "edit"],
+    outputSchema: Type.Object({ summary: Type.String() }), modelPolicy: {},
+  }), /no frozen controller-approved command plan/i);
+});
+
 test("tool error summaries expose only allowlisted classifications", () => {
   const arbitrary = boundedToolErrorSummary({
     content: [{

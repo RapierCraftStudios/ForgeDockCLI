@@ -30,6 +30,8 @@ export interface ForgeDockOrchestrationPatch {
   maxRemediationChildren?: number;
   maxParallel?: number;
   autoMerge?: boolean;
+  /** Explicit fast-lane target; absent means the repository default branch. */
+  fastLaneTarget?: string;
 }
 
 export interface ForgeDockNextConfig {
@@ -48,6 +50,8 @@ export interface ForgeDockNextConfig {
   maxRemediationChildren?: number;
   maxParallel?: number;
   autoMerge?: boolean;
+  /** Explicit fast-lane target; absent means the repository default branch. */
+  fastLaneTarget?: string;
   orchestration?: ForgeDockOrchestrationPatch;
 }
 
@@ -63,6 +67,7 @@ export interface EffectiveOrchestrationConfig {
   maxRemediationChildren: number;
   maxParallel: number;
   autoMerge: boolean;
+  fastLaneTarget?: string;
 }
 
 export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
@@ -94,6 +99,7 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
     maxRemediationChildren: parsed("max_remediation_children", parsePositiveInteger),
     maxParallel: parsed("max_parallel", parsePositiveInteger),
     autoMerge: parsed("auto_merge", parseBoolean),
+    fastLaneTarget: parsed("fast_lane_target", parseString),
   }) as ForgeDockNextConfig;
   validatePatch(config, false);
   return config;
@@ -146,6 +152,7 @@ export function resolveOrchestrationConfig(
     maxRemediationChildren: merged.maxRemediationChildren ?? DEFAULT_ORCHESTRATION.maxRemediationChildren,
     maxParallel: merged.maxParallel ?? DEFAULT_ORCHESTRATION.maxParallel,
     autoMerge: merged.autoMerge ?? DEFAULT_ORCHESTRATION.autoMerge,
+    ...(merged.fastLaneTarget !== undefined ? { fastLaneTarget: merged.fastLaneTarget } : {}),
   };
   validateEffectiveOrchestration(result);
   return result;
@@ -169,6 +176,7 @@ export function orchestrationConfigSources(
     maxRemediationChildren: source("maxRemediationChildren"),
     maxParallel: source("maxParallel"),
     autoMerge: source("autoMerge"),
+    fastLaneTarget: source("fastLaneTarget"),
   };
 }
 
@@ -198,7 +206,7 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
   const hasBatching = config.batchingPolicy !== undefined || config.maxBatchSize !== undefined || config.maxSensitiveBatchSize !== undefined;
   const hasOrchestration = hasBatching || config.scopeExpansion !== undefined || config.maxRemediationCycles !== undefined
     || config.maxRemediationDepth !== undefined || config.maxRemediationChildren !== undefined
-    || config.maxParallel !== undefined || config.autoMerge !== undefined;
+    || config.maxParallel !== undefined || config.autoMerge !== undefined || config.fastLaneTarget !== undefined;
   const lines = [START, "next:", hasAgents ? "  agents:" : "  agents: {}"];
   if (config.workerModel !== undefined) lines.push(`    worker_model: ${JSON.stringify(config.workerModel)}`);
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
@@ -221,6 +229,7 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
     if (config.maxRemediationChildren !== undefined) lines.push(`    max_remediation_children: ${config.maxRemediationChildren}`);
     if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
     if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
+    if (config.fastLaneTarget !== undefined) lines.push(`    fast_lane_target: ${JSON.stringify(config.fastLaneTarget)}`);
   }
   lines.push(END);
   return lines.join("\n");
@@ -242,6 +251,9 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (patch.maxParallel !== undefined && (!Number.isInteger(patch.maxParallel) || patch.maxParallel < 1 || patch.maxParallel > 20)) {
     throw new Error("maxParallel must be an integer from 1 to 20");
   }
+  if (patch.fastLaneTarget !== undefined && !isSafeBranchName(patch.fastLaneTarget)) {
+    throw new Error(`fastLaneTarget must be a safe Git branch name: ${patch.fastLaneTarget}`);
+  }
   if (patch.batchingPolicy !== undefined && !["aggressive", "conservative", "none"].includes(patch.batchingPolicy)) throw new Error("batchingPolicy must be aggressive, conservative, or none");
   if (patch.scopeExpansion !== undefined && !["scope-locked", "recursive"].includes(patch.scopeExpansion)) throw new Error("scopeExpansion must be scope-locked or recursive");
   for (const [name, value] of [["maxBatchSize", patch.maxBatchSize], ["maxSensitiveBatchSize", patch.maxSensitiveBatchSize], ["maxRemediationCycles", patch.maxRemediationCycles], ["maxRemediationChildren", patch.maxRemediationChildren]] as const) {
@@ -261,6 +273,7 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (nested?.maxRemediationDepth !== undefined && (!Number.isSafeInteger(nested.maxRemediationDepth) || nested.maxRemediationDepth < 0 || nested.maxRemediationDepth > 100)) throw new Error("maxRemediationDepth must be an integer from 0 to 100");
   if (nested?.maxRemediationChildren !== undefined && (!Number.isSafeInteger(nested.maxRemediationChildren) || nested.maxRemediationChildren < 1 || nested.maxRemediationChildren > 100)) throw new Error("maxRemediationChildren must be a positive integer");
   if (nested?.maxParallel !== undefined && (!Number.isSafeInteger(nested.maxParallel) || nested.maxParallel < 1 || nested.maxParallel > 20)) throw new Error("maxParallel must be an integer from 1 to 20");
+  if (nested?.fastLaneTarget !== undefined && !isSafeBranchName(nested.fastLaneTarget)) throw new Error(`orchestration.fastLaneTarget must be a safe Git branch name: ${nested.fastLaneTarget}`);
 }
 
 function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextConfig {
@@ -277,6 +290,7 @@ function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextCon
   if (result.maxRemediationChildren === undefined && nested.maxRemediationChildren !== undefined) result.maxRemediationChildren = nested.maxRemediationChildren;
   if (result.maxParallel === undefined && nested.maxParallel !== undefined) result.maxParallel = nested.maxParallel;
   if (result.autoMerge === undefined && nested.autoMerge !== undefined) result.autoMerge = nested.autoMerge;
+  if (result.fastLaneTarget === undefined && nested.fastLaneTarget !== undefined) result.fastLaneTarget = nested.fastLaneTarget;
   return result;
 }
 
@@ -289,6 +303,7 @@ function validateEffectiveOrchestration(config: EffectiveOrchestrationConfig): v
   if (!Number.isSafeInteger(config.maxRemediationDepth) || config.maxRemediationDepth < 0) throw new Error("Invalid effective remediation depth");
   if (!Number.isSafeInteger(config.maxRemediationChildren) || config.maxRemediationChildren < 1) throw new Error("Invalid effective remediation child limit");
   if (!Number.isSafeInteger(config.maxParallel) || config.maxParallel < 1) throw new Error("Invalid effective maxParallel");
+  if (config.fastLaneTarget !== undefined && !isSafeBranchName(config.fastLaneTarget)) throw new Error(`Invalid effective fastLaneTarget: ${config.fastLaneTarget}`);
 }
 
 function parseString(value: string | undefined): string | undefined {
@@ -325,6 +340,10 @@ function parseNonNegativeInteger(value: string | undefined): number | undefined 
   if (value === undefined || !/^\d+$/.test(value)) return undefined;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function isSafeBranchName(value: string): boolean {
+  return /^[A-Za-z0-9._/-]+$/u.test(value) && !value.includes("..") && !value.startsWith("/") && !value.endsWith("/") && !value.includes("//");
 }
 
 function parseBoolean(value: string | undefined): boolean | undefined {

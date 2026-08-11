@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, readlink } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type ControllerVerificationGate, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
@@ -76,7 +76,11 @@ export async function verifyAndCommit(
     return { run, checks, outcome };
   };
   try {
-    const uncoveredPlan = uncoveredVerificationCommands(input.packet.payload.verificationPlan, input.commands);
+    const uncoveredPlan = uncoveredVerificationCommands(
+      input.packet.payload.verificationPlan,
+      input.commands,
+      input.packet.payload.controllerGates,
+    );
     const changedPaths = canonicalizeConcreteScopePaths(await dependencies.git.changedPaths(input.workspace));
     const priorRevisionChangedPaths = canonicalizeConcreteScopePaths(
       await dependencies.git.revisionChangedPaths(input.workspace),
@@ -229,12 +233,20 @@ export async function verifyAndCommit(
 export function uncoveredVerificationCommands(
   plan: readonly string[],
   commands: readonly Pick<VerificationCommand, "id" | "command" | "args">[],
+  controllerGates: readonly ControllerVerificationGate[] = [],
 ): string[] {
   const uncovered = new Set<string>();
+  const configuredGates = new Set(controllerGates.map((gate) => gate.id));
   for (const step of plan) {
+    const controllerGate = /^controller-gate:([a-z-]+)$/i.exec(step.trim().replace(/[.!]+$/, ""));
+    if (controllerGate) {
+      const token = `controller-gate:${controllerGate[1]}`;
+      if (!configuredGates.has(controllerGate[1] as ControllerVerificationGate["id"])) uncovered.add(token);
+      continue;
+    }
     const fenced = [...step.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim());
     const hasExecutableVerb = /^\s*(?:run|execute)\s+/i.test(step);
-    const hasControllerLifecycleEvidence = /^\s*(?:confirm|ensure|verify|check)\s+(?:the\s+)?controller\s+lifecycle\s+gates?\b/i.test(step);
+    const hasControllerLifecycleEvidence = /^\s*(?:(?:confirm|ensure|verify|check)\s+(?:the\s+)?controller\s+lifecycle\s+gates?\b|(?:the\s+)?controller\s+(?:verifies?|checks?|confirms?|owns?)\b)/i.test(step);
     const hasManualEvidenceVerb = (/^\s*(?:inspect|review)\b/i.test(step)
       || /^\s*(?:confirm|ensure|verify|check)\s+(?:that|the|whether)\b/i.test(step)
       || hasControllerLifecycleEvidence)

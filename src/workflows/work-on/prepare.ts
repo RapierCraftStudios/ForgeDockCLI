@@ -54,6 +54,7 @@ export async function prepareBuildPacket(
         "Expected paths must be concrete repository-relative files and are the frozen write/conflict boundary; never emit globs, absolute paths, traversal, or line-location suffixes.",
         "When a shared interface or contract changes, include every affected implementation and test-double path that may need edits, especially all paths declared by the issue. The builder cannot edit a path omitted from this packet.",
         "Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
+        "Represent controller-owned lifecycle evidence with a matching controllerGates entry and the exact token controller-gate:<id> in verificationPlan, using only staging-review, workflow-lifecycle, review-aggregation, publication, or merge-closure; never encode those gates as shell commands or free-text command-shaped steps.",
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
       context: [input.intent, input.investigation],

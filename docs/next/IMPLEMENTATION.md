@@ -16,7 +16,7 @@ This is the execution tracker for the greenfield rewrite described in [`../forge
 ### 0. Foundation — implemented
 
 - [x] TypeScript build and Node `>=22.19.0` runtime floor
-- [x] Seven v2 artifact schemas, including durable recursive-remediation checkpoints
+- [x] Eight v2 artifact schemas, including durable recursive-remediation and typed verification-adjudication checkpoints
 - [x] Human Markdown plus Base64url machine marker codec
 - [x] Typed `work-on` state machine with guarded transitions
 - [x] Optimistic run repository contract with in-memory and SQLite implementations
@@ -61,20 +61,23 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 
 - [x] Build Packet author policy and durable artifact
 - [x] Git worktree adapter and branch ownership
-- [x] Builder session with workspace-only mutation rights and no shell/GitHub grant
+- [x] Builder session with bounded worktree mutation, typed frozen-verification feedback agency, and no shell/GitHub grant
 - [x] Credential-isolated verification runner with normalized/redacted output digests; every frozen required command executes independently with fail-closed evidence
+- [x] Live controller milestones project review/remediation cycle, phase, reviewer roles, artifact timestamps, remediation budget, active child, and current tool/path into CLI progress and fleet visibility
 - [x] Scope-drift check against expected paths
 - [x] Hook-disabled branch push and PR publication with verified-SHA, raw committed-blob, and asserted Git-tree checks; repository clean filters are rejected
 - [x] End-to-end six-artifact trajectory test through merge and closure
 - [x] Auto-merge default after successful verification and independent approval, with explicit `--no-auto-merge` opt-out
 - [ ] Idempotent publication reconciliation after a crash between push and state commit
-- [ ] Apply configured issue closure/decomposition actions for terminal investigation outcomes
+- [x] Apply controller-owned issue closure and authoritative re-read for invalid investigation outcomes; preserve decomposition behavior
 - [x] Fail-safe semantic-state reconstruction from GitHub artifacts plus local status store
 - [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
-- [x] Verification-stage resume from retained workspaces without replaying investigation or build
+- [x] Verification-stage resume from retained workspaces without replaying investigation or build; exhausted baselines require a durable human adjudication before typed resume
 - [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
 - [x] Explicit staging-review source-branch evidence, immutable recovery base refs, and fail-closed cross-branch resume validation
 - [x] Frozen verification-plan coverage: every controller-approved diff/package command executes and contributes evidence instead of stopping after the first failure or claiming unobserved success
+- [x] Typed controller-owned verification gates plus legacy manual-gate recognition prevent staging/lifecycle evidence from being parsed as unsupported shell commands
+- [x] Script-free isolated dependency preparation reapplies only the pinned pi-subagents visibility patch before verification
 - [x] Same-invocation verification recovery: in-packet build and post-review remediation failures receive at most two evidence-backed builder repairs, with durable crash-resume budgets and no scope widening
 - [x] Truthful Build Results require controller-observed changed paths to match the worker report and explicit coverage for every frozen acceptance criterion
 - [x] Stable criterion IDs plus verbatim builder contracts prevent model wording from changing frozen acceptance evidence
@@ -116,12 +119,13 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Compatible ordinary and P2/P3 review findings sharing a bounded concern surface contract into one durable batch issue and one work-on agent
 - [x] Strict machine-readable member contracts are parsed before batch execution
 - [x] Successful batch completion projects a typed merged Outcome and protocol trajectory receipt to each member before closing the member issues
-- [x] Durable recursive-remediation checkpoints, checkpoint-authorized nested child targeting with frozen depth/child limits, synchronized parent-SHA and child-commit ancestry verification, actual expanded-path proof, and exact expanded-review transition without replaying superseded checkpoints
+- [x] Durable recursive-remediation checkpoints, checkpoint-authorized nested child targeting with frozen depth/child limits, synchronized parent-SHA and child-commit ancestry verification, actual expanded-path proof, and exact expanded-review transition without replaying superseded checkpoints or later verified Build Results
 - [x] Explicit ScopeManifest enforcement across investigator, builder, remediator, and reviewer runtime tool grants
 - [x] Scheduler suspension statuses, typed event sinks, orchestration snapshots, and restartable remediation projections
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
 - [x] Durable same-checkout cross-process leases and heartbeats
 - [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
+- [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
 - [ ] Cross-machine/GitHub-backed lease coordination
 - [ ] Promote Build Packet paths into live scheduler claims
 - [ ] Token/cost budgets in addition to worker concurrency
@@ -147,6 +151,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Remove fixed wall-clock lifetimes from workflow controllers and nested reviews; retain explicit cancellation, owner-disconnect cleanup, and verification-command and short transport-handshake bounds
 - [x] Materialize issue-worker definitions with an absolute child-only ForgeDock extension path so strict subagent tool allowlists can actually load `forgedock_work_on`
 - [x] Project typed run transitions into auto-provisioned, mutually exclusive `workflow:*` GitHub labels without making labels authoritative
+- [x] Distinguish invalid, blocked, failed, suspended, and awaiting-human states in CLI, TUI, and orchestration board projections
 - [x] Refresh explicitly configured GitHub App credentials at interactive terminal startup through a packaged cross-platform Node helper
 - [x] Serialize verification, bound Node test fanout, terminate full subprocess trees on timeout/cancellation, isolate credential-free verification homes, and redact credential-shaped durable output
 - [x] Keep subagent transcripts out of delivery worktrees and reject automatic remediation outside frozen Build Packet paths
@@ -180,7 +185,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- ForgeDock Next suite: 336 passing, 0 failing. `npm run build` and `npm run docs:build` are green. With the staging shell's `jq` path available, the legacy invocation reaches 1,813 passing, 0 failing, and 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
+- ForgeDock Next suite: 356 passing, 0 failing. `npm run build`, `npm run docs:build`, and conformance checks are green. With the staging shell's `jq` path available, the legacy invocation reaches 1,813 passing, 0 failing, and 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
 - Phase G in progress: agent receipts are persisted in SQLite and surfaced through `status --json`/trajectory comments, while controller progress is persisted and surfaced through `status --json`; runtime preflight runs before semantic mutation, nested verification scripts produce covered evidence without duplicate execution, and packet/remediation writes are exact-path scoped.
 
 ## Resolved environment and dependency blockers

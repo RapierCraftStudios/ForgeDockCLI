@@ -47,6 +47,8 @@ describe("bundled subagent live visibility", () => {
     assert.match(fleet, /review · \$\{reviewLabel\}/);
     assert.match(fleet, /\(\+\$\{item\.nestedCount\} agent/);
     assert.match(fleetStatus, /nestedCountForStep/);
+    assert.match(fleetStatus, /activeNestedChild/);
+    assert.match(fleetStatus, /entry\.currentTool/);
     assert.match(fleetStatus, /\(\+\$\{entry\.nestedCount\} agent/);
     assert.match(nestedEvents, /stringValue\(raw\.description, 2048\)/);
     assert.match(executor, /description: foregroundDescription\.slice\(0, 2048\)/);
@@ -123,7 +125,8 @@ describe("bundled subagent live visibility", () => {
         id: "review-security", parentRunId: "issue-worker", parentStepIndex: 0, parentAgent: "forgedock-issue-worker",
         depth: 1, path: [{ runId: "issue-worker", stepIndex: 0, agent: "forgedock-issue-worker" }],
         state: "running", mode: "single", agent: "forgedock-reviewer",
-        description: "ForgeDock review · security\nForgeDock nested task id: run:review:sha:security",
+        description: "ForgeDock review · cycle 3/3 · security · BuildResult 2026-08-10T14:01:00.000Z · remediation remaining 0",
+        currentTool: "grep", currentPath: "src/concurrency.ts",
         startedAt: now - 5_000, lastUpdate: now,
       }],
     }]]);
@@ -139,6 +142,9 @@ describe("bundled subagent live visibility", () => {
     assert.equal(snapshot.items[1]?.treePrefix, "└─ ");
     assert.equal(snapshot.items[1]?.key, "nested:issue-worker:review-security");
     assert.equal(fleetStatus.collectFleetStatusEntries(state)[0]?.nestedCount, 1);
+    assert.equal(fleetStatus.collectFleetStatusEntries(state)[0]?.currentTool, "grep");
+    assert.equal(fleetStatus.collectFleetStatusEntries(state)[0]?.currentPath, "src/concurrency.ts");
+    assert.equal(fleetStatus.collectFleetStatusEntries(state)[0]?.activeChild, "forgedock-reviewer");
   });
 
   it("accepts a completed read-only ForgeDock review despite an earlier optional probe failure", () => {

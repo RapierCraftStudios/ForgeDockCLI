@@ -206,7 +206,11 @@ export async function verifyParentRevision(input: {
   if (current.headSha === input.checkpoint.payload.headSha) {
     throw new Error(`Parent branch head did not advance after child remediation: ${current.headSha}`);
   }
-  const uncoveredPlan = uncoveredVerificationCommands(input.packet.payload.verificationPlan, input.commands);
+  const uncoveredPlan = uncoveredVerificationCommands(
+    input.packet.payload.verificationPlan,
+    input.commands,
+    input.packet.payload.controllerGates,
+  );
   if (uncoveredPlan.length) {
     throw new Error(`Parent revision verification does not cover the frozen plan: ${uncoveredPlan.join(", ")}`);
   }

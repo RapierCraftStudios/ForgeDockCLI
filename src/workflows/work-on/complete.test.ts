@@ -4,7 +4,7 @@ import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
-import { completeWorkItem } from "./complete.js";
+import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 
 const sha = "c".repeat(40);
 const openPr: PullRequestSnapshot = { repo: "a/b", number: 9, title: "Fix", body: "", url: "https://github.test/a/b/pull/9", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -67,6 +67,43 @@ async function mergingRun(runs: InMemoryRunRepository): Promise<RunState> {
   return run;
 }
 
+async function invalidRun(runs: InMemoryRunRepository): Promise<RunState> {
+  let run = createRun({
+    workflow: "work-on",
+    subject: { repo: "a/b", issue: 2 },
+    runId: `run_invalid_${crypto.randomUUID()}`,
+    target: { lane: "fast", targetBranch: "main" },
+  });
+  await runs.create(run);
+  for (const event of ["START_INVESTIGATION", "INVESTIGATION_INVALID"] as TransitionEvent[]) {
+    const next = transition(run, event);
+    await runs.commit(run.version, next.state, next.record);
+    run = next.state;
+  }
+  return run;
+}
+
+function invalidInvestigation(run: RunState) {
+  return createArtifact({
+    kind: "Investigation", runId: run.runId, subject: run.subject, producer: { role: "investigator" },
+    payload: {
+      outcome: "invalid", confidence: "high", summary: "The guarded implementation and regression test already cover the report.",
+      evidence: [{ claim: "Already fixed", source: "src/guard.ts:test", detail: "The regression test proves the reported behavior is covered." }],
+      affectedSurfaces: ["src/guard.ts"], risks: [], recommendation: "Close as already resolved.",
+    },
+  });
+}
+
+function invalidOutcome(run: RunState) {
+  return createArtifact({
+    kind: "Outcome", runId: run.runId, subject: run.subject, producer: { role: "controller" },
+    payload: {
+      status: "invalid", reason: "The guarded implementation and regression test already cover the report.", childIssues: [],
+      issueClosure: { status: "pending", repo: run.subject.repo, issue: run.subject.issue! },
+    },
+  });
+}
+
 function verdict(run: RunState) {
   return createArtifact({
     kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: 9 }, producer: { role: "controller" },
@@ -75,6 +112,74 @@ function verdict(run: RunState) {
 }
 
 describe("merge and close authority", () => {
+  it("closes an invalid investigation only after authoritative proof", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    const result = await completeInvalidWorkItem({ run, investigation, outcome: provisional }, { host, artifacts });
+    assert.equal(result.run.state, "invalid");
+    assert.deepEqual(host.closes, [2]);
+    assert.equal(result.outcome.payload.issueClosure?.status, "completed");
+    assert.match(result.outcome.payload.reason, /already cover/);
+    assert.match(result.outcome.payload.reason, /evidence artifact art_/);
+    assert.equal(result.outcome.payload.issueClosure?.repo, "a/b");
+    const outcomes = (await artifacts.list(run.subject, "Outcome"))
+      .filter((artifact): artifact is import("../../core/artifacts/schema.js").DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+    assert.equal(outcomes.length, 2);
+  });
+
+  it("leaves a provisional invalid Outcome recoverable when closure fails", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    host.failClose = true;
+    await assert.rejects(
+      completeInvalidWorkItem({ run, investigation, outcome: provisional }, { host, artifacts }),
+      /issue closure unavailable/,
+    );
+    const outcomes = (await artifacts.list(run.subject, "Outcome"))
+      .filter((artifact): artifact is import("../../core/artifacts/schema.js").DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+    assert.deepEqual(outcomes.map((artifact) => artifact.payload.issueClosure?.status), ["pending"]);
+  });
+
+  it("refuses to publish invalid terminal evidence when GitHub remains OPEN", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    host.staleClosureProof = true;
+    await assert.rejects(
+      completeInvalidWorkItem({ run, investigation, outcome: provisional }, { host, artifacts }),
+      /authoritative host state is OPEN/,
+    );
+    assert.equal((await artifacts.list(run.subject, "Outcome")).length, 1);
+  });
+
+  it("handles an already-closed invalid issue idempotently", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    host.closedIssues.add(2);
+    const result = await completeInvalidWorkItem({ run, investigation, outcome: provisional }, { host, artifacts });
+    assert.equal(result.outcome.payload.issueClosure?.status, "completed");
+    assert.deepEqual(host.closes, [2]);
+  });
+
   it("defaults to a human merge checkpoint without changing state", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);

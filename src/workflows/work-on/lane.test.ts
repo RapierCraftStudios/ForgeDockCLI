@@ -75,6 +75,12 @@ describe("issue lane classification", () => {
     assert.deepEqual(lane, { kind: "fast", targetBranch: "main", resolution: "repository-default" });
   });
 
+  it("honors an explicit configured staging fast-lane target", () => {
+    assert.deepEqual(classifyIssueLane(issueWithoutMilestone, "main", [], "staging"), {
+      kind: "fast", targetBranch: "staging", resolution: "configured-fast-lane",
+    });
+  });
+
   it("honors explicit staging-review source branch evidence instead of defaulting to main", () => {
     const stagingReview: IssueSnapshot = {
       ...issueWithoutMilestone,

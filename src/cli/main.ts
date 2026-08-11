@@ -8,6 +8,7 @@ import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } 
 import {
   decideSubjectAdmission,
   latestArtifactOfKind,
+  MAX_VERIFICATION_REPAIR_ATTEMPTS,
   latestDeliveryRunArtifacts,
   reviewRemediationCycleCount,
   verificationRepairAttemptCount,
@@ -31,6 +32,7 @@ import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
+import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
@@ -57,6 +59,20 @@ await main(args).catch((error: unknown) => {
   console.error(`${statusGlyph("failed", mode)} ${message}`);
   process.exitCode = 1;
 });
+
+type RunDisplayGlyph = "active" | "passed" | "failed" | "blocked";
+
+function runStatePresentation(state: string): { glyph: RunDisplayGlyph; label: string } {
+  switch (state) {
+    case "completed": return { glyph: "passed", label: "completed" };
+    case "failed": return { glyph: "failed", label: "failed · engine recovery required" };
+    case "blocked": return { glyph: "blocked", label: "blocked · human/recovery action required" };
+    case "invalid": return { glyph: "blocked", label: "invalid · no delivery performed" };
+    case "decomposed": return { glyph: "blocked", label: "decomposed · child scope required" };
+    case "merging": return { glyph: "active", label: "awaiting human merge" };
+    default: return { glyph: "active", label: state };
+  }
+}
 
 async function main(argv: string[]): Promise<void> {
   const command = argv[0] ?? "help";
@@ -119,7 +135,10 @@ async function status(argv: string[]): Promise<void> {
       if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       else {
         process.stdout.write(`${renderHeader({ subtitle: "status · reconstructed from GitHub" })}\n\n`);
-        process.stdout.write(`${statusGlyph(reconciled.state === "completed" ? "passed" : reconciled.state === "blocked" ? "blocked" : "active", mode)} ${result.subject} · ${reconciled.state}\n`);
+        const presentation = runStatePresentation(reconciled.state);
+        const suspended = reconciled.state === "blocked" && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint?.payload.status ?? "");
+        const label = suspended ? "suspended · remediation checkpoint awaiting resume" : presentation.label;
+        process.stdout.write(`${statusGlyph(suspended ? "active" : presentation.glyph, mode)} ${result.subject} · ${label}\n`);
         renderTelemetryLine(telemetry);
         if (controllerTiming !== undefined) renderControllerTimingLine(controllerTiming);
         if (latestProgress !== undefined) process.stdout.write(`  progress: ${latestProgress.phase} · ${latestProgress.message}\n`);
@@ -151,8 +170,8 @@ async function status(argv: string[]): Promise<void> {
     }
     for (const run of runsWithTelemetry) {
       const subject = `${run.subject.repo}${run.subject.issue ? `#${run.subject.issue}` : ""}${run.subject.pr ? ` PR#${run.subject.pr}` : ""}`;
-      const state = run.state === "completed" ? "passed" : run.state === "blocked" || run.state === "failed" ? "blocked" : "active";
-      process.stdout.write(`${statusGlyph(state, mode)} ${run.runId} · ${subject} · ${run.state} · v${run.version}\n`);
+      const presentation = runStatePresentation(run.state);
+      process.stdout.write(`${statusGlyph(presentation.glyph, mode)} ${run.runId} · ${subject} · ${presentation.label} · v${run.version}\n`);
       renderTelemetryLine(run.telemetry, "  ");
       renderControllerTimingLine(run.controllerTiming, "  ");
       if (run.controllerProgress) process.stdout.write(`  progress: ${run.controllerProgress.phase} · ${run.controllerProgress.message}\n`);
@@ -166,13 +185,16 @@ async function workOn(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueArg = argv.find((arg) => !arg.startsWith("-"));
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
   const dryRun = argv.includes("--dry-run");
   if (dryRun && through !== "investigate") throw new Error("--dry-run must be paired with --through investigate; full work-on creates a branch and PR");
   if (argv.includes("--rerun") && argv.includes("--resume")) throw new Error("--rerun and --resume are mutually exclusive recovery policies");
+  const adjudicationReason = option(argv, "--adjudicate-verification");
+  if (adjudicationReason !== undefined && !argv.includes("--resume")) throw new Error("--adjudicate-verification requires --resume; it authorizes typed verification checkpoint resume, not a fresh run");
+  if (adjudicationReason !== undefined && argv.includes("--rerun")) throw new Error("--adjudicate-verification cannot be combined with --rerun");
   const autoMerge = commandAutoMerge(argv);
   const configuredNext = readForgeDockConfig(process.cwd());
   const scopeExpansionOption = option(argv, "--scope-expansion");
@@ -193,7 +215,7 @@ async function workOn(argv: string[]): Promise<void> {
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
-  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github);
+  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
@@ -222,7 +244,38 @@ async function workOn(argv: string[]): Promise<void> {
       `Dependency #${dependency} admission: authoritative artifact state completed${reconciled.runId ? ` in run ${reconciled.runId}` : ""}; merged Outcome recorded ${mergedOutcome?.createdAt ?? "with no timestamp"}; issue state ${dependencyIssue.state}; labels ${dependencyIssue.labels.join(", ") || "none"}`,
     );
   }
-  const priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
+  let priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
+  if (adjudicationReason !== undefined) {
+    const latestDelivery = latestDeliveryRunArtifacts(priorArtifacts);
+    const latestOutcome = latestDelivery ? latestArtifactOfKind(latestDelivery.artifacts, "Outcome") : undefined;
+    if (!latestDelivery || !latestOutcome || latestOutcome.payload.status !== "blocked" || !latestOutcome.payload.failureEvidence) {
+      throw new Error("--adjudicate-verification requires the latest run to have a retained blocked verification Outcome");
+    }
+    if (!latestOutcome.payload.failureEvidence.criterionCoverage?.length) {
+      throw new Error("--adjudicate-verification requires typed builder criterion coverage; legacy evidence must use ordinary checkpoint recovery");
+    }
+    if (verificationRepairAttemptCount(latestDelivery.artifacts) < MAX_VERIFICATION_REPAIR_ATTEMPTS) {
+      throw new Error("--adjudicate-verification is only valid after the bounded verification repair budget is exhausted");
+    }
+    const adjudicationId = `vadj_${latestDelivery.runId}_${latestOutcome.id}`;
+    const existingAdjudication = priorArtifacts.find((artifact) => artifact.id === adjudicationId);
+    if (!existingAdjudication) {
+      const adjudication = createArtifact({
+        kind: "VerificationAdjudication",
+        runId: latestDelivery.runId,
+        subject,
+        producer: { role: "human", runtime: "forgedock" },
+        payload: {
+          checkpoint: "verification",
+          decision: "resume",
+          supersedesOutcomeId: latestOutcome.id,
+          reason: adjudicationReason,
+        },
+      }, { id: adjudicationId });
+      await authoritativeArtifacts.append(adjudication);
+      priorArtifacts = [...priorArtifacts, adjudication];
+    }
+  }
   let resumeRunId: string | undefined;
   let progressRunId = runId;
   let resumeCheckpoint: string | undefined;
@@ -280,10 +333,29 @@ async function workOn(argv: string[]): Promise<void> {
   const onAgentEvent = (event: AgentEvent) => {
     writeAgentEvent(event);
     if (event.type === "thinking.delta" || event.type === "text.delta") return;
+    const observability = event.observability;
+    const activity = event.type === "tool.started"
+      ? `last tool ${event.tool} started`
+      : event.type === "tool.completed"
+        ? `last tool ${event.tool} ${event.isError ? "failed" : "completed"}`
+        : event.type === "session.started"
+          ? "agent session started"
+          : event.type === "session.completed"
+            ? "agent session completed"
+            : event.type === "artifact.submitted" ? "artifact submitted" : "agent activity";
+    const milestone = observability ? [
+      `phase ${observability.phase}`,
+      observability.cycle ? `review cycle ${observability.cycle.current}/${observability.cycle.total}` : "",
+      observability.activeChild ? `active child ${observability.activeChild}` : "",
+      observability.reviewerRoles?.length ? `reviewers ${observability.reviewerRoles.join(", ")}` : "",
+      observability.latestArtifacts?.buildResult ? `BuildResult ${observability.latestArtifacts.buildResult}` : "",
+      observability.latestArtifacts?.reviewVerdict ? `ReviewVerdict ${observability.latestArtifacts.reviewVerdict}` : "",
+      observability.remainingRemediationCycles !== undefined ? `remediation remaining ${observability.remainingRemediationCycles}` : "",
+    ].filter(Boolean).join(" · ") : `phase ${event.type}`;
     void runs.recordProgress({
       runId: progressRunId,
-      phase: event.type,
-      message: `Agent runtime event for ${event.taskId}`,
+      phase: observability?.phase ?? event.type,
+      message: `${milestone} · ${activity} · ${event.taskId}`,
       occurredAt: new Date().toISOString(),
     }).catch(() => undefined);
   };
@@ -294,7 +366,7 @@ async function workOn(argv: string[]): Promise<void> {
   let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
-    if (resumeCheckpoint !== "completion") {
+    if (resumeCheckpoint !== "completion" && resumeCheckpoint !== "invalid-closure") {
       await preflightRuntime(runtime, {
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
@@ -321,6 +393,43 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
       }
       const runArtifacts = resumeArtifacts.filter((artifact) => artifact.runId === resumeRunId);
+      if (admission.checkpoint === "invalid-closure") {
+        const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
+        const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
+        const invalidOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
+        if (!intentArtifact || !investigation || investigation.payload.outcome !== "invalid"
+          || !invalidOutcome || invalidOutcome.payload.status !== "invalid") {
+          throw new Error(`Run ${resumeRunId} does not contain the Intent, invalid Investigation, and invalid Outcome required for issue closure resume`);
+        }
+        const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
+        for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
+        const frozenTarget = runTargetForLane(lane);
+        const recoveredRun = {
+          schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
+          state: "invalid" as const, attempt: 1, version: 0,
+          ...frozenTarget,
+          createdAt: intentArtifact.createdAt,
+          updatedAt: invalidOutcome.createdAt,
+          artifactIds,
+        };
+        let run = await store.load(resumeRunId);
+        if (!run) {
+          await store.create(recoveredRun);
+          run = recoveredRun;
+        } else if (run.subject.repo !== subject.repo || run.subject.issue !== subject.issue) {
+          throw new Error(`Durable invalid run ${resumeRunId} targets ${run.subject.repo}#${run.subject.issue}, expected ${subject.repo}#${subject.issue}`);
+        } else if (run.targetBranch && run.targetBranch !== frozenTarget.targetBranch) {
+          throw new Error(`Durable invalid run target ${run.targetBranch} conflicts with current issue lane target ${frozenTarget.targetBranch}`);
+        } else if (run.state !== "invalid" || !run.targetBranch) {
+          await store.rebuildRun(recoveredRun);
+          run = recoveredRun;
+        } else {
+          assertRunFollowsLane(run, lane);
+        }
+        const finalized = await completeInvalidWorkItem({ run, investigation, outcome: invalidOutcome }, { host: github, artifacts });
+        process.stdout.write(`${statusGlyph("passed", mode)} Resumed invalid run ${finalized.run.runId} · issue #${issue.number} is authoritatively closed\n`);
+        return;
+      }
       const priorRemediationCycles = reviewRemediationCycleCount(runArtifacts);
       const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
       const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
@@ -330,6 +439,7 @@ async function workOn(argv: string[]): Promise<void> {
       }
       const remediationCheckpoint = latestArtifactOfKind(runArtifacts, "RemediationBlocked");
       const latestOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
+      const verificationAdjudication = latestArtifactOfKind(runArtifacts, "VerificationAdjudication");
       const checkpointArtifact = admission.checkpoint === "verification"
         ? latestOutcome
         : admission.checkpoint === "publication"
@@ -405,7 +515,7 @@ async function workOn(argv: string[]): Promise<void> {
         || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)
         || JSON.stringify(run.scopeManifest ?? null) !== JSON.stringify(recoveredScopeManifest)) {
         process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} state or scope (${run.state}) from durable GitHub authority (${admission.state})\n`);
-        store.rebuildRun(recoveredRun);
+        await store.rebuildRun(recoveredRun);
         run = recoveredRun;
       } else if (run.targetBranch) {
         assertRunFollowsLane(run, lane);
@@ -458,7 +568,9 @@ async function workOn(argv: string[]): Promise<void> {
             priorVerificationRepairAttempts,
             ...(retainedBuildResult && priorVerdict ? { repairContext: [retainedBuildResult, priorVerdict] } : {}),
           }
-          : {}),
+          : admission.checkpoint === "verification" && verificationAdjudication !== undefined
+            ? { priorVerificationRepairAttempts }
+            : {}),
         baseBranch: durableTargetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         priorRemediationCycles,
@@ -552,7 +664,8 @@ async function workOn(argv: string[]): Promise<void> {
                 }, dependencies)
               : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
-      process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
+      const presentation = runStatePresentation(result.run.state);
+      process.stdout.write(`${statusGlyph(result.awaitingHuman ? "active" : presentation.glyph, mode)} Resumed run ${result.run.runId} · ${result.awaitingHuman ? "awaiting human merge" : presentation.label}${suffix}\n`);
       if (result.run.state !== "completed") process.exitCode = 2;
       return;
     }
@@ -569,8 +682,12 @@ async function workOn(argv: string[]): Promise<void> {
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       }, { runtime, artifacts, runs, decomposer: github, onAgentEvent });
+      const finalized = !dryRun && result.run.state === "invalid" && result.outcome?.payload.status === "invalid"
+        ? await completeInvalidWorkItem({ run: result.run, investigation: result.investigation, outcome: result.outcome }, { host: github, artifacts })
+        : result;
       process.stdout.write(`\n${renderArtifactMarkdown(result.investigation)}\n\n`);
-      process.stdout.write(`${statusGlyph("passed", mode)} Investigation committed · run state: ${result.run.state}${dryRun ? " · dry run (not published)" : ""}\n`);
+      const presentation = runStatePresentation(finalized.run.state);
+      process.stdout.write(`${statusGlyph(presentation.glyph, mode)} Investigation committed · ${presentation.label}${dryRun ? " · dry run (not published)" : ""}\n`);
       return;
     }
 
@@ -613,7 +730,8 @@ async function workOn(argv: string[]): Promise<void> {
       onAgentEvent,
     });
     const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
-    process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Run ${result.run.runId} · ${result.run.state}${suffix}\n`);
+    const presentation = runStatePresentation(result.run.state);
+    process.stdout.write(`${statusGlyph(result.awaitingHuman ? "active" : presentation.glyph, mode)} Run ${result.run.runId} · ${result.awaitingHuman ? "awaiting human merge" : presentation.label}${suffix}\n`);
     if (result.run.state !== "completed") process.exitCode = 2;
   } finally {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
@@ -739,7 +857,7 @@ async function orchestrate(argv: string[]): Promise<void> {
   for (const issue of issueSnapshots) {
     routedIssues.set(issue.number, {
       issue,
-      lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches),
+      lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget),
     });
   }
   await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
@@ -800,8 +918,10 @@ async function orchestrate(argv: string[]): Promise<void> {
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
     });
-    // Validate the frozen verification policy before any batch issue is created.
-    discoverVerificationCommands(process.cwd(), `origin/${repository.defaultBranch}`);
+    // Validate the frozen verification policy for every authoritative lane before any batch issue is created.
+    for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
+      discoverVerificationCommands(process.cwd(), `origin/${targetBranch}`);
+    }
     const materializedResult = assembly.groups.length
       ? await materializeBatchGroups({
         repo: repository.repo,
@@ -902,7 +1022,16 @@ async function orchestrate(argv: string[]): Promise<void> {
           onAgentEvent: (event) => writeAgentEvent(event, item.id),
         });
         outcomes.set(item.id, result.run.state);
-        process.stdout.write(`${statusGlyph(result.run.state === "completed" || result.run.state === "merging" ? "passed" : "blocked", mode)} ${item.id} ${result.run.state}\n`);
+        if (result.awaitingHuman) {
+          process.stdout.write(`${statusGlyph("active", mode)} ${item.id} awaiting human merge${result.pullRequest?.url ? ` · ${result.pullRequest.url}` : ""}\n`);
+          return { status: "suspended", error: `Awaiting human merge${result.pullRequest?.url ? ` at ${result.pullRequest.url}` : ""}` };
+        }
+        if (result.run.state === "invalid") {
+          process.stdout.write(`${statusGlyph("blocked", mode)} ${item.id} invalid · no build or delivery performed\n`);
+          return { status: "invalid", error: "Investigation classified the issue as invalid; no delivery work was performed" };
+        }
+        const presentation = runStatePresentation(result.run.state);
+        process.stdout.write(`${statusGlyph(presentation.glyph, mode)} ${item.id} ${presentation.label}\n`);
         if (result.run.state === "blocked") {
           const reconciled = reconcileLatestRunArtifacts(await artifacts.list(subject));
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
@@ -912,7 +1041,6 @@ async function orchestrate(argv: string[]): Promise<void> {
         if (result.run.state === "decomposed") {
           return { status: "skipped", error: `${item.id} decomposed during orchestration; rerun orchestration to freeze its authoritative child scope` };
         }
-        if (result.run.state === "invalid") return;
         if (result.run.state !== "completed") throw new Error(`${item.id} ended in ${result.run.state}; dependents remain blocked`);
       } finally {
         clearInterval(heartbeat);
@@ -926,16 +1054,17 @@ async function orchestrate(argv: string[]): Promise<void> {
           result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
         });
         const event = orchestrationEventFromSchedule(scheduleEvent, snapshot);
-        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} suspended=${snapshot.suspendedNodes.length}\n`);
+        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
     const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked" || status === "skipped");
+    const invalid = [...schedule.status.entries()].filter(([, status]) => status === "invalid");
     const suspended = [...schedule.status.entries()].filter(([, status]) => status === "suspended");
     const completed = [...schedule.status.values()].filter((status) => status === "completed").length;
     const satisfiedExisting = [...skipped.values()].filter((state) => state === "completed" || state === "invalid").length;
-    process.stdout.write(`\nOrchestration complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${suspended.length} suspended\n`);
+    process.stdout.write(`\nOrchestration complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${invalid.length} invalid · ${suspended.length} suspended/awaiting-human\n`);
     for (const [id, state] of outcomes) process.stdout.write(`  ${id}: ${state}\n`);
-    if (failed.length || suspended.length) process.exitCode = 2;
+    if (failed.length || invalid.length || suspended.length) process.exitCode = 2;
   } finally {
     await runtime.close();
     store.close();
@@ -1090,7 +1219,7 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");

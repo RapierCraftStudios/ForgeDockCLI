@@ -10,6 +10,64 @@ import { attachArtifact, transition, type RunState } from "../../core/state/mach
 import { WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 
+/**
+ * Finalize an investigation that proved the issue invalid. The invalid
+ * Outcome written by investigation is a durable, provisional checkpoint; the
+ * terminal projection is appended only after the typed host has closed the
+ * exact issue and an authoritative re-read proves CLOSED.
+ */
+export async function completeInvalidWorkItem(
+  input: {
+    run: RunState;
+    investigation: DurableArtifact<"Investigation">;
+    outcome: DurableArtifact<"Outcome">;
+  },
+  dependencies: { host: ForgeHost; artifacts: ArtifactRepository },
+): Promise<{ run: RunState; outcome: DurableArtifact<"Outcome"> }> {
+  if (input.run.state !== "invalid") throw new Error(`Invalid closure requires invalid state, found ${input.run.state}`);
+  if (input.investigation.payload.outcome !== "invalid") throw new Error("Invalid closure requires an invalid Investigation artifact");
+  if (input.outcome.payload.status !== "invalid") throw new Error("Invalid closure requires an invalid Outcome artifact");
+  const issue = input.run.subject.issue;
+  if (!issue) throw new Error("Invalid closure requires an issue subject");
+  const closure = input.outcome.payload.issueClosure;
+  if (closure && (closure.repo.toLowerCase() !== input.run.subject.repo.toLowerCase() || closure.issue !== issue)) {
+    throw new Error(`Invalid closure proof targets ${closure.repo}#${closure.issue}, expected ${input.run.subject.repo}#${issue}`);
+  }
+  if (!dependencies.host.closeIssue) throw new Error("Invalid closure requires typed host closeIssue support");
+  try {
+    const reason = `ForgeDock investigation ${input.investigation.id} proved this issue invalid: ${input.outcome.payload.reason} (evidence artifact ${input.investigation.id}).`;
+    await dependencies.host.closeIssue(input.run.subject.repo, issue, reason);
+    await assertClosedIssue(dependencies.host, input.run.subject.repo, issue);
+    const durableFinal = (await dependencies.artifacts.list(input.run.subject, "Outcome"))
+      .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.runId === input.run.runId)
+      .reverse()
+      .find((artifact) => artifact.payload.status === "invalid" && artifact.payload.issueClosure?.status === "completed");
+    if (durableFinal) return { run: input.run, outcome: durableFinal };
+    if (closure?.status === "completed") return { run: input.run, outcome: input.outcome };
+    const finalized = createArtifact({
+      kind: "Outcome",
+      runId: input.run.runId,
+      subject: input.run.subject,
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        ...input.outcome.payload,
+        reason: `${reason} Authoritative GitHub state is CLOSED.`,
+        issueClosure: {
+          status: "completed",
+          repo: input.run.subject.repo,
+          issue,
+          verifiedAt: new Date().toISOString(),
+        },
+      },
+    });
+    await dependencies.artifacts.append(finalized);
+    return { run: input.run, outcome: finalized };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new WorkflowExecutionError(reason, input.run, { cause: error });
+  }
+}
+
 export async function completeWorkItem(
   input: {
     run: RunState;

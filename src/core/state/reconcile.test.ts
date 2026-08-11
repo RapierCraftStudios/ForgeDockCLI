@@ -30,6 +30,35 @@ describe("GitHub artifact reconciliation", () => {
     }
   });
 
+  it("lets a later verified BuildResult supersede a ready remediation checkpoint", () => {
+    const checkpoint = createArtifact({
+      ...common,
+      kind: "RemediationBlocked",
+      payload: {
+        checkpointKey: "checkpoint",
+        checkpointSequence: 1,
+        status: "ready-to-resume",
+        parentRunId: common.runId,
+        parentIssue: 1,
+        pullRequest: 9,
+        headSha: sha,
+        headBranch: "fix",
+        baseBranch: "main",
+        packetArtifactId: packet.id,
+        verdictArtifactId: verdict.id,
+        reason: "scope-violation",
+        findings: [],
+        childIssues: [2],
+        childRunIds: ["child"],
+        approvedPaths: ["a"],
+        childOutcomeIds: ["outcome"],
+        remediationDepth: 0,
+        maxRemediationDepth: 2,
+      },
+    });
+    assert.equal(reconcileArtifacts([intent, investigation, packet, checkpoint, build] as DurableArtifact[]).state, "publishing");
+  });
+
   it("selects the latest semantic run by durable Intent publication order", () => {
     const oldIntent = { ...intent, runId: "run_old", createdAt: "2099-01-01T00:00:00.000Z" };
     const oldOutcome = createArtifact({

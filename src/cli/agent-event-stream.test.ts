@@ -25,6 +25,23 @@ test("streams inner assistant and thinking deltas with task context", () => {
   assert.match(stream.output(), /◆ build:1 · assistant\n      │ I will update the scoped file\./);
 });
 
+test("shows typed review milestones and artifact timestamps in the live stream", () => {
+  const stream = capture();
+  stream.writer.write({
+    type: "tool.started", taskId: "review:3", toolCallId: "call-grep", tool: "grep",
+    observability: {
+      phase: "review", cycle: { current: 3, total: 3 }, activeChild: "concurrency",
+      reviewerRoles: ["correctness", "concurrency"],
+      latestArtifacts: { buildResult: "2026-08-10T14:01:00.000Z", reviewVerdict: "2026-08-10T13:45:00.000Z" },
+      remainingRemediationCycles: 0,
+    },
+  });
+  assert.match(stream.output(), /review · cycle 3\/3 · child concurrency/);
+  assert.match(stream.output(), /BuildResult 2026-08-10T14:01:00\.000Z/);
+  assert.match(stream.output(), /ReviewVerdict 2026-08-10T13:45:00\.000Z/);
+  assert.match(stream.output(), /remaining 0/);
+});
+
 test("shows bounded tool arguments and completion in the live stream", () => {
   const stream = capture();
   stream.writer.write({

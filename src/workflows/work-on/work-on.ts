@@ -13,7 +13,7 @@ import {
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
 import { buildWorkItem, type BuilderSubmission } from "./build.js";
-import { completeWorkItem } from "./complete.js";
+import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 import { publishPullRequest } from "./publish.js";
@@ -42,6 +42,7 @@ export interface WorkOnDependencies {
 
 export interface WorkOnResult {
   run: RunState;
+  outcome?: DurableArtifact<"Outcome">;
   pullRequest?: PullRequestSnapshot;
   awaitingHuman?: boolean;
 }
@@ -137,7 +138,17 @@ export async function workOn(
       ...runtimeOptions,
     }, agentDependencies);
     run = investigated.run;
-    if (run.state === "invalid" || run.state === "decomposed") return { run };
+    if (run.state === "invalid") {
+      if (!investigated.outcome || investigated.outcome.payload.status !== "invalid") {
+        throw new Error(`Invalid run ${run.runId} is missing its structured invalid Outcome`);
+      }
+      return await completeInvalidWorkItem({
+        run,
+        investigation: investigated.investigation,
+        outcome: investigated.outcome,
+      }, dependencies);
+    }
+    if (run.state === "decomposed") return { run };
 
     const prepared = await prepareBuildPacket({
       run,
@@ -173,7 +184,7 @@ export async function workOn(
   } catch (error) {
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
-    if (run && run.state !== "failed" && run.state !== "blocked") {
+    if (run && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
@@ -433,10 +444,14 @@ async function continueBuildDelivery(
     ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
     ...(input.priorVerificationFailure !== undefined ? { priorVerificationFailure: input.priorVerificationFailure } : {}),
     ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
-    worktree: input.workspace.path, ...runtimeOptions,
+    worktree: input.workspace.path,
+    verification: commands,
+    verificationRunner: dependencies.verifier,
+    ...runtimeOptions,
   }, {
     runtime: dependencies.runtime,
     runs: dependencies.runs,
+    verifier: dependencies.verifier,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
   run = built.run;
@@ -475,6 +490,7 @@ async function continueBuildDelivery(
       findingIssuePolicy: "approved-only",
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+      reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
       ...runtimeOptions,
     }, {
       runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -501,9 +517,12 @@ async function continueBuildDelivery(
     }
     const remediated = await remediateReview({
       run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-      buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+      buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path,
+      verification: commands,
+      verificationRunner: dependencies.verifier,
+      ...runtimeOptions,
     }, {
-      runtime: dependencies.runtime, runs: dependencies.runs,
+      runtime: dependencies.runtime, runs: dependencies.runs, verifier: dependencies.verifier,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
     run = remediated.run;
@@ -554,6 +573,7 @@ export async function resumeWorkOn(
     autoMerge?: boolean;
     maxRemediationCycles?: number;
     priorRemediationCycles?: number;
+    priorVerificationRepairAttempts?: number;
     maxRemediationDepth?: number;
     maxRemediationChildren?: number;
     remediationDepth?: number;
@@ -604,6 +624,7 @@ export async function resumeWorkOn(
       commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.priorVerificationRepairAttempts !== undefined ? { priorVerificationRepairAttempts: input.priorVerificationRepairAttempts } : {}),
       ...runtimeOptions,
     }, dependencies);
     run = verified.run;
@@ -625,6 +646,7 @@ export async function resumeWorkOn(
         findingIssuePolicy: "approved-only",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+        reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
         ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -650,7 +672,7 @@ export async function resumeWorkOn(
       }
       const remediated = await remediateReview({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path, ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, runs: dependencies.runs,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
@@ -777,6 +799,7 @@ export async function resumeReviewWorkOn(
         findingIssuePolicy: "approved-only",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
+        reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
         ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -817,7 +840,7 @@ export async function resumeReviewWorkOn(
 
     const firstRemediation = await remediateReview({
       run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-      buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+      buildResult, verdict, reviewCycle: { current: cycle, total: remediationLimit + 1 }, worktree: input.workspace.path, ...runtimeOptions,
     }, {
       runtime: dependencies.runtime, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
@@ -852,6 +875,7 @@ export async function resumeReviewWorkOn(
         findingIssuePolicy: "approved-only",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
+        reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
         ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -876,7 +900,7 @@ export async function resumeReviewWorkOn(
       }
       const remediated = await remediateReview({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+        buildResult, verdict, reviewCycle: { current: cycle, total: remediationLimit + 1 }, worktree: input.workspace.path, ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, runs: dependencies.runs,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
@@ -992,6 +1016,7 @@ export async function resumeExpandedReviewWorkOn(
     workspace: input.workspace.path,
     findingIssuePolicy: "approved-only",
     priorVerdict: input.priorVerdict,
+    reviewCycle: { current: 1, total: 1 },
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
@@ -1112,6 +1137,7 @@ export async function resumePublicationWorkOn(
         findingIssuePolicy: "approved-only",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+        reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
         ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -1137,7 +1163,7 @@ export async function resumePublicationWorkOn(
       }
       const remediated = await remediateReview({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path, ...runtimeOptions,
       }, {
         runtime: dependencies.runtime, runs: dependencies.runs,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),

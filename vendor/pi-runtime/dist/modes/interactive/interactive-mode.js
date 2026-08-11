@@ -4108,22 +4108,27 @@ export class InteractiveMode {
         this.showStatus("ForgeDock setup · checking provider authentication");
         let availableModels = [];
         try {
-            await this.session.modelRuntime.refresh();
+            // Startup onboarding must not wait forever on the optional remote catalog.
+            await this.session.modelRuntime.refresh({ signal: AbortSignal.timeout(15_000) });
             availableModels = [...(await this.session.modelRuntime.getAvailable())];
         }
         catch {
             availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
         }
-        // A model catalog can exist before credentials do. Only offer the
-        // detected-credentials shortcut when an authenticated provider actually
-        // backs one of the available models.
+        // A model catalog can exist before credentials do. Reuse any stored
+        // credential even when the catalog refresh is temporarily unavailable;
+        // rebuilding or relaunching the terminal must never force OAuth again.
+        const storedCredentials = await this.session.modelRuntime.listCredentials();
         const detectedModel = availableModels.find((model) => this.session.modelRuntime.hasConfiguredAuth(model.provider));
-        let connectProvider = detectedModel === undefined;
+        let connectProvider = detectedModel === undefined && storedCredentials.length === 0;
         if (detectedModel) {
             const choice = await this.selectForgeDockSetupChoice(availableModels.length);
             if (choice === undefined)
                 return;
             connectProvider = choice === "connect";
+        }
+        else if (storedCredentials.length > 0) {
+            this.showStatus("ForgeDock setup · reusing saved provider authentication");
         }
         if (connectProvider) {
             const authType = await this.selectForgeDockOnboardingAuthType();
@@ -4137,12 +4142,9 @@ export class InteractiveMode {
                 this.showWarning("Provider connection was not completed. Restart ForgeDock to try onboarding again.");
                 return;
             }
-            try {
-                await this.session.modelRuntime.refresh();
-            }
-            catch {
-                // Model selection below reports an empty authenticated catalog clearly.
-            }
+            // ModelRuntime.login already performs a bounded catalog refresh. The
+            // model selector performs its own bounded background refresh, so avoid
+            // issuing a second unbounded network refresh while onboarding is paused.
         }
         const model = await this.selectForgeDockOnboardingModel();
         if (!model) {

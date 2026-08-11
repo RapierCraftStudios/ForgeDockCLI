@@ -8,6 +8,7 @@ import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.
 import { composeModelProvider, configuredRequestAuthStatus, resolveCompatibilityRequestConfig, resolveConfiguredModelHeaders, validateExtensionProvider, } from "./provider-composer.js";
 import { withRemoteCatalog } from "./remote-catalog-provider.js";
 import { RuntimeCredentials } from "./runtime-credentials.js";
+const DEFAULT_MODEL_REFRESH_TIMEOUT_MS = 15_000;
 function mergeHeaders(base, override) {
     if (!base && !override)
         return undefined;
@@ -351,7 +352,11 @@ export class ModelRuntime {
     }
     async login(providerId, type, interaction) {
         const credential = await this.models.login(providerId, type, interaction);
-        await this.refresh({ allowNetwork: this.modelNetworkEnabled });
+        const timeoutSignal = AbortSignal.timeout(DEFAULT_MODEL_REFRESH_TIMEOUT_MS);
+        await this.refresh({
+            allowNetwork: this.modelNetworkEnabled,
+            signal: interaction.signal ? AbortSignal.any([interaction.signal, timeoutSignal]) : timeoutSignal,
+        });
         return credential;
     }
     async logout(providerId) {

@@ -34,13 +34,18 @@ describe("builder boundary", () => {
     const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const verification = [{ id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 60_000, required: true }];
+    const verifier = { async run() { return []; } };
     const built = await buildWorkItem({
       run: prepared.run, intent, investigation: investigated.investigation, packet: prepared.packet, scopeHints, worktree: process.cwd(),
-    }, { runtime, runs });
+      verification, verificationRunner: verifier,
+    }, { runtime, runs, verifier });
 
     assert.equal(built.run.state, "verifying");
     assert.equal(built.submission.summary, "Added the guard");
-    assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "edit", "write"]);
+    assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "verify", "edit", "write"]);
+    assert.equal(runtime.tasks[2]?.verification?.commands[0]?.id, "test");
+    assert.match(runtime.tasks[2]?.instructions ?? "", /test=npm test/);
     assert.ok(!runtime.tasks[2]?.tools.includes("bash"));
     assert.ok(runtime.tasks[2]?.workspace.scope.readRoots.includes("src"));
     assert.deepEqual(runtime.tasks[2]?.workspace.scope.writeRoots, []);

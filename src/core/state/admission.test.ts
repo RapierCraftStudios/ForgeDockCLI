@@ -34,6 +34,24 @@ function outcome(runId: string, createdAt: string, status: "invalid" | "decompos
   return { ...artifact, createdAt };
 }
 
+function invalidOutcome(runId: string, createdAt: string, closureStatus?: "pending" | "completed"): DurableArtifact<"Outcome"> {
+  const artifact = createArtifact({
+    kind: "Outcome",
+    runId,
+    subject,
+    producer: { role: "controller" },
+    payload: {
+      status: "invalid",
+      reason: "Already fixed by the repository implementation",
+      childIssues: [],
+      ...(closureStatus !== undefined ? {
+        issueClosure: { status: closureStatus, repo: subject.repo, issue: subject.issue! },
+      } : {}),
+    },
+  });
+  return { ...artifact, createdAt };
+}
+
 function repairOutcome(
   runId: string,
   createdAt: string,
@@ -115,6 +133,39 @@ describe("subject run admission", () => {
       runId: "run_old",
       state: "decomposed",
     });
+  });
+
+  it("resumes an invalid run until GitHub issue closure is authoritatively proven", () => {
+    const runId = "run_invalid_pending";
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      invalidOutcome(runId, "2026-01-01T00:01:00.000Z", "pending"),
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.runId, runId);
+      assert.equal(decision.state, "invalid");
+      assert.equal(decision.checkpoint, "invalid-closure");
+      assert.equal(decision.artifacts.length, 2);
+    }
+  });
+
+  it("treats legacy invalid Outcomes without closure proof as recoverable", () => {
+    const runId = "run_invalid_legacy";
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      invalidOutcome(runId, "2026-01-01T00:01:00.000Z"),
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") assert.equal(decision.checkpoint, "invalid-closure");
+  });
+
+  it("skips an invalid run only after closure proof is durable", () => {
+    const runId = "run_invalid_closed";
+    assert.deepEqual(decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      invalidOutcome(runId, "2026-01-01T00:01:00.000Z", "completed"),
+    ]), { action: "skip", runId, state: "invalid" });
   });
 
   it("blocks a newer interrupted run even when an older run was terminal", () => {
@@ -209,6 +260,34 @@ describe("subject run admission", () => {
     if (exhausted.action === "block") assert.match(exhausted.reason, /exhausted after 2 repair attempt/);
   });
 
+  it("accepts only a typed human verification adjudication after repair exhaustion", () => {
+    const runId = "run_repair_adjudication";
+    const delivery = publicationArtifacts(runId).filter((artifact) => artifact.kind !== "BuildResult");
+    const first = repairOutcome(runId, "2026-01-01T00:01:00.000Z");
+    const firstDispatch = repairOutcome(runId, "2026-01-01T00:02:00.000Z", { repairAttempt: 1 });
+    const secondDispatch = repairOutcome(runId, "2026-01-01T00:03:00.000Z", { repairAttempt: 2 });
+    const adjudication = createArtifact({
+      kind: "VerificationAdjudication",
+      runId,
+      subject,
+      producer: { role: "human", runtime: "forgedock" },
+      payload: {
+        checkpoint: "verification",
+        decision: "resume",
+        supersedesOutcomeId: secondDispatch.id,
+        reason: "The verification baseline was repaired and independently checked.",
+      },
+    });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, first, firstDispatch, secondDispatch, adjudication,
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "blocked");
+      assert.equal(decision.checkpoint, "verification");
+    }
+  });
+
   it("counts every request-changes verdict as a durable remediation cycle", () => {
     const runId = "run_review_cycles";
     const requestChanges = (headSha: string) => createArtifact({
@@ -251,7 +330,7 @@ describe("subject run admission", () => {
     assert.equal(latestArtifactOfKind([first, dispatched], "Outcome")?.id, dispatched.id);
   });
 
-  it("does not replay a recursive checkpoint superseded by a merged Outcome", () => {
+  it("does not replay a recursive checkpoint superseded by a later verified BuildResult", () => {
     const runId = "run_recursive_complete";
     const delivery = publicationArtifacts(runId);
     const build = delivery.find((artifact) => artifact.kind === "BuildResult");
@@ -291,7 +370,7 @@ describe("subject run admission", () => {
       intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, checkpoint, parentProof,
     ]);
     assert.equal(interrupted.action, "resume");
-    if (interrupted.action === "resume") assert.equal(interrupted.checkpoint, "remediation");
+    if (interrupted.action === "resume") assert.equal(interrupted.checkpoint, "publication");
 
     const merged = createArtifact({
       kind: "Outcome", runId, subject, producer: { role: "controller" },

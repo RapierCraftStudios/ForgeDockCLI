@@ -7,7 +7,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging"; checkpoint: "build" | "verification" | "remediation" | "publication" | "completion"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "build" | "verification" | "remediation" | "publication" | "completion" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -90,6 +90,13 @@ export function decideSubjectAdmission(
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
+  const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
+  const invalidClosurePending = reconciled.state === "invalid"
+    && latestOutcome?.payload.status === "invalid"
+    && latestOutcome.payload.issueClosure?.status !== "completed";
+  if (invalidClosurePending) {
+    return { action: "resume", runId: latest.runId, state: "invalid", checkpoint: "invalid-closure", artifacts: latest.artifacts };
+  }
   // A fresh rerun is an explicit human/controller authorization to abandon a
   // terminal checkpoint. It never overrides an in-flight nonterminal run.
   if (options.rerun && terminalStates.has(reconciled.state)) return { action: "start" };
@@ -107,9 +114,11 @@ export function decideSubjectAdmission(
   const latestVerdictIndex = lastArtifactIndex(latest.artifacts, "ReviewVerdict");
   const latestOutcomeIndex = lastArtifactIndex(latest.artifacts, "Outcome");
   const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
+  const latestVerificationAdjudication = latestArtifactOfKind(latest.artifacts, "VerificationAdjudication");
+  const latestVerificationAdjudicationIndex = lastArtifactIndex(latest.artifacts, "VerificationAdjudication");
   const remediationCheckpointIsPending = remediationCheckpoint !== undefined
     && (remediationCheckpoint.payload.status === "ready-to-resume"
-      ? latestRemediationCheckpointIndex > Math.max(latestVerdictIndex, latestOutcomeIndex)
+      ? latestRemediationCheckpointIndex > Math.max(latestBuildIndex, latestVerdictIndex, latestOutcomeIndex)
       : latestRemediationCheckpointIndex > Math.max(latestBuildIndex, latestVerdictIndex, latestOutcomeIndex));
   if (remediationCheckpoint && remediationCheckpointIsPending
     && (remediationCheckpoint.payload.status === "awaiting-dispatch"
@@ -132,7 +141,17 @@ export function decideSubjectAdmission(
     : undefined;
   const pendingVerificationFailure = verificationFailureOutcome !== undefined
     && latestOutcomeIndex >= latestBuildIndex;
+  const verificationAdjudicationIsPending = pendingVerificationFailure
+    && deliveryContext
+    && latestVerificationAdjudication !== undefined
+    && latestVerificationAdjudicationIndex > latestOutcomeIndex
+    && latestVerificationAdjudication.payload.checkpoint === "verification"
+    && latestVerificationAdjudication.payload.decision === "resume"
+    && latestVerificationAdjudication.payload.supersedesOutcomeId === verificationFailureOutcome.id;
   if (pendingVerificationFailure) {
+    if (verificationAdjudicationIsPending) {
+      return { action: "resume", runId: latest.runId, state: "blocked", checkpoint: "verification", artifacts: latest.artifacts };
+    }
     if (deliveryContext && isRepairableVerificationFailure(packet, verificationFailureOutcome)) {
       const repairAttempts = verificationRepairAttemptCount(latest.artifacts);
       if (repairAttempts < MAX_VERIFICATION_REPAIR_ATTEMPTS) {

@@ -107,10 +107,5 @@
   "overrides": {
     "vite": "6.4.3",
     "undici": "8.10.0"
-  },
-  "bundleDependencies": [
-    "@earendil-works/pi-coding-agent",
-    "pi-subagents",
-    "undici"
-  ]
+  }
 }

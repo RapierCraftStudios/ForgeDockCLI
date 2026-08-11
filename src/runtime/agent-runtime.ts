@@ -2,10 +2,11 @@
 
 import type { TSchema } from "typebox";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
+import type { VerificationCommand, VerificationRunner } from "../core/ports/verification.js";
 import { runIdFromTaskId, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
 
 export type AgentRole = "investigator" | "packet-author" | "builder" | "reviewer" | "adjudicator" | "remediator";
-export type ToolGrant = "read" | "grep" | "find" | "ls" | "compute" | "bash" | "edit" | "write";
+export type ToolGrant = "read" | "grep" | "find" | "ls" | "compute" | "verify" | "bash" | "edit" | "write";
 
 export type ScopeManifestSource = "issue-hints" | "build-packet" | "remediation";
 
@@ -155,23 +156,41 @@ export interface ModelPolicy {
 export interface AgentTask<_T> {
   id: string;
   role: AgentRole;
+  /** Short live-fleet label; it is observational metadata, never workflow authority. */
+  description?: string;
   objective: string;
   instructions: string;
   context: readonly DurableArtifact[];
   workspace: WorkspaceGrant;
   tools: readonly ToolGrant[];
+  /** Optional live phase/cycle context projected into controller and fleet observability. */
+  observability?: AgentObservability;
+  /** Optional typed authority to run only controller-approved checks in this worktree. */
+  verification?: {
+    commands: readonly VerificationCommand[];
+    runner: VerificationRunner;
+  };
   outputSchema: TSchema;
   modelPolicy: ModelPolicy;
 }
 
+export interface AgentObservability {
+  phase: string;
+  cycle?: { current: number; total: number };
+  activeChild?: string;
+  reviewerRoles?: readonly string[];
+  latestArtifacts?: { buildResult?: string; reviewVerdict?: string };
+  remainingRemediationCycles?: number;
+}
+
 export type AgentEvent =
-  | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string }
-  | { type: "thinking.delta"; taskId: string; text: string }
-  | { type: "text.delta"; taskId: string; text: string }
-  | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown }
-  | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string }
-  | { type: "artifact.submitted"; taskId: string }
-  | { type: "session.completed"; taskId: string; sessionRef: string };
+  | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string; observability?: AgentObservability }
+  | { type: "thinking.delta"; taskId: string; text: string; observability?: AgentObservability }
+  | { type: "text.delta"; taskId: string; text: string; observability?: AgentObservability }
+  | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown; observability?: AgentObservability }
+  | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string; observability?: AgentObservability }
+  | { type: "artifact.submitted"; taskId: string; observability?: AgentObservability }
+  | { type: "session.completed"; taskId: string; sessionRef: string; observability?: AgentObservability };
 
 export interface AgentRunResult<T> {
   output: T;

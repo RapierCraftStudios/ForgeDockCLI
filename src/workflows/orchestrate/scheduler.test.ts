@@ -86,6 +86,17 @@ describe("lean orchestration scheduler", () => {
     assert.ok(events.includes("skipped"));
   });
 
+  it("keeps invalid investigations distinct and blocks their dependents", async () => {
+    const events: string[] = [];
+    const result = await runSchedule([
+      { id: "invalid", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 2, priority: 1, dependencies: ["invalid"], claims: [] },
+    ], 1, async () => ({ status: "invalid", error: "issue already resolved" }), { onEvent: (event) => events.push(event.type) });
+    assert.equal(result.status.get("invalid"), "invalid");
+    assert.equal(result.status.get("dependent"), "blocked");
+    assert.ok(events.includes("invalid"));
+  });
+
   it("blocks dependents when a prerequisite fails", async () => {
     const result = await runSchedule([
       { id: "a", issue: 1, priority: 1, dependencies: [], claims: [] },

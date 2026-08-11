@@ -2,6 +2,7 @@
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
@@ -9,13 +10,24 @@ import { ConcurrentRunUpdateError, type ArtifactRepository, type RunProgressReco
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
+const SQLITE_BUSY_TIMEOUT_MS = 10_000;
+const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
+
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
+    // WAL permits concurrent readers, but SQLite still has one writer. Wait for
+    // short cross-process controller transactions instead of turning contention
+    // into a terminal workflow failure. Set it before WAL initialization so a
+    // concurrent constructor is covered too.
+    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    // Setting journal mode may replace SQLite's busy handler, so configure the
+    // timeout after WAL is enabled.
+    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     this.#database.exec(`
       CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
@@ -67,11 +79,11 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
 
   async append(artifact: DurableArtifact): Promise<void> {
     assertArtifact(artifact);
-    this.#database.prepare(`
+    await withSqliteBusyRetry(() => this.#database.prepare(`
       INSERT INTO artifacts (artifact_id, subject_key, kind, artifact_json)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(artifact_id) DO NOTHING
-    `).run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact));
+    `).run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact)));
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
@@ -87,8 +99,8 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
 
   async create(state: RunState): Promise<void> {
     try {
-      this.#database.prepare("INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)")
-        .run(state.runId, state.version, JSON.stringify(state));
+      await withSqliteBusyRetry(() => this.#database.prepare("INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)")
+        .run(state.runId, state.version, JSON.stringify(state)));
     } catch (error) {
       if (String(error).includes("UNIQUE constraint failed")) throw new Error(`Run already exists: ${state.runId}`);
       throw error;
@@ -106,11 +118,11 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async recordTelemetry(receipt: AgentRunReceipt): Promise<void> {
-    this.#database.prepare(`
+    await withSqliteBusyRetry(() => this.#database.prepare(`
       INSERT INTO run_telemetry (telemetry_key, run_id, task_id, session_ref, created_at, receipt_json)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(telemetry_key) DO NOTHING
-    `).run(receipt.key, receipt.runId, receipt.taskId, receipt.sessionRef, receipt.timing.completedAt, JSON.stringify(receipt));
+    `).run(receipt.key, receipt.runId, receipt.taskId, receipt.sessionRef, receipt.timing.completedAt, JSON.stringify(receipt)));
   }
 
   listTelemetry(runId: string): AgentRunReceipt[] {
@@ -118,28 +130,22 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => JSON.parse(String((row as { receipt_json: string }).receipt_json)) as AgentRunReceipt);
   }
 
-  rebuildRun(state: RunState): void {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+  async rebuildRun(state: RunState): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
       this.#database.prepare("DELETE FROM transitions WHERE run_id = ?").run(state.runId);
       this.#database.prepare("DELETE FROM run_progress WHERE run_id = ?").run(state.runId);
       this.#database.prepare(`
         INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET version = excluded.version, state_json = excluded.state_json
       `).run(state.runId, state.version, JSON.stringify(state));
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    }));
   }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
     if (state.version !== expectedVersion + 1 || record.sequence !== state.version) {
       throw new Error("Run commit must advance exactly one version");
     }
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
       const result = this.#database.prepare(`
         UPDATE runs SET version = ?, state_json = ?
         WHERE run_id = ? AND version = ?
@@ -151,11 +157,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       }
       this.#database.prepare("INSERT INTO transitions (run_id, sequence, record_json) VALUES (?, ?, ?)")
         .run(state.runId, record.sequence, JSON.stringify(record));
-      this.#database.exec("COMMIT");
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    }));
   }
 
   async history(runId: string): Promise<TransitionRecord[]> {
@@ -164,10 +166,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async recordProgress(progress: RunProgressRecord): Promise<void> {
-    this.#database.prepare(`
+    await withSqliteBusyRetry(() => this.#database.prepare(`
       INSERT INTO run_progress (run_id, phase, message, occurred_at)
       VALUES (?, ?, ?, ?)
-    `).run(progress.runId, progress.phase, progress.message, progress.occurredAt);
+    `).run(progress.runId, progress.phase, progress.message, progress.occurredAt));
   }
 
   async listProgress(runId: string): Promise<RunProgressRecord[]> {
@@ -179,20 +181,15 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
-    this.#database.exec("BEGIN IMMEDIATE");
-    try {
+    return this.inTransaction(() => {
       this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
       const token = crypto.randomUUID();
       const result = this.#database.prepare(`
         INSERT INTO leases (item_id, owner, token, acquired_at, heartbeat_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
       `).run(itemId, owner, token, now, now, now + ttlMs);
-      this.#database.exec("COMMIT");
       return result.changes === 1 ? { itemId, owner, token, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs } : undefined;
-    } catch (error) {
-      this.#database.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {
@@ -212,6 +209,38 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   close(): void {
     this.#database.close();
   }
+
+  private inTransaction<T>(operation: () => T): T {
+    this.#database.exec("BEGIN IMMEDIATE");
+    let active = true;
+    try {
+      const result = operation();
+      this.#database.exec("COMMIT");
+      active = false;
+      return result;
+    } catch (error) {
+      if (active) {
+        try { this.#database.exec("ROLLBACK"); } catch { /* preserve the original failure */ }
+      }
+      throw error;
+    }
+  }
+}
+
+async function withSqliteBusyRetry<T>(operation: () => T | Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isSqliteBusyError(error) || attempt >= SQLITE_BUSY_RETRY_DELAYS_MS.length) throw error;
+      await sleep(SQLITE_BUSY_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
+  return /database is locked|database is busy|SQLITE_(?:BUSY|LOCKED)/i.test(message);
 }
 
 function subjectKey(subject: Subject): string {

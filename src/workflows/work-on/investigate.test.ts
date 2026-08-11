@@ -71,7 +71,7 @@ describe("work-on investigation", () => {
     ]);
   });
 
-  it("makes invalid evidence terminal and records an Outcome", async () => {
+  it("records invalid evidence with a provisional closure checkpoint", async () => {
     const runtime = new FakeAgentRuntime([{
       ...confirmed(),
       outcome: "invalid",
@@ -83,6 +83,7 @@ describe("work-on investigation", () => {
     const result = await investigateWorkItem({ intent: intent("run_invalid"), cwd: process.cwd() }, deps);
     assert.equal(result.run.state, "invalid");
     assert.equal(result.outcome?.payload.status, "invalid");
+    assert.deepEqual(result.outcome?.payload.issueClosure, { status: "pending", repo: "acme/widget", issue: 17 });
     assert.deepEqual(deps.artifacts.artifacts.map((artifact) => artifact.kind), ["Intent", "Investigation", "Outcome"]);
   });
 

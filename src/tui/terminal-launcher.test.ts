@@ -48,6 +48,8 @@ describe("ForgeDock Pi terminal launcher", () => {
     assert.match(launcher, /discoveredEnvironment = sealVerificationEnvironment\(process\.env\)/);
     assert.match(launcher, /"FORGEDOCK_VERIFICATION_PATH"/);
     assert.match(launcher, /process\.env\[name\] = discoveredEnvironment\[name\]/);
+    assert.match(launcher, /if \(!process\.env\.FORGEDOCK_CODING_AGENT_DIR\)/);
+    assert.match(launcher, /process\.env\.FORGEDOCK_CODING_AGENT_DIR = join\(persistentHome, "\.forgedock", "agent"\)/);
   });
 
   it("ships and invokes the GitHub App refresher without a bash path boundary", () => {

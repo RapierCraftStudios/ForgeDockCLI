@@ -22,6 +22,7 @@ interface NestedAgentRequest {
   ownerRunId: string;
   id: string;
   role: AgentRole;
+  description?: string;
   objective: string;
   instructions: string;
   context: DurableArtifact[];
@@ -340,10 +341,10 @@ function asRecord(value: unknown): Record<string, any> | undefined {
 function buildTask(input: NestedAgentRequest): string {
   const context = input.context.map((artifact) => ({ kind: artifact.kind, id: artifact.id, payload: artifact.payload }));
   const reviewSpecialty = input.role === "reviewer"
-    ? /:review:[^:\r\n]+:([^:\r\n]+)/.exec(input.id)?.[1]
+    ? /:review:[^:\r\n]+:(?:cycle-\d+-of-\d+:)?([^:\r\n]+)/.exec(input.id)?.[1]
     : undefined;
   return [
-    reviewSpecialty ? `ForgeDock review · ${reviewSpecialty}` : `ForgeDock nested task · ${input.role}`,
+    input.description?.trim() || (reviewSpecialty ? `ForgeDock review · ${reviewSpecialty}` : `ForgeDock nested task · ${input.role}`),
     `ForgeDock nested task id: ${input.id}`,
     `Role: ${input.role}`,
     "",
@@ -374,6 +375,9 @@ function validateRequest(value: unknown): NestedAgentRequest {
   if (input.role !== "reviewer") throw new Error(`Nested role is not authorized: ${input.role}`);
   if (!Array.isArray(input.context) || !Array.isArray(input.tools)) throw new Error("Nested request context and tools must be arrays");
   if (!input.outputSchema || typeof input.outputSchema !== "object" || Array.isArray(input.outputSchema)) throw new Error("Nested request outputSchema is required");
+  if (input.description !== undefined && (typeof input.description !== "string" || !input.description.trim() || input.description.length > 2048 || /[\r\n]/.test(input.description))) {
+    throw new Error("Nested request description is invalid");
+  }
   if (input.resumeSessionRef !== undefined && (typeof input.resumeSessionRef !== "string" || !input.resumeSessionRef.trim() || input.resumeSessionRef.length > 256 || /[\r\n]/.test(input.resumeSessionRef))) {
     throw new Error("Nested request resumeSessionRef is invalid");
   }

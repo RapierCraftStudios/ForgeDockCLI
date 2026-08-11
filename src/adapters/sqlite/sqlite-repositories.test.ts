@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
@@ -7,6 +10,40 @@ import { createRun, transition } from "../../core/state/machine.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
 describe("SQLite operational repositories", () => {
+  it("waits for a concurrent writer before recording operational progress", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-lock-"));
+    const path = join(root, "state.db");
+    const store = new SqliteRepositories(path);
+    let holder: ReturnType<typeof spawn> | undefined;
+    try {
+      const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 10 }, runId: "run_lock" });
+      await store.create(run);
+      holder = spawn(process.execPath, ["-e", [
+        'const { DatabaseSync } = require("node:sqlite");',
+        'const db = new DatabaseSync(process.argv[1]);',
+        'db.exec("BEGIN IMMEDIATE");',
+        'process.stdout.write("locked\\n");',
+        'setTimeout(() => { db.exec("COMMIT"); db.close(); }, 250);',
+      ].join(""), path], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      await new Promise<void>((resolve, reject) => {
+        holder!.stdout!.once("data", () => resolve());
+        holder!.once("error", reject);
+      });
+      await store.recordProgress({ runId: run.runId, phase: "controller.lock-test", message: "Recovered after a concurrent writer", occurredAt: "2026-01-01T00:00:00.000Z" });
+      await new Promise<void>((resolve, reject) => {
+        holder!.once("close", () => resolve());
+        holder!.once("error", reject);
+      });
+      holder = undefined;
+      assert.equal((await store.listProgress(run.runId)).length, 1);
+    } finally {
+      holder?.kill();
+      store.close();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
   it("persists artifacts and run transitions across repository instances", async () => {
     const store = new SqliteRepositories(":memory:");
     try {
@@ -77,7 +114,7 @@ describe("SQLite operational repositories", () => {
       const started = transition(queued, "START_INVESTIGATION");
       await store.commit(queued.version, started.state, started.record);
       await store.recordProgress({ runId: queued.runId, phase: "controller.heartbeat", message: "stale", occurredAt: "2026-01-01T00:00:00.000Z" });
-      store.rebuildRun({ ...queued, state: "building" });
+      await store.rebuildRun({ ...queued, state: "building" });
       assert.equal((await store.load(queued.runId))?.state, "building");
       assert.deepEqual(await store.history(queued.runId), []);
       assert.deepEqual(await store.listProgress(queued.runId), []);

@@ -50,7 +50,7 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
 
   let state: RunStateName = "queued";
   const checkpointIsLatest = remediationCheckpoint !== undefined
-    && remediationCheckpointIndex >= outcomeIndex;
+    && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex);
   if (checkpointIsLatest) {
     state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
     if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");

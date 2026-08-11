@@ -132,7 +132,8 @@ patch(join(root, "src", "tui", "fleet.ts"), [
   ],
   [
     '\treturn run.steps.map((step) => ({\n\t\tkey: `async:${run.id}:${step.index}`,\n\t\tkind: "async" as const,\n\t\trunId: run.id,\n\t\tindex: step.index,\n\t\tagent: step.label ? `${step.label} (${step.agent})` : step.agent,\n\t\tstate: step.status,\n\t\tupdatedAt: step.lastActivityAt ?? updatedAt,\n\t\trun,\n\t\tstep,\n\t\t...(description ? { description } : {}),\n\t}));\n}',
-    '\tconst parents: FleetItem[] = run.steps.map((step) => ({\n\t\tkey: `async:${run.id}:${step.index}`,\n\t\tkind: "async" as const,\n\t\trunId: run.id,\n\t\tindex: step.index,\n\t\tagent: step.label ? `${step.label} (${step.agent})` : step.agent,\n\t\tstate: step.status,\n\t\tupdatedAt: step.lastActivityAt ?? updatedAt,\n\t\trun,\n\t\tstep,\n\t\t...(description ? { description } : {}),\n\t}));\n\tif (!run.nestedChildren?.length) return parents;\n\tconst assigned = new Set<string>();\n\tconst output: FleetItem[] = [];\n\tfor (const parent of parents) {\n\t\tconst children = run.nestedChildren.filter((child) => child.parentStepIndex === parent.index\n\t\t\t|| (run.steps.length === 1 && child.parentStepIndex === undefined));\n\t\tconst count = countNestedChildren(children);\n\t\toutput.push(count ? { ...parent, nestedCount: count } : parent);\n\t\toutput.push(...nestedFleetItems(run, children));\n\t\tfor (const child of children) assigned.add(child.id);\n\t}\n\tconst unassigned = run.nestedChildren.filter((child) => !assigned.has(child.id));\n\tif (unassigned.length) {\n\t\tif (output[0]) output[0] = { ...output[0], nestedCount: (output[0].nestedCount ?? 0) + countNestedChildren(unassigned) };\n\t\toutput.splice(1, 0, ...nestedFleetItems(run, unassigned));\n\t}\n\treturn output;\n}\n\nfunction countNestedChildren(children: readonly NestedRunSummary[]): number {\n\treturn children.reduce((count, child) => count + 1 + countNestedChildren(child.children ?? []), 0);\n}\n\nfunction nestedFleetItems(\n\trun: AsyncRunSummary,\n\tchildren: readonly NestedRunSummary[],\n\tancestorLast: readonly boolean[] = [],\n): FleetItem[] {\n\treturn children.flatMap((child, index) => {\n\t\tconst last = index === children.length - 1;\n\t\tconst treePrefix = `${ancestorLast.map((ancestorWasLast) => ancestorWasLast ? "   " : "│  ").join("")}${last ? "└─ " : "├─ "}`;\n\t\tconst firstLine = child.description?.split(/\\r?\\n/, 1)[0]?.trim();\n\t\tconst reviewLabel = /^ForgeDock review · (.+)$/i.exec(firstLine ?? "")?.[1];\n\t\tconst item: FleetItem = {\n\t\t\tkey: `nested:${run.id}:${child.id}`,\n\t\t\tkind: "async",\n\t\t\trunId: child.id,\n\t\t\tagent: reviewLabel ? `review · ${reviewLabel}` : child.agent ?? child.mode ?? "nested agent",\n\t\t\tstate: child.state,\n\t\t\tupdatedAt: child.lastUpdate ?? child.endedAt ?? child.startedAt ?? run.lastUpdate ?? run.startedAt,\n\t\t\trun,\n\t\t\tnested: child,\n\t\t\ttreePrefix,\n\t\t\t...(child.description ? { description: child.description } : {}),\n\t\t\t...(child.children?.length ? { nestedCount: countNestedChildren(child.children) } : {}),\n\t\t};\n\t\treturn [item, ...nestedFleetItems(run, child.children ?? [], [...ancestorLast, last])];\n\t});\n}',
+    '\tconst parents: FleetItem[] = run.steps.map((step) => ({\n\t\tkey: `async:${run.id}:${step.index}`,\n\t\tkind: "async" as const,\n\t\trunId: run.id,\n\t\tindex: step.index,\n\t\tagent: step.label ? `${step.label} (${step.agent})` : step.agent,\n\t\tstate: step.status,\n\t\tupdatedAt: step.lastActivityAt ?? updatedAt,\n\t\trun,\n\t\tstep,\n\t\t...(description ? { description } : {}),\n\t}));\n\tif (!run.nestedChildren?.length) return parents;\n\tconst assigned = new Set<string>();\n\tconst output: FleetItem[] = [];\n\tfor (const parent of parents) {\n\t\tconst children = run.nestedChildren.filter((child) => child.parentStepIndex === parent.index\n\t\t\t|| (run.steps.length === 1 && child.parentStepIndex === undefined));\n\t\tconst count = countNestedChildren(children);\n\t\toutput.push(count ? { ...parent, nestedCount: count } : parent);\n\t\toutput.push(...nestedFleetItems(run, children));\n\t\tfor (const child of children) assigned.add(child.id);\n\t}\n\tconst unassigned = run.nestedChildren.filter((child) => !assigned.has(child.id));\n\tif (unassigned.length) {\n\t\tif (output[0]) output[0] = { ...output[0], nestedCount: (output[0].nestedCount ?? 0) + countNestedChildren(unassigned) };\n\t\toutput.splice(1, 0, ...nestedFleetItems(run, unassigned));\n\t}\n\treturn output;\n}\n\nfunction countNestedChildren(children: readonly NestedRunSummary[]): number {\n\treturn children.reduce((count, child) => count + 1 + countNestedChildren(child.children ?? []), 0);\n}\n\nfunction nestedFleetItems(\n\trun: AsyncRunSummary,\n\tchildren: readonly NestedRunSummary[],\n\tancestorLast: readonly boolean[] = [],\n): FleetItem[] {\n\treturn children.flatMap((child, index) => {\n\t\tconst last = index === children.length - 1;\n\t\tconst treePrefix = `${ancestorLast.map((ancestorWasLast) => ancestorWasLast ? "   " : "│  ").join("")}${last ? "└─ " : "├─ "}`;\n\t\tconst firstLine = child.description?.split(/\\r?\\n/, 1)[0]?.trim();\n\t\tconst reviewLabel = /^ForgeDock review · (?:cycle \\d+\\/\\d+ · )?([^·\\r\\n]+?)(?: ·|$)/i.exec(firstLine ?? "")?.[1]?.trim();\n\t\tconst item: FleetItem = {\n\t\t\tkey: `nested:${run.id}:${child.id}`,\n\t\t\tkind: "async",\n\t\t\trunId: child.id,\n\t\t\tagent: reviewLabel ? `review · ${reviewLabel}` : child.agent ?? child.mode ?? "nested agent",\n\t\t\tstate: child.state,\n\t\t\tupdatedAt: child.lastUpdate ?? child.endedAt ?? child.startedAt ?? run.lastUpdate ?? run.startedAt,\n\t\t\trun,\n\t\t\tnested: child,\n\t\t\ttreePrefix,\n\t\t\t...(child.description ? { description: child.description } : {}),\n\t\t\t...(child.children?.length ? { nestedCount: countNestedChildren(child.children) } : {}),\n\t\t};\n\t\treturn [item, ...nestedFleetItems(run, child.children ?? [], [...ancestorLast, last])];\n\t});\n}',
+    "function nestedFleetItems",
   ],
 ]);
 
@@ -183,26 +184,68 @@ patch(join(root, "src", "tui", "fleet-status.ts"), [
   [
     '\ttokens: number;\n};',
     '\ttokens: number;\n\tnestedCount?: number;\n};',
+    "nestedCount?: number;",
   ],
   [
     'export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
     'function nestedCount(children: AsyncJobState["nestedChildren"]): number {\n\treturn (children ?? []).reduce((count, child) => count + 1 + nestedCount(child.children), 0);\n}\n\nfunction nestedCountForStep(job: AsyncJobState, index: number, stepCount: number): number {\n\tconst children = (job.nestedChildren ?? []).filter((child) => child.parentStepIndex === index\n\t\t|| (stepCount === 1 && child.parentStepIndex === undefined));\n\treturn nestedCount(children);\n}\n\nexport function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
+    "function activeNestedChild",
   ],
   [
     '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t});',
     '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t\t...(nestedCount(job.nestedChildren) > 0 ? { nestedCount: nestedCount(job.nestedChildren) } : {}),\n\t\t\t});',
+    "nestedCount(job.nestedChildren)",
   ],
   [
     '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t});',
     '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t\t...(nestedCountForStep(job, index, steps.length) > 0 ? { nestedCount: nestedCountForStep(job, index, steps.length) } : {}),\n\t\t\t});',
+    "nestedCountForStep(job, index, steps.length)",
   ],
   [
     'const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${description ? `  ${description}` : ""}`;',
     'const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;\n\t\tconst descendants = entry.nestedCount ? theme.fg("dim", ` (+${entry.nestedCount} agent${entry.nestedCount === 1 ? "" : "s"})`) : "";\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${descendants}${description ? `  ${description}` : ""}`;',
+    "const descendants = entry.nestedCount",
   ],
   [
     '\t\t\t\tentry.tokens,\n\t\t\t]),',
     '\t\t\t\tentry.tokens,\n\t\t\t\tentry.nestedCount,\n\t\t\t]),',
+    "entry.tokens,\n\t\t\t\tentry.nestedCount",
+  ],
+]);
+
+patch(join(root, "src", "tui", "fleet-status.ts"), [
+  [
+    'description: job.description,',
+    'description: activeNestedChild(job)?.description ?? job.description,',
+  ],
+  [
+    'description: step.description ?? job.description,',
+    'description: activeNestedChild(job)?.description ?? step.description ?? job.description,',
+  ],
+  [
+    '\ttokens: number;\n\tnestedCount?: number;\n};',
+    '\ttokens: number;\n\tnestedCount?: number;\n\tcurrentTool?: string;\n\tcurrentPath?: string;\n\tactiveChild?: string;\n};',
+    "currentTool?: string;",
+  ],
+  [
+    'function nestedCountForStep(job: AsyncJobState, index: number, stepCount: number): number {\n\tconst children = (job.nestedChildren ?? []).filter((child) => child.parentStepIndex === index\n\t\t|| (stepCount === 1 && child.parentStepIndex === undefined));\n\treturn nestedCount(children);\n}\n\nexport function collectFleetStatusEntries',
+    'function nestedCountForStep(job: AsyncJobState, index: number, stepCount: number): number {\n\tconst children = (job.nestedChildren ?? []).filter((child) => child.parentStepIndex === index\n\t\t|| (stepCount === 1 && child.parentStepIndex === undefined));\n\treturn nestedCount(children);\n}\n\nfunction activeNestedChild(job: AsyncJobState): { agent?: string; currentTool?: string; currentPath?: string; lastActivityAt?: number } | undefined {\n\tconst children = (job.nestedChildren ?? []).flatMap((child) => [child, ...(child.children ?? [])]);\n\treturn children.filter((child) => child.state === "running").sort((left, right) => (right.lastActivityAt ?? right.startedAt ?? 0) - (left.lastActivityAt ?? left.startedAt ?? 0))[0];\n}\n\nexport function collectFleetStatusEntries',
+  ],
+  [
+    '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t\t...(nestedCount(job.nestedChildren) > 0 ? { nestedCount: nestedCount(job.nestedChildren) } : {}),',
+    '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t\t...(nestedCount(job.nestedChildren) > 0 ? { nestedCount: nestedCount(job.nestedChildren) } : {}),\n\t\t\t\t...(job.currentTool || activeNestedChild(job)?.currentTool ? { currentTool: job.currentTool ?? activeNestedChild(job)?.currentTool } : {}),\n\t\t\t\t...(job.currentPath || activeNestedChild(job)?.currentPath ? { currentPath: job.currentPath ?? activeNestedChild(job)?.currentPath } : {}),\n\t\t\t\t...(activeNestedChild(job)?.agent ? { activeChild: activeNestedChild(job)?.agent } : {}),',
+  ],
+  [
+    '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t\t...(nestedCountForStep(job, index, steps.length) > 0 ? { nestedCount: nestedCountForStep(job, index, steps.length) } : {}),',
+    '\t\t\t\ttokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),\n\t\t\t\t...(nestedCountForStep(job, index, steps.length) > 0 ? { nestedCount: nestedCountForStep(job, index, steps.length) } : {}),\n\t\t\t\t...(step.currentTool || job.currentTool || activeNestedChild(job)?.currentTool ? { currentTool: step.currentTool ?? job.currentTool ?? activeNestedChild(job)?.currentTool } : {}),\n\t\t\t\t...(step.currentPath || job.currentPath || activeNestedChild(job)?.currentPath ? { currentPath: step.currentPath ?? job.currentPath ?? activeNestedChild(job)?.currentPath } : {}),\n\t\t\t\t...(activeNestedChild(job)?.agent ? { activeChild: activeNestedChild(job)?.agent } : {}),',
+  ],
+  [
+    '\t\tconst descendants = entry.nestedCount ? theme.fg("dim", ` (+${entry.nestedCount} agent${entry.nestedCount === 1 ? "" : "s"})`) : "";\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${descendants}${description ? `  ${description}` : ""}`;',
+    '\t\tconst descendants = entry.nestedCount ? theme.fg("dim", ` (+${entry.nestedCount} agent${entry.nestedCount === 1 ? "" : "s"})`) : "";\n\t\tconst activity = entry.currentTool ? theme.fg("accent", ` · ${entry.activeChild ? `${entry.activeChild} ` : ""}${entry.currentTool}${entry.currentPath ? ` · ${entry.currentPath}` : ""}`) : "";\n\t\tconst left = `  ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)}${descendants}${activity}${description ? `  ${description}` : ""}`;',
+  ],
+  [
+    '\t\t\t\tentry.nestedCount,\n\t\t\t]),',
+    '\t\t\t\tentry.nestedCount,\n\t\t\t\tentry.currentTool,\n\t\t\t\tentry.currentPath,\n\t\t\t\tentry.activeChild,\n\t\t\t]),',
   ],
 ]);
 
@@ -213,6 +256,7 @@ function patch(file, replacements) {
     // Some patches deliberately extend an earlier inserted block. In that case
     // the full earlier `after` text no longer survives contiguously, so use a
     // stable marker to keep repeated postinstall runs idempotent.
+    if (file.endsWith("fleet.ts") && before.startsWith("function asyncDetail") && source.includes("\tif (item.nested) {")) continue;
     if (source.includes(appliedMarker)) continue;
     const count = source.split(before).length - 1;
     if (count !== 1) throw new Error(`ForgeDock visibility patch could not find one expected block in ${file}; found ${count}`);

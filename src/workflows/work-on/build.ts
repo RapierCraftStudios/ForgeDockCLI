@@ -3,6 +3,7 @@
 import { Type, type Static } from "typebox";
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
+import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import { scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
@@ -33,8 +34,10 @@ export async function buildWorkItem(
     provider?: string;
     model?: string;
     signal?: AbortSignal;
+    verification?: readonly VerificationCommand[];
+    verificationRunner?: VerificationRunner;
   },
-  dependencies: { runtime: AgentRuntime; runs: RunRepository; onAgentEvent?: AgentEventSink },
+  dependencies: { runtime: AgentRuntime; runs: RunRepository; onAgentEvent?: AgentEventSink; verifier?: VerificationRunner },
 ): Promise<{ run: RunState; submission: BuilderSubmission; sessionRef: string }> {
   if (input.run.state !== "building") throw new Error(`Build requires building state, found ${input.run.state}`);
   let run = input.run;
@@ -51,9 +54,12 @@ export async function buildWorkItem(
           "This is a bounded repair of the retained implementation. Use the controller-recorded failed checks as evidence and change only frozen Build Packet paths.",
         ] : []),
         "Do not expand scope or perform unrelated cleanup.",
+        ...(input.verification?.length ? [
+          `Typed verification feedback is available only for these frozen command IDs: ${input.verification.map((command) => `${command.id}=${command.command} ${command.args.join(" ")}`).join("; ")}.`,
+        ] : []),
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
-        "The controller runs every verification command and owns git publication after your edits; do not claim that checks ran in this session.",
+        "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
         "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion and use implementation only for the concrete evidence.",
         "Before submitting, re-read changed files for malformed edits and whitespace damage.",
         "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",
@@ -70,7 +76,10 @@ export async function buildWorkItem(
         mode: "write",
         scope: scopeManifestForBuildPacket(input.packet.payload.expectedPaths),
       },
-      tools: ["read", "grep", "find", "ls", "compute", "edit", "write"],
+      tools: ["read", "grep", "find", "ls", "compute", ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? ["verify" as const] : []), "edit", "write"],
+      ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? {
+        verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
+      } : {}),
       outputSchema: BuilderSubmissionSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),

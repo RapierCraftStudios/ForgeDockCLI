@@ -16,9 +16,9 @@ export interface ScheduledWorkItem {
   summary?: string;
 }
 
-export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended";
+export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid";
 export type ScheduleWorkerResult = void | {
-  status: "completed" | "skipped" | "blocked" | "suspended" | "failed";
+  status: "completed" | "skipped" | "blocked" | "suspended" | "failed" | "invalid";
   error?: Error | string;
 };
 export interface ScheduleResult {
@@ -27,7 +27,7 @@ export interface ScheduleResult {
   startOrder: string[];
 }
 export interface ScheduleEvent {
-  type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "resumed";
+  type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed";
   itemId?: string;
   status: ReadonlyMap<string, ScheduledStatus>;
   errors: ReadonlyMap<string, Error>;
@@ -120,7 +120,7 @@ export async function runSchedule(
   while (running.size || items.some((item) => status.get(item.id) === "queued")) {
     for (const item of items) {
       if (status.get(item.id) !== "queued") continue;
-      if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked" || status.get(id) === "skipped")) {
+      if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked" || status.get(id) === "skipped" || status.get(id) === "invalid")) {
         status.set(item.id, "blocked");
         emit("blocked", item.id);
       }
@@ -157,6 +157,10 @@ export async function runSchedule(
             status.set(item.id, "suspended");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             emit("suspended", item.id);
+          } else if (outcome.status === "invalid") {
+            status.set(item.id, "invalid");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            emit("invalid", item.id);
           } else {
             status.set(item.id, "completed");
             emit("completed", item.id);

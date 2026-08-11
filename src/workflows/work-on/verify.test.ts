@@ -349,7 +349,12 @@ describe("verification and commit barrier", () => {
     ], [command]), []);
     assert.deepEqual(uncoveredVerificationCommands([
       "Confirm controller lifecycle gates: independent approval, PR target branch, automatic merge, trajectory publication, and authoritative issue closure.",
+      "The controller verifies staging review evidence and owns the lifecycle gate.",
     ], [command]), []);
+    assert.deepEqual(uncoveredVerificationCommands(["controller-gate:staging-review"], [command], [
+      { id: "staging-review", description: "Controller validates the staging review branch." },
+    ]), []);
+    assert.deepEqual(uncoveredVerificationCommands(["controller-gate:staging-review"], [command]), ["controller-gate:staging-review"]);
   });
 
   it("rejects out-of-packet paths before executing repository commands", async () => {

@@ -136,6 +136,13 @@ export async function investigateWorkItem(
         payload: {
           status: agentResult.output.outcome === "invalid" ? "invalid" : "decomposed",
           reason: agentResult.output.summary,
+          ...(agentResult.output.outcome === "invalid" ? {
+            issueClosure: {
+              status: "pending" as const,
+              repo: run.subject.repo,
+              issue: run.subject.issue ?? (() => { throw new Error("Invalid investigation requires an issue subject"); })(),
+            },
+          } : {}),
           childIssues,
         },
       });

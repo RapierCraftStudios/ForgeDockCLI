@@ -41,6 +41,69 @@ type ScopeAdjudication = Static<typeof ScopeAdjudicationSchema>;
 export type { ReviewerRole } from "./planner.js";
 export type FindingIssuePolicy = "all" | "approved-only" | "none";
 
+export const DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
+
+export class ReviewerAttemptTimeoutError extends AgentRunError {
+  readonly timeoutMs: number;
+
+  constructor(taskId: string, timeoutMs: number, sessionRef?: string) {
+    super(`Reviewer attempt ${taskId} timed out after ${timeoutMs}ms`, {
+      ...(sessionRef !== undefined ? { sessionRef, resumable: true } : {}),
+    });
+    this.name = "ReviewerAttemptTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export function resolveReviewerAttemptTimeoutMs(explicit?: number): number {
+  const configured = explicit ?? (process.env.FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS !== undefined
+    ? Number(process.env.FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS)
+    : DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS);
+  if (!Number.isInteger(configured) || configured < 1 || configured > MAX_REVIEWER_ATTEMPT_TIMEOUT_MS) {
+    throw new Error(`FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS must be an integer from 1 to ${MAX_REVIEWER_ATTEMPT_TIMEOUT_MS}`);
+  }
+  return configured;
+}
+
+async function withReviewerAttemptTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  input: {
+    externalSignal?: AbortSignal;
+    timeoutMs: number;
+    taskId: string;
+    sessionRef?: string;
+  },
+): Promise<T> {
+  const controller = new AbortController();
+  let timeoutError: ReviewerAttemptTimeoutError | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const abortFromCaller = () => controller.abort(input.externalSignal?.reason);
+  if (input.externalSignal) {
+    input.externalSignal.addEventListener("abort", abortFromCaller, { once: true });
+    if (input.externalSignal.aborted) abortFromCaller();
+  }
+  try {
+    const operationResult = operation(controller.signal);
+    const timeoutResult = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timeoutError = new ReviewerAttemptTimeoutError(input.taskId, input.timeoutMs, input.sessionRef);
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, input.timeoutMs);
+    });
+    try {
+      return await Promise.race([operationResult, timeoutResult]);
+    } catch (error) {
+      if (timeoutError) throw timeoutError;
+      throw error;
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    input.externalSignal?.removeEventListener("abort", abortFromCaller);
+  }
+}
+
 export async function reviewPullRequest(
   input: {
     run: RunState;
@@ -50,11 +113,14 @@ export async function reviewPullRequest(
     packet: DurableArtifact<"BuildPacket">;
     buildResult: DurableArtifact<"BuildResult">;
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
+    reviewCycle?: { current: number; total: number };
     workspace: string;
     provider?: string;
     model?: string;
     blockingSeverities?: readonly ("critical" | "high" | "medium" | "low")[];
     maxReviewSpecialists?: number;
+    /** Maximum time one provider-backed reviewer attempt may remain in flight. */
+    reviewerAttemptTimeoutMs?: number;
     findingIssuePolicy?: FindingIssuePolicy;
     deliveryRunId?: string;
     signal?: AbortSignal;
@@ -70,6 +136,19 @@ export async function reviewPullRequest(
   if (input.run.state !== "reviewing") throw new Error(`Review requires reviewing state, found ${input.run.state}`);
   let run = input.run;
   try {
+    const reviewerAttemptTimeoutMs = resolveReviewerAttemptTimeoutMs(input.reviewerAttemptTimeoutMs);
+    const recordReviewProgress = async (message: string): Promise<void> => {
+      try {
+        await dependencies.runs.recordProgress({
+          runId: run.runId,
+          phase: "review",
+          message: message.slice(0, 500),
+          occurredAt: new Date().toISOString(),
+        });
+      } catch {
+        // Progress is operational projection data and must not change workflow authority.
+      }
+    };
     const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
     if (frozen.headSha !== input.pullRequest.headSha || frozen.headSha !== input.buildResult.payload.headSha) {
       throw new Error("Cannot start review: PR head does not match the verified Build Result");
@@ -92,6 +171,14 @@ export async function reviewPullRequest(
       ...(input.maxReviewSpecialists !== undefined ? { maxSpecialists: input.maxReviewSpecialists } : {}),
     });
     assertReviewPlan(reviewPlan);
+    const reviewCycle = input.reviewCycle ?? { current: 1, total: 1 };
+    const reviewerRoles = reviewPlan.selected.map((selection) => selection.role);
+    const reviewDescription = (role: string): string => [
+      `ForgeDock review · cycle ${reviewCycle.current}/${reviewCycle.total} · ${role}`,
+      `BuildResult ${input.buildResult.createdAt}`,
+      input.priorVerdict ? `previous ReviewVerdict ${input.priorVerdict.createdAt}` : "no previous ReviewVerdict",
+      `remediation remaining ${Math.max(0, reviewCycle.total - reviewCycle.current)}`,
+    ].join(" · ");
     const runtimeCapabilities = await dependencies.runtime.capabilities();
     const canResumeReviewer = runtimeCapabilities.resumableSessions && typeof dependencies.runtime.resume === "function";
     const runReviewer = async (selection: ReviewPlan["selected"][number]) => {
@@ -105,9 +192,22 @@ export async function reviewPullRequest(
       for (let attempt = 1; attempt <= 4; attempt++) {
         try {
           const shouldResume = canResumeReviewer && resumeSessionRef !== undefined && !resumeAttempted;
+          const taskId = `${run.runId}:review:${frozen.headSha}:cycle-${reviewCycle.current}-of-${reviewCycle.total}:${role}${attempt === 1 ? "" : shouldResume ? ":resume" : `:retry-${attempt}`}`;
           const task: AgentTask<ReviewerSubmission> = {
-            id: `${run.runId}:review:${frozen.headSha}:${role}${attempt === 1 ? "" : shouldResume ? ":resume" : `:retry-${attempt}`}`,
+            id: taskId,
             role: "reviewer",
+            description: reviewDescription(role),
+            observability: {
+              phase: "review",
+              cycle: reviewCycle,
+              activeChild: role,
+              reviewerRoles,
+              latestArtifacts: {
+                buildResult: input.buildResult.createdAt,
+                ...(input.priorVerdict ? { reviewVerdict: input.priorVerdict.createdAt } : {}),
+              },
+              remainingRemediationCycles: Math.max(0, reviewCycle.total - reviewCycle.current),
+            },
             objective: [
               `Review PR #${frozen.number} at exactly ${frozen.headSha} as the ${role} reviewer.`,
               "Evaluate the change against original intent, proven investigation, frozen Build Packet, and verification evidence.",
@@ -149,14 +249,26 @@ export async function reviewPullRequest(
               ...(input.model !== undefined ? { model: input.model } : {}),
             },
           };
-          const runOptions = {
-            ...(input.signal !== undefined ? { signal: input.signal } : {}),
-            ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
-          };
+          const attemptKind = shouldResume ? "resume" : attempt === 1 ? "initial" : "fresh retry";
+          await recordReviewProgress(`${taskId} · ${attemptKind} attempt ${attempt}/4 started`);
           if (shouldResume) resumeAttempted = true;
-          const result = shouldResume
-            ? await dependencies.runtime.resume!(resumeSessionRef!, task, runOptions)
-            : await dependencies.runtime.run(task, runOptions);
+          const result = await withReviewerAttemptTimeout<AgentRunResult<ReviewerSubmission>>(
+            (signal) => {
+              const runOptions = {
+                signal,
+                ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+              };
+              return shouldResume
+                ? dependencies.runtime.resume!(resumeSessionRef!, task, runOptions)
+                : dependencies.runtime.run(task, runOptions);
+            },
+            {
+              ...(input.signal !== undefined ? { externalSignal: input.signal } : {}),
+              timeoutMs: reviewerAttemptTimeoutMs,
+              taskId,
+              ...(shouldResume && resumeSessionRef !== undefined ? { sessionRef: resumeSessionRef } : {}),
+            },
+          );
           completed = {
             role,
             output: result.output,
@@ -174,7 +286,10 @@ export async function reviewPullRequest(
             resumeSessionRef = undefined;
           }
           const retryLimit = transportFailureObserved ? 4 : resumeAttempted ? 3 : 2;
+          const failureKind = error instanceof ReviewerAttemptTimeoutError ? "timed out" : "failed";
+          await recordReviewProgress(`${run.runId}:review:${frozen.headSha}:cycle-${reviewCycle.current}-of-${reviewCycle.total}:${role} · attempt ${attempt}/${retryLimit} ${failureKind} · ${priorFailure}`);
           if (attempt >= retryLimit) throw error;
+          await recordReviewProgress(`${run.runId}:review:${frozen.headSha}:cycle-${reviewCycle.current}-of-${reviewCycle.total}:${role} · retry ${attempt + 1}/${retryLimit} scheduled`);
         }
       }
       if (!completed) throw new Error(`${role} reviewer exhausted its retry budget`);
@@ -225,6 +340,7 @@ export async function reviewPullRequest(
         ...(input.priorVerdict ? { priorVerdict: input.priorVerdict } : {}),
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
+        reviewerAttemptTimeoutMs,
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       }, { runtime: dependencies.runtime, ...(dependencies.onAgentEvent ? { onAgentEvent: dependencies.onAgentEvent } : {}) })
       : undefined;
@@ -310,6 +426,7 @@ async function adjudicateFindingScope(
     workspace: string;
     provider?: string;
     model?: string;
+    reviewerAttemptTimeoutMs: number;
     signal?: AbortSignal;
   },
   dependencies: { runtime: AgentRuntime; onAgentEvent?: AgentEventSink },
@@ -317,7 +434,7 @@ async function adjudicateFindingScope(
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const result = await dependencies.runtime.run<ScopeAdjudication>({
+      const task: AgentTask<ScopeAdjudication> = {
         id: `${input.run.runId}:review:${input.headSha}:scope-adjudication${attempt === 1 ? "" : ":retry-2"}`,
         role: "adjudicator",
         objective: [
@@ -349,10 +466,18 @@ async function adjudicateFindingScope(
           ...(input.provider !== undefined ? { provider: input.provider } : {}),
           ...(input.model !== undefined ? { model: input.model } : {}),
         },
-      }, {
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-        ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
-      });
+      };
+      const result = await withReviewerAttemptTimeout<AgentRunResult<ScopeAdjudication>>(
+        (signal) => dependencies.runtime.run(task, {
+          signal,
+          ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+        }),
+        {
+          ...(input.signal !== undefined ? { externalSignal: input.signal } : {}),
+          timeoutMs: input.reviewerAttemptTimeoutMs,
+          taskId: task.id,
+        },
+      );
       assertCompleteScopeAdjudication(result.output, input.findings);
       return result;
     } catch (error) {
@@ -396,7 +521,7 @@ function applyScopeAdjudication(
 }
 
 export function isTransientReviewerTransportFailure(message: string): boolean {
-  return /websocket|socket hang up|econnreset|etimedout|transport failed|response failed|network error/i.test(message);
+  return /websocket|socket hang up|econnreset|etimedout|timed out|transport failed|response failed|network error|overload(?:ed)?|rate.?limit|\b429\b|\b5\d\d\b|temporarily unavailable|service unavailable/i.test(message);
 }
 
 export function selectReviewerRoles(

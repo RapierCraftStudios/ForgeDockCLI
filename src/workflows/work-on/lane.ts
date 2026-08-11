@@ -7,7 +7,7 @@ export type IssueLane =
   | {
     kind: "fast";
     targetBranch: string;
-    resolution: "repository-default" | "explicit-source-branch";
+    resolution: "repository-default" | "configured-fast-lane" | "explicit-source-branch";
   }
   | {
     kind: "feature";
@@ -54,8 +54,10 @@ export function classifyIssueLane(
   issue: Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">,
   defaultBranch: string,
   milestoneBranches: readonly BranchSnapshot[] = [],
+  fastLaneTarget = defaultBranch,
 ): IssueLane {
   assertBranchName(defaultBranch, "repository default branch");
+  assertBranchName(fastLaneTarget, "configured fast-lane target");
   const explicitSourceBranch = sourceBranchFromIssue(issue);
   if (explicitSourceBranch) {
     return { kind: "fast", targetBranch: explicitSourceBranch, resolution: "explicit-source-branch" };
@@ -64,7 +66,11 @@ export function classifyIssueLane(
     throw new Error(`Staging-review issue #${issue.number} requires explicit Code branch or Worktree base branch evidence`);
   }
   if (!issue.milestone) {
-    return { kind: "fast", targetBranch: defaultBranch, resolution: "repository-default" };
+    return {
+      kind: "fast",
+      targetBranch: fastLaneTarget,
+      resolution: fastLaneTarget === defaultBranch ? "repository-default" : "configured-fast-lane",
+    };
   }
 
   const title = issue.milestone.title.trim();
@@ -116,9 +122,10 @@ export async function resolveIssueLane(
   issue: Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">,
   defaultBranch: string,
   branches: IssueLaneBranchReader,
+  fastLaneTarget = defaultBranch,
 ): Promise<IssueLane> {
   const catalog = issue.milestone ? await branches.listBranches(issue.repo, "milestone/") : [];
-  const lane = classifyIssueLane(issue, defaultBranch, catalog);
+  const lane = classifyIssueLane(issue, defaultBranch, catalog, fastLaneTarget);
   await branches.getBranchHead(issue.repo, lane.targetBranch);
   return lane;
 }
@@ -128,7 +135,9 @@ export function laneEvidence(lane: IssueLane): string {
     ? `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution}).`
     : lane.resolution === "explicit-source-branch"
       ? `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`
-      : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
+      : lane.resolution === "configured-fast-lane"
+        ? `Fast lane: project policy targets ${lane.targetBranch}.`
+        : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
 }
 
 export function runTargetForLane(lane: IssueLane): RunTarget {

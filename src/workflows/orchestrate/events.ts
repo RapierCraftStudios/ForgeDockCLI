@@ -3,7 +3,7 @@
 import type { RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ScheduleEvent, ScheduledStatus } from "./scheduler.js";
 
-export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "resumed" | "snapshot";
+export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed" | "snapshot";
 
 export interface OrchestrationNode {
   id: string;
@@ -20,6 +20,7 @@ export interface OrchestrationSnapshot {
   nodes: OrchestrationNode[];
   readyNodes: string[];
   blockedNodes: string[];
+  invalidNodes: string[];
   suspendedNodes: string[];
   activeLeases: string[];
   remediationCheckpoints: Array<{ checkpointKey: string; status: RemediationBlockedPayload["status"]; parentIssue: number; childIssues: readonly number[] }>;

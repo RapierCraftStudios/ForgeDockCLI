@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { request as httpRequest } from "node:http";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { Type } from "typebox";
 import { Check, Errors } from "typebox/value";
 import {
   createAgentSession,
@@ -129,7 +130,7 @@ export class PiAgentRuntime implements AgentRuntime {
       async execute(_toolCallId, params) {
         if (submitted !== undefined) throw new Error("Artifact was already submitted");
         submitted = params as T;
-        emit({ type: "artifact.submitted", taskId: task.id });
+        emit({ type: "artifact.submitted", taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
         return {
           content: [{ type: "text" as const, text: "ForgeDock accepted the structured artifact." }],
           details: params,
@@ -140,6 +141,31 @@ export class PiAgentRuntime implements AgentRuntime {
 
     const resourceLoader = createTaskResourceLoader(task);
     const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope);
+    const verificationTool = task.tools.includes("verify")
+      ? defineTool({
+        name: "verify",
+        label: "Run approved verification",
+        description: "Run exactly one controller-approved verification command by its frozen ID in the assigned worktree.",
+        promptSnippet: "Run a frozen verification command for implementation feedback",
+        promptGuidelines: ["Pass only a command ID from the approved verification list; never invent commands or arguments."],
+        parameters: Type.Object({ commandId: Type.String({ minLength: 1 }) }),
+        async execute(_toolCallId, params, signal) {
+          if (!task.verification) throw new Error("This builder was not granted a verification plan");
+          const commandId = String((params as { commandId: string }).commandId);
+          const command = task.verification.commands.find((candidate) => candidate.id === commandId);
+          if (!command) throw new Error(`Verification command '${commandId}' is not in the frozen controller-approved plan`);
+          if (resolve(command.cwd) !== resolve(task.workspace.cwd)) {
+            throw new Error(`Verification command '${commandId}' is bound to a different worktree`);
+          }
+          const result = (await task.verification.runner.run([command], signal))[0];
+          if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ id: commandId, ...result }) }],
+            details: result,
+          };
+        },
+      })
+      : undefined;
     const agentDir = this.#options.agentDir ?? getAgentDir();
     const { session } = await createAgentSession({
       cwd: task.workspace.cwd,
@@ -150,7 +176,7 @@ export class PiAgentRuntime implements AgentRuntime {
       resourceLoader,
       noTools: "builtin",
       tools: [...task.tools, "submit_artifact"],
-      customTools: [...sandboxedTools, submitTool],
+      customTools: [...sandboxedTools, ...(verificationTool ? [verificationTool] : []), submitTool],
       sessionManager: SessionManager.inMemory(task.workspace.cwd),
       settingsManager: SettingsManager.inMemory({
         compaction: { enabled: true },
@@ -163,7 +189,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "agent_end") usageMessages.push(...event.messages);
       if (event.type === "auto_retry_start") retryCount += 1;
-      mapEvent(task.id, event, emit);
+      mapEvent(task.id, event, emit, task.observability);
     });
     const abort = () => void session.abort();
     options.signal?.addEventListener("abort", abort, { once: true });
@@ -182,7 +208,7 @@ export class PiAgentRuntime implements AgentRuntime {
       if (submitted === undefined) {
         throw new Error(`Agent ${task.id} ended without calling submit_artifact`);
       }
-      emit({ type: "session.completed", taskId: task.id, sessionRef });
+      emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
       const result = { output: submitted, sessionRef, provider, model: modelId };
       return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageFromMessages(usageMessages), retryCount) };
     } finally {
@@ -246,7 +272,7 @@ async function runNestedReviewer<T>(
   if (!url || !token) throw new Error("Nested reviewer bridge is unavailable");
   const ownerRunId = task.id.split(":review:", 1)[0] ?? task.id;
   const provisionalSessionRef = `nested_pending_${crypto.randomUUID()}`;
-  input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model });
+  input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
   const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean }>({
     url,
     token,
@@ -254,6 +280,7 @@ async function runNestedReviewer<T>(
       ownerRunId,
       id: task.id,
       role: task.role,
+      ...(task.description ? { description: task.description } : {}),
       objective: task.objective,
       instructions: task.instructions,
       context: task.context,
@@ -280,8 +307,8 @@ async function runNestedReviewer<T>(
     const details = [...Errors(task.outputSchema, payload.output)].slice(0, 5).map((error) => error.message).join("; ");
     throw new AgentRunError(`Nested reviewer returned an invalid structured result: ${details}`, { sessionRef, resumable: false });
   }
-  input.emit({ type: "artifact.submitted", taskId: task.id });
-  input.emit({ type: "session.completed", taskId: task.id, sessionRef });
+  input.emit({ type: "artifact.submitted", taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
+  input.emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
   return {
     output: payload.output,
     sessionRef,
@@ -502,13 +529,14 @@ export function boundedToolErrorSummary(result: unknown): string | undefined {
     ?? "Tool execution failed; inspect the scoped arguments and retry";
 }
 
-function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink): void {
+function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink, observability?: AgentTask<unknown>["observability"]): void {
+  const context = observability ? { observability } : {};
   if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
-    emit({ type: "thinking.delta", taskId, text: event.assistantMessageEvent.delta });
+    emit({ type: "thinking.delta", taskId, text: event.assistantMessageEvent.delta, ...context });
   } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-    emit({ type: "text.delta", taskId, text: event.assistantMessageEvent.delta });
+    emit({ type: "text.delta", taskId, text: event.assistantMessageEvent.delta, ...context });
   } else if (event.type === "tool_execution_start") {
-    emit({ type: "tool.started", taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args });
+    emit({ type: "tool.started", taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args, ...context });
   } else if (event.type === "tool_execution_end") {
     const errorSummary = event.isError ? boundedToolErrorSummary(event.result) : undefined;
     emit({
@@ -517,6 +545,7 @@ function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink
       toolCallId: event.toolCallId,
       tool: event.toolName,
       isError: event.isError,
+      ...context,
       ...(errorSummary !== undefined ? { errorSummary } : {}),
     });
   }
@@ -534,5 +563,8 @@ function assertToolPolicy<T>(task: AgentTask<T>): void {
     && !task.workspace.scope.writeRoots.length
     && !task.workspace.scope.writePaths?.length) {
     throw new Error(`Mutating task ${task.id} has no write roots or exact write paths in its scope manifest`);
+  }
+  if (grants.has("verify") && (!task.verification || !task.verification.commands.length)) {
+    throw new Error(`Verification-enabled task ${task.id} has no frozen controller-approved command plan`);
   }
 }

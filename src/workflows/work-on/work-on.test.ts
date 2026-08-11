@@ -94,6 +94,37 @@ const acceptAdjudication = (task: AgentTask<unknown>) => ({
 });
 
 describe("complete work-on trajectory", () => {
+  it("closes an invalid investigation without entering build or delivery", async () => {
+    const runtime = new FakeAgentRuntime([{
+      ...investigation,
+      outcome: "invalid",
+      rootCause: undefined,
+      summary: "The guarded implementation and regression test already cover the report.",
+      recommendation: "Close as already resolved.",
+    }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_invalid_work_on", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Already fixed", problem: "The report is already covered", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const result = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+    assert.equal(result.run.state, "invalid");
+    assert.equal(host.issueClosed, true);
+    assert.equal(host.findingIssues, 0);
+    assert.equal(host.snapshot.state, "OPEN");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator"]);
+    assert.equal(git.removed, true);
+    const outcomes = (await artifacts.list(intent.subject, "Outcome"))
+      .filter((artifact): artifact is import("../../core/artifacts/schema.js").DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+    assert.equal(outcomes.at(-1)?.payload.issueClosure?.status, "completed");
+  });
+
   it("distinguishes durable artifact fields from dotted and extensionless repository paths", () => {
     assert.equal(repositoryPathFromLocation("BuildResult art_f1b0.payload.changedPaths/checks"), undefined);
     assert.equal(repositoryPathFromLocation("Evidence at .github/workflows/publish.yml:20"), ".github/workflows/publish.yml");

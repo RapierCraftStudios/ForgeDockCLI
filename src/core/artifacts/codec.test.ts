@@ -34,6 +34,25 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("renders a typed verification adjudication checkpoint", () => {
+    const adjudication = createArtifact({
+      kind: "VerificationAdjudication",
+      runId: "run_verify",
+      subject: { repo: "acme/widget", issue: 42 },
+      producer: { role: "human", runtime: "forgedock" },
+      payload: {
+        checkpoint: "verification",
+        decision: "resume",
+        supersedesOutcomeId: "outcome-1",
+        reason: "The clean-worktree baseline was repaired and checked independently.",
+      },
+    });
+    const comment = renderArtifactComment(adjudication);
+    assert.match(comment, /Verification Adjudication/);
+    assert.match(comment, /outcome-1/);
+    assert.deepEqual(findArtifacts(comment)[0], adjudication);
+  });
+
   it("renders explainable review routing and consolidated finding lineage", () => {
     const verdict = createArtifact({
       kind: "ReviewVerdict", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },

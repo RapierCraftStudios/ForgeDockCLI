@@ -81,7 +81,15 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     activateOnly(pi, [HUMAN_DECISION_TOOL, "subagent_supervisor"]);
   });
 
+  // Pi emits agent_end before an automatic provider retry, compaction retry, or
+  // queued continuation. Keep the workflow tools and bound invocation alive
+  // until the session has fully settled so transient provider failures can
+  // recover without turning the native tool into an unavailable one.
   pi.on("agent_end", (_event, ctx) => {
+    if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
     clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
     if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
@@ -210,7 +218,7 @@ async function queueNativeWorkflow(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
-  activateOnly(pi, [tool]);
+  activateOnly(pi, command === "orchestrate" ? [tool, HUMAN_DECISION_TOOL] : [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs);
   // Slash-command dispatch itself occupies Pi's prompt pipeline, so ctx.isIdle()

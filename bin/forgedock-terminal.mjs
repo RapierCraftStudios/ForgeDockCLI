@@ -4,6 +4,7 @@
 
 import { existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -59,6 +60,13 @@ if (!isSupported(process.versions.node)) {
       }
     }
     refreshConfiguredGitHubApp(packageRoot, cliArgs);
+    // Verification deliberately isolates HOME/USERPROFILE so Git and other tools
+    // cannot touch the user's global state. Pi's auth must remain durable across
+    // terminal launches, so pin ForgeDock's agent directory before that boundary.
+    if (!process.env.FORGEDOCK_CODING_AGENT_DIR) {
+      const persistentHome = process.env.HOME || process.env.USERPROFILE || homedir();
+      process.env.FORGEDOCK_CODING_AGENT_DIR = join(persistentHome, ".forgedock", "agent");
+    }
     const { sealVerificationEnvironment } = await import(pathToFileURL(environmentModule).href);
     const discoveredEnvironment = sealVerificationEnvironment(process.env);
     for (const name of ["PATH", "USERPROFILE", "FORGEDOCK_GIT_BASH", "FORGEDOCK_VERIFICATION_PATH"]) {
