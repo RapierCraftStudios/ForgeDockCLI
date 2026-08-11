@@ -211,7 +211,7 @@ async function workOn(argv: string[]): Promise<void> {
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
-  const github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd());
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
@@ -324,6 +324,9 @@ async function workOn(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  // All remediation callers in this controller share the durable admission
+  // repository, including a later --resume invocation in another process.
+  github = new GitHubClient(process.cwd(), store);
   const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const runs = dryRun ? store : projectRunsToGitHub(store, github);
   const runtime = createCliRuntime({
@@ -614,25 +617,9 @@ async function workOn(argv: string[]): Promise<void> {
                   let checkpoint = remediationCheckpoint;
                   const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
                   if (checkpoint.payload.status === "awaiting-dispatch") {
-                    const dispatched = await supervisor.begin({
-                      parentRun: run,
+                    const dispatched = await supervisor.resumeAwaiting({
+                      checkpoint,
                       parentPullRequest: checkpointPullRequest!,
-                      packetArtifact: packet,
-                      verdictArtifact: priorVerdict!,
-                      reason: checkpoint.payload.reason,
-                      remediationDepth: checkpoint.payload.remediationDepth,
-                      maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
-                      maxRemediationChildren: checkpoint.payload.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
-                      approvedPaths: checkpoint.payload.approvedPaths,
-                      findings: checkpoint.payload.findings.map((finding) => ({
-                        id: finding.id,
-                        severity: finding.severity,
-                        title: finding.title,
-                        evidence: finding.evidence,
-                        ...(finding.location ? { location: finding.location } : {}),
-                        remediation: finding.remediation,
-                        ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
-                      })),
                     });
                     checkpoint = dispatched.checkpoint;
                   }

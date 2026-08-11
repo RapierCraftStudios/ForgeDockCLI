@@ -55,6 +55,34 @@ describe("durable recursive remediation", () => {
     assert.equal(reconcileArtifacts(await artifacts.list({ repo: "owner/repo", issue: 20 })).state, "blocked");
   });
 
+  it("replays the original awaiting checkpoint without recording partial children", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    let attempts = 0;
+    const host = {
+      async materializeRemediationChildren(input: { checkpointKey: string }) {
+        attempts += 1;
+        if (attempts === 1) throw new Error(`visibility pending for ${input.checkpointKey}`);
+        return [{ repo: "owner/repo", number: 31, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts });
+    await assert.rejects(supervisor.begin({
+      parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation",
+      findings: [{ id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug" }],
+    }), /visibility pending/);
+    const awaiting = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 } });
+    assert.equal(awaiting?.payload.status, "awaiting-dispatch");
+    assert.deepEqual(awaiting?.payload.childIssues, []);
+    assert.ok(awaiting);
+    const recovered = await supervisor.resumeAwaiting({ checkpoint: awaiting!, parentPullRequest: pr });
+    assert.equal(recovered.checkpoint.payload.status, "children-running");
+    assert.equal(recovered.checkpoint.payload.checkpointKey, awaiting!.payload.checkpointKey);
+    assert.equal(recovered.checkpoint.payload.checkpointSequence, awaiting!.payload.checkpointSequence + 1);
+    assert.deepEqual(recovered.childIssues, [31]);
+    assert.equal((await artifacts.list({ repo: "owner/repo", issue: 20 }, "RemediationBlocked")).length, 2);
+  });
+
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {
     const { run, packet, verdict } = context();
     const artifacts = new InMemoryArtifactRepository();

@@ -116,6 +116,52 @@ export class RemediationSupervisor {
     return { checkpoint: running, childIssues: children.map((child) => child.number) };
   }
 
+  /** Replay the exact durable admission represented by an awaiting checkpoint. */
+  async resumeAwaiting(input: {
+    checkpoint: DurableArtifact<"RemediationBlocked">;
+    parentPullRequest: PullRequestSnapshot;
+  }): Promise<RemediationCheckpointResult> {
+    const awaiting = input.checkpoint.payload;
+    if (awaiting.status !== "awaiting-dispatch") throw new Error("Remediation checkpoint is not awaiting dispatch");
+    if (awaiting.pullRequest !== input.parentPullRequest.number || awaiting.headSha !== input.parentPullRequest.headSha) {
+      throw new Error("Remediation recovery pull request identity does not match the persisted checkpoint");
+    }
+    if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
+    const findings = awaiting.findings.map((finding) => {
+      if (!finding.location || !finding.acceptanceCriterion) {
+        throw new Error(`Remediation checkpoint ${awaiting.checkpointKey} contains an ineligible finding`);
+      }
+      return {
+        id: finding.id,
+        title: finding.title,
+        evidence: finding.evidence,
+        location: finding.location,
+        remediation: finding.remediation,
+        acceptanceCriterion: finding.acceptanceCriterion,
+      };
+    });
+    const children = await this.dependencies.host.materializeRemediationChildren({
+      repo: input.checkpoint.subject.repo,
+      parentRunId: awaiting.parentRunId,
+      parentIssue: awaiting.parentIssue,
+      parentPullRequest: awaiting.pullRequest,
+      headSha: awaiting.headSha,
+      headBranch: awaiting.headBranch,
+      baseBranch: awaiting.baseBranch,
+      checkpointKey: awaiting.checkpointKey,
+      remediationDepth: awaiting.remediationDepth + 1,
+      findings,
+    });
+    const running = createCheckpointFromExisting(input.checkpoint, {
+      ...awaiting,
+      checkpointSequence: awaiting.checkpointSequence + 1,
+      status: "children-running",
+      childIssues: children.map((child) => child.number),
+    });
+    await this.dependencies.artifacts.append(running);
+    return { checkpoint: running, childIssues: children.map((child) => child.number) };
+  }
+
   async reconcileChildren(input: {
     checkpoint: DurableArtifact<"RemediationBlocked">;
     childOutcomes: readonly DurableArtifact<"Outcome">[];

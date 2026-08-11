@@ -5,15 +5,16 @@ import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
+import type { IssueSnapshot } from "../../core/ports/forge-host.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
-import { ConcurrentRunUpdateError, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
+import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
 const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
@@ -74,6 +75,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         receipt_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS run_telemetry_run ON run_telemetry(run_id, created_at);
+      CREATE TABLE IF NOT EXISTS remediation_admissions (
+        admission_key TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        parent_issue INTEGER NOT NULL,
+        parent_pull_request INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        marker TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'materialized')),
+        issue_json TEXT
+      );
     `);
   }
 
@@ -115,6 +126,34 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   listRuns(limit = 50): RunState[] {
     const rows = this.#database.prepare("SELECT state_json FROM runs ORDER BY rowid DESC LIMIT ?").all(limit);
     return rows.map((row) => JSON.parse(String((row as { state_json: string }).state_json)) as RunState);
+  }
+
+  async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
+    const admissionKey = remediationAdmissionKey(key);
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      const inserted = this.#database.prepare(`
+        INSERT INTO remediation_admissions
+          (admission_key, repository, parent_issue, parent_pull_request, head_sha, marker, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending') ON CONFLICT(admission_key) DO NOTHING
+      `).run(admissionKey, key.repo.trim().toLowerCase(), key.parentIssue, key.parentPullRequest, key.headSha.trim().toLowerCase(), key.marker.trim());
+      const row = this.#database.prepare("SELECT status, issue_json FROM remediation_admissions WHERE admission_key = ?")
+        .get(admissionKey) as { status: "pending" | "materialized"; issue_json?: string } | undefined;
+      if (!row) throw new Error(`Unable to read remediation admission: ${admissionKey}`);
+      if (row.status === "materialized" && row.issue_json) {
+        return { status: "materialized", snapshot: JSON.parse(row.issue_json) as IssueSnapshot };
+      }
+      return inserted.changes === 1 ? { status: "claimed" } : { status: "pending" };
+    }));
+  }
+
+  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void> {
+    const admissionKey = remediationAdmissionKey(key);
+    await withSqliteBusyRetry(() => {
+      const result = this.#database.prepare(`
+        UPDATE remediation_admissions SET status = 'materialized', issue_json = ? WHERE admission_key = ?
+      `).run(JSON.stringify(snapshot), admissionKey);
+      if (result.changes !== 1) throw new Error(`Unknown remediation admission: ${admissionKey}`);
+    });
   }
 
   async recordTelemetry(receipt: AgentRunReceipt): Promise<void> {
