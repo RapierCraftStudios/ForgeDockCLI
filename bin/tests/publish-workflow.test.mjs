@@ -17,8 +17,10 @@ const changedPathGuard = workflow.slice(changedGuardStart, changedGuardEnd);
 
 describe("npm publish workflow recovery", () => {
   it("includes Pi source and staged runtime in both publish path guards", () => {
+    assert.match(pushPaths, /- 'vendor\/pi'/);
     assert.match(pushPaths, /- 'vendor\/pi\/\*\*'/);
     assert.match(pushPaths, /- 'vendor\/pi-runtime\/\*\*'/);
+    assert.match(changedPathGuard, /'vendor\/pi'/);
     assert.match(changedPathGuard, /'vendor\/pi\/\*\*'/);
     assert.match(changedPathGuard, /'vendor\/pi-runtime\/\*\*'/);
     assert.doesNotMatch(changedPathGuard, /\.github\/workflows\/publish\.yml/);
