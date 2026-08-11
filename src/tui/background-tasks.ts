@@ -7,7 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
 
-export type BackgroundTaskStatus = "running" | "completed" | "blocked" | "failed" | "cancelled";
+export type BackgroundTaskStatus = "running" | "detached" | "completed" | "blocked" | "failed" | "cancelled";
 
 export interface BackgroundTaskRecord {
   id: string;
@@ -26,7 +26,8 @@ const MAX_BACKGROUND_TASKS = 4;
 
 interface LiveTask {
   record: BackgroundTaskRecord;
-  child: ChildProcess;
+  child?: ChildProcess;
+  adopted: boolean;
   cleanup?: () => Promise<void>;
 }
 
@@ -51,15 +52,24 @@ export class ForgeDockBackgroundTasks {
         const record = JSON.parse(readFileSync(join(directory, name), "utf8")) as BackgroundTaskRecord;
         if (!record.id || !record.logPath || !record.startedAt) continue;
         if (record.status === "running") {
-          record.status = "failed";
-          record.completedAt = new Date().toISOString();
-          this.persist(record);
+          if (isProcessAlive(record.pid)) {
+            // A terminal restart must not turn a still-running controller into a
+            // false failure. Adopt it as a detached task and supervise its PID
+            // and durable log until it exits.
+            record.status = "detached";
+            this.#live.set(record.id, { record, adopted: true });
+          } else {
+            record.status = "failed";
+            record.completedAt = new Date().toISOString();
+            this.persist(record);
+          }
         }
         this.#records.set(record.id, record);
       } catch {
         // Ignore damaged operational records; durable workflow truth remains on GitHub.
       }
     }
+    if (this.#live.size) this.ensureTicker();
   }
 
   start(input: {
@@ -103,7 +113,7 @@ export class ForgeDockBackgroundTasks {
     };
     this.#ctx = input.ctx;
     this.#records.set(id, record);
-    this.#live.set(id, { record, child, ...(input.cleanup ? { cleanup: input.cleanup } : {}) });
+    this.#live.set(id, { record, child, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) });
     this.persist(record);
     child.once("error", (error) => void this.finish(id, "failed", undefined, error.message));
     child.once("exit", (code, signal) => {
@@ -135,13 +145,15 @@ export class ForgeDockBackgroundTasks {
     if (!live) {
       const record = this.recordsFromDisk().get(id);
       if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
-      if (record.status === "running") throw new Error(`Task ${id} belongs to another or interrupted ForgeDock session and cannot be safely signalled`);
+      if (record.status === "running" || record.status === "detached") {
+        throw new Error(`Task ${id} belongs to another or interrupted ForgeDock session and is not supervised here`);
+      }
       return record;
     }
     live.record.status = "cancelled";
     live.record.completedAt = new Date().toISOString();
     this.persist(live.record);
-    terminateProcessTree(live.child);
+    terminateProcessTree(live.child ?? live.record.pid);
     this.renderStatus();
     return { ...live.record, args: [...live.record.args] };
   }
@@ -188,13 +200,24 @@ export class ForgeDockBackgroundTasks {
 
   private ensureTicker(): void {
     if (this.#ticker) return;
-    this.#ticker = setInterval(() => this.renderStatus(), 1_000);
+    this.#ticker = setInterval(() => {
+      this.reconcileAdoptedTasks();
+      this.renderStatus();
+    }, 1_000);
     this.#ticker.unref();
   }
 
   private stopTicker(): void {
     if (this.#ticker) clearInterval(this.#ticker);
     this.#ticker = undefined;
+  }
+
+  private reconcileAdoptedTasks(): void {
+    for (const task of [...this.#live.values()]) {
+      if (!task.adopted || task.record.status !== "detached") continue;
+      if (isProcessAlive(task.record.pid)) continue;
+      void this.finish(task.record.id, "failed", undefined, "Detached controller exited before this terminal reattached");
+    }
   }
 
   private renderStatus(): void {
@@ -214,18 +237,33 @@ export function renderRecord(record: BackgroundTaskRecord): string {
   return `${record.id} · ${record.status}${record.exitCode !== undefined ? ` (exit ${record.exitCode})` : ""} · pid ${record.pid} · ${record.args.slice(1, 3).join(" ") || record.command}`;
 }
 
-export function terminateProcessTree(child: ChildProcess): void {
-  const pid = child.pid;
+export function terminateProcessTree(childOrPid: ChildProcess | number): void {
+  const pid = typeof childOrPid === "number" ? childOrPid : childOrPid.pid;
   if (!pid) return;
   if (process.platform === "win32") {
     const result = spawnSync("taskkill.exe", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, shell: false, stdio: "ignore" });
-    if (result.error || result.status !== 0) child.kill();
+    if (result.error || result.status !== 0) {
+      if (typeof childOrPid !== "number") childOrPid.kill();
+      else { try { process.kill(pid, "SIGTERM"); } catch { /* already exited */ } }
+    }
     return;
   }
   try { process.kill(-pid, "SIGTERM"); }
-  catch { child.kill("SIGTERM"); }
+  catch {
+    if (typeof childOrPid !== "number") childOrPid.kill("SIGTERM");
+  }
   const force = setTimeout(() => {
     try { process.kill(-pid, "SIGKILL"); } catch { /* already exited */ }
   }, 2_000);
   force.unref();
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

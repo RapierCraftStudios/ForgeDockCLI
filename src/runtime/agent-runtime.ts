@@ -232,9 +232,44 @@ export interface RuntimePreflightOptions {
 export interface RuntimePreflightResult {
   provider: string;
   model: string;
+  capabilities?: RuntimeCapabilities;
+  diagnostics?: readonly string[];
+}
+
+export interface RuntimeBudgetLimits {
+  /** Aggregate input + output token ceiling for this controller process. */
+  maxTotalTokens?: number;
+  /** Aggregate estimated USD ceiling for this controller process. */
+  maxCostUsd?: number;
+  /** Optional per-agent token ceiling, checked after every completed attempt. */
+  maxTokensPerRun?: number;
+}
+
+export interface RuntimeBudgetUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number;
+  observedRuns: number;
+  unknownUsageRuns: number;
+}
+
+export class AgentBudgetExceededError extends Error {
+  constructor(readonly limit: keyof RuntimeBudgetLimits, readonly value: number, readonly maximum: number) {
+    super(`Agent ${limit} budget exceeded: ${value} > ${maximum}`);
+    this.name = "AgentBudgetExceededError";
+  }
+}
+
+export class AgentBudgetUnknownError extends Error {
+  constructor(readonly limit: keyof RuntimeBudgetLimits, readonly runId: string) {
+    super(`Cannot evaluate ${limit} budget for agent run ${runId}; runtime did not report the required usage`);
+    this.name = "AgentBudgetUnknownError";
+  }
 }
 
 export interface AgentRuntime {
+
   capabilities(): Promise<RuntimeCapabilities>;
   preflight?(options?: RuntimePreflightOptions): Promise<RuntimePreflightResult>;
   run<T>(task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>>;
@@ -246,6 +281,88 @@ export interface AgentRuntime {
 export type AgentReceiptSink = (receipt: AgentRunReceipt) => void | Promise<void>;
 
 /** Adds rebuildable telemetry without giving telemetry authority over workflow state. */
+/** Enforces aggregate controller budgets without making telemetry authoritative state. */
+export class BudgetedAgentRuntime implements AgentRuntime {
+  readonly #usage: RuntimeBudgetUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, estimatedCostUsd: 0, observedRuns: 0, unknownUsageRuns: 0 };
+
+  constructor(readonly inner: AgentRuntime, readonly limits: RuntimeBudgetLimits) {}
+
+  capabilities(): Promise<RuntimeCapabilities> { return this.inner.capabilities(); }
+  preflight(options?: RuntimePreflightOptions): Promise<RuntimePreflightResult> {
+    if (!this.inner.preflight) return Promise.reject(new Error("Agent runtime does not support preflight"));
+    return this.inner.preflight(options);
+  }
+  usage(): RuntimeBudgetUsage { return { ...this.#usage }; }
+
+  async run<T>(task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>> {
+    this.assertAggregateBudget(task.id);
+    const result = await this.inner.run(task, options);
+    this.record(result, task.id);
+    return result;
+  }
+
+  async resume<T>(sessionRef: string, task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>> {
+    this.assertAggregateBudget(task.id);
+    if (!this.inner.resume) throw new AgentRunError("Agent runtime cannot resume persisted sessions");
+    const result = await this.inner.resume(sessionRef, task, options);
+    this.record(result, task.id);
+    return result;
+  }
+
+  close(): Promise<void> { return this.inner.close(); }
+
+  private assertAggregateBudget(runId: string): void {
+    if (this.limits.maxTotalTokens !== undefined && this.#usage.totalTokens >= this.limits.maxTotalTokens) {
+      throw new AgentBudgetExceededError("maxTotalTokens", this.#usage.totalTokens, this.limits.maxTotalTokens);
+    }
+    if (this.limits.maxCostUsd !== undefined && this.#usage.estimatedCostUsd >= this.limits.maxCostUsd) {
+      throw new AgentBudgetExceededError("maxCostUsd", this.#usage.estimatedCostUsd, this.limits.maxCostUsd);
+    }
+    void runId;
+  }
+
+  private record(result: AgentRunResult<unknown>, runId: string): void {
+    const usage = result.receipt?.usage;
+    this.#usage.observedRuns += 1;
+    if (!usage) {
+      this.#usage.unknownUsageRuns += 1;
+      this.assertKnown("maxTotalTokens", runId, this.limits.maxTotalTokens !== undefined);
+      this.assertKnown("maxCostUsd", runId, this.limits.maxCostUsd !== undefined);
+      return;
+    }
+    const inputTokens = usage.inputTokens ?? 0;
+    const outputTokens = usage.outputTokens ?? 0;
+    const totalTokens = usage.totalTokens ?? (usage.inputTokens !== undefined || usage.outputTokens !== undefined ? inputTokens + outputTokens : undefined);
+    const cost = usage.estimatedCostUsd;
+    if (this.limits.maxTokensPerRun !== undefined && totalTokens === undefined) {
+      throw new AgentBudgetUnknownError("maxTokensPerRun", runId);
+    }
+    if (this.limits.maxTotalTokens !== undefined && totalTokens === undefined) {
+      throw new AgentBudgetUnknownError("maxTotalTokens", runId);
+    }
+    if (this.limits.maxCostUsd !== undefined && cost === undefined) {
+      throw new AgentBudgetUnknownError("maxCostUsd", runId);
+    }
+    this.#usage.inputTokens += inputTokens;
+    this.#usage.outputTokens += outputTokens;
+    this.#usage.totalTokens += totalTokens ?? 0;
+    this.#usage.estimatedCostUsd += cost ?? 0;
+    if (this.limits.maxTokensPerRun !== undefined && totalTokens! > this.limits.maxTokensPerRun) {
+      throw new AgentBudgetExceededError("maxTokensPerRun", totalTokens!, this.limits.maxTokensPerRun);
+    }
+    if (this.limits.maxTotalTokens !== undefined && this.#usage.totalTokens > this.limits.maxTotalTokens) {
+      throw new AgentBudgetExceededError("maxTotalTokens", this.#usage.totalTokens, this.limits.maxTotalTokens);
+    }
+    if (this.limits.maxCostUsd !== undefined && this.#usage.estimatedCostUsd > this.limits.maxCostUsd) {
+      throw new AgentBudgetExceededError("maxCostUsd", this.#usage.estimatedCostUsd, this.limits.maxCostUsd);
+    }
+  }
+
+  private assertKnown(limit: keyof RuntimeBudgetLimits, runId: string, required: boolean): void {
+    if (required) throw new AgentBudgetUnknownError(limit, runId);
+  }
+}
+
 export class TelemetryAgentRuntime implements AgentRuntime {
   constructor(readonly inner: AgentRuntime, readonly sink: AgentReceiptSink) {}
 

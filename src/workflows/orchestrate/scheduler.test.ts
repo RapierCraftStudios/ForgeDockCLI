@@ -42,6 +42,25 @@ describe("lean orchestration scheduler", () => {
     assert.equal(preview.criticalPath[0]?.id, "a");
   });
 
+  it("promotes Build Packet paths and rejects a newly discovered active claim conflict", async () => {
+    let releaseFirst!: () => void;
+    const promoted: Array<[string, string[]]> = [];
+    const resultPromise = runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
+    ], 2, async (item, scheduler) => {
+      scheduler.promoteClaims(["src/shared"]);
+      if (item.id === "first") await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    }, { onClaimsPromoted: (id, claims) => promoted.push([id, [...claims]]) });
+    await sleep(5);
+    assert.deepEqual(promoted, [["first", ["src/shared"]]]);
+    releaseFirst();
+    const result = await resultPromise;
+    assert.equal(result.status.get("first"), "completed");
+    assert.equal(result.status.get("second"), "failed");
+    assert.match(result.errors.get("second")?.message ?? "", /active work/);
+  });
+
   it("streams a newly ready successor without waiting for an unrelated ready node", async () => {
     const releases = new Map<string, () => void>();
     const started: string[] = [];

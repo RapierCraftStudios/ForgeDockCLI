@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
+import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
@@ -20,6 +21,23 @@ describe("GitHub repository resolution", () => {
     assert.equal(repositoryFromRemote("https://github.com/RapierCraftStudios/ForgeDockCLI"), "RapierCraftStudios/ForgeDockCLI");
     assert.equal(repositoryFromRemote("git@github.com:RapierCraftStudios/ForgeDockCLI.git"), "RapierCraftStudios/ForgeDockCLI");
     assert.equal(repositoryFromRemote("https://git.example.test/owner/repo.git"), undefined);
+  });
+
+  it("refreshes expired credentials once and retries the same GitHub operation", async () => {
+    let attempts = 0;
+    let refreshed = 0;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository(), async () => {
+      refreshed += 1;
+      return true;
+    });
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("gh api failed (1): gh: Bad credentials (HTTP 401)");
+      return JSON.stringify({ nameWithOwner: "a/b", defaultBranchRef: { name: "main" } });
+    } });
+    assert.deepEqual(await client.getRepository("a/b"), { repo: "a/b", defaultBranch: "main" });
+    assert.equal(attempts, 2);
+    assert.equal(refreshed, 1);
   });
 });
 
@@ -180,6 +198,71 @@ describe("GitHub decomposition materialization", () => {
     assert.ok(edit);
     assert.deepEqual(edit.slice(edit.indexOf("--milestone")), ["--milestone", "Milestone One"]);
     assert.equal(children[0]?.milestone?.number, 1);
+  });
+});
+
+describe("GitHub remediation admission", () => {
+  const input = {
+    repo: "Owner/Repo",
+    parentRunId: "run-parent",
+    parentIssue: 20,
+    parentPullRequest: 9,
+    headSha: "a".repeat(40),
+    headBranch: "forge/parent",
+    baseBranch: "main",
+    checkpointKey: "checkpoint-1",
+    remediationDepth: 1,
+    findings: [{ id: "finding-1", title: "Fix", evidence: "Evidence", location: "src/a.ts:1", remediation: "Add guard", acceptanceCriterion: "The guard exists" }],
+  } as const;
+
+  function clients(options: { visibleAfter: number; failFirstRead?: boolean }) {
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" }> = [];
+    let listCalls = 0;
+    let creates = 0;
+    let failFirstRead = options.failFirstRead ?? false;
+    const make = () => {
+      const client = new GitHubClient(".", admissions);
+      Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+        if (args[0] === "api" && args[1]?.includes("issues?state=all")) {
+          listCalls += 1;
+          return JSON.stringify([listCalls >= options.visibleAfter ? issues : []]);
+        }
+        if (args[0] === "issue" && args[1] === "create") {
+          creates += 1;
+          const number = 100 + creates;
+          issues.push({ number, title: args[args.indexOf("--title") + 1] ?? "Child", body: body ?? "", html_url: `https://github.test/a/b/issues/${number}`, state: "open" });
+          return `https://github.test/a/b/issues/${number}\n`;
+        }
+        if (args[0] === "issue" && args[1] === "view") {
+          if (failFirstRead) { failFirstRead = false; throw new Error("post-create read interrupted"); }
+          const issue = issues.find((candidate) => candidate.number === Number(args[2]));
+          if (!issue) throw new Error("issue not found");
+          return JSON.stringify({ number: issue.number, title: issue.title, body: issue.body, url: issue.html_url, state: "OPEN", labels: [], milestone: null });
+        }
+        if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+      return client;
+    };
+    return { make, creates: () => creates };
+  }
+
+  it("uses one durable admission for concurrent clients and adopts delayed visibility", async () => {
+    const fixture = clients({ visibleAfter: 10 });
+    const [first, second] = await Promise.all([
+      fixture.make().materializeRemediationChildren(input),
+      fixture.make().materializeRemediationChildren(input),
+    ]);
+    assert.equal(fixture.creates(), 1);
+    assert.equal(first[0]?.number, second[0]?.number);
+  });
+
+  it("fails closed after an accepted create when marker visibility remains unresolved", async () => {
+    const fixture = clients({ visibleAfter: Number.MAX_SAFE_INTEGER, failFirstRead: true });
+    await assert.rejects(fixture.make().materializeRemediationChildren(input), /post-create read interrupted/);
+    await assert.rejects(fixture.make().materializeRemediationChildren(input), /remains unresolved/);
+    assert.equal(fixture.creates(), 1);
   });
 });
 

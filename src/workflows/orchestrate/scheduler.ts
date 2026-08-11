@@ -33,10 +33,23 @@ export interface ScheduleEvent {
   errors: ReadonlyMap<string, Error>;
 }
 export type ScheduleEventSink = (event: ScheduleEvent) => void;
+export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => void;
+export interface ScheduleWorkerContext {
+  /** Add concrete Build Packet paths before the worker mutates its checkout. */
+  promoteClaims(claims: readonly string[]): void;
+}
 export interface RunScheduleOptions {
   onEvent?: ScheduleEventSink;
+  onClaimsPromoted?: ScheduleClaimsSink;
   /** IDs being retried from a durable orchestration attempt. */
   resumedItemIds?: readonly string[];
+}
+
+export class ClaimPromotionConflictError extends Error {
+  constructor(readonly itemId: string, readonly conflicts: readonly string[]) {
+    super(`Promoted scheduler claims for ${itemId} conflict with active work: ${conflicts.join(", ")}`);
+    this.name = "ClaimPromotionConflictError";
+  }
 }
 
 export interface ClaimSerializationEdge {
@@ -98,7 +111,7 @@ export function buildSchedulePreview(items: readonly ScheduledWorkItem[]): Sched
 export async function runSchedule(
   items: readonly ScheduledWorkItem[],
   maxParallel: number,
-  worker: (item: ScheduledWorkItem) => Promise<ScheduleWorkerResult>,
+  worker: (item: ScheduledWorkItem, context: ScheduleWorkerContext) => Promise<ScheduleWorkerResult>,
   options: RunScheduleOptions = {},
 ): Promise<ScheduleResult> {
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
@@ -108,6 +121,7 @@ export async function runSchedule(
   const errors = new Map<string, Error>();
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
+  const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const emit = (type: ScheduleEvent["type"], itemId?: string) => options.onEvent?.({
     type, ...(itemId ? { itemId } : {}), status: new Map(status), errors: new Map(errors),
   });
@@ -134,11 +148,23 @@ export async function runSchedule(
     for (const item of candidates) {
       if (running.size >= maxParallel) break;
       const activeItems = [...running.keys()].map((id) => byId.get(id)).filter((value): value is ScheduledWorkItem => Boolean(value));
-      if (activeItems.some((active) => claimsConflict(item.claims, active.claims))) continue;
+      if (activeItems.some((active) => claimsConflict(currentClaims.get(item.id) ?? [], currentClaims.get(active.id) ?? []))) continue;
       status.set(item.id, "running");
       startOrder.push(item.id);
       emit("started", item.id);
-      const promise = worker(item)
+      const context: ScheduleWorkerContext = {
+        promoteClaims: (claims) => {
+          const merged = [...new Set([...(currentClaims.get(item.id) ?? []), ...claims.map((claim) => claim.trim()).filter(Boolean)])];
+          const conflicts = activeItems
+            .filter((active) => active.id !== item.id)
+            .filter((active) => claimsConflict(merged, currentClaims.get(active.id) ?? []))
+            .map((active) => active.id);
+          if (conflicts.length) throw new ClaimPromotionConflictError(item.id, conflicts);
+          currentClaims.set(item.id, merged);
+          options.onClaimsPromoted?.(item.id, merged);
+        },
+      };
+      const promise = worker(item, context)
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
           if (outcome.status === "failed") {

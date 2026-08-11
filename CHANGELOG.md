@@ -20,6 +20,7 @@
 
 ### Changed
 
+- GitHub default CodeQL setup is now the repository-authoritative security analysis; the conflicting advanced workflow file was removed so PR checks are not suppressed by dual configuration.
 - `forgedock` now launches the provider-neutral terminal; the legacy entry point remains available as `forgedock-legacy` during cutover.
 - Long-term devdocs memory is explicitly reference-only and selectively retrieved; it cannot authorize actions or override current user intent and typed contracts.
 - Required verification failures remain failed even when identical failures exist on the base revision; baseline comparison is retained only as non-regression evidence.
@@ -34,6 +35,12 @@
 
 ### Fixed
 
+- Recursive remediation materialization now uses durable, fail-closed admission records keyed by the parent identity, verified head, and deterministic finding marker; interrupted awaiting-dispatch recovery reuses the original checkpoint and never creates a second child while marker visibility is unresolved.
+- GitHub API operations retry once after a configured GitHub App token refresh when an installation token expires during a long controller run, preserving the semantic checkpoint instead of failing on a transient 401.
+- npm publication triggers and changed-path guards now include both exact Pi submodule gitlinks and recursive Pi/staged-runtime paths, with focused regression coverage for both forms.
+- Initial visible DAG dispatch no longer converts stale `workflow:*` labels into checkpoint resumes; only explicit DAG recovery can resume a prior child run.
+- CLI and visible orchestration now persist parent DAG records, node dependencies/status/errors, and associated child run IDs in SQLite for durable status inspection.
+- Publication retries reconcile a PR created before a crash at the publication transition boundary instead of creating a duplicate.
 - Runtime startup now preflights the staged Pi HTTP dispatcher and its resolved `undici` entry before semantic work, smoke-loads the dispatcher, rejects stale bundle metadata, and reports incomplete npm trees as setup failures instead of late Build Packet/review failures. Managed worktrees validate direct package entrypoints, serialize dependency installation with a heartbeating lease, reuse verified installs, and repair partial trees deterministically.
 - Required verification now fail-closes unsupported executable plan steps, executes every frozen command instead of inferring success from package-script prose, validates the complete base-to-head delivery revision against frozen scope and builder reports before verification and again after commit, binds passing checks to stable file-content digests and raw committed blobs in a hook-disabled asserted Git tree, and automatically gives the retained in-packet implementation at most two evidence-backed repair attempts in the same lifecycle invocation—including post-review remediation without spending repair slots on interrupted dispatches or infrastructure spawn failures. Recovery selects runs and artifacts by durable publication order and preserves configured scope and remediation budgets across every checkpoint.
 - Frozen Build Packet scope is persisted as exact write authority with bounded discovery reads; agent tool failures retain correlated, redacted diagnostics, and merged Outcomes are withheld until GitHub issue closure is authoritatively re-read and confirmed.

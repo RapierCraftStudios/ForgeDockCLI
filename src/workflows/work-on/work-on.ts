@@ -78,6 +78,8 @@ export async function workOn(
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
+    /** Promote frozen Build Packet paths into the owning scheduler before edits begin. */
+    onClaimsPromoted?: (paths: readonly string[]) => void;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -158,6 +160,7 @@ export async function workOn(
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       ...runtimeOptions,
     }, agentDependencies);
+    input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     run = prepared.run;
     const continued = await continueBuildDelivery({
       run, intent: input.intent, investigation: investigated.investigation, packet: prepared.packet, workspace,

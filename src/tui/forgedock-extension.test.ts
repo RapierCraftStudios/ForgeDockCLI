@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
+import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import forgedockExtension, { executeController, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
   bindOrchestrationInvocation,
@@ -371,7 +372,8 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.match(spawnRequest.params.task, /"maxRemediationCycles":2/);
   assert.match(spawnRequest.params.task, /"maxRemediationDepth":2/);
   assert.match(spawnRequest.params.task, /"maxRemediationChildren":8/);
-  assert.match(spawnRequest.params.task, /"resume":true/);
+  assert.match(spawnRequest.params.task, /"rerun":false/);
+  assert.match(spawnRequest.params.task, /"resume":false/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);
 });
@@ -427,7 +429,89 @@ test("visible DAG delegation dispatches a successor on its predecessor completio
 test("fresh-rerun authorization cannot be converted back into checkpoint resume", () => {
   assert.deepEqual(resolveIssueWorkerRecovery(["needs-human"], false, "rerun"), { rerun: true, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:engine-error"], true, "initial"), { rerun: true, resume: false });
+  assert.deepEqual(resolveIssueWorkerRecovery(["workflow:in-review", "needs-human"], false, "initial"), { rerun: false, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
+});
+
+test("visible DAG persists its durable parent record and terminal node state", async () => {
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "durable-child" } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = new VisibleDagDelegator(state.pi, () => repository);
+  const run = await delegator.start({
+    repository: "a/b", autoMerge: true,
+    items: [{ id: "issue-21", issue: 21, title: "Twenty-one", summary: "Durable", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [21] }],
+    maxParallel: 1,
+    taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+  originalEmit("subagent:async-complete", { runId: "durable-child" });
+  await run.completion;
+  const record = await repository.loadOrchestration(run.id);
+  assert.equal(record?.status, "completed");
+  assert.equal(record?.repository, "a/b");
+  assert.equal(record?.nodes[0]?.status, "completed");
+  assert.deepEqual(record?.nodes[0]?.childRunIds, ["durable-child"]);
+  await delegator.shutdown();
+});
+
+test("visible DAG rebuilds and resumes a durable parent after supervisor restart", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const firstState = fakePi();
+  const firstEmit = firstState.pi.events.emit.bind(firstState.pi.events);
+  firstState.pi.events.emit = ((name: string, data: any) => {
+    firstEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      queueMicrotask(() => firstEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "restart-child-1" } },
+      }));
+    }
+  }) as typeof firstState.pi.events.emit;
+  const first = new VisibleDagDelegator(firstState.pi, () => repository);
+  const input = {
+    repository: "a/b", autoMerge: true,
+    items: [{ id: "issue-22", issue: 22, title: "Twenty-two", summary: "Restart", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [22] }],
+    maxParallel: 1,
+    taskFor: (item: any) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    assertCompleted: async () => ({ status: "failed" as const, error: "controller stopped" }),
+    onComplete: () => undefined,
+  };
+  const initial = await first.start(input);
+  firstEmit("subagent:async-complete", { runId: "restart-child-1" });
+  await initial.completion;
+  await first.shutdown();
+
+  const secondState = fakePi();
+  const secondEmit = secondState.pi.events.emit.bind(secondState.pi.events);
+  secondState.pi.events.emit = ((name: string, data: any) => {
+    secondEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      queueMicrotask(() => secondEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "restart-child-2" } },
+      }));
+    }
+  }) as typeof secondState.pi.events.emit;
+  const second = new VisibleDagDelegator(secondState.pi, () => repository, async (record) => ({
+    ...input,
+    items: record.nodes.map((node) => ({ ...node, title: node.title ?? `Issue #${node.issue}`, summary: node.summary ?? "Restart", labels: [], memberIssues: node.memberIssues ?? [node.issue], affectedFiles: node.affectedFiles ?? [] })),
+    assertCompleted: async () => undefined,
+  }));
+  const resumed = await second.resume(initial.id, { rerunIssueNumbers: [22] });
+  secondEmit("subagent:async-complete", { runId: "restart-child-2" });
+  await resumed.completion;
+  const record = await repository.loadOrchestration(initial.id);
+  assert.equal(record?.status, "completed");
+  assert.deepEqual(record?.nodes[0]?.childRunIds, ["restart-child-1", "restart-child-2"]);
+  await second.shutdown();
 });
 
 test("visible DAG resume retries failed nodes without replaying completed nodes", async () => {

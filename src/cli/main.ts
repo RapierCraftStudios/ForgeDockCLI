@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } from "../core/ports/repositories.js";
+import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import {
   decideSubjectAdmission,
   latestArtifactOfKind,
@@ -41,7 +42,7 @@ import { reviewExistingPullRequest } from "../workflows/review-pr/review-existin
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
-import { materializeClaimDependencies, runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { ClaimPromotionConflictError, materializeClaimDependencies, runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { orchestrationEventFromSchedule } from "../workflows/orchestrate/events.js";
 import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
@@ -107,6 +108,23 @@ async function status(argv: string[]): Promise<void> {
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   try {
+    const orchestrationId = option(argv, "--orchestration");
+    if (orchestrationId !== undefined) {
+      const orchestration = await store.loadOrchestration(orchestrationId);
+      if (!orchestration) throw new Error(`Unknown orchestration ${orchestrationId}`);
+      if (argv.includes("--json")) {
+        process.stdout.write(`${JSON.stringify(orchestration, null, 2)}\n`);
+      } else {
+        process.stdout.write(`${renderHeader({ subtitle: "status · durable orchestration" })}\n\n`);
+        process.stdout.write(`${statusGlyph(orchestration.status === "completed" ? "passed" : orchestration.status === "running" ? "active" : "failed", mode)} ${orchestration.orchestrationId} · ${orchestration.status} · ${orchestration.repository}\n`);
+        for (const node of orchestration.nodes) {
+          const presentation = runStatePresentation(node.status);
+          const childRuns = node.childRunIds.length ? ` · runs=${node.childRunIds.join(",")}` : "";
+          process.stdout.write(`  ${statusGlyph(presentation.glyph, mode)} #${node.issue} · ${presentation.label}${childRuns}${node.error ? ` · ${node.error}` : ""}\n`);
+        }
+      }
+      return;
+    }
     const issueValue = option(argv, "--issue");
     if (issueValue !== undefined) {
       if (!/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
@@ -211,7 +229,7 @@ async function workOn(argv: string[]): Promise<void> {
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
-  const github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd());
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
@@ -324,6 +342,9 @@ async function workOn(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  // All remediation callers in this controller share the durable admission
+  // repository, including a later --resume invocation in another process.
+  github = new GitHubClient(process.cwd(), store);
   const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const runs = dryRun ? store : projectRunsToGitHub(store, github);
   const runtime = createCliRuntime({
@@ -614,25 +635,9 @@ async function workOn(argv: string[]): Promise<void> {
                   let checkpoint = remediationCheckpoint;
                   const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
                   if (checkpoint.payload.status === "awaiting-dispatch") {
-                    const dispatched = await supervisor.begin({
-                      parentRun: run,
+                    const dispatched = await supervisor.resumeAwaiting({
+                      checkpoint,
                       parentPullRequest: checkpointPullRequest!,
-                      packetArtifact: packet,
-                      verdictArtifact: priorVerdict!,
-                      reason: checkpoint.payload.reason,
-                      remediationDepth: checkpoint.payload.remediationDepth,
-                      maxRemediationDepth: checkpoint.payload.maxRemediationDepth,
-                      maxRemediationChildren: checkpoint.payload.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
-                      approvedPaths: checkpoint.payload.approvedPaths,
-                      findings: checkpoint.payload.findings.map((finding) => ({
-                        id: finding.id,
-                        severity: finding.severity,
-                        title: finding.title,
-                        evidence: finding.evidence,
-                        ...(finding.location ? { location: finding.location } : {}),
-                        remediation: finding.remediation,
-                        ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
-                      })),
                     });
                     checkpoint = dispatched.checkpoint;
                   }
@@ -826,7 +831,7 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--dry-run] [--confirm]");
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--dry-run] [--confirm] [--rerun]");
   const config = readForgeDockConfig(process.cwd());
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
@@ -942,10 +947,49 @@ async function orchestrate(argv: string[]): Promise<void> {
       }
     }
     const scheduleItems = materializeClaimDependencies(contracted);
+    const orchestrationId = `dag_${crypto.randomUUID()}`;
+    const orchestrationCreatedAt = new Date().toISOString();
+    let orchestrationRecord: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId,
+      repository: repository.repo,
+      issueNumbers: [...issueNumbers],
+      maxParallel: effective.maxParallel,
+      autoMerge,
+      status: "running",
+      createdAt: orchestrationCreatedAt,
+      updatedAt: orchestrationCreatedAt,
+      nodes: scheduleItems.items.map((item): OrchestrationNodeRecord => ({
+        id: item.id,
+        issue: item.issue,
+        priority: item.priority,
+        dependencies: [...item.dependencies],
+        claims: [...item.claims],
+        ...(item.affectedFiles ? { affectedFiles: [...item.affectedFiles] } : {}),
+        ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
+        ...(item.title ? { title: item.title } : {}),
+        ...(item.summary ? { summary: item.summary } : {}),
+        status: "queued",
+        childRunIds: [],
+      })),
+    };
+    await store.createOrchestration(orchestrationRecord);
+    let orchestrationPersistQueue = Promise.resolve();
+    const persistOrchestration = (next: OrchestrationRecord): void => {
+      orchestrationRecord = next;
+      orchestrationPersistQueue = orchestrationPersistQueue.then(() => store.saveOrchestration(next));
+    };
+    const updateOrchestrationNode = (nodeId: string, patch: Partial<OrchestrationNodeRecord>): void => {
+      persistOrchestration({
+        ...orchestrationRecord,
+        updatedAt: new Date().toISOString(),
+        nodes: orchestrationRecord.nodes.map((node) => node.id === nodeId ? { ...node, ...patch } : node),
+      });
+    };
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
-    const schedule = await runSchedule(scheduleItems.items, effective.maxParallel, async (item) => {
+    const schedule = await runSchedule(scheduleItems.items, effective.maxParallel, async (item, scheduler) => {
       const lease = store.acquire(item.id, owner, 60_000);
       if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
       const controller = new AbortController();
@@ -985,6 +1029,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (model !== undefined) resumeArgs.push("--model", model);
           await workOn(resumeArgs);
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
+          updateOrchestrationNode(item.id, { childRunIds: resumed.runId ? [resumed.runId] : [] });
           outcomes.set(item.id, resumed.state);
           if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; dependents remain blocked`);
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
@@ -1000,27 +1045,41 @@ async function orchestrate(argv: string[]): Promise<void> {
         const baseRef = `origin/${parentRemediation?.parentBranch ?? lane.targetBranch}`;
         const verification = discoverVerificationCommands(process.cwd(), baseRef);
         process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
-        const result = await executeWorkOn({
-          intent, repoPath: process.cwd(), lane,
-          verification, autoMerge, signal: controller.signal,
-          scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
-          maxRemediationCycles: effective.maxRemediationCycles,
-          maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
-          maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effective.maxRemediationChildren,
-          remediationDepth: parentRemediation?.remediationDepth ?? 0,
-          ...(parentRemediation !== undefined ? { parentRemediation } : {}),
-          scopeHints: {
-            affectedFiles: item.affectedFiles ?? [],
-            claims: item.claims,
-            metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
-          },
-          subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
-          ...(provider !== undefined ? { provider } : {}),
-          ...(model !== undefined ? { model } : {}),
-        }, {
-          runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
-          onAgentEvent: (event) => writeAgentEvent(event, item.id),
-        });
+        let result;
+        try {
+          result = await executeWorkOn({
+            intent, repoPath: process.cwd(), lane,
+            verification, autoMerge, signal: controller.signal,
+            scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
+            maxRemediationCycles: effective.maxRemediationCycles,
+            maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
+            maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effective.maxRemediationChildren,
+            remediationDepth: parentRemediation?.remediationDepth ?? 0,
+            ...(parentRemediation !== undefined ? { parentRemediation } : {}),
+            scopeHints: {
+              affectedFiles: item.affectedFiles ?? [],
+              claims: item.claims,
+              metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
+            },
+            onClaimsPromoted: (paths) => {
+              scheduler.promoteClaims(paths);
+              updateOrchestrationNode(item.id, { claims: [...paths] });
+            },
+            subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
+            ...(provider !== undefined ? { provider } : {}),
+            ...(model !== undefined ? { model } : {}),
+          }, {
+            runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+            onAgentEvent: (event) => writeAgentEvent(event, item.id),
+          });
+        } catch (error) {
+          if (error instanceof ClaimPromotionConflictError) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
+            return { status: "suspended", error: error.message };
+          }
+          throw error;
+        }
+        updateOrchestrationNode(item.id, { childRunIds: [result.run.runId] });
         outcomes.set(item.id, result.run.state);
         if (result.awaitingHuman) {
           process.stdout.write(`${statusGlyph("active", mode)} ${item.id} awaiting human merge${result.pullRequest?.url ? ` · ${result.pullRequest.url}` : ""}\n`);
@@ -1049,10 +1108,20 @@ async function orchestrate(argv: string[]): Promise<void> {
     }, {
       onEvent: (scheduleEvent) => {
         const snapshot = buildOrchestrationSnapshot({
-          orchestrationId: `cli-${process.pid}`,
+          orchestrationId,
           items: scheduleItems.items,
           result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
         });
+        const nodes = orchestrationRecord.nodes.map((node) => {
+          const status = scheduleEvent.status.get(node.id);
+          const error = scheduleEvent.errors.get(node.id);
+          return {
+            ...node,
+            ...(status !== undefined ? { status } : {}),
+            ...(error !== undefined ? { error: error.message } : {}),
+          };
+        });
+        persistOrchestration({ ...orchestrationRecord, updatedAt: new Date().toISOString(), nodes });
         const event = orchestrationEventFromSchedule(scheduleEvent, snapshot);
         process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
@@ -1062,7 +1131,23 @@ async function orchestrate(argv: string[]): Promise<void> {
     const suspended = [...schedule.status.entries()].filter(([, status]) => status === "suspended");
     const completed = [...schedule.status.values()].filter((status) => status === "completed").length;
     const satisfiedExisting = [...skipped.values()].filter((state) => state === "completed" || state === "invalid").length;
-    process.stdout.write(`\nOrchestration complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${invalid.length} invalid · ${suspended.length} suspended/awaiting-human\n`);
+    const orchestrationFailed = [...schedule.status.values()].some((status) => status === "failed" || status === "blocked" || status === "suspended" || status === "invalid");
+    persistOrchestration({
+      ...orchestrationRecord,
+      status: orchestrationFailed ? "failed" : "completed",
+      updatedAt: new Date().toISOString(),
+      nodes: orchestrationRecord.nodes.map((node) => {
+        const status = schedule.status.get(node.id);
+        const error = schedule.errors.get(node.id);
+        return {
+          ...node,
+          ...(status !== undefined ? { status } : {}),
+          ...(error !== undefined ? { error: error.message } : {}),
+        };
+      }),
+    });
+    await orchestrationPersistQueue;
+    process.stdout.write(`\nOrchestration ${orchestrationId} complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${invalid.length} invalid · ${suspended.length} suspended/awaiting-human\n`);
     for (const [id, state] of outcomes) process.stdout.write(`  ${id}: ${state}\n`);
     if (failed.length || invalid.length || suspended.length) process.exitCode = 2;
   } finally {
@@ -1223,8 +1308,8 @@ function printHelp(): void {
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--dry-run|--confirm]\n");
-  process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo]\n\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--dry-run|--confirm] [--rerun]\n");
+  process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID]\n\n");
   process.stdout.write("Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
   process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");
 }

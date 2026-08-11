@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
+import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
@@ -82,6 +83,38 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("persists orchestration DAG records for restart inspection", async () => {
+    const store = new SqliteRepositories(":memory:");
+    const record: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_test",
+      repository: "a/b",
+      issueNumbers: [9, 10],
+      maxParallel: 2,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{
+        id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: ["src"],
+        status: "running", childRunIds: ["run_9"],
+      }, {
+        id: "issue-10", issue: 10, priority: 2, dependencies: ["issue-9"], claims: ["docs"],
+        status: "queued", childRunIds: [],
+      }],
+    };
+    try {
+      await store.createOrchestration(record);
+      const loaded = await store.loadOrchestration(record.orchestrationId);
+      assert.deepEqual(loaded, record);
+      const completed = { ...record, status: "completed" as const, updatedAt: "2026-01-01T00:01:00.000Z" };
+      await store.saveOrchestration(completed);
+      assert.equal((await store.listOrchestrations())[0]?.status, "completed");
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists telemetry receipts idempotently for status projections", async () => {
     const store = new SqliteRepositories(":memory:");
     try {
@@ -133,6 +166,28 @@ describe("SQLite operational repositories", () => {
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
     } finally {
       store.close();
+    }
+  });
+
+  it("atomically shares remediation admission across repository instances", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-"));
+    const path = join(root, "state.db");
+    const first = new SqliteRepositories(path);
+    const second = new SqliteRepositories(path);
+    const key = {
+      repo: "Owner/Repo", parentIssue: 20, parentPullRequest: 9, headSha: "A".repeat(40), marker: "marker-1",
+    } as const;
+    const snapshot = { repo: "Owner/Repo", number: 31, title: "Child", body: "", url: "https://example.test/issues/31", state: "OPEN" as const };
+    try {
+      const claims = await Promise.all([first.claim(key), second.claim(key)]);
+      assert.equal(claims.filter((claim) => claim.status === "claimed").length, 1);
+      assert.equal(claims.filter((claim) => claim.status === "pending").length, 1);
+      await first.complete(key, snapshot);
+      assert.deepEqual(await second.claim(key), { status: "materialized", snapshot });
+    } finally {
+      first.close();
+      second.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
     }
   });
 

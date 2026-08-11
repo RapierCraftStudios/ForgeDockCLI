@@ -2,6 +2,27 @@
 
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
+import type { IssueSnapshot } from "./forge-host.js";
+import type { OrchestrationRecord, OrchestrationRepository } from "./orchestration.js";
+
+export interface RemediationAdmissionKey {
+  repo: string;
+  parentIssue: number;
+  parentPullRequest: number;
+  headSha: string;
+  marker: string;
+}
+
+export type RemediationAdmissionClaim =
+  | { status: "claimed" }
+  | { status: "pending" }
+  | { status: "materialized"; snapshot: IssueSnapshot };
+
+/** Durable, fail-closed admission for one deterministic remediation marker. */
+export interface RemediationAdmissionRepository {
+  claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim>;
+  complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void>;
+}
 
 export interface ArtifactRepository {
   append(artifact: DurableArtifact): Promise<void>;
@@ -79,6 +100,27 @@ export class ProjectedRunRepository implements RunRepository {
   }
 }
 
+export class InMemoryRemediationAdmissionRepository implements RemediationAdmissionRepository {
+  readonly records = new Map<string, { status: "pending" | "materialized"; snapshot?: IssueSnapshot }>();
+
+  async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
+    const admissionKey = remediationAdmissionKey(key);
+    const existing = this.records.get(admissionKey);
+    if (existing?.status === "materialized" && existing.snapshot) {
+      return { status: "materialized", snapshot: structuredClone(existing.snapshot) };
+    }
+    if (existing) return { status: "pending" };
+    this.records.set(admissionKey, { status: "pending" });
+    return { status: "claimed" };
+  }
+
+  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void> {
+    const admissionKey = remediationAdmissionKey(key);
+    if (!this.records.has(admissionKey)) throw new Error(`Unknown remediation admission: ${admissionKey}`);
+    this.records.set(admissionKey, { status: "materialized", snapshot: structuredClone(snapshot) });
+  }
+}
+
 export class InMemoryArtifactRepository implements ArtifactRepository {
   readonly artifacts: DurableArtifact[] = [];
 
@@ -91,6 +133,29 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
     return this.artifacts
       .filter((artifact) => sameSubject(artifact.subject, subject) && (!kind || artifact.kind === kind))
       .map((artifact) => structuredClone(artifact));
+  }
+}
+
+export class InMemoryOrchestrationRepository implements OrchestrationRepository {
+  readonly records = new Map<string, OrchestrationRecord>();
+
+  async createOrchestration(record: OrchestrationRecord): Promise<void> {
+    if (this.records.has(record.orchestrationId)) throw new Error(`Orchestration already exists: ${record.orchestrationId}`);
+    this.records.set(record.orchestrationId, structuredClone(record));
+  }
+
+  async loadOrchestration(orchestrationId: string): Promise<OrchestrationRecord | undefined> {
+    const record = this.records.get(orchestrationId);
+    return record ? structuredClone(record) : undefined;
+  }
+
+  async saveOrchestration(record: OrchestrationRecord): Promise<void> {
+    if (!this.records.has(record.orchestrationId)) throw new Error(`Unknown orchestration: ${record.orchestrationId}`);
+    this.records.set(record.orchestrationId, structuredClone(record));
+  }
+
+  async listOrchestrations(limit = 50): Promise<OrchestrationRecord[]> {
+    return [...this.records.values()].slice(-limit).reverse().map((record) => structuredClone(record));
   }
 }
 
@@ -147,4 +212,14 @@ export class ConcurrentRunUpdateError extends Error {
 
 function sameSubject(left: Subject, right: Subject): boolean {
   return left.repo === right.repo && left.issue === right.issue && left.pr === right.pr;
+}
+
+export function remediationAdmissionKey(key: RemediationAdmissionKey): string {
+  return [
+    key.repo.trim().toLowerCase(),
+    `issue:${key.parentIssue}`,
+    `pr:${key.parentPullRequest}`,
+    `sha:${key.headSha.trim().toLowerCase()}`,
+    `marker:${key.marker.trim()}`,
+  ].join("|");
 }

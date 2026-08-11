@@ -22,7 +22,7 @@ describe("npm publish workflow recovery", () => {
     assert.notEqual(changedGuardStart, -1);
     assert.notEqual(changedGuardEnd, -1);
 
-    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime/**"]) {
+    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime", "vendor/pi-runtime/**"]) {
       assert.ok(pushPaths.includes(`'${path}'`), `push.paths should include '${path}'`);
       assert.ok(changedPathGuard.includes(`'${path}'`), `changed-path guard should include '${path}'`);
     }

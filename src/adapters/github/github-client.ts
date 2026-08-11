@@ -6,8 +6,9 @@ import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
-import type { ArtifactRepository } from "../../core/ports/repositories.js";
+import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
+import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 
 export function repositoryFromRemote(remote: string): string | undefined {
   const match = /github\.com[/:]([^/\s:]+)\/([^/\s]+?)(?:\.git)?$/i.exec(remote.trim().replace(/\/+$/, ""));
@@ -83,8 +84,13 @@ export interface BatchIssueInput {
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
+  private authRefreshAttempted = false;
 
-  constructor(readonly cwd = process.cwd()) {}
+  constructor(
+    readonly cwd = process.cwd(),
+    readonly remediationAdmissions: RemediationAdmissionRepository = new InMemoryRemediationAdmissionRepository(),
+    readonly refreshAuth?: () => Promise<boolean>,
+  ) {}
 
   async resolveRepository(): Promise<string> {
     return (await this.getRepository()).repo;
@@ -444,19 +450,33 @@ export class GitHubClient implements ForgeHost {
     }[];
   }): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
-    const existing = await this.listAllIssues(input.repo);
-    const byMarker = new Map(existing.flatMap((issue) => {
-      const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
-      return match?.[1] ? [[match[1], issue] as const] : [];
-    }));
-    const created: IssueSnapshot[] = [];
+    const materialized: IssueSnapshot[] = [];
     for (const finding of input.findings) {
       const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
-      const existingIssue = byMarker.get(marker);
-      if (existingIssue) {
-        created.push(existingIssue);
+      const admissionKey: RemediationAdmissionKey = {
+        repo: input.repo,
+        parentIssue: input.parentIssue,
+        parentPullRequest: input.parentPullRequest,
+        headSha: input.headSha,
+        marker,
+      };
+      const claim = await this.remediationAdmissions.claim(admissionKey);
+      if (claim.status === "materialized") {
+        materialized.push(claim.snapshot);
         continue;
       }
+
+      const existing = await this.reconcileRemediationMarker(input.repo, marker);
+      if (existing) {
+        const authoritative = await this.authoritativeIssueSnapshot(existing);
+        await this.remediationAdmissions.complete(admissionKey, authoritative);
+        materialized.push(authoritative);
+        continue;
+      }
+      if (claim.status !== "claimed") {
+        throw new RemediationMaterializationPendingError(marker);
+      }
+
       const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
       const body = [
         "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
@@ -478,11 +498,32 @@ export class GitHubClient implements ForgeHost {
       const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
       const number = Number(url.split("/").at(-1));
       if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
-      const issue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
-      byMarker.set(marker, issue);
-      created.push(issue);
+      // A successful create is still pending until GitHub returns an authoritative
+      // issue projection. If this read is interrupted, the durable admission keeps
+      // later controllers from issuing a second create.
+      const authoritative = await this.authoritativeIssueSnapshot({
+        repo: input.repo, number, title, body, url, state: "OPEN",
+      });
+      await this.remediationAdmissions.complete(admissionKey, authoritative);
+      materialized.push(authoritative);
     }
-    return created;
+    return materialized;
+  }
+
+  private async reconcileRemediationMarker(repo: string, marker: string): Promise<IssueSnapshot | undefined> {
+    const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
+    for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      const issue = (await this.listAllIssues(repo)).find((candidate) => candidate.body.includes(marker));
+      if (issue) return issue;
+    }
+    return undefined;
+  }
+
+  private async authoritativeIssueSnapshot(issue: IssueSnapshot): Promise<IssueSnapshot> {
+    const fetched = await this.getIssue(issue.number, issue.repo);
+    const { comments: _comments, ...snapshot } = fetched;
+    return snapshot;
   }
 
   async createPullRequest(input: {
@@ -661,7 +702,19 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  private gh(args: string[], input?: string): Promise<string> {
+  private async gh(args: string[], input?: string): Promise<string> {
+    try {
+      return await this.runGh(args, input);
+    } catch (error) {
+      if (this.authRefreshAttempted || !isGitHubAuthenticationFailure(error)) throw error;
+      this.authRefreshAttempted = true;
+      const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.cwd)))();
+      if (!refreshed) throw error;
+      return this.runGh(args, input);
+    }
+  }
+
+  private runGh(args: string[], input?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn("gh", args, {
         cwd: this.cwd,
@@ -684,6 +737,13 @@ export class GitHubClient implements ForgeHost {
       if (input !== undefined) child.stdin.end(input);
       else child.stdin.end();
     });
+  }
+}
+
+export class RemediationMaterializationPendingError extends Error {
+  constructor(readonly marker: string) {
+    super(`Remediation child marker remains unresolved; admission is retained pending reconciliation: ${marker}`);
+    this.name = "RemediationMaterializationPendingError";
   }
 }
 

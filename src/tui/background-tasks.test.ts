@@ -24,7 +24,7 @@ function fixture() {
   } as unknown as ExtensionContext;
   const tasks = new ForgeDockBackgroundTasks(pi);
   tasks.initialize(ctx);
-  return { cwd, messages, statuses, tasks, ctx };
+  return { cwd, messages, statuses, tasks, ctx, pi };
 }
 
 async function eventually(assertion: () => void): Promise<void> {
@@ -86,4 +86,25 @@ test("native background cancellation terminates the owned task", async () => {
   assert.equal(tasks.cancel(record.id).status, "cancelled");
   await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
   await tasks.shutdown();
+});
+
+test("terminal restart adopts a still-live controller instead of marking it failed", async () => {
+  const first = fixture();
+  const record = first.tasks.start({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    cwd: first.cwd,
+    ctx: first.ctx,
+  });
+  const second = new ForgeDockBackgroundTasks(first.pi);
+  second.initialize(first.ctx);
+  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "detached");
+  assert.match(second.output(record.id), /detached/);
+  assert.equal(second.cancel(record.id).status, "cancelled");
+  // Keep the original supervisor from overwriting the adopted cancellation
+  // when its child exit event arrives.
+  first.tasks.cancel(record.id);
+  await eventually(() => assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
+  await first.tasks.shutdown();
+  await second.shutdown();
 });

@@ -68,10 +68,13 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Hook-disabled branch push and PR publication with verified-SHA, raw committed-blob, and asserted Git-tree checks; repository clean filters are rejected
 - [x] End-to-end six-artifact trajectory test through merge and closure
 - [x] Auto-merge default after successful verification and independent approval, with explicit `--no-auto-merge` opt-out
-- [ ] Idempotent publication reconciliation after a crash between push and state commit
+- [x] Durable, fail-closed remediation admission keyed by parent identity, verified SHA, and finding marker, including interrupted awaiting-dispatch recovery
+- [x] One-shot GitHub App credential refresh and retry for an expiring `gh` token during long controller runs
+- [x] Idempotent publication reconciliation after a crash between push and state commit, including retry coverage for a PR created before the publication transition commits
 - [x] Apply controller-owned issue closure and authoritative re-read for invalid investigation outcomes; preserve decomposition behavior
 - [x] Fail-safe semantic-state reconstruction from GitHub artifacts plus local status store
 - [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
+- [x] Fresh DAG initial dispatch ignores stale workflow labels; only explicit DAG recovery may request checkpoint resume
 - [x] Verification-stage resume from retained workspaces without replaying investigation or build; exhausted baselines require a durable human adjudication before typed resume
 - [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
 - [x] Explicit staging-review source-branch evidence, immutable recovery base refs, and fail-closed cross-branch resume validation
@@ -125,6 +128,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
 - [x] Durable same-checkout cross-process leases and heartbeats
 - [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
+- [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, and per-node errors for CLI/status restart inspection
 - [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
 - [ ] Cross-machine/GitHub-backed lease coordination
 - [ ] Promote Build Packet paths into live scheduler claims
@@ -194,3 +198,4 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 2. **Pi ownership and transitive vulnerability:** ForgeDock now maintains the source fork at `RapierCraftStudios/pi` and pins it under `vendor/pi` rather than carrying an opaque compiled copy. The distributed coding-agent dependency resolves fixed `brace-expansion@5.0.9`; ForgeDock development and production audits report zero vulnerabilities. Fork provenance, MIT licensing, upstream synchronization, and the controller/kernel boundary are documented in `vendor/pi/FORGEDOCK.md`.
 3. **GitHub authentication:** interactive startup refreshes `rapiercraft-forgedock[bot]` through the packaged Node helper when `FORGEDOCK_APP_PEM` is configured. This avoids Windows Bash path conversion failures and restores expired installation credentials before workers launch.
 4. **Live lifecycle probes:** issue #4 completed the six-artifact path through parallel nested review, PR #18 merge, issue closure, and successful-workspace cleanup. Issue #16/PR #17 removed the Windows-only legacy verification blockers discovered by the probe.
+5. **CodeQL configuration:** GitHub default setup is authoritative for this repository; the conflicting advanced workflow file was removed so default PR/security analysis is not suppressed by dual configuration.

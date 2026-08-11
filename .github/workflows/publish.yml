@@ -39,6 +39,7 @@ on:
       # revision update is recorded as the exact vendor/pi entry.
       - 'vendor/pi'
       - 'vendor/pi/**'
+      - 'vendor/pi-runtime'
       - 'vendor/pi-runtime/**'
       - 'package.json'
       - '.github/workflows/publish.yml'
@@ -79,7 +80,7 @@ jobs:
             # recursive pathspecs also cover changes within checked-out contents.
             CHANGED=$(git diff --name-only "$LAST_TAG"..HEAD -- \
               commands/ bin/ .claude-plugin/ docs/ scripts/ templates/ package.json \
-              'vendor/pi' 'vendor/pi/**' 'vendor/pi-runtime/**' 2>/dev/null || echo "")
+              'vendor/pi' 'vendor/pi/**' 'vendor/pi-runtime' 'vendor/pi-runtime/**' 2>/dev/null || echo "")
             if [ -z "$CHANGED" ]; then
               echo "No publish-relevant files changed since $LAST_TAG — skipping spurious dispatch"
               echo "SKIP_PUBLISH=true" >> $GITHUB_ENV

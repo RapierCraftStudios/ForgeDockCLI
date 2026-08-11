@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -12,9 +13,11 @@ import {
 import { Type } from "typebox";
 import { findArtifacts } from "../core/artifacts/codec.js";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
+import type { OrchestrationRecord, OrchestrationRepository } from "../core/ports/orchestration.js";
 import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
+import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import {
@@ -460,6 +463,8 @@ type DagRecoveryMode = "initial" | "resume" | "rerun";
 interface VisibleDagInput {
   items: readonly VisibleOrchestrationItem[];
   maxParallel: number;
+  repository?: string;
+  autoMerge?: boolean;
   taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => { agent: string; task: string; cwd: string; model?: string };
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<ScheduleWorkerResult | void>;
   onComplete: (result: Awaited<ReturnType<typeof runSchedule>>, orchestrationId: string) => void;
@@ -472,6 +477,8 @@ interface StoredDagRun {
   childRunIds: string[];
   result?: Awaited<ReturnType<typeof runSchedule>>;
   running: boolean;
+  durableRecord: OrchestrationRecord;
+  persistence: Promise<void>;
 }
 
 interface ToolDetails {
@@ -484,13 +491,23 @@ interface ToolDetails {
 
 export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTasks {
   const backgroundTasks = new ForgeDockBackgroundTasks(pi);
-  const dagDelegator = new VisibleDagDelegator(pi);
-  pi.on("session_shutdown", async () => dagDelegator.shutdown());
+  let orchestrationCwd = process.cwd();
+  let orchestrationRepository: SqliteRepositories | undefined;
+  const dagDelegator = new VisibleDagDelegator(
+    pi,
+    () => orchestrationRepository,
+    (record) => rebuildVisibleDagInput(orchestrationCwd, record),
+  );
+  pi.on("session_shutdown", async () => {
+    await dagDelegator.shutdown();
+    orchestrationRepository?.close();
+    orchestrationRepository = undefined;
+  });
   pi.registerTool({
     ...forgeDockToolPresentation("Resume orchestration"),
     name: ORCHESTRATION_RESUME_TOOL,
     label: "Resume ForgeDock orchestration",
-    description: "Resume the latest failed or blocked orchestration DAG in this supervisor session. Completed nodes stay completed. Failed/blocked nodes normally use typed checkpoint resume; after explicit human authorization, list an issue in rerunIssueNumbers to start a fresh semantic controller run instead of repeating an unsupported resume.",
+    description: "Resume the latest failed, blocked, or interrupted orchestration DAG from durable state. Completed nodes stay completed. Failed/blocked nodes normally use typed checkpoint resume; after explicit human authorization, list an issue in rerunIssueNumbers to start a fresh semantic controller run instead of repeating an unsupported resume.",
     parameters: Type.Object({
       orchestrationId: Type.Optional(Type.String({ description: "Specific DAG ID; omit to resume the latest interrupted DAG" })),
       rerunIssueNumbers: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { description: "Failed DAG issues explicitly authorized for a fresh semantic rerun; these receive rerun=true and resume=false" })),
@@ -500,7 +517,13 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       }), { description: "Exhausted verification checkpoints authorized for typed resume after human baseline repair; never a fresh rerun" })),
     }),
     executionMode: "sequential",
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (ctx) {
+        orchestrationCwd = ctx.cwd;
+        if (ctx.mode === "tui" && !orchestrationRepository) {
+          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"));
+        }
+      }
       const rerunIssueNumbers = [...new Set(params.rerunIssueNumbers ?? [])];
       const adjudicationEntries = params.adjudicateVerification ?? [];
       const adjudications = new Map<number, string>();
@@ -836,9 +859,15 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
         config.workerThinking,
       );
       const artifacts = new GitHubArtifactRepository(github);
+      orchestrationCwd = ctx.cwd;
+      if (ctx.mode === "tui" && !orchestrationRepository) {
+        orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"));
+      }
       const orchestration = await dagDelegator.start({
         items: schedule.items as VisibleOrchestrationItem[],
         maxParallel,
+        repository: repository!.repo,
+        autoMerge,
         taskFor: (item, recovery, adjudicationReason) => {
           const policy = resolveIssueWorkerRecovery(item.labels, params.rerun === true, recovery);
           return {
@@ -1297,12 +1326,12 @@ function issueNumberFromId(id: string): number {
   return Number(match[1]);
 }
 
-export function shouldResumeObservedItem(labels: readonly string[], sameSessionRetry: boolean): boolean {
-  if (sameSessionRetry) return true;
-  return labels.some((label) => label === "workflow:building"
-    || label === "workflow:in-review"
-    || label === "workflow:engine-error"
-    || label === "needs-human");
+export function shouldResumeObservedItem(_labels: readonly string[], sameSessionRetry: boolean): boolean {
+  // Workflow labels are a rebuildable projection and may belong to an older
+  // controller. They cannot silently turn a new DAG's initial dispatch into a
+  // checkpoint resume. Only an explicit same-session/DAG recovery authorizes
+  // resume; callers that want a fresh semantic run pass rerun explicitly.
+  return sameSessionRetry;
 }
 
 export function resolveIssueWorkerRecovery(
@@ -1312,6 +1341,63 @@ export function resolveIssueWorkerRecovery(
 ): { rerun: boolean; resume: boolean } {
   if (orchestrationRerun || recovery === "rerun") return { rerun: true, resume: false };
   return { rerun: false, resume: shouldResumeObservedItem(labels, recovery === "resume") };
+}
+
+async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord): Promise<VisibleDagInput> {
+  if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
+  const config = readForgeDockConfig(cwd);
+  const effective = resolveOrchestrationConfig(config, { maxParallel: record.maxParallel });
+  const github = new GitHubClient(cwd);
+  const artifacts = new GitHubArtifactRepository(github);
+  const items = record.nodes.map((node) => ({
+    id: node.id,
+    issue: node.issue,
+    priority: node.priority,
+    dependencies: [...node.dependencies],
+    claims: [...node.claims],
+    affectedFiles: [...(node.affectedFiles ?? [])],
+    memberIssues: [...(node.memberIssues ?? [node.issue])],
+    labels: [],
+    title: node.title ?? `Issue #${node.issue}`,
+    summary: node.summary ?? "Resumed from durable orchestration state",
+  }));
+  return {
+    repository: record.repository,
+    autoMerge: record.autoMerge,
+    items,
+    maxParallel: record.maxParallel,
+    taskFor: (item, recovery, adjudicationReason) => {
+      const policy = resolveIssueWorkerRecovery([], false, recovery);
+      return {
+        agent: "forgedock-issue-worker",
+        task: buildIssueWorkerTask(item.issue, {
+          repository: record.repository,
+          autoMerge: record.autoMerge,
+          batching: effective.batchingPolicy,
+          scopeExpansion: effective.scopeExpansion,
+          maxRemediationCycles: effective.maxRemediationCycles,
+          maxRemediationDepth: effective.maxRemediationDepth,
+          maxRemediationChildren: effective.maxRemediationChildren,
+          ...policy,
+          ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
+          dependencies: item.dependencies.map(issueNumberFromId),
+        }, { issue: item.issue, title: item.title ?? `Issue #${item.issue}`, summary: item.summary ?? "Resumed from durable orchestration state" }),
+        cwd,
+        ...(config.workerModel ? { model: config.workerModel } : {}),
+      };
+    },
+    assertCompleted: async (item) => {
+      const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: record.repository, issue: item.issue }));
+      if (reconciled.state === "completed") return;
+      if (reconciled.state === "invalid") return { status: "invalid", error: `#${item.issue} was classified invalid; no delivery work was performed` };
+      if (reconciled.state === "decomposed") return { status: "skipped", error: `#${item.issue} decomposed into authoritative child work` };
+      if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
+        return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
+      }
+      throw new Error(`#${item.issue} ended in ${reconciled.state}; its DAG dependents remain blocked`);
+    },
+    onComplete: () => undefined,
+  };
 }
 
 function buildIssueWorkerTask(
@@ -1478,13 +1564,44 @@ function normalizedModelTokens(value: string): string[] {
   return [...new Set(value.toLowerCase().match(/[a-z]+|\d+/g) ?? [])];
 }
 
+function createDurableOrchestrationRecord(id: string, input: VisibleDagInput, now: string): OrchestrationRecord {
+  return {
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: id,
+    repository: input.repository ?? "unknown/unknown",
+    issueNumbers: [...new Set(input.items.flatMap((item) => [item.issue, ...item.memberIssues]))],
+    maxParallel: input.maxParallel,
+    autoMerge: input.autoMerge ?? true,
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+    nodes: input.items.map((item) => ({
+      id: item.id,
+      issue: item.issue,
+      priority: item.priority,
+      dependencies: [...item.dependencies],
+      claims: [...item.claims],
+      ...(item.affectedFiles ? { affectedFiles: [...item.affectedFiles] } : {}),
+      ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
+      ...(item.title ? { title: item.title } : {}),
+      ...(item.summary ? { summary: item.summary } : {}),
+      status: "queued" as const,
+      childRunIds: [],
+    })),
+  };
+}
+
 export class VisibleDagDelegator {
   private readonly waiting = new Map<string, { resolve: (event: unknown) => void }>();
   private readonly active = new Set<string>();
   private readonly runs = new Map<string, StoredDagRun>();
   private readonly unsubscribe: (() => void) | undefined;
 
-  constructor(private readonly pi: ExtensionAPI) {
+  constructor(
+    private readonly pi: ExtensionAPI,
+    private readonly getOrchestrationRepository: () => OrchestrationRepository | undefined = () => undefined,
+    private readonly rebuildInput?: (record: OrchestrationRecord) => Promise<VisibleDagInput>,
+  ) {
     this.unsubscribe = pi.events.on("subagent:async-complete", (event: unknown) => {
       const runId = typeof event === "object" && event !== null && "runId" in event ? String((event as { runId: unknown }).runId) : "";
       if (!runId) return;
@@ -1497,7 +1614,11 @@ export class VisibleDagDelegator {
 
   async start(input: VisibleDagInput): Promise<VisibleDagRun> {
     const id = `dag_${crypto.randomUUID()}`;
-    const stored: StoredDagRun = { id, input, childRunIds: [], running: false };
+    const now = new Date().toISOString();
+    const durableRecord = createDurableOrchestrationRecord(id, input, now);
+    const stored: StoredDagRun = { id, input, childRunIds: [], running: false, durableRecord, persistence: Promise.resolve() };
+    const repository = this.getOrchestrationRepository();
+    if (repository) await repository.createOrchestration(durableRecord);
     this.runs.set(id, stored);
     return this.launch(stored, input.items);
   }
@@ -1506,16 +1627,44 @@ export class VisibleDagDelegator {
     orchestrationId?: string,
     options: { rerunIssueNumbers?: readonly number[]; adjudications?: ReadonlyMap<number, string> } = {},
   ): Promise<VisibleDagRun> {
-    const stored = orchestrationId ? this.runs.get(orchestrationId) : [...this.runs.values()].reverse().find((run) =>
+    let stored = orchestrationId ? this.runs.get(orchestrationId) : [...this.runs.values()].reverse().find((run) =>
       !run.running && run.result && [...run.result.status.values()].some((status) => status === "failed" || status === "blocked"));
+    if (!stored) {
+      const repository = this.getOrchestrationRepository();
+      const records = repository
+        ? orchestrationId
+          ? [await repository.loadOrchestration(orchestrationId)].filter((record): record is OrchestrationRecord => record !== undefined)
+          : (await repository.listOrchestrations()).filter((record) => record.status === "failed" || record.status === "running")
+        : [];
+      const record = records[0];
+      if (record && this.rebuildInput) {
+        const input = await this.rebuildInput(record);
+        const statuses = new Map(record.nodes.map((node) => [node.id, node.status] as const));
+        const errors = new Map(record.nodes.filter((node) => node.error).map((node) => [node.id, new Error(node.error!)] as const));
+        stored = {
+          id: record.orchestrationId,
+          input,
+          childRunIds: record.nodes.flatMap((node) => node.childRunIds),
+          result: { status: statuses, errors, startOrder: record.nodes.map((node) => node.id) },
+          running: false,
+          durableRecord: record,
+          persistence: Promise.resolve(),
+        };
+        this.runs.set(stored.id, stored);
+      }
+    }
     if (!stored) throw new Error(orchestrationId
-      ? `No orchestration DAG ${orchestrationId} exists in this supervisor session`
-      : "No failed or blocked orchestration DAG is available to resume in this supervisor session");
+      ? `No resumable orchestration DAG ${orchestrationId} exists in this supervisor session or durable state`
+      : "No failed or blocked orchestration DAG is available to resume in this supervisor session or durable state");
     if (stored.running) throw new Error(`Orchestration DAG ${stored.id} is still running`);
     if (!stored.result) throw new Error(`Orchestration DAG ${stored.id} has no completed scheduling attempt to resume`);
     const skipped = [...stored.result.status].filter(([, status]) => status === "skipped").map(([id]) => id);
     if (skipped.length) {
       throw new Error(`Orchestration DAG ${stored.id} contains terminally decomposed work (${skipped.join(", ")}); invoke /orchestrate again to freeze its authoritative child scope`);
+    }
+    const invalid = [...stored.result.status].filter(([, status]) => status === "invalid").map(([id]) => id);
+    if (invalid.length) {
+      throw new Error(`Orchestration DAG ${stored.id} contains terminally invalid work (${invalid.join(", ")}); invalid issues are not retryable`);
     }
     const completed = new Set([...stored.result.status].filter(([, status]) => status === "completed").map(([id]) => id));
     const remainingIds = new Set(stored.input.items.filter((item) => !completed.has(item.id)).map((item) => item.id));
@@ -1541,6 +1690,7 @@ export class VisibleDagDelegator {
   async shutdown(): Promise<void> {
     const active = [...this.active];
     await Promise.allSettled(active.map((id) => callSubagentRpc(this.pi, "stop", { id })));
+    await Promise.allSettled([...this.runs.values()].map((run) => run.persistence));
     this.active.clear();
     this.unsubscribe?.();
   }
@@ -1552,6 +1702,7 @@ export class VisibleDagDelegator {
     adjudications: ReadonlyMap<number, string> = new Map(),
   ): Promise<VisibleDagRun> {
     stored.running = true;
+    this.queueDurableRecord(stored, { ...stored.durableRecord, status: "running", updatedAt: new Date().toISOString() });
     const initialLaunches: Promise<unknown>[] = [];
     let collectingInitial = true;
     const result = runSchedule(items, stored.input.maxParallel, async (scheduled) => {
@@ -1566,6 +1717,13 @@ export class VisibleDagDelegator {
       const response = await launch;
       const runId = asyncRunId(response);
       stored.childRunIds.push(runId);
+      this.queueDurableRecord(stored, {
+        ...stored.durableRecord,
+        updatedAt: new Date().toISOString(),
+        nodes: stored.durableRecord.nodes.map((node) => node.id === item.id
+          ? { ...node, childRunIds: [...node.childRunIds, runId] }
+          : node),
+      });
       this.active.add(runId);
       try {
         await this.waitForCompletion(runId);
@@ -1580,6 +1738,19 @@ export class VisibleDagDelegator {
           items,
           result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
         });
+        this.queueDurableRecord(stored, {
+          ...stored.durableRecord,
+          updatedAt: new Date().toISOString(),
+          nodes: stored.durableRecord.nodes.map((node) => {
+            const status = scheduleEvent.status.get(node.id);
+            const error = scheduleEvent.errors.get(node.id);
+            return {
+              ...node,
+              ...(status !== undefined ? { status } : {}),
+              ...(error !== undefined ? { error: error.message } : {}),
+            };
+          }),
+        });
         stored.input.onEvent?.(orchestrationEventFromSchedule(scheduleEvent, snapshot));
       },
       resumedItemIds: stored.result ? items.map((item) => item.id) : [],
@@ -1588,21 +1759,39 @@ export class VisibleDagDelegator {
       await Promise.all(initialLaunches);
     } catch (error) {
       stored.running = false;
+      this.queueDurableRecord(stored, { ...stored.durableRecord, status: "failed", updatedAt: new Date().toISOString() });
       await Promise.allSettled(stored.childRunIds.map((runId) => callSubagentRpc(this.pi, "stop", { id: runId })));
+      await stored.persistence;
       throw error;
     }
     collectingInitial = false;
-    const completion = result.then((attempt) => {
+    const completion = result.then(async (attempt) => {
       const merged = mergeScheduleResults(stored.result, attempt);
       stored.result = merged;
       stored.running = false;
+      const failed = [...merged.status.values()].some((status) => status === "failed" || status === "blocked" || status === "suspended" || status === "invalid");
+      this.queueDurableRecord(stored, {
+        ...stored.durableRecord,
+        status: failed ? "failed" : "completed",
+        updatedAt: new Date().toISOString(),
+      });
+      await stored.persistence;
       stored.input.onComplete(merged, stored.id);
-    }, (error) => {
+    }, async (error) => {
       stored.running = false;
+      this.queueDurableRecord(stored, { ...stored.durableRecord, status: "failed", updatedAt: new Date().toISOString() });
+      await stored.persistence;
       throw error;
     });
     completion.catch(() => undefined);
     return { id: stored.id, childRunIds: stored.childRunIds, completion };
+  }
+
+  private queueDurableRecord(stored: StoredDagRun, record: OrchestrationRecord): void {
+    stored.durableRecord = record;
+    const repository = this.getOrchestrationRepository();
+    if (!repository) return;
+    stored.persistence = stored.persistence.then(() => repository.saveOrchestration(record));
   }
 
   private waitForCompletion(runId: string): Promise<unknown> {
