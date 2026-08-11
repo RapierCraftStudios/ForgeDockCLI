@@ -11,8 +11,31 @@ import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 
 export function repositoryFromRemote(remote: string): string | undefined {
-  const match = /github\.com[/:]([^/\s:]+)\/([^/\s]+?)(?:\.git)?$/i.exec(remote.trim().replace(/\/+$/, ""));
-  return match ? `${match[1]}/${match[2]}` : undefined;
+  const trimmed = remote.trim().replace(/\/+$/, "");
+  let hostname: string;
+  let pathname: string;
+  const scp = /^[^/\s@]+@([^/\s:]+):(.+)$/.exec(trimmed);
+  if (scp?.[1] && scp[2]) {
+    hostname = scp[1];
+    pathname = scp[2];
+  } else {
+    let url: URL;
+    try {
+      url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
+    } catch {
+      return undefined;
+    }
+    if (url.username || url.password || url.search || url.hash) return undefined;
+    hostname = url.hostname;
+    pathname = url.pathname;
+  }
+  if (hostname.toLowerCase() !== "github.com") return undefined;
+  const segments = pathname.replace(/^\/+|\/+$/g, "").split("/");
+  if (segments.length !== 2) return undefined;
+  const owner = segments[0];
+  const repository = segments[1]?.replace(/\.git$/i, "");
+  if (!owner || !repository || !/^[^\s/:]+$/.test(owner) || !/^[^\s/:]+$/.test(repository)) return undefined;
+  return `${owner}/${repository}`;
 }
 
 const WORKFLOW_LABELS = [
@@ -199,19 +222,32 @@ export class GitHubClient implements ForgeHost {
 
   async publishPullRequestComment(input: { repo: string; pullRequest: number; marker: string; body: string }): Promise<void> {
     if (!input.body.includes(input.marker)) throw new Error("Reviewer comment body is missing its idempotency marker");
-    const subject = { repo: input.repo, pr: input.pullRequest };
-    const comments = await this.listIssueComments(subject);
-    if (!comments.some((comment) => comment.includes(input.marker))) {
-      await this.postIssueComment(subject, input.body);
-    }
+    await this.publishMarkedComment({ repo: input.repo, pr: input.pullRequest }, input.marker, input.body);
   }
 
   async publishIssueComment(input: { repo: string; issue: number; marker: string; body: string }): Promise<void> {
     if (!input.body.includes(input.marker)) throw new Error("Issue comment is missing its idempotency marker");
-    const comments = await this.listIssueComments({ repo: input.repo, issue: input.issue });
-    if (!comments.some((comment) => comment.includes(input.marker))) {
-      await this.postIssueComment({ repo: input.repo, issue: input.issue }, input.body);
+    await this.publishMarkedComment({ repo: input.repo, issue: input.issue }, input.marker, input.body);
+  }
+
+  private async publishMarkedComment(subject: Subject, marker: string, body: string): Promise<void> {
+    const admissionKey: RemediationAdmissionKey = {
+      repo: subject.repo,
+      parentIssue: subject.issue ?? 0,
+      parentPullRequest: subject.pr ?? 0,
+      headSha: marker,
+      marker: `comment:${marker}`,
+    };
+    const claim = await this.remediationAdmissions.claim(admissionKey);
+    if (claim.status === "materialized") return;
+    const comments = await this.listIssueComments(subject);
+    if (comments.some((comment) => comment.includes(marker))) {
+      await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
+      return;
     }
+    if (claim.status !== "claimed") throw new RemediationMaterializationPendingError(marker);
+    await this.postIssueComment(subject, body);
+    await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
   }
 
   async materializeReviewFinding(input: {
@@ -226,9 +262,31 @@ export class GitHubClient implements ForgeHost {
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const legacyMarker = legacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const admissionKey: RemediationAdmissionKey = {
+      repo: input.repo,
+      // The review-finding marker is independent of the delivery issue and
+      // reviewed SHA, so the admission key must be stable across both.
+      parentIssue: 0,
+      parentPullRequest: input.pullRequest.number,
+      headSha: marker,
+      marker,
+    };
+    const claim = await this.remediationAdmissions.claim(admissionKey);
+    if (claim.status === "materialized") return claim.snapshot;
     const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker)
       || (marker !== legacyMarker && issue.body.includes(legacyMarker)));
-    if (existing) return existing;
+    if (existing) {
+      await this.remediationAdmissions.complete(admissionKey, existing);
+      return existing;
+    }
+    if (claim.status !== "claimed") {
+      const visible = await this.reconcileReviewFindingMarker(input.repo, marker, legacyMarker);
+      if (visible) {
+        await this.remediationAdmissions.complete(admissionKey, visible);
+        return visible;
+      }
+      throw new RemediationMaterializationPendingError(marker);
+    }
 
     const priority = reviewFindingPriority(input.finding.severity);
     const title = boundedGitHubText(`fix: ${input.finding.title} (review finding — PR #${input.pullRequest.number})`, 240).replace(/[\r\n]+/g, " ");
@@ -292,7 +350,9 @@ export class GitHubClient implements ForgeHost {
     const url = (await this.gh(args, body)).trim();
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
-    return { repo: input.repo, number, title, body, url, state: "OPEN" };
+    const snapshot = { repo: input.repo, number, title, body, url, state: "OPEN" as const };
+    await this.remediationAdmissions.complete(admissionKey, snapshot);
+    return snapshot;
   }
 
   async reconcileReviewFindings(input: {
@@ -510,11 +570,23 @@ export class GitHubClient implements ForgeHost {
     return materialized;
   }
 
-  private async reconcileRemediationMarker(repo: string, marker: string): Promise<IssueSnapshot | undefined> {
+  private async reconcileRemediationMarker(repo: string, marker: string, openOnly = false): Promise<IssueSnapshot | undefined> {
     const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
     for (let attempt = 0; attempt < delays.length; attempt += 1) {
       if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
-      const issue = (await this.listAllIssues(repo)).find((candidate) => candidate.body.includes(marker));
+      const issue = (await this.listAllIssues(repo)).find((candidate) => candidate.body.includes(marker)
+        && (!openOnly || candidate.state === "OPEN"));
+      if (issue) return issue;
+    }
+    return undefined;
+  }
+
+  private async reconcileReviewFindingMarker(repo: string, marker: string, legacyMarker: string): Promise<IssueSnapshot | undefined> {
+    const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
+    for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      const issue = (await this.listAllIssues(repo)).find((candidate) => candidate.body.includes(marker)
+        || (marker !== legacyMarker && candidate.body.includes(legacyMarker)));
       if (issue) return issue;
     }
     return undefined;
@@ -608,13 +680,37 @@ export class GitHubClient implements ForgeHost {
     const marker = /<!-- FORGEDOCK:BATCH ([0-9-]+) -->/.exec(input.body)?.[0];
     if (!marker) throw new Error("Batch issue body is missing its deterministic FORGEDOCK:BATCH marker");
     const incomingContract = parseBatchContract(input.body);
-    const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.state === "OPEN" && issue.body.includes(marker));
-    if (existing) {
+    const admissionKey: RemediationAdmissionKey = {
+      repo: input.repo,
+      parentIssue: 0,
+      parentPullRequest: 0,
+      headSha: marker,
+      marker: `batch:${marker}`,
+    };
+    const claim = await this.remediationAdmissions.claim(admissionKey);
+    const validateExisting = (existing: IssueSnapshot): IssueSnapshot => {
       const existingContract = parseBatchContract(existing.body);
       if (JSON.stringify(existingContract) !== JSON.stringify(incomingContract)) {
         throw new Error(`Existing batch marker ${marker} has a different member contract`);
       }
       return existing;
+    };
+    if (claim.status === "materialized") return validateExisting(claim.snapshot);
+
+    const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.state === "OPEN" && issue.body.includes(marker));
+    if (existing) {
+      const authoritative = validateExisting(existing);
+      await this.remediationAdmissions.complete(admissionKey, authoritative);
+      return authoritative;
+    }
+    if (claim.status !== "claimed") {
+      const visible = await this.reconcileRemediationMarker(input.repo, marker, true);
+      if (visible) {
+        const authoritative = validateExisting(visible);
+        await this.remediationAdmissions.complete(admissionKey, authoritative);
+        return authoritative;
+      }
+      throw new RemediationMaterializationPendingError(marker);
     }
 
     await this.gh([
@@ -629,7 +725,9 @@ export class GitHubClient implements ForgeHost {
     const url = (await this.gh(createArgs, input.body)).trim();
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a batch issue number");
-    return { repo: input.repo, number, title: input.title, body: input.body, url, state: "OPEN" };
+    const snapshot = { repo: input.repo, number, title: input.title, body: input.body, url, state: "OPEN" as const };
+    await this.remediationAdmissions.complete(admissionKey, snapshot);
+    return snapshot;
   }
 
   async findOpenPullRequest(repo: string, headBranch: string): Promise<PullRequestSnapshot | undefined> {
@@ -805,6 +903,19 @@ function boundedGitHubCode(value: string): string {
   return boundedGitHubText(value, 500).replaceAll("`", "'").replace(/[\r\n]+/g, " ");
 }
 
+function projectionAdmissionSnapshot(subject: Subject, marker: string): IssueSnapshot {
+  const number = subject.issue ?? subject.pr;
+  if (!number) throw new Error("Projection admission requires an issue or pull request target");
+  return {
+    repo: subject.repo,
+    number,
+    title: "ForgeDock idempotent projection",
+    body: marker,
+    url: "",
+    state: "OPEN",
+  };
+}
+
 function decompositionMarker(repo: string, parentIssue: number, title: string): string {
   return createHash("sha256").update(`${repo.toLowerCase()}#${parentIssue}\n${title.trim().toLowerCase()}`).digest("hex");
 }
@@ -837,7 +948,14 @@ function orderDecompositionChildren(children: DecompositionChild[]): Decompositi
 }
 
 export class GitHubArtifactRepository implements ArtifactRepository {
-  constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
+  private readonly projectionAdmissions: RemediationAdmissionRepository;
+
+  constructor(
+    readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment"> & Partial<Pick<GitHubClient, "remediationAdmissions">>,
+    projectionAdmissions?: RemediationAdmissionRepository,
+  ) {
+    this.projectionAdmissions = projectionAdmissions ?? client.remediationAdmissions ?? new InMemoryRemediationAdmissionRepository();
+  }
 
   async append(artifact: DurableArtifact): Promise<void> {
     const canonical = canonicalSubject(artifact.subject);
@@ -845,9 +963,24 @@ export class GitHubArtifactRepository implements ArtifactRepository {
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
       : [canonical];
     for (const target of targets) {
+      const admissionKey: RemediationAdmissionKey = {
+        repo: target.repo,
+        parentIssue: target.issue ?? 0,
+        parentPullRequest: target.pr ?? 0,
+        headSha: artifact.id,
+        marker: `artifact:${artifact.id}`,
+      };
+      const claim = await this.projectionAdmissions.claim(admissionKey);
+      if (claim.status === "materialized") continue;
       const comments = await this.client.listIssueComments(target);
       const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
-      if (!exists) await this.client.postIssueComment(target, renderArtifactComment(artifact));
+      if (exists) {
+        await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id));
+        continue;
+      }
+      if (claim.status !== "claimed") throw new RemediationMaterializationPendingError(artifact.id);
+      await this.client.postIssueComment(target, renderArtifactComment(artifact));
+      await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id));
     }
   }
 

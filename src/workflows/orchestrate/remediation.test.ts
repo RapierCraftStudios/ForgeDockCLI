@@ -101,6 +101,18 @@ describe("durable recursive remediation", () => {
     assert.equal(resumed.state, "reviewing");
   });
 
+  it("does not treat duplicate outcomes from one child as complete remediation", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const host = { async materializeRemediationChildren() { return [{ repo: "owner/repo", number: 30, title: "Child", body: "", url: "", state: "OPEN" as const }]; } } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts });
+    const started = await supervisor.begin({ parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict, reason: "scope-violation", findings: [{ id: "finding-1", severity: "high", title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug" }] });
+    const checkpoint = { ...started.checkpoint, payload: { ...started.checkpoint.payload, childIssues: [30, 31] } };
+    const outcome = (id: string) => createArtifact({ kind: "Outcome", runId: id, subject: { repo: "owner/repo", issue: 30 }, producer: { role: "controller" }, payload: { status: "merged", reason: "merged", finalSha: pr.headSha, prUrl: pr.url, childIssues: [] } }, { id, createdAt: `2026-01-01T00:00:0${id === "child-1" ? "1" : "2"}.000Z` });
+    const result = await supervisor.reconcileChildren({ checkpoint, childOutcomes: [outcome("child-1"), outcome("child-2")], parentPullRequest: { ...pr, headSha: "b".repeat(40) } });
+    assert.equal(result, checkpoint);
+  });
+
   it("synchronizes and verifies the actual advanced parent revision", async () => {
     const { run, packet, verdict } = context();
     const artifacts = new InMemoryArtifactRepository();

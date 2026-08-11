@@ -9,9 +9,16 @@ import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFin
 
 class CommentClient {
   comments = new Map<string, string[]>();
+  postCalls = 0;
+  failAfterPost = false;
   async listIssueComments(subject: Subject): Promise<string[]> { return this.comments.get(key(subject)) ?? []; }
   async postIssueComment(subject: Subject, body: string): Promise<void> {
+    this.postCalls += 1;
     const values = this.comments.get(key(subject)) ?? []; values.push(body); this.comments.set(key(subject), values);
+    if (this.failAfterPost) {
+      this.failAfterPost = false;
+      throw new Error("projection interrupted after remote write");
+    }
   }
 }
 function key(subject: Subject) { return `${subject.repo}#${subject.pr ? `pr${subject.pr}` : `i${subject.issue}`}`; }
@@ -21,6 +28,8 @@ describe("GitHub repository resolution", () => {
     assert.equal(repositoryFromRemote("https://github.com/RapierCraftStudios/ForgeDockCLI"), "RapierCraftStudios/ForgeDockCLI");
     assert.equal(repositoryFromRemote("git@github.com:RapierCraftStudios/ForgeDockCLI.git"), "RapierCraftStudios/ForgeDockCLI");
     assert.equal(repositoryFromRemote("https://git.example.test/owner/repo.git"), undefined);
+    assert.equal(repositoryFromRemote("https://evilgithub.com/attacker/repo.git"), undefined);
+    assert.equal(repositoryFromRemote("https://evil.github.com/attacker/repo.git"), undefined);
   });
 
   it("refreshes expired credentials once and retries the same GitHub operation", async () => {
@@ -318,6 +327,20 @@ describe("GitHub durable artifact projection", () => {
     assert.equal(client.comments.get("a/b#pr3")?.length, 1);
     assert.equal(client.comments.get("a/b#i2")?.length, 1);
     assert.equal((await repository.list(artifact.subject)).length, 1);
+  });
+
+  it("recovers a projection after the remote comment succeeds before admission completion", async () => {
+    const client = new CommentClient();
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run-recovery", subject: { repo: "a/b", issue: 2 }, producer: { role: "test" },
+      payload: { title: "Recovery", problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    client.failAfterPost = true;
+    await assert.rejects(new GitHubArtifactRepository(client, admissions).append(artifact), /after remote write/);
+    await new GitHubArtifactRepository(client, admissions).append(artifact);
+    assert.equal(client.postCalls, 1);
+    assert.equal((await new GitHubArtifactRepository(client, admissions).list(artifact.subject)).length, 1);
   });
 
   it("filters embedded artifacts by canonical target while retaining issue/PR overlap", async () => {

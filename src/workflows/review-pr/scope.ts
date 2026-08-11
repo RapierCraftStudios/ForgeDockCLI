@@ -94,10 +94,8 @@ const EXCLUDED_TOPICS: ReadonlyArray<{ name: string; pattern: RegExp }> = [
 function findingExcludedTopic(finding: ReviewFinding, packet: DurableArtifact<"BuildPacket">): string | undefined {
   const findingText = [finding.title, finding.evidence, finding.remediation, finding.intentRelevance].join("\n");
   const excludedText = packet.payload.outOfScope.join("\n");
-  const affirmativeScope = [...packet.payload.scope, ...packet.payload.acceptanceCriteria, ...packet.payload.implementationPlan].join("\n");
   return EXCLUDED_TOPICS.find(({ pattern }) => pattern.test(excludedText)
-    && pattern.test(findingText)
-    && !pattern.test(affirmativeScope))?.name;
+    && pattern.test(findingText))?.name;
 }
 
 export function repositoryPathFromLocation(location: string): string | undefined {

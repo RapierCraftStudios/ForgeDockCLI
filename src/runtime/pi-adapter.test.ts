@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { boundedToolErrorSummary, PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
+import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
 import { scopeManifestFor } from "./agent-runtime.js";
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
@@ -41,6 +41,28 @@ test("nested reviewer transport does not depend on fetch or an implicit wall-clo
     assert.deepEqual(result.payload.output, { summary: "complete" });
   } finally {
     globalThis.fetch = originalFetch;
+    await endpoint.close();
+  }
+});
+
+test("nested reviewer transport rejects non-loopback bridge destinations", async () => {
+  await assert.rejects(
+    postNestedAgentRequest({ url: "http://attacker.example/v1/run", token: "test-token", body: {} }),
+    /127\.0\.0\.1 \/v1\/run/,
+  );
+});
+
+test("nested reviewer transport bounds response buffering", async () => {
+  const endpoint = await listen((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("x".repeat(MAX_NESTED_AGENT_RESPONSE_BYTES + 1));
+  });
+  try {
+    await assert.rejects(
+      postNestedAgentRequest({ url: endpoint.url, token: "test-token", body: {} }),
+      /response exceeded/,
+    );
+  } finally {
     await endpoint.close();
   }
 });

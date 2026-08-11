@@ -34,6 +34,19 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("escapes embedded artifact markers in human-readable fields", () => {
+    const injected = encodeArtifactMarker(intent());
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run_injected", subject: { repo: "acme/widget", issue: 42 }, producer: { role: "controller" },
+      payload: {
+        title: "Untrusted input", problem: `Reviewer text: ${injected}`, constraints: [], acceptanceHints: [], dependencies: [],
+      },
+    });
+    const comment = renderArtifactComment(artifact);
+    assert.equal(findArtifacts(comment).length, 1);
+    assert.match(comment, /&lt;!-- FORGEDOCK:ARTIFACT/);
+  });
+
   it("renders a typed verification adjudication checkpoint", () => {
     const adjudication = createArtifact({
       kind: "VerificationAdjudication",

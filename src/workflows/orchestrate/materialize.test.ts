@@ -15,6 +15,9 @@ function item(issue: number): BatchableWorkItem {
 
 class FakeBatchHost implements BatchMaterializationHost {
   writes = 0;
+  closes = 0;
+  nextIssue = 20;
+  readonly closedIssues: number[] = [];
   readonly issues = new Map<number, IssueSnapshot>([
     [1, { repo: "owner/repo", number: 1, title: "One", body: "## Affected Files\n- `src/api/a.ts`", url: "https://example.test/issues/1", state: "OPEN" }],
     [2, { repo: "owner/repo", number: 2, title: "Two", body: "## Affected Files\n- `src/api/a.ts`", url: "https://example.test/issues/2", state: "OPEN" }],
@@ -26,7 +29,12 @@ class FakeBatchHost implements BatchMaterializationHost {
   }
   async materializeBatchIssue(input: { repo: string; title: string; body: string; priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3" }): Promise<IssueSnapshot> {
     this.writes++;
-    return { repo: input.repo, number: 20, title: input.title, body: input.body, url: "https://example.test/issues/20", state: "OPEN" };
+    const number = this.nextIssue++;
+    return { repo: input.repo, number, title: input.title, body: input.body, url: `https://example.test/issues/${number}`, state: "OPEN" };
+  }
+  async closeIssue(_repo: string, issue: number): Promise<void> {
+    this.closes++;
+    this.closedIssues.push(issue);
   }
 }
 
@@ -40,6 +48,29 @@ describe("authoritative batch materialization", () => {
     assert.equal(host.writes, 1);
     assert.equal(result.materialized[0]?.issue, 20);
     assert.equal(result.groups[0]?.members[0]?.title, "One");
+  });
+
+  it("closes provisional issues when a later group fails authoritative revalidation", async () => {
+    const host = new FakeBatchHost();
+    for (const issue of [3, 4]) {
+      host.issues.set(issue, {
+        repo: "owner/repo", number: issue, title: `Issue ${issue}`,
+        body: "## Affected Files\n- `src/api/a.ts`",
+        url: `https://example.test/issues/${issue}`,
+        state: issue === 4 ? "CLOSED" : "OPEN",
+      });
+    }
+    const groups = [1, 2, 3, 4].map((issue) => item(issue));
+    const proposed = [
+      { id: "batch:first", kind: "same-file" as const, key: "src/api/a.ts", riskClass: "routine" as const, members: groups.slice(0, 2) },
+      { id: "batch:second", kind: "same-file" as const, key: "src/api/a.ts", riskClass: "routine" as const, members: groups.slice(2) },
+    ];
+    await assert.rejects(
+      materializeBatchGroups({ repo: "owner/repo", groups: proposed, items: groups, host }),
+      /Cannot batch #4: issue is closed/,
+    );
+    assert.equal(host.writes, 1);
+    assert.deepEqual(host.closedIssues, [20]);
   });
 
   it("removes HTML comment fragments from materialized batch titles", async () => {

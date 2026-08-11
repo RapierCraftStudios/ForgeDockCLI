@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { BatchMemberContractPayload } from "../../core/artifacts/schema.js";
 import type { ScheduledWorkItem } from "./scheduler.js";
 
-export type BatchRiskClass = "routine" | "security" | "auth" | "billing";
-
-export interface BatchMemberContract {
-  issue: number;
-  repository?: string;
-  title: string;
-  acceptanceCriteria: readonly string[];
-  affectedFiles: readonly string[];
-  claims: readonly string[];
-  riskClass: BatchRiskClass;
-  sourceIssueUrl?: string;
-}
+export type BatchRiskClass = BatchMemberContractPayload["riskClass"];
+export type BatchMemberContract = BatchMemberContractPayload;
 
 export interface BatchableWorkItem extends ScheduledWorkItem {
   title: string;

@@ -170,7 +170,15 @@ export class RemediationSupervisor {
     const checkpoint = input.checkpoint.payload;
     const expected = new Set(checkpoint.childIssues);
     if (!expected.size || input.parentPullRequest.headSha === checkpoint.headSha) return input.checkpoint;
-    const merged = input.childOutcomes.filter((outcome) => outcome.payload.status === "merged" && outcome.subject.issue && expected.has(outcome.subject.issue));
+    const mergedByIssue = new Map<number, DurableArtifact<"Outcome">>();
+    for (const outcome of input.childOutcomes) {
+      const issue = outcome.subject.issue;
+      if (outcome.payload.status !== "merged" || issue === undefined || !expected.has(issue)) continue;
+      const existing = mergedByIssue.get(issue);
+      if (!existing || outcome.createdAt >= existing.createdAt) mergedByIssue.set(issue, outcome);
+    }
+    if (mergedByIssue.size !== expected.size) return input.checkpoint;
+    const merged = [...expected].map((issue) => mergedByIssue.get(issue)).filter((outcome): outcome is DurableArtifact<"Outcome"> => outcome !== undefined);
     if (merged.length !== expected.size) return input.checkpoint;
     const childFinalShas = merged.map((outcome) => outcome.payload.finalSha);
     if (childFinalShas.some((sha) => sha === undefined)) return input.checkpoint;

@@ -22,6 +22,7 @@ export interface BatchMaterializationHost {
     priorityLabel: "priority:P0" | "P0" | "priority:P1" | "P1" | "priority:P2" | "P2" | "priority:P3" | "P3";
     milestone?: string;
   }): Promise<IssueSnapshot>;
+  closeIssue(repo: string, issue: number, reason: string): Promise<void>;
 }
 
 export interface MaterializeBatchGroupsInput {
@@ -50,29 +51,40 @@ export async function materializeBatchGroups(
 ): Promise<MaterializeBatchGroupsResult> {
   const groups: IssueBatchGroup[] = [];
   const materialized: MaterializedBatchIssue[] = [];
-  for (const proposed of input.groups) {
-    const validated = await revalidateBatchGroup(proposed, input.repo, input.host, input.expectedRoutes);
-    const members = validated.members;
-    const priority = priorityLabel(members);
-    const title = `fix(batch): ${members.length} ${priority.slice(-2)} findings — ${safeTitle(proposed.key)}`.slice(0, 240);
-    const summary = `Deliver ${members.map((member) => `#${member.issue}`).join(", ")} as one ${proposed.kind} work unit.`;
-    const issue = await input.host.materializeBatchIssue({
-      repo: input.repo,
-      title,
-      body: renderBatchIssueBody({ ...proposed, members }),
-      priorityLabel: priority,
-      ...(validated.milestone ? { milestone: validated.milestone } : {}),
-    });
-    groups.push({ ...proposed, members });
-    materialized.push({ groupId: proposed.id, issue: issue.number, title: issue.title, summary });
-  }
+  const createdIssueNumbers: number[] = [];
+  try {
+    for (const proposed of input.groups) {
+      const validated = await revalidateBatchGroup(proposed, input.repo, input.host, input.expectedRoutes);
+      const members = validated.members;
+      const priority = priorityLabel(members);
+      const title = `fix(batch): ${members.length} ${priority.slice(-2)} findings — ${safeTitle(proposed.key)}`.slice(0, 240);
+      const summary = `Deliver ${members.map((member) => `#${member.issue}`).join(", ")} as one ${proposed.kind} work unit.`;
+      const issue = await input.host.materializeBatchIssue({
+        repo: input.repo,
+        title,
+        body: renderBatchIssueBody({ ...proposed, members }),
+        priorityLabel: priority,
+        ...(validated.milestone ? { milestone: validated.milestone } : {}),
+      });
+      groups.push({ ...proposed, members });
+      materialized.push({ groupId: proposed.id, issue: issue.number, title: issue.title, summary });
+      createdIssueNumbers.push(issue.number);
+    }
 
-  // Validate the graph with real batch issue IDs before the caller dispatches.
-  const allMembers = input.items ? [...input.items] : groups.flatMap((group) => group.members);
-  const contracted = contractBatchGroups(allMembers, groups, materialized);
-  const claimGraph = materializeClaimDependencies(contracted as ScheduledWorkItem[]);
-  validateGraph(claimGraph.items);
-  return { groups, materialized, validatedItems: claimGraph.items as BatchableWorkItem[] };
+    // Validate the graph with real batch issue IDs before the caller dispatches.
+    const allMembers = input.items ? [...input.items] : groups.flatMap((group) => group.members);
+    const contracted = contractBatchGroups(allMembers, groups, materialized);
+    const claimGraph = materializeClaimDependencies(contracted as ScheduledWorkItem[]);
+    validateGraph(claimGraph.items);
+    return { groups, materialized, validatedItems: claimGraph.items as BatchableWorkItem[] };
+  } catch (error) {
+    await Promise.allSettled(createdIssueNumbers.map((issue) => input.host.closeIssue(
+      input.repo,
+      issue,
+      "ForgeDock closed this provisional batch issue because pre-dispatch validation failed; no controller was dispatched.",
+    )));
+    throw error;
+  }
 }
 
 /** Validate only; useful for dry-run confirmation and tests that assert zero writes. */

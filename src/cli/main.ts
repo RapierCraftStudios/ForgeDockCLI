@@ -236,14 +236,14 @@ async function workOn(argv: string[]): Promise<void> {
   const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
-  const authoritativeArtifacts = new GitHubArtifactRepository(github);
+  let authoritativeArtifacts = new GitHubArtifactRepository(github);
   const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts);
   const deliveryTargetBranch = parentRemediation?.parentBranch ?? lane.targetBranch;
   const baseRef = `origin/${deliveryTargetBranch}`;
   const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
-  const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
+  const parsedBatchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
   const subjectEvidence = issueSubjectEvidence(issue);
   subjectEvidence.push(laneEvidence(lane));
   if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
@@ -263,6 +263,10 @@ async function workOn(argv: string[]): Promise<void> {
     );
   }
   let priorArtifacts = dryRun ? [] : await authoritativeArtifacts.list(subject);
+  const persistedBatchMemberContracts = !argv.includes("--rerun")
+    ? latestArtifactOfKind(priorArtifacts, "Intent")?.payload.batchMemberContracts
+    : undefined;
+  const batchMemberContracts = persistedBatchMemberContracts ?? parsedBatchMemberContracts;
   if (adjudicationReason !== undefined) {
     const latestDelivery = latestDeliveryRunArtifacts(priorArtifacts);
     const latestOutcome = latestDelivery ? latestArtifactOfKind(latestDelivery.artifacts, "Outcome") : undefined;
@@ -326,6 +330,7 @@ async function workOn(argv: string[]): Promise<void> {
       constraints: [],
       acceptanceHints: [],
       dependencies: dependencyIssues.map((dependency) => `issue-${dependency}`),
+      ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
       sourceUrl: issue.url,
       conversation: issue.comments
         .filter((comment) => !comment.containsArtifact && comment.body.trim())
@@ -345,6 +350,7 @@ async function workOn(argv: string[]): Promise<void> {
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
   github = new GitHubClient(process.cwd(), store);
+  authoritativeArtifacts = new GitHubArtifactRepository(github);
   const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const runs = dryRun ? store : projectRunsToGitHub(store, github);
   const runtime = createCliRuntime({
@@ -458,6 +464,8 @@ async function workOn(argv: string[]): Promise<void> {
       if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
+      const durableBatchMemberContracts = intentArtifact.payload.batchMemberContracts ?? batchMemberContracts;
+      const durableBatchMembers = durableBatchMemberContracts.map((contract) => contract.issue);
       const remediationCheckpoint = latestArtifactOfKind(runArtifacts, "RemediationBlocked");
       const latestOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
       const verificationAdjudication = latestArtifactOfKind(runArtifacts, "VerificationAdjudication");
@@ -602,8 +610,8 @@ async function workOn(argv: string[]): Promise<void> {
         remediationDepth: parentRemediation?.remediationDepth ?? 0,
         ...(parentRemediation !== undefined ? { parentRemediation } : {}),
         subjectEvidence,
-        ...(batchMembers.length ? { batchMembers } : {}),
-        ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
+        ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
+        ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
         autoMerge,
         ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
         ...(provider !== undefined ? { provider } : {}),
@@ -617,8 +625,8 @@ async function workOn(argv: string[]): Promise<void> {
           verdict: priorVerdict!,
           pullRequest: checkpointPullRequest!,
           ...(workspace ? { workspace } : {}),
-          ...(batchMembers.length ? { batchMembers } : {}),
-          ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
+          ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
+          ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
           autoMerge,
         }, dependencies)
         : admission.checkpoint === "build"
@@ -783,7 +791,7 @@ async function reviewPr(argv: string[]): Promise<void> {
   const prArg = argv.find((arg) => !arg.startsWith("-"));
   if (!prArg || !/^\d+$/.test(prArg)) throw new Error("Usage: forgedock-next review-pr <pr-number> [--repo owner/repo] [--issue number]");
   process.stdout.write(`${renderHeader({ subtitle: "review-pr · fresh context · SHA anchored" })}\n\n`);
-  const github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd());
   const localRepository = await github.getRepository();
   const repo = option(argv, "--repo") ?? localRepository.repo;
   if (repo !== localRepository.repo) throw new Error(`Current checkout is ${localRepository.repo}; review workspace for ${repo} is unavailable here`);
@@ -794,6 +802,7 @@ async function reviewPr(argv: string[]): Promise<void> {
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  github = new GitHubClient(process.cwd(), store);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   // Standalone review is advisory and read-only. Its operational state must not
   // replace the issue delivery controller's workflow-label projection.
@@ -851,39 +860,43 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
-  const github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd());
   const repository = await github.getRepository();
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
-  const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
-  const milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
-    ? await github.listBranches(repository.repo, "milestone/")
-    : [];
-  const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
-  for (const issue of issueSnapshots) {
-    routedIssues.set(issue.number, {
-      issue,
-      lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget),
+  const readAuthoritativeItems = async () => {
+    const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
+    const milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
+      ? await github.listBranches(repository.repo, "milestone/")
+      : [];
+    const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
+    for (const issue of issueSnapshots) {
+      routedIssues.set(issue.number, {
+        issue,
+        lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget),
+      });
+    }
+    await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
+      .map((branch) => github.getBranchHead(repository.repo, branch)));
+    const items: BatchableWorkItem[] = baseItems.map((item) => {
+      const observed = requiredIssueRoute(routedIssues, item.issue).issue;
+      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+      const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
+      return {
+        ...item,
+        repository: repository.repo,
+        targetBranch: lane.targetBranch,
+        ...(observed.milestone ? { milestone: observed.milestone } : {}),
+        labels: observed.labels,
+        title: observed.title,
+        summary: observed.body.slice(0, 4_000),
+        affectedFiles: affectedFilesFromIssueBody(observed.body),
+        riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
+        ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
+      };
     });
-  }
-  await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
-    .map((branch) => github.getBranchHead(repository.repo, branch)));
-  const items: BatchableWorkItem[] = baseItems.map((item) => {
-    const observed = requiredIssueRoute(routedIssues, item.issue).issue;
-    const lane = requiredIssueRoute(routedIssues, item.issue).lane;
-    const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
-    return {
-      ...item,
-      repository: repository.repo,
-      targetBranch: lane.targetBranch,
-      ...(observed.milestone ? { milestone: observed.milestone } : {}),
-      labels: observed.labels,
-      title: observed.title,
-      summary: observed.body.slice(0, 4_000),
-      affectedFiles: affectedFilesFromIssueBody(observed.body),
-      riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
-      ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
-    };
-  });
+    return { items, routedIssues };
+  };
+  let { items, routedIssues } = await readAuthoritativeItems();
   const priorityOption = option(argv, "--priority");
   const milestoneOption = option(argv, "--milestone");
   const assembly = assembleWorkUnits(items, {
@@ -906,10 +919,15 @@ async function orchestrate(argv: string[]): Promise<void> {
     return;
   }
   if (!argv.includes("--confirm")) throw new Error("orchestrate requires --confirm after the authoritative work-unit proposal (use --dry-run to inspect it)");
+  // Confirmation is a boundary, not a freshness grant. Re-read every selected
+  // issue before freezing the DAG so ungrouped work cannot dispatch stale body,
+  // label, state, or lane evidence.
+  ({ items, routedIssues } = await readAuthoritativeItems());
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  github = new GitHubClient(process.cwd(), store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -931,12 +949,12 @@ async function orchestrate(argv: string[]): Promise<void> {
       ? await materializeBatchGroups({
         repo: repository.repo,
         groups: assembly.groups,
-        items: assembly.selected,
+        items,
         host: github,
         expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, { targetBranch: value.lane.targetBranch, lane: value.lane.kind }])),
       })
       : { groups: [], materialized: [], validatedItems: items };
-    const contracted = contractBatchGroups(assembly.selected, materializedResult.groups, materializedResult.materialized);
+    const contracted = materializedResult.validatedItems;
     for (const materialized of materializedResult.materialized) {
       const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
       const member = group?.members[0];
@@ -1037,10 +1055,20 @@ async function orchestrate(argv: string[]): Promise<void> {
         }
         const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
         const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
+        const batchMembers = item.memberIssues ? [...item.memberIssues] : [];
+        const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
         const intent = createArtifact({
           kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
           producer: { role: "controller", runtime: "forgedock" },
-          payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
+          payload: {
+            title: issue.title,
+            problem: issue.body || issue.title,
+            constraints: [],
+            acceptanceHints: [],
+            dependencies: [...item.dependencies],
+            ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
+            sourceUrl: issue.url,
+          },
         });
         const baseRef = `origin/${parentRemediation?.parentBranch ?? lane.targetBranch}`;
         const verification = discoverVerificationCommands(process.cwd(), baseRef);
@@ -1066,6 +1094,8 @@ async function orchestrate(argv: string[]): Promise<void> {
               updateOrchestrationNode(item.id, { claims: [...paths] });
             },
             subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
+            ...(batchMembers.length ? { batchMembers } : {}),
+            ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
             ...(provider !== undefined ? { provider } : {}),
             ...(model !== undefined ? { model } : {}),
           }, {

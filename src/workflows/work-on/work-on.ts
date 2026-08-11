@@ -84,6 +84,23 @@ export async function workOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  if (input.batchMemberContracts?.length && !input.intent.payload.batchMemberContracts?.length) {
+    input = {
+      ...input,
+      intent: {
+        ...input.intent,
+        payload: {
+          ...input.intent.payload,
+          batchMemberContracts: input.batchMemberContracts.map((contract) => ({
+            ...contract,
+            acceptanceCriteria: [...contract.acceptanceCriteria],
+            affectedFiles: [...contract.affectedFiles],
+            claims: [...contract.claims],
+          })),
+        },
+      },
+    };
+  }
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),

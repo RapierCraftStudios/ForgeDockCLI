@@ -43,6 +43,23 @@ describe("review finding scope policy", () => {
     assert.match(excludedRuntime?.scopeRationale ?? "", /excluded runtime\/controller behavior/);
   });
 
+  it("gives explicit runtime exclusions precedence over affirmative adapter wording", () => {
+    const adapterPacket = createArtifact({
+      kind: "BuildPacket", runId, subject, producer: { role: "packet-author" },
+      payload: {
+        scope: ["Implement the requested adapter"], acceptanceCriteria: ["Implement the requested adapter"], context: [],
+        implementationPlan: ["Edit src/runtime/adapter.ts"], expectedPaths: ["src/runtime/adapter.ts"], verificationPlan: ["npm test"], risks: [],
+        outOfScope: ["Do not change runtime or controller behavior"],
+      },
+    });
+    const [result] = applyFindingScopePolicy([finding({
+      title: "Runtime controller bypass", evidence: "The agent runtime skips the controller", remediation: "Redesign the runtime adapter",
+      location: "src/runtime/adapter.ts:1", matchedAcceptanceCriteria: ["Implement the requested adapter"],
+    })], adapterPacket);
+    assert.equal(result?.blocking, false);
+    assert.match(result?.scopeRationale ?? "", /excluded runtime\/controller behavior/);
+  });
+
   it("prevents fresh concern expansion after remediation while preserving continuity and regressions", () => {
     const prior = createArtifact({
       kind: "ReviewVerdict", runId, subject: { ...subject, pr: 2 }, producer: { role: "controller" },

@@ -34,6 +34,8 @@ import type {
 import { createSandboxedTools } from "./sandboxed-tools.js";
 import { assertRuntimeInstallAsync } from "./runtime-install.js";
 
+export const MAX_NESTED_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
+
 export interface PiRuntimeOptions {
   agentDir?: string;
   provider?: string;
@@ -392,11 +394,15 @@ export function postNestedAgentRequest<T>(input: {
   try {
     target = new URL(input.url);
   } catch (error) {
-    throw new Error("Nested reviewer bridge received an invalid URL", { cause: error });
+    return Promise.reject(new Error("Nested reviewer bridge received an invalid URL", { cause: error }));
   }
-  if (target.protocol !== "http:") throw new Error(`Nested reviewer bridge requires local HTTP, found ${target.protocol}`);
+  if (target.protocol !== "http:" || target.hostname !== "127.0.0.1" || target.pathname !== "/v1/run"
+    || target.username || target.password || target.search || target.hash) {
+    return Promise.reject(new Error("Nested reviewer bridge requires the local 127.0.0.1 /v1/run endpoint"));
+  }
   const encoded = JSON.stringify(input.body);
   return new Promise((resolve, reject) => {
+    let settled = false;
     const request = httpRequest(target, {
       method: "POST",
       headers: {
@@ -407,9 +413,26 @@ export function postNestedAgentRequest<T>(input: {
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, (response) => {
       const chunks: Buffer[] = [];
-      response.on("data", (chunk: Buffer) => chunks.push(chunk));
-      response.once("error", (error) => reject(new Error(`Nested reviewer response failed: ${error.message}`, { cause: error })));
+      let received = 0;
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        response.destroy();
+        reject(error);
+      };
+      response.on("data", (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        received += buffer.byteLength;
+        if (received > MAX_NESTED_AGENT_RESPONSE_BYTES) {
+          fail(new Error(`Nested reviewer response exceeded ${MAX_NESTED_AGENT_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(buffer);
+      });
+      response.once("error", (error) => fail(new Error(`Nested reviewer response failed: ${error.message}`, { cause: error })));
       response.once("end", () => {
+        if (settled) return;
+        settled = true;
         try {
           const text = Buffer.concat(chunks).toString("utf8");
           resolve({ status: response.statusCode ?? 500, payload: JSON.parse(text) as T });
@@ -418,7 +441,11 @@ export function postNestedAgentRequest<T>(input: {
         }
       });
     });
-    request.once("error", (error) => reject(new Error(`Nested reviewer transport failed: ${error.message}`, { cause: error })));
+    request.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Nested reviewer transport failed: ${error.message}`, { cause: error }));
+    });
     request.end(encoded);
   });
 }

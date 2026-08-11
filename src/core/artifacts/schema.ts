@@ -20,6 +20,17 @@ export const ProducerSchema = Type.Object({
   model: Type.Optional(NonEmptyString),
 });
 
+export const BatchMemberContractPayloadSchema = Type.Object({
+  issue: Type.Integer({ minimum: 1 }),
+  repository: Type.Optional(NonEmptyString),
+  title: NonEmptyString,
+  acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
+  affectedFiles: Type.Array(NonEmptyString, { minItems: 1 }),
+  claims: Type.Array(NonEmptyString, { minItems: 1 }),
+  riskClass: Type.Union([Type.Literal("routine"), Type.Literal("security"), Type.Literal("auth"), Type.Literal("billing")]),
+  sourceIssueUrl: Type.Optional(Type.String()),
+});
+
 export const IntentPayloadSchema = Type.Object({
   title: NonEmptyString,
   problem: NonEmptyString,
@@ -27,6 +38,7 @@ export const IntentPayloadSchema = Type.Object({
   constraints: Type.Array(Type.String()),
   acceptanceHints: Type.Array(Type.String()),
   dependencies: Type.Array(Type.String()),
+  batchMemberContracts: Type.Optional(Type.Array(BatchMemberContractPayloadSchema)),
   sourceUrl: Type.Optional(Type.String()),
   conversation: Type.Optional(Type.Array(Type.Object({
     author: NonEmptyString,
@@ -309,6 +321,7 @@ export const ArtifactPayloadSchemas = {
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
 export type Subject = Static<typeof SubjectSchema>;
 export type Producer = Static<typeof ProducerSchema>;
+export type BatchMemberContractPayload = Static<typeof BatchMemberContractPayloadSchema>;
 export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
 export type BuildPacketPayload = Static<typeof BuildPacketPayloadSchema>;

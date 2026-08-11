@@ -48,7 +48,7 @@ export function findArtifacts(text: string): DurableArtifact[] {
 }
 
 export function renderArtifactComment(artifact: DurableArtifact): string {
-  return `${renderArtifactMarkdown(artifact)}\n\n${encodeArtifactMarker(artifact)}`;
+  return `${escapeArtifactText(renderArtifactMarkdown(artifact))}\n\n${encodeArtifactMarker(artifact)}`;
 }
 
 export function renderArtifactMarkdown(artifact: DurableArtifact): string {
@@ -142,6 +142,10 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
       ].filter(Boolean).join("\n");
     }
   }
+}
+
+function escapeArtifactText(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 function splitKind(kind: string): string {
