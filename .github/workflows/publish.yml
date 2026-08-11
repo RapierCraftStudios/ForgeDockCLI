@@ -35,6 +35,8 @@ on:
       - 'docs/**'
       - 'scripts/**'
       - 'templates/**'
+      # Keep the submodule gitlink path alongside descendant contents: a Pi fork
+      # revision update is recorded as the exact vendor/pi entry.
       - 'vendor/pi'
       - 'vendor/pi/**'
       - 'vendor/pi-runtime/**'
@@ -73,6 +75,8 @@ jobs:
             echo "No previous tag found — proceeding with publish"
             echo "SKIP_PUBLISH=false" >> $GITHUB_ENV
           else
+            # A submodule revision update is the exact vendor/pi gitlink; the
+            # recursive pathspecs also cover changes within checked-out contents.
             CHANGED=$(git diff --name-only "$LAST_TAG"..HEAD -- \
               commands/ bin/ .claude-plugin/ docs/ scripts/ templates/ package.json \
               'vendor/pi' 'vendor/pi/**' 'vendor/pi-runtime/**' 2>/dev/null || echo "")

@@ -16,13 +16,16 @@ const changedGuardEnd = workflow.indexOf('\n            if [ -z "$CHANGED" ]', c
 const changedPathGuard = workflow.slice(changedGuardStart, changedGuardEnd);
 
 describe("npm publish workflow recovery", () => {
-  it("includes Pi source and staged runtime in both publish path guards", () => {
-    assert.match(pushPaths, /- 'vendor\/pi'/);
-    assert.match(pushPaths, /- 'vendor\/pi\/\*\*'/);
-    assert.match(pushPaths, /- 'vendor\/pi-runtime\/\*\*'/);
-    assert.match(changedPathGuard, /'vendor\/pi'/);
-    assert.match(changedPathGuard, /'vendor\/pi\/\*\*'/);
-    assert.match(changedPathGuard, /'vendor\/pi-runtime\/\*\*'/);
+  it("includes Pi gitlink, source contents, and staged runtime in both publish path guards", () => {
+    assert.notEqual(pushPathsStart, -1);
+    assert.notEqual(pushPathsEnd, -1);
+    assert.notEqual(changedGuardStart, -1);
+    assert.notEqual(changedGuardEnd, -1);
+
+    for (const path of ["vendor/pi", "vendor/pi/**", "vendor/pi-runtime/**"]) {
+      assert.ok(pushPaths.includes(`'${path}'`), `push.paths should include '${path}'`);
+      assert.ok(changedPathGuard.includes(`'${path}'`), `changed-path guard should include '${path}'`);
+    }
     assert.doesNotMatch(changedPathGuard, /\.github\/workflows\/publish\.yml/);
   });
   it("reconciles repository versions when npm publication already succeeded", () => {
