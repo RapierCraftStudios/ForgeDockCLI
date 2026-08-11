@@ -83,6 +83,48 @@ describe("durable recursive remediation", () => {
     assert.equal((await artifacts.list({ repo: "owner/repo", issue: 20 }, "RemediationBlocked")).length, 2);
   });
 
+  it("persists and recovers every admitted finding beyond the legacy 32-entry bound", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const findings = Array.from({ length: 40 }, (_, index) => ({
+      id: `finding-${index + 1}`,
+      severity: "high" as const,
+      title: `Fix ${index + 1}`,
+      evidence: `evidence ${index + 1}`,
+      location: `src/file-${index + 1}.ts:1`,
+      remediation: `remediation ${index + 1}`,
+      acceptanceCriterion: `criterion ${index + 1}`,
+    }));
+    let attempts = 0;
+    const host = {
+      async materializeRemediationChildren(input: { findings: readonly { id: string }[] }) {
+        attempts += 1;
+        if (attempts === 1) throw new Error("visibility pending");
+        return input.findings.map((finding, index) => ({
+          repo: "owner/repo", number: 100 + index, title: finding.id, body: "", url: "",
+          state: "OPEN" as const,
+        }));
+      },
+    } as unknown as ForgeHost;
+    const supervisor = new RemediationSupervisor({ host, artifacts });
+    await assert.rejects(supervisor.begin({
+      parentRun: run, parentPullRequest: pr, packetArtifact: packet, verdictArtifact: verdict,
+      reason: "scope-violation", maxRemediationChildren: 40, findings,
+    }), /visibility pending/);
+    const awaiting = await supervisor.reconstruct({ subject: { repo: "owner/repo", issue: 20 } });
+    assert.ok(awaiting);
+    assert.equal(awaiting.payload.status, "awaiting-dispatch");
+    assert.equal(awaiting.payload.findings.length, 40);
+    assert.deepEqual(awaiting.payload.findings.map((finding) => finding.id), findings.map((finding) => finding.id));
+
+    const recovered = await supervisor.resumeAwaiting({ checkpoint: awaiting, parentPullRequest: pr });
+    assert.equal(recovered.checkpoint.payload.status, "children-running");
+    assert.equal(recovered.checkpoint.payload.checkpointKey, awaiting.payload.checkpointKey);
+    assert.equal(recovered.checkpoint.payload.checkpointSequence, awaiting.payload.checkpointSequence + 1);
+    assert.deepEqual(recovered.childIssues, Array.from({ length: 40 }, (_, index) => 100 + index));
+    assert.equal((await artifacts.list({ repo: "owner/repo", issue: 20 }, "RemediationBlocked")).length, 2);
+  });
+
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {
     const { run, packet, verdict } = context();
     const artifacts = new InMemoryArtifactRepository();

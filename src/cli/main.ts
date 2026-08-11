@@ -833,7 +833,10 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
-  const github = new GitHubClient(process.cwd());
+  // Routing is read-only and may run before confirmation. Mutation paths below
+  // replace this client with the store-backed instance before any work unit is
+  // dispatched.
+  let github = new GitHubClient(process.cwd());
   const repository = await github.getRepository();
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
   const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
@@ -892,6 +895,9 @@ async function orchestrate(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  // Every confirmed orchestration mutation, including recursive remediation,
+  // must share the durable admission table used by later controllers/resumes.
+  github = new GitHubClient(process.cwd(), store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),

@@ -375,7 +375,10 @@ function remediationPayload(
     packetArtifactId: input.packetArtifact.id,
     verdictArtifactId: input.verdictArtifact.id,
     reason: input.reason,
-    findings: input.findings.slice(0, 32).map((finding) => ({
+    // The awaiting checkpoint is the authoritative recovery input. The
+    // configured child limit may be greater than the old serialization cap,
+    // so never truncate findings that were admitted for dispatch.
+    findings: input.findings.map((finding) => ({
       id: finding.id, severity: finding.severity, title: finding.title, evidence: finding.evidence.slice(0, 8_000),
       ...(finding.location ? { location: finding.location } : {}), remediation: finding.remediation.slice(0, 4_000),
       ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
