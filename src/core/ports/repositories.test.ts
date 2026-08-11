@@ -2,8 +2,26 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createArtifact } from "../artifacts/schema.js";
 import { createRun, transition } from "../state/machine.js";
-import { InMemoryRunRepository, ProjectedRunRepository } from "./repositories.js";
+import { InMemoryArtifactRepository, InMemoryRunRepository, ProjectedRunRepository } from "./repositories.js";
+
+test("fenced artifact publication rejects a stale owner before writing", async () => {
+  const artifacts = new InMemoryArtifactRepository();
+  const queued = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 7 } });
+  const intent = createArtifact({
+    kind: "Intent", runId: queued.runId, subject: queued.subject,
+    producer: { role: "controller", runtime: "test" },
+    payload: { title: "fenced", problem: "fenced", constraints: [], acceptanceHints: [], dependencies: [] },
+  }, { id: "fenced-intent", createdAt: "2026-01-01T00:00:00.000Z" });
+  let checks = 0;
+  await assert.rejects(artifacts.appendFenced(intent, {
+    itemId: "lease", operationKey: "artifact", token: "stale", epoch: 1,
+    assertOwnership: () => { checks += 1; throw new Error("stale fence"); },
+  }), /stale fence/);
+  assert.equal(checks, 1);
+  assert.deepEqual(await artifacts.list(queued.subject), []);
+});
 
 test("run-state projection follows every committed typed transition without owning authority", async () => {
   const inner = new InMemoryRunRepository();

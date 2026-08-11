@@ -99,6 +99,24 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("persists side-effect fence epochs and rejects stale owners", () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const first = store.acquire("remediation-key", "first", 10, 1_000);
+      assert.ok(first);
+      const fence = store.beginFence("remediation-key", "children", first.token, 1_001);
+      const second = store.acquire("remediation-key", "second", 10, 1_011);
+      assert.ok(second);
+      assert.throws(() => store.completeFence("remediation-key", "children", first.token, fence.epoch, 1_012), /stale|another worker/);
+      const recovered = store.beginFence("remediation-key", "children", second.token, 1_012);
+      assert.equal(recovered.epoch, fence.epoch + 1);
+      assert.equal(recovered.status, "unknown");
+      assert.equal(store.completeFence("remediation-key", "children", second.token, recovered.epoch, 1_013).status, "completed");
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses compare-and-swap versions to reject concurrent writers", async () => {
     const store = new SqliteRepositories(":memory:");
     try {

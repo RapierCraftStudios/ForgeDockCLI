@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import type { LeaseRepository } from "../../core/ports/lease.js";
-import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
+import type { LeaseRepository, LeaseSideEffectFence } from "../../core/ports/lease.js";
+import type { ArtifactFence, ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
@@ -100,26 +100,41 @@ export class RemediationSupervisor {
         const terminal = existing && existing.payload.status === "awaiting-dispatch"
           ? createCheckpointFromExisting(existing, { ...base, status: "terminal", checkpointSequence: existing.payload.checkpointSequence + 1 })
           : createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
-        await this.dependencies.artifacts.append(terminal);
+        await this.appendCheckpoint(terminal, leaseKey, admission.token, `${checkpointKey}:terminal`);
         return { checkpoint: terminal, childIssues: [] };
       }
       const awaiting = existing && existing.payload.status === "awaiting-dispatch"
         ? existing
         : createCheckpoint(input, base);
-      if (!existing) await this.dependencies.artifacts.append(awaiting);
+      if (!existing) await this.appendCheckpoint(awaiting, leaseKey, admission.token, `${checkpointKey}:awaiting`);
       if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
 
-      const children = await this.materializeChildren(input, awaiting, leaseKey, admission.token);
-      await this.assertLeaseHealthy(leaseKey, admission.token);
-      const childIssues = children.map((child) => child.number);
-      const running = createCheckpointFromExisting(awaiting, {
-        ...awaiting.payload,
-        checkpointSequence: awaiting.payload.checkpointSequence + 1,
-        status: "children-running",
-        childIssues,
-      });
-      await this.dependencies.artifacts.append(running);
-      return { checkpoint: running, childIssues };
+      const materializationOperationKey = `${checkpointKey}:children`;
+      let materializationFence: LeaseSideEffectFence | undefined;
+      try {
+        materializationFence = this.dependencies.lease && admission.token
+          ? this.dependencies.lease.beginFence(leaseKey, materializationOperationKey, admission.token)
+          : undefined;
+        const children = await this.materializeChildren(input, awaiting, leaseKey, admission.token, materializationFence);
+        if (materializationFence && this.dependencies.lease && admission.token) {
+          this.dependencies.lease.completeFence(leaseKey, materializationOperationKey, admission.token, materializationFence.epoch);
+        }
+        await this.assertLeaseHealthy(leaseKey, admission.token);
+        const childIssues = children.map((child) => child.number);
+        const running = createCheckpointFromExisting(awaiting, {
+          ...awaiting.payload,
+          checkpointSequence: awaiting.payload.checkpointSequence + 1,
+          status: "children-running",
+          childIssues,
+        });
+        await this.appendCheckpoint(running, leaseKey, admission.token, `${checkpointKey}:running`, awaiting.payload.checkpointSequence);
+        return { checkpoint: running, childIssues };
+      } catch (error) {
+        if (materializationFence && this.dependencies.lease) {
+          try { this.dependencies.lease.unknownFence(leaseKey, materializationOperationKey, materializationFence.token, materializationFence.epoch); } catch { /* a successor may already own recovery */ }
+        }
+        throw error;
+      }
     } finally {
       await admission.release();
     }
@@ -130,6 +145,7 @@ export class RemediationSupervisor {
     checkpoint: DurableArtifact<"RemediationBlocked">,
     leaseKey: string,
     leaseToken?: string,
+    fence?: { operationKey: string; epoch: number },
   ) {
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
     const heartbeat = this.startLeaseHeartbeat(leaseKey, leaseToken);
@@ -144,6 +160,7 @@ export class RemediationSupervisor {
         baseBranch: checkpoint.payload.baseBranch,
         checkpointKey: checkpoint.payload.checkpointKey,
         remediationDepth: checkpoint.payload.remediationDepth + 1,
+        ...(fence && leaseToken ? { operationKey: fence.operationKey, leaseToken, leaseEpoch: fence.epoch } : {}),
         findings: checkpoint.payload.findings.flatMap((finding) => finding.location && finding.acceptanceCriterion ? [{
           id: finding.id,
           title: finding.title,
@@ -155,6 +172,50 @@ export class RemediationSupervisor {
       });
     } finally {
       heartbeat.stop();
+    }
+  }
+
+  private async appendCheckpoint(
+    artifact: DurableArtifact<"RemediationBlocked">,
+    leaseKey: string,
+    leaseToken: string | undefined,
+    operationKey: string,
+    expectedCheckpointSequence?: number,
+  ): Promise<void> {
+    if (!this.dependencies.lease || !leaseToken) {
+      await this.dependencies.artifacts.append(artifact);
+      return;
+    }
+    if (expectedCheckpointSequence !== undefined) {
+      const latest = await latestCheckpoint(this.dependencies.artifacts, artifact.subject, artifact.payload.checkpointKey);
+      if (!latest || latest.payload.checkpointSequence !== expectedCheckpointSequence) {
+        throw new Error(`Remediation checkpoint sequence changed for ${artifact.payload.checkpointKey}`);
+      }
+      if (artifact.payload.checkpointSequence !== expectedCheckpointSequence + 1) {
+        throw new Error(`Remediation checkpoint must advance exactly one sequence for ${artifact.payload.checkpointKey}`);
+      }
+    }
+    const fence = this.dependencies.lease.beginFence(leaseKey, operationKey, leaseToken);
+    const publication: ArtifactFence = {
+      itemId: leaseKey,
+      operationKey,
+      token: leaseToken,
+      epoch: fence.epoch,
+      ...(expectedCheckpointSequence !== undefined ? { expectedCheckpointSequence } : {}),
+      assertOwnership: () => { this.dependencies.lease!.assertFence(leaseKey, operationKey, leaseToken, fence.epoch); },
+      complete: () => { this.dependencies.lease!.completeFence(leaseKey, operationKey, leaseToken, fence.epoch); },
+    };
+    try {
+      const fenced = this.dependencies.artifacts as ArtifactRepository & { appendFenced?: (artifact: DurableArtifact, fence: ArtifactFence) => Promise<void> };
+      if (fenced.appendFenced) await fenced.appendFenced(artifact, publication);
+      else {
+        await publication.assertOwnership?.();
+        await this.dependencies.artifacts.append(artifact);
+        await publication.complete?.();
+      }
+    } catch (error) {
+      try { this.dependencies.lease.unknownFence(leaseKey, operationKey, leaseToken, fence.epoch); } catch { /* recovery may already have transferred the fence */ }
+      throw error;
     }
   }
 

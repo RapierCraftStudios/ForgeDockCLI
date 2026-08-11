@@ -4,8 +4,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
-import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
-import { ConcurrentRunUpdateError, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
+import type { Lease, LeaseRepository, LeaseSideEffectFence } from "../../core/ports/lease.js";
+import { ConcurrentRunUpdateError, type ArtifactFence, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
@@ -53,6 +53,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS lease_fences (
+        item_id TEXT NOT NULL,
+        operation_key TEXT NOT NULL,
+        token TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (item_id, operation_key)
+      );
       CREATE TABLE IF NOT EXISTS run_telemetry (
         telemetry_key TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -72,6 +82,12 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       VALUES (?, ?, ?, ?)
       ON CONFLICT(artifact_id) DO NOTHING
     `).run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact));
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: ArtifactFence): Promise<void> {
+    await fence.assertOwnership?.();
+    await this.append(artifact);
+    await fence.complete?.();
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
@@ -209,6 +225,98 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
   }
 
+  beginFence(itemId: string, operationKey: string, token: string, now = Date.now()): LeaseSideEffectFence {
+    this.assertCurrentLease(itemId, token, now);
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#database.prepare("SELECT * FROM lease_fences WHERE item_id = ? AND operation_key = ?")
+        .get(itemId, operationKey) as FenceRow | undefined;
+      if (row?.token === token) {
+        this.#database.exec("COMMIT");
+        return fenceFromRow(row);
+      }
+      const epoch = (row?.epoch ?? 0) + 1;
+      this.#database.prepare(`
+        INSERT INTO lease_fences (item_id, operation_key, token, epoch, status, started_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_id, operation_key) DO UPDATE SET token = excluded.token, epoch = excluded.epoch, status = excluded.status, updated_at = excluded.updated_at
+      `).run(itemId, operationKey, token, epoch, row && row.token !== token ? "unknown" : "active", row?.started_at ?? now, now);
+      this.#database.exec("COMMIT");
+      return { itemId, operationKey, token, epoch, status: row && row.token !== token ? "unknown" : "active", startedAt: row?.started_at ?? now, updatedAt: now };
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  assertFence(itemId: string, operationKey: string, token: string, epoch: number, now = Date.now()): LeaseSideEffectFence {
+    this.assertCurrentLease(itemId, token, now);
+    const row = this.#database.prepare("SELECT * FROM lease_fences WHERE item_id = ? AND operation_key = ?")
+      .get(itemId, operationKey) as FenceRow | undefined;
+    if (!row || row.token !== token || row.epoch !== epoch) throw new Error(`Lease fence is stale or owned by another worker: ${operationKey}`);
+    return fenceFromRow(row);
+  }
+
+  renewFence(itemId: string, operationKey: string, token: string, epoch: number, now = Date.now()): LeaseSideEffectFence {
+    this.assertFence(itemId, operationKey, token, epoch, now);
+    this.#database.prepare("UPDATE lease_fences SET updated_at = ? WHERE item_id = ? AND operation_key = ? AND token = ? AND epoch = ?")
+      .run(now, itemId, operationKey, token, epoch);
+    return this.assertFence(itemId, operationKey, token, epoch, now);
+  }
+
+  completeFence(itemId: string, operationKey: string, token: string, epoch: number, now = Date.now()): LeaseSideEffectFence {
+    this.assertFence(itemId, operationKey, token, epoch, now);
+    const result = this.#database.prepare(`
+      UPDATE lease_fences SET status = 'completed', updated_at = ?
+      WHERE item_id = ? AND operation_key = ? AND token = ? AND epoch = ?
+    `).run(now, itemId, operationKey, token, epoch);
+    if (result.changes !== 1) throw new Error(`Lease fence is stale or owned by another worker: ${operationKey}`);
+    return this.assertFence(itemId, operationKey, token, epoch, now);
+  }
+
+  unknownFence(itemId: string, operationKey: string, token: string, epoch: number, now = Date.now()): LeaseSideEffectFence {
+    const result = this.#database.prepare(`
+      UPDATE lease_fences SET status = 'unknown', updated_at = ?
+      WHERE item_id = ? AND operation_key = ? AND token = ? AND epoch = ?
+    `).run(now, itemId, operationKey, token, epoch);
+    if (result.changes !== 1) throw new Error(`Lease fence is stale or already recovered: ${operationKey}`);
+    const row = this.#database.prepare("SELECT * FROM lease_fences WHERE item_id = ? AND operation_key = ?")
+      .get(itemId, operationKey) as FenceRow;
+    return fenceFromRow(row);
+  }
+
+  recoverFence(itemId: string, operationKey: string, token: string, now = Date.now()): LeaseSideEffectFence {
+    this.assertCurrentLease(itemId, token, now);
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#database.prepare("SELECT * FROM lease_fences WHERE item_id = ? AND operation_key = ?")
+        .get(itemId, operationKey) as FenceRow | undefined;
+      if (!row) {
+        this.#database.prepare(`INSERT INTO lease_fences (item_id, operation_key, token, epoch, status, started_at, updated_at) VALUES (?, ?, ?, 1, 'active', ?, ?)`)
+          .run(itemId, operationKey, token, now, now);
+        this.#database.exec("COMMIT");
+        return { itemId, operationKey, token, epoch: 1, status: "active", startedAt: now, updatedAt: now };
+      }
+      if (row.token === token) {
+        this.#database.exec("COMMIT");
+        return fenceFromRow(row);
+      }
+      const epoch = row.epoch + 1;
+      this.#database.prepare("UPDATE lease_fences SET token = ?, epoch = ?, status = 'active', updated_at = ? WHERE item_id = ? AND operation_key = ?")
+        .run(token, epoch, now, itemId, operationKey);
+      this.#database.exec("COMMIT");
+      return { itemId, operationKey, token, epoch, status: "active", startedAt: row.started_at, updatedAt: now };
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private assertCurrentLease(itemId: string, token: string, now: number): void {
+    const row = this.#database.prepare("SELECT token, expires_at FROM leases WHERE item_id = ?").get(itemId) as { token: string; expires_at: number } | undefined;
+    if (!row || row.token !== token || row.expires_at <= now) throw new Error(`Lease is absent, stale, or owned by another worker: ${itemId}`);
+  }
+
   close(): void {
     this.#database.close();
   }
@@ -222,5 +330,27 @@ function leaseFromRow(row: Record<string, string | number>): Lease {
   return {
     itemId: String(row.item_id), owner: String(row.owner), token: String(row.token),
     acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at),
+  };
+}
+
+type FenceRow = {
+  item_id: string;
+  operation_key: string;
+  token: string;
+  epoch: number;
+  status: "active" | "unknown" | "completed";
+  started_at: number;
+  updated_at: number;
+};
+
+function fenceFromRow(row: FenceRow): LeaseSideEffectFence {
+  return {
+    itemId: row.item_id,
+    operationKey: row.operation_key,
+    token: row.token,
+    epoch: row.epoch,
+    status: row.status,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
   };
 }

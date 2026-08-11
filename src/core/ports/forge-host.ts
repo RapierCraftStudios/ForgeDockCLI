@@ -27,6 +27,30 @@ export interface DecompositionChild {
   dependsOn: string[];
 }
 
+export interface RemediationChildrenInput {
+  repo: string;
+  parentRunId: string;
+  parentIssue: number;
+  parentPullRequest: number;
+  headSha: string;
+  headBranch: string;
+  baseBranch: string;
+  checkpointKey: string;
+  remediationDepth: number;
+  /** Stable operation identity used to serialize and reconcile an accepted request. */
+  operationKey?: string;
+  leaseToken?: string;
+  leaseEpoch?: number;
+  findings: readonly {
+    id: string;
+    title: string;
+    evidence: string;
+    location: string;
+    remediation: string;
+    acceptanceCriterion: string;
+  }[];
+}
+
 export interface ReviewFindingInput {
   id: string;
   severity: "critical" | "high" | "medium" | "low";
@@ -74,25 +98,7 @@ export interface ForgeHost {
     marker: string;
     body: string;
   }): Promise<void>;
-  materializeRemediationChildren?(input: {
-    repo: string;
-    parentRunId: string;
-    parentIssue: number;
-    parentPullRequest: number;
-    headSha: string;
-    headBranch: string;
-    baseBranch: string;
-    checkpointKey: string;
-    remediationDepth: number;
-    findings: readonly {
-      id: string;
-      title: string;
-      evidence: string;
-      location: string;
-      remediation: string;
-      acceptanceCriterion: string;
-    }[];
-  }): Promise<IssueSnapshot[]>;
+  materializeRemediationChildren?(input: RemediationChildrenInput): Promise<IssueSnapshot[]>;
   materializeDecomposition(input: {
     repo: string;
     parentIssue: number;

@@ -211,6 +211,43 @@ describe("GitHub remediation materialization", () => {
   });
 });
 
+describe("GitHub remediation concurrency", () => {
+  it("serializes delayed issue acceptance and returns one canonical marker snapshot", async () => {
+    const client = new GitHubClient();
+    const input = {
+      repo: "a/b", parentRunId: "run_parent", parentIssue: 20, parentPullRequest: 9,
+      headSha: "a".repeat(40), headBranch: "forge/parent", baseBranch: "main", checkpointKey: "d".repeat(64), operationKey: "shared-remediation-operation", remediationDepth: 1,
+      findings: [{ id: "finding-1", title: "Fix", evidence: "Evidence", location: "src/a.ts:1", remediation: "Guard", acceptanceCriterion: "Guard passes" }],
+    };
+    const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, "finding-1");
+    let issue: { number: number; title: string; body: string; html_url: string; state: string } | undefined;
+    let creates = 0;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredCreate = new Promise<void>((resolve) => { entered = resolve; });
+    const releaseCreate = new Promise<void>((resolve) => { release = resolve; });
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issue ? [issue] : []]);
+      if (args[0] === "issue" && args[1] === "create") {
+        creates += 1;
+        issue = { number: 41, title: "Child", body: body ?? `<!-- FORGEDOCK:REMEDIATION_CHILD ${marker} -->`, html_url: "https://github.test/a/b/issues/41", state: "open" };
+        entered();
+        await releaseCreate;
+        return "https://github.test/a/b/issues/41\n";
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const first = client.materializeRemediationChildren(input);
+    await enteredCreate;
+    const second = client.materializeRemediationChildren(input);
+    release();
+    const [left, right] = await Promise.all([first, second]);
+    assert.equal(creates, 1);
+    assert.deepEqual(left.map((child) => child.number), [41]);
+    assert.deepEqual(right.map((child) => child.number), [41]);
+  });
+});
+
 describe("GitHub issue closure", () => {
   function closeClient(closeChangesState: boolean) {
     let state: "OPEN" | "CLOSED" = "OPEN";
@@ -263,6 +300,23 @@ describe("GitHub durable artifact projection", () => {
     assert.equal(client.comments.get("a/b#pr3")?.length, 1);
     assert.equal(client.comments.get("a/b#i2")?.length, 1);
     assert.equal((await repository.list(artifact.subject)).length, 1);
+  });
+
+  it("reconciles a comment accepted before lease loss without posting a duplicate", async () => {
+    const client = new CommentClient();
+    const repository = new GitHubArtifactRepository(client);
+    const artifact = createArtifact({
+      kind: "Intent", runId: "fenced", subject: { repo: "a/b", issue: 2 }, producer: { role: "controller" },
+      payload: { title: "fenced", problem: "fenced", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    let assertions = 0;
+    await assert.rejects(repository.appendFenced(artifact, {
+      itemId: "lease", operationKey: "comment", token: "owner", epoch: 1,
+      assertOwnership: () => { assertions += 1; if (assertions === 2) throw new Error("lease lost after POST"); },
+    }), /lease lost after POST/);
+    assert.equal(client.comments.get("a/b#i2")?.length, 1);
+    await repository.append(artifact);
+    assert.equal(client.comments.get("a/b#i2")?.length, 1);
   });
 
   it("filters embedded artifacts by canonical target while retaining issue/PR overlap", async () => {

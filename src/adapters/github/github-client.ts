@@ -5,8 +5,8 @@ import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
-import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
-import type { ArtifactRepository } from "../../core/ports/repositories.js";
+import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, RemediationChildrenInput, ReviewFindingInput } from "../../core/ports/forge-host.js";
+import type { ArtifactFence, ArtifactRepository } from "../../core/ports/repositories.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 
 export function repositoryFromRemote(remote: string): string | undefined {
@@ -83,6 +83,8 @@ export interface BatchIssueInput {
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
+  /** Serializes one deterministic remediation operation through remote acceptance. */
+  private readonly remediationMaterializationLocks = new Map<string, Promise<IssueSnapshot[]>>();
 
   constructor(readonly cwd = process.cwd()) {}
 
@@ -424,25 +426,23 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
-  async materializeRemediationChildren(input: {
-    repo: string;
-    parentRunId: string;
-    parentIssue: number;
-    parentPullRequest: number;
-    headSha: string;
-    headBranch: string;
-    baseBranch: string;
-    checkpointKey: string;
-    remediationDepth: number;
-    findings: readonly {
-      id: string;
-      title: string;
-      evidence: string;
-      location: string;
-      remediation: string;
-      acceptanceCriterion: string;
-    }[];
-  }): Promise<IssueSnapshot[]> {
+  async materializeRemediationChildren(input: RemediationChildrenInput): Promise<IssueSnapshot[]> {
+    if (!input.findings.length) return [];
+    const operationKey = input.operationKey ?? `${input.repo.toLowerCase()}:${input.checkpointKey}`;
+    const prior = this.remediationMaterializationLocks.get(operationKey);
+    if (prior) return prior;
+    const current = this.materializeRemediationChildrenLocked(input);
+    this.remediationMaterializationLocks.set(operationKey, current);
+    try {
+      return await current;
+    } finally {
+      if (this.remediationMaterializationLocks.get(operationKey) === current) {
+        this.remediationMaterializationLocks.delete(operationKey);
+      }
+    }
+  }
+
+  private async materializeRemediationChildrenLocked(input: RemediationChildrenInput): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
     const existing = await this.listAllIssues(input.repo);
     // Index markers deterministically so a retry reuses the authoritative
@@ -480,9 +480,30 @@ export class GitHubClient implements ForgeHost {
         "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
         "", marker,
       ].join("\n");
-      const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
+      let url: string;
+      try {
+        url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
+      } catch (error) {
+        // A local process failure is not proof that GitHub rejected an accepted request.
+        // Re-read the deterministic marker before classifying the operation as failed.
+        const adopted = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker));
+        if (adopted) {
+          byMarker.set(marker, adopted);
+          created.push(adopted);
+          continue;
+        }
+        throw error;
+      }
       const number = Number(url.split("/").at(-1));
-      if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
+      if (!url || !Number.isSafeInteger(number) || number < 1) {
+        const adopted = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker));
+        if (adopted) {
+          byMarker.set(marker, adopted);
+          created.push(adopted);
+          continue;
+        }
+        throw new Error("GitHub did not return a remediation issue number");
+      }
       const issue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
       byMarker.set(marker, issue);
       created.push(issue);
@@ -785,6 +806,18 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   constructor(readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment">) {}
 
   async append(artifact: DurableArtifact): Promise<void> {
+    await this.appendInternal(artifact);
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: ArtifactFence): Promise<void> {
+    await fence.assertOwnership?.();
+    await this.appendInternal(artifact);
+    // A lease loss after POST is an unknown outcome, not a successful commit.
+    await fence.assertOwnership?.();
+    await fence.complete?.();
+  }
+
+  private async appendInternal(artifact: DurableArtifact): Promise<void> {
     const canonical = canonicalSubject(artifact.subject);
     const targets: Subject[] = canonical.pr && canonical.issue
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]

@@ -122,6 +122,20 @@ describe("durable recursive remediation", () => {
     assert.equal(attempts, 2);
   });
 
+  it("fences stale remediation owners before the authoritative child transition", () => {
+    const leases = new InMemoryLeaseRepository();
+    const first = leases.acquire("remediation-key", "first", 10, 1_000);
+    assert.ok(first);
+    const fence = leases.beginFence("remediation-key", "children", first.token, 1_001);
+    const second = leases.acquire("remediation-key", "second", 10, 1_011);
+    assert.ok(second);
+    assert.throws(() => leases.completeFence("remediation-key", "children", first.token, fence.epoch, 1_012), /stale|another worker/);
+    const recovered = leases.beginFence("remediation-key", "children", second.token, 1_012);
+    assert.equal(recovered.epoch, fence.epoch + 1);
+    assert.equal(recovered.status, "unknown");
+    assert.equal(leases.completeFence("remediation-key", "children", second.token, recovered.epoch, 1_013).status, "completed");
+  });
+
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {
     const { run, packet, verdict } = context();
     const artifacts = new InMemoryArtifactRepository();

@@ -6,6 +6,22 @@ import type { RunState, TransitionRecord } from "../state/machine.js";
 export interface ArtifactRepository {
   append(artifact: DurableArtifact): Promise<void>;
   list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]>;
+  appendFenced?(artifact: DurableArtifact, fence: ArtifactFence): Promise<void>;
+}
+
+/** The callbacks are the durable ownership-CAS boundary for an irreversible publication. */
+export interface ArtifactFence {
+  itemId: string;
+  operationKey: string;
+  token: string;
+  epoch: number;
+  expectedCheckpointSequence?: number;
+  assertOwnership?: () => void | Promise<void>;
+  complete?: () => void | Promise<void>;
+}
+
+export interface FencedArtifactRepository extends ArtifactRepository {
+  appendFenced(artifact: DurableArtifact, fence: ArtifactFence): Promise<void>;
 }
 
 export interface RunProgressRecord {
@@ -37,6 +53,19 @@ export class CachedArtifactRepository implements ArtifactRepository {
     const artifacts = await this.authoritative.list(subject, kind);
     for (const artifact of artifacts) await this.cache.append(artifact);
     return artifacts;
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: ArtifactFence): Promise<void> {
+    const authoritative = this.authoritative as Partial<FencedArtifactRepository>;
+    if (typeof authoritative.appendFenced === "function") {
+      await authoritative.appendFenced.call(this.authoritative, artifact, fence);
+      await this.cache.append(artifact);
+      return;
+    }
+    await fence.assertOwnership?.();
+    await this.authoritative.append(artifact);
+    await fence.complete?.();
+    await this.cache.append(artifact);
   }
 }
 
@@ -85,6 +114,12 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   async append(artifact: DurableArtifact): Promise<void> {
     if (this.artifacts.some((item) => item.id === artifact.id)) return;
     this.artifacts.push(structuredClone(artifact));
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: ArtifactFence): Promise<void> {
+    await fence.assertOwnership?.();
+    await this.append(artifact);
+    await fence.complete?.();
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
