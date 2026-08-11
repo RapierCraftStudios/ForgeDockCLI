@@ -209,6 +209,40 @@ describe("GitHub remediation materialization", () => {
     assert.deepEqual(second.map((child) => child.number), [40]);
     assert.equal(creates, 1);
   });
+
+  it("adopts an accepted but initially invisible create across separate clients without creating again", async () => {
+    const input = {
+      repo: "a/b", parentRunId: "run_parent", parentIssue: 20, parentPullRequest: 9,
+      headSha: "a".repeat(40), headBranch: "forge/parent", baseBranch: "main", checkpointKey: "c".repeat(64), remediationDepth: 1,
+      findings: [{ id: "finding-1", title: "Fix", evidence: "Evidence", location: "src/a.ts:1", remediation: "Guard", acceptanceCriterion: "Guard passes" }],
+    };
+    const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, "finding-1");
+    let issue: { number: number; title: string; body: string; html_url: string; state: string } | undefined;
+    let creates = 0;
+    const gh = async (args: string[], body?: string) => {
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) {
+        return creates > 0
+          ? JSON.stringify([[{ number: 41, title: "Child", body: `<!-- FORGEDOCK:REMEDIATION_CHILD ${marker} -->`, html_url: "https://github.test/a/b/issues/41", state: "open" }]])
+          : "[[]]";
+      }
+      if (args[0] === "issue" && args[1] === "create") {
+        creates += 1;
+        issue = { number: 41, title: "Child", body: `<!-- FORGEDOCK:REMEDIATION_CHILD ${marker} -->`, html_url: "https://github.test/a/b/issues/41", state: "open" };
+        throw new Error("accepted create response interrupted");
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    };
+    const firstClient = new GitHubClient();
+    const recoveryClient = new GitHubClient();
+    Object.defineProperty(firstClient, "gh", { value: gh });
+    Object.defineProperty(recoveryClient, "gh", { value: gh });
+
+    await assert.rejects(firstClient.materializeRemediationChildren(input), /interrupted/);
+    const recovered = await recoveryClient.materializeRemediationChildren({ ...input, recoveryOnly: true });
+    assert.equal(creates, 1);
+    assert.equal(recovered[0]?.number, 41);
+    assert.equal(recovered[0]?.body.includes(marker), true);
+  });
 });
 
 describe("GitHub issue closure", () => {

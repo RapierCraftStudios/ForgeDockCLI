@@ -80,6 +80,15 @@ export interface BatchIssueInput {
   milestone?: string;
 }
 
+export class RemediationAdoptionPendingError extends Error {
+  constructor(markers: readonly string[]) {
+    super(`Remediation marker reconciliation is unresolved; refusing issue creation for ${markers.join(", ")}`);
+    this.name = "RemediationAdoptionPendingError";
+  }
+}
+
+const REMEDIATION_RECONCILIATION_ATTEMPTS = 8;
+
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
@@ -434,6 +443,7 @@ export class GitHubClient implements ForgeHost {
     baseBranch: string;
     checkpointKey: string;
     remediationDepth: number;
+    recoveryOnly?: boolean;
     findings: readonly {
       id: string;
       title: string;
@@ -444,24 +454,26 @@ export class GitHubClient implements ForgeHost {
     }[];
   }): Promise<IssueSnapshot[]> {
     if (!input.findings.length) return [];
-    const existing = await this.listAllIssues(input.repo);
-    // Index markers deterministically so a retry reuses the authoritative
-    // marked issue even if historical duplicate markers are present.
-    const byMarker = new Map<string, IssueSnapshot>();
-    for (const issue of [...existing].sort((left, right) => left.number - right.number)) {
-      const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
-      if (!match?.[1] || byMarker.has(match[1])) continue;
-      byMarker.set(match[1], issue);
-    }
+    const markers = input.findings.map((finding) => remediationChildMarker(
+      input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id,
+    ));
+    // A miss is not evidence of absence. Re-read the authoritative namespace
+    // before an initial create, and fail closed for recovery admissions.
+    const byMarker = await this.reconcileRemediationMarkers(input.repo, markers);
+    const unresolved = markers.filter((marker) => !byMarker.has(marker));
+    if (input.recoveryOnly && unresolved.length) throw new RemediationAdoptionPendingError(unresolved);
+
     const created: IssueSnapshot[] = [];
-    for (const finding of input.findings) {
-      const marker = remediationChildMarker(input.repo, input.parentRunId, input.parentIssue, input.parentPullRequest, input.headSha, finding.id);
+    for (const [index, finding] of input.findings.entries()) {
+      const marker = markers[index];
+      if (!marker) throw new Error("Remediation finding marker was not computed");
       const existingIssue = byMarker.get(marker);
       if (existingIssue) {
         // Do not recreate or mutate a marker-matched issue on restart.
         created.push(existingIssue);
         continue;
       }
+      if (input.recoveryOnly) throw new RemediationAdoptionPendingError([marker]);
       const title = boundedGitHubText(`fix: ${finding.title} (remediation for #${input.parentIssue})`, 240).replace(/[\r\n]+/g, " ");
       const body = [
         "## Problem", "", boundedGitHubText(finding.title, 1_000), "",
@@ -483,11 +495,40 @@ export class GitHubClient implements ForgeHost {
       const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
       const number = Number(url.split("/").at(-1));
       if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
-      const issue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
+      const createdIssue: IssueSnapshot = { repo: input.repo, number, title, body, url, state: "OPEN" };
+      let issue = createdIssue;
+      try {
+        // Prefer the server projection, while retaining the create response as
+        // a safe fallback when GitHub has not projected it yet.
+        const projected = await this.getIssue(number, input.repo);
+        if (projected.number !== number || !projected.body.includes(marker)) {
+          throw new Error("GitHub issue projection did not retain the remediation marker");
+        }
+        issue = projected;
+      } catch {
+        issue = createdIssue;
+      }
       byMarker.set(marker, issue);
       created.push(issue);
     }
     return created;
+  }
+
+  private async reconcileRemediationMarkers(repo: string, markers: readonly string[]): Promise<Map<string, IssueSnapshot>> {
+    const byMarker = new Map<string, IssueSnapshot>();
+    const wanted = new Set(markers);
+    for (let attempt = 0; attempt < REMEDIATION_RECONCILIATION_ATTEMPTS; attempt += 1) {
+      const issues = await this.listAllIssues(repo);
+      for (const issue of [...issues].sort((left, right) => left.number - right.number)) {
+        const match = /<!-- FORGEDOCK:REMEDIATION_CHILD ([a-f0-9]{64}) -->/.exec(issue.body);
+        if (match?.[1] && wanted.has(match[1])) {
+          const prior = byMarker.get(match[1]);
+          if (!prior || issue.number < prior.number) byMarker.set(match[1], issue);
+        }
+      }
+      if (markers.every((marker) => byMarker.has(marker))) break;
+    }
+    return byMarker;
   }
 
   async createPullRequest(input: {

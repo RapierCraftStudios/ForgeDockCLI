@@ -238,6 +238,10 @@ export const RemediationBlockedPayloadSchema = Type.Object({
     Type.Literal("awaiting-dispatch"), Type.Literal("children-running"),
     Type.Literal("ready-to-resume"), Type.Literal("terminal"),
   ]),
+  /** Omitted on legacy awaiting checkpoints; readers must treat those as in-flight. */
+  materializationState: Type.Optional(Type.Union([
+    Type.Literal("not-started"), Type.Literal("in-flight"),
+  ])),
   parentRunId: NonEmptyString,
   parentIssue: Type.Integer({ minimum: 1 }),
   pullRequest: Type.Integer({ minimum: 1 }),

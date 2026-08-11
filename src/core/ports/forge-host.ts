@@ -84,6 +84,8 @@ export interface ForgeHost {
     baseBranch: string;
     checkpointKey: string;
     remediationDepth: number;
+    /** Recovery-only reconciliation must never create an issue on a marker miss. */
+    recoveryOnly: boolean;
     findings: readonly {
       id: string;
       title: string;

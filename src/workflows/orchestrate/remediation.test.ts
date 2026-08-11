@@ -122,6 +122,51 @@ describe("durable recursive remediation", () => {
     assert.equal(attempts, 2);
   });
 
+  it("recovers an in-flight admission with a separate supervisor without a partial running checkpoint", async () => {
+    const { run, packet, verdict } = context();
+    const artifacts = new InMemoryArtifactRepository();
+    const leases = new InMemoryLeaseRepository();
+    const input = {
+      parentRun: run,
+      parentPullRequest: pr,
+      packetArtifact: packet,
+      verdictArtifact: verdict,
+      reason: "scope-violation" as const,
+      findings: [{ id: "finding-1", severity: "high" as const, title: "Fix", evidence: "e", location: "src/a.ts", remediation: "r", acceptanceCriterion: "Fix the bug" }],
+    };
+    let creates = 0;
+    let recoveryOnly: boolean | undefined;
+    const firstHost = {
+      async materializeRemediationChildren(input: { recoveryOnly: boolean }) {
+        recoveryOnly = input.recoveryOnly;
+        creates += 1;
+        throw new Error("accepted create response interrupted");
+      },
+    } as unknown as ForgeHost;
+    const secondHost = {
+      async materializeRemediationChildren(input: { recoveryOnly: boolean }) {
+        recoveryOnly = input.recoveryOnly;
+        return [{ repo: "owner/repo", number: 30, title: "Child", body: "", url: "", state: "OPEN" as const }];
+      },
+    } as unknown as ForgeHost;
+    const first = new RemediationSupervisor({ host: firstHost, artifacts, lease: leases });
+    const recovery = new RemediationSupervisor({ host: secondHost, artifacts, lease: leases });
+
+    await assert.rejects(first.begin(input), /accepted create response interrupted/);
+    const awaiting = await first.reconstruct({ subject: { repo: "owner/repo", issue: 20 } });
+    assert.equal(awaiting?.payload.status, "awaiting-dispatch");
+    assert.equal(awaiting?.payload.materializationState, "in-flight");
+    assert.deepEqual(awaiting?.payload.childIssues, []);
+    assert.equal((await artifacts.list({ repo: "owner/repo", issue: 20 }, "RemediationBlocked"))
+      .some((artifact) => artifact.kind === "RemediationBlocked" && artifact.payload.status === "children-running"), false);
+
+    const resumed = await recovery.begin(input);
+    assert.equal(recoveryOnly, true);
+    assert.equal(creates, 1);
+    assert.equal(resumed.checkpoint.payload.status, "children-running");
+    assert.deepEqual(resumed.childIssues, [30]);
+  });
+
   it("uses the explicit expanded-review transition only after child outcomes are merged", async () => {
     const { run, packet, verdict } = context();
     const artifacts = new InMemoryArtifactRepository();

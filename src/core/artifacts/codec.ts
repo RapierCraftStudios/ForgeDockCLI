@@ -109,6 +109,9 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     case "RemediationBlocked": {
       const payload = artifact.payload as RemediationBlockedPayload;
       return [heading, meta, "", `**Status:** \`${payload.status}\` · **Reason:** \`${payload.reason}\``,
+        payload.status === "awaiting-dispatch"
+          ? `**Materialization:** \`${payload.materializationState ?? "in-flight"}\``
+          : "",
         `**Parent:** issue #${payload.parentIssue} · PR #${payload.pullRequest} · head \`${payload.headSha}\``,
         `**Branch:** \`${payload.headBranch}\` → \`${payload.baseBranch}\` · depth ${payload.remediationDepth}/${payload.maxRemediationDepth}`,
         listSection("Findings", payload.findings.map((finding) => `**${finding.severity.toUpperCase()} · ${finding.title}** — ${finding.location ?? "location not recorded"}\n${finding.evidence}\nRemediation: ${finding.remediation}`)),

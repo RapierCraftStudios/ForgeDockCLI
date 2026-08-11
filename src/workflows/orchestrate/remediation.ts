@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, IssueSnapshot, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { LeaseRepository } from "../../core/ports/lease.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -109,12 +109,30 @@ export class RemediationSupervisor {
       if (!existing) await this.dependencies.artifacts.append(awaiting);
       if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
 
-      const children = await this.materializeChildren(input, awaiting, leaseKey, admission.token);
+      // An omitted state is deliberately conservative: old checkpoints may have
+      // been written after GitHub accepted a create but before its result was
+      // durable. They can only reconcile an existing marker, never create.
+      const legacyAwaiting = awaiting.payload.materializationState === undefined;
+      const recoveryOnly = legacyAwaiting || awaiting.payload.materializationState === "in-flight";
+      let inFlight = awaiting;
+      if (!recoveryOnly || legacyAwaiting) {
+        inFlight = createCheckpointFromExisting(awaiting, {
+          ...awaiting.payload,
+          checkpointSequence: awaiting.payload.checkpointSequence + 1,
+          status: "awaiting-dispatch",
+          materializationState: "in-flight",
+          childIssues: [],
+        });
+        await this.dependencies.artifacts.append(inFlight);
+      }
+
+      const children = await this.materializeChildren(input, inFlight, recoveryOnly, leaseKey, admission.token);
       await this.assertLeaseHealthy(leaseKey, admission.token);
+      assertCompleteMaterialization(children, inFlight, input.parentRun.subject.repo);
       const childIssues = children.map((child) => child.number);
-      const running = createCheckpointFromExisting(awaiting, {
-        ...awaiting.payload,
-        checkpointSequence: awaiting.payload.checkpointSequence + 1,
+      const running = createCheckpointFromExisting(inFlight, {
+        ...inFlight.payload,
+        checkpointSequence: inFlight.payload.checkpointSequence + 1,
         status: "children-running",
         childIssues,
       });
@@ -128,9 +146,10 @@ export class RemediationSupervisor {
   private async materializeChildren(
     input: RemediationBlockedInput,
     checkpoint: DurableArtifact<"RemediationBlocked">,
+    recoveryOnly: boolean,
     leaseKey: string,
     leaseToken?: string,
-  ) {
+  ): Promise<IssueSnapshot[]> {
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
     const heartbeat = this.startLeaseHeartbeat(leaseKey, leaseToken);
     try {
@@ -144,6 +163,7 @@ export class RemediationSupervisor {
         baseBranch: checkpoint.payload.baseBranch,
         checkpointKey: checkpoint.payload.checkpointKey,
         remediationDepth: checkpoint.payload.remediationDepth + 1,
+        recoveryOnly,
         findings: checkpoint.payload.findings.flatMap((finding) => finding.location && finding.acceptanceCriterion ? [{
           id: finding.id,
           title: finding.title,
@@ -376,6 +396,25 @@ function actionableFindings(findings: readonly RemediationFindingInput[]): Remed
     .filter((finding, index, all) => all.findIndex((candidate) => candidate.id === finding.id) === index);
 }
 
+function assertCompleteMaterialization(
+  children: readonly IssueSnapshot[],
+  checkpoint: DurableArtifact<"RemediationBlocked">,
+  repo: string,
+): void {
+  const expected = checkpoint.payload.findings.length;
+  if (children.length !== expected) {
+    throw new Error(`Remediation materialization returned ${children.length} children; expected ${expected}`);
+  }
+  const numbers = new Set<number>();
+  for (const child of children) {
+    if (child.repo.toLowerCase() !== repo.toLowerCase() || !Number.isSafeInteger(child.number) || child.number < 1) {
+      throw new Error("Remediation materialization returned an invalid child snapshot");
+    }
+    if (numbers.has(child.number)) throw new Error(`Remediation materialization returned duplicate child #${child.number}`);
+    numbers.add(child.number);
+  }
+}
+
 function remediationPayload(
   input: RemediationBlockedInput,
   checkpointKey: string,
@@ -391,6 +430,7 @@ function remediationPayload(
     checkpointKey,
     checkpointSequence,
     status,
+    ...(status === "awaiting-dispatch" ? { materializationState: "not-started" as const } : {}),
     parentRunId: input.parentRun.runId,
     parentIssue: input.parentRun.subject.issue ?? input.parentPullRequest.number,
     pullRequest: input.parentPullRequest.number,
