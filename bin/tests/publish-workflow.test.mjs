@@ -25,8 +25,8 @@ describe("npm publish workflow recovery", () => {
     for (const path of ["src/**", "vendor/pi", "vendor/pi/**", "vendor/pi-runtime", "vendor/pi-runtime/**"]) {
       assert.ok(pushPaths.includes(`'${path}'`), `push.paths should include '${path}'`);
     }
-    for (const path of ["src/", "vendor/pi", "vendor/pi/**", "vendor/pi-runtime", "vendor/pi-runtime/**"]) {
-      assert.ok(changedPathGuard.includes(`'${path}'`), `changed-path guard should include '${path}'`);
+    for (const path of ["src/", "'vendor/pi'", "'vendor/pi/**'", "'vendor/pi-runtime'", "'vendor/pi-runtime/**'"]) {
+      assert.ok(changedPathGuard.includes(path), `changed-path guard should include ${path}`);
     }
     assert.doesNotMatch(changedPathGuard, /\.github\/workflows\/publish\.yml/);
   });
