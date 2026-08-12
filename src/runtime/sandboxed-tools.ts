@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash, createPrivateKey, createPublicKey, sign as cryptoSign } from "node:crypto";
 import { constants } from "node:fs";
 import { access, glob as fsGlob, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
@@ -12,6 +13,7 @@ import {
   createWriteTool,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
 import type { ToolGrant } from "./agent-runtime.js";
 
 /**
@@ -71,6 +73,7 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
       readdir: async (path) => readdir(await guard.existing(path)),
     } }) as unknown as ToolDefinition);
   }
+  if (grants.includes("compute")) tools.push(createDeterministicComputeTool());
   if (grants.includes("edit")) {
     tools.push(createEditTool(cwd, { operations: {
       readFile: async (path) => readFile(await guard.existing(path)),
@@ -85,6 +88,84 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
     } }) as unknown as ToolDefinition);
   }
   return tools;
+}
+
+const ComputeSchema = Type.Object({
+  operation: Type.Union([
+    Type.Literal("sha256"), Type.Literal("base64url_encode"), Type.Literal("jcs"), Type.Literal("ed25519_sign"),
+  ]),
+  data: Type.Optional(Type.String({ maxLength: 1_000_000 })),
+  encoding: Type.Optional(Type.Union([
+    Type.Literal("utf8"), Type.Literal("hex"), Type.Literal("base64"), Type.Literal("base64url"),
+  ])),
+  seedHex: Type.Optional(Type.String({ pattern: "^[0-9a-fA-F]{64}$" })),
+  value: Type.Optional(Type.Unknown()),
+});
+type ComputeInput = Static<typeof ComputeSchema>;
+
+/** Pure bounded computation for builders; no process, network, environment, or filesystem authority. */
+export function createDeterministicComputeTool(): ToolDefinition {
+  return {
+    name: "compute",
+    label: "compute",
+    description: "Perform side-effect-free SHA-256, base64url, canonical JSON (JCS-compatible JSON domain), or Ed25519 test-vector signing. This tool cannot access files, processes, environment variables, Git, or the network.",
+    promptSnippet: "Perform bounded deterministic cryptographic/encoding computations without shell access",
+    parameters: ComputeSchema,
+    async execute(_toolCallId, input: ComputeInput, signal?: AbortSignal) {
+      if (signal?.aborted) throw signal.reason ?? new Error("Computation aborted");
+      let output: Record<string, unknown>;
+      if (input.operation === "jcs") {
+        if (input.value === undefined) throw new Error("jcs requires value");
+        const canonical = canonicalJson(input.value);
+        output = { canonical, utf8Hex: Buffer.from(canonical, "utf8").toString("hex") };
+      } else {
+        if (input.data === undefined) throw new Error(`${input.operation} requires data`);
+        const bytes = decodeComputeData(input.data, input.encoding ?? "utf8");
+        if (input.operation === "sha256") {
+          const digest = createHash("sha256").update(bytes).digest();
+          output = { hex: digest.toString("hex"), base64url: digest.toString("base64url") };
+        } else if (input.operation === "base64url_encode") {
+          output = { base64url: bytes.toString("base64url"), byteLength: bytes.length };
+        } else {
+          if (!input.seedHex) throw new Error("ed25519_sign requires a 32-byte seedHex");
+          const seed = Buffer.from(input.seedHex, "hex");
+          const privateDer = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+          const privateKey = createPrivateKey({ key: privateDer, format: "der", type: "pkcs8" });
+          const publicDer = createPublicKey(privateKey).export({ format: "der", type: "spki" });
+          const signature = cryptoSign(null, bytes, privateKey);
+          output = {
+            publicKeyHex: publicDer.subarray(-32).toString("hex"),
+            signatureHex: signature.toString("hex"),
+            signatureBase64url: signature.toString("base64url"),
+            messageByteLength: bytes.length,
+          };
+        }
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(output) }], details: output };
+    },
+  } as ToolDefinition;
+}
+
+function decodeComputeData(data: string, encoding: "utf8" | "hex" | "base64" | "base64url"): Buffer {
+  if (encoding === "hex" && (data.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(data))) throw new Error("Invalid hexadecimal data");
+  return Buffer.from(data, encoding);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Canonical JSON does not support non-finite numbers");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`);
+    return `{${entries.join(",")}}`;
+  }
+  throw new Error(`Canonical JSON does not support ${typeof value}`);
 }
 
 export class WorkspaceGuard {

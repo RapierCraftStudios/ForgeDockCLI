@@ -24,7 +24,23 @@ describe("verification policy discovery", () => {
     writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc", test: "node --test" } }));
 
     const commands = discoverVerificationCommands(repo, "HEAD");
-    assert.equal(commands.length, 1);
-    assert.deepEqual(commands[0]?.args.slice(-1), ["test"]);
+    assert.deepEqual(commands.map(({ id }) => id), ["diff-check", "test"]);
+    assert.deepEqual(commands[1]?.args.slice(-1), ["test"]);
+  });
+
+  it("includes controller-approved documentation and quality scripts", () => {
+    const repo = mkdtempSync(join(tmpdir(), "forgedock-policy-docs-"));
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({
+      scripts: { lint: "eslint .", build: "tsc", "docs:build": "vitepress build", test: "node --test" },
+    }));
+    git(repo, "add", "package.json");
+    git(repo, "commit", "-m", "base");
+
+    assert.deepEqual(discoverVerificationCommands(repo, "HEAD").map(({ id }) => id), [
+      "diff-check", "lint", "build", "docs:build", "test",
+    ]);
   });
 });

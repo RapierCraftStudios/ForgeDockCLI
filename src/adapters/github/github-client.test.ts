@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
-import { GitHubArtifactRepository, reviewFindingMarker, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -39,6 +39,29 @@ describe("GitHub review finding projection", () => {
     const second = reviewFindingMarker("a/b", 57, { ...finding, id: "renamed", evidence: "Expanded evidence" });
     assert.equal(first, second);
     assert.match(first, /^<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->$/);
+  });
+
+  it("reconciles only stale open findings from the same run and pull request", () => {
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Schema is incomplete", evidence: "Request fields are missing", location: "src/schema.ts:20",
+      intentRelevance: "Breaks clients", remediation: "Define fields",
+    };
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
+    };
+    const body = (marker: string, run = "run-1", pr = 57) => `**Source:** PR #${pr} — Fix\n**Run:** \`${run}\`\n${marker}`;
+    const staleMarker = reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Different root cause" });
+    const issues = [
+      { repo: "a/b", number: 1, title: "active", body: body(reviewFindingMarker("a/b", 57, finding)), url: "u1", state: "OPEN" as const },
+      { repo: "a/b", number: 2, title: "stale", body: body(staleMarker), url: "u2", state: "OPEN" as const },
+      { repo: "a/b", number: 3, title: "other run", body: body(staleMarker, "run-2"), url: "u3", state: "OPEN" as const },
+      { repo: "a/b", number: 4, title: "closed", body: body(staleMarker), url: "u4", state: "CLOSED" as const },
+    ];
+    assert.deepEqual(reviewFindingReconciliationCandidates(issues, {
+      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [finding],
+    }).map(({ number }) => number), [2]);
   });
 
   it("does not collapse distinct consolidated root causes that share a title and location", () => {

@@ -34,7 +34,7 @@ export async function prepareBuildPacket(
         "Every acceptance criterion must be observable and testable.",
         "Include implementation-specific history and consistency constraints only when relevant.",
         "Expected paths are claims for conflict detection, not permission to broaden scope.",
-        "Verification commands are plans; the controller decides which commands may execute.",
+        "Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
       context: [input.intent, input.investigation],

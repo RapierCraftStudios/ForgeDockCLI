@@ -72,7 +72,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Fail-safe semantic-state reconstruction from GitHub artifacts plus local status store
 - [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
 - [x] Verification-stage resume from retained workspaces without replaying investigation or build
-- [ ] Review/remediation-stage automatic resume after reconciliation
+- [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
+- [x] Frozen verification-plan coverage: controller-approved diff/package commands execute or the Build Result blocks instead of claiming unobserved success
 
 ### 3. Independent `review-pr` — executable core and CLI implemented
 
@@ -82,11 +83,12 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Typed, scored Review Plan using changed-path, added-diff, Build Packet, and explicit repository-policy evidence with selected/skipped rationale
 - [x] Soft specialist budget with concrete-surface override, bounded reviewer slices, and one finding-triggered adaptive escalation wave
 - [x] Structured findings, deterministic blocking policy, semantic cross-reviewer consolidation, and source/session lineage
+- [x] Build-Packet semantic scope adjudication and post-remediation continuity gating prevent newly discovered adjacent concerns from expanding the active delivery
 - [x] SHA freshness invalidation before and after review
 - [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results retain the complete delivery path set against an immutable base SHA persisted across recovery
 - [x] Policy-controlled auto-merge default with explicit per-run or project-level opt-out
 - [x] Live GitHub review smoke test with parallel, independently inspectable nested reviewer sessions
-- [x] Per-reviewer provisional PR comments and a controller-authoritative consolidated Review Verdict; create follow-up issues only for consolidated findings that survive remediation or terminal review exhaustion
+- [x] Per-reviewer provisional PR comments and a controller-authoritative consolidated Review Verdict; create follow-up issues only for unresolved blockers or independently corroborated high-risk follow-ups, and close stale projections after a superseding verdict
 - [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before fresh replacement
 
 ### 4. Lean `orchestrate` — scheduler and CLI implemented; durable coordination pending
@@ -124,6 +126,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Bundle pinned `pi-subagents`, launch visible parallel issue workers, and preserve the typed controller as the only mutation authority
 - [x] Surface nested reviewer grandchildren as selectable fleet-tree rows and summarize them as `(+N agents)` on the parent status row
 - [x] Resume incomplete nested reviewers through the package-owned RPC/session lease lifecycle, including child-safe issue-worker RPC registration, bounded handshake failure, structured-output recovery, and no controller polling loop
+- [x] Provide native multi-image clipboard attachments with inline previews plus compact, expandable built-in and ForgeDock semantic-tool presentation without renderer dependencies or execution overrides
 - [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
 - [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
 - [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
@@ -162,7 +165,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - Pi adapter module import: passing.
 - Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
 - Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- ForgeDock Next suite: 195 passing, 0 failing. Legacy suite: 1,813 passing, 0 failing, 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
+- ForgeDock Next suite: 226 passing, 0 failing. Legacy suite: 1,813 passing, 0 failing, 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
 
 ## Resolved environment and dependency blockers
 

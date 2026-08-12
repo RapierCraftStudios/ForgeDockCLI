@@ -11,6 +11,11 @@ const base = {
   blocking: false,
   intentRelevance: "The authority contract must be interoperable.",
   remediation: "Freeze an exact schema and conformance vectors.",
+  scopeDisposition: "in_scope" as const,
+  scopeRationale: "Directly violates the frozen interoperability criterion.",
+  matchedAcceptanceCriteria: ["The authority contract is interoperable."],
+  matchedPriorFindingIds: [] as string[],
+  introducedByRemediation: false,
 };
 
 function submission(findings: ReviewerSubmission["findings"]): ReviewerSubmission {

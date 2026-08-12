@@ -13,18 +13,28 @@ class CompletionHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   snapshot = { ...openPr };
   merges = 0;
+  mergeBase?: string;
   closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
-  async mergePullRequest(): Promise<void> { this.merges++; this.snapshot.state = "MERGED"; }
+  async mergePullRequest(_repo: string, _number: number, _head: string, base: string): Promise<void> {
+    this.merges++;
+    this.mergeBase = base;
+    this.snapshot.state = "MERGED";
+  }
   async closeIssue(_repo: string, issue: number): Promise<void> { this.closes.push(issue); }
 }
 
 async function mergingRun(runs: InMemoryRunRepository): Promise<RunState> {
-  let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 2 }, runId: `run_complete_${crypto.randomUUID()}` });
+  let run = createRun({
+    workflow: "work-on",
+    subject: { repo: "a/b", issue: 2 },
+    runId: `run_complete_${crypto.randomUUID()}`,
+    target: { lane: "fast", targetBranch: "main" },
+  });
   await runs.create(run);
   for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED"] as TransitionEvent[]) {
     const next = transition(run, event, { headSha: sha });
@@ -64,7 +74,22 @@ describe("merge and close authority", () => {
     assert.equal(result.run.state, "completed");
     assert.equal(result.outcome?.payload.status, "merged");
     assert.equal(host.merges, 1);
+    assert.equal(host.mergeBase, "main");
     assert.deepEqual(host.closes, [2]);
+  });
+
+  it("refuses merge when the PR target changes after approval", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.snapshot.baseBranch = "milestone/other";
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+        host, artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /targets main, not milestone\/other/,
+    );
+    assert.equal(host.merges, 0);
   });
 
   it("projects a successful batch Outcome to every member before closing them", async () => {

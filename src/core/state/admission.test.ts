@@ -211,14 +211,93 @@ describe("subject run admission", () => {
     }
   });
 
-  it("does not misclassify a failed reviewed run as a publication checkpoint", () => {
+  it("resumes a failed post-approval run at completion rather than publication", () => {
     const runId = "run_review_failed";
     const artifacts = publicationArtifacts(runId);
     const verdict = createArtifact({
-      kind: "ReviewVerdict", runId, subject, producer: { role: "reviewer" },
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "reviewer" },
       payload: { headSha: "d".repeat(40), disposition: "approve", reviewerRoles: ["reviewer"], findings: [], checks: [] },
     });
-    assert.equal(decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...artifacts, verdict, outcome(runId, "2026-01-01T00:03:00.000Z", "failed")]).action, "skip");
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...artifacts, verdict,
+      outcome(runId, "2026-01-01T00:03:00.000Z", "failed"),
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "merging");
+      assert.equal(decision.checkpoint, "completion");
+    }
+  });
+
+  it("resumes a remediation-budget review block from its matching verified head", () => {
+    const runId = "run_review_budget";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact,
+      createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [], checks: [],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const blocked = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: { status: "blocked", reason: "Remediation budget exhausted after 2 cycle(s)", childIssues: [] },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked,
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "blocked");
+      assert.equal(decision.checkpoint, "remediation");
+    }
+  });
+
+  it("restarts publication and fresh review when a newer verified remediation head outlives an interrupted panel", () => {
+    const runId = "run_interrupted_panel";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const firstBuild = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(firstBuild?.kind === "BuildResult");
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: firstBuild.payload.headSha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const oldBlock = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: { status: "blocked", reason: "Remediation budget exhausted after 2 cycle(s)", childIssues: [] },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const latestBuild = createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: { ...firstBuild.payload, headSha: "e".repeat(40) },
+    }, { createdAt: "2026-01-01T00:06:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, priorVerdict, oldBlock, latestBuild]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "publishing");
+      assert.equal(decision.checkpoint, "publication");
+    }
+  });
+
+  it("resumes an interrupted remediator from the matching request-changes verdict", () => {
+    const runId = "run_interrupted_remediator";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "remediating");
+      assert.equal(decision.checkpoint, "remediation");
+    }
   });
 
   it("does not reuse stale verification evidence after a newer review block", () => {
@@ -237,6 +316,33 @@ describe("subject run admission", () => {
     const artifacts = [intent(runId, "2026-01-01T00:00:00.000Z"), staleVerification, reviewBlocked];
     assert.deepEqual(decideSubjectAdmission(artifacts), { action: "skip", runId, state: "blocked" });
     assert.deepEqual(decideSubjectAdmission(artifacts, { rerun: true }), { action: "start" });
+  });
+
+  it("retries the responsible remediator when verification proves it produced no changes", () => {
+    const runId = "run_no_change_remediation";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const blocked = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked", reason: "Builder produced no repository changes", childIssues: [],
+        failureEvidence: {
+          branch: "forgedock/issue-1", workspacePath: "/tmp/recovery", builderSummary: "Could not compute fixture",
+          changedPaths: [], checks: [{ command: "npm test", status: "passed", durationMs: 1 }],
+        },
+      },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "remediating");
+      assert.equal(decision.checkpoint, "remediation");
+    }
   });
 
   it("resumes a blocked verification attempt with retained evidence", () => {

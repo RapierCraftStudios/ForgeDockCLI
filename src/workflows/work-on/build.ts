@@ -42,13 +42,14 @@ export async function buildWorkItem(
       instructions: [
         "Read the affected code before editing.",
         "Do not expand scope or perform unrelated cleanup.",
+        "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "The controller runs verification and owns git publication after your edits.",
         "Report paths and criterion coverage accurately; the controller will independently inspect the diff.",
       ].join("\n"),
       context: [input.intent, input.investigation, input.packet],
       workspace: { cwd: input.worktree, mode: "write" },
-      tools: ["read", "grep", "find", "ls", "edit", "write"],
+      tools: ["read", "grep", "find", "ls", "compute", "edit", "write"],
       outputSchema: BuilderSubmissionSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),

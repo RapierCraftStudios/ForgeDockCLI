@@ -5,6 +5,7 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "./investigate.js";
+import { assertRunTargetsBranch } from "./lane.js";
 
 export async function completeWorkItem(
   input: {
@@ -20,14 +21,22 @@ export async function completeWorkItem(
   if (input.verdict.payload.disposition !== "approve") throw new Error("Cannot complete without an approving Review Verdict");
   let run = input.run;
   try {
+    assertRunTargetsBranch(run, input.pullRequest.baseBranch);
     let pullRequest = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+    assertRunTargetsBranch(run, pullRequest.baseBranch);
     if (pullRequest.headSha !== input.verdict.payload.headSha) {
       throw new Error(`Approved SHA ${input.verdict.payload.headSha} is stale; current PR head is ${pullRequest.headSha}`);
     }
     if (pullRequest.state !== "MERGED") {
       if (!input.autoMerge) return { run, awaitingHuman: true };
-      await dependencies.host.mergePullRequest(pullRequest.repo, pullRequest.number, input.verdict.payload.headSha);
+      await dependencies.host.mergePullRequest(
+        pullRequest.repo,
+        pullRequest.number,
+        input.verdict.payload.headSha,
+        run.targetBranch!,
+      );
       pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+      assertRunTargetsBranch(run, pullRequest.baseBranch);
       if (pullRequest.state !== "MERGED") throw new Error("Merge command completed but the pull request is not merged");
     }
 

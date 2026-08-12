@@ -37,20 +37,23 @@ export async function verifyAndCommit(
   if (input.run.state !== "verifying") throw new Error(`Verification requires verifying state, found ${input.run.state}`);
   let run = input.run;
   try {
-    const observedChecks = await dependencies.verifier.run(input.commands, input.signal);
+    const uncoveredPlan = uncoveredVerificationCommands(input.packet.payload.verificationPlan, input.commands);
+    const observedChecks = uncoveredPlan.length ? [] : await dependencies.verifier.run(input.commands, input.signal);
     const checks = observedChecks.map((check, index) => compareWithBaseline(check, input.baselineChecks?.[index]));
     const changedPaths = await dependencies.git.changedPaths(input.workspace);
     const unexpected = changedPaths.filter((path) => !input.packet.payload.expectedPaths.includes(path));
     const requiredFailure = input.commands.some((command, index) => command.required && checks[index]?.status !== "passed");
     const failure = !changedPaths.length
       ? "Builder produced no repository changes"
-      : !input.commands.some((command) => command.required)
-        ? "No required verification commands were configured"
-        : requiredFailure
-        ? "Required verification failed"
-        : unexpected.length && !input.allowUnexpectedPaths
-          ? `Diff contains paths outside the Build Packet: ${unexpected.join(", ")}`
-          : undefined;
+      : uncoveredPlan.length
+        ? `Frozen verification plan is not covered by controller-approved commands: ${uncoveredPlan.join(", ")}`
+        : !input.commands.some((command) => command.required)
+          ? "No required verification commands were configured"
+          : requiredFailure
+            ? "Required verification failed"
+            : unexpected.length && !input.allowUnexpectedPaths
+              ? `Diff contains paths outside the Build Packet: ${unexpected.join(", ")}`
+              : undefined;
 
     if (failure) {
       const failedChecks = checks.filter((check) => check.status === "failed");
@@ -124,6 +127,37 @@ export async function verifyAndCommit(
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
   }
+}
+
+export function uncoveredVerificationCommands(
+  plan: readonly string[],
+  commands: readonly Pick<VerificationCommand, "id">[],
+): string[] {
+  const commandIds = new Set(commands.map((command) => command.id));
+  const uncovered = new Set<string>();
+  for (const step of plan) {
+    const fenced = [...step.matchAll(/`([^`]+)`/g)].map((match) => match[1]!.trim());
+    const candidates = fenced.length ? fenced : [step.replace(/^\s*(?:run|execute)\s+/i, "").replace(/[.!]\s*$/, "").trim()];
+    for (const candidate of candidates) {
+      if (/^git\s+diff\s+--check(?:\s|$)/i.test(candidate)) {
+        if (!commandIds.has("diff-check")) uncovered.add(candidate);
+        continue;
+      }
+      const npmScript = /^npm(?:\.cmd)?\s+(?:run\s+)?([A-Za-z0-9:_-]+)(?:\s|$)/i.exec(candidate)?.[1];
+      if (npmScript) {
+        if (!commandIds.has(npmScript)) uncovered.add(candidate);
+        continue;
+      }
+      // Read-only diff inspection remains semantic reviewer evidence. Other
+      // explicitly requested executable tools are unsupported rather than
+      // silently represented as having run.
+      if (/^(?:node|npx|pnpm|yarn|python|python3|pytest|cargo|go|make)\b/i.test(candidate)
+        && /^\s*(?:run|execute)/i.test(step)) {
+        uncovered.add(candidate);
+      }
+    }
+  }
+  return [...uncovered];
 }
 
 function compareWithBaseline(check: CheckResult, baseline: CheckResult | undefined): CheckResult {

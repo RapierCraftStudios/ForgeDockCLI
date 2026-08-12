@@ -128,6 +128,14 @@ export const FindingSchema = Type.Object({
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  /** Reviewer-declared semantic relationship to the frozen Build Packet. */
+  scopeDisposition: Type.Optional(Type.Union([
+    Type.Literal("in_scope"), Type.Literal("follow_up"), Type.Literal("rejected"),
+  ])),
+  scopeRationale: Type.Optional(NonEmptyString),
+  matchedAcceptanceCriteria: Type.Optional(Type.Array(NonEmptyString)),
+  matchedPriorFindingIds: Type.Optional(Type.Array(NonEmptyString)),
+  introducedByRemediation: Type.Optional(Type.Boolean()),
 });
 
 const ReviewerRoleSchema = Type.Union([
@@ -168,6 +176,14 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   findings: Type.Array(FindingSchema),
   checks: Type.Array(CheckResultSchema),
   reviewPlan: Type.Optional(ReviewPlanSchema),
+  scopeAdjudication: Type.Optional(Type.Object({
+    sessionRef: NonEmptyString,
+    decisions: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      disposition: Type.Union([Type.Literal("accept"), Type.Literal("follow_up"), Type.Literal("reject")]),
+      rationale: NonEmptyString,
+    })),
+  })),
   supersedes: Type.Optional(NonEmptyString),
 });
 

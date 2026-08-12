@@ -56,4 +56,34 @@ describe("isolated Git worktrees", () => {
     assert.equal(existsSync(join(repo, "vendor", "example", "index.js")), true);
     assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), new RegExp(workspace.branch.replaceAll("/", "\\/")));
   });
+
+  it("rejects recovery when the frozen workspace base does not belong to the requested lane", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-lane-"));
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "README.md"), "old base\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-m", "old base");
+    const oldBase = git(repo, "rev-parse", "HEAD");
+    writeFileSync(join(repo, "README.md"), "new default base\n");
+    git(repo, "commit", "-am", "new base");
+    git(repo, "branch", "milestone/old-lane", oldBase);
+
+    const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+    const workspace = await manager.create({ runId: "run_lane", issue: 6, baseRef: "HEAD" });
+    const frozenBase = workspace.baseSha;
+    assert.ok(frozenBase);
+    await assert.rejects(
+      manager.recover({
+        runId: "run_lane",
+        issue: 6,
+        baseRef: "milestone/old-lane",
+        baseSha: frozenBase,
+      }),
+      /does not belong to target ref milestone\/old-lane/,
+    );
+    await manager.remove(workspace);
+  });
 });

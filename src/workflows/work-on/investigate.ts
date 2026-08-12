@@ -3,7 +3,7 @@
 import { createArtifact, InvestigationPayloadSchema, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
-import { attachArtifact, createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
+import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
 
 export interface InvestigateDependencies {
@@ -21,6 +21,7 @@ export interface InvestigateInput {
   provider?: string;
   model?: string;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  target?: RunTarget;
   signal?: AbortSignal;
 }
 
@@ -35,7 +36,12 @@ export async function investigateWorkItem(
   input: InvestigateInput,
   dependencies: InvestigateDependencies,
 ): Promise<InvestigateResult> {
-  let run = createRun({ workflow: "work-on", subject: input.intent.subject, runId: input.intent.runId });
+  let run = createRun({
+    workflow: "work-on",
+    subject: input.intent.subject,
+    runId: input.intent.runId,
+    ...(input.target ? { target: input.target } : {}),
+  });
   run = attachArtifact(run, "Intent", input.intent.id);
   await dependencies.artifacts.append(input.intent);
   await dependencies.runs.create(run);

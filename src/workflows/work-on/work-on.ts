@@ -16,6 +16,10 @@ import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
 import { verifyAndCommit } from "./verify.js";
 import { materializeReviewFindings, reviewPullRequest } from "../review-pr/review.js";
+import { repositoryPathFromLocation } from "../review-pr/scope.js";
+import { assertRunTargetsBranch, laneEvidence, runTargetForLane, type IssueLane } from "./lane.js";
+
+export { repositoryPathFromLocation } from "../review-pr/scope.js";
 
 export interface WorkOnDependencies {
   runtime: AgentRuntime;
@@ -38,8 +42,7 @@ export async function workOn(
     intent: DurableArtifact<"Intent">;
     priorArtifacts?: readonly DurableArtifact[];
     repoPath: string;
-    baseBranch: string;
-    baseRef?: string;
+    lane: IssueLane;
     verification: readonly Omit<VerificationCommand, "cwd">[];
     baselineChecks?: readonly CheckResult[];
     provider?: string;
@@ -70,11 +73,16 @@ export async function workOn(
   try {
     const issue = input.intent.subject.issue;
     if (!issue) throw new Error("work-on requires an issue subject");
-    workspace = await dependencies.git.create({ runId: input.intent.runId, issue, baseRef: input.baseRef ?? input.baseBranch });
+    workspace = await dependencies.git.create({
+      runId: input.intent.runId,
+      issue,
+      baseRef: `origin/${input.lane.targetBranch}`,
+    });
     const investigated = await investigateWorkItem({
       intent: input.intent,
       ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
       cwd: workspace.path,
+      target: runTargetForLane(input.lane),
       ...runtimeOptions,
     }, agentDependencies);
     run = investigated.run;
@@ -90,14 +98,14 @@ export async function workOn(
     run = prepared.run;
     const continued = await continueBuildDelivery({
       run, intent: input.intent, investigation: investigated.investigation, packet: prepared.packet, workspace,
-      baseBranch: input.baseBranch, verification: input.verification,
+      baseBranch: input.lane.targetBranch, verification: input.verification,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.autoMerge !== undefined ? { autoMerge: input.autoMerge } : {}),
       ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
-      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      subjectEvidence: [...(input.subjectEvidence ?? []), laneEvidence(input.lane)],
       ...(input.batchMembers !== undefined ? { batchMembers: input.batchMembers } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
@@ -143,6 +151,7 @@ export async function resumeBuildWorkOn(
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
   if (input.run.state !== "building") throw new Error(`Build resume requires building state, found ${input.run.state}`);
+  assertRunTargetsBranch(input.run, input.baseBranch);
   let run = input.run;
   try {
     const resumed = transition(run, "RESUME_BUILD", { reason: `Resuming frozen Build Packet in retained workspace ${input.workspace.path}` });
@@ -190,6 +199,7 @@ async function continueBuildDelivery(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  assertRunTargetsBranch(input.run, input.baseBranch);
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
@@ -217,7 +227,7 @@ async function continueBuildDelivery(
   let buildResult = verified.buildResult;
 
   const published = await publishPullRequest({
-    run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace, baseBranch: input.baseBranch,
+    run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
   }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
   run = published.run;
   let pullRequest = published.pullRequest;
@@ -298,6 +308,7 @@ export async function resumeWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    priorRemediationCycles?: number;
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
@@ -307,6 +318,7 @@ export async function resumeWorkOn(
 ): Promise<WorkOnResult> {
   const evidence = input.outcome.payload.failureEvidence;
   if (input.run.state !== "blocked" || !evidence) throw new Error("Only a blocked verification run with retained evidence can resume");
+  assertRunTargetsBranch(input.run, input.baseBranch);
   if (evidence.workspacePath !== input.workspace.path || evidence.branch !== input.workspace.branch) {
     throw new Error("Recovery workspace does not match the durable failure evidence");
   }
@@ -341,13 +353,13 @@ export async function resumeWorkOn(
     if (!verified.buildResult) return { run };
     let buildResult = verified.buildResult;
     const published = await publishPullRequest({
-      run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace, baseBranch: input.baseBranch,
+      run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
     run = published.run;
     let pullRequest = published.pullRequest;
     let verdict: DurableArtifact<"ReviewVerdict">;
     let priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined;
-    let cycle = 0;
+    let cycle = input.priorRemediationCycles ?? 0;
     while (true) {
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
@@ -421,6 +433,189 @@ export async function resumeWorkOn(
   }
 }
 
+export async function resumeReviewWorkOn(
+  input: {
+    run: RunState;
+    intent: DurableArtifact<"Intent">;
+    investigation: DurableArtifact<"Investigation">;
+    packet: DurableArtifact<"BuildPacket">;
+    buildResult: DurableArtifact<"BuildResult">;
+    priorVerdict: DurableArtifact<"ReviewVerdict">;
+    pullRequest: PullRequestSnapshot;
+    workspace: GitWorkspace;
+    baseBranch: string;
+    verification: readonly Omit<VerificationCommand, "cwd">[];
+    baselineChecks?: readonly CheckResult[];
+    provider?: string;
+    model?: string;
+    autoMerge?: boolean;
+    maxRemediationCycles?: number;
+    maxReviewSpecialists?: number;
+    subjectEvidence?: readonly string[];
+    batchMembers?: readonly number[];
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult> {
+  const budgetBlocked = input.run.state === "blocked"
+    && /^Remediation budget exhausted after \d+ cycle\(s\)$/i.test(input.run.blockedReason ?? "");
+  const interruptedRemediation = input.run.state === "remediating";
+  if (!budgetBlocked && !interruptedRemediation) {
+    throw new Error("Remediation resume requires an interrupted remediation or remediation-budget blocked run");
+  }
+  assertRunTargetsBranch(input.run, input.baseBranch);
+  if (input.priorVerdict.payload.disposition !== "request_changes"
+    || input.priorVerdict.payload.headSha !== input.buildResult.payload.headSha
+    || input.pullRequest.headSha !== input.buildResult.payload.headSha
+    || input.pullRequest.baseBranch !== input.baseBranch) {
+    throw new Error("Review resume requires one matching request-changes verdict, verified Build Result, and open PR head");
+  }
+  let run = input.run;
+  const resumed = transition(run, budgetBlocked ? "RESUME_REVIEW" : "RESUME_REMEDIATION", {
+    reason: budgetBlocked
+      ? `Reassessing exhausted findings at ${input.buildResult.payload.headSha} against the frozen scope before authorizing any further remediation`
+      : `Continuing accepted review remediation at ${input.buildResult.payload.headSha} from the retained verified workspace`,
+    headSha: input.buildResult.payload.headSha,
+  });
+  await dependencies.runs.commit(run.version, resumed.state, resumed.record);
+  run = resumed.state;
+  const runtimeOptions = {
+    ...(input.provider !== undefined ? { provider: input.provider } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  };
+  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  let buildResult = input.buildResult;
+  let pullRequest = input.pullRequest;
+  let verdict = input.priorVerdict;
+  let cycle = 1;
+  const remediationLimit = budgetBlocked ? 1 : (input.maxRemediationCycles ?? 2);
+  try {
+    if (budgetBlocked) {
+      const reassessed = await reviewPullRequest({
+        run, pullRequest, intent: input.intent, investigation: input.investigation,
+        packet: input.packet, buildResult, workspace: input.workspace.path,
+        findingIssuePolicy: "approved-only",
+        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+        priorVerdict: verdict,
+        ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = reassessed.run;
+      verdict = reassessed.verdict;
+      if (run.state === "merging") {
+        const completed = await completeWorkItem({
+          run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+          ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+        }, { host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs });
+        run = completed.run;
+        return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
+      }
+      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      if (scopeViolation) {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+        return { run, pullRequest };
+      }
+    }
+
+    const firstRemediation = await remediateReview({
+      run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+      buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+    }, {
+      runtime: dependencies.runtime, runs: dependencies.runs,
+      ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+    });
+    run = firstRemediation.run;
+    let verified = await verifyAndCommit({
+      run, packet: input.packet, submission: firstRemediation.submission, workspace: input.workspace, commands,
+      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = verified.run;
+    if (!verified.buildResult) return { run, pullRequest };
+    buildResult = verified.buildResult;
+    let revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+      git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+    });
+    run = revision.run;
+    pullRequest = revision.pullRequest;
+
+    while (true) {
+      const reviewed = await reviewPullRequest({
+        run, pullRequest, intent: input.intent, investigation: input.investigation,
+        packet: input.packet, buildResult, workspace: input.workspace.path,
+        findingIssuePolicy: "approved-only",
+        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+        priorVerdict: verdict,
+        ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = reviewed.run;
+      verdict = reviewed.verdict;
+      if (run.state === "merging") break;
+      const scopeViolation = blockingFindingOutsidePacket(verdict, input.packet);
+      if (scopeViolation) {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, scopeViolation);
+        return { run, pullRequest };
+      }
+      cycle++;
+      if (cycle > remediationLimit) {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+        return { run, pullRequest };
+      }
+      const remediated = await remediateReview({
+        run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+        buildResult, verdict, worktree: input.workspace.path, ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime, runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = remediated.run;
+      verified = await verifyAndCommit({
+        run, packet: input.packet, submission: remediated.submission, workspace: input.workspace, commands,
+        ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+        ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      }, { verifier: dependencies.verifier, git: dependencies.git, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      run = verified.run;
+      if (!verified.buildResult) return { run, pullRequest };
+      buildResult = verified.buildResult;
+      revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+        git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+      });
+      run = revision.run;
+      pullRequest = revision.pullRequest;
+    }
+
+    const completed = await completeWorkItem({
+      run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+      ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+    }, { host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = completed.run;
+    return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorkflowExecutionError) run = error.run;
+    if (run.state !== "failed" && run.state !== "blocked") {
+      const failed = transition(run, "FAIL", { reason });
+      await dependencies.runs.commit(run.version, failed.state, failed.record);
+      run = failed.state;
+    }
+    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    throw error;
+  } finally {
+    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    if (!retainForRecovery) {
+      try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
+    }
+  }
+}
+
 export async function resumePublicationWorkOn(
   input: {
     run: RunState;
@@ -437,6 +632,7 @@ export async function resumePublicationWorkOn(
     model?: string;
     autoMerge?: boolean;
     maxRemediationCycles?: number;
+    priorRemediationCycles?: number;
     maxReviewSpecialists?: number;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
@@ -447,6 +643,7 @@ export async function resumePublicationWorkOn(
   if (input.run.state !== "publishing" && input.run.state !== "failed") {
     throw new Error(`Publication resume requires publishing or recoverable failed state, found ${input.run.state}`);
   }
+  assertRunTargetsBranch(input.run, input.baseBranch);
   const recoveringRevision = input.run.state === "failed";
   if (recoveringRevision) {
     const expectedHead = /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i
@@ -474,13 +671,13 @@ export async function resumePublicationWorkOn(
   let buildResult = input.buildResult;
   try {
     const published = await publishPullRequest({
-      run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace, baseBranch: input.baseBranch,
+      run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
     run = published.run;
     let pullRequest = published.pullRequest;
     let verdict: DurableArtifact<"ReviewVerdict">;
     let priorVerdict = input.priorVerdict;
-    let cycle = 0;
+    let cycle = input.priorRemediationCycles ?? 0;
     while (true) {
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
@@ -554,6 +751,56 @@ export async function resumePublicationWorkOn(
   }
 }
 
+export async function resumeCompletionWorkOn(
+  input: {
+    run: RunState;
+    verdict: DurableArtifact<"ReviewVerdict">;
+    pullRequest: PullRequestSnapshot;
+    autoMerge?: boolean;
+    batchMembers?: readonly number[];
+    workspace?: GitWorkspace;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult> {
+  if (input.run.state !== "merging") throw new Error(`Completion resume requires merging state, found ${input.run.state}`);
+  if (input.verdict.payload.disposition !== "approve"
+    || input.verdict.payload.headSha !== input.pullRequest.headSha) {
+    throw new Error("Completion resume requires an approving verdict for the current pull request head");
+  }
+  let run = input.run;
+  try {
+    const resumed = transition(run, "RESUME_COMPLETION", {
+      reason: `Resuming idempotent merge and issue closure at approved head ${input.verdict.payload.headSha}`,
+      headSha: input.verdict.payload.headSha,
+    });
+    await dependencies.runs.commit(run.version, resumed.state, resumed.record);
+    run = resumed.state;
+    const completed = await completeWorkItem({
+      run,
+      pullRequest: input.pullRequest,
+      verdict: input.verdict,
+      autoMerge: input.autoMerge ?? false,
+      ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+    }, { host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = completed.run;
+    return { run, pullRequest: input.pullRequest, awaitingHuman: completed.awaitingHuman };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorkflowExecutionError) run = error.run;
+    if (run.state !== "failed" && run.state !== "blocked") {
+      const failed = transition(run, "FAIL", { reason });
+      await dependencies.runs.commit(run.version, failed.state, failed.record);
+      run = failed.state;
+    }
+    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    throw error;
+  } finally {
+    if (input.workspace && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
+      try { await dependencies.git.remove(input.workspace); } catch { /* stale worktree reconciliation is operational */ }
+    }
+  }
+}
+
 function blockingFindingOutsidePacket(
   verdict: DurableArtifact<"ReviewVerdict">,
   packet: DurableArtifact<"BuildPacket">,
@@ -566,24 +813,6 @@ function blockingFindingOutsidePacket(
   if (!violations.length) return undefined;
   const details = violations.map(({ finding, path }) => `${finding.id} at ${path}`).join(", ");
   return `Blocking review finding requires changes outside the frozen Build Packet (${details}); refusing automatic scope expansion`;
-}
-
-export function repositoryPathFromLocation(location: string): string | undefined {
-  const normalized = location.replaceAll("\\", "/").trim();
-  const candidates = normalized.matchAll(/(?:^|[\s`(])(\.?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*)(?=[:#\s`),]|$)/g);
-  for (const match of candidates) {
-    if (!match[1]) continue;
-    const candidate = normalizeRepoPath(match[1]);
-    const finalSegment = candidate.split("/").at(-1) ?? "";
-    // Artifact/session field references are evidence locations, not repository
-    // paths. False scope classification here strands otherwise recoverable runs.
-    if (/^(?:art|run|task)_/i.test(candidate)) continue;
-    const pathLike = candidate.includes("/")
-      || finalSegment.includes(".")
-      || /^(?:Dockerfile(?:\.[A-Za-z0-9_.-]+)?|LICENSE|Makefile|Procfile|README)$/i.test(finalSegment);
-    if (pathLike) return candidate;
-  }
-  return undefined;
 }
 
 function normalizeRepoPath(path: string): string {

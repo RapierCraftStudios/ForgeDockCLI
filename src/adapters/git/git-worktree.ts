@@ -56,6 +56,11 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       ?? configuredBaseSha
       ?? (await this.git(["merge-base", input.baseRef, "HEAD"], path)).trim();
     try {
+      await this.git(["merge-base", "--is-ancestor", baseSha, input.baseRef], path);
+    } catch (error) {
+      throw new Error(`Frozen base ${baseSha} does not belong to target ref ${input.baseRef}`, { cause: error });
+    }
+    try {
       await this.git(["merge-base", "--is-ancestor", baseSha, "HEAD"], path);
     } catch (error) {
       throw new Error(`Frozen base ${baseSha} is not an ancestor of retained workspace ${branch}`, { cause: error });

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -40,6 +41,19 @@ describe("bundled subagent live visibility", () => {
     assert.match(nestedEvents, /stringValue\(raw\.description, 2048\)/);
     assert.match(executor, /description: foregroundDescription\.slice\(0, 2048\)/);
     assert.match(fanoutChild, /registerSubagentRpcBridge\([\s\S]*?executor\.execute/);
+  });
+
+  it("keeps the composed child-safe RPC patch idempotent", () => {
+    const fanoutChildPath = resolve("node_modules/pi-subagents/src/extension/fanout-child.ts");
+    const patchScript = resolve("scripts/patch-pi-subagents-visibility.mjs");
+    const before = readFileSync(fanoutChildPath, "utf8");
+    execFileSync(process.execPath, [patchScript], { cwd: process.cwd() });
+    const afterFirstRepeat = readFileSync(fanoutChildPath, "utf8");
+    execFileSync(process.execPath, [patchScript], { cwd: process.cwd() });
+    const afterSecondRepeat = readFileSync(fanoutChildPath, "utf8");
+    assert.equal(afterFirstRepeat, before);
+    assert.equal(afterSecondRepeat, before);
+    assert.equal(afterSecondRepeat.match(/let lastContext: ExtensionContext \| null = null;/g)?.length, 1);
   });
 
   it("registers the resume RPC seam inside child-safe issue workers", async () => {

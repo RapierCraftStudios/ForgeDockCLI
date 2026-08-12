@@ -3,8 +3,8 @@
 import type { TSchema } from "typebox";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 
-export type AgentRole = "investigator" | "packet-author" | "builder" | "reviewer" | "remediator";
-export type ToolGrant = "read" | "grep" | "find" | "ls" | "bash" | "edit" | "write";
+export type AgentRole = "investigator" | "packet-author" | "builder" | "reviewer" | "adjudicator" | "remediator";
+export type ToolGrant = "read" | "grep" | "find" | "ls" | "compute" | "bash" | "edit" | "write";
 
 export interface WorkspaceGrant {
   cwd: string;

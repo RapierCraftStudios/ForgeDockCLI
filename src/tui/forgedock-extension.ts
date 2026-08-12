@@ -17,7 +17,10 @@ import {
   inspectSubagentRuntime,
   registerForgeDockTools,
   type WorkflowCommand,
+  workflowCommandDisplay,
 } from "./forgedock-tools.js";
+
+export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /work-on · /review-pr · /orchestrate";
 
 const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
@@ -35,7 +38,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, ORCHESTRATION_RESUME_TOOL]);
     if (ctx.mode !== "tui") return;
     ctx.ui.setTitle(`ForgeDock — ${ctx.cwd}`);
-    ctx.ui.setStatus("forgedock", `◆ ${FORGEDOCK_NATIVE_RUNTIME} · GitHub authoritative`);
+    ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -76,8 +79,9 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     activateOnly(pi, [HUMAN_DECISION_TOOL, "subagent_supervisor"]);
   });
 
-  pi.on("agent_end", () => {
+  pi.on("agent_end", (_event, ctx) => {
     deactivateWorkflowTools(pi);
+    if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
 
   pi.on("session_shutdown", async () => {
@@ -198,7 +202,7 @@ async function queueNativeWorkflow(
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
   activateOnly(pi, [tool]);
-  ctx.ui.setStatus("forgedock", `◆ ${command} · resolving intent`);
+  ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs);
   if (ctx.isIdle()) pi.sendUserMessage(prompt);
   else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
@@ -211,9 +215,9 @@ function workflowDescription(workflow: Workflow): string {
 }
 
 function workflowUsage(workflow: Workflow): string {
-  if (workflow === "work-on") return "Usage: /work-on <issue or natural-language issue reference>";
+  if (workflow === "work-on") return "Usage: /work-on <issue or natural-language issue reference> [--no-auto-merge]";
   if (workflow === "review-pr") return "Usage: /review-pr <PR or natural-language PR reference>";
-  return "Usage: /orchestrate <issue set or natural-language scope> [policy options]";
+  return "Usage: /orchestrate <issue set or natural-language scope> [--no-auto-merge] [policy options]";
 }
 
 async function confirmWorkflow(workflow: Workflow, args: string, ctx: ExtensionCommandContext): Promise<boolean> {

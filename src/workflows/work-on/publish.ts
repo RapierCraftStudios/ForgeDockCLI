@@ -6,6 +6,7 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "./investigate.js";
+import { assertRunTargetsBranch } from "./lane.js";
 
 export async function publishPullRequest(
   input: {
@@ -14,34 +15,41 @@ export async function publishPullRequest(
     packet: DurableArtifact<"BuildPacket">;
     buildResult: DurableArtifact<"BuildResult">;
     workspace: GitWorkspace;
-    baseBranch: string;
   },
   dependencies: { git: GitWorkspaceManager; host: ForgeHost; runs: RunRepository },
 ): Promise<{ run: RunState; pullRequest: PullRequestSnapshot }> {
   if (input.run.state !== "publishing") throw new Error(`Publication requires publishing state, found ${input.run.state}`);
   let run = input.run;
   try {
+    const targetBranch = run.targetBranch;
+    if (!targetBranch) throw new Error(`Run ${run.runId} has no frozen target branch`);
+    assertWorkspaceFollowsTarget(input.workspace, targetBranch);
     const workspaceHead = await dependencies.git.head(input.workspace);
     if (workspaceHead !== input.buildResult.payload.headSha) {
       throw new Error(`Publication workspace head ${workspaceHead} does not match verified build ${input.buildResult.payload.headSha}`);
     }
-    await dependencies.git.push(input.workspace);
     const issue = run.subject.issue;
     if (!issue) throw new Error("work-on publication requires an issue subject");
+    const existing = await dependencies.host.findOpenPullRequest?.(run.subject.repo, input.workspace.branch);
+    if (existing) assertRunTargetsBranch(run, existing.baseBranch);
+    await dependencies.git.push(input.workspace);
     const body = renderPullRequestHandoff({
       issue,
       packet: input.packet,
       buildResult: input.buildResult,
     });
-    const existing = await dependencies.host.findOpenPullRequest?.(run.subject.repo, input.workspace.branch);
     const pullRequest = existing ?? await dependencies.host.createPullRequest({
       repo: run.subject.repo,
       issue,
       headBranch: input.workspace.branch,
-      baseBranch: input.baseBranch,
+      baseBranch: targetBranch,
       title: input.intent.payload.title,
       body,
     });
+    assertRunTargetsBranch(run, pullRequest.baseBranch);
+    if (pullRequest.headBranch !== input.workspace.branch) {
+      throw new Error(`Published PR branch ${pullRequest.headBranch} does not match delivery branch ${input.workspace.branch}`);
+    }
     if (pullRequest.headSha !== input.buildResult.payload.headSha) {
       throw new Error(`Published PR head ${pullRequest.headSha} does not match verified build ${input.buildResult.payload.headSha}`);
     }
@@ -53,6 +61,12 @@ export async function publishPullRequest(
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+  }
+}
+
+function assertWorkspaceFollowsTarget(workspace: GitWorkspace, targetBranch: string): void {
+  if (workspace.baseRef !== targetBranch && workspace.baseRef !== `origin/${targetBranch}`) {
+    throw new Error(`Workspace ${workspace.branch} follows ${workspace.baseRef}, not frozen target ${targetBranch}`);
   }
 }
 

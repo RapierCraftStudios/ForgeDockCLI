@@ -33,12 +33,13 @@ export async function remediateReview(
       objective: `Fix only the accepted blocking findings from review of ${input.verdict.payload.headSha}:\n${JSON.stringify(findings, null, 2)}`,
       instructions: [
         "Do not address rejected, non-blocking, speculative, or unrelated cleanup.",
+        "Use the pure compute tool when an accepted criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, commit, push, merge, or alter workflow state.",
         "The controller will re-run all required verification and start a fresh review at the new SHA.",
       ].join("\n"),
       context: [input.intent, input.investigation, input.packet, input.buildResult, input.verdict],
       workspace: { cwd: input.worktree, mode: "write" },
-      tools: ["read", "grep", "find", "ls", "edit", "write"],
+      tools: ["read", "grep", "find", "ls", "compute", "edit", "write"],
       outputSchema: BuilderSubmissionSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),

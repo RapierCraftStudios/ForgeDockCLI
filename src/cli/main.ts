@@ -16,16 +16,20 @@ import type { CheckResult, VerificationCommand } from "../core/ports/verificatio
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { readForgeDockConfig, resolveAutoMerge } from "../core/config/forgedock-config.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumePublicationWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { assertRunFollowsLane, classifyIssueLane, laneEvidence, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
 import { parseBatchMemberIssues } from "../workflows/orchestrate/batching.js";
 import { runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { AgentEventStreamWriter } from "./agent-event-stream.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
+const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
 
 await main(args).catch((error: unknown) => {
+  agentEventStream.finish();
   const message = error instanceof Error ? error.message : String(error);
   console.error(`${statusGlyph("failed", mode)} ${message}`);
   process.exitCode = 1;
@@ -120,12 +124,15 @@ async function workOn(argv: string[]): Promise<void> {
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
+  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github);
+  const baseRef = `origin/${lane.targetBranch}`;
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
   const subjectEvidence = issueSubjectEvidence(issue);
+  subjectEvidence.push(laneEvidence(lane));
   if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
   if (dependencyIssues.includes(issue.number)) throw new Error(`Issue #${issue.number} cannot depend on itself`);
   for (const dependency of dependencyIssues) {
@@ -215,6 +222,7 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
       }
       const runArtifacts = resumeArtifacts.filter((artifact) => artifact.runId === resumeRunId);
+      const priorRemediationCycles = Math.max(0, runArtifacts.filter((artifact) => artifact.kind === "BuildResult").length - 1);
       const intentArtifact = latestArtifact(runArtifacts, "Intent");
       const investigation = latestArtifact(runArtifacts, "Investigation");
       const packet = latestArtifact(runArtifacts, "BuildPacket");
@@ -225,13 +233,38 @@ async function workOn(argv: string[]): Promise<void> {
         ? latestArtifact(runArtifacts, "Outcome")
         : admission.checkpoint === "publication"
           ? latestArtifact(runArtifacts, "BuildResult")
-          : packet;
+          : admission.checkpoint === "completion"
+            ? latestArtifact(runArtifacts, "ReviewVerdict")
+            : admission.checkpoint === "remediation"
+              ? (admission.state === "blocked" ? latestArtifact(runArtifacts, "Outcome") : latestArtifact(runArtifacts, "ReviewVerdict"))
+              : packet;
       const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
       for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
       const failedOutcome = admission.state === "failed" ? latestArtifact(runArtifacts, "Outcome") : undefined;
+      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
+      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
+      const openPullRequest = retainedBuildResult
+        ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
+        : undefined;
+      const checkpointPullRequest = admission.checkpoint === "completion" && priorVerdict?.subject.pr
+        ? await github.getPullRequest(issue.repo, priorVerdict.subject.pr)
+        : openPullRequest;
+      if (admission.checkpoint === "remediation" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, Review Verdict, and open PR required for remediation resume`);
+      }
+      if (admission.checkpoint === "completion" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for completion resume`);
+      }
+      if (checkpointPullRequest && checkpointPullRequest.baseBranch !== lane.targetBranch) {
+        throw new Error(
+          `Existing PR #${checkpointPullRequest.number} targets ${checkpointPullRequest.baseBranch}, but issue #${issue.number} classifies to ${lane.targetBranch}; refusing cross-lane resume`,
+        );
+      }
+      const frozenTarget = runTargetForLane(lane);
       const recoveredRun = {
         schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
         state: admission.state, attempt: 1, version: 0,
+        ...frozenTarget,
         createdAt: intentArtifact.createdAt, updatedAt: checkpointArtifact?.createdAt ?? packet.createdAt,
         artifactIds,
         ...(admission.state === "blocked" && checkpointArtifact?.kind === "Outcome" ? { blockedReason: checkpointArtifact.payload.reason } : {}),
@@ -241,27 +274,36 @@ async function workOn(argv: string[]): Promise<void> {
       if (!run) {
         await store.create(recoveredRun);
         run = recoveredRun;
-      } else if (run.state !== admission.state) {
+      } else if (run.state !== admission.state
+        || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)) {
         process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${run.state}) from durable GitHub state (${admission.state})\n`);
         store.rebuildRun(recoveredRun);
         run = recoveredRun;
+      } else if (run.targetBranch) {
+        assertRunFollowsLane(run, lane);
+      } else {
+        run = { ...run, ...frozenTarget };
       }
 
-      const baseRef = `origin/${localRepository.defaultBranch}`;
       const git = new GitWorktreeManager(process.cwd());
       const verifier = new ProcessVerificationRunner();
-      const retainedBuildResult = latestArtifact(runArtifacts, "BuildResult");
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
-      if (admission.checkpoint === "build" || admission.checkpoint === "publication") {
-        workspace = await git.recover({
+      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion") {
+        const recoveryInput = {
           runId: resumeRunId,
           issue: issue.number,
           baseRef,
-          ...(admission.checkpoint === "publication" && retainedBuildResult?.payload.baseSha
+          ...(admission.checkpoint !== "build" && retainedBuildResult?.payload.baseSha
             ? { baseSha: retainedBuildResult.payload.baseSha }
             : {}),
-        });
+        };
+        if (admission.checkpoint === "completion") {
+          try { workspace = await git.recover(recoveryInput); }
+          catch (error) { process.stderr.write(`warning: completion will proceed without retained-worktree cleanup: ${error instanceof Error ? error.message : String(error)}\n`); }
+        } else {
+          workspace = await git.recover(recoveryInput);
+        }
       } else {
         outcome = latestArtifact(runArtifacts, "Outcome");
         if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
@@ -275,15 +317,16 @@ async function workOn(argv: string[]): Promise<void> {
         };
         if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
       }
-      const verification = discoverVerificationCommands(process.cwd(), baseRef);
-      const baselineChecks = admission.checkpoint === "publication"
+      const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), baseRef);
+      const baselineChecks = admission.checkpoint === "publication" || admission.checkpoint === "completion"
         ? undefined
         : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef });
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
-        run, intent: intentArtifact, investigation, packet, workspace,
-        baseBranch: localRepository.defaultBranch, verification,
+        run, intent: intentArtifact, investigation, packet, workspace: workspace!,
+        baseBranch: lane.targetBranch, verification,
         ...(baselineChecks !== undefined ? { baselineChecks } : {}),
+        priorRemediationCycles,
         subjectEvidence,
         ...(batchMembers.length ? { batchMembers } : {}),
         autoMerge,
@@ -293,16 +336,31 @@ async function workOn(argv: string[]): Promise<void> {
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, onAgentEvent };
-      const priorVerdict = latestArtifact(runArtifacts, "ReviewVerdict");
-      const result = admission.checkpoint === "build"
-        ? await resumeBuildWorkOn(common, dependencies)
-        : admission.checkpoint === "publication"
-          ? await resumePublicationWorkOn({
-            ...common,
-            buildResult: retainedBuildResult!,
-            ...(priorVerdict ? { priorVerdict } : {}),
-          }, dependencies)
-          : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
+      const result = admission.checkpoint === "completion"
+        ? await resumeCompletionWorkOn({
+          run,
+          verdict: priorVerdict!,
+          pullRequest: checkpointPullRequest!,
+          ...(workspace ? { workspace } : {}),
+          ...(batchMembers.length ? { batchMembers } : {}),
+          autoMerge,
+        }, dependencies)
+        : admission.checkpoint === "build"
+          ? await resumeBuildWorkOn(common, dependencies)
+          : admission.checkpoint === "publication"
+            ? await resumePublicationWorkOn({
+              ...common,
+              buildResult: retainedBuildResult!,
+              ...(priorVerdict ? { priorVerdict } : {}),
+            }, dependencies)
+            : admission.checkpoint === "remediation"
+              ? await resumeReviewWorkOn({
+                ...common,
+                buildResult: retainedBuildResult!,
+                priorVerdict: priorVerdict!,
+                pullRequest: checkpointPullRequest!,
+              }, dependencies)
+              : await resumeWorkOn({ ...common, outcome: outcome! }, dependencies);
       const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
       process.stdout.write(`${statusGlyph(result.run.state === "completed" ? "passed" : "blocked", mode)} Resumed run ${result.run.runId} · ${result.run.state}${suffix}\n`);
       if (result.run.state !== "completed") process.exitCode = 2;
@@ -312,7 +370,7 @@ async function workOn(argv: string[]): Promise<void> {
     if (through === "investigate") {
       process.stdout.write(`${statusGlyph("active", mode)} Investigating ${issue.repo}#${issue.number} — ${issue.title}\n`);
       const result = await investigateWorkItem({
-        intent, priorArtifacts, cwd: process.cwd(),
+        intent, priorArtifacts, cwd: process.cwd(), target: runTargetForLane(lane),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
@@ -322,7 +380,6 @@ async function workOn(argv: string[]): Promise<void> {
       return;
     }
 
-    const baseRef = `origin/${localRepository.defaultBranch}`;
     const verification = discoverVerificationCommands(process.cwd(), baseRef);
     const git = new GitWorktreeManager(process.cwd());
     const verifier = new ProcessVerificationRunner();
@@ -332,8 +389,7 @@ async function workOn(argv: string[]): Promise<void> {
       intent,
       priorArtifacts,
       repoPath: process.cwd(),
-      baseBranch: localRepository.defaultBranch,
-      baseRef,
+      lane,
       verification,
       baselineChecks,
       subjectEvidence,
@@ -449,8 +505,24 @@ async function orchestrate(argv: string[]): Promise<void> {
   const github = new GitHubClient(process.cwd());
   const repository = await github.getRepository();
   const items = loadOrchestrationItems(issueNumbers, repository.repo);
+  const issueSnapshots = await Promise.all(items.map((item) => github.getIssue(item.issue, repository.repo)));
+  const milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
+    ? await github.listBranches(repository.repo, "milestone/")
+    : [];
+  const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
+  for (const issue of issueSnapshots) {
+    routedIssues.set(issue.number, {
+      issue,
+      lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches),
+    });
+  }
+  await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
+    .map((branch) => github.getBranchHead(repository.repo, branch)));
   if (argv.includes("--dry-run")) {
-    for (const item of items) process.stdout.write(`${item.id} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
+    for (const item of items) {
+      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+      process.stdout.write(`${item.id} · ${lane.kind} → ${lane.targetBranch} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
+    }
     return;
   }
 
@@ -466,7 +538,6 @@ async function orchestrate(argv: string[]): Promise<void> {
   const runs = projectRunsToGitHub(store, github);
   const git = new GitWorktreeManager(process.cwd());
   const verifier = new ProcessVerificationRunner();
-  const verification = discoverVerificationCommands(process.cwd());
   const outcomes = new Map<string, string>();
   const skipped = new Map<string, string>();
   try {
@@ -507,16 +578,19 @@ async function orchestrate(argv: string[]): Promise<void> {
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
         }
-        const issue = await github.getIssue(item.issue, repository.repo);
+        const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
         const intent = createArtifact({
           kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
           producer: { role: "controller", runtime: "forgedock" },
           payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
         });
-        process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started\n`);
+        const baseRef = `origin/${lane.targetBranch}`;
+        const verification = discoverVerificationCommands(process.cwd(), baseRef);
+        process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
         const result = await executeWorkOn({
-          intent, repoPath: process.cwd(), baseBranch: repository.defaultBranch, baseRef: `origin/${repository.defaultBranch}`,
+          intent, repoPath: process.cwd(), lane,
           verification, autoMerge, signal: controller.signal,
+          subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
         }, {
@@ -551,6 +625,12 @@ function projectRunsToGitHub(runs: RunRepository, github: GitHubClient): RunRepo
       process.stderr.write(`warning: GitHub label projection failed for ${state.subject.repo}#${state.subject.issue ?? "?"} at ${state.state}: ${message}\n`);
     },
   );
+}
+
+function requiredIssueRoute<T>(routes: ReadonlyMap<number, T>, issue: number): T {
+  const route = routes.get(issue);
+  if (!route) throw new Error(`Issue #${issue} has no authoritative lane classification`);
+  return route;
 }
 
 function loadOrchestrationItems(issueNumbers: number[], repo: string): ScheduledWorkItem[] {
@@ -607,7 +687,15 @@ async function collectBaselineChecks(input: {
   runId: string;
   baseRef: string;
 }): Promise<CheckResult[]> {
-  const workspace = await input.git.create({ runId: `${input.runId}-baseline`, issue: input.issue, baseRef: input.baseRef });
+  const identity = { runId: `${input.runId}-baseline`, issue: input.issue, baseRef: input.baseRef };
+  let workspace;
+  try {
+    workspace = await input.git.create(identity);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (!/branch named .+ already exists|already checked out|path .+ already exists/i.test(reason)) throw error;
+    workspace = await input.git.recover(identity);
+  }
   try {
     return await input.verifier.run(input.verification.map((command) => ({ ...command, cwd: workspace.path })));
   } finally {
@@ -616,16 +704,7 @@ async function collectBaselineChecks(input: {
 }
 
 function writeAgentEvent(event: AgentEvent, prefix?: string): void {
-  const task = prefix ? `${prefix} · ${event.taskId}` : event.taskId;
-  if (event.type === "session.started") {
-    process.stdout.write(`  ${statusGlyph("active", mode)} ${task} · ${event.provider}/${event.model}\n`);
-  } else if (event.type === "tool.started") {
-    process.stdout.write(`    ${statusGlyph("active", mode)} ${task} · ${event.tool}\n`);
-  } else if (event.type === "artifact.submitted") {
-    process.stdout.write(`  ${statusGlyph("passed", mode)} ${task} · artifact submitted\n`);
-  } else if (event.type === "session.completed") {
-    process.stdout.write(`  ${statusGlyph("passed", mode)} ${task} · session complete\n`);
-  }
+  agentEventStream.write(event, prefix);
 }
 
 function configuredMaxReviewSpecialists(): number | undefined {

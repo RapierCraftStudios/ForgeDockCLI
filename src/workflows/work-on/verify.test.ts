@@ -6,7 +6,7 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import type { BuilderSubmission } from "./build.js";
-import { verifyAndCommit } from "./verify.js";
+import { uncoveredVerificationCommands, verifyAndCommit } from "./verify.js";
 
 const workspace: GitWorkspace = { path: "/tmp/worktree", branch: "forgedock/issue-1", baseRef: "main", baseSha: "0".repeat(40) };
 const submission: BuilderSubmission = {
@@ -125,6 +125,26 @@ describe("verification and commit barrier", () => {
       changedPaths: ["src/a.ts"],
       checks: [failed],
     });
+  });
+
+  it("blocks rather than claiming an unexecuted frozen verification command passed", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = packet(run);
+    const result = await verifyAndCommit({
+      run,
+      packet: { ...frozen, payload: { ...frozen.payload, verificationPlan: ["Run `npm run docs:build`.", "Run `npm test`."] } },
+      submission, workspace, commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /docs:build/);
+    assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
+    assert.deepEqual(uncoveredVerificationCommands(["Run `git diff --check`.", "Run `npm test`."], [
+      { id: "diff-check" }, { id: "test" },
+    ]), []);
   });
 
   it("blocks paths outside the frozen Build Packet before commit", async () => {

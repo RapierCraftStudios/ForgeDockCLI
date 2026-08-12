@@ -12,10 +12,23 @@ export function discoverVerificationCommands(
   const manifest = readPackageManifest(cwd, baseRef);
   const scripts = manifest.scripts ?? {};
   const npm = npmInvocation();
-  const commands: Array<Omit<VerificationCommand, "cwd">> = [];
-  if (scripts.build) commands.push({ id: "build", command: npm.command, args: [...npm.prefix, "run", "build"], timeoutMs: 10 * 60_000, required: true });
-  if (scripts.test) commands.push({ id: "test", command: npm.command, args: [...npm.prefix, "test"], timeoutMs: 20 * 60_000, required: true });
-  if (!commands.length) throw new Error("No required verification commands detected; define package.json scripts.build or scripts.test");
+  const commands: Array<Omit<VerificationCommand, "cwd">> = [
+    { id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 2 * 60_000, required: true },
+  ];
+  const scriptOrder = ["lint", "typecheck", "check", "build", "docs:build", "test"] as const;
+  for (const script of scriptOrder) {
+    if (!scripts[script]) continue;
+    commands.push({
+      id: script,
+      command: npm.command,
+      args: script === "test" ? [...npm.prefix, "test"] : [...npm.prefix, "run", script],
+      timeoutMs: script === "test" ? 20 * 60_000 : 10 * 60_000,
+      required: true,
+    });
+  }
+  if (commands.length === 1) {
+    throw new Error("No required package verification commands detected; define a lint, typecheck, check, build, docs:build, or test script");
+  }
   return commands;
 }
 
