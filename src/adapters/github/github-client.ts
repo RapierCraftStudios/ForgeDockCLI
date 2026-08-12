@@ -6,6 +6,7 @@ import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
+import type { LeaseFence, LeaseRepository } from "../../core/ports/lease.js";
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
@@ -113,6 +114,7 @@ export class GitHubClient implements ForgeHost {
     readonly cwd = process.cwd(),
     readonly remediationAdmissions: RemediationAdmissionRepository = new InMemoryRemediationAdmissionRepository(),
     readonly refreshAuth?: () => Promise<boolean>,
+    readonly leaseRepository?: LeaseRepository,
   ) {}
 
   async resolveRepository(): Promise<string> {
@@ -500,6 +502,7 @@ export class GitHubClient implements ForgeHost {
     baseBranch: string;
     checkpointKey: string;
     remediationDepth: number;
+    fence?: LeaseFence;
     findings: readonly {
       id: string;
       title: string;
@@ -520,7 +523,8 @@ export class GitHubClient implements ForgeHost {
         headSha: input.headSha,
         marker,
       };
-      const claim = await this.remediationAdmissions.claim(admissionKey);
+      this.assertFence(input.fence);
+      const claim = await this.remediationAdmissions.claim(admissionKey, input.fence);
       if (claim.status === "materialized") {
         materialized.push(claim.snapshot);
         continue;
@@ -529,7 +533,8 @@ export class GitHubClient implements ForgeHost {
       const existing = await this.reconcileRemediationMarker(input.repo, marker);
       if (existing) {
         const authoritative = await this.authoritativeIssueSnapshot(existing);
-        await this.remediationAdmissions.complete(admissionKey, authoritative);
+        this.assertFence(input.fence);
+        await this.remediationAdmissions.complete(admissionKey, authoritative, input.fence);
         materialized.push(authoritative);
         continue;
       }
@@ -555,6 +560,9 @@ export class GitHubClient implements ForgeHost {
         "", "## Required Remediation", "", boundedGitHubText(finding.remediation, 4_000),
         "", marker,
       ].join("\n");
+      // AbortSignal/process termination cannot roll back a request accepted by
+      // GitHub. The durable fence is checked immediately before and after it.
+      this.assertFence(input.fence);
       const url = (await this.gh(["issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-"], body)).trim();
       const number = Number(url.split("/").at(-1));
       if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a remediation issue number");
@@ -564,10 +572,15 @@ export class GitHubClient implements ForgeHost {
       const authoritative = await this.authoritativeIssueSnapshot({
         repo: input.repo, number, title, body, url, state: "OPEN",
       });
-      await this.remediationAdmissions.complete(admissionKey, authoritative);
+      this.assertFence(input.fence);
+      await this.remediationAdmissions.complete(admissionKey, authoritative, input.fence);
       materialized.push(authoritative);
     }
     return materialized;
+  }
+
+  private assertFence(fence?: LeaseFence): void {
+    if (fence && this.leaseRepository) this.leaseRepository.assertOwnership(fence);
   }
 
   private async reconcileRemediationMarker(repo: string, marker: string, openOnly = false): Promise<IssueSnapshot | undefined> {
@@ -972,13 +985,21 @@ export class GitHubArtifactRepository implements ArtifactRepository {
   private readonly projectionAdmissions: RemediationAdmissionRepository;
 
   constructor(
-    readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment"> & Partial<Pick<GitHubClient, "remediationAdmissions">>,
+    readonly client: Pick<GitHubClient, "listIssueComments" | "postIssueComment"> & Partial<Pick<GitHubClient, "remediationAdmissions" | "leaseRepository">>,
     projectionAdmissions?: RemediationAdmissionRepository,
   ) {
     this.projectionAdmissions = projectionAdmissions ?? client.remediationAdmissions ?? new InMemoryRemediationAdmissionRepository();
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
+    await this.appendWithFence(artifact);
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: LeaseFence): Promise<void> {
+    await this.appendWithFence(artifact, fence);
+  }
+
+  private async appendWithFence(artifact: DurableArtifact, fence?: LeaseFence): Promise<void> {
     const canonical = canonicalSubject(artifact.subject);
     const targets: Subject[] = canonical.pr && canonical.issue
       ? [{ repo: canonical.repo, pr: canonical.pr }, { repo: canonical.repo, issue: canonical.issue }]
@@ -991,17 +1012,23 @@ export class GitHubArtifactRepository implements ArtifactRepository {
         headSha: artifact.id,
         marker: `artifact:${artifact.id}`,
       };
-      const claim = await this.projectionAdmissions.claim(admissionKey);
+      if (fence && this.client.leaseRepository) this.client.leaseRepository.assertOwnership(fence);
+      const claim = await this.projectionAdmissions.claim(admissionKey, fence);
       if (claim.status === "materialized") continue;
       const comments = await this.client.listIssueComments(target);
       const exists = comments.flatMap(findArtifacts).some((item) => item.id === artifact.id);
       if (exists) {
-        await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id));
+        if (fence && this.client.leaseRepository) this.client.leaseRepository.assertOwnership(fence);
+        await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id), fence);
         continue;
       }
       if (claim.status !== "claimed") throw new RemediationMaterializationPendingError(artifact.id);
+      if (fence && this.client.leaseRepository) this.client.leaseRepository.assertOwnership(fence);
       await this.client.postIssueComment(target, renderArtifactComment(artifact));
-      await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id));
+      // A started POST is an unknown outcome. Never complete the durable
+      // admission after losing the fence; the next owner must reconcile it.
+      if (fence && this.client.leaseRepository) this.client.leaseRepository.assertOwnership(fence);
+      await this.projectionAdmissions.complete(admissionKey, projectionAdmissionSnapshot(target, artifact.id), fence);
     }
   }
 

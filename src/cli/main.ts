@@ -31,6 +31,7 @@ import {
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
+import type { LeaseFence } from "../core/ports/lease.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
@@ -349,7 +350,7 @@ async function workOn(argv: string[]): Promise<void> {
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
-  github = new GitHubClient(process.cwd(), store);
+  github = new GitHubClient(process.cwd(), store, undefined, store);
   authoritativeArtifacts = new GitHubArtifactRepository(github);
   const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const runs = dryRun ? store : projectRunsToGitHub(store, github);
@@ -390,6 +391,7 @@ async function workOn(argv: string[]): Promise<void> {
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
   const leaseController = new AbortController();
   let leaseToken: string | undefined;
+  let leaseFence: LeaseFence | undefined;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
@@ -402,6 +404,7 @@ async function workOn(argv: string[]): Promise<void> {
     const lease = store.acquire(leaseItem, leaseOwner, 60_000);
     if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
     leaseToken = lease.token;
+    leaseFence = { itemId: lease.itemId, token: lease.token, epoch: lease.epoch };
     leaseHeartbeat = setInterval(() => {
       try {
         store.heartbeat(leaseItem, lease.token, 60_000);
@@ -618,7 +621,7 @@ async function workOn(argv: string[]): Promise<void> {
         ...(model !== undefined ? { model } : {}),
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, lease: store, ...(leaseFence ? { fence: leaseFence } : {}), dispatches: store, onAgentEvent };
       const result = admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
@@ -641,7 +644,7 @@ async function workOn(argv: string[]): Promise<void> {
               ? remediationCheckpoint?.kind === "RemediationBlocked"
                 ? await (async () => {
                   let checkpoint = remediationCheckpoint;
-                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs });
+                  const supervisor = new RemediationSupervisor({ host: github, artifacts, runs, lease: store, fence: leaseFence, dispatches: store });
                   if (checkpoint.payload.status === "awaiting-dispatch") {
                     const dispatched = await supervisor.resumeAwaiting({
                       checkpoint,
@@ -927,7 +930,7 @@ async function orchestrate(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
-  github = new GitHubClient(process.cwd(), store);
+  github = new GitHubClient(process.cwd(), store, undefined, store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -1100,6 +1103,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             ...(model !== undefined ? { model } : {}),
           }, {
             runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+            lease: store, fence: { itemId: item.id, token: lease.token, epoch: lease.epoch }, dispatches: store,
             onAgentEvent: (event) => writeAgentEvent(event, item.id),
           });
         } catch (error) {

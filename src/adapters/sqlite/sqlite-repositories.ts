@@ -6,16 +6,16 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
-import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
+import type { Lease, LeaseFence, LeaseRepository } from "../../core/ports/lease.js";
 import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
-import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
+import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RemediationDispatchClaim, type RemediationDispatchRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
 const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, RemediationDispatchRepository, OrchestrationRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
@@ -63,9 +63,22 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         item_id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
         token TEXT NOT NULL,
+        epoch INTEGER NOT NULL DEFAULT 1,
         acquired_at INTEGER NOT NULL,
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS lease_epochs (
+        item_id TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS remediation_dispatches (
+        checkpoint_key TEXT PRIMARY KEY,
+        checkpoint_sequence INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'materialized')),
+        child_issues_json TEXT,
+        fence_token TEXT,
+        fence_epoch INTEGER
       );
       CREATE TABLE IF NOT EXISTS run_telemetry (
         telemetry_key TEXT PRIMARY KEY,
@@ -95,6 +108,8 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE INDEX IF NOT EXISTS orchestrations_updated ON orchestrations(updated_at);
     `);
+    const leaseColumns = this.#database.prepare("PRAGMA table_info(leases)").all() as Array<{ name?: string }>;
+    if (!leaseColumns.some((column) => column.name === "epoch")) this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1");
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
@@ -104,6 +119,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       VALUES (?, ?, ?, ?)
       ON CONFLICT(artifact_id) DO NOTHING
     `).run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact)));
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: LeaseFence): Promise<void> {
+    assertArtifact(artifact);
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      this.assertOwnershipInTransaction(fence);
+      this.#database.prepare(`INSERT INTO artifacts (artifact_id, subject_key, kind, artifact_json) VALUES (?, ?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING`)
+        .run(artifact.id, subjectKey(artifact.subject), artifact.kind, JSON.stringify(artifact));
+      this.assertOwnershipInTransaction(fence);
+    }));
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
@@ -167,9 +192,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
   }
 
-  async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
+  async claim(key: RemediationAdmissionKey, fence?: LeaseFence): Promise<RemediationAdmissionClaim> {
     const admissionKey = remediationAdmissionKey(key);
     return withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (fence) this.assertOwnershipInTransaction(fence);
       const inserted = this.#database.prepare(`
         INSERT INTO remediation_admissions
           (admission_key, repository, parent_issue, parent_pull_request, head_sha, marker, status)
@@ -185,14 +211,60 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     }));
   }
 
-  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void> {
+  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot, fence?: LeaseFence): Promise<void> {
     const admissionKey = remediationAdmissionKey(key);
-    await withSqliteBusyRetry(() => {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (fence) this.assertOwnershipInTransaction(fence);
       const result = this.#database.prepare(`
         UPDATE remediation_admissions SET status = 'materialized', issue_json = ? WHERE admission_key = ?
       `).run(JSON.stringify(snapshot), admissionKey);
       if (result.changes !== 1) throw new Error(`Unknown remediation admission: ${admissionKey}`);
-    });
+      if (fence) this.assertOwnershipInTransaction(fence);
+    }));
+  }
+
+  async claimDispatch(checkpointKey: string, checkpointSequence: number, fence?: LeaseFence): Promise<RemediationDispatchClaim> {
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (fence) this.assertOwnershipInTransaction(fence);
+      this.#database.prepare(`INSERT INTO remediation_dispatches (checkpoint_key, checkpoint_sequence, status, fence_token, fence_epoch) VALUES (?, ?, 'claimed', ?, ?) ON CONFLICT(checkpoint_key) DO NOTHING`)
+        .run(checkpointKey, checkpointSequence, fence?.token ?? null, fence?.epoch ?? null);
+      const row = this.#database.prepare("SELECT checkpoint_sequence, status, child_issues_json, fence_token, fence_epoch FROM remediation_dispatches WHERE checkpoint_key = ?")
+        .get(checkpointKey) as { checkpoint_sequence: number; status: "pending" | "claimed" | "materialized"; child_issues_json?: string; fence_token?: string; fence_epoch?: number } | undefined;
+      if (!row) throw new Error(`Unable to read remediation dispatch: ${checkpointKey}`);
+      if (row.status === "materialized") return { status: "materialized", checkpointSequence: row.checkpoint_sequence, childIssues: row.child_issues_json ? JSON.parse(row.child_issues_json) as number[] : [] };
+      if (row.status === "pending") {
+        this.#database.prepare("UPDATE remediation_dispatches SET status = 'claimed', fence_token = ?, fence_epoch = ? WHERE checkpoint_key = ?")
+          .run(fence?.token ?? null, fence?.epoch ?? null, checkpointKey);
+        return { status: "claimed", checkpointSequence: row.checkpoint_sequence };
+      }
+      if (fence && row.fence_token === fence.token && row.fence_epoch === fence.epoch) return { status: "claimed", checkpointSequence: row.checkpoint_sequence };
+      if (fence && row.fence_token && row.fence_epoch !== undefined) {
+        const owner = this.#database.prepare("SELECT 1 FROM leases WHERE token = ? AND epoch = ? AND expires_at > ?")
+          .get(row.fence_token, row.fence_epoch, Date.now());
+        if (owner) return { status: "pending", checkpointSequence: row.checkpoint_sequence };
+        this.#database.prepare("UPDATE remediation_dispatches SET status = 'claimed', fence_token = ?, fence_epoch = ? WHERE checkpoint_key = ?")
+          .run(fence.token, fence.epoch, checkpointKey);
+        return { status: "claimed", checkpointSequence: row.checkpoint_sequence };
+      }
+      return { status: "pending", checkpointSequence: row.checkpoint_sequence };
+    }));
+  }
+
+  async completeDispatch(checkpointKey: string, childIssues: readonly number[], fence?: LeaseFence): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (fence) this.assertOwnershipInTransaction(fence);
+      const result = this.#database.prepare("UPDATE remediation_dispatches SET status = 'materialized', child_issues_json = ? WHERE checkpoint_key = ? AND status = 'claimed' AND (fence_token IS NULL OR fence_token = ?) AND (fence_epoch IS NULL OR fence_epoch = ?)")
+        .run(JSON.stringify([...childIssues]), checkpointKey, fence?.token ?? null, fence?.epoch ?? null);
+      if (result.changes !== 1) throw new Error(`Unknown remediation dispatch: ${checkpointKey}`);
+      if (fence) this.assertOwnershipInTransaction(fence);
+    }));
+  }
+
+  async abandonDispatch(checkpointKey: string, fence?: LeaseFence): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (fence) this.assertOwnershipInTransaction(fence);
+      this.#database.prepare("UPDATE remediation_dispatches SET status = 'pending' WHERE checkpoint_key = ? AND status = 'claimed'").run(checkpointKey);
+    }));
   }
 
   async recordTelemetry(receipt: AgentRunReceipt): Promise<void> {
@@ -261,12 +333,14 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
     return this.inTransaction(() => {
       this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
+      this.#database.prepare("INSERT INTO lease_epochs (item_id, epoch) VALUES (?, 1) ON CONFLICT(item_id) DO UPDATE SET epoch = epoch + 1").run(itemId);
+      const epoch = Number((this.#database.prepare("SELECT epoch FROM lease_epochs WHERE item_id = ?").get(itemId) as { epoch: number }).epoch);
       const token = crypto.randomUUID();
       const result = this.#database.prepare(`
-        INSERT INTO leases (item_id, owner, token, acquired_at, heartbeat_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
-      `).run(itemId, owner, token, now, now, now + ttlMs);
-      return result.changes === 1 ? { itemId, owner, token, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs } : undefined;
+        INSERT INTO leases (item_id, owner, token, epoch, acquired_at, heartbeat_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
+      `).run(itemId, owner, token, epoch, now, now, now + ttlMs);
+      return result.changes === 1 ? { itemId, owner, token, epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs } : undefined;
     });
   }
 
@@ -280,12 +354,23 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return leaseFromRow(row);
   }
 
+  assertOwnership(fence: LeaseFence, now = Date.now()): Lease {
+    return this.inTransaction(() => this.assertOwnershipInTransaction(fence, now));
+  }
+
   release(itemId: string, token: string): boolean {
     return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
   }
 
   close(): void {
     this.#database.close();
+  }
+
+  private assertOwnershipInTransaction(fence: LeaseFence, now = Date.now()): Lease {
+    const row = this.#database.prepare("SELECT * FROM leases WHERE item_id = ? AND token = ? AND epoch = ? AND expires_at > ?")
+      .get(fence.itemId, fence.token, fence.epoch, now) as Record<string, string | number> | undefined;
+    if (!row) throw new Error(`Lease fence is absent, stale, or owned by another worker: ${fence.itemId}`);
+    return leaseFromRow(row);
   }
 
   private inTransaction<T>(operation: () => T): T {
@@ -327,7 +412,7 @@ function subjectKey(subject: Subject): string {
 
 function leaseFromRow(row: Record<string, string | number>): Lease {
   return {
-    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token),
+    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token), epoch: Number(row.epoch ?? 1),
     acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at),
   };
 }

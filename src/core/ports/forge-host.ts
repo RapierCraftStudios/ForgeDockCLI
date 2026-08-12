@@ -64,6 +64,8 @@ export interface PullRequestSnapshot {
   baseBranch: string;
 }
 
+import type { LeaseFence } from "./lease.js";
+
 export interface ForgeHost {
   getIssue?(number: number, repo?: string): Promise<IssueSnapshot>;
   materializeBatchIssue?(input: {
@@ -89,6 +91,8 @@ export interface ForgeHost {
     baseBranch: string;
     checkpointKey: string;
     remediationDepth: number;
+    /** Durable lease fence; omitted only by legacy non-controller callers. */
+    fence?: LeaseFence;
     findings: readonly {
       id: string;
       title: string;

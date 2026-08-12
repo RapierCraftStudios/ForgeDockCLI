@@ -3,6 +3,7 @@
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot } from "./forge-host.js";
+import type { LeaseFence } from "./lease.js";
 import type { OrchestrationRecord, OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
@@ -20,12 +21,27 @@ export type RemediationAdmissionClaim =
 
 /** Durable, fail-closed admission for one deterministic remediation marker. */
 export interface RemediationAdmissionRepository {
-  claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim>;
-  complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void>;
+  claim(key: RemediationAdmissionKey, fence?: LeaseFence): Promise<RemediationAdmissionClaim>;
+  complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot, fence?: LeaseFence): Promise<void>;
+}
+
+export interface RemediationDispatchClaim {
+  status: "claimed" | "pending" | "materialized";
+  checkpointSequence: number;
+  childIssues?: readonly number[];
+}
+
+/** Durable single-dispatch admission for a remediation checkpoint. */
+export interface RemediationDispatchRepository {
+  claimDispatch(checkpointKey: string, checkpointSequence: number, fence?: LeaseFence): Promise<RemediationDispatchClaim>;
+  completeDispatch(checkpointKey: string, childIssues: readonly number[], fence?: LeaseFence): Promise<void>;
+  abandonDispatch(checkpointKey: string, fence?: LeaseFence): Promise<void>;
 }
 
 export interface ArtifactRepository {
   append(artifact: DurableArtifact): Promise<void>;
+  /** Fenced publication is optional for compatibility with non-remediation stores. */
+  appendFenced?(artifact: DurableArtifact, fence: LeaseFence): Promise<void>;
   list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]>;
 }
 
@@ -52,6 +68,13 @@ export class CachedArtifactRepository implements ArtifactRepository {
   async append(artifact: DurableArtifact): Promise<void> {
     await this.authoritative.append(artifact);
     await this.cache.append(artifact);
+  }
+
+  async appendFenced(artifact: DurableArtifact, fence: LeaseFence): Promise<void> {
+    if (this.authoritative.appendFenced) await this.authoritative.appendFenced(artifact, fence);
+    else await this.authoritative.append(artifact);
+    if (this.cache.appendFenced) await this.cache.appendFenced(artifact, fence);
+    else await this.cache.append(artifact);
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {
@@ -103,7 +126,7 @@ export class ProjectedRunRepository implements RunRepository {
 export class InMemoryRemediationAdmissionRepository implements RemediationAdmissionRepository {
   readonly records = new Map<string, { status: "pending" | "materialized"; snapshot?: IssueSnapshot }>();
 
-  async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
+  async claim(key: RemediationAdmissionKey, _fence?: LeaseFence): Promise<RemediationAdmissionClaim> {
     const admissionKey = remediationAdmissionKey(key);
     const existing = this.records.get(admissionKey);
     if (existing?.status === "materialized" && existing.snapshot) {
@@ -114,10 +137,47 @@ export class InMemoryRemediationAdmissionRepository implements RemediationAdmiss
     return { status: "claimed" };
   }
 
-  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void> {
+  async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot, _fence?: LeaseFence): Promise<void> {
     const admissionKey = remediationAdmissionKey(key);
     if (!this.records.has(admissionKey)) throw new Error(`Unknown remediation admission: ${admissionKey}`);
     this.records.set(admissionKey, { status: "materialized", snapshot: structuredClone(snapshot) });
+  }
+}
+
+export class InMemoryRemediationDispatchRepository implements RemediationDispatchRepository {
+  readonly records = new Map<string, { status: "pending" | "claimed" | "materialized"; checkpointSequence: number; childIssues?: number[]; fence?: LeaseFence }>();
+
+  async claimDispatch(checkpointKey: string, checkpointSequence: number, fence?: LeaseFence): Promise<RemediationDispatchClaim> {
+    const existing = this.records.get(checkpointKey);
+    if (!existing) {
+      this.records.set(checkpointKey, { status: "claimed", checkpointSequence, ...(fence ? { fence: { ...fence } } : {}) });
+      return { status: "claimed", checkpointSequence };
+    }
+    if (existing.status === "materialized") return { status: "materialized", checkpointSequence: existing.checkpointSequence, childIssues: [...(existing.childIssues ?? [])] };
+    if (existing.status === "pending") {
+      existing.status = "claimed";
+      if (fence) existing.fence = { ...fence };
+      else delete existing.fence;
+      return { status: "claimed", checkpointSequence: existing.checkpointSequence };
+    }
+    if (fence && (!existing.fence || existing.fence.token !== fence.token || existing.fence.epoch !== fence.epoch)) {
+      existing.fence = { ...fence };
+      return { status: "claimed", checkpointSequence: existing.checkpointSequence };
+    }
+    return { status: "pending", checkpointSequence: existing.checkpointSequence };
+  }
+
+  async completeDispatch(checkpointKey: string, childIssues: readonly number[], _fence?: LeaseFence): Promise<void> {
+    const existing = this.records.get(checkpointKey);
+    if (!existing) throw new Error(`Unknown remediation dispatch: ${checkpointKey}`);
+    if (_fence && existing.fence && (existing.fence.token !== _fence.token || existing.fence.epoch !== _fence.epoch)) throw new Error(`Stale remediation dispatch fence: ${checkpointKey}`);
+    existing.status = "materialized";
+    existing.childIssues = [...childIssues];
+  }
+
+  async abandonDispatch(checkpointKey: string, _fence?: LeaseFence): Promise<void> {
+    const existing = this.records.get(checkpointKey);
+    if (existing?.status === "claimed") existing.status = "pending";
   }
 }
 
@@ -127,6 +187,10 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   async append(artifact: DurableArtifact): Promise<void> {
     if (this.artifacts.some((item) => item.id === artifact.id)) return;
     this.artifacts.push(structuredClone(artifact));
+  }
+
+  async appendFenced(artifact: DurableArtifact, _fence: LeaseFence): Promise<void> {
+    await this.append(artifact);
   }
 
   async list(subject: Subject, kind?: ArtifactKind): Promise<DurableArtifact[]> {

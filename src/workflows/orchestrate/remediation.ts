@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact, type RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
+import type { LeaseFence, LeaseRepository } from "../../core/ports/lease.js";
+import type { ArtifactRepository, RemediationDispatchRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
@@ -38,6 +39,7 @@ export interface RemediationBlockedInput {
   maxRemediationDepth?: number;
   maxRemediationChildren?: number;
   approvedPaths?: readonly string[];
+  fence?: LeaseFence;
 }
 
 export interface RemediationCheckpointResult {
@@ -49,6 +51,9 @@ export interface RemediationSupervisorDependencies {
   host: ForgeHost;
   artifacts: ArtifactRepository;
   runs?: RunRepository;
+  lease?: LeaseRepository;
+  fence?: LeaseFence;
+  dispatches?: RemediationDispatchRepository;
 }
 
 /**
@@ -62,14 +67,17 @@ export class RemediationSupervisor {
     private readonly limits: { maxCycles?: number; maxDepth?: number; maxChildren?: number } = {},
   ) {}
 
+  readonly #inflight = new Map<string, Promise<RemediationCheckpointResult>>();
+
   async begin(input: RemediationBlockedInput): Promise<RemediationCheckpointResult> {
     const depth = input.remediationDepth ?? 0;
     const maxDepth = input.maxRemediationDepth ?? this.limits.maxDepth ?? DEFAULT_REMEDIATION_LIMITS.maxDepth;
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
     const actionable = actionableFindings(input.findings);
     const eligible = actionable.slice(0, maxChildren);
+    const { fence: _inputFence, ...inputWithoutFence } = input;
     const authorizedInput = {
-      ...input,
+      ...inputWithoutFence,
       findings: eligible,
       remediationDepth: depth,
       maxRemediationDepth: maxDepth,
@@ -77,6 +85,14 @@ export class RemediationSupervisor {
     };
     const checkpointKey = remediationCheckpointKey(input.parentRun.runId, input.parentPullRequest.number, input.parentPullRequest.headSha, eligible);
     const sequence = await nextCheckpointSequence(this.dependencies.artifacts, input.parentRun.subject, checkpointKey);
+    const fence = input.fence ?? this.dependencies.fence;
+    if (this.dependencies.dispatches || fence) {
+      const existing = this.#inflight.get(checkpointKey);
+      if (existing) return existing;
+      const operation = this.beginFenced({ input, authorizedInput, checkpointKey, sequence, depth, maxDepth, maxChildren, ...(fence ? { fence } : {}) });
+      this.#inflight.set(checkpointKey, operation);
+      try { return await operation; } finally { this.#inflight.delete(checkpointKey); }
+    }
     const base = remediationPayload(authorizedInput, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
     if (depth >= maxDepth || eligible.length === 0 || actionable.length > maxChildren) {
       const terminal = createCheckpoint(input, { ...base, status: "terminal", checkpointSequence: sequence });
@@ -116,10 +132,77 @@ export class RemediationSupervisor {
     return { checkpoint: running, childIssues: children.map((child) => child.number) };
   }
 
+  private async beginFenced(input: {
+    input: RemediationBlockedInput;
+    authorizedInput: RemediationBlockedInput;
+    checkpointKey: string;
+    sequence: number;
+    depth: number;
+    maxDepth: number;
+    maxChildren: number;
+    fence?: LeaseFence;
+  }): Promise<RemediationCheckpointResult> {
+    const { input: original, authorizedInput, checkpointKey, sequence, depth, maxDepth, fence } = input;
+    const base = remediationPayload(authorizedInput, checkpointKey, sequence, "awaiting-dispatch", [], [], [], depth, maxDepth);
+    if (depth >= maxDepth || authorizedInput.findings.length === 0) {
+      const terminal = createCheckpoint(original, { ...base, status: "terminal", checkpointSequence: sequence });
+      await this.appendCheckpoint(terminal, fence);
+      return { checkpoint: terminal, childIssues: [] };
+    }
+    const dispatch = this.dependencies.dispatches;
+    const claim = dispatch ? await dispatch.claimDispatch(checkpointKey, sequence, fence) : { status: "claimed" as const, checkpointSequence: sequence };
+    if (claim.status === "materialized") {
+      const checkpoint = await this.reconstruct({ subject: { repo: original.parentRun.subject.repo, issue: original.parentRun.subject.issue ?? original.parentPullRequest.number }, checkpointKey });
+      if (!checkpoint || checkpoint.payload.status !== "children-running") throw new Error(`Materialized remediation dispatch ${checkpointKey} has no authoritative children-running checkpoint`);
+      return { checkpoint, childIssues: [...checkpoint.payload.childIssues] };
+    }
+    if (claim.status === "pending") throw new Error(`Remediation dispatch ${checkpointKey} is owned by another current fence`);
+    const awaiting = createCheckpoint(original, base);
+    try {
+      await this.appendCheckpoint(awaiting, fence);
+      if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
+      const children = await this.dependencies.host.materializeRemediationChildren({
+        repo: original.parentRun.subject.repo,
+        parentRunId: original.parentRun.runId,
+        parentIssue: original.parentRun.subject.issue ?? original.parentPullRequest.number,
+        parentPullRequest: original.parentPullRequest.number,
+        headSha: original.parentPullRequest.headSha,
+        headBranch: original.parentPullRequest.headBranch,
+        baseBranch: original.parentPullRequest.baseBranch,
+        checkpointKey,
+        remediationDepth: depth + 1,
+        ...(fence ? { fence } : {}),
+        findings: authorizedInput.findings.flatMap((finding) => finding.location && finding.acceptanceCriterion ? [{
+          id: finding.id, title: finding.title, evidence: finding.evidence, location: finding.location,
+          remediation: finding.remediation, acceptanceCriterion: finding.acceptanceCriterion,
+        }] : []),
+      });
+      const childIssues = children.map((child) => child.number);
+      if (new Set(childIssues).size !== childIssues.length) throw new Error(`Remediation materialization returned duplicate child issue IDs for ${checkpointKey}`);
+      const running = createCheckpoint(original, { ...base, checkpointSequence: sequence + 1, status: "children-running", childIssues });
+      await this.appendCheckpoint(running, fence);
+      if (dispatch) await dispatch.completeDispatch(checkpointKey, childIssues, fence);
+      return { checkpoint: running, childIssues };
+    } catch (error) {
+      if (dispatch) {
+        try { await dispatch.abandonDispatch(checkpointKey, fence); } catch { /* preserve the unknown remote outcome */ }
+      }
+      throw error;
+    }
+  }
+
+  private async appendCheckpoint(artifact: DurableArtifact<"RemediationBlocked">, fence?: LeaseFence): Promise<void> {
+    if (fence && this.dependencies.lease) this.dependencies.lease.assertOwnership(fence);
+    if (fence && this.dependencies.artifacts.appendFenced) await this.dependencies.artifacts.appendFenced(artifact, fence);
+    else await this.dependencies.artifacts.append(artifact);
+    if (fence && this.dependencies.lease) this.dependencies.lease.assertOwnership(fence);
+  }
+
   /** Replay the exact durable admission represented by an awaiting checkpoint. */
   async resumeAwaiting(input: {
     checkpoint: DurableArtifact<"RemediationBlocked">;
     parentPullRequest: PullRequestSnapshot;
+    fence?: LeaseFence;
   }): Promise<RemediationCheckpointResult> {
     const awaiting = input.checkpoint.payload;
     if (awaiting.status !== "awaiting-dispatch") throw new Error("Remediation checkpoint is not awaiting dispatch");
@@ -150,16 +233,19 @@ export class RemediationSupervisor {
       baseBranch: awaiting.baseBranch,
       checkpointKey: awaiting.checkpointKey,
       remediationDepth: awaiting.remediationDepth + 1,
+      ...(input.fence ?? this.dependencies.fence ? { fence: input.fence ?? this.dependencies.fence } : {}),
       findings,
     });
+    const childIssues = children.map((child) => child.number);
+    if (new Set(childIssues).size !== childIssues.length) throw new Error(`Remediation recovery returned duplicate child issue IDs for ${awaiting.checkpointKey}`);
     const running = createCheckpointFromExisting(input.checkpoint, {
       ...awaiting,
       checkpointSequence: awaiting.checkpointSequence + 1,
       status: "children-running",
-      childIssues: children.map((child) => child.number),
+      childIssues,
     });
-    await this.dependencies.artifacts.append(running);
-    return { checkpoint: running, childIssues: children.map((child) => child.number) };
+    await this.appendCheckpoint(running, input.fence ?? this.dependencies.fence);
+    return { checkpoint: running, childIssues };
   }
 
   async reconcileChildren(input: {
