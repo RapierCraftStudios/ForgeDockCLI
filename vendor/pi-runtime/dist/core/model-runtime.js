@@ -75,7 +75,7 @@ export class ModelRuntime {
         const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
         const controller = refreshFromNetwork ? new AbortController() : undefined;
         const timeout = controller
-            ? setTimeout(() => controller.abort(), options.modelRefreshTimeoutMs ?? 15_000)
+            ? setTimeout(() => controller.abort(), options.modelRefreshTimeoutMs ?? DEFAULT_MODEL_REFRESH_TIMEOUT_MS)
             : undefined;
         try {
             await runtime.refresh({ allowNetwork: refreshFromNetwork, signal: controller?.signal });
