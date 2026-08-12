@@ -5,6 +5,7 @@ import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
+import { terminalReviewFindings } from "../../workflows/review-pr/review.js";
 import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
@@ -108,16 +109,20 @@ describe("GitHub review finding projection", () => {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
       state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
     };
+    const aggregate = terminalReviewFindings([
+      { ...finding, reviewerRoles: ["correctness"], scopeDisposition: "in_scope" },
+      { ...finding, id: "review-2222222222222222", title: "Response schema is incomplete", evidence: "Response fields are missing", reviewerRoles: ["data"], scopeDisposition: "in_scope" },
+    ])[0]!;
     const body = (marker: string, run = "run-1", pr = 57) => `**Source:** PR #${pr} — Fix\n**Run:** \`${run}\`\n${marker}`;
-    const staleMarker = reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Different root cause" });
+    const staleMarker = reviewFindingMarker("a/b", 57, finding);
     const issues = [
-      { repo: "a/b", number: 1, title: "active", body: body(reviewFindingMarker("a/b", 57, finding)), url: "u1", state: "OPEN" as const },
-      { repo: "a/b", number: 2, title: "stale", body: body(staleMarker), url: "u2", state: "OPEN" as const },
+      { repo: "a/b", number: 1, title: "active aggregate", body: body(reviewFindingMarker("a/b", 57, aggregate)), url: "u1", state: "OPEN" as const },
+      { repo: "a/b", number: 2, title: "stale component", body: body(staleMarker), url: "u2", state: "OPEN" as const },
       { repo: "a/b", number: 3, title: "other run", body: body(staleMarker, "run-2"), url: "u3", state: "OPEN" as const },
       { repo: "a/b", number: 4, title: "closed", body: body(staleMarker), url: "u4", state: "CLOSED" as const },
     ];
     assert.deepEqual(reviewFindingReconciliationCandidates(issues, {
-      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [finding],
+      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [aggregate],
     }).map(({ number }) => number), [2]);
   });
 
@@ -131,6 +136,58 @@ describe("GitHub review finding projection", () => {
       reviewFindingMarker("a/b", 57, finding),
       reviewFindingMarker("a/b", 57, { ...finding, id: "review-2222222222222222", evidence: "Response variants are missing" }),
     );
+  });
+
+  it("creates distinct issues for same-count aggregate root sets and closes the stale aggregate", async () => {
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
+    };
+    const finding = (id: string, index: number) => ({
+      id, severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: `Root ${index}`, evidence: `Evidence ${index}`, location: `src/schema.ts:${index}`,
+      intentRelevance: "Breaks clients", remediation: `Fix root ${index}`,
+      scopeDisposition: "in_scope" as const, reviewerRoles: ["correctness"],
+    });
+    const firstAggregate = terminalReviewFindings([
+      finding("review-1111111111111111", 1), finding("review-2222222222222222", 2),
+    ])[0]!;
+    const secondAggregate = terminalReviewFindings([
+      finding("review-3333333333333333", 3), finding("review-4444444444444444", 4),
+    ])[0]!;
+    assert.notEqual(firstAggregate.id, secondAggregate.id);
+    assert.notEqual(reviewFindingMarker("a/b", 57, firstAggregate), reviewFindingMarker("a/b", 57, secondAggregate));
+
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed" }> = [];
+    const closed: number[] = [];
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "issue" && args[1] === "create") {
+        const number = 100 + issues.length + 1;
+        issues.push({ number, title: args[args.indexOf("--title") + 1] ?? "Finding", body: body ?? "", html_url: `https://github.test/a/b/issues/${number}`, state: "open" });
+        return `https://github.test/a/b/issues/${number}\n`;
+      }
+      if (args[0] === "issue" && args[1] === "close") {
+        const number = Number(args[2]);
+        const issue = issues.find((candidate) => candidate.number === number);
+        if (issue) issue.state = "closed";
+        closed.push(number);
+        return "";
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const baseInput = { repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-1", reviewedHeadSha: pullRequest.headSha, reviewerRoles: ["correctness"] };
+    const firstIssue = await client.materializeReviewFinding({ ...baseInput, finding: firstAggregate });
+    const secondIssue = await client.materializeReviewFinding({ ...baseInput, finding: secondAggregate });
+    assert.notEqual(firstIssue.number, secondIssue.number);
+    assert.equal(issues.length, 2);
+    assert.deepEqual(await client.reconcileReviewFindings({
+      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [secondAggregate],
+    }), [firstIssue.number]);
+    assert.deepEqual(closed, [firstIssue.number]);
   });
 });
 

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { Check } from "typebox/value";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { isTransientReviewerTransportFailure, renderReviewerSubmissionComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
+import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -15,11 +17,18 @@ class FakeHost implements ForgeHost {
   snapshots: PullRequestSnapshot[] = [pr, pr];
   comments: Array<{ marker: string; body: string }> = [];
   findingIssues: Array<{ finding: { id: string }; reviewerRoles: readonly string[] }> = [];
+  reconciliations: Array<{ activeFindings: readonly { id: string }[] }> = [];
+  remediationDeltaPaths: readonly string[] = [];
+  remediationDeltaRequests: Array<{ baseSha: string; headSha: string }> = [];
   constructor(readonly events?: string[]) {}
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { return pr; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return this.snapshots.shift() ?? pr; }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)"; }
+  async getChangedPathsBetween(_repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {
+    this.remediationDeltaRequests.push({ baseSha, headSha });
+    return this.remediationDeltaPaths;
+  }
   async publishPullRequestComment(input: { marker: string; body: string }): Promise<void> {
     this.comments.push(input);
     this.events?.push(`comment:${/Independent Review · ([^\n]+)/.exec(input.body)?.[1] ?? "unknown"}`);
@@ -29,6 +38,10 @@ class FakeHost implements ForgeHost {
     this.events?.push(`issue:${input.finding.id}`);
     const number = 100 + this.findingIssues.length;
     return { repo: pr.repo, number, title: input.finding.id, body: "", url: `https://github.test/a/b/issues/${number}`, state: "OPEN" as const };
+  }
+  async reconcileReviewFindings(input: { activeFindings: readonly { id: string }[] }): Promise<readonly number[]> {
+    this.reconciliations.push(input);
+    return [];
   }
   async mergePullRequest(): Promise<void> {}
   async closeIssue(): Promise<void> {}
@@ -43,6 +56,18 @@ async function reviewingRun(runs: InMemoryRunRepository): Promise<RunState> {
     run = next.state;
   }
   return run;
+}
+
+function reviewPlanContext(run: RunState): Omit<ReviewPlanContext, "packetId" | "packetDigest"> {
+  return {
+    runId: run.runId,
+    repo: run.subject.repo,
+    ...(run.subject.issue !== undefined ? { issue: run.subject.issue } : {}),
+    pullRequest: pr.number,
+    deliveryRunId: run.runId,
+    buildResultBranch: "fix",
+    targetBranch: "main",
+  };
 }
 
 function artifacts(run: RunState) {
@@ -67,6 +92,7 @@ const inScope = {
   matchedAcceptanceCriteria: ["Concurrent updates pass"],
   matchedPriorFindingIds: [] as string[],
   introducedByRemediation: false,
+  causalRoot: "lock releases before guarded write",
 };
 const acceptAdjudication = (task: AgentTask<unknown>) => ({
   decisions: [...task.objective.matchAll(/"id": "(review-[a-f0-9]{16})"/g)].map((match) => ({
@@ -117,7 +143,7 @@ describe("fresh-context PR review", () => {
     );
   });
 
-  it("launches one bounded adaptive escalation wave when correctness exposes a new specialist surface", async () => {
+  it("does not expand a frozen tiny-diff topology from reviewer findings", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -146,15 +172,170 @@ describe("fresh-context PR review", () => {
         title: "Stale lease holder can commit", evidence: "A reassigned worker is not fenced", location: "src/worker.ts:20",
         intentRelevance: "Permits stale writes", remediation: "Fence commits with the active lease epoch",
       }],
-    }, clean, acceptAdjudication]);
+    }, acceptAdjudication]);
     const result = await reviewPullRequest({
       run, pullRequest: pr, intent: context.intent, investigation: context.investigation,
       packet: packetWithoutConcurrency, buildResult, workspace: process.cwd(), maxReviewSpecialists: 1,
     }, { runtime, host: new PlainHost(), artifacts: new InMemoryArtifactRepository(), runs });
-    assert.deepEqual(result.reviewPlan.selected.map(({ role }) => role), ["correctness", "concurrency"]);
-    assert.equal(runtime.tasks.length, 3);
-    assert.ok(runtime.tasks.some((task) => task.id.includes(":concurrency")));
+    assert.deepEqual(result.reviewPlan.selected.map(({ role }) => role), ["correctness"]);
+    assert.equal(result.reviewPlan.frozen, true);
+    assert.equal(runtime.tasks.length, 2);
+    assert.equal(runtime.tasks.filter((task) => task.role === "reviewer").length, 1);
+    assert.ok(!runtime.tasks.some((task) => task.id.includes("review-concurrency")));
     assert.ok(runtime.tasks.some((task) => task.role === "adjudicator"));
+  });
+
+  it("reuses the exact frozen topology after remediation instead of broadening it", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const neutralPacket = createArtifact({
+      kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" },
+      payload: { ...context.packet.payload, risks: [], expectedPaths: ["src/worker.ts"] },
+    });
+    const priorPlan = planReviewPanel({
+      changedPaths: ["src/worker.ts"], diff: "+work();", packet: neutralPacket,
+      context: reviewPlanContext(run),
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: priorPlan },
+    });
+    const runtime = new FakeAgentRuntime([clean]);
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet: neutralPacket, priorVerdict, workspace: process.cwd() }, {
+      runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.reviewPlan.planId, priorPlan.planId);
+    assert.deepEqual(result.reviewPlan.executionGroups.map(({ role }) => role), ["correctness"]);
+    assert.equal(runtime.tasks.filter(({ role }) => role === "reviewer").length, 1);
+  });
+
+  it("threads an exact host-observed prior-SHA remediation delta into continuity policy", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const priorPlan = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths,
+      diff: await new FakeHost().getPullRequestDiff(),
+      packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: {
+        headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan: priorPlan,
+      },
+    });
+    const introduced = {
+      ...inScope,
+      id: "introduced-delta",
+      introducedByRemediation: true,
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: true,
+      title: "Remediation broke the guarded write",
+      evidence: "The new edit returns before save",
+      location: "src/lock.ts:20",
+      intentRelevance: "Breaks the frozen criterion",
+      remediation: "Keep save in the guard",
+    };
+    const host = new FakeHost();
+    host.remediationDeltaPaths = ["src/lock.ts"];
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([{ summary: "introduced regression", findings: [introduced] }, clean, acceptAdjudication]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.verdict.payload.findings[0]?.blocking, true);
+    assert.deepEqual(host.remediationDeltaRequests, [{ baseSha: "b".repeat(40), headSha: sha }]);
+  });
+
+  it("rejects a foreign prior verdict before topology, continuity, adjudication, or supersession use", async () => {
+    const variants = ["run", "repo", "issue", "pr", "head-branch", "base-branch", "delivery", "packet", "plan-identity", "head-lineage"] as const;
+    for (const variant of variants) {
+      const runs = new InMemoryRunRepository();
+      const run = await reviewingRun(runs);
+      const context = artifacts(run);
+      const validPlan = planReviewPanel({
+        changedPaths: context.buildResult.payload.changedPaths,
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)",
+        packet: context.packet,
+        context: reviewPlanContext(run),
+      });
+      let priorVerdict = createArtifact({
+        kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+        payload: {
+          headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes",
+          reviewerRoles: validPlan.selected.map(({ role }) => role), findings: [], checks: [], reviewPlan: validPlan,
+        },
+      });
+      if (variant === "run") priorVerdict = { ...priorVerdict, runId: "foreign-run" };
+      if (variant === "repo") priorVerdict = { ...priorVerdict, subject: { ...priorVerdict.subject, repo: "foreign/repo" } };
+      if (variant === "issue") priorVerdict = { ...priorVerdict, subject: { ...priorVerdict.subject, issue: 99 } };
+      if (variant === "pr") priorVerdict = { ...priorVerdict, subject: { ...priorVerdict.subject, pr: 99 } };
+      if (variant === "head-branch") priorVerdict = { ...priorVerdict, payload: { ...priorVerdict.payload, headBranch: "foreign-head" } };
+      if (variant === "base-branch") priorVerdict = { ...priorVerdict, payload: { ...priorVerdict.payload, baseBranch: "release" } };
+      if (variant === "delivery" || variant === "packet") {
+        const changed = {
+          ...validPlan,
+          context: {
+            ...validPlan.context,
+            ...(variant === "delivery" ? { deliveryRunId: "foreign-delivery" } : { packetDigest: "f".repeat(64) }),
+          },
+        };
+        const foreignPlan = { ...changed, planId: computeReviewPlanId(changed) };
+        priorVerdict = { ...priorVerdict, payload: { ...priorVerdict.payload, reviewPlan: foreignPlan } };
+      }
+      if (variant === "plan-identity") {
+        const changed = { ...validPlan, executionGroups: validPlan.executionGroups.map((group, index) => index ? group : { ...group, score: group.score + 1 }) };
+        priorVerdict = { ...priorVerdict, payload: { ...priorVerdict.payload, reviewPlan: changed } };
+      }
+      if (variant === "head-lineage") priorVerdict = { ...priorVerdict, payload: { ...priorVerdict.payload, headSha: "c".repeat(40) } };
+      const runtime = new FakeAgentRuntime([clean, clean]);
+      const host = new FakeHost();
+      if (variant === "head-lineage") {
+        Object.defineProperty(host, "getChangedPathsBetween", { value: async () => { throw new Error("unknown revision"); } });
+      }
+      const artifactStore = new InMemoryArtifactRepository();
+      await assert.rejects(
+        reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+          runtime, host, artifacts: artifactStore, runs,
+        }),
+        /Cannot use prior Review Verdict/,
+        variant,
+      );
+      assert.equal(runtime.tasks.length, 0, variant);
+      assert.equal(host.comments.length, 0, variant);
+      assert.equal(artifactStore.artifacts.length, 0, variant);
+    }
+  });
+
+  it("replans compatibility budgets missing new fields and cannot approve with zero reviewers", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const planned = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths,
+      diff: await new FakeHost().getPullRequestDiff(), packet: context.packet, context: reviewPlanContext(run),
+    });
+    const { maxParallelSessions: _parallel, maxModelCalls: _modelCalls, ...legacyBudget } = planned.budget;
+    const compatibilityCandidate = { ...planned, budget: legacyBudget } as unknown as ReviewPlan;
+    const compatibilityPlan = { ...compatibilityCandidate, planId: computeReviewPlanId(compatibilityCandidate) };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: {
+        headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan: compatibilityPlan,
+      },
+    });
+    const runtime = new FakeAgentRuntime([clean, clean]);
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.verdict.payload.disposition, "approve");
+    assert.notEqual(result.reviewPlan.planId, compatibilityPlan.planId);
+    assert.equal(runtime.tasks.filter(({ role }) => role === "reviewer").length, result.reviewPlan.executionGroups.length);
+    assert.ok(runtime.tasks.some(({ role }) => role === "reviewer"));
   });
 
   it("retries one operationally failed reviewer in fresh context without discarding successful peers", async () => {
@@ -171,8 +352,10 @@ describe("fresh-context PR review", () => {
     });
     assert.equal(result.run.state, "merging");
     assert.equal(runtime.tasks.length, 3);
-    assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-2")));
-    assert.ok(runtime.tasks.find((task) => task.id.endsWith(":retry-2"))?.instructions.includes("previous operational attempt failed"));
+    const correctnessTasks = runtime.tasks.filter((task) => task.id.endsWith(":review-correctness"));
+    assert.equal(correctnessTasks.length, 2);
+    assert.equal(new Set(correctnessTasks.map(({ id }) => id)).size, 1);
+    assert.ok(correctnessTasks[1]?.instructions.includes("previous operational attempt failed"));
   });
 
   it("resumes an incomplete persisted reviewer once before spending a fresh session", async () => {
@@ -216,11 +399,13 @@ describe("fresh-context PR review", () => {
     assert.equal(result.run.state, "merging");
     assert.deepEqual(runtime.resumed, ["persisted-review"]);
     assert.deepEqual(result.verdict.payload.findings[0]?.sourceSessionRefs, ["persisted-review", "resumed-session"]);
-    assert.equal(runtime.tasks.filter((task) => task.id.includes(":correctness")).length, 2);
-    assert.ok(runtime.tasks.some((task) => task.id.endsWith(":correctness:resume")));
+    const correctnessTasks = runtime.tasks.filter((task) => task.id.endsWith(":review-correctness"));
+    assert.equal(correctnessTasks.length, 2);
+    assert.equal(new Set(correctnessTasks.map(({ id }) => id)).size, 1);
+    assert.ok(correctnessTasks[1]?.instructions.includes("Continue only the persisted incomplete reviewer session"));
   });
 
-  it("uses additional fresh attempts for transient reviewer transport failures", async () => {
+  it("settles successful siblings, preserves their report, caps attempts at two, and issues no partial approval", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -228,16 +413,109 @@ describe("fresh-context PR review", () => {
       async () => { throw new Error("WebSocket error"); },
       clean,
       async () => { throw new Error("Nested reviewer transport failed: ECONNRESET"); },
-      clean,
     ]);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
-      runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
-    });
-    assert.equal(result.run.state, "merging");
-    assert.equal(runtime.tasks.length, 4);
-    assert.ok(runtime.tasks.some((task) => task.id.endsWith(":retry-3")));
+    const host = new FakeHost();
+    const artifactStore = new InMemoryArtifactRepository();
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+        runtime, host, artifacts: artifactStore, runs,
+      }),
+      /Review incomplete.*successful reviewer reports were preserved and no partial approval was issued/,
+    );
+    assert.equal(runtime.tasks.length, 3);
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length <= 2));
+    assert.equal(host.comments.length, 1);
+    assert.match(host.comments[0]?.body ?? "", /Independent Review · concurrency/);
+    assert.equal(artifactStore.artifacts.some(({ kind }) => kind === "ReviewVerdict"), false);
+    assert.equal((await runs.load(run.runId))?.state, "blocked");
     assert.equal(isTransientReviewerTransportFailure("read failed: optional path missing"), false);
     assert.equal(isTransientReviewerTransportFailure("Codex error: Our servers are currently overloaded"), true);
+  });
+
+  it("enforces the frozen reviewer-attempt budget across the whole wave", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const planned = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths, diff: await new FakeHost().getPullRequestDiff(), packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const budgeted = {
+      ...planned,
+      budget: {
+        ...planned.budget,
+        maxReviewerAttempts: planned.executionGroups.length,
+        maxModelCalls: planned.executionGroups.length + planned.budget.maxScopeAdjudicationAttempts,
+      },
+    };
+    const reviewPlan = { ...budgeted, planId: computeReviewPlanId(budgeted) };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan },
+    });
+    const runtime = new FakeAgentRuntime([async () => { throw new Error("first attempt failed"); }, clean]);
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /reviewer-attempt budget exhausted/,
+    );
+    assert.equal(runtime.tasks.length, planned.executionGroups.length);
+  });
+
+  it("enforces maxModelCalls independently of the reviewer-attempt ceiling", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const planned = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths, diff: await new FakeHost().getPullRequestDiff(), packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const budgeted = { ...planned, budget: { ...planned.budget, maxModelCalls: planned.executionGroups.length } };
+    const reviewPlan = { ...budgeted, planId: computeReviewPlanId(budgeted) };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan },
+    });
+    const runtime = new FakeAgentRuntime([async () => { throw new Error("first attempt failed"); }, clean]);
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /model-call budget exhausted/,
+    );
+    assert.equal(runtime.tasks.length, planned.executionGroups.length);
+  });
+
+  it("uses maxScopeAdjudicationAttempts as the actual adjudicator-loop limit", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const planned = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths, diff: await new FakeHost().getPullRequestDiff(), packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const budgeted = {
+      ...planned,
+      budget: { ...planned.budget, maxScopeAdjudicationAttempts: 1, maxModelCalls: planned.budget.maxReviewerAttempts + 1 },
+    };
+    const reviewPlan = { ...budgeted, planId: computeReviewPlanId(budgeted) };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "approve", reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan },
+    });
+    const finding = {
+      ...inScope, id: "budget-scope", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Guard fails", evidence: "Returns false", location: "src/lock.ts:1", intentRelevance: "Breaks criterion", remediation: "Fix guard",
+    };
+    const runtime = new FakeAgentRuntime([{ summary: "finding", findings: [finding] }, clean, { decisions: [] }]);
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /Scope adjudication omitted finding/,
+    );
+    assert.equal(runtime.tasks.filter(({ role }) => role === "adjudicator").length, 1);
   });
 
   it("bounds a hanging reviewer attempt and records retry progress", async () => {
@@ -261,10 +539,11 @@ describe("fresh-context PR review", () => {
       }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs }),
       /timed out after 25ms/,
     );
-    assert.equal(runtime.tasks.length, 8);
+    assert.equal(runtime.tasks.length, 4);
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 2));
     const progress = await runs.listProgress(run.runId);
     assert.ok(progress.some(({ message }) => message.includes("timed out")));
-    assert.ok(progress.some(({ message }) => message.includes("retry 4/4 scheduled")));
+    assert.ok(progress.some(({ message }) => message.includes("fresh retry 2/2 scheduled")));
   });
 
   it("runs independently selected reviewer roles concurrently", async () => {
@@ -288,6 +567,35 @@ describe("fresh-context PR review", () => {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(maxActive, 2);
+  });
+
+  it("enforces maxParallelSessions without changing the frozen groups", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const planned = planReviewPanel({
+      changedPaths: context.buildResult.payload.changedPaths, diff: await new FakeHost().getPullRequestDiff(), packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const limited = { ...planned, budget: { ...planned.budget, maxParallelSessions: 1 } };
+    const reviewPlan = { ...limited, planId: computeReviewPlanId(limited) };
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "approve", reviewerRoles: ["correctness", "concurrency"], findings: [], checks: [], reviewPlan },
+    });
+    let active = 0;
+    let maxActive = 0;
+    const response = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      return clean;
+    };
+    await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([response, response]), host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(maxActive, 1);
   });
 
   it("publishes every reviewer report and finding issue before the consolidated verdict", async () => {
@@ -321,8 +629,59 @@ describe("fresh-context PR review", () => {
     assert.ok(verdictIndex > issueIndex);
   });
 
+  it("materializes terminal root causes as one bounded aggregate instead of an issue storm", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const host = new FakeHost();
+    const roots = ["root-a", "root-b"].map((id, index) => ({
+      ...inScope,
+      id,
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: true,
+      title: `Root cause ${index + 1}`,
+      evidence: `Anchored evidence ${index + 1}`,
+      location: `src/lock.ts:${20 + index}`,
+      intentRelevance: "Breaks the guarded update",
+      remediation: `Fix root ${index + 1}`,
+      sourceFindingIds: [`correctness:${id}`],
+      reviewerRoles: ["correctness"],
+    }));
+    await materializeReviewFindings({ run, pullRequest: pr, findings: roots }, host);
+    assert.equal(host.findingIssues.length, 1);
+    assert.match(host.findingIssues[0]?.finding.id ?? "", /^review-terminal-/);
+  });
+
+  it("reconciles the same aggregate identity it materializes", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const findings = ["root-a", "root-b"].map((id, index) => ({
+      ...inScope,
+      id,
+      causalRoot: `independent root ${index}`,
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: true,
+      title: `Root ${index}`,
+      evidence: `Evidence ${index}`,
+      location: `src/lock.ts:${index + 1}`,
+      intentRelevance: "Breaks criterion",
+      remediation: `Fix ${index}`,
+    }));
+    const host = new FakeHost();
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([{ summary: "two roots", findings }, clean, acceptAdjudication]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(host.findingIssues.length, 1);
+    assert.equal(host.reconciliations.length, 1);
+    assert.deepEqual(host.reconciliations[0]?.activeFindings.map(({ id }) => id), [host.findingIssues[0]?.finding.id]);
+    assert.match(host.findingIssues[0]?.finding.id ?? "", /^review-terminal-/);
+  });
+
   for (const severity of ["high", "medium"] as const) {
-    it(`makes ${severity}-severity evidence blocking regardless of the model's blocking flag`, async () => {
+    it(`applies central confidence/corroboration policy to ${severity}-severity evidence`, async () => {
       const runs = new InMemoryRunRepository();
       const run = await reviewingRun(runs);
       const context = artifacts(run);
@@ -337,13 +696,14 @@ describe("fresh-context PR review", () => {
       const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
       });
-      assert.equal(result.run.state, "remediating");
-      assert.equal(result.verdict.payload.findings[0]?.blocking, true);
+      const expectedBlocking = severity === "high";
+      assert.equal(result.run.state, expectedBlocking ? "remediating" : "merging");
+      assert.equal(result.verdict.payload.findings[0]?.blocking, expectedBlocking);
       assert.deepEqual(result.verdict.payload.findings[0]?.reviewerRoles, ["correctness"]);
       assert.deepEqual(result.verdict.payload.findings[0]?.sourceFindingIds, ["correctness:f1"]);
       assert.equal(result.verdict.payload.findings[0]?.sourceSessionRefs?.length, 1);
-      assert.equal(host.findingIssues.length, 1);
-      assert.deepEqual(host.findingIssues[0]?.reviewerRoles, ["correctness"]);
+      assert.equal(host.findingIssues.length, expectedBlocking ? 1 : 0);
+      if (expectedBlocking) assert.deepEqual(host.findingIssues[0]?.reviewerRoles, ["correctness"]);
     });
   }
 
@@ -400,6 +760,18 @@ describe("fresh-context PR review", () => {
     assert.ok(bounded.length <= 60_000);
     assert.match(bounded, /projection truncated/);
     assert.match(bounded, /FORGEDOCK:REVIEWER-SUBMISSION v1/);
+  });
+
+  it("requires causalRoot in current reviewer submissions", () => {
+    const finding = {
+      ...inScope,
+      id: "schema-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Guard fails", evidence: "Returns false", location: "src/lock.ts:1",
+      intentRelevance: "Breaks the criterion", remediation: "Fix the guard",
+    };
+    assert.equal(Check(ReviewerSubmissionSchema, { summary: "current", findings: [finding] }), true);
+    const { causalRoot: _causalRoot, ...legacyShape } = finding;
+    assert.equal(Check(ReviewerSubmissionSchema, { summary: "missing root", findings: [legacyShape] }), false);
   });
 
   it("validates reviewer attempt timeout overrides", () => {

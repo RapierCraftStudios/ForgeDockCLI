@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { assertReviewPlan, escalateReviewPlan, planReviewPanel, scopedReviewDiff } from "./planner.js";
+import { assertReviewPlan, computeReviewPlanId, planReviewPanel, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
   return createArtifact({
@@ -68,26 +68,34 @@ describe("evidence-backed review planning", () => {
     assert.deepEqual(concrete.selected.map(({ role }) => role), ["correctness", "frontend", "infrastructure"]);
   });
 
-  it("treats the specialist budget as soft for independently concrete changed surfaces", () => {
+  it("hard-bounds specialist sessions while preserving all independently evidenced capabilities", () => {
     const plan = planReviewPanel({
-      changedPaths: ["src/auth/token.ts", "db/migration.sql", "web/src/App.tsx", "infra/terraform/main.tf"],
+      changedPaths: ["src/auth/token.ts", "db/migration.sql", "web/src/App.tsx", "infra/terraform/main.tf", "src/lease.ts"],
       diff: "",
       packet: packet(),
       maxSpecialists: 2,
     });
-    assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness", "security", "data", "frontend", "infrastructure"]);
-    assert.ok(plan.selected.slice(1).every(({ required }) => required));
+    assert.equal(plan.executionGroups.length, 3);
+    assert.equal(plan.executionGroups.slice(1).length, 2);
+    assert.equal(plan.budget.maxSpecialistExecutionGroups, 2);
+    assert.equal(plan.budget.maxLogicalReviewerSessions, 3);
+    assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 2);
+    assert.deepEqual(new Set(plan.capabilities.map(({ id }) => id)), new Set([
+      "acceptance-correctness", "security", "data-integrity", "frontend", "release", "concurrency",
+    ]));
+    assert.ok(plan.executionGroups.slice(1).some(({ capabilities }) => capabilities.length > 1));
+    assert.doesNotThrow(() => assertReviewPlan(plan));
   });
 
-  it("does not let the soft budget suppress an explicitly declared security risk", () => {
+  it("does not let the hard session budget suppress an explicitly declared security capability", () => {
     const plan = planReviewPanel({
       changedPaths: ["docs/contract.md", "web/src/App.tsx"],
       diff: "diff --git a/docs/contract.md b/docs/contract.md\n+Trust contract clarified.\ndiff --git a/web/src/App.tsx b/web/src/App.tsx\n+export function App() {}",
       packet: packet([{ risk: "Signature replay and trust root ambiguity", mitigation: "Require revocation" }]),
       maxSpecialists: 1,
     });
-    assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness", "security", "frontend"]);
-    assert.ok(plan.selected.slice(1).every(({ required }) => required));
+    assert.equal(plan.executionGroups.length, 2);
+    assert.deepEqual(new Set(plan.executionGroups[1]?.capabilities), new Set(["frontend", "security"]));
   });
 
   it("does not double-route semantic schema/protocol prose without independently concrete API and data surfaces", () => {
@@ -100,6 +108,10 @@ describe("evidence-backed review planning", () => {
     });
     const interoperability = plan.selected.map(({ role }) => role).filter((role) => role === "data" || role === "api-compatibility");
     assert.equal(interoperability.length, 1);
+    assert.deepEqual(new Set(plan.capabilities.map(({ id }) => id)), new Set([
+      "acceptance-correctness", "data-integrity", "api-compatibility",
+    ]));
+    assert.ok(plan.executionGroups.some(({ capabilities }) => capabilities.includes("data-integrity") && capabilities.includes("api-compatibility")));
     assert.equal(plan.skipped.find(({ role }) => role === "data" || role === "api-compatibility")?.reason, "overlapping-coverage");
   });
 
@@ -122,26 +134,54 @@ describe("evidence-backed review planning", () => {
     assert.deepEqual(generic.selected.map(({ role }) => role), ["correctness"]);
   });
 
-  it("adaptively escalates concrete specialist evidence beyond the initial soft budget", () => {
-    const initial = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "", packet: packet(), maxSpecialists: 1 });
-    assert.deepEqual(initial.selected.map(({ role }) => role), ["correctness"]);
-    const escalated = escalateReviewPlan(initial, [{
-      role: "correctness",
-      findings: [{
-        id: "race-1", severity: "high", confidence: "high", title: "Unfenced lease permits stale writer",
-        evidence: "A stale worker can commit after lease reassignment", location: "src/worker.ts:42",
-        remediation: "Fence the commit with the current lease epoch",
-      }],
-    }]);
-    assert.deepEqual(escalated.selected.map(({ role }) => role), ["correctness", "concurrency"]);
-    assert.equal(escalated.selected[1]?.required, true);
-    assert.match(escalated.selected[1]?.reasons[0] ?? "", /race-1/);
+  it("freezes plan identity and topology before review execution", () => {
+    const plan = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "+commitResult(worker)", packet: packet(), maxSpecialists: 1 });
+    assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness"]);
+    assert.equal(plan.frozen, true);
+    assert.equal(plan.generation, 1);
+    assert.match(plan.planId, /^review-plan-[a-f0-9]{20}$/);
+    assert.equal(computeReviewPlanId(plan), plan.planId);
+    assert.equal(Object.isFrozen(plan), true);
+    assert.equal(Object.isFrozen(plan.executionGroups), true);
+    assert.throws(() => plan.executionGroups.push({ ...plan.executionGroups[0]!, id: "adaptive" }));
   });
 
-  it("rejects an unauditable role decision before any reviewer is launched", () => {
-    const plan = planReviewPanel({ changedPaths: ["src/a.ts"], diff: "", packet: packet() });
+  it("rejects an uncovered capability or exceeded budget before any reviewer is launched", () => {
+    const plan = planReviewPanel({ changedPaths: ["src/auth/token.ts", "db/a.sql"], diff: "", packet: packet(), maxSpecialists: 1 });
     assert.doesNotThrow(() => assertReviewPlan(plan));
-    assert.throws(() => assertReviewPlan({ ...plan, skipped: plan.skipped.slice(1) }), /account for every specialist/);
+    const mutated = { ...plan, riskTier: "critical" as const };
+    assert.throws(() => assertReviewPlan(mutated), /canonical identity/);
+    const uncovered = { ...plan, executionGroups: plan.executionGroups.slice(0, 1) };
+    assert.throws(() => assertReviewPlan({ ...uncovered, planId: computeReviewPlanId(uncovered) }), /does not cover required capabilities|budget is invalid/);
+    const exceeded = {
+      ...plan,
+      executionGroups: [...plan.executionGroups, { ...plan.executionGroups[1]!, id: "extra-specialist", role: "data" as const }],
+      selected: [...plan.selected, { ...plan.selected[1]!, role: "data" as const }],
+    };
+    assert.throws(() => assertReviewPlan({ ...exceeded, planId: computeReviewPlanId(exceeded) }), /budget is invalid or exceeded/);
+  });
+
+  it("rejects every missing, noninteger, or invalid authority budget field even with a matching canonical ID", () => {
+    const plan = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "+work();", packet: packet() });
+    const fields: Array<keyof ReviewBudget> = [
+      "maxSpecialistExecutionGroups",
+      "maxLogicalReviewerSessions",
+      "maxParallelSessions",
+      "maxAttemptsPerExecutionGroup",
+      "maxReviewerAttempts",
+      "maxScopeAdjudicationAttempts",
+      "maxModelCalls",
+    ];
+    const reidentify = (budget: Partial<ReviewBudget>): ReviewPlan => {
+      const candidate = { ...plan, budget } as unknown as ReviewPlan;
+      return { ...candidate, planId: computeReviewPlanId(candidate) };
+    };
+    for (const field of fields) {
+      const { [field]: _missing, ...withoutField } = plan.budget;
+      assert.throws(() => assertReviewPlan(reidentify(withoutField)), /budget fields must all be present safe integers/, `${field} missing`);
+      assert.throws(() => assertReviewPlan(reidentify({ ...plan.budget, [field]: 1.5 })), /budget fields must all be present safe integers/, `${field} noninteger`);
+      assert.throws(() => assertReviewPlan(reidentify({ ...plan.budget, [field]: 0 })), /absolute budget is invalid or exceeded/, `${field} invalid`);
+    }
   });
 
   it("size-bounds the initial diff across files while preserving workspace follow-up authority", () => {

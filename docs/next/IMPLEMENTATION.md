@@ -92,16 +92,17 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Resolve original intent and exact PR head SHA
 - [x] Detached read-only review worktree at the frozen SHA
 - [x] Baseline fresh-context reviewer
-- [x] Typed, scored Review Plan using changed-path, added-diff, Build Packet, and explicit repository-policy evidence with selected/skipped rationale
-- [x] Soft specialist budget with concrete-surface override, bounded reviewer slices, and one finding-triggered adaptive escalation wave
-- [x] Structured findings, deterministic blocking policy, semantic cross-reviewer consolidation, and source/session lineage
-- [x] Build-Packet semantic scope adjudication and post-remediation continuity gating prevent newly discovered adjacent concerns from expanding the active delivery
+- [x] Typed, immutable Review Plan with a canonical hash over every authority-bearing field, explicit run/repository/PR/packet/delivery context, deterministic legacy-plan replanning, bounded many-to-one execution groups, compatibility projections for older verdict readers, and enforced session/parallel/attempt/model-call/adjudication budgets
+- [x] Mandatory acceptance/correctness capability plus changed-path, added-diff, Build Packet, route-fact, and explicit repository-policy risk routing; reviewer prose cannot expand topology, overlapping data/API routing retains both capabilities in one execution group, and post-remediation reuse requires exact plan lineage and identity
+- [x] Current reviewer submissions require a causal root and typed blocker anchors; normalization retains source/session lineage while blocking severity, confidence, scope, and corroboration derive only from independently qualifying attestations
+- [x] Basic confidence, scope, path, and duplicate filtering before semantic scope adjudication; exact acceptance-criterion scope gates and controller-observed prior-SHA remediation deltas prevent cumulative paths, generic route facts, adjacent concerns, or falsely introduced concerns from expanding delivery
+- [x] At most two attempts per logical review group with exact persisted-session resume first, stable logical task IDs, budget-bounded parallel all-settled waves, preserved successful sibling reports, and fail-closed no-partial-approval behavior
 - [x] Full head SHA, head branch, base branch, and PR-state freshness invalidation before, during, and immediately before verdict publication; standalone review preserves explicit delivery-run lineage
 - [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results validate rename-complete delivery paths and stable content against frozen scope, an immutable base SHA, and the asserted committed tree across recovery
 - [x] Policy-controlled auto-merge default with explicit per-run or project-level opt-out
 - [x] Live GitHub review smoke test with parallel, independently inspectable nested reviewer sessions
-- [x] Per-reviewer provisional PR comments and a controller-authoritative consolidated Review Verdict; create follow-up issues only for unresolved blockers or independently corroborated high-risk follow-ups, and close stale projections after a superseding verdict
-- [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before fresh replacement
+- [x] Per-execution-group provisional PR comments and a controller-authoritative consolidated Review Verdict; normal remediation keeps root-cause blockers in the verdict, while terminal materialization and reconciliation share one normalized aggregate identity so stale component projections close without closing the active aggregate
+- [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before the single allowed replacement attempt
 
 ### 4. Lean `orchestrate` — scheduler and CLI implemented; durable coordination pending
 

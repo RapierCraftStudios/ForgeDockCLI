@@ -9,6 +9,7 @@ import type { CheckResult, VerificationRunner } from "../../core/ports/verificat
 import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import type { BuilderSubmission } from "./build.js";
+import { planReviewPanel } from "../review-pr/planner.js";
 import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
@@ -54,6 +55,7 @@ class EndToEndHost implements ForgeHost {
   }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.js b/src/a.js\n+guard();"; }
+  async getChangedPathsBetween(): Promise<readonly string[]> { return ["src/a.js"]; }
   async getBranchHead(): Promise<string> { return sha; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() {
@@ -84,6 +86,21 @@ const packet: BuildPacketPayload = {
   scope: ["Add guard"], acceptanceCriteria: ["Guard runs"], context: [], implementationPlan: ["Edit src/a.js"],
   expectedPaths: ["src/a.js"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
 };
+
+function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>) {
+  return planReviewPanel({
+    changedPaths: ["src/a.js"], diff: "diff --git a/src/a.js b/src/a.js\n+guard();", packet: packetArtifact,
+    context: {
+      runId: packetArtifact.runId,
+      repo: packetArtifact.subject.repo,
+      ...(packetArtifact.subject.issue !== undefined ? { issue: packetArtifact.subject.issue } : {}),
+      pullRequest: 11,
+      deliveryRunId: packetArtifact.runId,
+      buildResultBranch: workspace.branch,
+      targetBranch: "main",
+    },
+  });
+}
 const submission: BuilderSubmission = {
   summary: "Added guard", changedPaths: ["src/a.js"], criterionCoverage: [{ criterion: "Guard runs", implementation: "guard() is called" }], decisions: [], residualRisks: [],
 };
@@ -395,7 +412,10 @@ describe("complete work-on trajectory", () => {
     const oldSha = "d".repeat(40);
     const priorVerdict = createArtifact({
       kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
-      payload: { headSha: oldSha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+      payload: {
+        headSha: oldSha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
+      },
     }, { createdAt: "2026-01-01T00:01:00.000Z" });
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
@@ -456,7 +476,7 @@ describe("complete work-on trajectory", () => {
       run = advanced.state;
     }
     const finding = {
-      id: "correctness-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "correctness-1", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen guard criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
@@ -506,7 +526,7 @@ describe("complete work-on trajectory", () => {
       },
     });
     const finding = {
-      id: "correctness-repair", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "correctness-repair", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen guard criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "One accepted case is absent", location: "src/a.js:1",
@@ -571,13 +591,16 @@ describe("complete work-on trajectory", () => {
       },
     });
     const finding = {
-      id: "correctness-resume", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "correctness-resume", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
       intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
     };
     const priorVerdict = createArtifact({
       kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
-      payload: { headSha: sha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding], checks: [] },
+      payload: {
+        headSha: sha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness"], findings: [finding], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
+      },
     });
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
     await runs.create(run);
@@ -623,7 +646,7 @@ describe("complete work-on trajectory", () => {
       },
     });
     const finding = {
-      id: "budget-repeat", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "budget-repeat", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
@@ -631,7 +654,10 @@ describe("complete work-on trajectory", () => {
     };
     const priorVerdict = createArtifact({
       kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
-      payload: { headSha: sha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding], checks: [] },
+      payload: {
+        headSha: sha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness"], findings: [finding], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
+      },
     });
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
     await runs.create(run);
@@ -753,7 +779,7 @@ describe("complete work-on trajectory", () => {
     assert.ok(packetArtifact?.kind === "BuildPacket");
     assert.ok(outcome?.kind === "Outcome");
     const finding = {
-      id: "budget-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "budget-1", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is still incomplete", evidence: "One accepted case is missing", location: "src/a.js:1",
@@ -784,7 +810,7 @@ describe("complete work-on trajectory", () => {
 
   it("downgrades a concern outside the frozen Build Packet instead of expanding remediation", async () => {
     const finding = {
-      id: "scope-1", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "scope-1", causalRoot: "unchanged publish workflow races", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "The reviewer believes it is related.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Related workflow needs a separate fix", evidence: "The unchanged publish workflow has a race",
@@ -813,8 +839,8 @@ describe("complete work-on trajectory", () => {
     assert.equal(result.run.state, "completed");
     assert.equal(host.findingIssues, 0, "a single-reviewer out-of-scope concern must not proliferate into a new issue");
     assert.equal(git.removed, true);
-    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "reviewer", "reviewer", "adjudicator"]);
-    assert.ok(runtime.tasks.some((task) => task.id.includes(":infrastructure")));
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "reviewer"]);
+    assert.ok(!runtime.tasks.some((task) => task.id.includes("review-infrastructure")), "reviewer prose must not expand the frozen topology");
     const verdict = artifacts.artifacts.find((artifact) => artifact.kind === "ReviewVerdict");
     assert.equal(verdict?.kind === "ReviewVerdict" ? verdict.payload.findings[0]?.scopeDisposition : undefined, "follow_up");
     assert.equal(verdict?.kind === "ReviewVerdict" ? verdict.payload.findings[0]?.blocking : undefined, false);
@@ -856,7 +882,7 @@ describe("complete work-on trajectory", () => {
 
   it("allows an authorized remediation child to dispatch the configured next recursive level", async () => {
     const finding = {
-      id: "nested-scope", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "nested-scope", causalRoot: "nested delivery path remains broken", severity: "high" as const, confidence: "high" as const, blocking: true,
       scopeDisposition: "in_scope" as const, scopeRationale: "Required by the frozen behavior.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Nested delivery path is required", evidence: "The accepted path still fails",

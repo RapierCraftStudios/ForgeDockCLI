@@ -261,7 +261,7 @@ export class GitHubClient implements ForgeHost {
   }): Promise<IssueSnapshot> {
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
-    const legacyMarker = legacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const legacyMarker = compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const admissionKey: RemediationAdmissionKey = {
       repo: input.repo,
       // The review-finding marker is independent of the delivery issue and
@@ -649,6 +649,13 @@ export class GitHubClient implements ForgeHost {
     return this.gh(["pr", "diff", String(number), "--repo", repo]);
   }
 
+  async getChangedPathsBetween(repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {
+    const output = await this.gh([
+      "api", `repos/${repo}/compare/${baseSha}...${headSha}`, "--paginate", "--jq", ".files[].filename",
+    ]);
+    return [...new Set(output.split(/\r?\n/).map((path) => path.trim().replaceAll("\\", "/")).filter(Boolean))].sort();
+  }
+
   async mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void> {
     const current = await this.getPullRequest(repo, number);
     if (current.headSha !== expectedHeadSha) {
@@ -851,7 +858,7 @@ export function reviewFindingReconciliationCandidates(
 ): IssueSnapshot[] {
   const activeMarkers = new Set(input.activeFindings.flatMap((finding) => [
     reviewFindingMarker(input.repo, input.pullRequest.number, finding),
-    legacyReviewFindingMarker(input.repo, input.pullRequest.number, finding),
+    compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, finding),
   ]));
   const runMarker = `**Run:** \`${input.runId}\``;
   const sourceMarker = `**Source:** PR #${input.pullRequest.number} `;
@@ -864,8 +871,22 @@ export function reviewFindingReconciliationCandidates(
 
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
   const legacyIdentity = reviewFindingIdentity(repo, pullRequest, finding);
-  const identity = /^review-[a-f0-9]{16}$/.test(finding.id) ? `${legacyIdentity}\n${finding.id}` : legacyIdentity;
-  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(identity).digest("hex")} -->`;
+  // Controller-normalized individual and terminal aggregate IDs encode their
+  // causal root set. Keep arbitrary/legacy reviewer IDs on the old identity so
+  // existing individual issues remain adoptable across evidence-only edits.
+  const controllerIdentity = /^review-(?:[a-f0-9]{16}|terminal-[a-f0-9]{16})$/.test(finding.id)
+    ? `\n${finding.id}`
+    : "";
+  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${legacyIdentity}${controllerIdentity}`).digest("hex")} -->`;
+}
+
+function compatibleLegacyReviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  // Count-only terminal aggregates never had a safe legacy identity: adopting
+  // it can bind a new root set to a stale issue. Individual findings retain
+  // legacy adoption so existing durable projections are not duplicated.
+  return /^review-terminal-[a-f0-9]{16}$/.test(finding.id)
+    ? reviewFindingMarker(repo, pullRequest, finding)
+    : legacyReviewFindingMarker(repo, pullRequest, finding);
 }
 
 function legacyReviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {

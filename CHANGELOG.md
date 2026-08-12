@@ -24,17 +24,22 @@
 - `forgedock` now launches the provider-neutral terminal; the legacy entry point remains available as `forgedock-legacy` during cutover.
 - Long-term devdocs memory is explicitly reference-only and selectively retrieved; it cannot authorize actions or override current user intent and typed contracts.
 - Required verification failures remain failed even when identical failures exist on the base revision; baseline comparison is retained only as non-regression evidence.
-- Medium-or-higher review findings block delivery by default.
+- Review findings are proposals: central policy now combines severity, confidence, controller-verified evidence anchoring, exact scope, and corroboration. Low-confidence or low-severity findings never auto-block; medium findings require high confidence plus independent corroboration or deterministic evidence.
 - Successful merges remove their remote delivery branch.
 - Verification is serialized per machine, bounds Node test fanout, and terminates complete subprocess trees on timeout or cancellation to prevent orphaned Node workers and resource storms.
-- Bundled subagent artifacts use temp storage and are excluded from delivery diffs. Review routing now commits a typed, scored Review Plan from changed paths, added diff semantics, Build Packet risks, and explicit repository policy; specialists receive bounded slices, concrete required surfaces may exceed the soft budget, and one evidence-triggered escalation wave can add a newly justified specialist.
-- Cross-reviewer findings are conservatively consolidated by root-cause evidence with stable IDs and source/session lineage. Follow-up issues are deferred until findings remain unresolved after remediation, terminal blocking, or review-budget exhaustion.
+- Bundled subagent artifacts use temp storage and are excluded from delivery diffs. Review routing now freezes an immutable, identified Review Plan before execution, separates risk capabilities from hard-bounded execution groups, preserves all mandatory dimensions through many-to-one grouping, and removes reviewer-finding-triggered topology expansion.
+- Same- and cross-reviewer finding proposals are normalized by acceptance criterion, authority boundary, and causal failure mode before policy/adjudication, with stable IDs and source/session lineage. Low-quality candidates are filtered before LLM scope adjudication; normal remediation retains blockers in the verdict and terminal materialization emits one bounded aggregate instead of an issue storm.
+- Reviewer recovery now permits at most two attempts under one stable logical group ID, resumes an exact persisted session first, and uses cancellation-aware, parallel-budgeted all-settled waves so successful sibling reports survive a failed peer without allowing partial approval. Frozen totals for reviewer attempts, model calls, and scope-adjudication attempts are now enforced rather than descriptive.
 - Automatic review remediation refuses changes outside the frozen Build Packet instead of widening scope and emitting oversized operational-artifact failure comments.
 - npm publication now reconciles already-published versions and retries version metadata pushes against current `main` rather than wedging after a concurrent push.
 - Direct terminal work/review runs background by default while orchestration children remain synchronously owned by their worker, preserving typed dependency and nested-review lifetimes.
 
 ### Fixed
 
+- Terminal review-finding materialization and reconciliation now use the same normalized aggregate identity, retaining the active aggregate while closing stale component projections.
+- Post-remediation findings can no longer claim introduction from cumulative Build Result paths or generic current route facts; only exact prior-reviewed-SHA delta paths, explicit changed authority facts, or accepted prior-finding lineage preserve blocking continuity.
+- Finding consolidation derives policy-bearing severity, confidence, scope, and corroboration from qualifying source attestations, preventing low-confidence or rejected duplicates from laundering another source into a blocker.
+- Review Plan identity now canonically covers all authority-bearing fields and validates run/repository/PR/packet/delivery lineage before reuse; foreign, legacy, and mutated plans replan deterministically while old verdict artifacts remain readable.
 - Recursive remediation materialization now uses durable, fail-closed admission records keyed by the parent identity, verified head, and deterministic finding marker; interrupted awaiting-dispatch recovery reuses the original checkpoint and never creates a second child while marker visibility is unresolved.
 - GitHub API operations retry once after a configured GitHub App token refresh when an installation token expires during a long controller run, preserving the semantic checkpoint instead of failing on a transient 401.
 - npm publication triggers and changed-path guards now include both exact Pi submodule gitlinks and recursive Pi/staged-runtime paths, with focused regression coverage for both forms.

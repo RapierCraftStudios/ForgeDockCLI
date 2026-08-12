@@ -33,6 +33,7 @@ export interface ReviewFindingInput {
   confidence: "high" | "medium" | "low";
   blocking: boolean;
   title: string;
+  causalRoot?: string;
   evidence: string;
   location?: string;
   intentRelevance: string;
@@ -45,6 +46,10 @@ export interface ReviewFindingInput {
   matchedAcceptanceCriteria?: readonly string[];
   matchedPriorFindingIds?: readonly string[];
   introducedByRemediation?: boolean;
+  evidenceAnchor?: {
+    kind: "repository-location" | "delivery-authority" | "deterministic-check";
+    reference: string;
+  };
 }
 
 export interface PullRequestSnapshot {
@@ -113,6 +118,8 @@ export interface ForgeHost {
   /** Enumerate a bounded ref namespace for deterministic lane classification. */
   listBranches?(repo: string, prefix: string): Promise<BranchSnapshot[]>;
   getPullRequestDiff(repo: string, number: number): Promise<string>;
+  /** Exact changed paths between two controller-reviewed commits, when the host can prove them. */
+  getChangedPathsBetween?(repo: string, baseSha: string, headSha: string): Promise<readonly string[]>;
   publishPullRequestComment(input: {
     repo: string;
     pullRequest: number;

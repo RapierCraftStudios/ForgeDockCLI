@@ -15,6 +15,12 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
   findings: readonly T[],
   packet: DurableArtifact<"BuildPacket">,
   priorVerdict?: DurableArtifact<"ReviewVerdict">,
+  controllerEvidence: {
+    /** Exact controller-observed diff from the prior reviewed SHA to current head. */
+    remediationDeltaPaths?: readonly string[];
+    /** Explicit authority facts whose prior-verdict value changed. */
+    changedRemediationAuthorityReferences?: readonly string[];
+  } = {},
 ): T[] {
   const criteria = new Set(packet.payload.acceptanceCriteria);
   const priorFindingIds = new Set(priorVerdict?.payload.findings
@@ -48,9 +54,16 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
 
     if (accepted && priorVerdict?.payload.disposition === "request_changes") {
       const continuesAcceptedFinding = (finding.matchedPriorFindingIds ?? []).some((id) => priorFindingIds.has(id));
-      if (!continuesAcceptedFinding && finding.introducedByRemediation !== true) {
+      const changedPathEvidence = locationPath !== undefined
+        && (controllerEvidence.remediationDeltaPaths ?? []).some((path) => pathMatchesExpectation(locationPath, normalizeRepoPath(path)));
+      const authorityEvidence = finding.evidenceAnchor?.kind === "delivery-authority"
+        && (controllerEvidence.changedRemediationAuthorityReferences ?? []).includes(finding.evidenceAnchor.reference);
+      const controllerProvesIntroduced = finding.introducedByRemediation === true && (changedPathEvidence || authorityEvidence);
+      if (!continuesAcceptedFinding && !controllerProvesIntroduced) {
         accepted = false;
-        controllerReasons.push("new post-remediation concern neither traces to an accepted prior finding nor identifies a remediation-introduced regression");
+        controllerReasons.push(finding.introducedByRemediation
+          ? "reviewer claimed a remediation-introduced regression without an exact prior-SHA remediation delta or changed delivery-authority fact"
+          : "new post-remediation concern neither traces to an accepted prior finding nor identifies a controller-proven remediation-introduced regression");
       }
     }
 

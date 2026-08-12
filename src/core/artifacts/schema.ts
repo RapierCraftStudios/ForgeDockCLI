@@ -156,10 +156,21 @@ export const FindingSchema = Type.Object({
   confidence: Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
   blocking: Type.Boolean(),
   title: NonEmptyString,
+  /** Stable reviewer-proposed failure-mode label used only after controller normalization. */
+  causalRoot: Type.Optional(NonEmptyString),
   evidence: NonEmptyString,
   location: Type.Optional(NonEmptyString),
   intentRelevance: NonEmptyString,
   remediation: NonEmptyString,
+  /** Controller-verifiable anchor proposed by a reviewer; prose alone is never an anchor. */
+  evidenceAnchor: Type.Optional(Type.Object({
+    kind: Type.Union([
+      Type.Literal("repository-location"),
+      Type.Literal("delivery-authority"),
+      Type.Literal("deterministic-check"),
+    ]),
+    reference: NonEmptyString,
+  })),
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
@@ -182,8 +193,56 @@ const SpecialistReviewerRoleSchema = Type.Union([
   Type.Literal("frontend"), Type.Literal("infrastructure"), Type.Literal("concurrency"),
 ]);
 
+const ReviewCapabilityIdSchema = Type.Union([
+  Type.Literal("acceptance-correctness"), Type.Literal("security"), Type.Literal("data-integrity"),
+  Type.Literal("api-compatibility"), Type.Literal("frontend"), Type.Literal("release"), Type.Literal("concurrency"),
+]);
+const ReviewCapabilitySchema = Type.Object({
+  id: ReviewCapabilityIdSchema,
+  score: Type.Integer({ minimum: 0 }),
+  reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+  scope: Type.Array(NonEmptyString),
+  required: Type.Boolean(),
+});
+
 export const ReviewPlanSchema = Type.Object({
+  /** Current identity fields remain optional so legacy durable verdicts decode. */
+  planId: Type.Optional(NonEmptyString),
+  schemaVersion: Type.Optional(Type.Literal(2)),
+  context: Type.Optional(Type.Object({
+    runId: NonEmptyString,
+    repo: NonEmptyString,
+    issue: Type.Optional(Type.Integer({ minimum: 1 })),
+    pullRequest: Type.Integer({ minimum: 0 }),
+    packetId: NonEmptyString,
+    packetDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+    deliveryRunId: NonEmptyString,
+    buildResultBranch: NonEmptyString,
+    targetBranch: NonEmptyString,
+    baseSha: Type.Optional(Sha),
+  })),
+  generation: Type.Optional(Type.Integer({ minimum: 1 })),
+  frozen: Type.Optional(Type.Literal(true)),
   riskTier: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]),
+  budget: Type.Optional(Type.Object({
+    maxSpecialistExecutionGroups: Type.Integer({ minimum: 1, maximum: 6 }),
+    maxLogicalReviewerSessions: Type.Integer({ minimum: 1, maximum: 7 }),
+    maxParallelSessions: Type.Optional(Type.Integer({ minimum: 1, maximum: 7 })),
+    maxAttemptsPerExecutionGroup: Type.Literal(2),
+    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 14 }),
+    maxScopeAdjudicationAttempts: Type.Integer({ minimum: 1, maximum: 2 }),
+    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+  })),
+  capabilities: Type.Optional(Type.Array(ReviewCapabilitySchema, { minItems: 1 })),
+  executionGroups: Type.Optional(Type.Array(Type.Object({
+    id: NonEmptyString,
+    role: ReviewerRoleSchema,
+    capabilities: Type.Array(ReviewCapabilityIdSchema, { minItems: 1 }),
+    score: Type.Integer({ minimum: 0 }),
+    reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+    scope: Type.Array(NonEmptyString),
+    required: Type.Boolean(),
+  }), { minItems: 1 })),
   specialistBudget: Type.Integer({ minimum: 1, maximum: 6 }),
   selected: Type.Array(Type.Object({
     role: ReviewerRoleSchema,
@@ -195,7 +254,10 @@ export const ReviewPlanSchema = Type.Object({
   skipped: Type.Array(Type.Object({
     role: SpecialistReviewerRoleSchema,
     score: Type.Integer({ minimum: 0 }),
-    reason: Type.Union([Type.Literal("below-threshold"), Type.Literal("panel-budget"), Type.Literal("overlapping-coverage")]),
+    reason: Type.Union([
+      Type.Literal("below-threshold"), Type.Literal("panel-budget"),
+      Type.Literal("overlapping-coverage"), Type.Literal("grouped-coverage"),
+    ]),
     evidence: Type.Array(NonEmptyString),
   })),
 });

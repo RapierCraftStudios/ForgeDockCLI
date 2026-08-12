@@ -19,7 +19,7 @@ const packet = createArtifact({
 function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
   return {
     id: "review-current", severity: "high", confidence: "high", blocking: true,
-    title: "Update is not atomic", evidence: "The write escapes the lock", location: "src/a.ts:20",
+    title: "Update is not atomic", causalRoot: "write escapes atomic lock", evidence: "The write escapes the lock", location: "src/a.ts:20",
     intentRelevance: "Breaks the guarded update", remediation: "Keep the write inside the lock",
     reviewerRoles: ["correctness"], scopeDisposition: "in_scope", scopeRationale: "Direct criterion violation",
     matchedAcceptanceCriteria: [criterion], matchedPriorFindingIds: [], introducedByRemediation: false,
@@ -60,20 +60,51 @@ describe("review finding scope policy", () => {
     assert.match(result?.scopeRationale ?? "", /excluded runtime\/controller behavior/);
   });
 
-  it("prevents fresh concern expansion after remediation while preserving continuity and regressions", () => {
+  it("prevents fresh concern expansion and distrusts unsupported introduced flags after remediation", () => {
     const prior = createArtifact({
       kind: "ReviewVerdict", runId, subject: { ...subject, pr: 2 }, producer: { role: "controller" },
       payload: { headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding({ id: "review-prior" })], checks: [] },
     });
-    const [newConcern, continued, regression] = applyFindingScopePolicy([
+    const locationlessIntroduced = finding({ id: "false-introduced", introducedByRemediation: true });
+    delete locationlessIntroduced.location;
+    const [newConcern, continued, falseIntroduced, cumulativeOnly, provenRegression] = applyFindingScopePolicy([
       finding({ id: "new", matchedPriorFindingIds: [] }),
       finding({ id: "continued", matchedPriorFindingIds: ["review-prior"] }),
-      finding({ id: "regression", introducedByRemediation: true }),
-    ], packet, prior);
+      locationlessIntroduced,
+      finding({ id: "cumulative", introducedByRemediation: true, location: "src/a.ts:25" }),
+      finding({ id: "regression", introducedByRemediation: true, location: "src/a.ts:30" }),
+    ], packet, prior, { remediationDeltaPaths: ["src/unrelated.ts"] });
     assert.equal(newConcern?.blocking, false);
     assert.equal(newConcern?.scopeDisposition, "follow_up");
     assert.equal(continued?.blocking, true);
-    assert.equal(regression?.blocking, true);
+    assert.equal(falseIntroduced?.blocking, false);
+    assert.match(falseIntroduced?.scopeRationale ?? "", /without an exact prior-SHA remediation delta/);
+    assert.equal(cumulativeOnly?.blocking, false, "a cumulative BuildResult path must not prove remediation introduction");
+    assert.equal(provenRegression?.blocking, false);
+    const [exactDelta] = applyFindingScopePolicy([
+      finding({ id: "exact-regression", introducedByRemediation: true, location: "src/a.ts:30" }),
+    ], packet, prior, { remediationDeltaPaths: ["src/a.ts"] });
+    assert.equal(exactDelta?.blocking, true);
+
+    const currentOnly = finding({
+      id: "current-route", introducedByRemediation: true,
+      evidenceAnchor: { kind: "delivery-authority", reference: "PR.baseBranch=main" },
+    });
+    delete currentOnly.location;
+    const [genericAuthority] = applyFindingScopePolicy([currentOnly], packet, prior, {
+      changedRemediationAuthorityReferences: [],
+    });
+    assert.equal(genericAuthority?.blocking, false, "a generic current route fact is not an introduced authority change");
+    const changedFact = "ReviewVerdict.baseBranch=release->PR.baseBranch=main";
+    const changedAuthorityFinding = finding({
+      id: "changed-route", introducedByRemediation: true,
+      evidenceAnchor: { kind: "delivery-authority", reference: changedFact },
+    });
+    delete changedAuthorityFinding.location;
+    const [explicitAuthorityChange] = applyFindingScopePolicy(
+      [changedAuthorityFinding], packet, prior, { changedRemediationAuthorityReferences: [changedFact] },
+    );
+    assert.equal(explicitAuthorityChange?.blocking, true);
   });
 
   it("materializes blockers but requires corroboration for nonblocking follow-ups", () => {

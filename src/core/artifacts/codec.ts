@@ -105,7 +105,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     case "ReviewVerdict": {
       const payload = artifact.payload as ReviewVerdictPayload;
       return [heading, meta, "", `**Disposition:** \`${payload.disposition}\` · **Reviewed SHA:** \`${payload.headSha}\``, "", `**Reviewer roles:** ${payload.reviewerRoles.map(code).join(", ")}`,
-        payload.reviewPlan ? `### Review plan\n**Risk:** \`${payload.reviewPlan.riskTier}\` · **Specialist budget:** ${payload.reviewPlan.specialistBudget}\n${payload.reviewPlan.selected.map((selection) => `- **${selection.role}** · score ${selection.score}${selection.required ? " · required" : ""} — ${selection.reasons.join("; ")}`).join("\n")}${payload.reviewPlan.skipped.length ? `\n\n**Skipped specialists**\n${payload.reviewPlan.skipped.map((selection) => `- **${selection.role}** · score ${selection.score} · ${selection.reason}${selection.evidence.length ? ` — ${selection.evidence.join("; ")}` : " — no qualifying evidence"}`).join("\n")}` : ""}` : "",
+        payload.reviewPlan ? reviewPlanMarkdown(payload.reviewPlan) : "",
         payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
       ].filter(Boolean).join("\n\n");
@@ -154,6 +154,25 @@ function splitKind(kind: string): string {
 
 function code(value: string): string {
   return `\`${value}\``;
+}
+
+function reviewPlanMarkdown(plan: NonNullable<ReviewVerdictPayload["reviewPlan"]>): string {
+  const identity = plan.planId
+    ? `\n**Identity:** \`${plan.planId}\` · **Generation:** ${plan.generation} · **Frozen:** ${plan.frozen ? "yes" : "no"}`
+    : "\n**Compatibility:** legacy Review Plan without frozen-topology metadata";
+  const budget = plan.budget
+    ? `\n**Absolute budget:** ${plan.budget.maxLogicalReviewerSessions} logical sessions (${plan.budget.maxSpecialistExecutionGroups} specialist groups), ${plan.budget.maxAttemptsPerExecutionGroup} attempts/group`
+    : "";
+  const capabilities = plan.capabilities?.length
+    ? `\n\n**Required capabilities**\n${plan.capabilities.map((capability) => `- **${capability.id}** · score ${capability.score}${capability.required ? " · mandatory evidence" : ""}`).join("\n")}`
+    : "";
+  const groups = plan.executionGroups?.length
+    ? `\n\n**Execution groups**\n${plan.executionGroups.map((group) => `- **${group.id}** (${group.role}) · ${group.capabilities.join(", ")} — ${group.reasons.join("; ")}`).join("\n")}`
+    : `\n${plan.selected.map((selection) => `- **${selection.role}** · score ${selection.score}${selection.required ? " · required" : ""} — ${selection.reasons.join("; ")}`).join("\n")}`;
+  const skipped = plan.skipped.length
+    ? `\n\n**Non-executing specialist roles**\n${plan.skipped.map((selection) => `- **${selection.role}** · score ${selection.score} · ${selection.reason}${selection.evidence.length ? ` — ${selection.evidence.join("; ")}` : " — no qualifying evidence"}`).join("\n")}`
+    : "";
+  return `### Review plan\n**Risk:** \`${plan.riskTier}\` · **Specialist group budget:** ${plan.specialistBudget}${identity}${budget}${capabilities}${groups}${skipped}`;
 }
 
 function listSection(title: string, items: readonly string[], ordered = false): string {
