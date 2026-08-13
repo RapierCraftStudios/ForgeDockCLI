@@ -67,6 +67,9 @@ export async function workOn(
     baselineChecks?: readonly CheckResult[];
     provider?: string;
     model?: string;
+    planningProvider?: string;
+    planningModel?: string;
+    planningThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
     autoMerge?: boolean;
     maxRemediationCycles?: number;
     maxRemediationDepth?: number;
@@ -105,6 +108,11 @@ export async function workOn(
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  };
+  const planningOptions = {
+    ...(input.planningProvider !== undefined ? { planningProvider: input.planningProvider } : {}),
+    ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
+    ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
   };
   const agentDependencies = {
     runtime: dependencies.runtime,
@@ -155,6 +163,7 @@ export async function workOn(
         },
       } : {}),
       ...runtimeOptions,
+      ...planningOptions,
     }, agentDependencies);
     run = investigated.run;
     if (run.state === "invalid") {
@@ -176,6 +185,7 @@ export async function workOn(
       cwd: workspace.path,
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       ...runtimeOptions,
+      ...planningOptions,
     }, agentDependencies);
     input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     run = prepared.run;

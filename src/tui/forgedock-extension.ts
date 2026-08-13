@@ -109,7 +109,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("forgedock-config", {
-    description: "Naturally update ForgeDock model and orchestration preferences",
+    description: "Naturally update ForgeDock planning, worker, reviewer, and orchestration preferences",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -117,7 +117,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
         return;
       }
       activateOnly(pi, [CONFIG_TOOL]);
-      pi.sendUserMessage(`The user asked ForgeDock to update project configuration: ${request}\nInterpret the preference and call ${CONFIG_TOOL} exactly once. Pass friendly model names through to the tool for live-catalog resolution; when the user says all subagents, set both through subagentModel/subagentThinking. Preserve unrelated forge.yaml content.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+      pi.sendUserMessage(`The user asked ForgeDock to update project configuration: ${request}\nInterpret the preference and call ${CONFIG_TOOL} exactly once. Pass friendly model names through to the tool for live-catalog resolution; when the user says all subagents, set the shared model through subagentModel/subagentThinking for planners, workers, and reviewers. Preserve unrelated forge.yaml content.`, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
     },
   });
 

@@ -651,6 +651,8 @@ next:
   agents:
     worker_model: "provider/model"
     worker_thinking: "high"
+    planning_model: "provider/model"
+    planning_thinking: "high"
     reviewer_model: "provider/model"
     reviewer_thinking: "high"
     max_review_specialists: 4
@@ -682,6 +684,8 @@ auto_merge                  existing configured default
 ```
 
 #### F2. Define precedence and validation
+
+`planning_model` and `planning_thinking` select the read-only investigator and Build Packet author independently from worker and reviewer models. Native `/orchestrate` issue-set interpretation remains the supervising terminal model and is not silently redirected by this setting.
 
 `src/core/config/forgedock-config.ts` must provide typed parsing/rendering and helpers:
 

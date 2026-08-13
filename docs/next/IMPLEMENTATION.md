@@ -161,7 +161,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Serialize verification, bound Node test fanout, terminate full subprocess trees on timeout/cancellation, isolate credential-free verification homes, and redact credential-shaped durable output
 - [x] Keep subagent transcripts out of delivery worktrees and reject automatic remediation outside frozen Build Packet paths
 - [x] Correlate concurrent worker tool calls by call ID and retain only bounded, single-line, credential-redacted failure summaries in live controller logs
-- [x] Bootstrap `forge.yaml` on parent-terminal launch and preserve it through an isolated ForgeDock Next managed section with natural-language `/forgedock-config`, live-catalog model alias resolution, and all-subagent role updates
+- [x] Bootstrap `forge.yaml` on parent-terminal launch and preserve it through an isolated ForgeDock Next managed section with natural-language `/forgedock-config`, live-catalog model alias resolution, and independent planning, worker, and reviewer role updates
 - [x] Load explicit `FORGE.md` project guidance in the terminal and bounded typed workflow agents
 - [x] Provide token-bounded `devdocs/` memory retrieval with anchors, wiki links, backlinks, and an explicit reference-only authority boundary
 - [x] Persist user-requested preferences and decisions through `/forgedock-remember`

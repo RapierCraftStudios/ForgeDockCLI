@@ -12,7 +12,7 @@
 - Source-pinned ForgeDock Pi fork and packaged runtime staging with explicit provenance and fork policy.
 - Isolated live GitHub lifecycle probes covering investigation, Build Packet creation, build, verification, PR publication, parallel independent review, merge, closure, and cleanup.
 - Evidence-backed orchestration DAGs with deterministic priority ordering, claim-derived serialization edges, streaming ready-set dispatch, authoritative prerequisite admission, and real P2/P3 concern batching into one batch issue/work-on unit.
-- Automatic minimal `forge.yaml` bootstrap on normal parent-terminal launch, plus natural-language ForgeDock Next configuration with live-catalog model alias resolution and one setting for all worker/reviewer subagents.
+- Automatic minimal `forge.yaml` bootstrap on normal parent-terminal launch, plus natural-language ForgeDock Next configuration with live-catalog model alias resolution and independent planning, worker, and reviewer model settings.
 - `FORGE.md` project guidance plus token-bounded, Obsidian-compatible `devdocs/` memory retrieval with anchors, links, and backlinks.
 - Native session-scoped background controller tasks for direct work/review runs, with task IDs, bounded log inspection, passive completion notices, cancellation, and shutdown cleanup—without another runtime dependency.
 - A dependency-free, pi-native decision interview inspired by pi-ask: tabbed single/multi/preview questions, evidence-backed recommendations, number-key selection, inline custom answers, question/option notes, dirty-dismiss protection, and a Submit/Elaborate/Cancel review step.

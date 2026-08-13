@@ -150,6 +150,9 @@ export interface ModelPolicy {
   provider?: string;
   model?: string;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  planningProvider?: string;
+  planningModel?: string;
+  planningThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   requireDifferentFrom?: { provider?: string; model?: string };
 }
 

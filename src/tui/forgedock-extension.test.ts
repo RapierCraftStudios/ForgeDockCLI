@@ -138,6 +138,8 @@ test("natural configuration resolves a friendly live model name for all subagent
     await tool.execute("config-1", {
       subagentModel: "Luna 5.6",
       subagentThinking: "max",
+      planningModel: "Sol 5.6",
+      planningThinking: "high",
     }, undefined, undefined, {
       ...commandContext(),
       cwd,
@@ -147,6 +149,8 @@ test("natural configuration resolves a friendly live model name for all subagent
     assert.deepEqual(readForgeDockConfig(cwd), {
       workerModel: "openai-codex/gpt-5.6-luna",
       workerThinking: "max",
+      planningModel: "openai-codex/gpt-5.6-sol",
+      planningThinking: "high",
       reviewerModel: "openai-codex/gpt-5.6-luna",
       reviewerThinking: "max",
     });

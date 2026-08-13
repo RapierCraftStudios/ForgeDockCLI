@@ -58,7 +58,13 @@ describe("work-on investigation", () => {
   it("commits confirmed evidence and stops at the Build Packet boundary", async () => {
     const runtime = new FakeAgentRuntime([confirmed()]);
     const deps = dependencies(runtime);
-    const result = await investigateWorkItem({ intent: intent(), cwd: process.cwd() }, deps);
+    const result = await investigateWorkItem({
+      intent: intent(),
+      cwd: process.cwd(),
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    }, deps);
 
     assert.equal(result.run.state, "preparing");
     assert.equal(result.investigation.payload.outcome, "confirmed");
@@ -66,6 +72,11 @@ describe("work-on investigation", () => {
     assert.deepEqual(runtime.tasks[0]?.tools, ["read", "grep", "find", "ls"]);
     assert.match(runtime.tasks[0]?.instructions ?? "", /missing implementation.*confirmed, not invalid/);
     assert.equal(runtime.tasks[0]?.workspace.mode, "read-only");
+    assert.deepEqual(runtime.tasks[0]?.modelPolicy, {
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    });
     assert.deepEqual((await deps.runs.history(result.run.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED",
     ]);

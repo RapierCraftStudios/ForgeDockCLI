@@ -36,6 +36,8 @@ describe("ForgeDock Next project configuration", () => {
         workerModel: "openai-codex/gpt-5.6-sol",
         workerThinking: "max",
         reviewerThinking: "high",
+        planningModel: "anthropic/claude-sonnet",
+        planningThinking: "high",
         maxReviewSpecialists: 3,
         maxParallel: 3,
       });
@@ -46,6 +48,8 @@ describe("ForgeDock Next project configuration", () => {
         workerModel: "openai-codex/gpt-5.6-sol",
         workerThinking: "max",
         reviewerThinking: "high",
+        planningModel: "anthropic/claude-sonnet",
+        planningThinking: "high",
         maxReviewSpecialists: 3,
         maxParallel: 3,
       });
@@ -61,6 +65,22 @@ describe("ForgeDock Next project configuration", () => {
     const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
     try {
       assert.throws(() => updateForgeDockConfig(cwd, { maxReviewSpecialists: 7 }), /1 to 6/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("validates planning model and thinking settings like other agent roles", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
+    try {
+      assert.throws(
+        () => updateForgeDockConfig(cwd, { planningModel: "planner" }),
+        /provider\/model/,
+      );
+      assert.throws(
+        () => updateForgeDockConfig(cwd, { planningThinking: "turbo" as any }),
+        /Unsupported thinking level/,
+      );
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

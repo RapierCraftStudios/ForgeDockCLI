@@ -32,7 +32,7 @@ import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
-import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
+import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type ThinkingLevel, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
@@ -203,7 +203,7 @@ async function workOn(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueArg = argv.find((arg) => !arg.startsWith("-"));
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
@@ -345,6 +345,7 @@ async function workOn(argv: string[]): Promise<void> {
 
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   // All remediation callers in this controller share the durable admission
@@ -356,6 +357,7 @@ async function workOn(argv: string[]): Promise<void> {
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...planning,
   }, store);
   const onAgentEvent = (event: AgentEvent) => {
     writeAgentEvent(event);
@@ -616,6 +618,7 @@ async function workOn(argv: string[]): Promise<void> {
         ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
+        ...planning,
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
@@ -693,6 +696,7 @@ async function workOn(argv: string[]): Promise<void> {
         },
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
+        ...planning,
         signal: leaseController.signal,
       }, { runtime, artifacts, runs, decomposer: github, onAgentEvent });
       const finalized = !dryRun && result.run.state === "invalid" && result.outcome?.payload.status === "invalid"
@@ -733,6 +737,7 @@ async function workOn(argv: string[]): Promise<void> {
       ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
+      ...planning,
       signal: leaseController.signal,
     }, {
       runtime, artifacts, runs,
@@ -840,7 +845,7 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--dry-run] [--confirm] [--rerun]");
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--confirm] [--rerun]");
   const config = readForgeDockConfig(process.cwd());
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
@@ -925,12 +930,14 @@ async function orchestrate(argv: string[]): Promise<void> {
   ({ items, routedIssues } = await readAuthoritativeItems());
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   github = new GitHubClient(process.cwd(), store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...planning,
   }, store);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   const runs = projectRunsToGitHub(store, github);
@@ -1045,6 +1052,8 @@ async function orchestrate(argv: string[]): Promise<void> {
           );
           if (provider !== undefined) resumeArgs.push("--provider", provider);
           if (model !== undefined) resumeArgs.push("--model", model);
+          if (planning.planningProvider !== undefined && planning.planningModel !== undefined) resumeArgs.push("--planning-model", `${planning.planningProvider}/${planning.planningModel}`);
+          if (planning.planningThinking !== undefined) resumeArgs.push("--planning-thinking", planning.planningThinking);
           await workOn(resumeArgs);
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
           updateOrchestrationNode(item.id, { childRunIds: resumed.runId ? [resumed.runId] : [] });
@@ -1098,6 +1107,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
             ...(provider !== undefined ? { provider } : {}),
             ...(model !== undefined ? { model } : {}),
+            ...planning,
           }, {
             runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
             onAgentEvent: (event) => writeAgentEvent(event, item.id),
@@ -1262,6 +1272,27 @@ function writeAgentEvent(event: AgentEvent, prefix?: string): void {
   agentEventStream.write(event, prefix);
 }
 
+function configuredPlanningOptions(argv: string[]): {
+  planningProvider?: string;
+  planningModel?: string;
+  planningThinking?: ThinkingLevel;
+} {
+  const configured = readForgeDockConfig(process.cwd());
+  const reference = option(argv, "--planning-model") ?? configured.planningModel ?? process.env.FORGEDOCK_PLANNING_MODEL;
+  const planningThinkingValue = option(argv, "--planning-thinking") ?? configured.planningThinking ?? process.env.FORGEDOCK_PLANNING_THINKING;
+  if (planningThinkingValue !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(planningThinkingValue)) {
+    throw new Error(`Unsupported planning thinking level: ${planningThinkingValue}`);
+  }
+  if (reference !== undefined && !splitConfiguredModel(reference)) {
+    throw new Error(`Planning model must use provider/model form: ${reference}`);
+  }
+  const selected = splitConfiguredModel(reference);
+  return {
+    ...(selected ? { planningProvider: selected.provider, planningModel: selected.model } : {}),
+    ...(planningThinkingValue ? { planningThinking: planningThinkingValue as ThinkingLevel } : {}),
+  };
+}
+
 function configuredMaxReviewSpecialists(): number | undefined {
   const configured = process.env.FORGEDOCK_MAX_REVIEW_SPECIALISTS;
   if (configured !== undefined) {
@@ -1272,10 +1303,13 @@ function configuredMaxReviewSpecialists(): number | undefined {
   return readForgeDockConfig(process.cwd()).maxReviewSpecialists;
 }
 
-function createCliRuntime(options: { provider?: string; model?: string }, telemetry: TelemetryRepository): AgentRuntime {
+function createCliRuntime(options: { provider?: string; model?: string; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
   const inner = new PiAgentRuntime({
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.model !== undefined ? { model: options.model } : {}),
+    ...(options.planningProvider !== undefined ? { planningProvider: options.planningProvider } : {}),
+    ...(options.planningModel !== undefined ? { planningModel: options.planningModel } : {}),
+    ...(options.planningThinking !== undefined ? { planningThinking: options.planningThinking } : {}),
   });
   return new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
 }
@@ -1334,11 +1368,11 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--dry-run|--confirm] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm] [--rerun]\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID]\n\n");
   process.stdout.write("Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
   process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");

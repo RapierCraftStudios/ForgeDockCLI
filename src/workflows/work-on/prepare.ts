@@ -28,6 +28,9 @@ export async function prepareBuildPacket(
     scopeHints?: ScopeHints;
     provider?: string;
     model?: string;
+    planningProvider?: string;
+    planningModel?: string;
+    planningThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
     signal?: AbortSignal;
   },
   dependencies: {
@@ -76,6 +79,9 @@ export async function prepareBuildPacket(
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.planningProvider !== undefined ? { planningProvider: input.planningProvider } : {}),
+        ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
+        ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
       },
     }, {
       ...(input.signal !== undefined ? { signal: input.signal } : {}),

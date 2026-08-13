@@ -41,6 +41,10 @@ export interface PiRuntimeOptions {
   provider?: string;
   model?: string;
   thinking?: ModelPolicy["thinking"];
+  /** Provider/model override for read-only planning roles. */
+  planningProvider?: string;
+  planningModel?: string;
+  planningThinking?: ModelPolicy["thinking"];
   runtimeApiKeys?: Record<string, string>;
 }
 
@@ -63,6 +67,12 @@ export class PiAgentRuntime implements AgentRuntime {
   async preflight(options: RuntimePreflightOptions = {}): Promise<{ provider: string; model: string }> {
     await assertRuntimeInstallAsync();
     const configuredReviewer = splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL);
+    const configuredPlanning = splitConfiguredModel(
+      process.env.FORGEDOCK_PLANNING_MODEL ??
+        (this.#options.planningProvider && this.#options.planningModel
+          ? `${this.#options.planningProvider}/${this.#options.planningModel}`
+          : this.#options.planningModel),
+    );
     const worker = {
       provider: options.provider ?? this.#options.provider ?? process.env.PI_PROVIDER,
       model: options.model ?? this.#options.model ?? process.env.PI_MODEL,
@@ -70,9 +80,11 @@ export class PiAgentRuntime implements AgentRuntime {
     const primary = options.role === "reviewer" && configuredReviewer
       ? { provider: configuredReviewer.provider, model: configuredReviewer.model }
       : worker;
-    const targets = options.role === "reviewer" || !configuredReviewer
-      ? [primary]
-      : [primary, configuredReviewer];
+    const targets = [
+      primary,
+      ...(options.role !== "reviewer" && configuredReviewer ? [configuredReviewer] : []),
+      ...(configuredPlanning ? [configuredPlanning] : []),
+    ];
     const runtime = await this.modelRuntime();
     for (const target of targets) {
       if (!target.provider || !target.model) {
@@ -96,12 +108,7 @@ export class PiAgentRuntime implements AgentRuntime {
     assertToolPolicy(task);
     const emit = options.onEvent ?? (() => undefined);
     const startedAt = Date.now();
-    const configuredReviewer = task.role === "reviewer" ? splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL) : undefined;
-    const provider = configuredReviewer?.provider ?? task.modelPolicy.provider ?? this.#options.provider ?? process.env.PI_PROVIDER;
-    const modelId = configuredReviewer?.model ?? task.modelPolicy.model ?? this.#options.model ?? process.env.PI_MODEL;
-    const thinking = task.role === "reviewer"
-      ? configuredThinking(process.env.FORGEDOCK_REVIEWER_THINKING) ?? task.modelPolicy.thinking
-      : task.modelPolicy.thinking;
+    const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
     if (!provider || !modelId) {
       throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
     }
@@ -229,10 +236,7 @@ export class PiAgentRuntime implements AgentRuntime {
     if (task.role !== "reviewer" || !process.env.FORGEDOCK_NESTED_AGENT_URL || !process.env.FORGEDOCK_NESTED_AGENT_TOKEN) {
       throw new AgentRunError("Pi can resume ForgeDock reviewers only through the persisted nested-agent bridge");
     }
-    const configuredReviewer = splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL);
-    const provider = configuredReviewer?.provider ?? task.modelPolicy.provider ?? this.#options.provider ?? process.env.PI_PROVIDER;
-    const modelId = configuredReviewer?.model ?? task.modelPolicy.model ?? this.#options.model ?? process.env.PI_MODEL;
-    const thinking = configuredThinking(process.env.FORGEDOCK_REVIEWER_THINKING) ?? task.modelPolicy.thinking;
+    const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
     if (!provider || !modelId) throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
     const startedAt = Date.now();
     const result = await runNestedReviewer(task, {
@@ -263,6 +267,46 @@ export class PiAgentRuntime implements AgentRuntime {
     }
     return this.#modelRuntime;
   }
+}
+
+export interface ResolvedPiModelPolicy {
+  provider: string | undefined;
+  model: string | undefined;
+  thinking: ThinkingLevel | undefined;
+}
+
+/** Resolve role-specific model settings without changing controller authority. */
+export function resolvePiModelPolicy<T>(
+  task: AgentTask<T>,
+  runtimeOptions: PiRuntimeOptions = {},
+  environment: NodeJS.ProcessEnv = process.env,
+): ResolvedPiModelPolicy {
+  const planningRole = task.role === "investigator" || task.role === "packet-author";
+  const configured = planningRole
+    ? environment.FORGEDOCK_PLANNING_MODEL ??
+      (runtimeOptions.planningProvider && runtimeOptions.planningModel
+        ? `${runtimeOptions.planningProvider}/${runtimeOptions.planningModel}`
+        : runtimeOptions.planningModel)
+    : task.role === "reviewer"
+      ? environment.FORGEDOCK_REVIEWER_MODEL
+      : undefined;
+  const selected = splitConfiguredModel(configured);
+  const selectedThinking = planningRole
+    ? configuredThinking(environment.FORGEDOCK_PLANNING_THINKING) ?? runtimeOptions.planningThinking
+    : task.role === "reviewer"
+      ? configuredThinking(environment.FORGEDOCK_REVIEWER_THINKING)
+      : undefined;
+  return {
+    provider: planningRole
+      ? task.modelPolicy.planningProvider ?? selected?.provider ?? task.modelPolicy.provider ?? runtimeOptions.provider ?? environment.PI_PROVIDER
+      : selected?.provider ?? task.modelPolicy.provider ?? runtimeOptions.provider ?? environment.PI_PROVIDER,
+    model: planningRole
+      ? task.modelPolicy.planningModel ?? selected?.model ?? task.modelPolicy.model ?? runtimeOptions.model ?? environment.PI_MODEL
+      : selected?.model ?? task.modelPolicy.model ?? runtimeOptions.model ?? environment.PI_MODEL,
+    thinking: planningRole
+      ? task.modelPolicy.planningThinking ?? selectedThinking ?? task.modelPolicy.thinking ?? runtimeOptions.thinking
+      : selectedThinking ?? task.modelPolicy.thinking ?? runtimeOptions.thinking,
+  };
 }
 
 async function runNestedReviewer<T>(

@@ -32,9 +32,13 @@ describe("Build Packet preparation", () => {
       payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
     const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
-    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const investigated = await investigateWorkItem({
+      intent, cwd: process.cwd(), scopeHints,
+      planningProvider: "anthropic", planningModel: "claude-sonnet", planningThinking: "high",
+    }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({
       run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
+      planningProvider: "anthropic", planningModel: "claude-sonnet", planningThinking: "high",
     }, { runtime, artifacts, runs });
 
     assert.equal(prepared.run.state, "building");
@@ -46,6 +50,11 @@ describe("Build Packet preparation", () => {
     assert.ok(prepared.run.scopeManifest?.readRoots.includes("test"));
     assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
     assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
+    assert.deepEqual(runtime.tasks[1]?.modelPolicy, {
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    });
     assert.ok(runtime.tasks[0]?.workspace.scope.readRoots.includes("src"));
     assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [

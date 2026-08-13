@@ -39,6 +39,8 @@ export interface ForgeDockNextConfig {
   workerThinking?: ThinkingLevel;
   reviewerModel?: string;
   reviewerThinking?: ThinkingLevel;
+  planningModel?: string;
+  planningThinking?: ThinkingLevel;
   maxReviewSpecialists?: number;
   /** Flat resolved fields are used by controllers; YAML is rendered nested. */
   batchingPolicy?: BatchingPolicy;
@@ -89,6 +91,8 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
     workerThinking: parsed("worker_thinking", parseThinking),
     reviewerModel: parsed("reviewer_model", parseString),
     reviewerThinking: parsed("reviewer_thinking", parseThinking),
+    planningModel: parsed("planning_model", parseString),
+    planningThinking: parsed("planning_thinking", parseThinking),
     maxReviewSpecialists: parsed("max_review_specialists", parsePositiveInteger),
     batchingPolicy: parsed("policy", parseBatchingPolicy),
     maxBatchSize: parsed("max_batch_size", parsePositiveInteger),
@@ -202,7 +206,9 @@ function managedBlock(raw: string): string | undefined {
 
 function renderManagedBlock(config: ForgeDockNextConfig): string {
   const hasAgents = config.workerModel !== undefined || config.workerThinking !== undefined
-    || config.reviewerModel !== undefined || config.reviewerThinking !== undefined || config.maxReviewSpecialists !== undefined;
+    || config.reviewerModel !== undefined || config.reviewerThinking !== undefined
+    || config.planningModel !== undefined || config.planningThinking !== undefined
+    || config.maxReviewSpecialists !== undefined;
   const hasBatching = config.batchingPolicy !== undefined || config.maxBatchSize !== undefined || config.maxSensitiveBatchSize !== undefined;
   const hasOrchestration = hasBatching || config.scopeExpansion !== undefined || config.maxRemediationCycles !== undefined
     || config.maxRemediationDepth !== undefined || config.maxRemediationChildren !== undefined
@@ -212,6 +218,8 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
   if (config.reviewerModel !== undefined) lines.push(`    reviewer_model: ${JSON.stringify(config.reviewerModel)}`);
   if (config.reviewerThinking !== undefined) lines.push(`    reviewer_thinking: ${JSON.stringify(config.reviewerThinking)}`);
+  if (config.planningModel !== undefined) lines.push(`    planning_model: ${JSON.stringify(config.planningModel)}`);
+  if (config.planningThinking !== undefined) lines.push(`    planning_thinking: ${JSON.stringify(config.planningThinking)}`);
   if (config.maxReviewSpecialists !== undefined) lines.push(`    max_review_specialists: ${config.maxReviewSpecialists}`);
   if (!hasOrchestration) {
     lines.push("  orchestration: {}");
@@ -237,12 +245,12 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
 
 function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (requireValue && !Object.values(patch).some((value) => value !== undefined)) throw new Error("At least one ForgeDock setting is required");
-  for (const model of [patch.workerModel, patch.reviewerModel]) {
+  for (const model of [patch.workerModel, patch.reviewerModel, patch.planningModel]) {
     if (model !== undefined && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._@:/-]+$/.test(model)) {
       throw new Error(`Model must use provider/model form: ${model}`);
     }
   }
-  for (const thinking of [patch.workerThinking, patch.reviewerThinking]) {
+  for (const thinking of [patch.workerThinking, patch.reviewerThinking, patch.planningThinking]) {
     if (thinking !== undefined && !THINKING_LEVELS.includes(thinking)) throw new Error(`Unsupported thinking level: ${thinking}`);
   }
   if (patch.maxReviewSpecialists !== undefined && (!Number.isInteger(patch.maxReviewSpecialists) || patch.maxReviewSpecialists < 1 || patch.maxReviewSpecialists > 6)) {

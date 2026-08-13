@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest } from "./pi-adapter.js";
+import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, resolvePiModelPolicy } from "./pi-adapter.js";
 import { scopeManifestFor } from "./agent-runtime.js";
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
@@ -21,6 +21,36 @@ async function listen(handler: (request: IncomingMessage, response: ServerRespon
     close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
   };
 }
+
+function taskForRole(role: "investigator" | "packet-author" | "builder" | "reviewer", modelPolicy: Record<string, string> = {}) {
+  return {
+    id: `run:${role}`,
+    role,
+    objective: "Test model resolution",
+    instructions: "Read only",
+    context: [],
+    workspace: { cwd: process.cwd(), mode: "read-only" as const, scope: scopeManifestFor("issue-hints", { metadataRoots: ["."] }) },
+    tools: ["read" as const],
+    outputSchema: Type.Object({ summary: Type.String() }),
+    modelPolicy,
+  } as any;
+}
+
+test("planning model resolution is role-specific and invocation policy wins", () => {
+  const environment = {
+    FORGEDOCK_PLANNING_MODEL: "env/planner",
+    FORGEDOCK_PLANNING_THINKING: "high",
+    FORGEDOCK_REVIEWER_MODEL: "env/reviewer",
+    PI_PROVIDER: "env/default-provider",
+    PI_MODEL: "env/default-model",
+  };
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("investigator", {
+    provider: "generic-provider", model: "generic-model", planningProvider: "flag", planningModel: "planner", planningThinking: "low",
+  }), { planningProvider: "option", planningModel: "planner", planningThinking: "max" }, environment), { provider: "flag", model: "planner", thinking: "low" });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("packet-author"), {}, environment), { provider: "env", model: "planner", thinking: "high" });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("builder", { provider: "worker", model: "builder" }), {}, environment), { provider: "worker", model: "builder", thinking: undefined });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("reviewer", { provider: "task", model: "task" }), {}, environment), { provider: "env", model: "reviewer", thinking: undefined });
+});
 
 test("nested reviewer transport does not depend on fetch or an implicit wall-clock timeout", async () => {
   const endpoint = await listen((_request, response) => {

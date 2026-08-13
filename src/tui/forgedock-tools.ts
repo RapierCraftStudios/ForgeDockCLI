@@ -941,12 +941,14 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
     ...forgeDockToolPresentation("Configure ForgeDock"),
     name: CONFIG_TOOL,
     label: "Configure ForgeDock",
-    description: "Persist user-requested ForgeDock Next runtime preferences in forge.yaml. Model values may be exact provider/model identifiers or unambiguous friendly names from the live model catalog. Use subagentModel/subagentThinking when the request applies to all workers and reviewers; preserve unrelated configuration.",
+    description: "Persist user-requested ForgeDock Next runtime preferences in forge.yaml. Model values may be exact provider/model identifiers or unambiguous friendly names from the live model catalog. Use subagentModel/subagentThinking when the request applies to all planning, worker, and review agents; preserve unrelated configuration.",
     parameters: Type.Object({
-      subagentModel: Type.Optional(Type.String({ description: "Model for all issue workers and nested reviewers; exact provider/model ID or unambiguous friendly name" })),
-      subagentThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS], description: "Thinking level for all issue workers and nested reviewers" })),
+      subagentModel: Type.Optional(Type.String({ description: "Model for all read-only planners, issue workers, and nested reviewers; exact provider/model ID or unambiguous friendly name" })),
+      subagentThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS], description: "Thinking level for all read-only planners, issue workers, and nested reviewers" })),
       workerModel: Type.Optional(Type.String({ description: "Issue-worker model; exact provider/model ID or unambiguous friendly name" })),
       workerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
+      planningModel: Type.Optional(Type.String({ description: "Read-only investigator and Build Packet planning model; exact provider/model ID or unambiguous friendly name" })),
+      planningThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
       reviewerModel: Type.Optional(Type.String({ description: "Nested-reviewer model; exact provider/model ID or unambiguous friendly name" })),
       reviewerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
       maxReviewSpecialists: Type.Optional(Type.Integer({ minimum: 1, maximum: 6, description: "Soft default specialist budget; independently concrete high-risk surfaces may exceed it" })),
@@ -964,12 +966,17 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const commonModel = params.subagentModel !== undefined ? resolveModelReference(params.subagentModel, ctx) : undefined;
       const workerModel = params.workerModel !== undefined ? resolveModelReference(params.workerModel, ctx) : commonModel;
+      const planningModel = params.planningModel !== undefined ? resolveModelReference(params.planningModel, ctx) : commonModel;
       const reviewerModel = params.reviewerModel !== undefined ? resolveModelReference(params.reviewerModel, ctx) : commonModel;
       const commonThinking = params.subagentThinking as ThinkingLevel | undefined;
       const patch = {
         ...(workerModel !== undefined ? { workerModel } : {}),
         ...(params.workerThinking !== undefined || commonThinking !== undefined
           ? { workerThinking: (params.workerThinking ?? commonThinking) as ThinkingLevel }
+          : {}),
+        ...(planningModel !== undefined ? { planningModel } : {}),
+        ...(params.planningThinking !== undefined || commonThinking !== undefined
+          ? { planningThinking: (params.planningThinking ?? commonThinking) as ThinkingLevel }
           : {}),
         ...(reviewerModel !== undefined ? { reviewerModel } : {}),
         ...(params.reviewerThinking !== undefined || commonThinking !== undefined
@@ -1442,10 +1449,13 @@ async function runControllerToolBackground(
   const nestedBridge = await startNestedAgentBridge(pi);
   const config = readForgeDockConfig(ctx.cwd);
   const reviewer = splitConfiguredModel(config.reviewerModel);
+  const planning = splitConfiguredModel(config.planningModel);
   const env = {
     ...nestedBridge.env,
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
+    ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+    ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
   try {
@@ -1489,9 +1499,12 @@ async function runControllerTool(
   const nestedBridge = includeModel ? await startNestedAgentBridge(pi) : undefined;
   const config = includeModel ? readForgeDockConfig(ctx.cwd) : {};
   const reviewer = splitConfiguredModel(config.reviewerModel);
+  const planning = splitConfiguredModel(config.planningModel);
   const configEnv = {
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
+    ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+    ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
   let result: ControllerResult;

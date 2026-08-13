@@ -28,6 +28,9 @@ export interface InvestigateInput {
   cwd: string;
   provider?: string;
   model?: string;
+  planningProvider?: string;
+  planningModel?: string;
+  planningThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   target?: RunTarget;
   scopeHints?: ScopeHints;
@@ -73,6 +76,9 @@ export async function investigateWorkItem(
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
+      ...(input.planningProvider !== undefined ? { planningProvider: input.planningProvider } : {}),
+      ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
+      ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
     };
     const agentResult = await dependencies.runtime.run<InvestigationPayload>({
       id: `${run.runId}:investigation:${run.attempt}`,
