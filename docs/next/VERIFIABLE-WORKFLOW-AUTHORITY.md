@@ -787,6 +787,6 @@ Every mutation-capable workflow receives a controller-owned `LeaseGuard` and che
 
 ### 15.2 Configuration and retention
 
-CLI and TUI repository factories require a configured retained witness and fail explicitly when `FORGEDOCK_LEASE_WITNESS_PATH`, `FORGEDOCK_LEASE_WITNESS_PUBLIC_KEY`, or `FORGEDOCK_LEASE_WITNESS_PRIVATE_KEY` is absent or unusable. The checkpoint file and verification key MUST be retained outside the SQLite backup/restore scope, with restricted permissions and an operator-backed backup policy.
+Mutation-capable CLI and TUI repository factories require a configured retained witness and fail explicitly when `FORGEDOCK_LEASE_WITNESS_PATH`, `FORGEDOCK_LEASE_WITNESS_PUBLIC_KEY`, or `FORGEDOCK_LEASE_WITNESS_PRIVATE_KEY` is absent or unusable. Standalone advisory `/review-pr` may open the operational repository without a witness because it never acquires a lease; any attempted lease operation remains fail-closed. The checkpoint file and verification key MUST be retained outside the SQLite backup/restore scope, with restricted permissions and an operator-backed backup policy.
 
 After suspected joint restore or checkpoint loss, coordination MUST stop, recovery status MUST be inspected, and signed higher-epoch re-enrollment MUST complete before resuming. Cross-machine or GitHub-backed coordination is not claimed; it remains a future adapter behind the witness port.

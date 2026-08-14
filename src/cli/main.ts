@@ -544,7 +544,7 @@ async function workOn(argv: string[]): Promise<void> {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
       const durableBatchMemberContracts = intentArtifact.payload.batchMemberContracts ?? batchMemberContracts;
-      const durableBatchMembers = durableBatchMemberContracts.map((contract) => contract.issue);
+      const durableBatchMembers = durableBatchMemberContracts.map((contract: { issue: number }) => contract.issue);
       const remediationCheckpoint = latestArtifactOfKind(runArtifacts, "RemediationBlocked");
       const latestOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
       const verificationAdjudication = latestArtifactOfKind(runArtifacts, "VerificationAdjudication");
@@ -745,9 +745,9 @@ async function workOn(argv: string[]): Promise<void> {
                     checkpoint = dispatched.checkpoint;
                   }
                   if (checkpoint.payload.status === "children-running") {
-                    const childOutcomes = (await Promise.all(checkpoint.payload.childIssues.map(async (childIssue) =>
+                    const childOutcomes = (await Promise.all(checkpoint.payload.childIssues.map(async (childIssue: number) =>
                       authoritativeArtifacts.list({ repo: issue.repo, issue: childIssue })))).flat()
-                      .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged");
+                      .filter((artifact: DurableArtifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged");
                     checkpoint = await supervisor.reconcileChildren({ checkpoint, childOutcomes, parentPullRequest: checkpointPullRequest! });
                   }
                   if (checkpoint.payload.status !== "ready-to-resume") {
@@ -1019,8 +1019,14 @@ async function reviewPr(argv: string[]): Promise<void> {
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const reviewWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!reviewWitness) throw new Error("Lease witness configuration is required for CLI repository construction; token-only local leases are disabled");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: reviewWitness });
+  // Standalone review is advisory and never acquires a lease. Keep an
+  // explicitly configured witness when available, but do not make review
+  // depend on mutation-only lease configuration; the repository still fails
+  // closed if a lease operation is attempted without a witness.
+  const store = new SqliteRepositories(
+    join(process.cwd(), ".forgedock", "state.db"),
+    reviewWitness ? { witness: reviewWitness } : {},
+  );
   github = new GitHubClient(process.cwd(), store);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   // Standalone review is advisory and read-only. Its operational state must not
