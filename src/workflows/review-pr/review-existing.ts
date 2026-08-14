@@ -93,7 +93,7 @@ async function reviewDeploymentPullRequest(
   await dependencies.runs.create(run);
   const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: input.pullRequest.number, headSha: input.pullRequest.headSha });
   try {
-    return await reviewPullRequest({
+    const result = await reviewPullRequest({
       run,
       pullRequest: input.pullRequest,
       ...context,
@@ -116,6 +116,8 @@ async function reviewDeploymentPullRequest(
       runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
+    await publishDeploymentGateMarker(dependencies.host, input.pullRequest, result);
+    return result;
   } finally {
     await dependencies.workspaces.remove(workspace);
   }
@@ -127,12 +129,43 @@ function isDeploymentPullRequest(
   return pullRequest.headBranch === "staging" && pullRequest.baseBranch === "main";
 }
 
+const DEPLOYMENT_GATE_MARKER_CHECK = "check for forge gate markers";
+
 function assertDeploymentMergeGate(gate: PullRequestMergeGate): void {
   if (!gate.mergeable) throw new Error(`Deployment PR #${gate.pullRequest} is not currently mergeable`);
-  const blocked = gate.requiredChecks.filter((check) => check.state !== "passed");
+  const blocked = gate.requiredChecks.filter((check) => {
+    if (check.state === "passed") return false;
+    // This check is intentionally red until this review posts its trusted
+    // marker. It must not deadlock the review that is responsible for it.
+    return !(check.name.trim().toLowerCase() === DEPLOYMENT_GATE_MARKER_CHECK
+      && (check.state === "pending" || check.state === "failed"));
+  });
   if (blocked.length) {
     throw new Error(`Deployment PR checks are not green: ${blocked.map((check) => `${check.name}=${check.state}`).join(", ")}`);
   }
+}
+
+async function publishDeploymentGateMarker(
+  host: ForgeHost,
+  pullRequest: PullRequestSnapshot,
+  result: { run: ReturnType<typeof createRun>; verdict: DurableArtifact<"ReviewVerdict"> },
+): Promise<void> {
+  const passed = result.verdict.payload.disposition === "approve";
+  const idempotencyMarker = `<!-- FORGEDOCK:DEPLOYMENT_GATE:${result.run.runId}:${pullRequest.headSha} -->`;
+  const gateMarker = passed ? "<!-- FORGE:GATE_PASS -->" : "<!-- FORGE:GATE_FAILURE -->";
+  await host.publishPullRequestComment({
+    repo: pullRequest.repo,
+    pullRequest: pullRequest.number,
+    marker: idempotencyMarker,
+    body: [
+      gateMarker,
+      "<!-- FORGE:SPEC_LOADED -->",
+      idempotencyMarker,
+      `ForgeDock deployment review ${passed ? "passed" : "blocked"} for PR #${pullRequest.number}.`,
+      `Reviewed head: ${pullRequest.headSha}`,
+      `Disposition: ${result.verdict.payload.disposition}`,
+    ].join("\\n"),
+  });
 }
 
 function toReviewChecks(gate: PullRequestMergeGate | undefined): ReviewChecks {

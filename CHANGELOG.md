@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Deployment review now bootstraps its self-reporting gate check, publishes trusted `FORGE:GATE_PASS`/`FORGE:GATE_FAILURE` markers, and keeps GitHub mergeability separate from required-check state.
 - Standalone advisory review no longer requires mutation-only lease-witness configuration; lease enforcement remains fail-closed for commands that acquire leases.
 - Orchestration now preserves the original authorized issue scope separately from contracted work units, keeps inherited batch-labelled decomposition children dispatchable as singletons, and reports the correct preview/work-unit counts instead of silently dropping selected issues.
 - The TUI now persists and enforces claim-serialization edges, filters them during recovery, and exposes typed dependency, claim, capacity, and suspension wait reasons in live snapshots.

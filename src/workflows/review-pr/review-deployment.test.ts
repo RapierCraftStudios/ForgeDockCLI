@@ -24,6 +24,8 @@ const clean: ReviewerSubmission = { summary: "No deployment defects", findings: 
 class DeploymentHost implements ForgeHost {
   readonly comments: string[] = [];
 
+  constructor(private readonly markerCheckState?: PullRequestMergeGate["requiredChecks"][number]["state"]) {}
+
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { return deploymentPr; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return deploymentPr; }
@@ -37,7 +39,10 @@ class DeploymentHost implements ForgeHost {
       headSha,
       baseBranch,
       mergeable: true,
-      requiredChecks: [{ name: "CI", state: "passed" }],
+      requiredChecks: [
+        { name: "CI", state: "passed" },
+        ...(this.markerCheckState ? [{ name: "Check for FORGE gate markers", state: this.markerCheckState }] : []),
+      ],
       observedAt: new Date().toISOString(),
     };
   }
@@ -81,8 +86,23 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual(result.verdict.payload.checks, [{ command: "GitHub required check: CI", status: "passed", durationMs: 0 }]);
     assert.ok(runtime.tasks.length > 0);
     assert.ok(runtime.tasks.every((task) => !task.context.some((artifact) => artifact.kind === "BuildResult")));
-    assert.equal(host.comments.length, runtime.tasks.length);
+    assert.equal(host.comments.length, runtime.tasks.length + 1);
+    assert.ok(host.comments.some((comment) => comment.includes("<!-- FORGE:GATE_PASS -->")));
     assert.equal(workspaces.removed, true);
+  });
+
+  it("bootstraps a failed marker check and publishes a trusted gate result", async () => {
+    const host = new DeploymentHost("failed");
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
+    const workspaces = new TestWorkspaces();
+    const result = await reviewExistingPullRequest(
+      { repo: deploymentPr.repo, pr: deploymentPr.number },
+      { runtime, host, workspaces, artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+    );
+
+    assert.equal(result.verdict.payload.disposition, "approve");
+    assert.ok(host.comments.some((comment) => comment.includes("<!-- FORGE:GATE_PASS -->")));
+    assert.ok(host.comments.some((comment) => comment.includes("<!-- FORGE:SPEC_LOADED -->")));
   });
 
   it("still requires an issue for a non-deployment PR", async () => {

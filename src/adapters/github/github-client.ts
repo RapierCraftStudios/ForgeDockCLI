@@ -662,16 +662,17 @@ export class GitHubClient implements ForgeHost {
       throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${pullRequest.baseBranch}`);
     }
     let mergeable = false;
-    let mergeState = "UNKNOWN";
     try {
       const result = await this.gh([
         "pr", "view", String(number), "--repo", repo,
         "--json", "mergeable,mergeStateStatus",
       ]);
-      const value = JSON.parse(result) as { mergeable?: string; mergeStateStatus?: string };
-      mergeState = String(value.mergeStateStatus ?? "UNKNOWN").toUpperCase();
-      mergeable = String(value.mergeable ?? "UNKNOWN").toUpperCase() === "MERGEABLE"
-        && ["CLEAN", "HAS_HOOKS"].includes(mergeState);
+      const value = JSON.parse(result) as { mergeable?: string };
+      // GitHub's mergeable field reports whether the head can be merged
+      // without conflicts. mergeStateStatus also includes branch-protection
+      // and required-check state; deployment review must inspect those checks
+      // separately so its own marker check can bootstrap from a red state.
+      mergeable = String(value.mergeable ?? "UNKNOWN").toUpperCase() === "MERGEABLE";
     } catch {
       mergeable = false;
     }
