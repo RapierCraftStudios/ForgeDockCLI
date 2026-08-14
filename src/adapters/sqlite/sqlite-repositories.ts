@@ -6,7 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
-import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
+import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
 import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
@@ -18,8 +18,12 @@ const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
+  readonly #witness: LeaseWitness | undefined;
+  #recoveryEpoch: number | undefined;
+  #leaseFailure: string | undefined;
 
-  constructor(path: string) {
+  constructor(path: string, options: { witness?: LeaseWitness } = {}) {
+    this.#witness = options.witness;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
     // WAL permits concurrent readers, but SQLite still has one writer. Wait for
@@ -64,10 +68,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         item_id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
         token TEXT NOT NULL,
+        epoch INTEGER NOT NULL DEFAULT 0,
         acquired_at INTEGER NOT NULL,
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS lease_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        max_epoch INTEGER NOT NULL
+      );
+      INSERT INTO lease_state (singleton, max_epoch) VALUES (1, 0) ON CONFLICT(singleton) DO NOTHING;
       CREATE TABLE IF NOT EXISTS run_telemetry (
         telemetry_key TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -105,6 +115,9 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE INDEX IF NOT EXISTS promotions_updated ON promotion_records(updated_at);
     `);
+    // Existing operational stores predate fencing. They are retained for
+    // inspection, but lease use remains fail-closed until a witness is bound.
+    try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
@@ -308,29 +321,105 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
+    this.#assertLeaseContinuity();
     return this.inTransaction(() => {
-      this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
+      const current = this.#database.prepare("SELECT epoch, expires_at FROM leases WHERE item_id = ?").get(itemId) as { epoch: number; expires_at: number } | undefined;
+      if (current && current.epoch > this.#localMaximum()) this.#failLease("local lease epoch is ahead of the retained witness");
+      const recoveredRow = current && this.#recoveryEpoch !== undefined && current.epoch < this.#recoveryEpoch;
+      if (current && current.expires_at > now && !recoveredRow) return undefined;
+      // Advancing the retained witness happens before assigning the row. A
+      // failed SQLite commit therefore consumes an epoch and can never reuse it.
+      const advanced = this.#witness!.compareAndAdvance(this.#localMaximum());
+      this.#acceptWitness(advanced);
+      if (recoveredRow) this.#database.prepare("DELETE FROM leases WHERE item_id = ?").run(itemId);
+      else this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
       const token = crypto.randomUUID();
       const result = this.#database.prepare(`
-        INSERT INTO leases (item_id, owner, token, acquired_at, heartbeat_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
-      `).run(itemId, owner, token, now, now, now + ttlMs);
-      return result.changes === 1 ? { itemId, owner, token, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs } : undefined;
+        INSERT INTO leases (item_id, owner, token, epoch, acquired_at, heartbeat_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
+      `).run(itemId, owner, token, advanced.epoch, now, now, now + ttlMs);
+      if (result.changes !== 1) return undefined;
+      this.#recoveryEpoch = undefined;
+      return { itemId, owner, token, epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" as const };
     });
   }
 
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {
+    this.#assertLeaseContinuity();
+    const rowBefore = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
+    if (rowBefore && rowBefore.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
+    if (rowBefore && this.#recoveryEpoch !== undefined && rowBefore.epoch < this.#recoveryEpoch) {
+      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+    }
     const result = this.#database.prepare(`
       UPDATE leases SET heartbeat_at = ?, expires_at = ?
       WHERE item_id = ? AND token = ? AND expires_at > ?
     `).run(now, now + ttlMs, itemId, token, now);
     if (result.changes !== 1) throw new Error(`Lease is absent, stale, or owned by another worker: ${itemId}`);
-    const row = this.#database.prepare("SELECT * FROM leases WHERE item_id = ?").get(itemId) as Record<string, string | number>;
-    return leaseFromRow(row);
+    return leaseFromRow(this.#database.prepare("SELECT * FROM leases WHERE item_id = ?").get(itemId) as Record<string, string | number>);
   }
 
   release(itemId: string, token: string): boolean {
+    this.#assertLeaseContinuity();
+    const row = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
+    if (row && row.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
+    if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
+      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+    }
     return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
+  }
+
+  guard(itemId: string, token: string): LeaseGuard {
+    return { assertValid: () => {
+      this.#assertLeaseContinuity();
+      const row = this.#database.prepare("SELECT token, epoch FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number } | undefined;
+      if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
+        throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+      }
+      if (!row || row.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
+    }, check: () => { this.guard(itemId, token).assertValid(); } };
+  }
+
+  continuity(): LeaseWitnessSnapshot {
+    if (this.#leaseFailure) return { state: "unverifiable", epoch: this.#localMaximum(), reason: this.#leaseFailure };
+    if (!this.#witness) return { state: "unverifiable", epoch: this.#localMaximum(), reason: "no retained checkpoint witness is configured" };
+    const snapshot = this.#witness.verify();
+    if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
+      return { ...snapshot, state: "unverifiable", reason: snapshot.reason ?? "local maximum diverges from the retained witness" };
+    }
+    return snapshot;
+  }
+
+  reEnroll(checkpoint: AuthenticatedLeaseCheckpoint): void {
+    if (!this.#witness) throw new LeaseContinuityError("no retained checkpoint witness is configured");
+    if (!Number.isSafeInteger(checkpoint.epoch) || checkpoint.epoch <= this.#localMaximum()) {
+      throw new LeaseContinuityError("re-enrollment checkpoint is not higher than the local maximum");
+    }
+    const snapshot = this.#witness.reEnroll(checkpoint);
+    this.#acceptWitness(snapshot);
+    this.#recoveryEpoch = snapshot.epoch;
+    this.#leaseFailure = undefined;
+  }
+
+  #localMaximum(): number {
+    return Number((this.#database.prepare("SELECT max_epoch FROM lease_state WHERE singleton = 1").get() as { max_epoch: number } | undefined)?.max_epoch ?? 0);
+  }
+  #acceptWitness(snapshot: LeaseWitnessSnapshot): void {
+    if (snapshot.state !== "verified" || !Number.isSafeInteger(snapshot.epoch) || snapshot.epoch < 0 || snapshot.epoch < this.#localMaximum()) this.#failLease(snapshot.reason ?? "retained witness rolled back or failed verification");
+    this.#database.prepare("UPDATE lease_state SET max_epoch = ? WHERE singleton = 1").run(snapshot.epoch);
+  }
+  #failLease(reason: string): never {
+    this.#leaseFailure = reason;
+    throw new LeaseContinuityError(reason);
+  }
+  #assertLeaseContinuity(): void {
+    if (this.#leaseFailure) throw new LeaseContinuityError(this.#leaseFailure);
+    if (!this.#witness) this.#failLease("no retained checkpoint witness is configured");
+    const snapshot = this.#witness.verify();
+    if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
+      this.#failLease(snapshot.reason ?? "local maximum diverges from the retained witness");
+    }
+    this.#acceptWitness(snapshot);
   }
 
   close(): void {
@@ -376,7 +465,7 @@ function subjectKey(subject: Subject): string {
 
 function leaseFromRow(row: Record<string, string | number>): Lease {
   return {
-    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token),
-    acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at),
+    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token), epoch: Number(row.epoch),
+    acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at), continuity: "verified",
   };
 }

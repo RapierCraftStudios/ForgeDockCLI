@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { LeaseContinuityError } from "../../core/ports/lease.js";
+
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
+export { LeaseContinuityError };
 export type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 
 export interface ScheduledWorkItem {
@@ -224,7 +227,14 @@ export async function runSchedule(
       const promise = worker(item, context)
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
-          if (outcome.status === "failed") {
+          if (outcome.status === "failed" && isLeaseContinuityFailure(outcome.error)) {
+            // Continuity loss is a suspension, not an ordinary worker failure:
+            // dependents stay queued until the controller explicitly re-enrolls
+            // and resumes the retained DAG.
+            status.set(item.id, "suspended");
+            errors.set(item.id, asError(outcome.error));
+            emit("suspended", item.id);
+          } else if (outcome.status === "failed") {
             status.set(item.id, "failed");
             errors.set(item.id, asError(outcome.error ?? "scheduled worker failed"));
             emit("failed", item.id);
@@ -250,9 +260,17 @@ export async function runSchedule(
           }
         })
         .catch((error: unknown) => {
-          status.set(item.id, "failed");
-          errors.set(item.id, error instanceof Error ? error : new Error(String(error)));
-          emit("failed", item.id);
+          if (isLeaseContinuityFailure(error)) {
+            // A thrown continuity error has the same durable meaning as an
+            // explicit suspended result returned by a controller worker.
+            status.set(item.id, "suspended");
+            errors.set(item.id, error);
+            emit("suspended", item.id);
+          } else {
+            status.set(item.id, "failed");
+            errors.set(item.id, asError(error));
+            emit("failed", item.id);
+          }
         })
         .finally(() => { running.delete(item.id); });
       running.set(item.id, promise);
@@ -269,8 +287,17 @@ export async function runSchedule(
   return { status, errors, startOrder };
 }
 
-function asError(value: Error | string): Error {
-  return value instanceof Error ? value : new Error(value);
+function isError(value: unknown): value is Error {
+  return typeof value === "object" && value !== null && value instanceof Error;
+}
+
+function asError(value: unknown): Error {
+  return isError(value) ? value : new Error(String(value));
+}
+
+export function isLeaseContinuityFailure(value: unknown): value is LeaseContinuityError {
+  return value instanceof LeaseContinuityError
+    || (isError(value) && (value as Error & { code?: unknown }).code === "LEASE_CONTINUITY_UNVERIFIABLE");
 }
 
 export function claimsConflict(left: readonly string[], right: readonly string[]): boolean {

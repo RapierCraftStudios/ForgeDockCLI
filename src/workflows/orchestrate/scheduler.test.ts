@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildSchedulePreview, claimsConflict, InMemoryLeaseRepository, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
+import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import { buildSchedulePreview, claimsConflict, InMemoryLeaseRepository, LeaseContinuityError, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -109,6 +110,21 @@ describe("lean orchestration scheduler", () => {
     assert.ok(events.includes("suspended"));
   });
 
+  it("turns a thrown lease continuity failure into suspension without dispatching dependents", async () => {
+    const events: string[] = [];
+    const result = await runSchedule([
+      { id: "leased", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 2, priority: 1, dependencies: ["leased"], claims: [] },
+    ], 1, async () => {
+      throw new LeaseContinuityError("retained checkpoint rolled back");
+    }, { onEvent: (event) => events.push(event.type) });
+    assert.equal(result.status.get("leased"), "suspended");
+    assert.equal(result.status.get("dependent"), "queued");
+    assert.deepEqual(result.startOrder, ["leased"]);
+    assert.ok(events.includes("suspended"));
+    assert.match(result.errors.get("leased")?.message ?? "", /continuity/i);
+  });
+
   it("keeps decomposed work terminally skipped and blocks its frozen dependents", async () => {
     const events: string[] = [];
     const result = await runSchedule([
@@ -160,6 +176,16 @@ describe("worker leases", () => {
     assert.equal(recovered?.owner, "worker-b");
     assert.equal(leases.release("issue-1", first?.token ?? ""), false);
     assert.equal(leases.release("issue-1", recovered?.token ?? ""), true);
+  });
+
+  it("fails closed when the retained witness rolls back", () => {
+    const witness = new InMemoryLeaseWitness();
+    const leases = new InMemoryLeaseRepository(witness);
+    const lease = leases.acquire("issue-rollback", "worker", 100, 1_000);
+    assert.ok(lease);
+    witness.rollback(0);
+    assert.throws(() => leases.heartbeat("issue-rollback", lease.token, 100, 1_010), /unverifiable|rolled back/i);
+    assert.throws(() => leases.release("issue-rollback", lease.token), /unverifiable|rolled back/i);
   });
 
   it("requires the current token for heartbeat", () => {

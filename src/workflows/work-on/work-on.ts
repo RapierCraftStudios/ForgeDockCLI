@@ -4,6 +4,7 @@ import { createArtifact, type DurableArtifact } from "../../core/artifacts/schem
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
+import type { LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import type { TelemetryRepository } from "../../core/ports/telemetry.js";
 import {
@@ -37,6 +38,8 @@ export interface WorkOnDependencies {
   verifier: VerificationRunner;
   host: ForgeHost;
   telemetry?: TelemetryRepository;
+  /** Controller-owned fencing guard checked before every dependent mutation. */
+  leaseGuard?: LeaseGuard;
   onAgentEvent?: AgentEventSink;
 }
 
@@ -88,6 +91,7 @@ export async function workOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   if (input.batchMemberContracts?.length && !input.intent.payload.batchMemberContracts?.length) {
     input = {
       ...input,
@@ -125,6 +129,7 @@ export async function workOn(
   let workspace: GitWorkspace | undefined;
   let run: RunState | undefined;
   try {
+    assertLease(dependencies);
     const issue = input.intent.subject.issue;
     if (!issue) throw new Error("work-on requires an issue subject");
     if (input.parentRemediation) {
@@ -140,6 +145,7 @@ export async function workOn(
       }
     }
     const deliveryBranch = input.parentRemediation?.parentBranch ?? input.lane.targetBranch;
+    assertLease(dependencies);
     workspace = await dependencies.git.create({
       runId: input.intent.runId,
       issue,
@@ -290,6 +296,7 @@ export async function resumeBuildWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "building") throw new Error(`Build resume requires building state, found ${input.run.state}`);
   assertRunTargetsBranch(input.run, input.baseBranch);
   let run = input.run;
@@ -469,6 +476,7 @@ async function continueBuildDelivery(
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
   assertRunTargetsBranch(input.run, input.baseBranch);
+  assertLease(dependencies);
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
@@ -510,6 +518,7 @@ async function continueBuildDelivery(
   if (!initialVerification.buildResult) return { run };
   let buildResult = initialVerification.buildResult;
 
+  assertLease(dependencies);
   const published = await publishPullRequest({
     run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
     ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
@@ -586,6 +595,7 @@ async function continueBuildDelivery(
     pullRequest = revision.pullRequest;
   }
 
+  assertLease(dependencies);
   const completed = await completeWorkItem({
     run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
     ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
@@ -624,6 +634,7 @@ export async function resumeWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   const evidence = input.outcome.payload.failureEvidence;
   if (input.run.state !== "blocked" || !evidence) throw new Error("Only a blocked verification run with retained evidence can resume");
   if (!evidence.criterionCoverage) {
@@ -793,6 +804,7 @@ export async function resumeReviewWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   const budgetBlocked = input.run.state === "blocked"
     && /^Remediation budget exhausted after \d+ cycle\(s\)$/i.test(input.run.blockedReason ?? "");
   const interruptedRemediation = input.run.state === "remediating";
@@ -1023,6 +1035,7 @@ export async function resumeExpandedReviewWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "blocked") throw new Error(`Expanded review resume requires blocked state, found ${input.run.state}`);
   if (input.checkpoint.payload.status !== "ready-to-resume") throw new Error("Expanded review resume requires a ready remediation checkpoint");
   assertRunTargetsBranch(input.run, input.baseBranch);
@@ -1128,6 +1141,7 @@ export async function resumePublicationWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "publishing" && input.run.state !== "failed") {
     throw new Error(`Publication resume requires publishing or recoverable failed state, found ${input.run.state}`);
   }
@@ -1265,6 +1279,7 @@ export async function resumeCompletionWorkOn(
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "merging") throw new Error(`Completion resume requires merging state, found ${input.run.state}`);
   if (input.verdict.payload.disposition !== "approve"
     || input.verdict.payload.headSha !== input.pullRequest.headSha) {
@@ -1339,6 +1354,49 @@ export function shouldAppendFailureOutcome(existing: readonly DurableArtifact[],
     .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.runId === runId && artifact.kind === "Outcome" && artifact.payload.status === "failed")
     .at(-1);
   return latestFailure?.payload.reason !== reason;
+}
+
+function assertLease(dependencies: Pick<WorkOnDependencies, "leaseGuard">): void {
+  dependencies.leaseGuard?.assertValid();
+}
+
+/**
+ * Guard the actual mutation ports, not merely the phase entry points. A
+ * heartbeat can discover continuity loss while an awaited helper is between
+ * phase checks, so every dependent write gets a final controller-owned check.
+ * Cleanup is intentionally not guarded: failed worktrees must remain
+ * removable during recovery.
+ */
+function guardMutationBoundaries(dependencies: WorkOnDependencies): WorkOnDependencies {
+  if (!dependencies.leaseGuard) return dependencies;
+  const guarded = <T extends object>(target: T, methods: readonly string[]): T => {
+    const mutationMethods = new Set(methods);
+    return new Proxy(target, {
+      get(value, property) {
+        const member = Reflect.get(value, property, value);
+        if (typeof member !== "function") return member;
+        if (!mutationMethods.has(String(property))) return member.bind(value);
+        return (...args: never[]) => {
+          dependencies.leaseGuard!.assertValid();
+          return member.apply(value, args);
+        };
+      },
+    });
+  };
+  return {
+    ...dependencies,
+    artifacts: guarded(dependencies.artifacts, ["append"]),
+    runs: guarded(dependencies.runs, ["create", "commit", "recordProgress"]),
+    git: guarded(dependencies.git, ["create", "syncToRemoteHead", "prepareWorkspaceDependencies", "commit", "push"]),
+    host: guarded(dependencies.host, [
+      "materializeBatchIssue", "publishIssueComment", "materializeRemediationChildren",
+      "materializeDecomposition", "createPullRequest", "publishPullRequestComment",
+      "materializeReviewFinding", "reconcileReviewFindings", "mergePullRequest", "closeIssue",
+    ]),
+    ...(dependencies.telemetry !== undefined
+      ? { telemetry: guarded(dependencies.telemetry, ["recordTelemetry"]) }
+      : {}),
+  };
 }
 
 async function appendFailureOutcome(run: RunState, reason: string, dependencies: WorkOnDependencies): Promise<void> {

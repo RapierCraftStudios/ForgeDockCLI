@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
+import { LeaseContinuityError } from "../core/ports/lease.js";
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
@@ -20,6 +21,7 @@ import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
+import { createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import {
   scopeManifestForBuildPacket,
   STANDARD_SCOPE_METADATA_ROOTS,
@@ -141,7 +143,9 @@ async function main(argv: string[]): Promise<void> {
 
 async function status(argv: string[]): Promise<void> {
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const statusWitness = createConfiguredLeaseWitness(process.cwd());
+  if (!statusWitness) throw new Error("Lease witness configuration is required for status/recovery inspection; token-only local leases are disabled");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: statusWitness });
   try {
     if (argv.includes("--promotions")) {
       const promotions = await store.listPromotions();
@@ -401,7 +405,9 @@ async function workOn(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const leaseWitness = createConfiguredLeaseWitness(process.cwd());
+  if (!leaseWitness) throw new Error("Lease witness configuration is required: set FORGEDOCK_LEASE_WITNESS_PATH, FORGEDOCK_LEASE_WITNESS_PUBLIC_KEY, and FORGEDOCK_LEASE_WITNESS_PRIVATE_KEY; token-only local leases are disabled");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: leaseWitness });
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
   github = new GitHubClient(process.cwd(), store);
@@ -452,6 +458,7 @@ async function workOn(argv: string[]): Promise<void> {
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
   const leaseController = new AbortController();
   let leaseToken: string | undefined;
+  let leaseGuard: import("../core/ports/lease.js").LeaseGuard | undefined;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
@@ -464,6 +471,7 @@ async function workOn(argv: string[]): Promise<void> {
     const lease = store.acquire(leaseItem, leaseOwner, 60_000);
     if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
     leaseToken = lease.token;
+    leaseGuard = store.guard(leaseItem, lease.token);
     leaseHeartbeat = setInterval(() => {
       try {
         store.heartbeat(leaseItem, lease.token, 60_000);
@@ -696,7 +704,7 @@ async function workOn(argv: string[]): Promise<void> {
         ...planning,
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, onAgentEvent };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent };
       const result = admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
@@ -830,7 +838,7 @@ async function workOn(argv: string[]): Promise<void> {
     if (result.run.state !== "completed") process.exitCode = 2;
   } finally {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
-    if (leaseToken) store.release(leaseItem, leaseToken);
+    if (leaseToken) { try { store.release(leaseItem, leaseToken); } catch { /* continuity failure deliberately retains the row */ } }
     await runtime.close();
     store.close();
   }
@@ -982,7 +990,9 @@ async function reviewPr(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const reviewWitness = createConfiguredLeaseWitness(process.cwd());
+  if (!reviewWitness) throw new Error("Lease witness configuration is required for CLI repository construction; token-only local leases are disabled");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: reviewWitness });
   github = new GitHubClient(process.cwd(), store);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   // Standalone review is advisory and read-only. Its operational state must not
@@ -1132,7 +1142,9 @@ async function orchestrate(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const orchestrationWitness = createConfiguredLeaseWitness(process.cwd());
+  if (!orchestrationWitness) throw new Error("Lease witness configuration is required before orchestrate dispatch; token-only local leases are disabled");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: orchestrationWitness });
   github = new GitHubClient(process.cwd(), store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
@@ -1350,9 +1362,14 @@ async function orchestrate(argv: string[]): Promise<void> {
             ...planning,
           }, {
             runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+            leaseGuard: store.guard(item.id, lease.token),
             onAgentEvent: (event) => writeAgentEvent(event, item.id),
           });
         } catch (error) {
+          if (controller.signal.aborted || error instanceof LeaseContinuityError) {
+            controller.abort(error);
+            return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
+          }
           if (error instanceof ClaimPromotionConflictError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
             return { status: "suspended", error: error.message };
@@ -1383,7 +1400,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         if (result.run.state !== "completed") throw new Error(`${item.id} ended in ${result.run.state}; dependents remain blocked`);
       } finally {
         clearInterval(heartbeat);
-        store.release(item.id, lease.token);
+        try { store.release(item.id, lease.token); } catch { /* fail-closed recovery retains the lease row */ }
       }
     }, {
       serializationEdges: scheduleItems.edges,
