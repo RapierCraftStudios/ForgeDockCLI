@@ -10,7 +10,7 @@ import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
-import forgedockExtension, { executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
+import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
@@ -134,6 +134,85 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate", "forgedock_ask_user"]);
+});
+
+test("assistant mode keeps generic PR requests on normal GitHub tooling", async () => {
+  const state = fakePi();
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  const prompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+
+  assert.match(prompt.systemPrompt, /Mode: assistant \(default\)/);
+  assert.match(prompt.systemPrompt, /create\/open pull-request requests default to ordinary gh usage/);
+  assert.match(prompt.systemPrompt, /explicitly requests gh CLI, honor that tool choice/);
+  assert.match(prompt.systemPrompt, /Plain GitHub PR or ForgeDock promotion/);
+  assert.match(prompt.systemPrompt, /from a forgedock_\* workflow tool call onward/);
+  assert.match(prompt.systemPrompt, /do not combine or follow it with raw gh mutations/);
+  assert.match(prompt.systemPrompt, /Do not inspect ForgeDock controller source/);
+  assert.equal(state.active.includes("forgedock_promote"), false);
+  assert.equal(state.sent.length, 0);
+});
+
+test("explicit promote activates one semantic workflow and settled failure returns to assistant mode", async () => {
+  const state = fakePi();
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.commands.get("promote")?.("--production --confirm", commandContext());
+
+  assert.equal(state.sent.length, 1);
+  assert.match(state.sent[0]?.content ?? "", /call forgedock_promote exactly once/);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_promote"]);
+  const activePrompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(activePrompt.systemPrompt, /Mode: forgedock-workflow \(explicitly activated by \/promote\)/);
+  assert.match(activePrompt.systemPrompt, /Do not replace the active workflow's GitHub mutations with raw gh/);
+
+  await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
+  const resetPrompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(resetPrompt.systemPrompt, /Mode: assistant \(default\)/);
+  assert.match(resetPrompt.systemPrompt, /explicitly requests gh CLI, honor that tool choice/);
+});
+
+test("direct semantic workflow invocation enters workflow mode under current-turn conditional authority", () => {
+  const state = fakePi();
+  const beforeStart = state.handlers.get("before_agent_start")?.[0];
+  const assistantPrompt = beforeStart?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(assistantPrompt.systemPrompt, /from a forgedock_\* workflow tool call onward/);
+
+  const guard = state.handlers.get("tool_call")?.[0];
+  guard?.({ toolName: "forgedock_promote", input: {} });
+  const retryPrompt = beforeStart?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(retryPrompt.systemPrompt, /Mode: forgedock-workflow \(explicitly activated by \/promote\)/);
+  assert.match(buildHarnessModePrompt("assistant"), /ForgeDock workflows are opt-in/);
+});
+
+test("failed slash-command dispatch restores assistant mode immediately", async () => {
+  const state = fakePi();
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  state.pi.sendUserMessage = (() => { throw new Error("dispatch failed"); }) as typeof state.pi.sendUserMessage;
+
+  await assert.rejects(
+    () => state.commands.get("promote")!("--production --confirm", commandContext()),
+    /dispatch failed/,
+  );
+  assert.equal(state.active.includes("forgedock_promote"), false);
+  const prompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(prompt.systemPrompt, /Mode: assistant \(default\)/);
 });
 
 test("keeps native workflow tools active through a transient provider retry", async () => {
@@ -940,6 +1019,7 @@ test("shell fallback cannot impose a wall-clock timeout on lifecycle controllers
     reason: "ForgeDock lifecycle controllers cannot be launched through the shell tool or bounded by its wall-clock timeout. Use the active semantic workflow, resume, task-status, or cancellation tool instead.",
   });
   assert.equal(guard({ toolName: "bash", input: { command: "node dist/cli/main.js status --issue 6" } }), undefined);
+  assert.equal(guard({ toolName: "bash", input: { command: "gh pr create --head staging --base main" } }), undefined);
   assert.equal(guard({ toolName: "bash", input: { command: "npm test" } }), undefined);
   assert.equal(isLifecycleControllerShellCommand("forgedock-next orchestrate 6,7"), true);
   assert.equal(isLifecycleControllerShellCommand("npm run next -- work-on 6 --rerun"), true);

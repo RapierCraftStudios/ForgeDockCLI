@@ -152,7 +152,6 @@ export async function promoteBranch(
       });
     } else {
       const [sourceHeadSha, targetHeadSha] = await readRefs(dependencies.host, input.repository, sourceBranch!, targetBranch!);
-      await assertProductionProtection(input.mode, input.repository, targetBranch!, dependencies.host);
       const now = new Date().toISOString();
       record = {
         schema: "forgedock.promotion/v1",
@@ -197,7 +196,6 @@ export async function promoteBranch(
   }
   try {
     await assertFrozenRefs(record, dependencies.host);
-    await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
 
     if (input.authorizeCreation && !record.authorized) {
       record = await advance(record, { authorized: true }, dependencies.promotions);
@@ -504,6 +502,10 @@ async function mergePromotion(record: PromotionRecord, dependencies: PromotionDe
     throw new Error(`Promotion reviewed SHA ${record.review.headSha} is stale; current PR/source head is ${pullRequest.headSha}/${sourceHead}`);
   }
   if (pullRequest.baseBranch !== record.review.baseBranch) throw new Error("Promotion reviewed target changed before merge");
+  // Protection is a promotion-completion gate, not a PR-publication gate. Check
+  // it even when the host reports an externally merged PR so ForgeDock never
+  // records an unprotected production promotion as successfully completed.
+  await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
   if (pullRequest.state !== "MERGED") {
     await dependencies.host.mergePullRequest(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
   }

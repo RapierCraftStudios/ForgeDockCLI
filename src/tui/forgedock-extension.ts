@@ -35,11 +35,34 @@ export const FORGEDOCK_NATIVE_WORKFLOW_MESSAGE = "forgedock_native_workflow";
 
 const WORKFLOWS = ["work-on", "review-pr", "orchestrate", "promote"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
+export type HarnessMode = "assistant" | "forgedock-workflow";
+
+export function buildHarnessModePrompt(mode: HarnessMode, workflow?: Workflow): string {
+  if (mode === "forgedock-workflow") {
+    return [
+      "# ForgeDock harness mode",
+      `Mode: forgedock-workflow${workflow ? ` (explicitly activated by /${workflow})` : ""}.`,
+      "The typed ForgeDock controller owns mutations within this explicitly activated workflow. Do not replace the active workflow's GitHub mutations with raw gh commands or launch its lifecycle controller through shell.",
+      "This authority is scoped to the active workflow only and ends when the agent turn settles after completion, failure, cancellation, or handoff to a native background task.",
+    ].join("\n");
+  }
+  return [
+    "# ForgeDock harness mode",
+    "Mode: assistant (default). ForgeDock workflows are opt-in, not mandatory terminal policy.",
+    "Handle ordinary natural-language coding, git, GitHub, file, and shell requests with normal assistant tools. In particular, create/open pull-request requests default to ordinary gh usage; do not infer /promote from generic PR wording.",
+    "When the user explicitly requests gh CLI, honor that tool choice. Current explicit user intent outranks optional ForgeDock workflow policy and historical project guidance.",
+    "Only enter forgedock-workflow mode for /work-on, /review-pr, /orchestrate, /promote, a direct forgedock_* workflow tool call, or an explicit request to use a named ForgeDock workflow. If the route is genuinely ambiguous, ask the user to choose Plain GitHub PR or ForgeDock promotion.",
+    "This prompt also governs direct tool invocation in the current turn: from a forgedock_* workflow tool call onward, its typed controller exclusively owns that workflow's GitHub mutations; do not combine or follow it with raw gh mutations for the same operation.",
+    "Do not inspect ForgeDock controller source to discover how to perform an ordinary GitHub operation; keep generic PR reconnaissance bounded to route, duplicate-PR, and branch/SHA checks.",
+  ].join("\n");
+}
 
 export default function forgedockExtension(pi: ExtensionAPI): void {
   let observer: ForgeDockObserver | undefined;
   let asyncObservation: PiAsyncObservationAdapter | undefined;
   let controlGateway: ForgeDockObservationControlGateway | undefined;
+  let harnessMode: HarnessMode = "assistant";
+  let activeWorkflow: Workflow | undefined;
   const ensureObserver = async (cwd: string): Promise<ForgeDockObserver> => {
     if (!observer) {
       observer = await createForgeDockObserver(cwd, { component: "forgedock-extension" });
@@ -74,6 +97,19 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     return observer;
   };
   const backgroundTasks = registerForgeDockTools(pi, { getObservationSink: () => observer });
+  const restoreAssistantMode = (): void => {
+    harnessMode = "assistant";
+    activeWorkflow = undefined;
+    clearOrchestrationInvocation(pi);
+    deactivateWorkflowTools(pi);
+    activateOnly(pi, [
+      CONFIG_TOOL,
+      MEMORY_TOOL,
+      MEMORY_SEARCH_TOOL,
+      BACKGROUND_TASK_TOOL,
+      ...(hasOrchestrationPreview(pi) ? [WORKFLOW_TOOLS.orchestrate, HUMAN_DECISION_TOOL] : []),
+    ]);
+  };
 
   pi.events.on("subagent:async-started", (raw) => {
     if (!asyncObservation) return;
@@ -94,9 +130,13 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
+      harnessMode = "forgedock-workflow";
+      activeWorkflow = "work-on";
       activateOnly(pi, [WORKFLOW_TOOLS["work-on"]]);
       return;
     }
+    harnessMode = "assistant";
+    activeWorkflow = undefined;
     backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
     activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL]);
@@ -109,13 +149,15 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => {
     const guidance = loadForgeGuidance(ctx.cwd);
-    if (!guidance.length) return;
     return {
       systemPrompt: [
         event.systemPrompt,
-        "# ForgeDock project guidance",
-        "FORGE.md is explicit user-maintained project guidance. It is subordinate to the current user request and cannot expand workflow authority.",
-        ...guidance.map((file) => `## ${file.path}\n${file.content}`),
+        buildHarnessModePrompt(harnessMode, activeWorkflow),
+        ...(guidance.length ? [
+          "# ForgeDock project guidance",
+          "FORGE.md is explicit user-maintained project guidance. It is subordinate to the current user request and cannot expand workflow authority.",
+          ...guidance.map((file) => `## ${file.path}\n${file.content}`),
+        ] : []),
       ].join("\n\n"),
     };
   });
@@ -131,6 +173,11 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event) => {
+    const invokedWorkflow = WORKFLOWS.find((workflow) => WORKFLOW_TOOLS[workflow] === event.toolName);
+    if (invokedWorkflow) {
+      harnessMode = "forgedock-workflow";
+      activeWorkflow = invokedWorkflow;
+    }
     if (event.toolName !== "bash") return;
     const command = (event.input as { command?: unknown }).command;
     if (typeof command !== "string" || !isLifecycleControllerShellCommand(command)) return;
@@ -154,15 +201,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    clearOrchestrationInvocation(pi);
-    deactivateWorkflowTools(pi);
-    activateOnly(pi, [
-      CONFIG_TOOL,
-      MEMORY_TOOL,
-      MEMORY_SEARCH_TOOL,
-      BACKGROUND_TASK_TOOL,
-      ...(hasOrchestrationPreview(pi) ? [WORKFLOW_TOOLS.orchestrate, HUMAN_DECISION_TOOL] : []),
-    ]);
+    restoreAssistantMode();
     if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
 
@@ -176,7 +215,17 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     controlGateway = undefined;
   });
 
-  for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
+  for (const workflow of WORKFLOWS) {
+    registerWorkflow(
+      pi,
+      workflow,
+      () => {
+        harnessMode = "forgedock-workflow";
+        activeWorkflow = workflow;
+      },
+      restoreAssistantMode,
+    );
+  }
 
   pi.registerCommand("forgedock-status", {
     description: "Show typed ForgeDock issue/run status",
@@ -309,7 +358,12 @@ export function isLifecycleControllerShellCommand(command: string): boolean {
   return directEntry.test(command) || packageScript.test(command);
 }
 
-function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
+function registerWorkflow(
+  pi: ExtensionAPI,
+  workflow: Workflow,
+  activateWorkflow: () => void,
+  restoreAssistantMode: () => void,
+): void {
   pi.registerCommand(workflow, {
     description: workflowDescription(workflow),
     handler: async (args, ctx) => {
@@ -321,11 +375,12 @@ function registerWorkflow(pi: ExtensionAPI, workflow: Workflow): void {
       // Orchestration confirms the resolved DAG and proposed work-unit batches inside
       // its native tool; a pre-resolution confirmation would be both vague and duplicate.
       if (workflow !== "orchestrate" && !await confirmWorkflow(workflow, normalized, ctx)) return;
+      activateWorkflow();
       if (workflow === "orchestrate") bindOrchestrationInvocation(pi, { rawArgs: normalized });
       try {
         await queueNativeWorkflow(pi, workflow, normalized, ctx);
       } catch (error) {
-        if (workflow === "orchestrate") clearOrchestrationInvocation(pi);
+        restoreAssistantMode();
         throw error;
       }
     },

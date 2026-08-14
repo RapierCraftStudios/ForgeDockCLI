@@ -961,7 +961,27 @@ async function promote(argv: string[]): Promise<void> {
       const pullRequest = result.pullRequest ? ` · PR ${result.pullRequest.url}` : "";
       process.stdout.write(`${statusGlyph(result.phase === "completed" ? "passed" : result.phase === "failed" ? "failed" : "active", outputMode)} Promotion ${result.promotionId} · ${result.sourceBranch} → ${result.targetBranch} · ${result.phase}${pullRequest}\n`);
       if (result.phase === "planned") process.stdout.write("Preview only. Re-run with --confirm to create the promotion PR.\n");
-      if (result.phase === "awaiting-merge") process.stdout.write("Review passed. Re-run with --resume <promotion-id> --authorize-merge to merge the exact reviewed SHA.\n");
+      if (result.phase === "awaiting-merge") {
+        let mergeBlocker: string | undefined;
+        if (result.mode === "production") {
+          if (!host.isBranchProtected) {
+            mergeBlocker = `Production target ${result.targetBranch} has no typed branch-protection check`;
+          } else {
+            try {
+              if (!await host.isBranchProtected(result.repository, result.targetBranch)) {
+                mergeBlocker = `Production target ${result.targetBranch} is not protected`;
+              }
+            } catch (error) {
+              mergeBlocker = `Production target protection could not be verified: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+        }
+        if (mergeBlocker) {
+          process.stdout.write(`Promotion status: blocked-for-merge\nReason: ${mergeBlocker}. The PR remains open for review; protect the target before authorizing merge.\n`);
+        } else {
+          process.stdout.write("Review passed. Re-run with --resume <promotion-id> --authorize-merge to merge the exact reviewed SHA.\n");
+        }
+      }
     }
     if (result.phase !== "completed" && result.phase !== "awaiting-merge" && result.phase !== "planned" && result.phase !== "cancelled") process.exitCode = 2;
   } catch (error) {

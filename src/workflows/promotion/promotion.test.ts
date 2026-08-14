@@ -19,8 +19,11 @@ class PromotionHost implements ForgeHost {
   targetSha = targetSha;
   protected = true;
   merged = false;
+  stagingIsSource = false;
   pullRequest: PullRequestSnapshot | undefined;
-  async getBranchHead(_repo: string, branch: string): Promise<string> { return branch === "milestone/feature" ? this.sourceSha : this.targetSha; }
+  async getBranchHead(_repo: string, branch: string): Promise<string> {
+    return branch === "milestone/feature" || (branch === "staging" && this.stagingIsSource) ? this.sourceSha : this.targetSha;
+  }
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { throw new Error("not an issue delivery PR"); }
   async materializeReviewFinding(input: { repo: string; pullRequest: PullRequestSnapshot; finding: { id: string } }) {
@@ -162,7 +165,7 @@ describe("explicit branch promotion", () => {
     assert.equal(completed.phase, "completed");
   });
 
-  it("fails closed on verification, review availability, branch drift, and unprotected production", async () => {
+  it("fails closed on verification, review availability, and branch drift", async () => {
     const failedVerification = dependencies(new PromotionHost(), new FakeVerifier("failed"));
     await assert.rejects(() => promoteBranch({ repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging", configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command], authorizeCreation: true }, failedVerification), /verification failed/i);
 
@@ -176,9 +179,49 @@ describe("explicit branch promotion", () => {
     const preview = await promoteBranch({ repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging", configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command] }, drift);
     driftHost.sourceSha = "c".repeat(40);
     await assert.rejects(() => promoteBranch({ repository: "a/b", mode: "feature", sourceBranch: preview.sourceBranch, targetBranch: preview.targetBranch, configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command], promotionId: preview.promotionId }, drift), /checkpoint refs changed/i);
+  });
 
-    const unprotectedHost = new PromotionHost();
-    unprotectedHost.protected = false;
-    await assert.rejects(() => promoteBranch({ repository: "a/b", mode: "production", sourceBranch: "staging", targetBranch: "main", configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command], authorizeCreation: true }, dependencies(unprotectedHost)), /not protected/i);
+  it("publishes an unprotected production PR but blocks merge authorization", async () => {
+    const host = new PromotionHost();
+    host.protected = false;
+    host.stagingIsSource = true;
+    const deps = dependencies(host);
+    const published = await promoteBranch({
+      repository: "a/b", mode: "production", sourceBranch: "staging", targetBranch: "main",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+      verification: [command], authorizeCreation: true,
+    }, deps);
+
+    assert.equal(published.phase, "awaiting-merge");
+    assert.equal(published.pullRequest?.url, "https://github.test/pull/7");
+    assert.equal(host.merged, false);
+
+    await assert.rejects(() => promoteBranch({
+      repository: "a/b", mode: "production", sourceBranch: published.sourceBranch, targetBranch: published.targetBranch,
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+      verification: [command], promotionId: published.promotionId, authorizeMerge: true,
+    }, deps), /not protected/i);
+    assert.equal(host.merged, false);
+  });
+
+  it("refuses to record an externally merged unprotected production PR as completed", async () => {
+    const host = new PromotionHost();
+    host.stagingIsSource = true;
+    const deps = dependencies(host);
+    const published = await promoteBranch({
+      repository: "a/b", mode: "production", sourceBranch: "staging", targetBranch: "main",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+      verification: [command], authorizeCreation: true,
+    }, deps);
+    assert.equal(published.phase, "awaiting-merge");
+
+    host.merged = true;
+    host.protected = false;
+    await assert.rejects(() => promoteBranch({
+      repository: "a/b", mode: "production", sourceBranch: published.sourceBranch, targetBranch: published.targetBranch,
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+      verification: [command], promotionId: published.promotionId, authorizeMerge: true,
+    }, deps), /not protected/i);
+    assert.equal((await deps.promotions.loadPromotion(published.promotionId))?.phase, "failed");
   });
 });
