@@ -162,6 +162,30 @@ export class ForgeDockBackgroundTasks {
       .map((record) => ({ ...record, args: [...record.args] }));
   }
 
+  async waitForTerminal(id: string, options: { warnAfterMs?: number } = {}): Promise<BackgroundTaskRecord> {
+    const warnAfterMs = options.warnAfterMs ?? 120_000;
+    let lastOutputSize = 0;
+    let lastProgressAt = Date.now();
+    let warned = false;
+    while (true) {
+      const record = this.recordsFromDisk().get(id);
+      if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
+      if (["completed", "blocked", "failed", "cancelled"].includes(record.status)) return { ...record, args: [...record.args] };
+      const outputSize = fileSize(record.logPath) + fileSize(record.stderrLogPath);
+      if (outputSize > lastOutputSize) {
+        lastOutputSize = outputSize;
+        lastProgressAt = Date.now();
+        warned = false;
+      } else if (!warned && Date.now() - lastProgressAt >= warnAfterMs) {
+        warned = true;
+        const message = `ForgeDock controller task ${id} has no observable semantic output for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and recovery is still explicit.`;
+        this.#ctx?.ui.notify(message, "warning");
+        try { this.#pi.sendMessage({ customType: "forgedock-progress-warning", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+
   output(id: string): string {
     const record = this.recordsFromDisk().get(id);
     if (!record) {

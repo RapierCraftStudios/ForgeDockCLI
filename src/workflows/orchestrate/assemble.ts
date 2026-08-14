@@ -62,6 +62,9 @@ export function assembleWorkUnits(
   // Other non-batchable risks likewise remain selected as singleton work.
   const orderedSelected = orderedFiltered.filter((item) => {
     const reason = singletonReason(item, policy.policy);
+    // A decomposed child can inherit the parent's `batch` label. That label
+    // makes it non-batchable, but it must remain dispatchable as a singleton;
+    // only an operator-only item is removed from the frozen scope.
     if (reason === "human-or-batch-state") {
       excluded.push({ item, reason });
       return false;
@@ -78,7 +81,7 @@ export function assembleWorkUnits(
     const reason = singletonReason(item, policy.policy);
     if (reason) {
       ungrouped.push(item);
-      excluded.push({ item, reason });
+      if (reason !== "batch-member-projection") excluded.push({ item, reason });
     } else {
       eligible.push(item);
     }
@@ -115,6 +118,14 @@ export function assembleWorkUnits(
       const uniqueCandidates = [...new Map(candidates.map((item) => [item.id, item])).values()]
         .filter((item) => !claimed.has(item.id))
         .sort(compareItems);
+      if (kind === "source-pr" && !hasSharedDeliverySurface(uniqueCandidates)) {
+        // A common source PR is historical context, not an implementation
+        // boundary. Keep unrelated members as independent work units unless
+        // their frozen claims/paths actually overlap.
+        ungrouped.push(...uniqueCandidates);
+        for (const member of uniqueCandidates) claimed.add(member.id);
+        continue;
+      }
       const cap = riskClass === "routine" ? policy.maxBatchSize : policy.maxSensitiveBatchSize;
       for (let offset = 0; offset + 1 < uniqueCandidates.length; offset += cap) {
         const members = uniqueCandidates.slice(offset, offset + cap);
@@ -189,6 +200,7 @@ function conservativeGroups(items: readonly BatchableWorkItem[], options: Batchi
       const [, key] = compound.split("\u0000");
       if (!key) continue;
       candidates.sort(compareItems);
+      if (kind === "source-pr" && !hasSharedDeliverySurface(candidates)) continue;
       const cap = (candidates[0]?.riskClass ?? "routine") === "routine" ? options.maxBatchSize : options.maxSensitiveBatchSize;
       const members = candidates.slice(0, cap);
       if (members.length < 2 || !isConvexGroup(items, members)) continue;
@@ -210,7 +222,11 @@ function conservativeGroups(items: readonly BatchableWorkItem[], options: Batchi
 
 function singletonReason(item: BatchableWorkItem, policy: BatchingPolicy): string | undefined {
   if (item.memberIssues?.length && item.memberIssues.some((issue) => issue !== item.issue)) return "already-batched";
-  if (item.labels.some((label) => ["operator-only", "batch"].includes(label))) return "human-or-batch-state";
+  if (item.labels.includes("operator-only")) return "human-or-batch-state";
+  // `batch` is an operational projection, not proof that the issue is a
+  // materialized aggregate. Keep inherited decomposed children in the
+  // selected scope, but prevent them from being grouped again.
+  if (item.labels.includes("batch")) return "batch-member-projection";
   if (item.labels.some((label) => ["needs-human", "blocked"].includes(label))) return "recovery-state";
   const risk = item.riskClass ?? "routine";
   if (risk === "billing") return "billing";
@@ -248,6 +264,24 @@ function compatibilityKey(item: BatchableWorkItem, groupingKey: string): string 
   const milestone = milestoneValue(item.milestone);
   const promotionTarget = item.promotionTarget ?? "none";
   return [repository, targetBranch, lane, promotionTarget, item.productionTarget ?? "none", urgency, risk, milestone ?? "none"].join("\u0001");
+}
+
+function hasSharedDeliverySurface(items: readonly BatchableWorkItem[]): boolean {
+  if (items.length < 2) return false;
+  const first = items[0]!;
+  const firstFiles = new Set(first.affectedFiles.map(normalizePath));
+  const firstClaims = new Set(first.claims.map(normalizePath));
+  return items.slice(1).some((item) =>
+    item.affectedFiles.some((file) => firstFiles.has(normalizePath(file)))
+    || item.claims.some((claim) => firstClaims.has(normalizePath(claim)))
+    || (
+      first.defectClass !== undefined
+      && first.defectClass === item.defectClass
+      && item.affectedFiles.some((file) =>
+        leafDirectory(file) !== undefined
+        && first.affectedFiles.some((other) => leafDirectory(other) === leafDirectory(file)))
+    )
+  );
 }
 
 function isConvexGroup(allItems: readonly BatchableWorkItem[], members: readonly BatchableWorkItem[]): boolean {

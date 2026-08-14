@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
@@ -33,9 +33,14 @@ class CompletionHost implements ForgeHost {
   snapshot = { ...openPr };
   merges = 0;
   mergeBase?: string;
+  mergeGate: PullRequestMergeGate = {
+    repo: "a/b", pullRequest: 9, headSha: sha, baseBranch: "main", mergeable: true,
+    requiredChecks: [], observedAt: new Date().toISOString(),
+  };
   closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
+  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> { return { ...this.mergeGate, requiredChecks: [...this.mergeGate.requiredChecks] }; }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
@@ -190,6 +195,21 @@ describe("merge and close authority", () => {
     assert.equal(result.awaitingHuman, true);
     assert.equal(result.run.state, "merging");
     assert.equal(host.merges, 0);
+  });
+
+  it("blocks auto-merge while a required GitHub check is pending or failed", async () => {
+    for (const state of ["pending", "failed"] as const) {
+      const runs = new InMemoryRunRepository();
+      const run = await mergingRun(runs);
+      const host = new CompletionHost();
+      host.mergeGate.requiredChecks = [{ name: "Unit Tests", state }];
+      const artifacts = new InMemoryArtifactRepository();
+      const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.equal(result.outcome?.payload.status, "blocked");
+      assert.equal(result.outcome?.payload.mergeGate?.requiredChecks[0]?.state, state);
+      assert.equal(host.merges, 0);
+    }
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {

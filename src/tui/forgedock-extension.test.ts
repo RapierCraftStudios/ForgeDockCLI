@@ -637,9 +637,10 @@ test("visible DAG delegation dispatches a successor on its predecessor completio
   const run = await delegator.start({
     items: [
       { id: "issue-1", issue: 1, title: "One", summary: "One", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] },
-      { id: "issue-2", issue: 2, title: "Two", summary: "Two", priority: 1, dependencies: ["issue-1"], claims: [], labels: [], affectedFiles: [], memberIssues: [2] },
+      { id: "issue-2", issue: 2, title: "Two", summary: "Two", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [2] },
     ],
     maxParallel: 2,
+    serializationEdges: [{ predecessor: "issue-1", successor: "issue-2", overlappingClaims: ["src/a.ts"] }],
     taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
     assertCompleted: async (item) => { completed.push(item.issue); },
     onComplete: () => undefined,
@@ -676,7 +677,8 @@ test("visible DAG persists its durable parent record and terminal node state", a
   const delegator = new VisibleDagDelegator(state.pi, () => repository);
   const run = await delegator.start({
     repository: "a/b", autoMerge: true,
-    items: [{ id: "issue-21", issue: 21, title: "Twenty-one", summary: "Durable", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [21] }],
+    requestedIssueNumbers: [21, 22],
+    items: [{ id: "issue-21", issue: 21, title: "Twenty-one", summary: "Durable", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [21, 22] }],
     maxParallel: 1,
     taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
     assertCompleted: async () => undefined,
@@ -687,6 +689,8 @@ test("visible DAG persists its durable parent record and terminal node state", a
   const record = await repository.loadOrchestration(run.id);
   assert.equal(record?.status, "completed");
   assert.equal(record?.repository, "a/b");
+  assert.deepEqual(record?.requestedIssueNumbers, [21, 22]);
+  assert.deepEqual(record?.issueNumbers, [21, 22]);
   assert.equal(record?.nodes[0]?.status, "completed");
   assert.deepEqual(record?.nodes[0]?.childRunIds, ["durable-child"]);
   await delegator.shutdown();

@@ -65,6 +65,63 @@ describe("Build Packet preparation", () => {
     ]);
   });
 
+  it("canonicalizes typed verification requirements against the controller catalog", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      {
+        ...packet,
+        verificationPlan: ["free-form lifecycle prose"],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+        verificationRequirements: [{ kind: "controller-gate", id: "staging-review", criterionIds: ["criterion-1"], rationale: "The controller owns staging validation." }],
+      },
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_typed_valid", subject: { repo: "a/b", issue: 5 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
+      verificationCatalog: {
+        commands: [{ id: "test", command: "npm", args: ["test"] }],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    }, { runtime, artifacts, runs });
+    assert.deepEqual(prepared.packet.payload.verificationPlan, ["controller-gate:staging-review"]);
+    assert.deepEqual(prepared.packet.payload.verificationRequirements?.map((requirement) => requirement.id), ["staging-review"]);
+  });
+
+  it("rejects controller-owned verification prose before the builder can start", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      {
+        ...packet,
+        verificationPlan: ["Confirm no targeted test bypasses the durable admission by checking that the tests still pass"],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_typed", subject: { repo: "a/b", issue: 4 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    await assert.rejects(() => prepareBuildPacket({
+      run: investigated.run,
+      intent,
+      investigation: investigated.investigation,
+      cwd: process.cwd(),
+      verificationCatalog: {
+        commands: [{ id: "test", command: "npm", args: ["test"] }],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    }, { runtime, artifacts, runs }), /unsupported or unfenced controller prose/);
+    assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+  });
+
   it("retries one packet-author session that ended before submit_artifact", async () => {
     const runtime = new FakeAgentRuntime([
       investigation,

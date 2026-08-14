@@ -27,13 +27,28 @@ describe("GitHub promotion transport", () => {
     assert.ok(calls.some((args) => args.includes("--head") && args.includes("staging") && args.includes("--base") && args.includes("main")));
   });
 
+  it("reads mergeability and required check state at the reviewed SHA", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Unit Tests", state: "SUCCESS", link: "https://github.test/check" }, { name: "Docs", state: "PENDING" }]);
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.mergeable, true);
+    assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
+  });
+
   it("rechecks exact SHA/base before merge", async () => {
     const client = new GitHubClient();
     let current = { ...pr };
     const calls: string[][] = [];
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
       calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
       if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: current.number, title: current.title, body: current.body, url: current.url, state: current.state, headRefOid: current.headSha, headRefName: current.headBranch, baseRefName: current.baseBranch });
+      if (args[0] === "pr" && args[1] === "checks") return "[]";
       if (args[0] === "pr" && args[1] === "merge") return "";
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });

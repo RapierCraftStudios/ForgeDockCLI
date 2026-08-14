@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
-import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
+import type { BranchSnapshot, DecompositionChild, ForgeHost, IssueSnapshot, PullRequestMergeGate, PullRequestSnapshot, ReviewFindingInput } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
@@ -426,7 +426,11 @@ export class GitHubClient implements ForgeHost {
   }): Promise<IssueSnapshot[]> {
     const ordered = orderDecompositionChildren(input.children);
     const parent = await this.getIssue(input.parentIssue, input.repo);
-    const inheritedLabels = parent.labels.filter((label) => !label.startsWith("workflow:") && label !== "needs-human");
+    const inheritedLabels = parent.labels.filter((label) => {
+      const normalized = label.trim().toLowerCase();
+      return !normalized.startsWith("workflow:")
+        && !new Set(["batch", "review-finding", "needs-validation", "needs-human", "blocked", "operator-only"]).has(normalized);
+    });
     const inheritedMilestone = parent.milestone;
     const existing = await this.listAllIssues(input.repo);
     const byMarker = new Map(existing.flatMap((issue) => {
@@ -649,6 +653,68 @@ export class GitHubClient implements ForgeHost {
     };
   }
 
+  async getPullRequestMergeGate(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate> {
+    const pullRequest = await this.getPullRequest(repo, number);
+    if (pullRequest.headSha !== expectedHeadSha) {
+      throw new Error(`Pull request head changed: reviewed ${expectedHeadSha}, current ${pullRequest.headSha}`);
+    }
+    if (pullRequest.baseBranch !== expectedBaseBranch) {
+      throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${pullRequest.baseBranch}`);
+    }
+    let mergeable = false;
+    let mergeState = "UNKNOWN";
+    try {
+      const result = await this.gh([
+        "pr", "view", String(number), "--repo", repo,
+        "--json", "mergeable,mergeStateStatus",
+      ]);
+      const value = JSON.parse(result) as { mergeable?: string; mergeStateStatus?: string };
+      mergeState = String(value.mergeStateStatus ?? "UNKNOWN").toUpperCase();
+      mergeable = String(value.mergeable ?? "UNKNOWN").toUpperCase() === "MERGEABLE"
+        && ["CLEAN", "HAS_HOOKS"].includes(mergeState);
+    } catch {
+      mergeable = false;
+    }
+
+    let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
+    try {
+      const result = await this.gh([
+        "pr", "checks", String(number), "--repo", repo, "--required",
+        "--json", "name,state,link",
+      ]);
+      const checks = JSON.parse(result) as Array<{ name?: string; state?: string; link?: string }>;
+      requiredChecks = checks.map((check) => ({
+        name: check.name?.trim() || "unnamed-required-check",
+        state: mergeCheckState(check.state),
+        ...(check.link ? { detailsUrl: check.link } : {}),
+      }));
+    } catch (error) {
+      requiredChecks = [{
+        name: "required-checks-query",
+        state: "unavailable",
+        detailsUrl: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+      }];
+    }
+    // The checks query is PR-scoped. Re-read the PR after it so a head/base
+    // race cannot attach current checks to a different reviewed revision.
+    const finalPullRequest = await this.getPullRequest(repo, number);
+    if (finalPullRequest.headSha !== expectedHeadSha) {
+      throw new Error(`Pull request head changed while reading required checks: reviewed ${expectedHeadSha}, current ${finalPullRequest.headSha}`);
+    }
+    if (finalPullRequest.baseBranch !== expectedBaseBranch) {
+      throw new Error(`Pull request target changed while reading required checks: expected ${expectedBaseBranch}, current ${finalPullRequest.baseBranch}`);
+    }
+    return {
+      repo,
+      pullRequest: number,
+      headSha: expectedHeadSha,
+      baseBranch: expectedBaseBranch,
+      mergeable,
+      requiredChecks,
+      observedAt: new Date().toISOString(),
+    };
+  }
+
   async getBranchHead(repo: string, branch: string): Promise<string> {
     const result = await this.gh(["api", `repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`]);
     const value = JSON.parse(result) as { object?: { sha?: string } };
@@ -705,6 +771,9 @@ export class GitHubClient implements ForgeHost {
     if (current.baseBranch !== expectedBaseBranch) {
       throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${current.baseBranch}`);
     }
+    const gate = await this.getPullRequestMergeGate(repo, number, expectedHeadSha, expectedBaseBranch);
+    const failure = mergeGateFailure(gate);
+    if (failure) throw new Error(failure);
     await this.gh([
       "pr", "merge", String(number), "--repo", repo, "--merge", "--delete-branch",
       "--match-head-commit", expectedHeadSha,
@@ -1007,6 +1076,24 @@ function boundedGitHubText(value: string, maximum: number): string {
 
 function boundedGitHubCode(value: string): string {
   return boundedGitHubText(value, 500).replaceAll("`", "'").replace(/[\r\n]+/g, " ");
+}
+
+function mergeCheckState(value: string | undefined): PullRequestMergeGate["requiredChecks"][number]["state"] {
+  const normalized = String(value ?? "").toUpperCase();
+  if (["SUCCESS", "PASSED", "PASS", "COMPLETED"].includes(normalized)) return "passed";
+  if (["FAILURE", "FAILED", "ERROR", "STARTUP_FAILURE", "ACTION_REQUIRED", "STALE"].includes(normalized)) return "failed";
+  if (["CANCELLED", "CANCELED"].includes(normalized)) return "cancelled";
+  if (["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"].includes(normalized)) return "pending";
+  return "unavailable";
+}
+
+function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+  if (!gate.mergeable) return `Pull request #${gate.pullRequest} is not mergeable at ${gate.baseBranch} for reviewed ${gate.headSha}`;
+  const failed = gate.requiredChecks.filter((check) => check.state !== "passed");
+  if (failed.length) {
+    return `Required GitHub checks are not all passing for PR #${gate.pullRequest}: ${failed.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+  }
+  return undefined;
 }
 
 function projectionAdmissionSnapshot(subject: Subject, marker: string): IssueSnapshot {

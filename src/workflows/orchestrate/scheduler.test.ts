@@ -45,6 +45,25 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("second"), "completed");
   });
 
+  it("emits typed wait reasons for claim serialization and clears them on dispatch", async () => {
+    let release!: () => void;
+    const waits: Array<[string, import("./scheduler.js").WaitReason | undefined]> = [];
+    const schedule = runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: ["src/shared"] },
+    ], 2, async (item) => {
+      if (item.id === "first") await new Promise<void>((resolve) => { release = resolve; });
+    }, {
+      serializationEdges: [{ predecessor: "first", successor: "second", overlappingClaims: ["src/shared"] }],
+      onEvent: (event) => waits.push([event.itemId ?? "", event.waitReasons?.get("second")]),
+    });
+    await sleep(5);
+    assert.ok(waits.some(([, reason]) => reason?.kind === "claim-serialization"));
+    release();
+    const result = await schedule;
+    assert.equal(result.status.get("second"), "completed");
+  });
+
   it("materializes claim conflicts as stable DAG edges instead of static batches", () => {
     const materialized = materializeClaimDependencies([
       { id: "a", issue: 1, priority: 2, dependencies: [], claims: ["src/core"] },

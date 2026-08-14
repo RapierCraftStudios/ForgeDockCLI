@@ -10,6 +10,14 @@ export type DurableOrchestrationNodeStatus =
   | "suspended"
   | "invalid";
 
+export type OrchestrationWaitReason =
+  | { kind: "dependency"; predecessor: string }
+  | { kind: "claim-serialization"; predecessor: string; claims: string[] }
+  | { kind: "active-claim-conflict"; node: string; claims: string[] }
+  | { kind: "capacity"; maxParallel: number }
+  | { kind: "suspended-predecessor"; predecessor: string; checkpoint: string }
+  | { kind: "decomposition-replan"; children: number[] };
+
 /** Serializable scheduler input retained so a controller can rebuild its DAG after restart. */
 export interface OrchestrationItemRecord {
   id: string;
@@ -25,6 +33,7 @@ export interface OrchestrationItemRecord {
   memberIssues?: number[];
   title?: string;
   summary?: string;
+  waitReason?: OrchestrationWaitReason;
 }
 
 export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
@@ -44,6 +53,9 @@ export interface OrchestrationRecord {
   schema: "forgedock.orchestration/v1";
   orchestrationId: string;
   repository: string;
+  /** Original operator-authorized issue scope, before batching contraction. */
+  requestedIssueNumbers?: number[];
+  /** Backward-compatible scope field; new records preserve the requested set. */
   issueNumbers: number[];
   maxParallel: number;
   autoMerge: boolean;

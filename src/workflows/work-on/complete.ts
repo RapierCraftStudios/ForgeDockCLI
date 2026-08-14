@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFromArtifacts } from "./trajectory.js";
@@ -94,6 +94,11 @@ export async function completeWorkItem(
     }
     if (pullRequest.state !== "MERGED") {
       if (!input.autoMerge) return { run, awaitingHuman: true };
+      const mergeGate = await readMergeGate(dependencies.host, pullRequest, input.verdict.payload.headSha, run.targetBranch!);
+      const mergeGateReason = mergeGateFailure(mergeGate);
+      if (mergeGateReason) {
+        return blockMergeAdmission(run, pullRequest, mergeGate, mergeGateReason, dependencies);
+      }
       await dependencies.host.mergePullRequest(
         pullRequest.repo,
         pullRequest.number,
@@ -216,10 +221,87 @@ export async function completeWorkItem(
     return { run: closed.state, awaitingHuman: false, outcome };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (run.state === "merging" && /merge admission|required GitHub checks|pull request .*not mergeable/i.test(reason)) {
+      const gate = await readMergeGate(dependencies.host, input.pullRequest, input.verdict.payload.headSha, run.targetBranch ?? input.pullRequest.baseBranch);
+      return blockMergeAdmission(run, input.pullRequest, gate, reason, dependencies);
+    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
   }
+}
+
+async function readMergeGate(
+  host: ForgeHost,
+  pullRequest: PullRequestSnapshot,
+  expectedHeadSha: string,
+  expectedBaseBranch: string,
+): Promise<PullRequestMergeGate> {
+  const unavailable = (detail: string): PullRequestMergeGate => ({
+    repo: pullRequest.repo,
+    pullRequest: pullRequest.number,
+    headSha: expectedHeadSha,
+    baseBranch: expectedBaseBranch,
+    mergeable: false,
+    requiredChecks: [{ name: "merge-admission-query", state: "unavailable", detailsUrl: detail.slice(0, 500) }],
+    observedAt: new Date().toISOString(),
+  });
+  if (!host.getPullRequestMergeGate) return unavailable("ForgeHost does not implement authoritative pull-request merge admission");
+  try {
+    return await host.getPullRequestMergeGate(pullRequest.repo, pullRequest.number, expectedHeadSha, expectedBaseBranch);
+  } catch (error) {
+    return unavailable(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+  if (!gate.mergeable) {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub does not report the reviewed SHA as mergeable on ${gate.baseBranch}`;
+  }
+  const nonPassing = gate.requiredChecks.filter((check) => check.state !== "passed");
+  if (!nonPassing.length) return undefined;
+  const pending = nonPassing.some((check) => check.state === "pending");
+  return `${pending ? "Awaiting" : "Required"} GitHub checks before merge for PR #${gate.pullRequest}: ${nonPassing.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+}
+
+async function blockMergeAdmission(
+  run: RunState,
+  pullRequest: PullRequestSnapshot,
+  gate: PullRequestMergeGate,
+  reason: string,
+  dependencies: { artifacts: ArtifactRepository; runs: RunRepository },
+): Promise<{ run: RunState; awaitingHuman: boolean; outcome: DurableArtifact<"Outcome"> }> {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: run.runId,
+    subject: run.subject,
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      status: "blocked",
+      reason,
+      childIssues: [],
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+      prUrl: pullRequest.url,
+      mergeGate: {
+        pullRequest: gate.pullRequest,
+        headSha: gate.headSha,
+        baseBranch: gate.baseBranch,
+        mergeable: gate.mergeable,
+        observedAt: gate.observedAt,
+        requiredChecks: gate.requiredChecks.map((check) => ({
+          name: check.name,
+          state: check.state,
+          ...(check.detailsUrl ? { detailsUrl: check.detailsUrl } : {}),
+        })),
+      },
+    },
+  });
+  await dependencies.artifacts.append(outcome);
+  const blocked = transition(run, "BLOCK", { reason });
+  await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+  return { run: attachArtifact(blocked.state, "Outcome", outcome.id), awaitingHuman: true, outcome };
 }
 
 async function assertClosedIssue(host: ForgeHost, expectedRepo: string, expectedNumber: number): Promise<void> {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LeaseContinuityError } from "../../core/ports/lease.js";
+import type { OrchestrationWaitReason } from "../../core/ports/orchestration.js";
 
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 export { LeaseContinuityError };
@@ -29,16 +30,20 @@ export type ScheduleWorkerResult = void | {
   status: "completed" | "skipped" | "blocked" | "suspended" | "failed" | "invalid";
   error?: Error | string;
 };
+export type WaitReason = OrchestrationWaitReason;
+
 export interface ScheduleResult {
   status: Map<string, ScheduledStatus>;
   errors: Map<string, Error>;
   startOrder: string[];
+  waitReasons?: Map<string, WaitReason>;
 }
 export interface ScheduleEvent {
   type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed";
   itemId?: string;
   status: ReadonlyMap<string, ScheduledStatus>;
   errors: ReadonlyMap<string, Error>;
+  waitReasons?: ReadonlyMap<string, WaitReason>;
 }
 export type ScheduleEventSink = (event: ScheduleEvent) => void;
 export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => void;
@@ -175,12 +180,17 @@ export async function runSchedule(
   const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
   const status = new Map(items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = new Map<string, Error>();
+  const waitReasons = new Map<string, WaitReason>();
   let queuedCount = items.length;
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const emit = (type: ScheduleEvent["type"], itemId?: string) => options.onEvent?.({
-    type, ...(itemId ? { itemId } : {}), status: new Map(status), errors: new Map(errors),
+    type,
+    ...(itemId ? { itemId } : {}),
+    status: new Map(status),
+    errors: new Map(errors),
+    ...(waitReasons.size ? { waitReasons: new Map(waitReasons) } : {}),
   });
   for (const item of items) emit("queued", item.id);
   for (const itemId of options.resumedItemIds ?? []) {
@@ -194,10 +204,31 @@ export async function runSchedule(
       // Only explicit semantic dependencies block their successors on
       // failure. Claim-serialization predecessors merely hold the resource
       // until they reach a terminal state, including failed/blocked/invalid.
-      if (item.dependencies.some((id) => ["failed", "blocked", "skipped", "invalid"].includes(status.get(id) ?? ""))) {
-        status.set(item.id, "blocked");
-        queuedCount--;
-        emit("blocked", item.id);
+      const dependency = item.dependencies.find((id) => status.get(id) !== "completed");
+      if (dependency) {
+        const dependencyStatus = status.get(dependency);
+        if (["failed", "blocked", "skipped", "invalid"].includes(dependencyStatus ?? "")) {
+          status.set(item.id, "blocked");
+          errors.set(item.id, new Error(`Blocked by dependency ${dependency} (${dependencyStatus ?? "unknown"})`));
+          waitReasons.delete(item.id);
+          queuedCount--;
+          emit("blocked", item.id);
+        } else if (dependencyStatus === "suspended") {
+          waitReasons.set(item.id, { kind: "suspended-predecessor", predecessor: dependency, checkpoint: "durable-recovery" });
+        } else {
+          waitReasons.set(item.id, { kind: "dependency", predecessor: dependency });
+        }
+        continue;
+      }
+      const serializationPredecessor = (predecessorsBySuccessor.get(item.id) ?? [])
+        .find((id) => !isTerminal(status.get(id)));
+      if (serializationPredecessor) {
+        const edge = serializationEdges.find((candidate) => candidate.predecessor === serializationPredecessor && candidate.successor === item.id);
+        waitReasons.set(item.id, {
+          kind: "claim-serialization",
+          predecessor: serializationPredecessor,
+          claims: [...(edge?.overlappingClaims ?? [])],
+        });
       }
     }
 
@@ -205,9 +236,21 @@ export async function runSchedule(
       if (status.get(item.id) !== "queued"
         || !item.dependencies.every((id) => status.get(id) === "completed")
         || !(predecessorsBySuccessor.get(item.id) ?? []).every((id) => isTerminal(status.get(id)))) continue;
-      if (running.size >= maxParallel) break;
+      if (running.size >= maxParallel) {
+        waitReasons.set(item.id, { kind: "capacity", maxParallel });
+        continue;
+      }
       const activeItems = [...running.keys()].map((id) => byId.get(id)).filter((value): value is ScheduledWorkItem => Boolean(value));
-      if (activeItems.some((active) => claimsConflict(currentClaims.get(item.id) ?? [], currentClaims.get(active.id) ?? []))) continue;
+      const conflicting = activeItems.find((active) => claimsConflict(currentClaims.get(item.id) ?? [], currentClaims.get(active.id) ?? []));
+      if (conflicting) {
+        waitReasons.set(item.id, {
+          kind: "active-claim-conflict",
+          node: conflicting.id,
+          claims: overlappingClaims(currentClaims.get(item.id) ?? [], currentClaims.get(conflicting.id) ?? []),
+        });
+        continue;
+      }
+      waitReasons.delete(item.id);
       status.set(item.id, "running");
       queuedCount--;
       startOrder.push(item.id);
@@ -284,7 +327,7 @@ export async function runSchedule(
     // supervisor can resume the same DAG after durable child work completes.
     break;
   }
-  return { status, errors, startOrder };
+  return { status, errors, startOrder, ...(waitReasons.size ? { waitReasons } : {}) };
 }
 
 function isError(value: unknown): value is Error {

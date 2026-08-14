@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { RemediationBlockedPayload } from "../../core/artifacts/schema.js";
-import type { ScheduleEvent, ScheduledStatus } from "./scheduler.js";
+import type { ScheduleEvent, ScheduledStatus, WaitReason } from "./scheduler.js";
 
 export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed" | "snapshot";
 
@@ -13,6 +13,7 @@ export interface OrchestrationNode {
   dependencies: readonly string[];
   claims: readonly string[];
   promotionTarget?: string;
+  waitReason?: WaitReason;
   error?: string;
 }
 

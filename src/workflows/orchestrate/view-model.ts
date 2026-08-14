@@ -8,7 +8,7 @@ import type { OrchestrationNode, OrchestrationSnapshot } from "./events.js";
 export function buildOrchestrationSnapshot(input: {
   orchestrationId: string;
   items: readonly ScheduledWorkItem[];
-  result?: Pick<ScheduleResult, "status" | "errors">;
+  result?: Pick<ScheduleResult, "status" | "errors" | "waitReasons">;
   activeLeases?: readonly Lease[];
   remediationCheckpoints?: readonly DurableArtifact<"RemediationBlocked">[];
   serializationEdges?: readonly ClaimSerializationEdge[];
@@ -16,16 +16,21 @@ export function buildOrchestrationSnapshot(input: {
 }): OrchestrationSnapshot {
   const status = input.result?.status ?? new Map(input.items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = input.result?.errors ?? new Map<string, Error>();
-  const nodes: OrchestrationNode[] = input.items.map((item) => ({
-    id: item.id,
-    issue: item.issue,
-    memberIssues: [...(item.memberIssues ?? [item.issue])],
-    status: status.get(item.id) ?? "queued",
-    dependencies: [...item.dependencies],
-    claims: [...item.claims],
-    ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
-    ...(errors.get(item.id) ? { error: errors.get(item.id)!.message } : {}),
-  }));
+  const nodes: OrchestrationNode[] = input.items.map((item) => {
+    const waitReason = input.result?.waitReasons?.get(item.id);
+    const error = errors.get(item.id);
+    return {
+      id: item.id,
+      issue: item.issue,
+      memberIssues: [...(item.memberIssues ?? [item.issue])],
+      status: status.get(item.id) ?? "queued",
+      dependencies: [...item.dependencies],
+      claims: [...item.claims],
+      ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
+      ...(waitReason !== undefined ? { waitReason } : {}),
+      ...(error !== undefined ? { error: error.message } : {}),
+    };
+  });
   const serializationPredecessors = new Map<string, string[]>();
   for (const edge of input.serializationEdges ?? []) {
     const predecessors = serializationPredecessors.get(edge.successor) ?? [];
@@ -62,8 +67,9 @@ export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): strin
   for (const node of snapshot.nodes) {
     const members = node.memberIssues.length > 1 ? ` members=${node.memberIssues.map((issue) => `#${issue}`).join(",")}` : "";
     const promotion = node.promotionTarget ? ` promotion=${node.promotionTarget}` : "";
+    const wait = node.waitReason ? ` wait=${renderWaitReason(node.waitReason)}` : "";
     const error = node.error ? ` — ${node.error}` : "";
-    lines.push(`${statusGlyph(node.status)} #${node.issue}${members} [${node.status}] deps=${node.dependencies.join(",") || "none"}${promotion}${error}`);
+    lines.push(`${statusGlyph(node.status)} #${node.issue}${members} [${node.status}] deps=${node.dependencies.join(",") || "none"}${promotion}${wait}${error}`);
   }
   if (snapshot.remediationCheckpoints.length) {
     lines.push("", "Review Desk");
@@ -74,6 +80,17 @@ export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): strin
 
 export function renderRunTimeline(records: readonly { sequence: number; event: string; from: string; to: string; occurredAt: string; reason?: string }[]): string {
   return records.map((record) => `${record.occurredAt} · ${record.sequence} · ${record.from} --${record.event}--> ${record.to}${record.reason ? ` · ${record.reason}` : ""}`).join("\n");
+}
+
+function renderWaitReason(reason: import("./scheduler.js").WaitReason): string {
+  switch (reason.kind) {
+    case "dependency": return `dependency:${reason.predecessor}`;
+    case "claim-serialization": return `claim:${reason.predecessor}`;
+    case "active-claim-conflict": return `active-claim:${reason.node}`;
+    case "capacity": return `capacity:${reason.maxParallel}`;
+    case "suspended-predecessor": return `suspended:${reason.predecessor}`;
+    case "decomposition-replan": return `replan:${reason.children.map((issue) => `#${issue}`).join(",")}`;
+  }
 }
 
 function statusGlyph(status: ScheduledStatus): string {

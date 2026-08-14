@@ -42,6 +42,9 @@ class PromotionHost implements ForgeHost {
     if (!this.pullRequest) throw new Error("missing promotion PR");
     return { ...this.pullRequest, state: this.merged ? "MERGED" : "OPEN" };
   }
+  async getPullRequestMergeGate() {
+    return { repo: "a/b", pullRequest: this.pullRequest?.number ?? 7, headSha: this.sourceSha, baseBranch: "staging", mergeable: true, requiredChecks: [], observedAt: new Date().toISOString() };
+  }
   async mergePullRequest(): Promise<void> { this.merged = true; }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.ts b/src/a.ts\n+change"; }
   async closeIssue(): Promise<void> {}

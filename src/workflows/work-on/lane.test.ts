@@ -96,6 +96,23 @@ describe("issue lane classification", () => {
     });
   });
 
+  it("honors an explicit target branch in acceptance text for an unmilestoned issue", () => {
+    const explicit = {
+      ...issueWithoutMilestone,
+      body: "Open the delivery PR only against `milestone/forgedock-e2e-simple-20260809-130336-bb51b7`, never main.",
+    };
+    assert.deepEqual(classifyIssueLane(explicit, "main", [], "staging"), {
+      kind: "fast", targetBranch: "milestone/forgedock-e2e-simple-20260809-130336-bb51b7", resolution: "explicit-target-branch",
+    });
+  });
+
+  it("rejects an explicit target that conflicts with a milestone lane", () => {
+    assert.throws(() => classifyIssueLane({
+      ...issue,
+      body: "**Target branch**: `staging`",
+    }, "main", [branch("milestone/verifiable-workflow-authority-portability")]), /conflicts with milestone/);
+  });
+
   it("accepts the documented Code branch evidence without requiring a duplicate Worktree base", () => {
     assert.deepEqual(classifyIssueLane({
       ...issueWithoutMilestone,

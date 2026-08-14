@@ -66,6 +66,20 @@ export interface PullRequestSnapshot {
   baseBranch: string;
 }
 
+export interface PullRequestMergeGate {
+  repo: string;
+  pullRequest: number;
+  headSha: string;
+  baseBranch: string;
+  mergeable: boolean;
+  requiredChecks: Array<{
+    name: string;
+    state: "pending" | "passed" | "failed" | "cancelled" | "unavailable";
+    detailsUrl?: string;
+  }>;
+  observedAt: string;
+}
+
 export interface ForgeHost {
   getIssue?(number: number, repo?: string): Promise<IssueSnapshot>;
   materializeBatchIssue?(input: {
@@ -126,6 +140,8 @@ export interface ForgeHost {
   /** Production promotion fails closed when branch protection cannot be proven. */
   isBranchProtected?(repo: string, branch: string): Promise<boolean>;
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
+  /** Read authoritative PR mergeability and required-check state before merge. */
+  getPullRequestMergeGate?(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate>;
   /** Read the Git ref directly when a PR projection may lag a successful push. */
   getBranchHead?(repo: string, branch: string): Promise<string>;
   /** Enumerate a bounded ref namespace for deterministic lane classification. */

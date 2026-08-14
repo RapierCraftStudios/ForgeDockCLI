@@ -55,6 +55,9 @@ class EndToEndHost implements ForgeHost {
     return { ...this.snapshot };
   }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
+  async getPullRequestMergeGate() {
+    return { repo: "a/b", pullRequest: this.snapshot.number, headSha: this.snapshot.headSha, baseBranch: this.snapshot.baseBranch, mergeable: true, requiredChecks: [], observedAt: new Date().toISOString() };
+  }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.js b/src/a.js\n+guard();"; }
   async getChangedPathsBetween(): Promise<readonly string[]> { return ["src/a.js"]; }
   async getBranchHead(): Promise<string> { return sha; }

@@ -54,6 +54,28 @@ describe("shared work-unit assembly", () => {
     assert.ok(result.excluded.some(({ item: member, reason }) => member.issue === 112 && reason === "human-or-batch-state"));
   });
 
+  it("does not batch unrelated findings merely because they share a source PR", () => {
+    const result = assembleWorkUnits([
+      item(201, { affectedFiles: ["src/runtime/a.ts"], claims: ["src/runtime/a.ts"], sourcePullRequest: 137 }),
+      item(202, { affectedFiles: [".github/workflows/ci.yml"], claims: [".github/workflows/ci.yml"], sourcePullRequest: 137 }),
+    ], DEFAULT_BATCHING_OPTIONS);
+    assert.equal(result.groups.length, 0);
+    assert.deepEqual(result.ungrouped.map((member) => member.issue), [201, 202]);
+  });
+
+  it("keeps inherited batch-labelled decomposition children dispatchable but never re-batches them", () => {
+    const result = assembleWorkUnits([
+      item(172, { labels: ["review-finding", "priority:P2", "batch"], sourcePullRequest: 137 }),
+      item(173, { labels: ["review-finding", "priority:P2", "batch"], sourcePullRequest: 137 }),
+      item(139, { labels: ["review-finding", "priority:P2"], sourcePullRequest: 137 }),
+      item(143, { labels: ["review-finding", "priority:P2"], sourcePullRequest: 137 }),
+    ], DEFAULT_BATCHING_OPTIONS);
+    assert.deepEqual(result.selected.map((member) => member.issue), [139, 143, 172, 173]);
+    assert.deepEqual(result.groups[0]?.members.map((member) => member.issue), [139, 143]);
+    assert.deepEqual(result.ungrouped.map((member) => member.issue), [172, 173]);
+    assert.ok(result.excluded.every(({ item: member }) => member.issue !== 172 && member.issue !== 173));
+  });
+
   it("filters before grouping and rejects mutually exclusive milestone selectors", () => {
     const result = assembleWorkUnits([
       item(1, { labels: ["enhancement", "priority:P1"], milestone: "release" }),

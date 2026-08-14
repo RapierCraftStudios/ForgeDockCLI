@@ -7,7 +7,7 @@ export type IssueLane =
   | {
     kind: "fast";
     targetBranch: string;
-    resolution: "repository-default" | "configured-fast-lane" | "explicit-source-branch";
+    resolution: "repository-default" | "configured-fast-lane" | "explicit-source-branch" | "explicit-target-branch";
   }
   | {
     kind: "feature";
@@ -83,14 +83,17 @@ export function classifyIssueLane(
   if (productionTarget !== undefined && featurePromotionTarget === productionTarget) {
     throw new Error(`Configured feature promotion target ${featurePromotionTarget} is the protected production target; use a separate integration branch`);
   }
-  const explicitSourceBranch = sourceBranchFromIssue(issue);
-  if (explicitSourceBranch) {
-    return { kind: "fast", targetBranch: explicitSourceBranch, resolution: "explicit-source-branch" };
-  }
-  if (isStagingReview(issue)) {
-    throw new Error(`Staging-review issue #${issue.number} requires explicit Code branch or Worktree base branch evidence`);
+  const explicitEvidence = explicitBranchEvidence(issue);
+  if (explicitEvidence.branch && explicitEvidence.kind === "source") {
+    return { kind: "fast", targetBranch: explicitEvidence.branch, resolution: "explicit-source-branch" };
   }
   if (!issue.milestone) {
+    if (explicitEvidence.branch) {
+      return { kind: "fast", targetBranch: explicitEvidence.branch, resolution: "explicit-target-branch" };
+    }
+    if (isStagingReview(issue)) {
+      throw new Error(`Staging-review issue #${issue.number} requires explicit Code branch or Worktree base branch evidence`);
+    }
     return {
       kind: "fast",
       targetBranch: fastLaneTarget,
@@ -104,10 +107,32 @@ export function classifyIssueLane(
     throw new Error(`Milestone '${issue.milestone.title}' for issue #${issue.number} has no ASCII-safe branch slug`);
   }
   const canonicalBranch = `milestone/${canonicalSlug}`;
+  const stableTitle = title.split(/\s+&\s+/u, 1)[0] ?? title;
+  const stableSlug = sanitizeMilestoneSlug(stableTitle);
+  const stableBranch = stableSlug ? `milestone/${stableSlug}` : canonicalBranch;
+  if (explicitEvidence.branch && ![canonicalBranch, stableBranch].includes(explicitEvidence.branch)) {
+    throw new Error(`Issue #${issue.number} explicitly targets ${explicitEvidence.branch}, which conflicts with milestone '${issue.milestone.title}' (expected ${canonicalBranch}${stableBranch !== canonicalBranch ? ` or ${stableBranch}` : ""})`);
+  }
   const branchNames = new Set(milestoneBranches.map((branch) => {
     assertBranchName(branch.name, "remote milestone branch");
     return branch.name;
   }));
+  const explicitMilestoneBranch = explicitEvidence.branch && branchNames.has(explicitEvidence.branch)
+    ? explicitEvidence.branch
+    : undefined;
+  if (explicitMilestoneBranch) {
+    return {
+      kind: "feature",
+      targetBranch: explicitMilestoneBranch,
+      resolution: explicitMilestoneBranch === canonicalBranch ? "canonical" : "stable-title-prefix",
+      milestone: issue.milestone,
+      canonicalBranch,
+      ...(featurePromotionTarget !== undefined ? { promotionTarget: featurePromotionTarget } : {}),
+    };
+  }
+  if (explicitEvidence.branch && !options.allowMissingMilestoneBranch) {
+    throw new Error(`Issue #${issue.number} explicitly targets ${explicitEvidence.branch}, but that branch is not present in the authoritative milestone branch catalog`);
+  }
   if (branchNames.has(canonicalBranch)) {
     return {
       kind: "feature",
@@ -122,9 +147,6 @@ export function classifyIssueLane(
   // A milestone title may gain a secondary "& ..." qualifier after its stable
   // branch was created. Follow that one explicit prior-title spelling only when
   // it exists remotely; never guess arbitrary fuzzy prefixes.
-  const stableTitle = title.split(/\s+&\s+/u, 1)[0] ?? title;
-  const stableSlug = sanitizeMilestoneSlug(stableTitle);
-  const stableBranch = stableSlug ? `milestone/${stableSlug}` : canonicalBranch;
   if (stableBranch !== canonicalBranch && branchNames.has(stableBranch)) {
     return {
       kind: "feature",
@@ -171,13 +193,13 @@ export async function resolveIssueLane(
 }
 
 export function laneEvidence(lane: IssueLane): string {
-  return lane.kind === "feature"
-    ? `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution})${lane.resolution === "planned-canonical" ? "; branch will be provisioned from the repository default before dispatch" : ""}${lane.promotionTarget ? `; promotion target ${lane.promotionTarget}` : ""}.`
-    : lane.resolution === "explicit-source-branch"
-      ? `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`
-      : lane.resolution === "configured-fast-lane"
-        ? `Fast lane: project policy targets ${lane.targetBranch}.`
-        : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
+  if (lane.kind === "feature") {
+    return `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution})${lane.resolution === "planned-canonical" ? "; branch will be provisioned from the repository default before dispatch" : ""}${lane.promotionTarget ? `; promotion target ${lane.promotionTarget}` : ""}.`;
+  }
+  if (lane.resolution === "explicit-source-branch") return `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`;
+  if (lane.resolution === "explicit-target-branch") return `Fast lane: issue acceptance evidence targets explicit branch ${lane.targetBranch}.`;
+  if (lane.resolution === "configured-fast-lane") return `Fast lane: project policy targets ${lane.targetBranch}.`;
+  return `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
 }
 
 export function missingMilestoneBranchForIssue(
@@ -286,17 +308,40 @@ export function assertRunTargetsBranch(run: RunState, branch: string): void {
 function sourceBranchFromIssue(
   issue: Pick<IssueSnapshot, "body" | "labels">,
 ): string | undefined {
-  if (!isStagingReview(issue)) return undefined;
+  const evidence = explicitBranchEvidence(issue);
+  return evidence.kind === "source" ? evidence.branch : undefined;
+}
+
+function explicitBranchEvidence(
+  issue: Pick<IssueSnapshot, "body" | "labels">,
+): { branch?: string; kind?: "source" | "target" } {
   const body = issue.body ?? "";
-  const codeBranch = sourceBranchValue(/\*\*Code branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]);
-  const worktreeBase = sourceBranchValue(/\*\*Worktree base\*\*:\s*`?origin\/([^`\r\n]+)`?/i.exec(body)?.[1]);
-  const sourceBranch = worktreeBase ?? codeBranch;
-  if (!sourceBranch) return undefined;
-  if (codeBranch && worktreeBase && codeBranch !== worktreeBase) {
-    throw new Error(`Staging-review source branch evidence conflicts: code branch '${codeBranch}' versus worktree base 'origin/${worktreeBase}'`);
+  const sourceValues = [
+    sourceBranchValue(/\*\*Code branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
+    sourceBranchValue(/\*\*Worktree base(?: branch)?\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
+  ].filter((value): value is string => Boolean(value));
+  const targetValues = [
+    sourceBranchValue(/\*\*Target branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
+    sourceBranchValue(/(?:pull request|delivery PR|PR)[^`\r\n]{0,160}\bonly against\s+`([^`]+)`/i.exec(body)?.[1]),
+    sourceBranchValue(/(?:pull request|PR)[^`\r\n]{0,160}\b(?:base|target) branch exactly\s+`([^`]+)`/i.exec(body)?.[1]),
+  ].filter((value): value is string => Boolean(value));
+  const uniqueSources = [...new Set(sourceValues)];
+  const uniqueTargets = [...new Set(targetValues)];
+  if (uniqueSources.length > 1) {
+    throw new Error(`Staging-review source branch evidence conflicts: ${uniqueSources.join(" versus ")}`);
   }
-  assertBranchName(sourceBranch, "staging-review source branch");
-  return sourceBranch;
+  if (uniqueTargets.length > 1) {
+    throw new Error(`Issue target branch evidence conflicts: ${uniqueTargets.join(" versus ")}`);
+  }
+  if (uniqueSources[0] && uniqueTargets[0] && uniqueSources[0] !== uniqueTargets[0]) {
+    throw new Error(`Issue branch evidence conflicts: source branch '${uniqueSources[0]}' versus target branch '${uniqueTargets[0]}'`);
+  }
+  const branch = uniqueSources[0] ?? uniqueTargets[0];
+  if (branch) {
+    assertBranchName(branch, uniqueSources[0] ? "staging-review source branch" : "explicit target branch");
+    return { branch, kind: uniqueSources[0] ? "source" : "target" };
+  }
+  return {};
 }
 
 function sourceBranchValue(value: string | undefined): string | undefined {

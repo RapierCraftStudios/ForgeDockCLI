@@ -16,7 +16,7 @@ import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/age
 import { buildWorkItem, type BuilderSubmission } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
-import { prepareBuildPacket } from "./prepare.js";
+import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket } from "./prepare.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
@@ -194,6 +194,10 @@ export async function workOn(
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       ...runtimeOptions,
       ...planningOptions,
+      verificationCatalog: {
+        commands: input.verification.map(({ id, command, args }) => ({ id, command, args })),
+        controllerGates: CONTROLLER_VERIFICATION_GATES,
+      },
     }, agentDependencies);
     input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     run = prepared.run;

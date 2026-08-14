@@ -7,6 +7,15 @@
 
 ### Fixed
 
+- Orchestration now preserves the original authorized issue scope separately from contracted work units, keeps inherited batch-labelled decomposition children dispatchable as singletons, and reports the correct preview/work-unit counts instead of silently dropping selected issues.
+- The TUI now persists and enforces claim-serialization edges, filters them during recovery, and exposes typed dependency, claim, capacity, and suspension wait reasons in live snapshots.
+- Work-on route resolution now honors explicit target-branch evidence in issue acceptance text and rejects conflicts with milestone lanes before workspace creation.
+- Build Packet preparation now canonicalizes typed verification requirements against the controller command/gate catalog and rejects unsupported controller prose before builder dispatch.
+- Merge and promotion admission now rechecks the reviewed SHA, target branch, GitHub mergeability, and required check state before merging; pending, failed, cancelled, or unavailable checks remain recoverable blocked outcomes.
+- Native TUI orchestration dispatches typed work-on controllers directly as supervised background tasks when the controller entry is available, avoiding a reasoning-only Pi wrapper and preserving orchestration/node identity in controller observations.
+- Decomposition children no longer inherit operational batch, review, or workflow labels that make them non-dispatchable.
+- Durable orchestration and CLI/TUI failure reporting now preserves the authoritative Outcome reason instead of claiming every failure is caused by blocked dependents.
+
 - Native orchestration now provisions missing canonical milestone branches only at explicit dispatch, keeps previews mutation-free, prevents stale DAG auto-resume, and distinguishes durable orchestration output from background-task output.
 - The orchestration scheduler now preserves deterministic priority order without repeatedly sorting or scanning the full queued set after every completion, while retaining dependency and claim-conflict semantics.
 - Preview confirmation now emits a compact first-line continuation record, permits an explicit tokenless continuation against the sole live checkpoint, and freezes the routed plan and policy against replay mutation.

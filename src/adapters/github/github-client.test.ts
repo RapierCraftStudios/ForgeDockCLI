@@ -230,7 +230,9 @@ describe("GitHub decomposition materialization", () => {
           body: "",
           url: `https://github.test/a/b/issues/${number}`,
           state: "OPEN",
-          labels: number === 7 ? [{ name: "enhancement" }] : [{ name: "enhancement" }],
+          labels: number === 7
+            ? [{ name: "enhancement" }, { name: "priority:P2" }, { name: "batch" }, { name: "review-finding" }, { name: "staging-review" }]
+            : [{ name: "enhancement" }, { name: "priority:P2" }, { name: "staging-review" }],
           milestone: { number: 1, title: "Milestone One" },
         });
       }
@@ -249,6 +251,11 @@ describe("GitHub decomposition materialization", () => {
     const create = calls.find((args) => args[0] === "issue" && args[1] === "create");
     assert.ok(create);
     assert.deepEqual(create.slice(create.indexOf("--milestone")), ["--milestone", "Milestone One"]);
+    assert.ok(create.includes("enhancement"));
+    assert.ok(create.includes("priority:P2"));
+    assert.ok(create.includes("staging-review"));
+    assert.equal(create.includes("batch"), false);
+    assert.equal(create.includes("review-finding"), false);
     assert.equal(children[0]?.milestone?.number, 1);
   });
 

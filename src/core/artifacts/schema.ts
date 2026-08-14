@@ -89,6 +89,13 @@ export const ControllerVerificationGateSchema = Type.Object({
   description: NonEmptyString,
 });
 
+export const VerificationRequirementSchema = Type.Object({
+  kind: Type.Union([Type.Literal("command"), Type.Literal("controller-gate")]),
+  id: NonEmptyString,
+  criterionIds: Type.Array(Type.String({ pattern: "^criterion-[1-9][0-9]*$" }), { minItems: 1 }),
+  rationale: NonEmptyString,
+});
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -101,6 +108,8 @@ export const BuildPacketPayloadSchema = Type.Object({
   verificationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
   /** Typed controller-owned gates; legacy prose remains readable for old packets. */
   controllerGates: Type.Optional(Type.Array(ControllerVerificationGateSchema)),
+  /** Additive typed verification references for new packets. */
+  verificationRequirements: Type.Optional(Type.Array(VerificationRequirementSchema, { minItems: 1 })),
   risks: Type.Array(Type.Object({
     risk: NonEmptyString,
     mitigation: NonEmptyString,
@@ -311,6 +320,22 @@ export const OutcomePayloadSchema = Type.Object({
     verifiedAt: Type.Optional(IsoDateTime),
   })),
   finalSha: Type.Optional(Sha),
+  /** Recoverable merge-admission evidence retained when GitHub checks are not ready. */
+  mergeGate: Type.Optional(Type.Object({
+    pullRequest: Type.Integer({ minimum: 1 }),
+    headSha: Sha,
+    baseBranch: NonEmptyString,
+    mergeable: Type.Boolean(),
+    observedAt: IsoDateTime,
+    requiredChecks: Type.Array(Type.Object({
+      name: NonEmptyString,
+      state: Type.Union([
+        Type.Literal("pending"), Type.Literal("passed"), Type.Literal("failed"),
+        Type.Literal("cancelled"), Type.Literal("unavailable"),
+      ]),
+      detailsUrl: Type.Optional(Type.String()),
+    })),
+  })),
   prUrl: Type.Optional(Type.String()),
   childIssues: Type.Array(Type.String()),
   batchParent: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -397,6 +422,7 @@ export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
 export type BuildPacketPayload = Static<typeof BuildPacketPayloadSchema>;
 export type ControllerVerificationGate = Static<typeof ControllerVerificationGateSchema>;
+export type VerificationRequirement = Static<typeof VerificationRequirementSchema>;
 export type BuildResultPayload = Static<typeof BuildResultPayloadSchema>;
 export type ReviewVerdictPayload = Static<typeof ReviewVerdictPayloadSchema>;
 export type OutcomePayload = Static<typeof OutcomePayloadSchema>;

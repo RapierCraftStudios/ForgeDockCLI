@@ -507,6 +507,12 @@ async function mergePromotion(record: PromotionRecord, dependencies: PromotionDe
   // records an unprotected production promotion as successfully completed.
   await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
   if (pullRequest.state !== "MERGED") {
+    if (!dependencies.host.getPullRequestMergeGate) throw new Error("Promotion merge requires authoritative GitHub merge-admission support");
+    const gate = await dependencies.host.getPullRequestMergeGate(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
+    const failedChecks = gate.requiredChecks.filter((check) => check.state !== "passed");
+    if (!gate.mergeable || failedChecks.length) {
+      throw new Error(`Promotion merge admission is blocked for PR #${pullRequest.number}: ${!gate.mergeable ? "PR is not mergeable" : failedChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`);
+    }
     await dependencies.host.mergePullRequest(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
   }
   const merged = await dependencies.host.getPullRequest(record.repository, pullRequest.number);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import {
@@ -43,6 +44,7 @@ import {
   buildSchedulePreview,
   materializeClaimDependencies,
   runSchedule,
+  validateGraph,
   type ScheduledWorkItem,
   type ClaimSerializationEdge,
   type ScheduleWorkerResult,
@@ -835,9 +837,23 @@ interface VisibleDagRun {
   completion: Promise<void>;
 }
 
+interface ControllerTaskSpec {
+  args: string[];
+  cwd: string;
+  env?: Record<string, string>;
+}
+
+interface ControllerTaskTransport {
+  start(spec: ControllerTaskSpec): Promise<string>;
+  wait(taskId: string): Promise<void>;
+  stop?(taskId: string): void;
+}
+
 type DagRecoveryMode = "initial" | "resume" | "rerun";
 
 interface VisibleDagInput {
+  /** Original operator-authorized scope; retained separately from contracted nodes. */
+  requestedIssueNumbers?: readonly number[];
   items: readonly VisibleOrchestrationItem[];
   maxParallel: number;
   productionTarget?: string;
@@ -845,6 +861,11 @@ interface VisibleDagInput {
   repository?: string;
   autoMerge?: boolean;
   taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => { agent: string; task: string; cwd: string; model?: string };
+  /** Optional direct typed-controller transport used by the live TUI. */
+  controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => ControllerTaskSpec;
+  startControllerTask?: (spec: ControllerTaskSpec) => Promise<string>;
+  waitControllerTask?: (taskId: string) => Promise<void>;
+  stopControllerTask?: (taskId: string) => void;
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<ScheduleWorkerResult | void>;
   onComplete: (result: Awaited<ReturnType<typeof runSchedule>>, orchestrationId: string) => void;
   onEvent?: (event: OrchestrationEvent) => void;
@@ -854,6 +875,7 @@ interface StoredDagRun {
   id: string;
   input: VisibleDagInput;
   childRunIds: string[];
+  directChildRunIds: Set<string>;
   result?: Awaited<ReturnType<typeof runSchedule>>;
   running: boolean;
   durableRecord: OrchestrationRecord;
@@ -882,11 +904,20 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
   const backgroundTasks = new ForgeDockBackgroundTasks(pi);
   const orchestrationBoard = new OrchestrationBoardController();
   let orchestrationCwd = process.cwd();
+  let orchestrationContext: ExtensionContext | undefined;
   let orchestrationRepository: SqliteRepositories | undefined;
   const dagDelegator = new VisibleDagDelegator(
     pi,
     () => orchestrationRepository,
     (record) => rebuildVisibleDagInput(orchestrationCwd, record),
+    {
+      start: async (spec) => {
+        if (!orchestrationContext) throw new Error("ForgeDock orchestration context is unavailable for direct controller dispatch");
+        return startNativeControllerTask(pi, backgroundTasks, spec, orchestrationContext);
+      },
+      wait: async (taskId) => { await backgroundTasks.waitForTerminal(taskId); },
+      stop: (taskId) => { try { backgroundTasks.cancel(taskId); } catch { /* task already terminal */ } },
+    },
   );
   pi.on("session_shutdown", async () => {
     orchestrationBoard.dispose();
@@ -911,6 +942,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (ctx) {
         orchestrationCwd = ctx.cwd;
+        orchestrationContext = ctx;
         if (ctx.mode === "tui" && !orchestrationRepository) {
           const witness = createConfiguredLeaseWitness(ctx.cwd);
           if (!witness) throw new Error("Lease witness configuration is required before TUI recovery inspection; token-only local leases are disabled");
@@ -1173,6 +1205,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
+      orchestrationCwd = ctx.cwd;
+      orchestrationContext = ctx;
       const livePreview = getOrchestrationPreview(pi);
       const previewCheckpoint = params.previewToken
         ? loadOrchestrationPreview(pi, params.previewToken)
@@ -1408,7 +1442,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           ...(previewToken ? { expiresAt: expiresAtIso } : {}),
           ...(repository?.repo !== undefined ? { repository: repository.repo } : {}),
           selectedIssueNumbers: [...issues],
-          workUnitCount: batchPlan.groups.length,
+          workUnitCount: proposedWorkUnitCount(discoveredSchedule.items as VisibleOrchestrationItem[], batchPlan.groups),
           maxParallel,
           batching: effective.batchingPolicy,
           scopeExpansion: effective.scopeExpansion,
@@ -1420,7 +1454,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           invocationLabel,
           ...(repository?.repo !== undefined ? { repository: repository.repo } : {}),
           selectedIssueCount: issues.length,
-          workUnitCount: batchPlan.groups.length,
+          workUnitCount: proposedWorkUnitCount(discoveredSchedule.items as VisibleOrchestrationItem[], batchPlan.groups),
           maxParallel,
           batching: effective.batchingPolicy,
           scopeExpansion: effective.scopeExpansion,
@@ -1451,7 +1485,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           invocationLabel,
           ...(repository?.repo !== undefined ? { repository: repository.repo } : {}),
           selectedIssueCount: issues.length,
-          workUnitCount: batchPlan.groups.length,
+          workUnitCount: proposedWorkUnitCount(discoveredSchedule.items as VisibleOrchestrationItem[], batchPlan.groups),
           maxParallel,
           batching: effective.batchingPolicy,
           scopeExpansion: effective.scopeExpansion,
@@ -1512,17 +1546,20 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const workerModel = resolvedWorkerModel;
       const artifacts = new GitHubArtifactRepository(github);
       orchestrationCwd = ctx.cwd;
+      orchestrationContext = ctx;
       if (ctx.mode === "tui" && !orchestrationRepository) {
         const witness = createConfiguredLeaseWitness(ctx.cwd);
         if (!witness) throw new Error("Lease witness configuration is required before TUI orchestration dispatch; token-only local leases are disabled");
         orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
       }
       const orchestration = await dagDelegator.start({
+        requestedIssueNumbers: issues,
         items: schedule.items as VisibleOrchestrationItem[],
         maxParallel,
         repository: repository!.repo,
         autoMerge,
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+        serializationEdges: schedule.edges,
         taskFor: (item, recovery, adjudicationReason) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
           return {
@@ -1547,6 +1584,31 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
             ...(workerModel ? { model: workerModel } : {}),
           };
         },
+        ...(controllerEntryAvailable() ? {
+          controllerTaskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => {
+            const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
+            return {
+              args: buildIssueWorkerControllerArgs(item.issue, {
+                repository: repository!.repo,
+                autoMerge,
+                scopeExpansion: effective.scopeExpansion,
+                maxRemediationCycles: effective.maxRemediationCycles,
+                maxRemediationDepth: effective.maxRemediationDepth,
+                maxRemediationChildren: effective.maxRemediationChildren,
+                ...policy,
+                ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
+                dependencies: item.dependencies.map(issueNumberFromId),
+              }),
+              cwd: ctx.cwd,
+              env: {
+                FORGEDOCK_ORCHESTRATION_NODE: item.id,
+                FORGEDOCK_ORCHESTRATION_ISSUE: String(item.issue),
+              },
+            };
+          },
+          startControllerTask: (spec: ControllerTaskSpec) => startNativeControllerTask(pi, backgroundTasks, spec, ctx),
+          waitControllerTask: async (taskId: string) => { await backgroundTasks.waitForTerminal(taskId); },
+        } : {}),
         assertCompleted: async (item) => {
           repository ??= await github.getRepository();
           const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: repository.repo, issue: item.issue }));
@@ -1560,7 +1622,9 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
-          throw new Error(`#${item.issue} ended in ${reconciled.state}; its DAG dependents remain blocked`);
+          const terminal = terminalArtifactResult(item.issue, await artifacts.list({ repo: repository.repo, issue: item.issue }), reconciled);
+          if (terminal) return terminal;
+          throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
         },
         onComplete: (result, orchestrationId) => {
           const finalSnapshot = buildOrchestrationSnapshot({
@@ -1598,10 +1662,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
             scopeExpansion: effective.scopeExpansion,
             autoMerge,
             snapshot: event.snapshot,
-            summary: `${event.name} · ready=${event.snapshot.readyNodes.length} · blocked=${event.snapshot.blockedNodes.length}`,
+            summary: `${event.name} · ready=${event.snapshot.readyNodes.length} · waiting=${event.snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} · blocked=${event.snapshot.blockedNodes.length}`,
           };
           onUpdate?.({
-            content: [{ type: "text", text: `Orchestration ${event.snapshot.orchestrationId}: ${event.name} · ready=${event.snapshot.readyNodes.length} blocked=${event.snapshot.blockedNodes.length} invalid=${event.snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${event.snapshot.suspendedNodes.length}` }],
+            content: [{ type: "text", text: `Orchestration ${event.snapshot.orchestrationId}: ${event.name} · ready=${event.snapshot.readyNodes.length} waiting=${event.snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${event.snapshot.blockedNodes.length} invalid=${event.snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${event.snapshot.suspendedNodes.length}` }],
             details: { command: "orchestrate", args: issues.map(String), state: "running", ui: activeView } satisfies OrchestrationToolDetails,
           });
         },
@@ -1955,14 +2019,21 @@ function buildVisibleOrchestrationPlan(
   });
 }
 
+function proposedWorkUnitCount(
+  items: readonly VisibleOrchestrationItem[],
+  groups: readonly IssueBatchGroup[],
+): number {
+  const grouped = new Set(groups.flatMap((group) => group.members.map((member) => member.id)));
+  return items.length - grouped.size + groups.length;
+}
+
 function renderOrchestrationProposal(
   items: readonly VisibleOrchestrationItem[],
   edges: readonly ClaimSerializationEdge[],
   groups: readonly IssueBatchGroup[],
   maxParallel: number,
 ): string {
-  const grouped = new Set(groups.flatMap((group) => group.members.map((member) => member.id)));
-  const workUnits = items.length - grouped.size + groups.length;
+  const workUnits = proposedWorkUnitCount(items, groups);
   const preview = buildSchedulePreview(items, edges);
   const claimPredecessors = new Map<string, string[]>();
   for (const edge of edges) claimPredecessors.set(edge.successor, [...(claimPredecessors.get(edge.successor) ?? []), edge.predecessor]);
@@ -2104,10 +2175,32 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
     repository: record.repository,
     autoMerge: record.autoMerge,
     ...(record.productionTarget !== undefined ? { productionTarget: record.productionTarget } : {}),
+    requestedIssueNumbers: [...(record.requestedIssueNumbers ?? record.issueNumbers)],
     items,
     maxParallel: record.maxParallel,
-    ...(record.serializationEdges ? {
-      serializationEdges: record.serializationEdges.map((edge) => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] })),
+    serializationEdges: (record.serializationEdges ?? []).map((edge) => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] })),
+    ...(controllerEntryAvailable() ? {
+      controllerTaskFor: (item, recovery, adjudicationReason) => {
+        const policy = resolveIssueWorkerRecovery([], false, recovery);
+        return {
+          args: buildIssueWorkerControllerArgs(item.issue, {
+            repository: record.repository,
+            autoMerge: record.autoMerge,
+            scopeExpansion: effective.scopeExpansion,
+            maxRemediationCycles: effective.maxRemediationCycles,
+            maxRemediationDepth: effective.maxRemediationDepth,
+            maxRemediationChildren: effective.maxRemediationChildren,
+            ...policy,
+            ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
+            dependencies: item.dependencies.map(issueNumberFromId),
+          }),
+          cwd,
+          env: {
+            FORGEDOCK_ORCHESTRATION_NODE: item.id,
+            FORGEDOCK_ORCHESTRATION_ISSUE: String(item.issue),
+          },
+        };
+      },
     } : {}),
     taskFor: (item, recovery, adjudicationReason) => {
       const policy = resolveIssueWorkerRecovery([], false, recovery);
@@ -2137,10 +2230,38 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
       if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
         return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
       }
-      throw new Error(`#${item.issue} ended in ${reconciled.state}; its DAG dependents remain blocked`);
+      const terminal = terminalArtifactResult(item.issue, await artifacts.list({ repo: record.repository, issue: item.issue }), reconciled);
+      if (terminal) return terminal;
+      throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
     },
     onComplete: () => undefined,
   };
+}
+
+function buildIssueWorkerControllerArgs(
+  issue: number,
+  options: {
+    repository: string;
+    autoMerge: boolean;
+    scopeExpansion: "scope-locked" | "recursive";
+    maxRemediationCycles: number;
+    maxRemediationDepth: number;
+    maxRemediationChildren: number;
+    rerun: boolean;
+    resume: boolean;
+    adjudicateVerification?: string;
+    dependencies: number[];
+  },
+): string[] {
+  const args = [String(issue), "--repo", options.repository, options.autoMerge ? "--auto-merge" : "--no-auto-merge", "--scope-expansion", options.scopeExpansion,
+    "--max-remediation-cycles", String(options.maxRemediationCycles),
+    "--max-remediation-depth", String(options.maxRemediationDepth),
+    "--max-remediation-children", String(options.maxRemediationChildren)];
+  if (options.dependencies.length) args.push("--depends-on", options.dependencies.join(","));
+  if (options.rerun) args.push("--rerun");
+  if (options.resume) args.push("--resume");
+  if (options.adjudicateVerification) args.push("--adjudicate-verification", options.adjudicateVerification);
+  return args;
 }
 
 function buildIssueWorkerTask(
@@ -2168,6 +2289,48 @@ function buildIssueWorkerTask(
     `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume, ...(options.adjudicateVerification ? { adjudicateVerification: options.adjudicateVerification } : {}) })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
+}
+
+function controllerEntryAvailable(): boolean {
+  const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  return entry !== undefined && existsSync(entry);
+}
+
+async function startNativeControllerTask(
+  pi: ExtensionAPI,
+  tasks: ForgeDockBackgroundTasks,
+  spec: ControllerTaskSpec,
+  ctx: ExtensionContext,
+): Promise<string> {
+  const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
+  const nestedBridge = await startNestedAgentBridge(pi);
+  const config = readForgeDockConfig(ctx.cwd);
+  const reviewer = splitConfiguredModel(config.reviewerModel);
+  const planning = splitConfiguredModel(config.planningModel);
+  const env = {
+    ...nestedBridge.env,
+    ...(spec.env ?? {}),
+    ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
+    ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
+    ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
+    ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
+    ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
+  };
+  try {
+    const record = tasks.start({
+      command: process.execPath,
+      args: [entry, "work-on", ...spec.args],
+      cwd: spec.cwd,
+      env,
+      cleanup: () => nestedBridge.close(),
+      ctx,
+    });
+    return record.id;
+  } catch (error) {
+    await nestedBridge.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 async function runControllerToolBackground(
@@ -2332,25 +2495,48 @@ function normalizedModelTokens(value: string): string[] {
   return [...new Set(value.toLowerCase().match(/[a-z]+|\d+/g) ?? [])];
 }
 
+function terminalArtifactResult(
+  issue: number,
+  artifacts: readonly DurableArtifact[],
+  reconciled: ReturnType<typeof reconcileLatestRunArtifacts>,
+): ScheduleWorkerResult | undefined {
+  const outcome = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+  if (outcome?.payload.status === "failed" || outcome?.payload.status === "blocked") {
+    const checkpoint = reconciled.remediationCheckpoint;
+    const checkpointDetail = checkpoint ? ` checkpoint=${checkpoint.payload.checkpointKey} status=${checkpoint.payload.status}` : "";
+    return {
+      status: outcome.payload.status,
+      error: `#${issue} reached ${outcome.payload.status}: ${outcome.payload.reason}${checkpointDetail}`,
+    };
+  }
+  if (reconciled.state === "blocked" || reconciled.state === "failed") {
+    return {
+      status: reconciled.state,
+      error: `#${issue} reconciled as ${reconciled.state}${reconciled.warnings.length ? `: ${reconciled.warnings.join("; ")}` : " without a terminal Outcome reason"}`,
+    };
+  }
+  return undefined;
+}
+
 function createDurableOrchestrationRecord(id: string, input: VisibleDagInput, now: string): OrchestrationRecord {
+  const requestedIssueNumbers = [...new Set(input.requestedIssueNumbers ?? input.items.flatMap((item) => [item.issue, ...item.memberIssues]))];
   return {
     schema: "forgedock.orchestration/v1",
     orchestrationId: id,
     repository: input.repository ?? "unknown/unknown",
-    issueNumbers: [...new Set(input.items.flatMap((item) => [item.issue, ...item.memberIssues]))],
+    requestedIssueNumbers,
+    issueNumbers: requestedIssueNumbers,
     maxParallel: input.maxParallel,
     autoMerge: input.autoMerge ?? true,
     ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
     status: "running",
     createdAt: now,
     updatedAt: now,
-    ...(input.serializationEdges?.length ? {
-      serializationEdges: input.serializationEdges.map((edge) => ({
-        predecessor: edge.predecessor,
-        successor: edge.successor,
-        overlappingClaims: [...edge.overlappingClaims],
-      })),
-    } : {}),
+    serializationEdges: (input.serializationEdges ?? []).map((edge) => ({
+      predecessor: edge.predecessor,
+      successor: edge.successor,
+      overlappingClaims: [...edge.overlappingClaims],
+    })),
     nodes: input.items.map((item) => ({
       id: item.id,
       issue: item.issue,
@@ -2381,6 +2567,7 @@ export class VisibleDagDelegator {
     private readonly pi: ExtensionAPI,
     private readonly getOrchestrationRepository: () => OrchestrationRepository | undefined = () => undefined,
     private readonly rebuildInput?: (record: OrchestrationRecord) => Promise<VisibleDagInput>,
+    private readonly directControllerTransport?: ControllerTaskTransport,
   ) {
     this.unsubscribe = pi.events.on("subagent:async-complete", (event: unknown) => {
       const runId = typeof event === "object" && event !== null && "runId" in event ? String((event as { runId: unknown }).runId) : "";
@@ -2395,8 +2582,13 @@ export class VisibleDagDelegator {
   async start(input: VisibleDagInput): Promise<VisibleDagRun> {
     const id = `dag_${crypto.randomUUID()}`;
     const now = new Date().toISOString();
-    const durableRecord = createDurableOrchestrationRecord(id, input, now);
-    const stored: StoredDagRun = { id, input, childRunIds: [], running: false, durableRecord, persistence: Promise.resolve() };
+    const normalizedInput: VisibleDagInput = {
+      ...input,
+      serializationEdges: [...(input.serializationEdges ?? [])],
+      ...(input.requestedIssueNumbers !== undefined ? { requestedIssueNumbers: [...input.requestedIssueNumbers] } : {}),
+    };
+    const durableRecord = createDurableOrchestrationRecord(id, normalizedInput, now);
+    const stored: StoredDagRun = { id, input: normalizedInput, childRunIds: [], directChildRunIds: new Set(), running: false, durableRecord, persistence: Promise.resolve() };
     const repository = this.getOrchestrationRepository();
     if (repository) await repository.createOrchestration(durableRecord);
     this.runs.set(id, stored);
@@ -2419,6 +2611,7 @@ export class VisibleDagDelegator {
           id: record.orchestrationId,
           input,
           childRunIds: record.nodes.flatMap((node) => node.childRunIds),
+          directChildRunIds: new Set(),
           result: { status: statuses, errors, startOrder: record.nodes.map((node) => node.id) },
           running: false,
           durableRecord: record,
@@ -2447,6 +2640,12 @@ export class VisibleDagDelegator {
     const remaining = stored.input.items
       .filter((item) => remainingIds.has(item.id))
       .map((item) => ({ ...item, dependencies: item.dependencies.filter((dependency) => remainingIds.has(dependency)) }));
+    const remainingSerializationEdges = (stored.input.serializationEdges ?? []).filter((edge) =>
+      remainingIds.has(edge.predecessor) && remainingIds.has(edge.successor));
+    // Validate the reduced graph before launching any recovery worker. Older
+    // records may not contain serialization edges, so an empty list remains a
+    // valid backward-compatible input.
+    validateGraph(remaining, remainingSerializationEdges);
     const rerunIssueNumbers = new Set(options.rerunIssueNumbers ?? []);
     const unknownReruns = [...rerunIssueNumbers].filter((issue) => !remaining.some((item) => item.issue === issue || item.memberIssues.includes(issue)));
     if (unknownReruns.length) {
@@ -2459,12 +2658,18 @@ export class VisibleDagDelegator {
     }
     const overlapping = [...adjudications.keys()].filter((issue) => rerunIssueNumbers.has(issue));
     if (overlapping.length) throw new Error(`Verification adjudication cannot be combined with fresh rerun authorization: ${overlapping.map((issue) => `#${issue}`).join(", ")}`);
-    return this.launch(stored, remaining, rerunIssueNumbers, adjudications);
+    return this.launch(stored, remaining, rerunIssueNumbers, adjudications, remainingSerializationEdges);
   }
 
   async shutdown(): Promise<void> {
     const active = [...this.active];
     await Promise.allSettled(active.map((id) => callSubagentRpc(this.pi, "stop", { id })));
+    for (const run of this.runs.values()) {
+      const stopControllerTask = run.input.stopControllerTask ?? this.directControllerTransport?.stop;
+      if (stopControllerTask) {
+        for (const taskId of run.directChildRunIds) stopControllerTask(taskId);
+      }
+    }
     await Promise.allSettled([...this.runs.values()].map((run) => run.persistence));
     this.active.clear();
     this.unsubscribe?.();
@@ -2475,16 +2680,46 @@ export class VisibleDagDelegator {
     items: readonly VisibleOrchestrationItem[],
     rerunIssueNumbers: ReadonlySet<number> = new Set(),
     adjudications: ReadonlyMap<number, string> = new Map(),
+    serializationEdges: readonly ClaimSerializationEdge[] = stored.input.serializationEdges ?? [],
   ): Promise<VisibleDagRun> {
     stored.running = true;
     this.queueDurableRecord(stored, { ...stored.durableRecord, status: "running", updatedAt: new Date().toISOString() });
     const initialLaunches: Promise<unknown>[] = [];
     let collectingInitial = true;
+    const stopControllerTask = stored.input.stopControllerTask ?? this.directControllerTransport?.stop;
     const result = runSchedule(items, stored.input.maxParallel, async (scheduled) => {
       const item = scheduled as VisibleOrchestrationItem;
       const explicitlyRerun = rerunIssueNumbers.has(item.issue) || item.memberIssues.some((issue) => rerunIssueNumbers.has(issue));
       const adjudication = adjudications.get(item.issue) ?? item.memberIssues.map((issue) => adjudications.get(issue)).find((reason): reason is string => reason !== undefined);
       const recovery: DagRecoveryMode = explicitlyRerun ? "rerun" : stored.result ? "resume" : "initial";
+      const startControllerTask = stored.input.startControllerTask ?? this.directControllerTransport?.start;
+      const waitControllerTask = stored.input.waitControllerTask ?? this.directControllerTransport?.wait;
+      const stopControllerTask = stored.input.stopControllerTask ?? this.directControllerTransport?.stop;
+      const directStart = stored.input.controllerTaskFor && startControllerTask && waitControllerTask
+        ? (async () => {
+          const spec = stored.input.controllerTaskFor!(item, recovery, adjudication);
+          const taskId = await startControllerTask({
+            ...spec,
+            env: { ...(spec.env ?? {}), FORGEDOCK_ORCHESTRATION_ID: stored.id },
+          });
+          stored.childRunIds.push(taskId);
+          stored.directChildRunIds.add(taskId);
+          this.queueDurableRecord(stored, {
+            ...stored.durableRecord,
+            updatedAt: new Date().toISOString(),
+            nodes: stored.durableRecord.nodes.map((node) => node.id === item.id
+              ? { ...node, childRunIds: [...node.childRunIds, taskId] }
+              : node),
+          });
+          return taskId;
+        })()
+        : undefined;
+      if (directStart) {
+        if (collectingInitial) initialLaunches.push(directStart);
+        const taskId = await directStart;
+        await waitControllerTask!(taskId);
+        return await stored.input.assertCompleted(item);
+      }
       const launch = callSubagentRpc(this.pi, "spawn", {
         ...stored.input.taskFor(item, recovery, adjudication), async: true, context: "fresh", artifacts: true,
       });
@@ -2507,13 +2742,17 @@ export class VisibleDagDelegator {
         this.active.delete(runId);
       }
     }, {
-      ...(stored.input.serializationEdges ? { serializationEdges: stored.input.serializationEdges } : {}),
+      serializationEdges,
       onEvent: (scheduleEvent) => {
         const snapshot = buildOrchestrationSnapshot({
           orchestrationId: stored.id,
           items,
-          ...(stored.input.serializationEdges ? { serializationEdges: stored.input.serializationEdges } : {}),
-          result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
+          serializationEdges,
+          result: {
+            status: new Map(scheduleEvent.status),
+            errors: new Map(scheduleEvent.errors),
+            ...(scheduleEvent.waitReasons ? { waitReasons: new Map(scheduleEvent.waitReasons) } : {}),
+          },
         });
         this.queueDurableRecord(stored, {
           ...stored.durableRecord,
@@ -2521,9 +2760,12 @@ export class VisibleDagDelegator {
           nodes: stored.durableRecord.nodes.map((node) => {
             const status = scheduleEvent.status.get(node.id);
             const error = scheduleEvent.errors.get(node.id);
+            const waitReason = scheduleEvent.waitReasons?.get(node.id);
+            const { waitReason: _previousWaitReason, ...withoutWaitReason } = node;
             return {
-              ...node,
+              ...withoutWaitReason,
               ...(status !== undefined ? { status } : {}),
+              ...(waitReason ? { waitReason } : {}),
               ...(error !== undefined ? { error: error.message } : {}),
             };
           }),
@@ -2537,7 +2779,13 @@ export class VisibleDagDelegator {
     } catch (error) {
       stored.running = false;
       this.queueDurableRecord(stored, { ...stored.durableRecord, status: "failed", updatedAt: new Date().toISOString() });
-      await Promise.allSettled(stored.childRunIds.map((runId) => callSubagentRpc(this.pi, "stop", { id: runId })));
+      await Promise.allSettled(stored.childRunIds.map((runId) => {
+        if (stored.directChildRunIds.has(runId)) {
+          stopControllerTask?.(runId);
+          return Promise.resolve();
+        }
+        return callSubagentRpc(this.pi, "stop", { id: runId });
+      }));
       await stored.persistence;
       throw error;
     }
@@ -2583,12 +2831,15 @@ function mergeScheduleResults(
   if (!previous) return attempt;
   const status = new Map(previous.status);
   const errors = new Map(previous.errors);
+  const waitReasons = new Map(previous.waitReasons);
   for (const [id, value] of attempt.status) {
     status.set(id, value);
     if (value === "completed" || value === "skipped") errors.delete(id);
+    if (value !== "queued") waitReasons.delete(id);
   }
   for (const [id, error] of attempt.errors) errors.set(id, error);
-  return { status, errors, startOrder: [...previous.startOrder, ...attempt.startOrder] };
+  for (const [id, reason] of attempt.waitReasons ?? []) waitReasons.set(id, reason);
+  return { status, errors, startOrder: [...previous.startOrder, ...attempt.startOrder], ...(waitReasons.size ? { waitReasons } : {}) };
 }
 
 function asyncRunId(response: unknown): string {

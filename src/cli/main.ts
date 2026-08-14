@@ -93,12 +93,18 @@ async function main(argv: string[]): Promise<void> {
   const controllerObservation = new ControllerObservationAdapter(observer, {
     identity: {
       ...(process.env.FORGEDOCK_RUN_ID ? { forgeRunId: process.env.FORGEDOCK_RUN_ID } : {}),
+      ...(process.env.FORGEDOCK_ORCHESTRATION_ID ? { orchestrationId: process.env.FORGEDOCK_ORCHESTRATION_ID } : {}),
+      ...(process.env.FORGEDOCK_ORCHESTRATION_NODE ? { nodeId: process.env.FORGEDOCK_ORCHESTRATION_NODE, workUnitId: process.env.FORGEDOCK_ORCHESTRATION_NODE } : {}),
+      ...(process.env.FORGEDOCK_ORCHESTRATION_ISSUE && /^\d+$/.test(process.env.FORGEDOCK_ORCHESTRATION_ISSUE) ? { issueNumber: Number(process.env.FORGEDOCK_ORCHESTRATION_ISSUE) } : {}),
       ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
     },
   });
   controllerObservation.started(command, argv.slice(1));
   setAgentEventObservationSink(observer, {
     ...(process.env.FORGEDOCK_RUN_ID ? { forgeRunId: process.env.FORGEDOCK_RUN_ID } : {}),
+    ...(process.env.FORGEDOCK_ORCHESTRATION_ID ? { orchestrationId: process.env.FORGEDOCK_ORCHESTRATION_ID } : {}),
+    ...(process.env.FORGEDOCK_ORCHESTRATION_NODE ? { nodeId: process.env.FORGEDOCK_ORCHESTRATION_NODE, workUnitId: process.env.FORGEDOCK_ORCHESTRATION_NODE } : {}),
+    ...(process.env.FORGEDOCK_ORCHESTRATION_ISSUE && /^\d+$/.test(process.env.FORGEDOCK_ORCHESTRATION_ISSUE) ? { issueNumber: Number(process.env.FORGEDOCK_ORCHESTRATION_ISSUE) } : {}),
     ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
   });
   let controllerFailed = false;
@@ -377,6 +383,8 @@ async function workOn(argv: string[]): Promise<void> {
     repository: issue.repo,
     issueNumber: issue.number,
     forgeRunId: progressRunId,
+    ...(process.env.FORGEDOCK_ORCHESTRATION_ID ? { orchestrationId: process.env.FORGEDOCK_ORCHESTRATION_ID } : {}),
+    ...(process.env.FORGEDOCK_ORCHESTRATION_NODE ? { nodeId: process.env.FORGEDOCK_ORCHESTRATION_NODE, workUnitId: process.env.FORGEDOCK_ORCHESTRATION_NODE } : {}),
     ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
   });
   const intent = createArtifact({
@@ -1225,6 +1233,7 @@ async function orchestrate(argv: string[]): Promise<void> {
       schema: "forgedock.orchestration/v1",
       orchestrationId,
       repository: repository.repo,
+      requestedIssueNumbers: [...issueNumbers],
       issueNumbers: [...issueNumbers],
       maxParallel: effective.maxParallel,
       autoMerge,
@@ -1328,7 +1337,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
           updateOrchestrationNode(item.id, { childRunIds: resumed.runId ? [resumed.runId] : [] });
           outcomes.set(item.id, resumed.state);
-          if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; dependents remain blocked`);
+          if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; ${resumed.warnings.join("; ") || "durable recovery details are required"}`);
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
         }
@@ -1417,7 +1426,10 @@ async function orchestrate(argv: string[]): Promise<void> {
         if (result.run.state === "decomposed") {
           return { status: "skipped", error: `${item.id} decomposed during orchestration; rerun orchestration to freeze its authoritative child scope` };
         }
-        if (result.run.state !== "completed") throw new Error(`${item.id} ended in ${result.run.state}; dependents remain blocked`);
+        if (result.run.state !== "completed") {
+          const reason = result.outcome?.payload.reason ?? result.run.blockedReason ?? result.run.failure ?? "durable recovery details are required";
+          throw new Error(`${item.id} ended in ${result.run.state}: ${reason}`);
+        }
       } finally {
         clearInterval(heartbeat);
         try { store.release(item.id, lease.token); } catch { /* fail-closed recovery retains the lease row */ }
@@ -1429,14 +1441,21 @@ async function orchestrate(argv: string[]): Promise<void> {
           orchestrationId,
           items: scheduleItems.items,
           serializationEdges: scheduleItems.edges,
-          result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
+          result: {
+            status: new Map(scheduleEvent.status),
+            errors: new Map(scheduleEvent.errors),
+            ...(scheduleEvent.waitReasons ? { waitReasons: new Map(scheduleEvent.waitReasons) } : {}),
+          },
         });
         const nodes = orchestrationRecord.nodes.map((node) => {
           const status = scheduleEvent.status.get(node.id);
           const error = scheduleEvent.errors.get(node.id);
+          const waitReason = scheduleEvent.waitReasons?.get(node.id);
+          const { waitReason: _previousWaitReason, ...withoutWaitReason } = node;
           return {
-            ...node,
+            ...withoutWaitReason,
             ...(status !== undefined ? { status } : {}),
+            ...(waitReason ? { waitReason } : {}),
             ...(error !== undefined ? { error: error.message } : {}),
           };
         });
@@ -1448,9 +1467,9 @@ async function orchestrate(argv: string[]): Promise<void> {
           source: "workflow",
           channel: "lifecycle",
           kind: "orchestration.state.changed",
-          payload: { name: event.name, itemId: event.itemId, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes },
+          payload: { name: event.name, itemId: event.itemId, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes, waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })) },
         });
-        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
+        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
     const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked" || status === "skipped");
