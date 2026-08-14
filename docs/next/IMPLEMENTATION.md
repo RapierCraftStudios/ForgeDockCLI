@@ -10,6 +10,24 @@ This is the execution tracker for the greenfield rewrite described in [`../forge
 - GitHub artifacts are durable truth; local state and Pi sessions are operational aids.
 - No phase is reported complete until its acceptance tests pass.
 - Private AlterLab issue content must not be copied into this repository.
+- [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md) is the sole normative source for protected bytes, identity, delegation, host guarantees, events, leases, bundles, compatibility, and tamper-evidence limits.
+- This documentation milestone does not implement runtime behavior, cryptography, persisted formats, or migrations. A future slice is not complete until its linked conformance tests and evidence pass; prose, parsing, or a green build alone is insufficient.
+
+## Verifiable authority milestone map
+
+The following is the implementation map for subsequent work. Issue references are intentionally pending until the controller creates the corresponding public milestone issues; no private issue content is copied here. Each row MUST cite the indicated anchors in its Build Packet and MUST remain unchecked until the named test/evidence set passes.
+
+| Subsequent slice | Normative anchors | Issue reference | Required evidence before completion |
+| --- | --- | --- | --- |
+| Protected envelope, canonicalization, digest, signature, and chain verifier | [`#envelope`](VERIFIABLE-WORKFLOW-AUTHORITY.md#envelope), [`#canonical-bytes`](VERIFIABLE-WORKFLOW-AUTHORITY.md#canonical-bytes), [`#signatures`](VERIFIABLE-WORKFLOW-AUTHORITY.md#signatures), [`#verification`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification) | Pending controller-created issue | Canonical byte vectors, digest/signature vectors, malformed/incomplete/invalid-signature/chain-gap/wrong-binding tests, and full-SHA binding tests |
+| Controller identity, trust roots, rotation, loss, and revocation | [`#identity`](VERIFIABLE-WORKFLOW-AUTHORITY.md#identity) | Pending controller-created issue | Key custody/access-failure, identifier derivation, rotation, historical verification, loss, retirement, and revocation tests |
+| Capabilities, delegation, and replay protection | [`#capabilities`](VERIFIABLE-WORKFLOW-AUTHORITY.md#capabilities) | Pending controller-created issue | Closed-action/default-deny, complete ancestor lifecycle/revocation/expiry/unavailable-lineage, subset/depth, nonce atomicity, reusable logical-request ID/digest and distinct-operation, exact replay and mismatched-ID reuse, authenticated presenter/audience session, unavailable-store, and exact subject/run/SHA tests |
+| Canonical subjects and host adapter conformance | [`#subjects`](VERIFIABLE-WORKFLOW-AUTHORITY.md#subjects), [`#boundaries`](VERIFIABLE-WORKFLOW-AUTHORITY.md#boundaries) | Pending controller-created issue | Subject round trips, discovery, idempotency, stale-SHA, permission/conflict classification, publish/review/merge/CAS guarantee tests |
+| Versioned workflow events and stable views | [`#events`](VERIFIABLE-WORKFLOW-AUTHORITY.md#events) | Pending controller-created issue | Ordering, correlation/causation, duplicate/conflict, gap recovery, unknown-event quarantine, and non-authorizing consumer tests |
+| Distributed leases and compare-and-swap fencing | [`#leases`](VERIFIABLE-WORKFLOW-AUTHORITY.md#leases) | Pending controller-created issue | Acquire/heartbeat/expiry/release/takeover, monotonic sequence, stale-owner fencing, split-brain, idempotency, and unsupported-host tests |
+| Portable bundles and offline verification/import | [`#bundles`](VERIFIABLE-WORKFLOW-AUTHORITY.md#bundles), [`#tamper-limits`](VERIFIABLE-WORKFLOW-AUTHORITY.md#tamper-limits) | Pending controller-created issue | Deterministic archive vectors, size/secret exclusion, offline key/chain/checkpoint tests, conflict import, and archival non-authority tests |
+| Legacy v2 compatibility and protected migration | [`#compatibility`](VERIFIABLE-WORKFLOW-AUTHORITY.md#compatibility), [`#verification`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification) | Pending controller-created issue | Matrix coverage for valid legacy, valid protected, mixed, malformed, incomplete, unsupported, expired/revoked, and unverifiable sets; no silent rewrite tests |
+| Checkpoint/anchoring and deletion-limit evidence | [`#tamper-limits`](VERIFIABLE-WORKFLOW-AUTHORITY.md#tamper-limits) | Pending controller-created issue | Detectable gap tests, unanchored-tail limitation test, authenticated checkpoint coverage, and retention/recovery evidence |
 
 ## Vertical slices
 

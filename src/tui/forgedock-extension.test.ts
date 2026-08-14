@@ -444,7 +444,7 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   }) as typeof state.pi.events.emit;
   const tool = state.tools.get("forgedock_orchestrate") as any;
   assert.ok(tool);
-  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], repository: "a/b", noMilestone: true });
   const preview = await tool.execute("preview-checkpoint", {
     issueNumbers: [7],
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],

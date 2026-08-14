@@ -186,6 +186,7 @@
     <nav aria-label="Document sections">
       <a href="#decision">The decision</a>
       <a href="#principles">Non-negotiables</a>
+      <a href="#trust-direction">Trust & portability</a>
       <a href="#architecture">Architecture</a>
       <a href="#commands">Command surface</a>
       <a href="#work-on">work-on</a>
@@ -229,6 +230,18 @@
         <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable truth. Local databases and Pi sessions accelerate execution but cannot be the only record.</p></div>
       </div>
       <div class="callout" style="margin-top:14px"><strong>Determinism belongs at the boundary.</strong> ForgeDock controls phase selection, permissions, validation, retries, state transitions, merge eligibility, and closure. A model may propose; it may not silently govern.</div>
+    </section>
+
+    <section id="trust-direction">
+      <div class="eyebrow">Approved direction · normative contract</div>
+      <h2>Verifiable evidence without a second authority</h2>
+      <p class="section-intro">The approved trust and portability direction is frozen in the <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md">normative authority specification</a>. This brief remains a projection: it records boundaries and product consequences, not a second copy of canonical byte or cryptographic rules.</p>
+      <div class="grid three">
+        <div class="card accent"><h3>Controller identity</h3><p>ForgeDock-owned keys, exact subject/run/SHA binding, protected evidence, and fail-closed verification. Models never hold signing keys.</p></div>
+        <div class="card"><h3>Portable, archival evidence</h3><p>Deterministic bundles can be checked offline, but imported evidence never becomes competing live authority. GitHub remains durable semantic truth for its adapter.</p></div>
+        <div class="card"><h3>Capability and coordination fences</h3><p>Least-authority grants, versioned controller events, and CAS/fenced leases report or constrain work; only typed controller decisions authorize it.</p></div>
+      </div>
+      <div class="callout" style="margin-top:14px"><strong>Boundary preserved:</strong> Pi remains a replaceable execution kernel, providers remain runtime-neutral, host adapters report capabilities rather than inventing guarantees, and GitHub mutations remain controller-owned. Missing, stale, revoked, or unverifiable trust and coordination guarantees fail closed.</div>
     </section>
 
     <section id="architecture">
@@ -371,9 +384,9 @@ while (capacity.available && ready.length) {
     </section>
 
     <section id="artifacts">
-      <div class="eyebrow">Durable memory</div>
-      <h2>Six artifacts replace annotation sprawl</h2>
-      <p class="section-intro">Each artifact is schema-versioned JSON with a human-readable Markdown projection on the issue or PR. The JSON is authoritative for machines; the Markdown remains useful to people.</p>
+      <div class="eyebrow">Durable memory · current v2 baseline</div>
+      <h2>Six legacy artifacts replace annotation sprawl</h2>
+      <p class="section-intro">The current six artifacts are <code>forgedock.artifact/v2</code>: readable structural JSON with a human-readable Markdown projection, but explicitly <code>legacy-unverified</code>. The protected <code>forgedock.protected/v1</code> contract and its exact authority rules live only in the <a href="next/VERIFIABLE-WORKFLOW-AUTHORITY.md">normative specification</a>; v2 cannot authorize protected actions.</p>
       <div class="grid three">
         <div class="card"><span class="num">01</span><h3>Intent</h3><p>Problem, desired outcome, constraints, source, acceptance hints, links, and dependency declarations.</p></div>
         <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
@@ -382,7 +395,7 @@ while (capacity.available && ready.length) {
         <div class="card"><span class="num">05</span><h3>Review Verdict</h3><p>Reviewed SHA, frozen Review Plan identity/generation, required capabilities, bounded execution groups/budget, checks, normalized findings, disposition, and freshness metadata.</p></div>
         <div class="card"><span class="num">06</span><h3>Outcome</h3><p>Merged, invalid, decomposed, blocked, or abandoned; final references, reason, and completion timestamp.</p></div>
       </div>
-      <pre>{
+      <pre aria-label="Legacy v2 example; not protected evidence">{
   "schema": "forgedock.artifact/v2",
   "kind": "ReviewVerdict",
   "id": "rv_...",
@@ -405,7 +418,7 @@ while (capacity.available && ready.length) {
         <div class="card"><h3>GitHub must be enough to…</h3><ul class="clean"><li>Understand why work was attempted</li><li>See what was proved and planned</li><li>Audit what changed and how it was verified</li><li>Know exactly which SHA was reviewed</li><li>Determine the terminal outcome</li></ul></div>
         <div class="card"><h3>Local state may improve…</h3><ul class="clean"><li>Fast status queries and TUI rendering</li><li>Streaming event history and cost tracking</li><li>In-flight process recovery</li><li>Workspace bookkeeping</li><li>Session continuation within one role</li></ul></div>
       </div>
-      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. New runs emit v2 artifacts. Legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
+      <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. The current baseline emits v2 artifacts, which remain <code>legacy-unverified</code> and cannot authorize protected work. Future protected runs may emit <code>forgedock.protected/v1</code> only through the separately reviewed implementation slices; legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
         <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
