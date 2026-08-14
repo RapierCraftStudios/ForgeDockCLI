@@ -133,7 +133,7 @@ Each completed member receives one idempotent `FORGE:TRAJECTORY` issue comment c
 
 ### D7 — Semantic state is durable; scheduling state is rebuildable
 
-GitHub artifacts/comments, PRs, branches, and issue state are semantic truth. SQLite leases, local run history, scheduler status, background-task records, and Pi sessions are operational state. Recursive orchestration must be restartable by reconstructing from durable artifacts; an in-memory callback alone is not sufficient.
+GitHub artifacts/comments, PRs, branches, and issue state are semantic truth. SQLite leases, local run history, scheduler status, background-task records, and Pi sessions are operational state. Lease rows are never fencing authority: an authenticated retained checkpoint outside the rollback scope must verify and advance every epoch, and loss/divergence denies acquire, heartbeat, release, and dependent writes until higher-epoch re-enrollment. Recursive orchestration must be restartable by reconstructing from durable artifacts; an in-memory callback alone is not sufficient.
 
 ---
 
@@ -916,7 +916,8 @@ The matrix intentionally includes `src/tui/forgedock-tools.ts` and `src/cli/main
 
 - No legacy Markdown prompt optimization.
 - No TUI-owned merge, issue creation, state transition, or authority.
-- No cross-machine lease implementation in this plan beyond preserving the existing port seam; that remains a separate portfolio item.
+- No GitHub-backed cross-machine lease implementation; the retained-checkpoint witness seam is now implemented, while a distributed witness remains a separate future adapter.
+- Lease recovery is fail-closed: token-only local state is insufficient, and explicit authenticated higher-epoch re-enrollment is required after rollback or checkpoint loss.
 - No evidence/memory graph implementation; Phase D emits provenance for that future consumer.
 - No universal guarantee that any arbitrary 30-issue set contracts to seven units; only the documented fixture has that acceptance target.
 

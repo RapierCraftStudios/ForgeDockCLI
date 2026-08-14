@@ -8,6 +8,7 @@ import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
+import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
 describe("SQLite operational repositories", () => {
@@ -157,7 +158,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("persists cross-process-style leases with stale recovery", () => {
-    const store = new SqliteRepositories(":memory:");
+    const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
     try {
       const first = store.acquire("issue-9", "worker-a", 100, 1_000);
       assert.ok(first);
@@ -166,6 +167,47 @@ describe("SQLite operational repositories", () => {
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
     } finally {
       store.close();
+    }
+  });
+
+  it("fails closed on rollback and permits only higher authenticated re-enrollment", () => {
+    const witness = new InMemoryLeaseWitness();
+    const store = new SqliteRepositories(":memory:", { witness });
+    try {
+      const first = store.acquire("issue-rollback", "worker-a", 100, 1_000);
+      assert.ok(first);
+      witness.rollback(0);
+      assert.throws(() => store.heartbeat("issue-rollback", first.token, 100, 1_010), /unverifiable|rolled back/i);
+      assert.throws(() => store.release("issue-rollback", first.token), /unverifiable|rolled back/i);
+      const higher = { ...witness.checkpoint(), epoch: 10 };
+      higher.signature = Buffer.from(`10:forgedock-test-retained-key`, "utf8").toString("base64url");
+      store.reEnroll(higher);
+      assert.throws(() => store.heartbeat("issue-rollback", first.token, 100, 1_020), /re-enrollment|unverifiable/i);
+      assert.throws(() => store.release("issue-rollback", first.token), /re-enrollment|unverifiable/i);
+      const recovered = store.acquire("issue-rollback", "worker-b", 100, 1_020);
+      assert.equal(recovered?.epoch, 11);
+      assert.equal(recovered?.token === first.token, false);
+    } finally { store.close(); }
+  });
+
+  it("retains fencing epochs across a repository restart and expiry recovery", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-restart-"));
+    const path = join(root, "state.db");
+    const witness = new InMemoryLeaseWitness();
+    const firstStore = new SqliteRepositories(path, { witness });
+    try {
+      const first = firstStore.acquire("issue-restart", "worker-a", 100, 1_000);
+      assert.ok(first);
+      firstStore.close();
+      const restarted = new SqliteRepositories(path, { witness });
+      try {
+        assert.equal(restarted.acquire("issue-restart", "worker-b", 100, 1_050), undefined);
+        const recovered = restarted.acquire("issue-restart", "worker-b", 100, 1_101);
+        assert.equal(recovered?.epoch, first.epoch + 1);
+        assert.notEqual(recovered?.token, first.token);
+      } finally { restarted.close(); }
+    } finally {
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
     }
   });
 

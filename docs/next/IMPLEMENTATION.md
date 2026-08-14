@@ -127,11 +127,11 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Explicit ScopeManifest enforcement across investigator, builder, remediator, and reviewer runtime tool grants
 - [x] Scheduler suspension statuses, typed event sinks, orchestration snapshots, and restartable remediation projections
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
-- [x] Durable same-checkout cross-process leases and heartbeats
+- [x] Durable same-checkout cross-process leases and heartbeats with authenticated retained-checkpoint fencing epochs, typed unverifiable recovery, and controller lease guards; token-only expiry recovery is insufficient, and signed higher-epoch re-enrollment is required after rollback or checkpoint loss
 - [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
 - [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, and per-node errors for CLI/status restart inspection
 - [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
-- [ ] Cross-machine/GitHub-backed lease coordination
+- [ ] Cross-machine/GitHub-backed lease coordination (the retained witness port is implemented; GitHub coordination remains a separate future adapter; local recovery remains fail-closed)
 - [ ] Promote Build Packet paths into live scheduler claims
 - [ ] Token/cost budgets in addition to worker concurrency
 - [ ] Restart/reconciliation and merge-sequencing integration tests
@@ -182,6 +182,20 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [ ] Move non-core commands to extensions/archive
 - [ ] Remove the temporary `forgedock-next` alias
 - [ ] Packaging, docs, and release hardening
+
+## Authenticated lease recovery status
+
+Token-only local lease behavior is insufficient. The Next lease port now carries a
+strictly increasing fencing epoch separate from the holder token and binds SQLite
+rows to an authenticated retained checkpoint. Missing, invalid, divergent, or
+rolled-back continuity fails closed for acquire, heartbeat, release, and guarded
+workflow mutations. Explicit signed higher-epoch re-enrollment is required after
+restore; ordinary expiry recovery is not a continuity recovery. CLI/TUI factories
+must configure a retained witness outside the operational-store backup scope.
+
+The staging review gate records validation against reviewed SHA
+`e963e098d259375c1d693efc846e6c568bf7e5e7` and the current target branch in
+[`VERIFIABLE-WORKFLOW-AUTHORITY.md`](./VERIFIABLE-WORKFLOW-AUTHORITY.md).
 
 ## Current verification
 
