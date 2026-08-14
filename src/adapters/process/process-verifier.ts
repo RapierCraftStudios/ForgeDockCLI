@@ -182,7 +182,7 @@ function terminateProcessTree(child: ChildProcess): void {
       shell: false,
       windowsHide: true,
     });
-    if (result.error) child.kill();
+    if (!windowsTaskkillSucceeded(result)) child.kill();
     return;
   }
   try {
@@ -194,6 +194,11 @@ function terminateProcessTree(child: ChildProcess): void {
     try { process.kill(-pid, "SIGKILL"); } catch { /* process group already exited */ }
   }, 2_000);
   force.unref();
+}
+
+/** A launched taskkill process can fail without populating `error`; its exit status is authoritative. */
+export function windowsTaskkillSucceeded(result: { error?: Error; status: number | null }): boolean {
+  return result.error === undefined && result.status === 0;
 }
 
 function redactVerificationOutput(output: string): string {

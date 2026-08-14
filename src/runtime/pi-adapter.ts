@@ -20,7 +20,7 @@ import { splitConfiguredModel, type ThinkingLevel } from "../core/config/forgedo
 import { runIdFromTaskId, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
-import { AgentRunError } from "./agent-runtime.js";
+import { AgentRunError, createScopeManifestReceipt, scopeManifestForReviewer } from "./agent-runtime.js";
 import type { RuntimePreflightOptions } from "./agent-runtime.js";
 import type {
   AgentEventSink,
@@ -48,9 +48,20 @@ export interface PiRuntimeOptions {
   runtimeApiKeys?: Record<string, string>;
 }
 
+type PiSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
+
+interface ActiveExecution {
+  controller: AbortController;
+  done: Promise<void>;
+  complete(): void;
+}
+
 export class PiAgentRuntime implements AgentRuntime {
   readonly #options: PiRuntimeOptions;
+  readonly #activeExecutions = new Set<ActiveExecution>();
+  readonly #activeSessions = new Set<PiSession>();
   #modelRuntime?: Promise<ModelRuntime>;
+  #closed = false;
 
   constructor(options: PiRuntimeOptions = {}) {
     this.#options = options;
@@ -101,11 +112,16 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async run<T>(
-    task: AgentTask<T>,
+    suppliedTask: AgentTask<T>,
     options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {},
   ): Promise<AgentRunResult<T>> {
+    throwIfAborted(options.signal);
+    assertToolPolicy(suppliedTask);
+    const task = effectiveRuntimeTask(suppliedTask);
     await assertRuntimeInstallAsync();
-    assertToolPolicy(task);
+    throwIfAborted(options.signal);
+    const execution = this.beginExecution(options.signal);
+    try {
     const emit = options.onEvent ?? (() => undefined);
     const startedAt = Date.now();
     const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
@@ -118,11 +134,12 @@ export class PiAgentRuntime implements AgentRuntime {
         model: modelId,
         emit,
         ...(thinking !== undefined ? { thinking } : {}),
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        signal: execution.controller.signal,
       });
       return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageUnavailable()) };
     }
     const modelRuntime = await this.modelRuntime();
+    throwIfAborted(execution.controller.signal);
     const model = modelRuntime.getModel(provider, modelId);
     if (!model) throw new Error(`Pi model not found: ${provider}/${modelId}`);
 
@@ -150,6 +167,7 @@ export class PiAgentRuntime implements AgentRuntime {
 
     const resourceLoader = createTaskResourceLoader(task);
     const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope);
+    throwIfAborted(execution.controller.signal);
     const verificationTool = task.tools.includes("verify")
       ? defineTool({
         name: "verify",
@@ -193,22 +211,26 @@ export class PiAgentRuntime implements AgentRuntime {
       }),
     });
 
-    const sessionRef = `pi_${crypto.randomUUID()}`;
-    emit({ type: "session.started", taskId: task.id, sessionRef, provider, model: modelId });
+    const sessionRef = session.sessionId;
+    this.#activeSessions.add(session);
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "agent_end") usageMessages.push(...event.messages);
       if (event.type === "auto_retry_start") retryCount += 1;
       mapEvent(task.id, event, emit, task.observability);
     });
-    const abort = () => void session.abort();
-    options.signal?.addEventListener("abort", abort, { once: true });
+    const abort = () => void session.abort().catch(() => undefined);
+    execution.controller.signal.addEventListener("abort", abort, { once: true });
+    if (execution.controller.signal.aborted) abort();
+    emit({ type: "session.started", taskId: task.id, sessionRef, provider, model: modelId, ...(task.observability ? { observability: task.observability } : {}) });
 
     try {
+      throwIfAborted(execution.controller.signal);
       await session.prompt(buildPrompt(task));
       if (submitted === undefined) {
         // A model may finish a useful read-only turn without invoking the
         // structured-output tool. Keep the same context once, then fail closed
         // so the workflow can apply its own bounded fresh-session recovery.
+        throwIfAborted(execution.controller.signal);
         await session.prompt([
           "You have not submitted the required structured result yet.",
           "Do not continue exploring or editing. Use the evidence already gathered, produce a schema-valid result, and call submit_artifact exactly once now as your final action.",
@@ -220,37 +242,68 @@ export class PiAgentRuntime implements AgentRuntime {
       emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
       const result = { output: submitted, sessionRef, provider, model: modelId };
       return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageFromMessages(usageMessages), retryCount) };
+    } catch (error) {
+      const cancelled = execution.controller.signal.aborted;
+      emit({
+        type: cancelled ? "session.cancelled" : "session.failed",
+        taskId: task.id,
+        sessionRef,
+        errorSummary: terminalErrorSummary(error, cancelled),
+        ...(task.observability ? { observability: task.observability } : {}),
+      });
+      if (error instanceof AgentRunError && error.sessionRef) throw error;
+      const detail = error instanceof Error ? error : new Error(String(error));
+      throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: error });
     } finally {
-      options.signal?.removeEventListener("abort", abort);
+      execution.controller.signal.removeEventListener("abort", abort);
       unsubscribe();
+      this.#activeSessions.delete(session);
       session.dispose();
+    }
+    } finally {
+      execution.complete();
     }
   }
 
   async resume<T>(
     sessionRef: string,
-    task: AgentTask<T>,
+    suppliedTask: AgentTask<T>,
     options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {},
   ): Promise<AgentRunResult<T>> {
-    assertToolPolicy(task);
+    throwIfAborted(options.signal);
+    assertToolPolicy(suppliedTask);
+    const task = effectiveRuntimeTask(suppliedTask);
+    await assertRuntimeInstallAsync();
+    throwIfAborted(options.signal);
     if (task.role !== "reviewer" || !process.env.FORGEDOCK_NESTED_AGENT_URL || !process.env.FORGEDOCK_NESTED_AGENT_TOKEN) {
       throw new AgentRunError("Pi can resume ForgeDock reviewers only through the persisted nested-agent bridge");
     }
     const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
     if (!provider || !modelId) throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
     const startedAt = Date.now();
-    const result = await runNestedReviewer(task, {
-      provider,
-      model: modelId,
-      emit: options.onEvent ?? (() => undefined),
-      resumeSessionRef: sessionRef,
-      ...(thinking !== undefined ? { thinking } : {}),
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    });
-    return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageUnavailable(), 0, sessionRef) };
+    const execution = this.beginExecution(options.signal);
+    try {
+      const result = await runNestedReviewer(task, {
+        provider,
+        model: modelId,
+        emit: options.onEvent ?? (() => undefined),
+        resumeSessionRef: sessionRef,
+        ...(thinking !== undefined ? { thinking } : {}),
+        signal: execution.controller.signal,
+      });
+      return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageUnavailable(), 0, sessionRef) };
+    } finally {
+      execution.complete();
+    }
   }
 
-  async close(): Promise<void> {}
+  async close(): Promise<void> {
+    this.#closed = true;
+    const executions = [...this.#activeExecutions];
+    for (const execution of executions) execution.controller.abort(new Error("Pi runtime closed"));
+    await Promise.allSettled([...this.#activeSessions].map((session) => session.abort()));
+    await Promise.allSettled(executions.map((execution) => execution.done));
+  }
 
   private modelRuntime(): Promise<ModelRuntime> {
     if (!this.#modelRuntime) {
@@ -266,6 +319,29 @@ export class PiAgentRuntime implements AgentRuntime {
       });
     }
     return this.#modelRuntime;
+  }
+
+  private beginExecution(signal?: AbortSignal): ActiveExecution {
+    if (this.#closed) throw new Error("Pi runtime is closed");
+    throwIfAborted(signal);
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort(signal?.reason ?? new Error("Agent run aborted"));
+    signal?.addEventListener("abort", forwardAbort, { once: true });
+    let resolveDone!: () => void;
+    let completed = false;
+    const execution: ActiveExecution = {
+      controller,
+      done: new Promise<void>((resolve) => { resolveDone = resolve; }),
+      complete: () => {
+        if (completed) return;
+        completed = true;
+        signal?.removeEventListener("abort", forwardAbort);
+        this.#activeExecutions.delete(execution);
+        resolveDone();
+      },
+    };
+    this.#activeExecutions.add(execution);
+    return execution;
   }
 }
 
@@ -313,6 +389,7 @@ async function runNestedReviewer<T>(
   task: AgentTask<T>,
   input: { provider: string; model: string; thinking?: ThinkingLevel; emit: AgentEventSink; resumeSessionRef?: string; signal?: AbortSignal },
 ): Promise<AgentRunResult<T>> {
+  throwIfAborted(input.signal);
   const url = process.env.FORGEDOCK_NESTED_AGENT_URL;
   const token = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
   if (!url || !token) throw new Error("Nested reviewer bridge is unavailable");
@@ -322,42 +399,60 @@ async function runNestedReviewer<T>(
   // timed-out fresh retry must not reuse the first attempt's node while its
   // cancellation is still propagating through the child runtime.
   const delegationNodeId = `forgedock-review-attempt-${crypto.randomUUID()}`;
-  const provisionalSessionRef = `nested_pending_${crypto.randomUUID()}`;
+  const provisionalSessionRef = input.resumeSessionRef ?? `nested_pending_${crypto.randomUUID()}`;
+  const scopeReceipt = createScopeManifestReceipt(task.workspace.scope);
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
-  const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean }>({
-    url,
-    token,
-    body: {
-      ownerRunId,
-      id: delegationNodeId,
-      logicalTaskId: task.id,
-      role: task.role,
-      ...(task.description ? { description: task.description } : {}),
-      objective: task.objective,
-      instructions: task.instructions,
-      context: task.context,
-      cwd: task.workspace.cwd,
-      scope: task.workspace.scope,
-      tools: task.tools,
-      outputSchema: task.outputSchema,
-      provider: input.provider,
-      model: input.model,
-      thinking: input.thinking ?? "high",
-      ...(input.resumeSessionRef ? { resumeSessionRef: input.resumeSessionRef } : {}),
-    },
-    ...(input.signal !== undefined ? { signal: input.signal } : {}),
-  });
+  let response: { status: number; payload: { output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean; scopeVersion?: number; scopeDigest?: string } };
+  try {
+    response = await postNestedAgentRequest({
+      url,
+      token,
+      body: {
+        ownerRunId,
+        id: delegationNodeId,
+        logicalTaskId: task.id,
+        role: task.role,
+        ...(task.description ? { description: task.description } : {}),
+        objective: task.objective,
+        instructions: task.instructions,
+        context: task.context,
+        cwd: task.workspace.cwd,
+        ...scopeReceipt,
+        tools: task.tools,
+        outputSchema: task.outputSchema,
+        provider: input.provider,
+        model: input.model,
+        thinking: input.thinking ?? "high",
+        ...(input.resumeSessionRef ? { resumeSessionRef: input.resumeSessionRef } : {}),
+      },
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    });
+  } catch (error) {
+    const cancelled = input.signal?.aborted === true;
+    emitNestedTerminal(task, input, cancelled ? "session.cancelled" : "session.failed", provisionalSessionRef, error);
+    const detail = error instanceof Error ? error : new Error(String(error));
+    throw new AgentRunError(detail.message, { sessionRef: provisionalSessionRef, resumable: false, cause: error });
+  }
   const payload = response.payload;
   if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
+    const sessionRef = payload.sessionRef ?? provisionalSessionRef;
+    emitNestedTerminal(task, input, input.signal?.aborted ? "session.cancelled" : "session.failed", sessionRef, payload.error);
     throw new AgentRunError(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
-      ...(payload.sessionRef ? { sessionRef: payload.sessionRef } : {}),
+      sessionRef,
       resumable: payload.resumable === true,
     });
   }
   const sessionRef = payload.sessionRef ?? provisionalSessionRef;
+  if (payload.scopeVersion !== scopeReceipt.scopeVersion || payload.scopeDigest !== scopeReceipt.scopeDigest) {
+    const error = new Error("Nested reviewer bridge did not acknowledge the exact scope manifest receipt");
+    emitNestedTerminal(task, input, "session.failed", sessionRef, error);
+    throw new AgentRunError(error.message, { sessionRef, resumable: false, cause: error });
+  }
   if (!Check(task.outputSchema, payload.output)) {
     const details = [...Errors(task.outputSchema, payload.output)].slice(0, 5).map((error) => error.message).join("; ");
-    throw new AgentRunError(`Nested reviewer returned an invalid structured result: ${details}`, { sessionRef, resumable: false });
+    const error = new AgentRunError(`Nested reviewer returned an invalid structured result: ${details}`, { sessionRef, resumable: false });
+    emitNestedTerminal(task, input, "session.failed", sessionRef, error);
+    throw error;
   }
   input.emit({ type: "artifact.submitted", taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
   input.emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
@@ -368,6 +463,22 @@ async function runNestedReviewer<T>(
     provider: payload.provider ?? input.provider,
     model: payload.model ?? input.model,
   };
+}
+
+function emitNestedTerminal<T>(
+  task: AgentTask<T>,
+  input: { emit: AgentEventSink },
+  type: "session.failed" | "session.cancelled",
+  sessionRef: string,
+  error: unknown,
+): void {
+  input.emit({
+    type,
+    taskId: task.id,
+    sessionRef,
+    errorSummary: terminalErrorSummary(error, type === "session.cancelled"),
+    ...(task.observability ? { observability: task.observability } : {}),
+  });
 }
 
 function createAgentReceipt<T>(
@@ -628,6 +739,27 @@ function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink
   }
 }
 
+function effectiveRuntimeTask<T>(task: AgentTask<T>): AgentTask<T> {
+  if (task.role !== "reviewer") return task;
+  return {
+    ...task,
+    workspace: { ...task.workspace, mode: "read-only", scope: scopeManifestForReviewer() },
+  };
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Agent run aborted");
+}
+
+function terminalErrorSummary(error: unknown, cancelled: boolean): string {
+  if (cancelled) return "Agent session cancelled";
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (/ended without calling submit_artifact/i.test(message)) return "Agent session ended without submitting the required artifact";
+  if (/invalid structured result/i.test(message)) return "Agent session returned an invalid structured result";
+  if (/scope manifest|scope receipt/i.test(message)) return "Agent session scope validation failed";
+  return "Agent session failed";
+}
+
 function assertToolPolicy<T>(task: AgentTask<T>): void {
   const grants = new Set<ToolGrant>(task.tools);
   if (!task.workspace.scope || !task.workspace.scope.readRoots.length) {
@@ -635,6 +767,13 @@ function assertToolPolicy<T>(task: AgentTask<T>): void {
   }
   if (task.workspace.mode === "read-only" && (grants.has("edit") || grants.has("write"))) {
     throw new Error(`Read-only task ${task.id} requested mutation tools`);
+  }
+  if (task.role === "reviewer") {
+    const allowed = new Set<ToolGrant>(["read", "grep", "find", "ls"]);
+    if (task.workspace.mode !== "read-only" || task.tools.some((tool) => !allowed.has(tool))
+      || task.workspace.scope.writeRoots.length || task.workspace.scope.writePaths?.length) {
+      throw new Error(`Reviewer task ${task.id} must be whole-checkout read-only with no write authority`);
+    }
   }
   if ((grants.has("edit") || grants.has("write"))
     && !task.workspace.scope.writeRoots.length

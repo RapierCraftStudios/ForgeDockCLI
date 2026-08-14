@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
@@ -41,6 +41,7 @@ export class ForgeDockBackgroundTasks {
   readonly #pi: ExtensionAPI;
   readonly #live = new Map<string, LiveTask>();
   readonly #records = new Map<string, BackgroundTaskRecord>();
+  readonly #directories = new Set<string>();
   #ticker: NodeJS.Timeout | undefined;
   #ctx: ExtensionContext | undefined;
   #observationAdapter: BackgroundTaskObservationAdapter | undefined;
@@ -60,18 +61,20 @@ export class ForgeDockBackgroundTasks {
   initialize(ctx: ExtensionContext): void {
     this.#ctx = ctx;
     const directory = join(ctx.cwd, ".forgedock", "tasks");
+    this.#directories.add(directory);
     if (!existsSync(directory)) return;
     for (const name of readdirSync(directory)) {
       if (!name.endsWith(".json")) continue;
       try {
-        const record = JSON.parse(readFileSync(join(directory, name), "utf8")) as BackgroundTaskRecord;
-        if (!record.id || !record.logPath || !record.startedAt) continue;
-        if (record.status === "running") {
+        const parsed = JSON.parse(readFileSync(join(directory, name), "utf8")) as unknown;
+        if (!isBackgroundTaskRecord(parsed) || !recordBelongsToTaskFile(parsed, directory, name)) continue;
+        const record = parsed;
+        if (record.status === "running" || record.status === "detached") {
+          record.status = "detached";
           if (isProcessAlive(record.pid)) {
             // A terminal restart must not turn a still-running controller into a
             // false failure. Adopt it as a detached task and supervise its PID
             // and durable log until it exits.
-            record.status = "detached";
             this.#live.set(record.id, {
               record,
               ...(record.stderrLogPath ? { stderrLogPath: record.stderrLogPath } : {}),
@@ -79,11 +82,11 @@ export class ForgeDockBackgroundTasks {
               stderrOffset: fileSize(record.stderrLogPath),
               adopted: true,
             });
-          } else {
-            record.status = "failed";
-            record.completedAt = new Date().toISOString();
-            this.persist(record);
           }
+          // A restarted supervisor cannot recover an already-consumed process
+          // exit code. Persist only the operational loss of attachment; the
+          // controller/GitHub result must decide semantic completion or failure.
+          this.persist(record);
         }
         this.#records.set(record.id, record);
       } catch {
@@ -106,6 +109,7 @@ export class ForgeDockBackgroundTasks {
     }
     const id = `task_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`;
     const directory = join(input.cwd, ".forgedock", "tasks");
+    this.#directories.add(directory);
     mkdirSync(directory, { recursive: true });
     const logPath = join(directory, `${id}.log`);
     const stderrLogPath = join(directory, `${id}.stderr.log`);
@@ -145,11 +149,19 @@ export class ForgeDockBackgroundTasks {
     this.#live.set(id, live);
     this.persist(record);
     this.#observationAdapter?.started(record);
-    child.once("error", (error) => void this.finish(id, "failed", undefined, error.message));
-    child.once("exit", (code, signal) => {
+    const onError = (error: Error) => void this.finish(id, "failed", undefined, error.message);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
       const status: BackgroundTaskStatus = signal ? "cancelled" : code === 0 ? "completed" : code === 2 ? "blocked" : "failed";
       void this.finish(id, status, code ?? undefined);
-    });
+    };
+    child.once("error", onError);
+    child.once("exit", onExit);
+    // Very short-lived controllers can exit between spawn() and listener
+    // registration. Node retains their terminal fields, so reconcile once
+    // after subscribing instead of relying on the event alone.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      queueMicrotask(() => onExit(child.exitCode, child.signalCode));
+    }
     child.unref();
     this.ensureTicker();
     this.renderStatus();
@@ -171,6 +183,14 @@ export class ForgeDockBackgroundTasks {
       const record = this.recordsFromDisk().get(id);
       if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
       if (["completed", "blocked", "failed", "cancelled"].includes(record.status)) return { ...record, args: [...record.args] };
+      if ((record.status === "running" || record.status === "detached") && !this.#live.has(id) && !isProcessAlive(record.pid)) {
+        if (record.status === "running") {
+          record.status = "detached";
+          this.#records.set(record.id, record);
+          this.persist(record);
+        }
+        throw new Error(`ForgeDock controller task ${id} exited while detached without a locally observable controller result; inspect durable workflow state and resume explicitly`);
+      }
       const outputSize = fileSize(record.logPath) + fileSize(record.stderrLogPath);
       if (outputSize > lastOutputSize) {
         lastOutputSize = outputSize;
@@ -199,14 +219,17 @@ export class ForgeDockBackgroundTasks {
   }
 
   cancel(id: string): BackgroundTaskRecord {
+    const latest = this.recordsFromDisk().get(id);
     const live = this.#live.get(id);
     if (!live) {
-      const record = this.recordsFromDisk().get(id);
-      if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
-      if (record.status === "running" || record.status === "detached") {
+      if (!latest) throw new Error(`Unknown ForgeDock background task: ${id}`);
+      if (latest.status === "running" || latest.status === "detached") {
         throw new Error(`Task ${id} belongs to another or interrupted ForgeDock session and is not supervised here`);
       }
-      return record;
+      return latest;
+    }
+    if (["completed", "blocked", "failed", "cancelled"].includes(live.record.status)) {
+      return { ...live.record, args: [...live.record.args] };
     }
     live.record.status = "cancelled";
     live.record.completedAt = new Date().toISOString();
@@ -216,10 +239,19 @@ export class ForgeDockBackgroundTasks {
     return { ...live.record, args: [...live.record.args] };
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options: { cancel?: boolean } = {}): Promise<void> {
     const live = [...this.#live.values()];
-    for (const task of live) this.cancel(task.record.id);
-    await Promise.allSettled(live.map((task) => task.cleanup?.()));
+    if (options.cancel ?? true) {
+      for (const task of live) this.cancel(task.record.id);
+      await Promise.allSettled(live.map((task) => task.cleanup?.()));
+    } else {
+      for (const task of live) {
+        if (task.record.status === "running") {
+          task.record.status = "detached";
+          this.persist(task.record);
+        }
+      }
+    }
     this.#live.clear();
     this.stopTicker();
     this.#ctx?.ui.setStatus("forgedock-tasks", undefined);
@@ -262,7 +294,23 @@ export class ForgeDockBackgroundTasks {
   }
 
   private recordsFromDisk(): Map<string, BackgroundTaskRecord> {
-    return this.#records;
+    for (const directory of this.#directories) {
+      if (!existsSync(directory)) continue;
+      for (const name of readdirSync(directory)) {
+        if (!name.endsWith(".json")) continue;
+        try {
+          const record = JSON.parse(readFileSync(join(directory, name), "utf8")) as unknown;
+          if (!isBackgroundTaskRecord(record) || !recordBelongsToTaskFile(record, directory, name)) continue;
+          this.#records.set(record.id, record);
+          const live = this.#live.get(record.id);
+          if (live) live.record = record;
+        } catch {
+          // Atomic writers may leave unrelated or damaged operational files;
+          // keep the last valid projection and retry on the next observation.
+        }
+      }
+    }
+    return new Map(this.#records);
   }
 
   private persist(record: BackgroundTaskRecord): void {
@@ -288,11 +336,23 @@ export class ForgeDockBackgroundTasks {
   }
 
   private reconcileAdoptedTasks(): void {
+    this.recordsFromDisk();
     for (const task of [...this.#live.values()]) {
-      if (!task.adopted || task.record.status !== "detached") continue;
+      if (!task.adopted) continue;
+      if (["completed", "blocked", "failed", "cancelled"].includes(task.record.status)) {
+        void this.finish(task.record.id, task.record.status, task.record.exitCode, "Recovered durable controller task result");
+        continue;
+      }
+      if (task.record.status !== "detached") continue;
       if (isProcessAlive(task.record.pid)) continue;
-      void this.finish(task.record.id, "failed", undefined, "Detached controller exited before this terminal reattached");
+      this.captureLogDeltas(task);
+      this.#live.delete(task.record.id);
+      const message = `${renderRecord(task.record)} — detached controller exited without an observable exit result; durable workflow state remains authoritative\nLog: ${task.record.logPath}`;
+      this.#ctx?.ui.notify(message, "warning");
+      try { this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
+      this.renderStatus();
     }
+    if (!this.#live.size) this.stopTicker();
   }
 
   private renderStatus(): void {
@@ -306,6 +366,36 @@ export class ForgeDockBackgroundTasks {
     const elapsed = recent ? Math.max(0, Math.round((Date.now() - Date.parse(recent.startedAt)) / 1_000)) : 0;
     this.#ctx.ui.setStatus("forgedock-tasks", `◆ ${running.length} background task${running.length === 1 ? "" : "s"} · ${recent?.id ?? ""} · ${elapsed}s`);
   }
+}
+
+function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<BackgroundTaskRecord>;
+  return typeof record.id === "string" && Boolean(record.id)
+    && typeof record.command === "string"
+    && Array.isArray(record.args) && record.args.every((arg) => typeof arg === "string")
+    && typeof record.cwd === "string" && Boolean(record.cwd)
+    && Number.isInteger(record.pid) && (record.pid ?? 0) > 0
+    && typeof record.logPath === "string" && Boolean(record.logPath)
+    && typeof record.startedAt === "string"
+    && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
+}
+
+function recordBelongsToTaskFile(record: BackgroundTaskRecord, directory: string, name: string): boolean {
+  if (!/^task_[A-Za-z0-9_-]{1,120}$/.test(record.id) || name !== `${record.id}.json`) return false;
+  const expected = resolve(record.cwd, ".forgedock", "tasks");
+  const actual = resolve(directory);
+  if (!samePath(expected, actual)) return false;
+  if (!samePath(record.logPath, join(actual, `${record.id}.log`))) return false;
+  return record.stderrLogPath === undefined || samePath(record.stderrLogPath, join(actual, `${record.id}.stderr.log`));
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = resolve(left);
+  const normalizedRight = resolve(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 function fileSize(path: string | undefined): number {

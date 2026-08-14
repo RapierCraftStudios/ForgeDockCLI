@@ -6,7 +6,6 @@ import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
-import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
   decideSubjectAdmission,
@@ -21,9 +20,13 @@ import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
-import { createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
+import { bootstrapLocalLeaseWitness, createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
+import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import {
   scopeManifestForBuildPacket,
+  scopeDiscoveryRoots,
+  scopeManifestFor,
+  STANDARD_SCOPE_DISCOVERY_ROOTS,
   STANDARD_SCOPE_METADATA_ROOTS,
   TelemetryAgentRuntime,
   type AgentEvent,
@@ -37,7 +40,7 @@ import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type ThinkingLevel, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
@@ -45,16 +48,16 @@ import { promoteBranch, PromotionExecutionError } from "../workflows/promotion/p
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
-import { ClaimPromotionConflictError, materializeClaimDependencies, runSchedule, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
-import { orchestrationEventFromSchedule } from "../workflows/orchestrate/events.js";
-import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
+import { OrchestrationController } from "../workflows/orchestrate/controller.js";
+import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
 import { AgentEventStreamWriter, observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "./agent-event-stream.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
 import type { RunState } from "../core/state/machine.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
-import { parseOrchestrationIssueNumbers } from "./argument-parser.js";
+import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
@@ -86,6 +89,10 @@ async function main(argv: string[]): Promise<void> {
   const command = argv[0] ?? "help";
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+  if (command === "lease-witness-bootstrap") {
+    bootstrapLeaseWitness(argv.slice(1));
     return;
   }
   const observer: ForgeDockObserver = await createForgeDockObserver(process.cwd(), { component: "forgedock-controller" });
@@ -150,7 +157,7 @@ async function main(argv: string[]): Promise<void> {
 async function status(argv: string[]): Promise<void> {
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const statusWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!statusWitness) throw new Error("Lease witness configuration is required for status/recovery inspection; token-only local leases are disabled");
+  if (!statusWitness) throw new Error("Authenticated lease witness is required for status/recovery inspection; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: statusWitness });
   try {
     if (argv.includes("--promotions")) {
@@ -259,7 +266,7 @@ async function status(argv: string[]): Promise<void> {
 
 async function workOn(argv: string[]): Promise<void> {
   requirePiNodeVersion();
-  const issueArg = argv.find((arg) => !arg.startsWith("-"));
+  const issueArg = parseWorkOnIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) {
     throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
   }
@@ -411,10 +418,11 @@ async function workOn(argv: string[]): Promise<void> {
 
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const thinking = configuredWorkerThinking(argv);
   const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const leaseWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!leaseWitness) throw new Error("Lease witness configuration is required: set FORGEDOCK_LEASE_WITNESS_PATH, FORGEDOCK_LEASE_WITNESS_PUBLIC_KEY, and FORGEDOCK_LEASE_WITNESS_PRIVATE_KEY; token-only local leases are disabled");
+  if (!leaseWitness) throw new Error("Authenticated lease witness is required; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: leaseWitness });
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
@@ -431,6 +439,7 @@ async function workOn(argv: string[]): Promise<void> {
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
     ...planning,
   }, store);
   const onAgentEvent = (event: AgentEvent) => {
@@ -445,7 +454,11 @@ async function workOn(argv: string[]): Promise<void> {
           ? "agent session started"
           : event.type === "session.completed"
             ? "agent session completed"
-            : event.type === "artifact.submitted" ? "artifact submitted" : "agent activity";
+            : event.type === "session.failed"
+              ? `agent session failed: ${event.errorSummary}`
+              : event.type === "session.cancelled"
+                ? `agent session cancelled: ${event.errorSummary}`
+                : event.type === "artifact.submitted" ? "artifact submitted" : "agent activity";
     const milestone = observability ? [
       `phase ${observability.phase}`,
       observability.cycle ? `review cycle ${observability.cycle.current}/${observability.cycle.total}` : "",
@@ -540,7 +553,95 @@ async function workOn(argv: string[]): Promise<void> {
       const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
       const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
       const packet = latestArtifactOfKind(runArtifacts, "BuildPacket");
-      if (!intentArtifact || !investigation || investigation.payload.outcome !== "confirmed" || !packet) {
+      if (!intentArtifact) {
+        throw new Error(`Run ${resumeRunId} does not contain the durable Intent required for ${admission.checkpoint} resume`);
+      }
+      if (admission.checkpoint === "investigation" || admission.checkpoint === "preparation") {
+        if (admission.checkpoint === "preparation" && (!investigation || investigation.payload.outcome !== "confirmed")) {
+          throw new Error(`Run ${resumeRunId} does not contain the confirmed Investigation required for preparation resume`);
+        }
+        const earlyArtifactIds: Partial<Record<ArtifactKind, string[]>> = {};
+        for (const artifact of runArtifacts) earlyArtifactIds[artifact.kind] = [...(earlyArtifactIds[artifact.kind] ?? []), artifact.id];
+        const earlyAffectedFiles = affectedFilesFromIssueBody(issue.body);
+        const earlyScopeManifest = scopeManifestFor("issue-hints", {
+          affectedFiles: earlyAffectedFiles,
+          metadataRoots: [
+            ...STANDARD_SCOPE_DISCOVERY_ROOTS,
+            ...STANDARD_SCOPE_METADATA_ROOTS,
+            ...scopeDiscoveryRoots(earlyAffectedFiles),
+          ],
+        });
+        const frozenTarget = parentRemediation
+          ? { ...runTargetForLane(lane, effectiveOrchestration.productionTarget), targetBranch: parentRemediation.parentBranch }
+          : runTargetForLane(lane, effectiveOrchestration.productionTarget);
+        const recoveredEarlyRun = {
+          schema: "forgedock.run/v1" as const,
+          runId: resumeRunId,
+          workflow: "work-on" as const,
+          subject,
+          state: admission.state,
+          attempt: 1,
+          version: 0,
+          ...frozenTarget,
+          createdAt: intentArtifact.createdAt,
+          updatedAt: investigation?.createdAt ?? intentArtifact.createdAt,
+          artifactIds: earlyArtifactIds,
+          scopeManifest: earlyScopeManifest,
+        };
+        let earlyRun = await store.load(resumeRunId);
+        if (!earlyRun) {
+          await store.create(recoveredEarlyRun);
+          earlyRun = recoveredEarlyRun;
+        } else if (earlyRun.subject.repo !== subject.repo || earlyRun.subject.issue !== subject.issue) {
+          throw new Error(`Durable run ${resumeRunId} targets a different issue`);
+        } else if (earlyRun.state !== admission.state || earlyRun.targetBranch !== frozenTarget.targetBranch) {
+          process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${earlyRun.state}) from durable GitHub ${admission.state} checkpoint\n`);
+          await store.rebuildRun(recoveredEarlyRun);
+          earlyRun = recoveredEarlyRun;
+        } else {
+          earlyRun = { ...earlyRun, ...frozenTarget, scopeManifest: earlyRun.scopeManifest ?? earlyScopeManifest };
+        }
+        const git = new GitWorktreeManager(process.cwd());
+        const verifier = new ProcessVerificationRunner();
+        const workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef: `origin/${deliveryTargetBranch}` });
+        const verification = discoverVerificationCommands(process.cwd(), workspace.baseRef);
+        const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef: workspace.baseRef });
+        process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
+        const result = await resumeEarlyWorkOn({
+          checkpoint: admission.checkpoint,
+          run: earlyRun,
+          intent: intentArtifact,
+          ...(investigation !== undefined ? { investigation } : {}),
+          priorArtifacts: runArtifacts,
+          workspace,
+          baseBranch: deliveryTargetBranch,
+          scopeHints: { affectedFiles: earlyAffectedFiles, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+          verification,
+          baselineChecks,
+          scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
+          maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
+          maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
+          maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+          remediationDepth: parentRemediation?.remediationDepth ?? 0,
+          ...(parentRemediation !== undefined ? { parentRemediation } : {}),
+          subjectEvidence,
+          ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
+          ...(batchMembers.length ? { batchMembers } : {}),
+          ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
+          autoMerge,
+          ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...planning,
+          signal: leaseController.signal,
+        }, { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent });
+        const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
+        const presentation = runStatePresentation(result.run.state);
+        process.stdout.write(`${statusGlyph(result.awaitingHuman ? "active" : presentation.glyph, mode)} Resumed run ${result.run.runId} · ${result.awaitingHuman ? "awaiting human merge" : presentation.label}${suffix}\n`);
+        if (result.run.state !== "completed") process.exitCode = 2;
+        return;
+      }
+      if (!investigation || investigation.payload.outcome !== "confirmed" || !packet) {
         throw new Error(`Run ${resumeRunId} does not contain the Intent, confirmed Investigation, and frozen Build Packet required for ${admission.checkpoint} resume`);
       }
       const durableBatchMemberContracts = intentArtifact.payload.batchMemberContracts ?? batchMemberContracts;
@@ -790,7 +891,15 @@ async function workOn(argv: string[]): Promise<void> {
         ...(model !== undefined ? { model } : {}),
         ...planning,
         signal: leaseController.signal,
-      }, { runtime, artifacts, runs, decomposer: github, onAgentEvent });
+      }, {
+        runtime,
+        artifacts,
+        runs,
+        // A dry-run may classify work as decomposable, but it must never turn
+        // that proposal into GitHub child issues.
+        ...(dryRun ? {} : { decomposer: github }),
+        onAgentEvent,
+      });
       const finalized = !dryRun && result.run.state === "invalid" && result.outcome?.payload.status === "invalid"
         ? await completeInvalidWorkItem({ run: result.run, investigation: result.investigation, outcome: result.outcome }, { host: github, artifacts })
         : result;
@@ -838,6 +947,7 @@ async function workOn(argv: string[]): Promise<void> {
       verifier,
       host: github,
       telemetry: store,
+      leaseGuard,
       onAgentEvent,
     });
     const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
@@ -853,7 +963,7 @@ async function workOn(argv: string[]): Promise<void> {
 }
 
 async function resetIssue(argv: string[]): Promise<void> {
-  const issueArg = argv.find((arg) => !arg.startsWith("-"));
+  const issueArg = parseResetIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) throw new Error("Usage: forgedock-next reset <issue-number> [--repo owner/repo] [--reason text]");
   const github = new GitHubClient(process.cwd());
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
@@ -1005,7 +1115,7 @@ async function promote(argv: string[]): Promise<void> {
 
 async function reviewPr(argv: string[]): Promise<void> {
   requirePiNodeVersion();
-  const prArg = argv.find((arg) => !arg.startsWith("-"));
+  const prArg = parseReviewPullRequestArgument(argv);
   if (!prArg || !/^\d+$/.test(prArg)) throw new Error("Usage: forgedock-next review-pr <pr-number> [--repo owner/repo] [--issue number]");
   process.stdout.write(`${renderHeader({ subtitle: "review-pr · fresh context · SHA anchored" })}\n\n`);
   let github = new GitHubClient(process.cwd());
@@ -1016,6 +1126,7 @@ async function reviewPr(argv: string[]): Promise<void> {
   if (issueValue && !/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const thinking = configuredWorkerThinking(argv);
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const reviewWitness = createConfiguredLeaseWitness(process.cwd());
@@ -1035,6 +1146,7 @@ async function reviewPr(argv: string[]): Promise<void> {
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
   }, store);
   try {
     await preflightRuntime(runtime, {
@@ -1065,7 +1177,14 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm|--auto] [--rerun]");
+  const orchestrationResumeId = option(argv, "--resume");
+  if (orchestrationResumeId !== undefined) {
+    if (!orchestrationResumeId.trim()) throw new Error("orchestrate --resume requires a durable orchestration ID");
+    if (issueNumbers.length) throw new Error("orchestrate --resume cannot be combined with a new issue selection");
+    await resumeCliOrchestration(argv, orchestrationResumeId);
+    return;
+  }
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun] | forgedock-next orchestrate --resume <dag-id>");
   const config = readForgeDockConfig(process.cwd());
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
@@ -1174,15 +1293,17 @@ async function orchestrate(argv: string[]): Promise<void> {
   assembly = assembleWorkUnits(items, assemblyOptions);
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
+  const thinking = configuredWorkerThinking(argv);
   const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const orchestrationWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!orchestrationWitness) throw new Error("Lease witness configuration is required before orchestrate dispatch; token-only local leases are disabled");
+  if (!orchestrationWitness) throw new Error("Authenticated lease witness is required before orchestrate dispatch; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: orchestrationWitness });
   github = new GitHubClient(process.cwd(), store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
     ...planning,
   }, store);
   const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
@@ -1234,73 +1355,24 @@ async function orchestrate(argv: string[]): Promise<void> {
     const runs = activeObserver
       ? observeRunRepository(baseRuns, activeObserver, { repository: repository.repo, orchestrationId })
       : baseRuns;
-    const orchestrationCreatedAt = new Date().toISOString();
-    let orchestrationRecord: OrchestrationRecord = {
-      schema: "forgedock.orchestration/v1",
-      orchestrationId,
-      repository: repository.repo,
-      requestedIssueNumbers: [...issueNumbers],
-      issueNumbers: [...issueNumbers],
-      maxParallel: effective.maxParallel,
-      autoMerge,
-      ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-      status: "running",
-      createdAt: orchestrationCreatedAt,
-      updatedAt: orchestrationCreatedAt,
-      serializationEdges: scheduleItems.edges.map((edge) => ({
-        predecessor: edge.predecessor,
-        successor: edge.successor,
-        overlappingClaims: [...edge.overlappingClaims],
-      })),
-      nodes: scheduleItems.items.map((item): OrchestrationNodeRecord => ({
-        id: item.id,
-        issue: item.issue,
-        priority: item.priority,
-        dependencies: [...item.dependencies],
-        claims: [...item.claims],
-        ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
-        ...(item.productionTarget !== undefined ? { productionTarget: item.productionTarget } : {}),
-        ...(item.affectedFiles ? { affectedFiles: [...item.affectedFiles] } : {}),
-        ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
-        ...(item.title ? { title: item.title } : {}),
-        ...(item.summary ? { summary: item.summary } : {}),
-        status: "queued",
-        childRunIds: [],
-      })),
-    };
-    await store.createOrchestration(orchestrationRecord);
-    if (activeObserver) {
-      await activeObserver.emit({
-        producer: activeObserver.producer,
-        identity: { repository: repository.repo, orchestrationId },
-        source: "workflow",
-        channel: "lifecycle",
-        kind: "orchestration.created",
-        payload: { status: orchestrationRecord.status, nodeCount: orchestrationRecord.nodes.length },
-      });
-    }
-    let orchestrationPersistQueue = Promise.resolve();
-    const persistOrchestration = (next: OrchestrationRecord): void => {
-      orchestrationRecord = next;
-      orchestrationPersistQueue = orchestrationPersistQueue.then(() => store.saveOrchestration(next));
-    };
-    const updateOrchestrationNode = (nodeId: string, patch: Partial<OrchestrationNodeRecord>): void => {
-      persistOrchestration({
-        ...orchestrationRecord,
-        updatedAt: new Date().toISOString(),
-        nodes: orchestrationRecord.nodes.map((node) => node.id === nodeId ? { ...node, ...patch } : node),
-      });
-    };
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
-    const schedule = await runSchedule(scheduleItems.items, effective.maxParallel, async (item, scheduler) => {
+    const controller = new OrchestrationController({
+      repository: store,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      transportCapacity: effective.maxParallel,
+      worker: async (item, controllerContext) => {
       const lease = store.acquire(item.id, owner, 60_000);
       if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
-      const controller = new AbortController();
+      const workerAbort = new AbortController();
       const heartbeat = setInterval(() => {
-        try { store.heartbeat(item.id, lease.token, 60_000); }
-        catch (error) { controller.abort(error); }
+        try {
+          store.heartbeat(item.id, lease.token, 60_000);
+          void controllerContext.heartbeat();
+        } catch (error) {
+          workerAbort.abort(error);
+        }
       }, 20_000);
       try {
         const subject = { repo: repository.repo, issue: item.issue };
@@ -1318,6 +1390,10 @@ async function orchestrate(argv: string[]): Promise<void> {
           throw new Error(admission.reason);
         }
         if (admission.action === "resume") {
+          await controllerContext.recordTask({
+            runId: admission.runId,
+            ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+          });
           clearInterval(heartbeat);
           store.release(item.id, lease.token);
           const resumeArgs = [String(item.issue), "--repo", repository.repo, "--resume"];
@@ -1332,6 +1408,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           );
           if (provider !== undefined) resumeArgs.push("--provider", provider);
           if (model !== undefined) resumeArgs.push("--model", model);
+          if (thinking !== undefined) resumeArgs.push("--thinking", thinking);
           if (planning.planningProvider !== undefined && planning.planningModel !== undefined) resumeArgs.push("--planning-model", `${planning.planningProvider}/${planning.planningModel}`);
           if (planning.planningThinking !== undefined) resumeArgs.push("--planning-thinking", planning.planningThinking);
           await workOn(resumeArgs);
@@ -1341,7 +1418,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
           });
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
-          updateOrchestrationNode(item.id, { childRunIds: resumed.runId ? [resumed.runId] : [] });
+          if (resumed.runId) await controllerContext.recordTask({ runId: resumed.runId });
           outcomes.set(item.id, resumed.state);
           if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; ${resumed.warnings.join("; ") || "durable recovery details are required"}`);
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
@@ -1364,6 +1441,10 @@ async function orchestrate(argv: string[]): Promise<void> {
             sourceUrl: issue.url,
           },
         });
+        await controllerContext.recordTask({
+          runId: intent.runId,
+          ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+        });
         const baseRef = `origin/${parentRemediation?.parentBranch ?? lane.targetBranch}`;
         const verification = discoverVerificationCommands(process.cwd(), baseRef);
         process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
@@ -1373,7 +1454,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             intent, repoPath: process.cwd(), lane,
             verification, autoMerge,
             ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-            signal: controller.signal,
+            signal: workerAbort.signal,
             scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
             maxRemediationCycles: effective.maxRemediationCycles,
             maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
@@ -1386,14 +1467,14 @@ async function orchestrate(argv: string[]): Promise<void> {
               metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
             },
             onClaimsPromoted: (paths) => {
-              scheduler.promoteClaims(paths);
-              updateOrchestrationNode(item.id, { claims: [...paths] });
+              controllerContext.promoteClaims(paths);
             },
             subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
             ...(batchMembers.length ? { batchMembers } : {}),
             ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
             ...(provider !== undefined ? { provider } : {}),
             ...(model !== undefined ? { model } : {}),
+            ...(thinking !== undefined ? { thinking } : {}),
             ...planning,
           }, {
             runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
@@ -1401,8 +1482,8 @@ async function orchestrate(argv: string[]): Promise<void> {
             onAgentEvent: (event) => writeAgentEvent(event, item.id),
           });
         } catch (error) {
-          if (controller.signal.aborted || error instanceof LeaseContinuityError) {
-            controller.abort(error);
+          if (workerAbort.signal.aborted || error instanceof LeaseContinuityError) {
+            workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
           }
           if (error instanceof ClaimPromotionConflictError) {
@@ -1411,7 +1492,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           }
           throw error;
         }
-        updateOrchestrationNode(item.id, { childRunIds: [result.run.runId] });
+        await controllerContext.recordTask({ runId: result.run.runId });
         outcomes.set(item.id, result.run.state);
         if (result.awaitingHuman) {
           process.stdout.write(`${statusGlyph("active", mode)} ${item.id} awaiting human merge${result.pullRequest?.url ? ` · ${result.pullRequest.url}` : ""}\n`);
@@ -1440,33 +1521,29 @@ async function orchestrate(argv: string[]): Promise<void> {
         clearInterval(heartbeat);
         try { store.release(item.id, lease.token); } catch { /* fail-closed recovery retains the lease row */ }
       }
-    }, {
-      serializationEdges: scheduleItems.edges,
-      onEvent: (scheduleEvent) => {
-        const snapshot = buildOrchestrationSnapshot({
-          orchestrationId,
-          items: scheduleItems.items,
-          serializationEdges: scheduleItems.edges,
-          result: {
-            status: new Map(scheduleEvent.status),
-            errors: new Map(scheduleEvent.errors),
-            ...(scheduleEvent.waitReasons ? { waitReasons: new Map(scheduleEvent.waitReasons) } : {}),
-          },
-        });
-        const nodes = orchestrationRecord.nodes.map((node) => {
-          const status = scheduleEvent.status.get(node.id);
-          const error = scheduleEvent.errors.get(node.id);
-          const waitReason = scheduleEvent.waitReasons?.get(node.id);
-          const { waitReason: _previousWaitReason, ...withoutWaitReason } = node;
-          return {
-            ...withoutWaitReason,
-            ...(status !== undefined ? { status } : {}),
-            ...(waitReason ? { waitReason } : {}),
-            ...(error !== undefined ? { error: error.message } : {}),
-          };
-        });
-        persistOrchestration({ ...orchestrationRecord, updatedAt: new Date().toISOString(), nodes });
-        const event = orchestrationEventFromSchedule(scheduleEvent, snapshot);
+      },
+      reconcileWorker: async ({ item }) => {
+        const subject = { repo: repository.repo, issue: item.issue };
+        const issueArtifacts = await artifacts.list(subject);
+        const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+        if (reconciled.state === "completed") {
+          return { disposition: "terminal", result: { status: "completed" }, reason: "Durable Outcome is complete" };
+        }
+        if (reconciled.state === "invalid") {
+          return { disposition: "terminal", result: { status: "invalid", error: `#${item.issue} is authoritatively invalid` } };
+        }
+        if (reconciled.state === "decomposed") {
+          return { disposition: "terminal", result: { status: "skipped", error: `#${item.issue} decomposed into replacement scope` } };
+        }
+        if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
+          return { disposition: "interrupted", reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
+        }
+        const terminal = terminalCliOrchestrationResult(item.issue, issueArtifacts, reconciled);
+        if (terminal) return { disposition: "terminal", result: terminal };
+        return { disposition: "interrupted", reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
+      },
+      onEvent: (event: OrchestrationEvent) => {
+        const snapshot = event.snapshot;
         void activeObserver?.emit({
           producer: activeObserver.producer,
           identity: { repository: repository.repo, orchestrationId },
@@ -1478,27 +1555,37 @@ async function orchestrate(argv: string[]): Promise<void> {
         process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
+    const controllerResult = await controller.createAndRun({
+      orchestrationId,
+      repository: repository.repo,
+      requestedIssueNumbers: issueNumbers,
+      items: scheduleItems.items,
+      serializationEdges: scheduleItems.edges,
+      maxParallel: effective.maxParallel,
+      autoMerge,
+      ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+      plan: {
+        adapter: "cli",
+        batchingPolicy: effective.batchingPolicy,
+        scopeExpansion: effective.scopeExpansion,
+        maxRemediationCycles: effective.maxRemediationCycles,
+        maxRemediationDepth: effective.maxRemediationDepth,
+        maxRemediationChildren: effective.maxRemediationChildren,
+        workerProvider: provider ?? null,
+        workerModel: model ?? null,
+        workerThinking: thinking ?? null,
+        planningProvider: planning.planningProvider ?? null,
+        planningModel: planning.planningModel ?? null,
+        planningThinking: planning.planningThinking ?? null,
+      },
+    });
+    const schedule = controllerResult.schedule;
     const failed = [...schedule.status.entries()].filter(([, status]) => status === "failed" || status === "blocked" || status === "skipped");
     const invalid = [...schedule.status.entries()].filter(([, status]) => status === "invalid");
     const suspended = [...schedule.status.entries()].filter(([, status]) => status === "suspended");
     const completed = [...schedule.status.values()].filter((status) => status === "completed").length;
     const satisfiedExisting = [...skipped.values()].filter((state) => state === "completed" || state === "invalid").length;
-    const orchestrationFailed = [...schedule.status.values()].some((status) => status === "failed" || status === "blocked" || status === "suspended" || status === "invalid");
-    persistOrchestration({
-      ...orchestrationRecord,
-      status: orchestrationFailed ? "failed" : "completed",
-      updatedAt: new Date().toISOString(),
-      nodes: orchestrationRecord.nodes.map((node) => {
-        const status = schedule.status.get(node.id);
-        const error = schedule.errors.get(node.id);
-        return {
-          ...node,
-          ...(status !== undefined ? { status } : {}),
-          ...(error !== undefined ? { error: error.message } : {}),
-        };
-      }),
-    });
-    await orchestrationPersistQueue;
+    const orchestrationFailed = controllerResult.record.status === "failed";
     if (activeObserver) {
       await activeObserver.emit({
         producer: activeObserver.producer,
@@ -1516,6 +1603,170 @@ async function orchestrate(argv: string[]): Promise<void> {
     await runtime.close();
     store.close();
   }
+}
+
+async function resumeCliOrchestration(argv: string[], orchestrationId: string): Promise<void> {
+  if (argv.includes("--rerun")) throw new Error("orchestrate --resume does not authorize a fresh semantic rerun; resume the durable checkpoints or create a new orchestration explicitly");
+  const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
+  const witness = createConfiguredLeaseWitness(process.cwd());
+  if (!witness) throw new Error("Authenticated lease witness is required before orchestration resume; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness });
+  try {
+    const record = await store.loadOrchestration(orchestrationId);
+    if (!record) throw new Error(`Unknown orchestration ${orchestrationId}`);
+    const github = new GitHubClient(process.cwd(), store);
+    const checkout = await github.getRepository();
+    if (checkout.repo.toLowerCase() !== record.repository.toLowerCase()) {
+      throw new Error(`Orchestration ${orchestrationId} belongs to ${record.repository}; current checkout is ${checkout.repo}`);
+    }
+    const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
+    const artifacts = activeObserver
+      ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: record.repository, orchestrationId })
+      : baseArtifacts;
+    const configured = readForgeDockConfig(process.cwd());
+    const configuredOrchestration = resolveOrchestrationConfig(configured);
+    const workerProvider = orchestrationPlanString(record.plan, "workerProvider") ?? option(argv, "--provider");
+    const workerModel = orchestrationPlanString(record.plan, "workerModel") ?? option(argv, "--model");
+    const workerThinking = orchestrationPlanThinking(record.plan, "workerThinking") ?? configuredWorkerThinking(argv);
+    const planningProvider = orchestrationPlanString(record.plan, "planningProvider");
+    const planningModel = orchestrationPlanString(record.plan, "planningModel");
+    const planningThinking = orchestrationPlanThinking(record.plan, "planningThinking");
+    const frozenScopeExpansion = orchestrationPlanString(record.plan, "scopeExpansion");
+    const scopeExpansion = frozenScopeExpansion === "recursive" || frozenScopeExpansion === "scope-locked"
+      ? frozenScopeExpansion
+      : configuredOrchestration.scopeExpansion;
+    const maxRemediationCycles = orchestrationPlanPositiveInteger(record.plan, "maxRemediationCycles") ?? configuredOrchestration.maxRemediationCycles;
+    const maxRemediationDepth = orchestrationPlanNonNegativeInteger(record.plan, "maxRemediationDepth") ?? configuredOrchestration.maxRemediationDepth;
+    const maxRemediationChildren = orchestrationPlanPositiveInteger(record.plan, "maxRemediationChildren") ?? configuredOrchestration.maxRemediationChildren;
+    setAgentEventObservationIdentity({
+      repository: record.repository,
+      orchestrationId,
+      ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+    });
+
+    const reconcileWorker = async (item: ScheduledWorkItem) => {
+      const subject = { repo: record.repository, issue: item.issue };
+      const issueArtifacts = await artifacts.list(subject);
+      const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+      if (reconciled.state === "completed") return { disposition: "terminal" as const, result: { status: "completed" as const }, reason: "Durable Outcome is complete" };
+      if (reconciled.state === "invalid") return { disposition: "terminal" as const, result: { status: "invalid" as const, error: `#${item.issue} is authoritatively invalid` } };
+      if (reconciled.state === "decomposed") return { disposition: "terminal" as const, result: { status: "skipped" as const, error: `#${item.issue} decomposed into replacement scope` } };
+      if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
+        return { disposition: "interrupted" as const, reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
+      }
+      const terminal = terminalCliOrchestrationResult(item.issue, issueArtifacts, reconciled);
+      if (terminal) return { disposition: "terminal" as const, result: terminal };
+      return { disposition: "interrupted" as const, reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
+    };
+
+    const controller = new OrchestrationController({
+      repository: store,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      transportCapacity: record.maxParallel,
+      reconcileWorker: ({ item }) => reconcileWorker(item),
+      worker: async (item, context) => {
+        const subject = { repo: record.repository, issue: item.issue };
+        const current = decideSubjectAdmission(await artifacts.list(subject), {
+          ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}),
+        });
+        if (current.action === "skip") {
+          if (current.state === "completed") return;
+          if (current.state === "invalid") return { status: "invalid", error: `#${item.issue} is authoritatively invalid` };
+          return { status: "skipped", error: `#${item.issue} is decomposed; freeze its replacement scope in a new orchestration` };
+        }
+        if (current.action === "block") throw new Error(current.reason);
+        const workerArgs = [String(item.issue), "--repo", record.repository];
+        const dependencies = item.dependencies.map(issueNumberFromScheduledId);
+        if (dependencies.length) workerArgs.push("--depends-on", dependencies.join(","));
+        workerArgs.push(record.autoMerge ? "--auto-merge" : "--no-auto-merge");
+        workerArgs.push(
+          "--scope-expansion", scopeExpansion,
+          "--max-remediation-cycles", String(maxRemediationCycles),
+          "--max-remediation-depth", String(maxRemediationDepth),
+          "--max-remediation-children", String(maxRemediationChildren),
+        );
+        if (current.action === "resume") {
+          workerArgs.push("--resume");
+          await context.recordTask({
+            runId: current.runId,
+            ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+          });
+        } else if (process.env.FORGEDOCK_CONTROLLER_TASK_ID) {
+          await context.recordTask({ controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID });
+        }
+        if (workerProvider) workerArgs.push("--provider", workerProvider);
+        if (workerModel) workerArgs.push("--model", workerModel);
+        if (workerThinking) workerArgs.push("--thinking", workerThinking);
+        if (planningProvider && planningModel) workerArgs.push("--planning-model", `${planningProvider}/${planningModel}`);
+        if (planningThinking) workerArgs.push("--planning-thinking", planningThinking);
+        await workOn(workerArgs);
+        setAgentEventObservationIdentity({
+          repository: record.repository,
+          orchestrationId,
+          ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+        });
+        const recovered = reconcileLatestRunArtifacts(await artifacts.list(subject));
+        if (recovered.runId) await context.recordTask({ runId: recovered.runId });
+        if (recovered.state === "completed") return;
+        if (recovered.state === "invalid") return { status: "invalid", error: `#${item.issue} is authoritatively invalid` };
+        if (recovered.state === "decomposed") return { status: "skipped", error: `#${item.issue} decomposed into replacement scope` };
+        const terminal = terminalCliOrchestrationResult(item.issue, await artifacts.list(subject), recovered);
+        if (terminal) return terminal;
+        throw new Error(`#${item.issue} resumed to ${recovered.state}: ${recovered.warnings.join("; ") || "durable recovery details are required"}`);
+      },
+      onEvent: (event) => renderCliOrchestrationEvent(event, record.repository),
+    });
+    process.stdout.write(`${renderHeader({ subtitle: `orchestrate · resume · ${orchestrationId}` })}\n\n`);
+    const result = await controller.resume(orchestrationId);
+    const failed = [...result.schedule.status.values()].filter((status) => status === "failed" || status === "blocked" || status === "skipped").length;
+    const invalid = [...result.schedule.status.values()].filter((status) => status === "invalid").length;
+    const suspended = [...result.schedule.status.values()].filter((status) => status === "suspended").length;
+    const completed = [...result.schedule.status.values()].filter((status) => status === "completed").length;
+    process.stdout.write(`\nOrchestration ${orchestrationId} resumed · ${completed} completed · ${failed} blocked/failed · ${invalid} invalid · ${suspended} suspended\n`);
+    if (result.record.status !== "completed") process.exitCode = 2;
+  } finally {
+    store.close();
+  }
+}
+
+function orchestrationPlanString(plan: import("../core/ports/orchestration.js").OrchestrationPlanMetadata | undefined, key: string): string | undefined {
+  const value = plan?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function orchestrationPlanThinking(plan: import("../core/ports/orchestration.js").OrchestrationPlanMetadata | undefined, key: string): ThinkingLevel | undefined {
+  const value = orchestrationPlanString(plan, key);
+  return value && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value) ? value as ThinkingLevel : undefined;
+}
+
+function orchestrationPlanPositiveInteger(plan: import("../core/ports/orchestration.js").OrchestrationPlanMetadata | undefined, key: string): number | undefined {
+  const value = plan?.[key];
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function orchestrationPlanNonNegativeInteger(plan: import("../core/ports/orchestration.js").OrchestrationPlanMetadata | undefined, key: string): number | undefined {
+  const value = plan?.[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function renderCliOrchestrationEvent(event: OrchestrationEvent, repository: string): void {
+  const snapshot = event.snapshot;
+  void activeObserver?.emit({
+    producer: activeObserver.producer,
+    identity: { repository, orchestrationId: event.orchestrationId },
+    source: "workflow",
+    channel: "lifecycle",
+    kind: "orchestration.state.changed",
+    payload: {
+      name: event.name,
+      itemId: event.itemId,
+      readyNodes: snapshot.readyNodes,
+      blockedNodes: snapshot.blockedNodes,
+      suspendedNodes: snapshot.suspendedNodes,
+      waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })),
+    },
+  });
+  process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.invalidNodes.length} suspended=${snapshot.suspendedNodes.length}\n`);
 }
 
 function projectRunsToGitHub(runs: RunRepository, github: GitHubClient): RunRepository {
@@ -1566,6 +1817,24 @@ function issueSubjectEvidence(issue: { number: number; body: string; labels: rea
   ];
 }
 
+function terminalCliOrchestrationResult(
+  issue: number,
+  artifacts: readonly DurableArtifact[],
+  reconciled: ReturnType<typeof reconcileLatestRunArtifacts>,
+): Exclude<ScheduleWorkerResult, void> | undefined {
+  const outcome = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+  if (outcome?.payload.status === "failed" || outcome?.payload.status === "blocked") {
+    return { status: outcome.payload.status, error: `#${issue} reached ${outcome.payload.status}: ${outcome.payload.reason}` };
+  }
+  if (reconciled.state === "blocked" || reconciled.state === "failed") {
+    return {
+      status: reconciled.state,
+      error: `#${issue} reconciled as ${reconciled.state}${reconciled.warnings.length ? `: ${reconciled.warnings.join("; ")}` : ""}`,
+    };
+  }
+  return undefined;
+}
+
 async function collectBaselineChecks(input: {
   git: GitWorktreeManager;
   verifier: ProcessVerificationRunner;
@@ -1612,6 +1881,14 @@ function configuredPlanningOptions(argv: string[]): {
   };
 }
 
+function configuredWorkerThinking(argv: string[]): ThinkingLevel | undefined {
+  const value = option(argv, "--thinking") ?? readForgeDockConfig(process.cwd()).workerThinking;
+  if (value !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
+    throw new Error(`Unsupported worker thinking level: ${value}`);
+  }
+  return value as ThinkingLevel | undefined;
+}
+
 function configuredMaxReviewSpecialists(): number | undefined {
   const configured = process.env.FORGEDOCK_MAX_REVIEW_SPECIALISTS;
   if (configured !== undefined) {
@@ -1622,10 +1899,11 @@ function configuredMaxReviewSpecialists(): number | undefined {
   return readForgeDockConfig(process.cwd()).maxReviewSpecialists;
 }
 
-function createCliRuntime(options: { provider?: string; model?: string; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
+function createCliRuntime(options: { provider?: string; model?: string; thinking?: ThinkingLevel; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
   const inner = new PiAgentRuntime({
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.model !== undefined ? { model: options.model } : {}),
+    ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
     ...(options.planningProvider !== undefined ? { planningProvider: options.planningProvider } : {}),
     ...(options.planningModel !== undefined ? { planningModel: options.planningModel } : {}),
     ...(options.planningThinking !== undefined ? { planningThinking: options.planningThinking } : {}),
@@ -1758,16 +2036,39 @@ function requirePiNodeVersion(): void {
   }
 }
 
+function bootstrapLeaseWitness(argv: string[]): void {
+  const unsupported = argv.filter((argument) => argument !== "--json");
+  if (unsupported.length) throw new Error(`Unknown lease-witness-bootstrap option: ${unsupported[0]}`);
+  const result = bootstrapLocalLeaseWitness(process.cwd());
+  if (argv.includes("--json")) {
+    process.stdout.write(`${JSON.stringify({
+      schema: "forgedock.lease-witness-bootstrap/v1",
+      scope: "single-machine-single-checkout",
+      ...result,
+    }, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`${renderHeader({ subtitle: "local lease witness" })}\n\n`);
+  process.stdout.write(`${statusGlyph("passed", mode)} Created a fail-closed Ed25519 lease witness for this canonical checkout.\n`);
+  process.stdout.write(`  checkout reference: ${result.configPath}\n`);
+  process.stdout.write(`  retained checkpoint: ${result.checkpointPath}\n`);
+  process.stdout.write(`  private key: ${result.privateKeyPath}\n\n`);
+  process.stdout.write("This witness coordinates only processes using this checkout on this machine. It does not provide cross-machine or cross-checkout fencing. Retain the OS-local witness directory independently from .forgedock/state.db backups; bootstrap never overwrites existing material.\n");
+}
+
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--provider NAME] [--model NAME] [--thinking LEVEL] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
-  process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
+  process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number] [--provider NAME] [--model NAME] [--thinking LEVEL]\n");
   process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm|--auto] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate --resume <dag-id>\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID | --promotions]\n\n");
+  process.stdout.write("Local safety bootstrap\n");
+  process.stdout.write("  forgedock-next lease-witness-bootstrap [--json]\n\n");
   process.stdout.write("Orchestration defaults to preview-only; use --confirm/--auto or forge.yaml dispatch_mode: confirm|auto to dispatch. Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
-  process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");
+  process.stdout.write("Model selection uses --provider/--model/--thinking or the worker/planning/reviewer settings in forge.yaml. Mutating controllers require the fail-closed local lease-witness bootstrap or a complete FORGEDOCK_LEASE_WITNESS_* environment override documented in README.md.\n");
 }

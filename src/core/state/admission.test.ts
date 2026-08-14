@@ -168,7 +168,7 @@ describe("subject run admission", () => {
     ]), { action: "skip", runId, state: "invalid" });
   });
 
-  it("blocks a newer interrupted run even when an older run was terminal", () => {
+  it("resumes a newer Intent-only run even when an older run was terminal", () => {
     const artifacts = [
       intent("run_terminal", "2099-01-01T00:00:00.000Z"),
       outcome("run_terminal", "2099-01-01T00:01:00.000Z", "decomposed"),
@@ -176,15 +176,111 @@ describe("subject run admission", () => {
     ];
     assert.equal(latestDeliveryRunArtifacts(artifacts)?.runId, "run_interrupted");
     const decision = decideSubjectAdmission(artifacts, { rerun: true });
-    assert.equal(decision.action, "block");
-    if (decision.action === "block") {
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
       assert.equal(decision.runId, "run_interrupted");
       assert.equal(decision.state, "investigating");
+      assert.equal(decision.checkpoint, "investigation");
     }
   });
 
   it("does not let rerun discard an interrupted run", () => {
-    assert.equal(decideSubjectAdmission([intent("run_old", "2026-01-01T00:00:00.000Z")], { rerun: true }).action, "block");
+    assert.equal(decideSubjectAdmission([intent("run_old", "2026-01-01T00:00:00.000Z")], { rerun: true }).action, "resume");
+  });
+
+  it("resumes packet preparation after a confirmed Investigation survives a crash", () => {
+    const runId = "run_prepare_recovery";
+    const investigation = createArtifact({
+      kind: "Investigation", runId, subject, producer: { role: "investigator" },
+      payload: {
+        outcome: "confirmed", confidence: "high", summary: "confirmed",
+        evidence: [{ claim: "broken", source: "src/a.ts", detail: "missing guard" }],
+        rootCause: "missing guard", affectedSurfaces: ["src/a.ts"], risks: [], recommendation: "add guard",
+      },
+    });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      investigation,
+      outcome(runId, "2026-01-01T00:02:00.000Z", "failed"),
+    ]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "preparing");
+      assert.equal(decision.checkpoint, "preparation");
+    }
+  });
+
+  it("finalizes invalid and decomposed Investigations without replaying the agent", () => {
+    for (const investigationOutcome of ["invalid", "decompose"] as const) {
+      const runId = `run_${investigationOutcome}_recovery`;
+      const investigation = createArtifact({
+        kind: "Investigation", runId, subject, producer: { role: "investigator" },
+        payload: {
+          outcome: investigationOutcome,
+          confidence: "high",
+          summary: `${investigationOutcome} result`,
+          evidence: [{ claim: "classified", source: "src/a.ts", detail: "durable evidence" }],
+          affectedSurfaces: ["src/a.ts"],
+          risks: [],
+          recommendation: "Finalize the durable result",
+          ...(investigationOutcome === "decompose" ? {
+            decomposition: [
+              { title: "Child one", outcome: "First outcome", dependsOn: [] },
+              { title: "Child two", outcome: "Second outcome", dependsOn: ["Child one"] },
+            ],
+          } : {}),
+        },
+      });
+      const decision = decideSubjectAdmission([
+        intent(runId, "2026-01-01T00:00:00.000Z"),
+        investigation,
+        outcome(runId, "2026-01-01T00:02:00.000Z", "failed"),
+      ]);
+      assert.equal(decision.action, "resume");
+      if (decision.action === "resume") {
+        assert.equal(decision.state, "investigating");
+        assert.equal(decision.checkpoint, "investigation");
+      }
+    }
+  });
+
+  it("preserves a terminal investigation projection when a later transition receipt fails", () => {
+    for (const investigationOutcome of ["invalid", "decompose"] as const) {
+      const runId = `run_${investigationOutcome}_projection_fault`;
+      const investigation = createArtifact({
+        kind: "Investigation", runId, subject, producer: { role: "investigator" },
+        payload: {
+          outcome: investigationOutcome,
+          confidence: "high",
+          summary: `${investigationOutcome} result`,
+          evidence: [{ claim: "classified", source: "src/a.ts", detail: "durable evidence" }],
+          affectedSurfaces: ["src/a.ts"],
+          risks: [],
+          recommendation: "Keep the durable terminal projection",
+          ...(investigationOutcome === "decompose" ? {
+            decomposition: [
+              { title: "Child one", outcome: "First outcome", dependsOn: [] },
+              { title: "Child two", outcome: "Second outcome", dependsOn: ["Child one"] },
+            ],
+          } : {}),
+        },
+      });
+      const terminal = investigationOutcome === "invalid"
+        ? invalidOutcome(runId, "2026-01-01T00:02:00.000Z", "pending")
+        : outcome(runId, "2026-01-01T00:02:00.000Z", "decomposed");
+      const decision = decideSubjectAdmission([
+        intent(runId, "2026-01-01T00:00:00.000Z"),
+        investigation,
+        terminal,
+        outcome(runId, "2026-01-01T00:03:00.000Z", "failed"),
+      ]);
+      if (investigationOutcome === "invalid") {
+        assert.equal(decision.action, "resume");
+        if (decision.action === "resume") assert.equal(decision.checkpoint, "invalid-closure");
+      } else {
+        assert.deepEqual(decision, { action: "skip", runId, state: "decomposed" });
+      }
+    }
   });
 
   it("allows an explicit rerun after a terminal outcome without discarding in-flight work", () => {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import type { TSchema } from "typebox";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import type { VerificationCommand, VerificationRunner } from "../core/ports/verification.js";
@@ -16,6 +17,14 @@ export interface ScopeManifest {
   /** Exact writable files for packet/remediation scopes; directory roots remain supported for legacy callers. */
   writePaths?: readonly string[];
   source: ScopeManifestSource;
+}
+
+export const SCOPE_MANIFEST_CONTRACT_VERSION = 1 as const;
+
+export interface ScopeManifestReceipt {
+  scopeVersion: typeof SCOPE_MANIFEST_CONTRACT_VERSION;
+  scope: ScopeManifest;
+  scopeDigest: string;
 }
 
 export interface ScopeHints {
@@ -88,6 +97,84 @@ export function scopeManifestForBuildPacket(expectedPaths: readonly string[]): S
     metadataRoots: [...STANDARD_SCOPE_METADATA_ROOTS, ...scopeDiscoveryRoots(writePaths)],
     writePaths,
   });
+}
+
+/** Reviewers may inspect the complete frozen checkout but never receive write authority. */
+export function scopeManifestForReviewer(): ScopeManifest {
+  return { readRoots: ["."], writeRoots: [], source: "issue-hints" };
+}
+
+/** Canonical, versioned scope receipt used at process/nested-agent boundaries. */
+export function createScopeManifestReceipt(scope: ScopeManifest): ScopeManifestReceipt {
+  const canonical = canonicalizeScopeManifest(scope);
+  return {
+    scopeVersion: SCOPE_MANIFEST_CONTRACT_VERSION,
+    scope: canonical,
+    scopeDigest: digestScopeManifest(canonical),
+  };
+}
+
+export function validateScopeManifestReceipt(value: {
+  scopeVersion?: unknown;
+  scope?: unknown;
+  scopeDigest?: unknown;
+}): ScopeManifestReceipt {
+  if (value.scopeVersion !== SCOPE_MANIFEST_CONTRACT_VERSION) {
+    throw new Error(`Unsupported scope manifest contract version: ${String(value.scopeVersion)}`);
+  }
+  if (typeof value.scopeDigest !== "string" || !/^[0-9a-f]{64}$/.test(value.scopeDigest)) {
+    throw new Error("Scope manifest digest must be a lowercase SHA-256 digest");
+  }
+  const scope = canonicalizeScopeManifest(value.scope);
+  const expected = digestScopeManifest(scope);
+  if (value.scopeDigest !== expected) throw new Error("Scope manifest digest does not match its canonical scope");
+  return { scopeVersion: SCOPE_MANIFEST_CONTRACT_VERSION, scope, scopeDigest: expected };
+}
+
+function canonicalizeScopeManifest(value: unknown): ScopeManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Scope manifest must be an object");
+  const scope = value as Partial<ScopeManifest>;
+  const unsupported = Object.keys(scope).find((key) => !["readRoots", "writeRoots", "writePaths", "source"].includes(key));
+  if (unsupported) throw new Error(`Scope manifest field is not supported: ${unsupported}`);
+  if (!(["issue-hints", "build-packet", "remediation"] as const).includes(scope.source as ScopeManifestSource)) {
+    throw new Error(`Scope manifest source is invalid: ${String(scope.source)}`);
+  }
+  const readRoots = canonicalScopeRoots(scope.readRoots, "readRoots");
+  const writeRoots = canonicalScopeRoots(scope.writeRoots, "writeRoots");
+  if (!readRoots.length) throw new Error("Scope manifest must contain at least one read root");
+  const writePaths = scope.writePaths === undefined
+    ? []
+    : canonicalizeConcreteScopePaths(assertStringArray(scope.writePaths, "writePaths"));
+  return {
+    readRoots,
+    writeRoots,
+    ...(writePaths.length ? { writePaths } : {}),
+    source: scope.source as ScopeManifestSource,
+  };
+}
+
+function canonicalScopeRoots(value: unknown, field: string): string[] {
+  const roots = assertStringArray(value, field).map(normalizeScopePath);
+  const invalid = roots.filter((root) => !root || !isSafeRelativeScopePath(root));
+  if (invalid.length) throw new Error(`Scope manifest ${field} contains unsafe paths: ${invalid.join(", ")}`);
+  return [...new Set(roots)].sort();
+}
+
+function assertStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error(`Scope manifest ${field} must be an array of strings`);
+  }
+  return value as string[];
+}
+
+function digestScopeManifest(scope: ScopeManifest): string {
+  return createHash("sha256").update(JSON.stringify({
+    version: SCOPE_MANIFEST_CONTRACT_VERSION,
+    source: scope.source,
+    readRoots: scope.readRoots,
+    writeRoots: scope.writeRoots,
+    writePaths: scope.writePaths ?? [],
+  })).digest("hex");
 }
 
 /** Build Packet and remediation writes must name concrete repository-relative files. */
@@ -193,7 +280,9 @@ export type AgentEvent =
   | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown; observability?: AgentObservability }
   | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string; observability?: AgentObservability }
   | { type: "artifact.submitted"; taskId: string; observability?: AgentObservability }
-  | { type: "session.completed"; taskId: string; sessionRef: string; observability?: AgentObservability };
+  | { type: "session.completed"; taskId: string; sessionRef: string; observability?: AgentObservability }
+  | { type: "session.failed"; taskId: string; sessionRef: string; errorSummary: string; observability?: AgentObservability }
+  | { type: "session.cancelled"; taskId: string; sessionRef: string; errorSummary: string; observability?: AgentObservability };
 
 export interface AgentRunResult<T> {
   output: T;
@@ -439,7 +528,9 @@ function successReceipt<T>(task: AgentTask<T>, result: AgentRunResult<T>, starte
 
 function failureReceipt<T>(task: AgentTask<T>, startedAt: number, error: unknown, resumedFrom?: string): AgentRunReceipt {
   const completedAt = Date.now();
-  const sessionRef = `failed_${crypto.randomUUID()}`;
+  const sessionRef = error instanceof AgentRunError && error.sessionRef
+    ? error.sessionRef
+    : resumedFrom ?? `failed_${crypto.randomUUID()}`;
   const detail = error instanceof Error ? error : new Error(String(error));
   return {
     key: `${task.id}:${sessionRef}`,

@@ -7,7 +7,14 @@
 
 ### Fixed
 
-- Deployment review gates now collapse duplicate GitHub check runs by check name and use the newest run, preventing a stale failure from blocking a later successful run at the same SHA.
+- Deployment review gates now retain contradictory same-name GitHub check observations at the reviewed SHA and fail closed instead of allowing a later push check to mask a failed pull-request check.
+- Reviewer execution now binds durable attempt and session identity to the frozen head and review plan, drains cancellation before retry, reconciles late terminal results, and publishes current-head deployment gate markers on every terminal path.
+- Work-on now resumes Intent-only and Investigation checkpoints without replaying completed semantic work, uses deterministic terminal Outcomes, and preserves blocked or operator-owned batch members during closure.
+- ForgeDock orchestration now runs through one headless, fenced controller shared by CLI and TUI, with durable attempts, task identities, heartbeats, recovery reconciliation, CLI resume, detached-worker adoption, and transport-capacity enforcement.
+- Native Deep Plan can explicitly materialize a confirmed plan into an idempotent GitHub issue DAG and return a typed orchestration handoff; no GitHub writes occur before confirmation.
+- Agent runtime cancellation now stops before Pi session creation, emits real completed/failed/cancelled session identities, binds nested reviewers to tamper-evident whole-checkout read-only scope receipts, and reconciles detached task records without treating process disappearance as semantic failure.
+- Sandboxed grep now has a workspace-confined Node fallback supplied through the Pi tool port, so offline or clean-machine execution no longer depends on downloading or preinstalling ripgrep.
+- Deployment gate Actions now accept only trusted markers bound to the exact repository, PR, and current head, with current-head failures taking precedence over passes.
 - Large deployment reviews now keep all risk capabilities while packing specialist coverage into one default group and sending a smaller bounded initial diff, preventing parallel reviewer attempts from exhausting their timeout without a verdict.
 - Deployment review now bootstraps its self-reporting gate check, publishes trusted `FORGE:GATE_PASS`/`FORGE:GATE_FAILURE` markers, and keeps GitHub mergeability separate from required-check state.
 - Standalone advisory review no longer requires mutation-only lease-witness configuration; lease enforcement remains fail-closed for commands that acquire leases.
@@ -29,6 +36,7 @@
 
 ### Added
 
+- `forgedock-next lease-witness-bootstrap` provisions a non-overwriting, per-checkout Ed25519 witness in OS-local user data for fail-closed single-machine dogfooding without storing private key material in the repository.
 - Provider-neutral typed ForgeDock runtime with durable v2 workflow artifacts, guarded state transitions, isolated worktrees, deterministic verification, GitHub projection, reconciliation, and resumable verification checkpoints.
 - ForgeDock-branded Pi terminal with lazily activated semantic workflow tools, supervised parallel issue workers, visible nested reviewer agents, and evidence-backed human decision checkpoints.
 - Source-pinned ForgeDock Pi fork and packaged runtime staging with explicit provenance and fork policy.

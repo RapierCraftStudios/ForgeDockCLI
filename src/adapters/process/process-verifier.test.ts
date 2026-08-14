@@ -5,9 +5,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
-import { ProcessVerificationRunner } from "./process-verifier.js";
+import { ProcessVerificationRunner, windowsTaskkillSucceeded } from "./process-verifier.js";
 
 describe("deterministic process verification", () => {
+  it("treats nonzero or indeterminate taskkill status as a failed tree termination", () => {
+    assert.equal(windowsTaskkillSucceeded({ status: 0 }), true);
+    assert.equal(windowsTaskkillSucceeded({ status: 1 }), false);
+    assert.equal(windowsTaskkillSucceeded({ status: null }), false);
+    assert.equal(windowsTaskkillSucceeded({ status: 0, error: new Error("spawn failed") }), false);
+  });
+
   it("records executable evidence without invoking a shell", async () => {
     const runner = isolatedRunner();
     const [result] = await runner.run([{

@@ -7,7 +7,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "build" | "verification" | "remediation" | "publication" | "completion" | "invalid-closure"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "completion" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -113,9 +113,41 @@ export function decideSubjectAdmission(
     };
   }
   const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
+  const latestInvestigation = latestArtifactOfKind(latest.artifacts, "Investigation");
+  const latestInvestigationIndex = lastArtifactIndex(latest.artifacts, "Investigation");
+  const matchingTerminalOutcomeIndex = latestInvestigation?.payload.outcome === "invalid"
+    ? lastOutcomeIndex(latest.artifacts, "invalid")
+    : latestInvestigation?.payload.outcome === "decompose"
+      ? lastOutcomeIndex(latest.artifacts, "decomposed")
+      : -1;
+  const matchingTerminalOutcomeCandidate = matchingTerminalOutcomeIndex >= 0
+    ? latest.artifacts[matchingTerminalOutcomeIndex]
+    : undefined;
+  const matchingTerminalOutcome = matchingTerminalOutcomeCandidate?.kind === "Outcome"
+    ? matchingTerminalOutcomeCandidate
+    : undefined;
+  const terminalInvestigationNeedsFinalization = latestInvestigation !== undefined
+    && latestInvestigation.payload.outcome !== "confirmed"
+    && matchingTerminalOutcomeIndex < latestInvestigationIndex;
+  if (terminalInvestigationNeedsFinalization) {
+    return {
+      action: "resume",
+      runId: latest.runId,
+      state: "investigating",
+      checkpoint: "investigation",
+      artifacts: latest.artifacts,
+    };
+  }
+  const invalidClosureOutcome = latestInvestigation?.payload.outcome === "invalid"
+    && matchingTerminalOutcomeIndex > latestInvestigationIndex
+    && matchingTerminalOutcome?.payload.status === "invalid"
+    ? matchingTerminalOutcome
+    : latestOutcome?.payload.status === "invalid"
+      ? latestOutcome
+      : undefined;
   const invalidClosurePending = reconciled.state === "invalid"
-    && latestOutcome?.payload.status === "invalid"
-    && latestOutcome.payload.issueClosure?.status !== "completed";
+    && invalidClosureOutcome !== undefined
+    && invalidClosureOutcome.payload.issueClosure?.status !== "completed";
   if (invalidClosurePending) {
     return { action: "resume", runId: latest.runId, state: "invalid", checkpoint: "invalid-closure", artifacts: latest.artifacts };
   }
@@ -138,6 +170,27 @@ export function decideSubjectAdmission(
   const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
   const latestVerificationAdjudication = latestArtifactOfKind(latest.artifacts, "VerificationAdjudication");
   const latestVerificationAdjudicationIndex = lastArtifactIndex(latest.artifacts, "VerificationAdjudication");
+
+  if (hasIntent && !latestInvestigation && !latestOutcome && reconciled.state === "investigating") {
+    return {
+      action: "resume",
+      runId: latest.runId,
+      state: "investigating",
+      checkpoint: "investigation",
+      artifacts: latest.artifacts,
+    };
+  }
+
+  if (hasIntent && latestInvestigation?.payload.outcome === "confirmed" && !hasPacket
+    && (!latestOutcome || latestOutcome.payload.status === "failed")) {
+    return {
+      action: "resume",
+      runId: latest.runId,
+      state: "preparing",
+      checkpoint: "preparation",
+      artifacts: latest.artifacts,
+    };
+  }
   const remediationCheckpointIsPending = remediationCheckpoint !== undefined
     && (remediationCheckpoint.payload.status === "ready-to-resume"
       ? latestRemediationCheckpointIndex > Math.max(latestBuildIndex, latestVerdictIndex, latestOutcomeIndex)
@@ -246,6 +299,17 @@ function isRepairableCheckFailure(check: CheckResult): boolean {
 function lastArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
   for (let index = artifacts.length - 1; index >= 0; index--) {
     if (artifacts[index]?.kind === kind) return index;
+  }
+  return -1;
+}
+
+function lastOutcomeIndex(
+  artifacts: readonly DurableArtifact[],
+  status: DurableArtifact<"Outcome">["payload"]["status"],
+): number {
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === "Outcome" && artifact.payload.status === status) return index;
   }
   return -1;
 }

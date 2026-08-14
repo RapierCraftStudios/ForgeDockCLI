@@ -124,7 +124,25 @@ describe("controller environment boundary", () => {
   it("classifies worker transport without stripping ordinary Pi model settings", () => {
     assert.equal(isAgentTransportVariable("PI_SUBAGENT_CHILD_AGENT"), true);
     assert.equal(isAgentTransportVariable("PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT"), true);
+    assert.equal(isAgentTransportVariable("pi_subagent_child_agent"), true);
+    assert.equal(isAgentTransportVariable("Pi_Subagents_Worktree_Dir"), true);
+    assert.equal(isAgentTransportVariable("pi_intercom_session_id"), true);
     assert.equal(isAgentTransportVariable("PI_PROVIDER"), false);
     assert.equal(isAgentTransportVariable("PI_MODEL"), false);
+  });
+
+  it("removes case-varied transport keys while retaining ordinary Pi settings", () => {
+    const environment = controllerEnvironment({
+      pi_subagent_child_agent: "forgedock-reviewer",
+      Pi_Subagents_Worktree_Dir: "C:/worker",
+      pi_intercom_session_id: "intercom",
+      PI_PROVIDER: "openai-codex",
+      PI_MODEL: "gpt-test",
+    });
+    assert.equal(environment.pi_subagent_child_agent, undefined);
+    assert.equal(environment.Pi_Subagents_Worktree_Dir, undefined);
+    assert.equal(environment.pi_intercom_session_id, undefined);
+    assert.equal(environment.PI_PROVIDER, "openai-codex");
+    assert.equal(environment.PI_MODEL, "gpt-test");
   });
 });

@@ -9,7 +9,10 @@ import { openForgeDockObserverWorkspace } from "./observer-workspace.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import {
   BACKGROUND_TASK_TOOL,
+  clearDeepPlanRequest,
   CONFIG_TOOL,
+  deepPlanToolBlockReason,
+  DEEP_PLAN_TOOL,
   FORGEDOCK_NATIVE_RUNTIME,
   HUMAN_DECISION_TOOL,
   MEMORY_SEARCH_TOOL,
@@ -24,20 +27,31 @@ import {
   controlSubagentRun,
   deactivateWorkflowTools,
   inspectSubagentRuntime,
+  isDeepPlanActive,
   registerForgeDockTools,
+  requestDeepPlanMode,
+  type ForgeDockToolRegistrationOptions,
   type WorkflowCommand,
   workflowCommandDisplay,
 } from "./forgedock-tools.js";
 import { formatOrchestrationInvocationLabel } from "./orchestration-board.js";
 
-export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /work-on · /review-pr · /orchestrate";
+export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /deep-plan · /work-on · /review-pr · /orchestrate · /promote · /status";
 export const FORGEDOCK_NATIVE_WORKFLOW_MESSAGE = "forgedock_native_workflow";
 
-const WORKFLOWS = ["work-on", "review-pr", "orchestrate", "promote"] as const;
+const WORKFLOWS = ["deep-plan", "work-on", "review-pr", "orchestrate", "promote"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 export type HarnessMode = "assistant" | "forgedock-workflow";
 
 export function buildHarnessModePrompt(mode: HarnessMode, workflow?: Workflow): string {
+  if (mode === "forgedock-workflow" && workflow === "deep-plan") {
+    return [
+      "# ForgeDock harness mode",
+      "Mode: forgedock-workflow (explicitly activated by /deep-plan).",
+      "Deep Plan is read-only until the user confirms its typed planning packet. Use repository/GitHub evidence and forgedock_deep_plan's bounded decision frontier; do not edit files, mutate GitHub, dispatch workers, or hand off automatically.",
+      "This authority is scoped to the active planning turn and ends when the agent settles or the user explicitly confirms the packet.",
+    ].join("\n");
+  }
   if (mode === "forgedock-workflow") {
     return [
       "# ForgeDock harness mode",
@@ -51,13 +65,17 @@ export function buildHarnessModePrompt(mode: HarnessMode, workflow?: Workflow): 
     "Mode: assistant (default). ForgeDock workflows are opt-in, not mandatory terminal policy.",
     "Handle ordinary natural-language coding, git, GitHub, file, and shell requests with normal assistant tools. In particular, create/open pull-request requests default to ordinary gh usage; do not infer /promote from generic PR wording.",
     "When the user explicitly requests gh CLI, honor that tool choice. Current explicit user intent outranks optional ForgeDock workflow policy and historical project guidance.",
-    "Only enter forgedock-workflow mode for /work-on, /review-pr, /orchestrate, /promote, a direct forgedock_* workflow tool call, or an explicit request to use a named ForgeDock workflow. If the route is genuinely ambiguous, ask the user to choose Plain GitHub PR or ForgeDock promotion.",
+    "Only enter forgedock-workflow mode for /deep-plan, /work-on, /review-pr, /orchestrate, /promote, a direct forgedock_* workflow tool call, or an explicit request to use a named ForgeDock workflow. If the route is genuinely ambiguous, ask the user to choose Plain GitHub PR or ForgeDock promotion.",
+    "For consequential ambiguity, dependent architectural choices, cross-subsystem scope, or high-risk/irreversible behavior, recommend ForgeDock's native /deep-plan and explain why before calling forgedock_deep_plan. It asks bounded MCQs with evidence-backed recommendations, preserves custom answers and notes, and cannot mutate or dispatch until explicit packet confirmation.",
     "This prompt also governs direct tool invocation in the current turn: from a forgedock_* workflow tool call onward, its typed controller exclusively owns that workflow's GitHub mutations; do not combine or follow it with raw gh mutations for the same operation.",
     "Do not inspect ForgeDock controller source to discover how to perform an ordinary GitHub operation; keep generic PR reconnaissance bounded to route, duplicate-PR, and branch/SHA checks.",
   ].join("\n");
 }
 
-export default function forgedockExtension(pi: ExtensionAPI): void {
+export default function forgedockExtension(
+  pi: ExtensionAPI,
+  toolOptions: Omit<ForgeDockToolRegistrationOptions, "getObservationSink"> = {},
+): void {
   let observer: ForgeDockObserver | undefined;
   let asyncObservation: PiAsyncObservationAdapter | undefined;
   let controlGateway: ForgeDockObservationControlGateway | undefined;
@@ -96,10 +114,12 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     }
     return observer;
   };
-  const backgroundTasks = registerForgeDockTools(pi, { getObservationSink: () => observer });
+  const backgroundTasks = registerForgeDockTools(pi, { ...toolOptions, getObservationSink: () => observer });
   const restoreAssistantMode = (): void => {
-    harnessMode = "assistant";
-    activeWorkflow = undefined;
+    clearDeepPlanRequest();
+    const planningStillActive = isDeepPlanActive();
+    harnessMode = planningStillActive ? "forgedock-workflow" : "assistant";
+    activeWorkflow = planningStillActive ? "deep-plan" : undefined;
     clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
     activateOnly(pi, [
@@ -107,6 +127,9 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
       MEMORY_TOOL,
       MEMORY_SEARCH_TOOL,
       BACKGROUND_TASK_TOOL,
+      DEEP_PLAN_TOOL,
+      WORKFLOW_TOOLS.status,
+      ORCHESTRATION_RESUME_TOOL,
       ...(hasOrchestrationPreview(pi) ? [WORKFLOW_TOOLS.orchestrate, HUMAN_DECISION_TOOL] : []),
     ]);
   };
@@ -139,7 +162,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     activeWorkflow = undefined;
     backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
-    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL]);
+    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, DEEP_PLAN_TOOL, WORKFLOW_TOOLS.status, ORCHESTRATION_RESUME_TOOL]);
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
     await ensureObserver(ctx.cwd);
     if (ctx.mode !== "tui") return;
@@ -177,7 +200,10 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     if (invokedWorkflow) {
       harnessMode = "forgedock-workflow";
       activeWorkflow = invokedWorkflow;
+      if (invokedWorkflow === "deep-plan") requestDeepPlanMode();
     }
+    const deepPlanReason = deepPlanToolBlockReason(event.toolName);
+    if (deepPlanReason) return { block: true, reason: deepPlanReason };
     if (event.toolName !== "bash") return;
     const command = (event.input as { command?: unknown }).command;
     if (typeof command !== "string" || !isLifecycleControllerShellCommand(command)) return;
@@ -189,7 +215,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
 
   pi.on("message_start", (event) => {
     if (event.message.role !== "custom" || event.message.customType !== "subagent_supervisor_request") return;
-    activateOnly(pi, [HUMAN_DECISION_TOOL, "subagent_supervisor"]);
+    activateOnly(pi, [HUMAN_DECISION_TOOL, DEEP_PLAN_TOOL, "subagent_supervisor"]);
   });
 
   // Pi emits agent_end before an automatic provider retry, compaction retry, or
@@ -206,7 +232,10 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    await backgroundTasks.shutdown();
+    // Native controller processes own durable work. Ordinary terminal/session
+    // teardown detaches them so the next supervisor can reconcile or resume;
+    // explicit forgedock_tasks cancellation remains destructive.
+    await backgroundTasks.shutdown({ cancel: false });
     backgroundTasks.setObservationSink(undefined);
     await observer?.flush();
     observer?.close();
@@ -374,7 +403,8 @@ function registerWorkflow(
       }
       // Orchestration confirms the resolved DAG and proposed work-unit batches inside
       // its native tool; a pre-resolution confirmation would be both vague and duplicate.
-      if (workflow !== "orchestrate" && !await confirmWorkflow(workflow, normalized, ctx)) return;
+      if (workflow !== "orchestrate" && workflow !== "deep-plan" && !await confirmWorkflow(workflow, normalized, ctx)) return;
+      if (workflow === "deep-plan") requestDeepPlanMode();
       activateWorkflow();
       if (workflow === "orchestrate") bindOrchestrationInvocation(pi, { rawArgs: normalized });
       try {
@@ -414,6 +444,7 @@ async function queueNativeWorkflow(
 }
 
 function workflowDescription(workflow: Workflow): string {
+  if (workflow === "deep-plan") return "Run a confirmation-gated ForgeDock-native planning interview";
   if (workflow === "work-on") return "Run the full typed ForgeDock issue pipeline";
   if (workflow === "review-pr") return "Run a fresh-context, SHA-anchored pull-request review";
   if (workflow === "promote") return "Promote an explicit feature or integration branch through durable gates";
@@ -421,6 +452,7 @@ function workflowDescription(workflow: Workflow): string {
 }
 
 function workflowUsage(workflow: Workflow): string {
+  if (workflow === "deep-plan") return "Usage: /deep-plan <natural-language planning request>";
   if (workflow === "work-on") return "Usage: /work-on <issue or natural-language issue reference> [--no-auto-merge]";
   if (workflow === "review-pr") return "Usage: /review-pr <PR or natural-language PR reference>";
   if (workflow === "promote") return "Usage: /promote --from <branch> [--to <target>] [--confirm] [--authorize-merge]";
@@ -429,7 +461,9 @@ function workflowUsage(workflow: Workflow): string {
 
 async function confirmWorkflow(workflow: Workflow, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
   if (!ctx.hasUI) return true;
-  const risk = workflow === "review-pr"
+  const risk = workflow === "deep-plan"
+    ? "This opens an interactive planning interview; no code, GitHub, or workflow mutation occurs before a separate confirmation."
+    : workflow === "review-pr"
     ? "This may publish a SHA-anchored review and update durable GitHub state."
     : workflow === "promote"
       ? "This may create a promotion PR or merge an explicitly reviewed SHA when separately authorized."

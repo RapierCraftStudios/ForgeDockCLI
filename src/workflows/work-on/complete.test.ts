@@ -11,8 +11,11 @@ const openPr: PullRequestSnapshot = { repo: "a/b", number: 9, title: "Fix", body
 
 class CompletionHost implements ForgeHost {
   closedIssues = new Set<number>();
+  labelsByIssue = new Map<number, string[]>();
+  reads: number[] = [];
   staleClosureProof = false;
   async getIssue(number: number, repo = "a/b") {
+    this.reads.push(number);
     return {
       repo,
       number,
@@ -20,6 +23,7 @@ class CompletionHost implements ForgeHost {
       body: "",
       url: `https://github.test/${repo}/issues/${number}`,
       state: this.closedIssues.has(number) ? "CLOSED" as const : "OPEN" as const,
+      labels: this.labelsByIssue.get(number) ?? [],
     };
   }
   async materializeBatchIssue(input: { repo: string; title: string; body: string; priorityLabel: "priority:P2" | "P2" | "priority:P3" | "P3" }) { return { repo: input.repo, number: 100, title: input.title, body: input.body, url: `https://github.test/${input.repo}/issues/100`, state: "OPEN" as const }; }
@@ -56,11 +60,11 @@ class CompletionHost implements ForgeHost {
   }
 }
 
-async function mergingRun(runs: InMemoryRunRepository): Promise<RunState> {
+async function mergingRun(runs: InMemoryRunRepository, runId = `run_complete_${crypto.randomUUID()}`): Promise<RunState> {
   let run = createRun({
     workflow: "work-on",
     subject: { repo: "a/b", issue: 2 },
-    runId: `run_complete_${crypto.randomUUID()}`,
+    runId,
     target: { lane: "fast", targetBranch: "main" },
   });
   await runs.create(run);
@@ -282,7 +286,7 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
-  it("projects a successful batch Outcome to every member before closing them", async () => {
+  it("projects a successful batch Outcome to every eligible member", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
     const host = new CompletionHost();
@@ -296,5 +300,76 @@ describe("merge and close authority", () => {
       .filter((artifact) => artifact.kind === "Outcome");
     assert.equal(childOutcomes[0]?.payload.status, "merged");
     assert.match(childOutcomes[0]?.payload.reason ?? "", /batch issue #2/);
+  });
+
+  it("preserves human and operator-gated batch members as a split outcome", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.labelsByIssue.set(7, ["needs-human"]);
+    host.labelsByIssue.set(8, ["blocked", "operator-only"]);
+    const artifacts = new InMemoryArtifactRepository();
+
+    const result = await completeWorkItem({
+      run,
+      pullRequest: openPr,
+      verdict: verdict(run),
+      autoMerge: true,
+      childIssues: [7, 8, 9],
+    }, { host, artifacts, runs });
+
+    assert.equal(result.run.state, "completed");
+    assert.deepEqual(host.closes, [9, 2]);
+    assert.deepEqual(result.outcome?.payload.childIssues, ["issue-9"]);
+    assert.match(result.outcome?.payload.reason ?? "", /#7 \(needs-human\).*#8 \(blocked, operator-only\).*remain open/);
+    assert.equal((await artifacts.list({ repo: "a/b", issue: 7 }, "Outcome")).length, 0);
+    assert.equal((await artifacts.list({ repo: "a/b", issue: 8 }, "Outcome")).length, 0);
+    assert.ok(host.reads.includes(7));
+    assert.ok(host.reads.includes(8));
+  });
+
+  it("reuses the terminal Outcome identity after a post-append fault", async () => {
+    const runId = "run_complete_retry";
+    const firstRuns = new InMemoryRunRepository();
+    const firstRun = await mergingRun(firstRuns, runId);
+    const host = new CompletionHost();
+    const artifacts = new InMemoryArtifactRepository();
+    const originalAppend = artifacts.append.bind(artifacts);
+    let injected = false;
+    artifacts.append = async (artifact) => {
+      await originalAppend(artifact);
+      if (!injected && artifact.kind === "Outcome" && artifact.subject.issue === 2) {
+        injected = true;
+        throw new Error("fault after terminal Outcome append");
+      }
+    };
+    await assert.rejects(
+      completeWorkItem({
+        run: firstRun, pullRequest: openPr, verdict: verdict(firstRun), autoMerge: true, childIssues: [7],
+      }, {
+        host, artifacts, runs: firstRuns,
+      }),
+      /fault after terminal Outcome append/,
+    );
+    const originalOutcome = (await artifacts.list(firstRun.subject, "Outcome"))[0];
+    assert.ok(originalOutcome?.kind === "Outcome");
+    assert.deepEqual(originalOutcome.payload.childIssues, ["issue-7"]);
+    assert.deepEqual(host.closes, [7, 2]);
+    host.labelsByIssue.set(7, ["needs-human"]);
+
+    const retryRuns = new InMemoryRunRepository();
+    const retryRun = await mergingRun(retryRuns, runId);
+    const retried = await completeWorkItem({
+      run: retryRun,
+      pullRequest: { ...openPr, state: "MERGED" },
+      verdict: verdict(retryRun),
+      autoMerge: true,
+      childIssues: [7],
+    }, { host, artifacts, runs: retryRuns });
+
+    assert.equal(retried.outcome?.id, originalOutcome.id);
+    assert.deepEqual(retried.outcome?.payload.childIssues, ["issue-7"]);
+    assert.deepEqual(host.closes, [7, 2], "retry must adopt the durable closure projection without replaying side effects");
+    assert.equal((await artifacts.list(firstRun.subject, "Outcome")).length, 1);
   });
 });

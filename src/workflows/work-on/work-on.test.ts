@@ -11,7 +11,7 @@ import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
-import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
+import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
@@ -115,6 +115,28 @@ const acceptAdjudication = (task: AgentTask<unknown>) => ({
 });
 
 describe("complete work-on trajectory", () => {
+  it("rejects a closed issue before creating a fresh workspace or dispatching an agent", async () => {
+    const runtime = new FakeAgentRuntime([]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    host.issueClosed = true;
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_closed_issue", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Closed", problem: "Already closed", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+
+    await assert.rejects(
+      workOn({ intent, repoPath: process.cwd(), lane: fastLane, verification: [] }, {
+        runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host,
+      }),
+      /Issue #8 is already closed; refusing to start fresh work/,
+    );
+    assert.equal(git.createdFrom, undefined);
+    assert.deepEqual(runtime.tasks, []);
+  });
+
   it("closes an invalid investigation without entering build or delivery", async () => {
     const runtime = new FakeAgentRuntime([{
       ...investigation,
@@ -144,6 +166,49 @@ describe("complete work-on trajectory", () => {
     const outcomes = (await artifacts.list(intent.subject, "Outcome"))
       .filter((artifact): artifact is import("../../core/artifacts/schema.js").DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
     assert.equal(outcomes.at(-1)?.payload.issueClosure?.status, "completed");
+  });
+
+  it("resumes preparation from a durable Investigation without replaying the investigator", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_early_prepare", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({
+      kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation,
+    });
+    let run = attachArtifact(createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget }), "Intent", intent.id);
+    await runs.create(run);
+    for (const [event, artifact] of [
+      ["START_INVESTIGATION", undefined],
+      ["INVESTIGATION_CONFIRMED", investigationArtifact],
+    ] as const) {
+      if (artifact) run = attachArtifact(run, artifact.kind, artifact.id);
+      const advanced = transition(run, event);
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    await artifacts.append(intent);
+    await artifacts.append(investigationArtifact);
+    const runtime = new FakeAgentRuntime([packet, submission, { summary: "Approved", findings: [] }]);
+
+    const resumed = await resumeEarlyWorkOn({
+      checkpoint: "preparation",
+      run,
+      intent,
+      investigation: investigationArtifact,
+      priorArtifacts: [intent, investigationArtifact],
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
+
+    assert.equal(resumed.run.state, "completed");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author", "builder", "reviewer"]);
   });
 
   it("distinguishes durable artifact fields from dotted and extensionless repository paths", () => {

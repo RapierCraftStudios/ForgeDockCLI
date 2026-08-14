@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { FakeAgentRuntime } from "./fake-runtime.js";
-import { TelemetryAgentRuntime, scopeManifestFor } from "./agent-runtime.js";
+import { AgentRunError, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
 import { summarizeControllerTiming, type AgentRunReceipt } from "../core/ports/telemetry.js";
 
 function task(id: string) {
@@ -55,4 +55,21 @@ test("telemetry runtime records bounded failure timing without changing the thro
   assert.equal(receipts[0]?.usage.source, "unavailable");
   assert.deepEqual(receipts[0]?.error, { name: "Error", message: "provider unavailable" });
   assert.ok((receipts[0]?.timing.activeMs ?? -1) >= 0);
+});
+
+test("telemetry failure receipts retain a runtime-provided session identity", async () => {
+  const receipts: AgentRunReceipt[] = [];
+  const failure = new AgentRunError("provider unavailable", { sessionRef: "pi-real-session" });
+  const runtime = new TelemetryAgentRuntime(new FakeAgentRuntime([failure]), (receipt) => { receipts.push(receipt); });
+  await assert.rejects(runtime.run(task("run-session-failure:investigation:1")), failure);
+  assert.equal(receipts[0]?.sessionRef, "pi-real-session");
+  assert.deepEqual(receipts[0]?.sessionLineage, ["pi-real-session"]);
+});
+
+test("reviewer scope receipts are whole-checkout read-only and tamper evident", () => {
+  const receipt = createScopeManifestReceipt(scopeManifestForReviewer());
+  assert.equal(receipt.scopeVersion, 1);
+  assert.deepEqual(receipt.scope, { readRoots: ["."], writeRoots: [], source: "issue-hints" });
+  assert.deepEqual(validateScopeManifestReceipt(receipt), receipt);
+  assert.throws(() => validateScopeManifestReceipt({ ...receipt, scopeDigest: "0".repeat(64) }), /does not match/);
 });

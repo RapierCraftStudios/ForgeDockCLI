@@ -92,3 +92,21 @@ test("keeps concurrent task streams readable instead of interleaving open lines"
   assert.match(stream.output(), /review · review:1 · assistant\n      │ First\n/);
   assert.match(stream.output(), /review · review:2 · assistant\n      │ Second/);
 });
+
+test("renders failed and cancelled sessions as distinct terminal outcomes", () => {
+  const stream = capture();
+  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "partial output" });
+  stream.writer.write({
+    type: "session.failed", taskId: "build:1", sessionRef: "pi-failed",
+    errorSummary: "provider unavailable",
+  });
+  stream.writer.write({
+    type: "session.cancelled", taskId: "review:1", sessionRef: "pi-cancelled",
+    errorSummary: "operator cancelled",
+  });
+
+  assert.match(stream.output(), /partial output\n/);
+  assert.match(stream.output(), /✕ build:1 · session failed · provider unavailable/);
+  assert.match(stream.output(), /■ review:1 · session cancelled · operator cancelled/);
+  assert.doesNotMatch(stream.output(), /session complete/);
+});

@@ -168,6 +168,23 @@ describe("fresh-context PR review", () => {
     );
   });
 
+  it("requires an open pull request at the frozen review snapshot", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const host = new FakeHost();
+    host.snapshots = [{ ...pr, state: "CLOSED" }];
+    const runtime = new FakeAgentRuntime([clean, clean]);
+
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+        runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /must be OPEN at freeze, found CLOSED/,
+    );
+    assert.equal(runtime.tasks.length, 0);
+  });
+
   it("does not expand a frozen tiny-diff topology from reviewer findings", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
@@ -569,6 +586,207 @@ describe("fresh-context PR review", () => {
     const progress = await runs.listProgress(run.runId);
     assert.ok(progress.some(({ message }) => message.includes("timed out")));
     assert.ok(progress.some(({ message }) => message.includes("fresh retry 2/2 scheduled")));
+  });
+
+  it("accepts a successful late result after abort without overlapping a retry", async () => {
+    class AbortIgnoringLateRuntime extends FakeAgentRuntime {
+      abortedAttempts = 0;
+
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        const sessionRef = `late-session-${this.tasks.length}`;
+        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late" });
+        await new Promise<void>((resolve) => setTimeout(resolve, 35));
+        if (options.signal?.aborted) this.abortedAttempts++;
+        options.onEvent?.({ type: "artifact.submitted", taskId: task.id });
+        options.onEvent?.({ type: "session.completed", taskId: task.id, sessionRef });
+        return { output: clean as T, sessionRef, provider: "fake", model: "late" };
+      }
+    }
+
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new AbortIgnoringLateRuntime();
+    const result = await reviewPullRequest({
+      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+    }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
+
+    assert.equal(result.run.state, "merging");
+    assert.equal(runtime.abortedAttempts, result.reviewPlan.executionGroups.length);
+    assert.equal(runtime.tasks.length, result.reviewPlan.executionGroups.length);
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 1));
+    assert.deepEqual(result.sessionRefs.sort(), ["late-session-1", "late-session-2"]);
+    const progress = await runs.listProgress(run.runId);
+    assert.equal(progress.some(({ message }) => message.includes("retry 2/2 scheduled")), false);
+  });
+
+  it("does not resume a terminal non-resumable provider failure received during timeout drain", async () => {
+    class NonResumableDrainFailureRuntime extends FakeAgentRuntime {
+      readonly attempts = new Map<string, number>();
+      resumeCalls = 0;
+
+      override async capabilities(): Promise<RuntimeCapabilities> {
+        return { runtime: "fake", resumableSessions: true, tools: ["read", "grep", "find", "ls"] };
+      }
+
+      async resume<T>(): Promise<AgentRunResult<T>> {
+        this.resumeCalls++;
+        throw new Error("A terminal provider failure must not be resumed");
+      }
+
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        const attempt = (this.attempts.get(task.id) ?? 0) + 1;
+        this.attempts.set(task.id, attempt);
+        const sessionRef = `terminal-${task.id}-${attempt}`;
+        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "terminal" });
+        if (attempt === 1) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          throw new AgentRunError("provider rejected the session as terminal", { sessionRef, resumable: false });
+        }
+        return { output: clean as T, sessionRef, provider: "fake", model: "terminal" };
+      }
+    }
+
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new NonResumableDrainFailureRuntime();
+    const result = await reviewPullRequest({
+      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+    }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
+
+    assert.equal(result.run.state, "merging");
+    assert.equal(runtime.resumeCalls, 0);
+    assert.ok([...runtime.attempts.values()].every((attempts) => attempts === 2));
+  });
+
+  it("durably reconciles a successful same-plan result that arrives after the bounded drain", async () => {
+    class PostDrainRuntime extends FakeAgentRuntime {
+      returned = 0;
+      readonly allReturned: Promise<void>;
+      private resolveAllReturned!: () => void;
+
+      constructor() {
+        super();
+        this.allReturned = new Promise<void>((resolve) => { this.resolveAllReturned = resolve; });
+      }
+
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        const sessionRef = `post-drain-session-${this.tasks.length}`;
+        // The provider ignores abort and does not reveal its session identity
+        // until after timeout + the 100ms minimum drain have both elapsed.
+        await new Promise<void>((resolve) => setTimeout(resolve, 125));
+        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "post-drain" });
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        options.onEvent?.({ type: "artifact.submitted", taskId: task.id });
+        options.onEvent?.({ type: "session.completed", taskId: task.id, sessionRef });
+        this.returned++;
+        if (this.returned === 2) this.resolveAllReturned();
+        return { output: clean as T, sessionRef, provider: "fake", model: "post-drain" };
+      }
+    }
+
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new PostDrainRuntime();
+    const host = new FakeHost();
+
+    await assert.rejects(
+      reviewPullRequest({
+        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+      }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }),
+      /did not settle within the 100ms drain window/,
+    );
+    assert.equal(runtime.tasks.length, 2);
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 1));
+
+    await runtime.allReturned;
+    for (let attempt = 0; attempt < 20 && host.comments.length < 2; attempt++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(host.comments.length, 2);
+    assert.ok(host.comments.every(({ body }) => body.includes("completed after the bounded drain")));
+    assert.ok(host.comments.every(({ body }) => /Frozen review plan:\*\* `review-plan-[a-f0-9]{20}`/.test(body)));
+    assert.ok(host.comments.every(({ body }) => body.includes("post-drain-session-")));
+    const progress = await runs.listProgress(run.runId);
+    assert.ok(progress.some(({ message }) => message.includes("late session identity reconciled after bounded drain")));
+    assert.equal(progress.filter(({ message }) => message.includes("late completion reconciled after bounded drain")).length, 2);
+  });
+
+  it("durably reconciles a successful late scope adjudication for the same frozen plan", async () => {
+    const finding = {
+      ...inScope,
+      id: "late-scope-finding",
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: true,
+      title: "Guarded write can escape the lock",
+      evidence: "The guarded write occurs after the lock is released.",
+      location: "src/lock.ts:20",
+      intentRelevance: "Breaks Concurrent updates pass",
+      remediation: "Keep the write inside the lock.",
+    };
+
+    class PostDrainAdjudicationRuntime extends FakeAgentRuntime {
+      reviewerCalls = 0;
+      readonly adjudicationReturned: Promise<void>;
+      private resolveAdjudicationReturned!: () => void;
+
+      constructor() {
+        super();
+        this.adjudicationReturned = new Promise<void>((resolve) => { this.resolveAdjudicationReturned = resolve; });
+      }
+
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        if (task.role !== "adjudicator") {
+          this.reviewerCalls++;
+          const sessionRef = `reviewer-${this.reviewerCalls}`;
+          options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
+          const output = (this.reviewerCalls === 1 ? { summary: "blocking finding", findings: [finding] } : clean) as T;
+          return { output, sessionRef, provider: "fake", model: "late-scope" };
+        }
+
+        const sessionRef = "post-drain-scope-session";
+        await new Promise<void>((resolve) => setTimeout(resolve, 125));
+        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        const output = acceptAdjudication(task) as T;
+        this.resolveAdjudicationReturned();
+        return { output, sessionRef, provider: "fake", model: "late-scope" };
+      }
+    }
+
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new PostDrainAdjudicationRuntime();
+    const host = new FakeHost();
+
+    await assert.rejects(
+      reviewPullRequest({
+        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+      }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }),
+      /scope-adjudication.*did not settle within the 100ms drain window/,
+    );
+    assert.equal(runtime.tasks.filter(({ role }) => role === "adjudicator").length, 1);
+
+    await runtime.adjudicationReturned;
+    for (let attempt = 0; attempt < 20 && !host.comments.some(({ body }) => body.includes("Late Scope Adjudication")); attempt++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    const lateComment = host.comments.find(({ body }) => body.includes("Late Scope Adjudication"));
+    assert.ok(lateComment);
+    assert.match(lateComment.body, /Frozen review plan:\*\* `review-plan-[a-f0-9]{20}`/);
+    assert.match(lateComment.body, /post-drain-scope-session/);
+    assert.match(lateComment.body, /:\*\* accept - Directly required by the frozen criterion/);
+    const progress = await runs.listProgress(run.runId);
+    assert.ok(progress.some(({ message }) => message.includes("late session identity reconciled after bounded drain")));
+    assert.ok(progress.some(({ message }) => message.includes("late scope adjudication reconciled after bounded drain")));
   });
 
   it("runs independently selected reviewer roles concurrently", async () => {

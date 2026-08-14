@@ -255,6 +255,7 @@ function setEnvironmentValue(environment: NodeJS.ProcessEnv, name: string, value
 }
 
 export function isAgentTransportVariable(name: string): boolean {
-  return AGENT_TRANSPORT_KEYS.has(name)
-    || AGENT_TRANSPORT_PREFIXES.some((prefix) => name.startsWith(prefix));
+  const normalized = name.toUpperCase();
+  return AGENT_TRANSPORT_KEYS.has(normalized)
+    || AGENT_TRANSPORT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }

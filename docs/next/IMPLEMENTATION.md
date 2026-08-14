@@ -125,7 +125,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Per-execution-group provisional PR comments and a controller-authoritative consolidated Review Verdict; normal remediation keeps root-cause blockers in the verdict, while terminal materialization and reconciliation share one normalized aggregate identity so stale component projections close without closing the active aggregate
 - [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before the single allowed replacement attempt
 
-### 4. Lean `orchestrate` — scheduler and CLI implemented; durable coordination pending
+### 4. Lean `orchestrate` — shared durable controller implemented; distributed coordination pending
 
 - [x] Dependency DAG, unknown-dependency checks, and cycle diagnostics
 - [x] Bounded concurrency with deterministic priority ordering
@@ -153,10 +153,15 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Native orchestration does not implicitly resume stale DAGs; durable DAG IDs are shown separately from background task IDs, and DAG output requests resolve through orchestration status
 - [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, route metadata, and per-node errors for CLI/status restart inspection
 - [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
+- [x] CLI and TUI use one shared orchestration controller for frozen DAG creation, execution attempts, event projection, persistence, reconciliation, and resume; CLI numeric selection and TUI routed preview remain caller adapters
+- [x] Caller-supplied execution admission is mandatory and backed by a witnessed SQLite lease with heartbeat/fencing; persisted execution claim identities are non-secret token digests
+- [x] `orchestrate --resume <dag-id>`, native status/resume tools, frozen provider/model/thinking metadata, and transport-capacity capping are wired through restart recovery
+- [x] Native controller teardown can detach still-running tasks for later local adoption without weakening explicit cancellation
 - [ ] Cross-machine/GitHub-backed lease coordination (the retained witness port is implemented; GitHub coordination remains a separate future adapter; local recovery remains fail-closed)
 - [ ] Promote Build Packet paths into live scheduler claims
 - [ ] Token/cost budgets in addition to worker concurrency
-- [ ] Restart/reconciliation and merge-sequencing integration tests
+- [x] Restart reconciliation tests cover live native adoption, terminal authoritative re-read, completed-node preservation, interrupted-node relaunch, and no duplicate live worker dispatch
+- [ ] Cross-process merge-sequencing integration tests
 
 ### 5. ForgeDock terminal (Pi fork)
 
@@ -193,6 +198,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Orchestration board projection
 - [ ] Model/provider profiles and capability diagnostics
 - [x] Tabbed single/multi/preview decision interviews with explicit recommendations, custom answers, notes, review, and elaboration for supervised child escalations
+- [x] Native `/deep-plan` with supervisor/model invocation, bounded dependency-aware rounds, typed planning packets, explicit confirmation, confirmation-gated idempotent GitHub issue-DAG materialization, and an orchestration-ready handoff that never dispatches implicitly
+- [x] Native DAG status and resume tools remain discoverable in assistant mode while workflow mode retains least-authority tool activation
 - [ ] Session attach and durable cross-restart child supervision
 
 ### 6. Cutover
@@ -214,6 +221,21 @@ rolled-back continuity fails closed for acquire, heartbeat, release, and guarded
 workflow mutations. Explicit signed higher-epoch re-enrollment is required after
 restore; ordinary expiry recovery is not a continuity recovery. CLI/TUI factories
 must configure a retained witness outside the operational-store backup scope.
+
+For single-checkout dogfooding, run `forgedock-next lease-witness-bootstrap`
+once from the canonical checkout. It creates non-overwriting Ed25519 material and
+the retained checkpoint under OS-local user data, then stores only path references
+in the ignored `.forgedock/lease-witness.json`. Complete `FORGEDOCK_LEASE_WITNESS_*`
+environment configuration takes precedence. Partial environment configuration,
+checkout/reference mismatch, unsafe key paths, mismatched keys, invalid signatures,
+and group/other-readable private keys on POSIX all fail closed.
+
+This local bootstrap does not claim cross-machine or cross-checkout safety. A
+confirmed Deep Plan packet is still active-session memory until materialization;
+restart therefore requires repeating confirmation. Materialization creates the
+issue-number DAG but requires a separate explicit `/orchestrate` confirmation to
+dispatch it. Native task detach/adoption is local operational recovery; if the
+owning bridge is lost, the durable DAG may require explicit resume.
 
 The staging review gate records validation against reviewed SHA
 `e963e098d259375c1d693efc846e6c568bf7e5e7` and the current target branch in

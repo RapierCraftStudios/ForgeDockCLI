@@ -3,7 +3,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign as cryptoSign } from "node:crypto";
 import { constants } from "node:fs";
 import { access, glob as fsGlob, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, posix, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
   createFindTool,
@@ -11,6 +11,7 @@ import {
   createLsTool,
   createReadTool,
   createWriteTool,
+  type GrepOperations,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -36,6 +37,7 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
     const grep = createGrepTool(cwd, { operations: {
       isDirectory: async (path) => (await stat(await guard.existing(path))).isDirectory(),
       readFile: async (path) => readFile(await guard.existing(path), "utf8"),
+      search: createWorkspaceSearch(guard),
     } });
     const execute = grep.execute.bind(grep);
     grep.execute = (async (...args: Parameters<typeof grep.execute>) => {
@@ -89,6 +91,191 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
     } }) as unknown as ToolDefinition);
   }
   return tools;
+}
+
+type WorkspaceSearch = NonNullable<GrepOperations["search"]>;
+type WorkspaceSearchResult = Awaited<ReturnType<WorkspaceSearch>>;
+
+interface IgnoreRule {
+  base: string;
+  pattern: string;
+  negated: boolean;
+  directoryOnly: boolean;
+  basenameOnly: boolean;
+}
+
+/** Portable grep backend for confined agents; Pi's ordinary local tool still uses ripgrep. */
+function createWorkspaceSearch(guard: WorkspaceGuard): WorkspaceSearch {
+  return async ({ pattern, path: requestedPath, glob, ignoreCase, literal, maxResults, signal }) => {
+    const searchRoot = await guard.existing(requestedPath);
+    const rootStats = await stat(searchRoot);
+    const matches: WorkspaceSearchResult["matches"] = [];
+    const lineMatches = createLineMatcher(pattern, literal, ignoreCase);
+    let truncated = false;
+
+    const throwIfAborted = () => {
+      if (signal?.aborted) throw new Error("Operation aborted");
+    };
+
+    const searchFile = async (safePath: string, relativePath: string, reportedPath: string): Promise<void> => {
+      throwIfAborted();
+      if (glob && !matchesGlob(relativePath, glob)) return;
+
+      let content: string;
+      try {
+        content = await readFile(await guard.existing(safePath), "utf8");
+      } catch {
+        return;
+      }
+      // Match ripgrep's default binary-file behavior for the common NUL-byte case.
+      if (content.includes("\0")) return;
+
+      const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const lines = normalized.split("\n");
+      if (normalized.endsWith("\n")) lines.pop();
+      for (let index = 0; index < lines.length; index++) {
+        throwIfAborted();
+        const line = lines[index] ?? "";
+        if (!lineMatches(line)) continue;
+        if (matches.length >= maxResults) {
+          truncated = true;
+          return;
+        }
+        matches.push({ filePath: reportedPath, lineNumber: index + 1, lineText: line });
+      }
+    };
+
+    const walk = async (safeDirectory: string, relativeDirectory: string, inherited: readonly IgnoreRule[]) => {
+      throwIfAborted();
+      const rules = await readIgnoreRules(guard, safeDirectory, inherited);
+      let entries;
+      try {
+        entries = await readdir(safeDirectory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      entries.sort((left, right) => left.name.localeCompare(right.name));
+
+      for (const entry of entries) {
+        throwIfAborted();
+        if (truncated) return;
+        if (entry.name === ".git" || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
+
+        const candidate = resolve(safeDirectory, entry.name);
+        let safeCandidate: string;
+        try {
+          safeCandidate = await guard.existing(candidate);
+        } catch {
+          // A raced symlink or other escape is never followed.
+          continue;
+        }
+        const relativePath = toPosixPath(relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name);
+        if (isIgnored(safeCandidate, entry.isDirectory(), rules)) continue;
+
+        if (entry.isDirectory()) {
+          await walk(safeCandidate, relativePath, rules);
+        } else if (entry.isFile()) {
+          await searchFile(safeCandidate, relativePath, resolve(requestedPath, ...relativePath.split("/")));
+        }
+      }
+    };
+
+    throwIfAborted();
+    if (rootStats.isDirectory()) {
+      await walk(searchRoot, "", await readAncestorIgnoreRules(guard, searchRoot));
+    } else if (rootStats.isFile()) {
+      const relativePath = toPosixPath(requestedPath).split("/").pop() ?? requestedPath;
+      await searchFile(searchRoot, relativePath, requestedPath);
+    }
+    throwIfAborted();
+    return { matches, truncated };
+  };
+}
+
+async function readAncestorIgnoreRules(guard: WorkspaceGuard, directory: string): Promise<readonly IgnoreRule[]> {
+  const relativeDirectory = relative(guard.root, directory);
+  if (!relativeDirectory) return [];
+  let current = guard.root;
+  let rules: readonly IgnoreRule[] = [];
+  for (const segment of relativeDirectory.split(sep)) {
+    rules = await readIgnoreRules(guard, current, rules);
+    current = resolve(current, segment);
+  }
+  return rules;
+}
+
+function createLineMatcher(pattern: string, literal: boolean, ignoreCase: boolean): (line: string) => boolean {
+  if (literal) {
+    const needle = ignoreCase ? pattern.toLocaleLowerCase() : pattern;
+    return (line) => (ignoreCase ? line.toLocaleLowerCase() : line).includes(needle);
+  }
+  const expression = new RegExp(pattern, ignoreCase ? "i" : undefined);
+  return (line) => expression.test(line);
+}
+
+function matchesGlob(relativePath: string, rawPattern: string): boolean {
+  const path = toPosixPath(relativePath);
+  let pattern = toPosixPath(rawPattern);
+  const negated = pattern.startsWith("!");
+  if (negated) pattern = pattern.slice(1);
+  pattern = pattern.replace(/^\.\//, "").replace(/^\//, "");
+  const subject = pattern.includes("/") ? path : posix.basename(path);
+  const matched = posix.matchesGlob(subject, pattern);
+  return negated ? !matched : matched;
+}
+
+async function readIgnoreRules(
+  guard: WorkspaceGuard,
+  directory: string,
+  inherited: readonly IgnoreRule[],
+): Promise<readonly IgnoreRule[]> {
+  let source: string;
+  try {
+    source = await readFile(await guard.existing(resolve(directory, ".gitignore")), "utf8");
+  } catch {
+    return inherited;
+  }
+
+  const local: IgnoreRule[] = [];
+  for (const rawLine of source.replace(/\r/g, "").split("\n")) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    let negated = false;
+    if (line.startsWith("!")) {
+      negated = true;
+      line = line.slice(1);
+    }
+    line = line.replace(/^\\([#!])/, "$1");
+    const directoryOnly = line.endsWith("/");
+    if (directoryOnly) line = line.slice(0, -1);
+    const anchored = line.startsWith("/");
+    if (anchored) line = line.slice(1);
+    if (!line) continue;
+    local.push({
+      base: directory,
+      pattern: toPosixPath(line),
+      negated,
+      directoryOnly,
+      basenameOnly: !anchored && !line.includes("/"),
+    });
+  }
+  return local.length === 0 ? inherited : [...inherited, ...local];
+}
+
+function isIgnored(candidate: string, isDirectory: boolean, rules: readonly IgnoreRule[]): boolean {
+  let ignored = false;
+  for (const rule of rules) {
+    if (rule.directoryOnly && !isDirectory) continue;
+    const relativePath = toPosixPath(relative(rule.base, candidate));
+    if (!relativePath || relativePath === ".." || relativePath.startsWith("../")) continue;
+    const subject = rule.basenameOnly ? posix.basename(relativePath) : relativePath;
+    if (posix.matchesGlob(subject, rule.pattern)) ignored = !rule.negated;
+  }
+  return ignored;
+}
+
+function toPosixPath(path: string): string {
+  return path.replace(/\\/g, "/");
 }
 
 const ComputeSchema = Type.Object({

@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
+import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { terminalReviewFindings } from "../../workflows/review-pr/review.js";
 import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
@@ -85,6 +86,106 @@ describe("GitHub branch provisioning", () => {
     assert.deepEqual(await client.createBranch("a/b", "milestone/ship", "main"), { name: "milestone/ship", headSha: "a".repeat(40) });
     assert.deepEqual(JSON.parse(calls.find(({ args }) => args[1] === "repos/a/b/git/refs")?.input ?? "{}"), { ref: "refs/heads/milestone/ship", sha: "a".repeat(40) });
   });
+
+  it("adopts an existing branch only when its SHA matches the requested source head", async () => {
+    const sourceSha = "a".repeat(40);
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[1] === "repos/a/b/git/ref/heads/main") return JSON.stringify({ object: { sha: sourceSha } });
+      if (args[1] === "repos/a/b/git/refs") throw new Error("gh api failed (422): Reference already exists");
+      if (args[1] === "repos/a/b/git/ref/heads/milestone%2Fship") return JSON.stringify({ object: { sha: "b".repeat(40) } });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(
+      client.createBranch("a/b", "milestone/ship", "main"),
+      /already existed at b{40}, expected source head a{40}/,
+    );
+  });
+
+  it("does not treat an unrelated 422 response as an existing-branch conflict", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[1] === "repos/a/b/git/ref/heads/main") return JSON.stringify({ object: { sha: "a".repeat(40) } });
+      if (args[1] === "repos/a/b/git/refs") throw new Error("gh api failed (422): invalid reference name");
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(client.createBranch("a/b", "milestone/ship", "main"), /invalid reference name/);
+  });
+});
+
+describe("GitHub pull request admission", () => {
+  const headSha = "c".repeat(40);
+  const pullRequestProjection = (number: number, state: "OPEN" | "CLOSED" | "MERGED" = "OPEN") => ({
+    number,
+    title: "Delivery",
+    body: "",
+    url: `https://github.test/a/b/pull/${number}`,
+    state,
+    headRefOid: headSha,
+    headRefName: "forgedock/issue-186",
+    baseRefName: "staging",
+  });
+
+  it("rejects a GitHub projection whose PR identity differs from the requested number", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async () => JSON.stringify(pullRequestProjection(187)) });
+    await assert.rejects(client.getPullRequest("a/b", 186), /returned PR #187 while #186 was requested/);
+  });
+
+  it("fails closed on the PR #186 duplicate push and pull-request check pattern", async () => {
+    let mergeCommands = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")) {
+        return JSON.stringify(pullRequestProjection(186));
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" });
+      if (args[0] === "pr" && args[1] === "checks") {
+        return JSON.stringify([
+          { name: "CI", state: "FAILURE", link: "https://github.test/checks/push", completedAt: "2026-08-14T10:00:00Z" },
+          { name: "CI", state: "SUCCESS", link: "https://github.test/checks/pull-request", completedAt: "2026-08-14T10:01:00Z" },
+        ]);
+      }
+      if (args[0] === "pr" && args[1] === "merge") { mergeCommands += 1; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(
+      client.mergePullRequest("a/b", 186, headSha, "staging"),
+      /Required GitHub checks are not all passing for PR #186: CI=failed/,
+    );
+    assert.equal(mergeCommands, 0);
+  });
+
+  it("accepts an exact merged state when the merge command reports failure after landing", async () => {
+    let state: "OPEN" | "MERGED" = "OPEN";
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")) {
+        return JSON.stringify(pullRequestProjection(186, state));
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "checks") return "[]";
+      if (args[0] === "pr" && args[1] === "merge") {
+        state = "MERGED";
+        throw new Error("transport closed after GitHub accepted the merge");
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.mergePullRequest("a/b", 186, headSha, "staging");
+    assert.equal(state, "MERGED");
+  });
+
+  it("requires the initial pull request to be open before reading its merge gate", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify(pullRequestProjection(186, "CLOSED"));
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(
+      client.getPullRequestMergeGate("a/b", 186, headSha, "staging"),
+      /is not open \(GitHub state: CLOSED\)/,
+    );
+  });
 });
 
 describe("GitHub workflow label projection", () => {
@@ -99,6 +200,36 @@ describe("GitHub workflow label projection", () => {
     assert.equal(workflowLabelForState("blocked"), "needs-human");
     assert.equal(workflowLabelForState("failed"), "workflow:engine-error");
     assert.equal(workflowLabelForState("cancelled"), undefined);
+  });
+});
+
+describe("GitHub canonical marker admission", () => {
+  it("does not let an untrusted substring impersonate a canonical comment marker", async () => {
+    const marker = "<!-- FORGEDOCK:TEST exact -->";
+    const comments = [{ body: `prose prefix ${marker} suffix` }];
+    let posts = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+      if (args[0] === "api" && args.includes("POST")) {
+        posts += 1;
+        comments.push({ body: (JSON.parse(input ?? "{}") as { body: string }).body });
+        return "{}";
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return JSON.stringify([comments]);
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.publishIssueComment({ repo: "a/b", issue: 2, marker, body: `Authoritative update\n\n${marker}` });
+    assert.equal(posts, 1);
+    assert.equal(comments.length, 2);
+  });
+
+  it("requires the outgoing marker itself to occupy a canonical line", async () => {
+    const marker = "<!-- FORGEDOCK:TEST exact -->";
+    const client = new GitHubClient();
+    await assert.rejects(
+      client.publishIssueComment({ repo: "a/b", issue: 2, marker, body: `prefix ${marker} suffix` }),
+      /canonical idempotency marker/,
+    );
   });
 });
 
@@ -156,6 +287,36 @@ describe("GitHub review finding projection", () => {
     );
   });
 
+  it("adopts an existing open lane issue across a fresh admission store", async () => {
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-terminal-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Retained finding", evidence: "The open lane issue already records this root.", location: "src/schema.ts:20",
+      intentRelevance: "Keeps the review root durable", remediation: "Apply the recorded fix.",
+    };
+    const issue = {
+      number: 88, title: "existing lane finding", body: `**Source:** PR #57 — Fix\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, finding)}`,
+      html_url: "https://github.test/a/b/issues/88", state: "open" as const,
+    };
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    let created = false;
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([[issue]]);
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "issue" && args[1] === "create") { created = true; return "https://github.test/a/b/issues/99\n"; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const adopted = await client.materializeReviewFinding({
+      repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-new", reviewedHeadSha: pullRequest.headSha,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(adopted.number, 88);
+    assert.equal(created, false);
+  });
   it("adopts an existing open lane issue when an aggregate root set changes and closes duplicates", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
@@ -183,6 +344,15 @@ describe("GitHub review finding projection", () => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
       if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view") {
+        const issue = issues.find((candidate) => candidate.number === Number(args[2]));
+        if (!issue) throw new Error(`Unknown issue: ${args[2] ?? ""}`);
+        return JSON.stringify({
+          number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
+          state: issue.state.toUpperCase(), labels: [], milestone: null,
+        });
+      }
       if (args[0] === "issue" && args[1] === "create") {
         const number = 100 + issues.length + 1;
         issues.push({ number, title: args[args.indexOf("--title") + 1] ?? "Finding", body: body ?? "", html_url: `https://github.test/a/b/issues/${number}`, state: "open" });
@@ -217,6 +387,21 @@ describe("GitHub review finding projection", () => {
 });
 
 describe("GitHub decomposition materialization", () => {
+  it("rejects unknown dependency names before issuing any GitHub writes", async () => {
+    const client = new GitHubClient();
+    let calls = 0;
+    Object.defineProperty(client, "gh", { value: async () => {
+      calls += 1;
+      throw new Error("GitHub must not be called for an invalid decomposition DAG");
+    } });
+    await assert.rejects(client.materializeDecomposition({
+      repo: "a/b",
+      parentIssue: 7,
+      children: [{ title: "Child", outcome: "Deliver child", dependsOn: ["Missing prerequisite"] }],
+    }), /Unknown decomposition dependency 'Missing prerequisite' for child 'Child'/);
+    assert.equal(calls, 0);
+  });
+
   it("inherits and authoritatively verifies the parent milestone on new children", async () => {
     const client = new GitHubClient();
     const calls: string[][] = [];
@@ -296,6 +481,188 @@ describe("GitHub decomposition materialization", () => {
     assert.ok(edit);
     assert.deepEqual(edit.slice(edit.indexOf("--milestone")), ["--milestone", "Milestone One"]);
     assert.equal(children[0]?.milestone?.number, 1);
+  });
+});
+
+describe("GitHub plan materialization", () => {
+  const request = (): PlanMaterializationRequest => ({
+    repo: "a/b",
+    planId: "plan-session-1",
+    revision: 3,
+    objective: "Deliver the confirmed, dependency-ordered capability.",
+    assumptions: ["The existing adapter remains the GitHub authority."],
+    evidence: [{
+      id: "repo-adapter",
+      authority: "repository",
+      source: "src/adapters/github/github-client.ts",
+      locator: "GitHubClient",
+      claim: "Issue projection belongs in the GitHub adapter.",
+      detail: "The adapter already owns deterministic issue materialization and authoritative re-reads.",
+    }],
+    vocabulary: [{
+      id: "plan-node",
+      term: "Plan node",
+      definition: "One independently deliverable and verifiable work unit.",
+      aliases: ["work unit"],
+      evidenceIds: ["repo-adapter"],
+      status: "accepted",
+    }],
+    decisions: [{
+      round: 1,
+      questionId: "delivery-shape",
+      values: ["issue-dag"],
+      labels: ["GitHub issue DAG"],
+      customText: "Keep each node independently reviewable.",
+      note: "The user confirmed durable GitHub handoff.",
+      optionNotes: { "issue-dag": "Preferred for dogfooding." },
+      authority: "user",
+    }],
+    outOfScope: ["Automatic dispatch before confirmation."],
+    // Deliberately reverse dependency order: the adapter, not caller order,
+    // owns topological creation.
+    nodes: [
+      {
+        planId: "plan-session-1",
+        revision: 3,
+        nodeId: "verify",
+        title: "Verify the materialized plan",
+        outcome: "The issue graph is independently verified.",
+        dependsOnNodeIds: ["build"],
+        acceptanceCriteria: ["The returned dependency mapping points at the build issue."],
+        affectedFiles: ["src/adapters/github/github-client.test.ts"],
+        claims: ["component:github-plan-verification"],
+        verificationPlan: ["Run the focused GitHub adapter tests."],
+        priority: 20,
+        riskClass: "routine",
+        evidenceIds: ["repo-adapter"],
+      },
+      {
+        planId: "plan-session-1",
+        revision: 3,
+        nodeId: "build",
+        title: "Build the plan materializer",
+        outcome: "Confirmed plan nodes become durable GitHub issues.",
+        dependsOnNodeIds: [],
+        acceptanceCriteria: ["Every node has one deterministic issue.", "No dependency is invented."],
+        affectedFiles: ["src/adapters/github/github-client.ts"],
+        claims: ["component:github-plan-materialization"],
+        verificationPlan: ["Compile the adapter.", "Run plan materialization regressions."],
+        priority: 10,
+        riskClass: "security",
+        evidenceIds: ["repo-adapter"],
+      },
+    ],
+  });
+
+  function fixture() {
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" }> = [];
+    const createTitles: string[] = [];
+    let calls = 0;
+    const makeClient = (admissions = new InMemoryRemediationAdmissionRepository()) => {
+      const client = new GitHubClient(".", admissions);
+      Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+        calls += 1;
+        if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
+        if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+        if (args[0] === "issue" && args[1] === "create") {
+          const number = 100 + issues.length + 1;
+          const title = args[args.indexOf("--title") + 1] ?? "Plan node";
+          createTitles.push(title);
+          issues.push({ number, title, body: body ?? "", html_url: `https://github.test/a/b/issues/${number}`, state: "open" });
+          return `https://github.test/a/b/issues/${number}\n`;
+        }
+        if (args[0] === "issue" && args[1] === "view") {
+          const issue = issues.find((candidate) => candidate.number === Number(args[2]));
+          if (!issue) throw new Error(`Unknown issue: ${args[2] ?? ""}`);
+          return JSON.stringify({
+            number: issue.number,
+            title: issue.title,
+            body: issue.body,
+            url: issue.html_url,
+            state: "OPEN",
+            labels: [],
+            milestone: null,
+          });
+        }
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+      return client;
+    };
+    return { issues, createTitles, calls: () => calls, makeClient };
+  }
+
+  it("creates the issue DAG topologically and returns authoritative dependency mappings", async () => {
+    const github = fixture();
+    const input = request();
+    const result = await github.makeClient().materializePlan(input);
+
+    assert.deepEqual(github.createTitles, ["Build the plan materializer", "Verify the materialized plan"]);
+    assert.deepEqual(result.nodes.map((node) => node.nodeId), ["verify", "build"]);
+    const build = result.nodes.find((node) => node.nodeId === "build")!;
+    const verify = result.nodes.find((node) => node.nodeId === "verify")!;
+    assert.deepEqual(verify.dependsOnNodeIds, ["build"]);
+    assert.deepEqual(verify.dependencyIssueNumbers, [build.issue.number]);
+    assert.equal(build.issue.state, "OPEN");
+    assert.match(build.issue.body.split("\n")[0] ?? "", /^<!-- FORGEDOCK:PLAN-NODE v1 identity=[a-f0-9]{64} contract=[a-f0-9]{64} -->$/);
+    for (const expected of [
+      "Every node has one deterministic issue.",
+      "src/adapters/github/github-client.ts",
+      "component:github-plan-materialization",
+      "Run plan materialization regressions.",
+      "**Priority:** 10",
+      "**Risk class:** `security`",
+      "Issue projection belongs in the GitHub adapter.",
+      "The adapter already owns deterministic issue materialization",
+      "The existing adapter remains the GitHub authority.",
+      "One independently deliverable and verifiable work unit.",
+      "Keep each node independently reviewable.",
+      "Automatic dispatch before confirmation.",
+    ]) assert.ok(build.issue.body.includes(expected), `missing full plan context: ${expected}`);
+    assert.ok(verify.issue.body.includes(`#${build.issue.number} — build: Build the plan materializer`));
+  });
+
+  it("adopts exact marker/digest matches across cached and fresh admission stores", async () => {
+    const github = fixture();
+    const input = request();
+    const cachedClient = github.makeClient();
+    const first = await cachedClient.materializePlan(input);
+    const cached = await cachedClient.materializePlan(input);
+    const fresh = await github.makeClient().materializePlan(input);
+    assert.equal(github.issues.length, 2);
+    assert.deepEqual(cached.nodes.map((node) => node.issue.number), first.nodes.map((node) => node.issue.number));
+    assert.deepEqual(fresh.nodes.map((node) => node.issue.number), first.nodes.map((node) => node.issue.number));
+  });
+
+  it("rejects a changed node contract at the same immutable identity before another write", async () => {
+    const github = fixture();
+    const input = request();
+    await github.makeClient().materializePlan(input);
+    const changed: PlanMaterializationRequest = {
+      ...input,
+      nodes: input.nodes.map((node) => node.nodeId === "verify"
+        ? { ...node, outcome: "A different contract under the same revision." }
+        : node),
+    };
+    await assert.rejects(
+      github.makeClient().materializePlan(changed),
+      /Plan node verify already exists with a different contract digest/,
+    );
+    assert.equal(github.issues.length, 2);
+  });
+
+  it("preflights every dependency before making a GitHub call", async () => {
+    const input = request();
+    const invalid: PlanMaterializationRequest = {
+      ...input,
+      nodes: input.nodes.map((node) => node.nodeId === "verify"
+        ? { ...node, dependsOnNodeIds: ["missing"] }
+        : node),
+    };
+    let calls = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async () => { calls += 1; throw new Error("must not call GitHub"); } });
+    await assert.rejects(client.materializePlan(invalid), /Unknown plan dependency 'missing' for node 'verify'/);
+    assert.equal(calls, 0);
   });
 });
 
@@ -430,6 +797,20 @@ describe("GitHub durable artifact projection", () => {
     await new GitHubArtifactRepository(client, admissions).append(artifact);
     assert.equal(client.postCalls, 1);
     assert.equal((await new GitHubArtifactRepository(client, admissions).list(artifact.subject)).length, 1);
+  });
+
+  it("re-reads GitHub before honoring a cached materialized artifact admission", async () => {
+    const client = new CommentClient();
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const repository = new GitHubArtifactRepository(client, admissions);
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run-stale-cache", subject: { repo: "a/b", issue: 2 }, producer: { role: "test" },
+      payload: { title: "Stale cache", problem: "test", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    await repository.append(artifact);
+    client.comments.delete("a/b#i2");
+    await assert.rejects(repository.append(artifact), /admission is retained pending reconciliation/);
+    assert.equal(client.postCalls, 1);
   });
 
   it("filters embedded artifacts by canonical target while retaining issue/PR overlap", async () => {

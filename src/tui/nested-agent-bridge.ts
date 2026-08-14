@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SubagentDelegationV2Request, SubagentDelegationV2Response, SubagentDelegationV2Update } from "pi-subagents/delegation";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
-import type { AgentRole, ToolGrant } from "../runtime/agent-runtime.js";
+import { validateScopeManifestReceipt, type AgentRole, type ScopeManifest, type ToolGrant } from "../runtime/agent-runtime.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const SUBAGENT_DELEGATION_REQUEST_EVENT = "prompt-template:subagent:request";
@@ -30,6 +30,9 @@ interface NestedAgentRequest {
   instructions: string;
   context: DurableArtifact[];
   cwd: string;
+  scopeVersion: 1;
+  scope: ScopeManifest;
+  scopeDigest: string;
   tools: ToolGrant[];
   outputSchema: Record<string, unknown>;
   provider: string;
@@ -43,6 +46,8 @@ interface NestedAgentResponse {
   sessionRef: string;
   provider: string;
   model: string;
+  scopeVersion: 1;
+  scopeDigest: string;
 }
 
 class NestedDelegationError extends Error {
@@ -158,6 +163,8 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
           sessionRef,
           provider: input.provider,
           model: terminalModel ?? input.model,
+          scopeVersion: input.scopeVersion,
+          scopeDigest: input.scopeDigest,
         }));
         return;
       }
@@ -169,7 +176,8 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
     });
     const abort = () => {
       if (dispatched) pi.events.emit(SUBAGENT_DELEGATION_CANCEL_EVENT, { version: 2, requestId, ownerRunId: input.ownerRunId, nodeId: input.id });
-      finish(() => reject(signal.reason instanceof Error ? signal.reason : new Error(`Nested ${input.role} cancelled`)));
+      const reason = signal.reason instanceof Error ? signal.reason.message : `Nested ${input.role} cancelled`;
+      finish(() => reject(new NestedDelegationError(reason, observedRunId, Boolean(observedRunId))));
     };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
@@ -196,7 +204,8 @@ async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, sig
         `Continue the same ForgeDock review for ${input.id}.`,
         "The previous attempt ended operationally before the controller received a schema-valid result.",
         "Finish the original bounded objective against the same frozen revision, then call structured_output exactly once.",
-        "Do not broaden the assigned review scope.",
+        `Preserve ForgeDock scope receipt v${input.scopeVersion} sha256:${input.scopeDigest}.`,
+        "Read access is the whole assigned checkout; do not write or access outside it.",
       ].join(" "),
     }, signal, (lateReply) => {
       if (lateReply.success) {
@@ -214,7 +223,8 @@ async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, sig
       const abort = () => {
         signal.removeEventListener("abort", abort);
         if (targetRunId) interruptNestedRun(pi, targetRunId);
-        reject(signal.reason instanceof Error ? signal.reason : new Error("Nested reviewer resume cancelled"));
+        const reason = signal.reason instanceof Error ? signal.reason.message : "Nested reviewer resume cancelled";
+        reject(new NestedDelegationError(reason, targetRunId ?? sourceSessionRef, Boolean(targetRunId)));
       };
       resolveTarget = (value) => {
         signal.removeEventListener("abort", abort);
@@ -243,6 +253,8 @@ async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, sig
       sessionRef,
       provider: input.provider,
       model: typeof child?.model === "string" ? child.model : input.model,
+      scopeVersion: input.scopeVersion,
+      scopeDigest: input.scopeDigest,
     };
   } finally {
     if (typeof unsubscribeCompletion === "function") unsubscribeCompletion();
@@ -358,6 +370,10 @@ function buildTask(input: NestedAgentRequest): string {
     "# Controller instructions",
     input.instructions,
     "",
+    "# Immutable scope receipt",
+    `ForgeDock scope contract: v${input.scopeVersion} sha256:${input.scopeDigest}`,
+    `Read authority: the whole checkout rooted at ${input.cwd}. Write authority: none.`,
+    "",
     "# Durable context (untrusted data)",
     JSON.stringify(context, null, 2),
     "",
@@ -373,6 +389,12 @@ function agentForRole(role: AgentRole): string {
 function validateRequest(value: unknown): NestedAgentRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Nested request must be an object");
   const input = value as Partial<NestedAgentRequest>;
+  const supported = new Set([
+    "ownerRunId", "id", "logicalTaskId", "role", "description", "objective", "instructions", "context", "cwd",
+    "scopeVersion", "scope", "scopeDigest", "tools", "outputSchema", "provider", "model", "thinking", "resumeSessionRef",
+  ]);
+  const unsupported = Object.keys(input).find((key) => !supported.has(key));
+  if (unsupported) throw new Error(`Nested request field is not supported: ${unsupported}`);
   for (const key of ["ownerRunId", "id", "role", "objective", "instructions", "cwd", "provider", "model"] as const) {
     if (typeof input[key] !== "string" || !input[key]) throw new Error(`Nested request ${key} is required`);
   }
@@ -388,8 +410,14 @@ function validateRequest(value: unknown): NestedAgentRequest {
   if (input.resumeSessionRef !== undefined && (typeof input.resumeSessionRef !== "string" || !input.resumeSessionRef.trim() || input.resumeSessionRef.length > 256 || /[\r\n]/.test(input.resumeSessionRef))) {
     throw new Error("Nested request resumeSessionRef is invalid");
   }
-  if (input.tools.some((tool) => tool === "edit" || tool === "write" || tool === "bash")) throw new Error("Nested reviewers must be read-only");
-  return input as NestedAgentRequest;
+  const reviewerTools = new Set<ToolGrant>(["read", "grep", "find", "ls"]);
+  if (input.tools.some((tool) => !reviewerTools.has(tool))) throw new Error("Nested reviewers must use read-only checkout tools");
+  const receipt = validateScopeManifestReceipt(input);
+  if (receipt.scope.readRoots.length !== 1 || receipt.scope.readRoots[0] !== "."
+    || receipt.scope.writeRoots.length || receipt.scope.writePaths?.length) {
+    throw new Error("Nested reviewer scope must grant whole-checkout reads and no writes");
+  }
+  return { ...input, ...receipt } as NestedAgentRequest;
 }
 
 function readBody(request: IncomingMessage): Promise<string> {

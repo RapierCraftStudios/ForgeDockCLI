@@ -15,7 +15,12 @@ import { attachArtifact, transition, type RunState } from "../../core/state/mach
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
 import { buildWorkItem, type BuilderSubmission } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
-import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
+import {
+  deterministicOutcomeId,
+  investigateWorkItem,
+  resumeInvestigationWorkItem,
+  WorkflowExecutionError,
+} from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket } from "./prepare.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
@@ -132,6 +137,7 @@ export async function workOn(
     assertLease(dependencies);
     const issue = input.intent.subject.issue;
     if (!issue) throw new Error("work-on requires an issue subject");
+    await assertFreshIssueOpen(dependencies.host, input.intent.subject.repo, issue);
     if (input.parentRemediation) {
       assertParentRemediationTarget(input.parentRemediation);
       if (dependencies.host.getBranchHead) {
@@ -242,6 +248,173 @@ export async function workOn(
   }
 }
 
+export interface EarlyWorkOnResumeInput extends ScopeExpansionOptions {
+  checkpoint: "investigation" | "preparation";
+  run: RunState;
+  intent: DurableArtifact<"Intent">;
+  investigation?: DurableArtifact<"Investigation">;
+  priorArtifacts?: readonly DurableArtifact[];
+  workspace: GitWorkspace;
+  baseBranch: string;
+  scopeHints?: ScopeHints;
+  verification: readonly Omit<VerificationCommand, "cwd">[];
+  baselineChecks?: readonly CheckResult[];
+  provider?: string;
+  model?: string;
+  planningProvider?: string;
+  planningModel?: string;
+  planningThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  autoMerge?: boolean;
+  maxRemediationCycles?: number;
+  priorRemediationCycles?: number;
+  maxReviewSpecialists?: number;
+  productionTarget?: string;
+  subjectEvidence?: readonly string[];
+  batchMembers?: readonly number[];
+  batchMemberContracts?: readonly BatchMemberContract[];
+  onClaimsPromoted?: (paths: readonly string[]) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Recover the two durable checkpoints before a Build Packet exists. The
+ * controller never replays an Investigation artifact: it either dispatches
+ * from Intent-only state or advances the existing result to preparation (or
+ * its invalid/decomposed terminal projection).
+ */
+export async function resumeEarlyWorkOn(
+  input: EarlyWorkOnResumeInput,
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
+  let run = input.run;
+  let investigation = input.investigation;
+  const workspace = input.workspace;
+  const agentDependencies = {
+    runtime: dependencies.runtime,
+    artifacts: dependencies.artifacts,
+    runs: dependencies.runs,
+    decomposer: dependencies.host,
+    ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+  };
+  try {
+    assertLease(dependencies);
+    assertRunTargetsBranch(run, input.baseBranch);
+    if (input.checkpoint === "investigation") {
+      if (run.state !== "investigating") {
+        throw new Error(`Investigation checkpoint requires investigating state, found ${run.state}`);
+      }
+      const investigated = await resumeInvestigationWorkItem({
+        run,
+        intent: input.intent,
+        ...(investigation ? { investigation } : {}),
+        ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
+        cwd: workspace.path,
+        ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
+        ...(input.provider !== undefined ? { provider: input.provider } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.planningProvider !== undefined ? { planningProvider: input.planningProvider } : {}),
+        ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
+        ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      }, agentDependencies);
+      run = investigated.run;
+      investigation = investigated.investigation;
+      if (run.state === "invalid") {
+        if (!investigated.outcome || investigated.outcome.payload.status !== "invalid") {
+          throw new Error(`Invalid run ${run.runId} is missing its structured invalid Outcome`);
+        }
+        return await completeInvalidWorkItem({
+          run,
+          investigation,
+          outcome: investigated.outcome,
+        }, dependencies);
+      }
+      if (run.state === "decomposed") {
+        return {
+          run,
+          ...(investigated.outcome ? { outcome: investigated.outcome } : {}),
+        };
+      }
+    } else {
+      if (run.state !== "preparing") {
+        throw new Error(`Preparation checkpoint requires preparing state, found ${run.state}`);
+      }
+      if (!investigation || investigation.payload.outcome !== "confirmed") {
+        throw new Error("Preparation checkpoint requires a confirmed durable Investigation");
+      }
+    }
+
+    if (!investigation || investigation.payload.outcome !== "confirmed") {
+      throw new Error("Build Packet recovery requires a confirmed durable Investigation");
+    }
+    const prepared = await prepareBuildPacket({
+      run,
+      intent: input.intent,
+      investigation,
+      ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
+      cwd: workspace.path,
+      ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.planningProvider !== undefined ? { planningProvider: input.planningProvider } : {}),
+      ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
+      ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      verificationCatalog: {
+        commands: input.verification.map(({ id, command, args }) => ({ id, command, args })),
+        controllerGates: CONTROLLER_VERIFICATION_GATES,
+      },
+    }, agentDependencies);
+    input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
+    run = prepared.run;
+    const continued = await continueBuildDelivery({
+      run,
+      intent: input.intent,
+      investigation,
+      packet: prepared.packet,
+      workspace,
+      baseBranch: input.baseBranch,
+      verification: input.verification,
+      ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
+      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.autoMerge !== undefined ? { autoMerge: input.autoMerge } : {}),
+      ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+      ...(input.priorRemediationCycles !== undefined ? { priorRemediationCycles: input.priorRemediationCycles } : {}),
+      ...(input.maxRemediationDepth !== undefined ? { maxRemediationDepth: input.maxRemediationDepth } : {}),
+      ...(input.maxRemediationChildren !== undefined ? { maxRemediationChildren: input.maxRemediationChildren } : {}),
+      ...(input.remediationDepth !== undefined ? { remediationDepth: input.remediationDepth } : {}),
+      ...(input.scopeExpansion !== undefined ? { scopeExpansion: input.scopeExpansion } : {}),
+      ...(input.parentRemediation !== undefined ? { parentRemediation: input.parentRemediation } : {}),
+      ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+      ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.batchMembers !== undefined ? { batchMembers: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { batchMemberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, dependencies);
+    run = continued.run;
+    return continued;
+  } catch (error) {
+    if (error instanceof WorkflowExecutionError) run = error.run;
+    const reason = error instanceof Error ? error.message : String(error);
+    if (run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
+      const failed = transition(run, "FAIL", { reason });
+      await dependencies.runs.commit(run.version, failed.state, failed.record);
+      run = failed.state;
+    }
+    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    throw error;
+  } finally {
+    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    if (!retainForRecovery) {
+      try { await dependencies.git.remove(workspace); } catch { /* recovery reconciles stale worktrees */ }
+    }
+  }
+}
+
 async function appendVerificationRepairCheckpoint(
   run: RunState,
   failure: DurableArtifact<"Outcome">,
@@ -264,6 +437,12 @@ async function appendVerificationRepairCheckpoint(
       childIssues: [],
       failureEvidence: { ...failureEvidence, repairAttempt },
     },
+  }, {
+    id: deterministicOutcomeId(
+      run.runId,
+      run.subject,
+      `blocked:verification-repair:${repairAttempt}:supersedes:${failure.id}`,
+    ),
   });
   await dependencies.artifacts.append(outcome);
   return { run: attachArtifact(run, "Outcome", outcome.id), outcome };
@@ -1364,6 +1543,17 @@ function assertLease(dependencies: Pick<WorkOnDependencies, "leaseGuard">): void
   dependencies.leaseGuard?.assertValid();
 }
 
+async function assertFreshIssueOpen(host: ForgeHost, expectedRepo: string, expectedIssue: number): Promise<void> {
+  if (!host.getIssue) return;
+  const issue = await host.getIssue(expectedIssue, expectedRepo);
+  if (issue.repo.toLowerCase() !== expectedRepo.toLowerCase() || issue.number !== expectedIssue) {
+    throw new Error(`Issue admission identified ${issue.repo}#${issue.number}, expected ${expectedRepo}#${expectedIssue}`);
+  }
+  if (issue.state === "CLOSED") {
+    throw new Error(`Issue #${expectedIssue} is already closed; refusing to start fresh work`);
+  }
+}
+
 /**
  * Guard the actual mutation ports, not merely the phase entry points. A
  * heartbeat can discover continuity loss while an awaited helper is between
@@ -1418,6 +1608,8 @@ async function appendFailureOutcome(run: RunState, reason: string, dependencies:
       ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
       childIssues: [],
     },
+  }, {
+    id: deterministicOutcomeId(run.runId, run.subject, `failed:${reason}`),
   }));
 }
 
@@ -1509,6 +1701,8 @@ async function blockForBudget(run: RunState, dependencies: WorkOnDependencies, r
       ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
       childIssues: [],
     },
+  }, {
+    id: deterministicOutcomeId(run.runId, run.subject, `blocked:${reason}`),
   });
   await dependencies.artifacts.append(outcome);
   run = attachArtifact(run, "Outcome", outcome.id);

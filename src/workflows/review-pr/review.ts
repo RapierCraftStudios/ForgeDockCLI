@@ -55,6 +55,8 @@ export interface DeploymentReviewEvidence {
 
 export const DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
+const DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS = 15_000;
+const MIN_REVIEWER_ATTEMPT_DRAIN_MS = 100;
 
 class ReviewWaveIncompleteError extends Error {
   constructor(message: string) {
@@ -64,14 +66,29 @@ class ReviewWaveIncompleteError extends Error {
 }
 
 export class ReviewerAttemptTimeoutError extends AgentRunError {
+  readonly taskId: string;
   readonly timeoutMs: number;
+  readonly drainExpired: boolean;
 
-  constructor(taskId: string, timeoutMs: number, sessionRef?: string) {
-    super(`Reviewer attempt ${taskId} timed out after ${timeoutMs}ms`, {
-      ...(sessionRef !== undefined ? { sessionRef, resumable: true } : {}),
+  constructor(
+    taskId: string,
+    timeoutMs: number,
+    sessionRef?: string,
+    options: { drainExpired?: boolean; drainMs?: number; resumable?: boolean; cause?: unknown } = {},
+  ) {
+    const drainExpired = options.drainExpired === true;
+    const sessionIdentity = sessionRef ? ` (session ${sessionRef})` : "";
+    const drainDetail = drainExpired
+      ? `; abort was requested but the attempt did not settle within the ${options.drainMs ?? 0}ms drain window`
+      : "";
+    super(`Reviewer attempt ${taskId}${sessionIdentity} timed out after ${timeoutMs}ms${drainDetail}`, {
+      ...(sessionRef !== undefined ? { sessionRef, resumable: !drainExpired && options.resumable !== false } : {}),
+      ...(options.cause !== undefined ? { cause: options.cause } : {}),
     });
     this.name = "ReviewerAttemptTimeoutError";
+    this.taskId = taskId;
     this.timeoutMs = timeoutMs;
+    this.drainExpired = drainExpired;
   }
 }
 
@@ -92,35 +109,92 @@ async function withReviewerAttemptTimeout<T>(
     timeoutMs: number;
     taskId: string;
     sessionRef?: string;
+    getSessionRef?: () => string | undefined;
+    onDrainExpired?: () => void;
+    onLateResult?: (value: T) => Promise<void> | void;
   },
 ): Promise<T> {
   const controller = new AbortController();
   let timeoutError: ReviewerAttemptTimeoutError | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
   const abortFromCaller = () => controller.abort(input.externalSignal?.reason);
   if (input.externalSignal) {
     input.externalSignal.addEventListener("abort", abortFromCaller, { once: true });
     if (input.externalSignal.aborted) abortFromCaller();
   }
   try {
-    const operationResult = operation(controller.signal);
-    const timeoutResult = new Promise<never>((_, reject) => {
+    type Settlement = { status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown };
+    const operationResult: Promise<Settlement> = Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => ({ status: "fulfilled" as const, value }),
+        (reason: unknown) => ({ status: "rejected" as const, reason }),
+      );
+    const timeoutResult = new Promise<{ status: "timed-out" }>((resolve) => {
       timer = setTimeout(() => {
-        timeoutError = new ReviewerAttemptTimeoutError(input.taskId, input.timeoutMs, input.sessionRef);
+        timeoutError = new ReviewerAttemptTimeoutError(
+          input.taskId,
+          input.timeoutMs,
+          input.getSessionRef?.() ?? input.sessionRef,
+        );
         controller.abort(timeoutError);
-        reject(timeoutError);
+        resolve({ status: "timed-out" });
       }, input.timeoutMs);
     });
-    try {
-      return await Promise.race([operationResult, timeoutResult]);
-    } catch (error) {
-      if (timeoutError) throw timeoutError;
-      throw error;
+    const first = await Promise.race([operationResult, timeoutResult]);
+    if (first.status === "fulfilled") return first.value;
+    if (first.status === "rejected") throw first.reason;
+
+    // A timeout is an abort request, not proof that the provider-backed
+    // attempt stopped. Reconcile the same in-flight operation before deciding
+    // whether a retry is safe. A successful late submission still belongs to
+    // this frozen task/head/plan and remains authoritative.
+    const drainMs = reviewerAttemptDrainMs(input.timeoutMs);
+    const drainExpired = new Promise<{ status: "drain-expired" }>((resolve) => {
+      drainTimer = setTimeout(() => resolve({ status: "drain-expired" }), drainMs);
+    });
+    const drained = await Promise.race([operationResult, drainExpired]);
+    if (drained.status === "fulfilled") return drained.value;
+    if (drained.status === "rejected") {
+      const sessionRef = drained.reason instanceof AgentRunError
+        ? drained.reason.sessionRef ?? input.getSessionRef?.() ?? input.sessionRef
+        : input.getSessionRef?.() ?? input.sessionRef;
+      throw new ReviewerAttemptTimeoutError(input.taskId, input.timeoutMs, sessionRef, {
+        // A provider may surface a terminal, explicitly non-resumable failure
+        // only after processing the abort request. Do not turn that failure
+        // into resume authority merely because it arrived during the drain.
+        resumable: drained.reason === timeoutError
+          ? true
+          : drained.reason instanceof AgentRunError ? drained.reason.resumable : false,
+        cause: drained.reason,
+      });
     }
+    input.onDrainExpired?.();
+    // The controller cannot safely overlap an undrained provider attempt with
+    // a replacement. Preserve a later success through the caller's durable
+    // reconciliation hook even though this wave must fail closed now.
+    void operationResult.then(async (settlement) => {
+      if (settlement.status === "fulfilled") await input.onLateResult?.(settlement.value);
+    }).catch(() => undefined);
+    throw new ReviewerAttemptTimeoutError(
+      input.taskId,
+      input.timeoutMs,
+      input.getSessionRef?.() ?? input.sessionRef,
+      { drainExpired: true, drainMs },
+    );
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    if (drainTimer !== undefined) clearTimeout(drainTimer);
     input.externalSignal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+function reviewerAttemptDrainMs(timeoutMs: number): number {
+  return Math.min(
+    DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS,
+    Math.max(MIN_REVIEWER_ATTEMPT_DRAIN_MS, Math.ceil(timeoutMs / 10)),
+  );
 }
 
 export async function reviewPullRequest(
@@ -179,6 +253,15 @@ export async function reviewPullRequest(
     const changedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
     if (!expectedHeadSha || !changedPaths) throw new Error("Review evidence is missing its head SHA or changed paths");
     const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+    if (!samePullRequestIdentity(input.pullRequest, frozen)) {
+      throw new Error(
+        `Cannot start review: host returned mismatched PR identity ${frozen.repo}#${frozen.number}`
+        + ` for ${input.pullRequest.repo}#${input.pullRequest.number}`,
+      );
+    }
+    if (frozen.state !== "OPEN") {
+      throw new Error(`Cannot start review: PR #${frozen.number} must be OPEN at freeze, found ${frozen.state}`);
+    }
     if (frozen.headSha !== input.pullRequest.headSha || frozen.headSha !== expectedHeadSha) {
       throw new Error(input.deployment
         ? "Cannot start deployment review: PR head changed before review"
@@ -262,12 +345,38 @@ export async function reviewPullRequest(
       let resumeSessionRef: string | undefined;
       let completed: { role: ReviewerRole; output: ReviewerSubmission; sessionRef: string; sessionLineage: readonly string[] } | undefined;
       const taskId = `${run.runId}:review:${frozen.headSha}:cycle-${reviewCycle.current}-of-${reviewCycle.total}:${selection.id}`;
+      const publishCompletedReviewer = async (
+        result: { role: ReviewerRole; output: ReviewerSubmission; sessionRef: string; sessionLineage: readonly string[] },
+        lateAfterDrain: boolean,
+      ): Promise<void> => {
+        const marker = reviewerSubmissionMarker(run.runId, frozen.headSha, role);
+        await dependencies.host.publishPullRequestComment({
+          repo: frozen.repo,
+          pullRequest: frozen.number,
+          marker,
+          body: renderReviewerSubmissionComment({
+            runId: run.runId,
+            pullRequest: frozen.number,
+            headSha: frozen.headSha,
+            reviewPlanId: reviewPlan.planId,
+            role,
+            submission: result.output,
+            sessionLineage: result.sessionLineage,
+            selection,
+            marker,
+            ...(lateAfterDrain ? { lateAfterDrain: true } : {}),
+          }),
+        });
+      };
       for (let attempt = 1; attempt <= reviewPlan.budget.maxAttemptsPerExecutionGroup; attempt++) {
         if (remainingReviewerAttempts <= 0) throw new Error(`Review Plan reviewer-attempt budget exhausted before ${selection.id}`);
         remainingReviewerAttempts--;
         claimModelCall(`${selection.id} attempt ${attempt}`);
+        let observedSessionRef: string | undefined;
+        let drainExpired = false;
         try {
           const shouldResume = canResumeReviewer && resumeSessionRef !== undefined;
+          observedSessionRef = shouldResume ? resumeSessionRef : undefined;
           const task: AgentTask<ReviewerSubmission> = {
             id: taskId,
             role: "reviewer",
@@ -339,7 +448,16 @@ export async function reviewPullRequest(
             (signal) => {
               const runOptions = {
                 signal,
-                ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+                onEvent: ((event) => {
+                  if (event.type === "session.started" && event.taskId === task.id) {
+                    const identityArrivedLate = drainExpired && observedSessionRef === undefined;
+                    observedSessionRef = event.sessionRef;
+                    if (identityArrivedLate) {
+                      void recordReviewProgress(`${taskId} · late session identity reconciled after bounded drain · session ${event.sessionRef}`);
+                    }
+                  }
+                  dependencies.onAgentEvent?.(event);
+                }) satisfies AgentEventSink,
               };
               return shouldResume
                 ? dependencies.runtime.resume!(resumeSessionRef!, task, runOptions)
@@ -350,6 +468,23 @@ export async function reviewPullRequest(
               timeoutMs: reviewerAttemptTimeoutMs,
               taskId,
               ...(shouldResume && resumeSessionRef !== undefined ? { sessionRef: resumeSessionRef } : {}),
+              getSessionRef: () => observedSessionRef,
+              onDrainExpired: () => { drainExpired = true; },
+              onLateResult: async (lateResult) => {
+                const lateCompleted = {
+                  role,
+                  output: lateResult.output,
+                  sessionRef: lateResult.sessionRef,
+                  sessionLineage: lateResult.sessionLineage ?? [lateResult.sessionRef],
+                };
+                try {
+                  await publishCompletedReviewer(lateCompleted, true);
+                  await recordReviewProgress(`${taskId} · late completion reconciled after bounded drain · session ${lateResult.sessionRef}`);
+                } catch (latePublicationError) {
+                  const lateReason = latePublicationError instanceof Error ? latePublicationError.message : String(latePublicationError);
+                  await recordReviewProgress(`${taskId} · late completion could not be published · session ${lateResult.sessionRef} · ${lateReason}`);
+                }
+              },
             },
           );
           completed = {
@@ -370,27 +505,19 @@ export async function reviewPullRequest(
           const retryLimit = reviewPlan.budget.maxAttemptsPerExecutionGroup;
           const failureKind = error instanceof ReviewerAttemptTimeoutError ? "timed out" : "failed";
           await recordReviewProgress(`${taskId} · attempt ${attempt}/${retryLimit} ${failureKind} · ${priorFailure}`);
+          if (error instanceof ReviewerAttemptTimeoutError && error.drainExpired) {
+            if (drainExpired && !observedSessionRef) {
+              await recordReviewProgress(`${taskId} · bounded drain expired before a session identity was observable`);
+            }
+            await recordReviewProgress(`${taskId} · retry suppressed because the timed-out attempt remained in flight after bounded drain`);
+            throw error;
+          }
           if (attempt >= retryLimit) throw error;
           await recordReviewProgress(`${taskId} · ${resumeSessionRef ? "persisted resume" : "fresh retry"} ${attempt + 1}/${retryLimit} scheduled`);
         }
       }
       if (!completed) throw new Error(`${role} reviewer exhausted its retry budget`);
-      const marker = reviewerSubmissionMarker(run.runId, frozen.headSha, role);
-      await dependencies.host.publishPullRequestComment({
-        repo: frozen.repo,
-        pullRequest: frozen.number,
-        marker,
-        body: renderReviewerSubmissionComment({
-          runId: run.runId,
-          pullRequest: frozen.number,
-          headSha: frozen.headSha,
-          role,
-          submission: completed.output,
-          sessionLineage: completed.sessionLineage,
-          selection,
-          marker,
-        }),
-      });
+      await publishCompletedReviewer(completed, false);
       return completed;
     };
     const settledReviewers = await settleAllWithConcurrency(
@@ -453,6 +580,8 @@ export async function reviewPullRequest(
       ? await adjudicateFindingScope({
         run, headSha: frozen.headSha, intent: input.intent, investigation: input.investigation,
         packet: input.packet, ...(input.buildResult ? { buildResult: input.buildResult } : {}), findings: adjudicationCandidates, workspace: input.workspace,
+        pullRequest: frozen,
+        reviewPlanId: reviewPlan.planId,
         ...(input.priorVerdict ? { priorVerdict: input.priorVerdict } : {}),
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
@@ -460,7 +589,12 @@ export async function reviewPullRequest(
         maxAttempts: reviewPlan.budget.maxScopeAdjudicationAttempts,
         claimModelCall,
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      }, { runtime: dependencies.runtime, ...(dependencies.onAgentEvent ? { onAgentEvent: dependencies.onAgentEvent } : {}) })
+      }, {
+        runtime: dependencies.runtime,
+        host: dependencies.host,
+        runs: dependencies.runs,
+        ...(dependencies.onAgentEvent ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      })
       : undefined;
     const adjudicated = adjudication ? applyScopeAdjudication(prefiltered, adjudication.output.decisions) : prefiltered;
     const findings = applyFindingScopePolicy(adjudicated, input.packet, input.priorVerdict, {
@@ -670,7 +804,8 @@ function assertPullRequestRouteStable(
   current: PullRequestSnapshot,
   phase: string,
 ): void {
-  if (current.headSha !== frozen.headSha
+  if (!samePullRequestIdentity(frozen, current)
+    || current.headSha !== frozen.headSha
     || current.headBranch !== frozen.headBranch
     || current.baseBranch !== frozen.baseBranch
     || current.state !== frozen.state) {
@@ -679,6 +814,11 @@ function assertPullRequestRouteStable(
       + ` became ${current.headBranch}@${current.headSha} -> ${current.baseBranch} (${current.state})`,
     );
   }
+}
+
+function samePullRequestIdentity(left: PullRequestSnapshot, right: PullRequestSnapshot): boolean {
+  return left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase()
+    && left.number === right.number;
 }
 
 async function adjudicateFindingScope(
@@ -692,6 +832,8 @@ async function adjudicateFindingScope(
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
     findings: readonly ConsolidatedFinding[];
     workspace: string;
+    pullRequest: PullRequestSnapshot;
+    reviewPlanId: string;
     provider?: string;
     model?: string;
     reviewerAttemptTimeoutMs: number;
@@ -699,7 +841,12 @@ async function adjudicateFindingScope(
     claimModelCall: (purpose: string) => void;
     signal?: AbortSignal;
   },
-  dependencies: { runtime: AgentRuntime; onAgentEvent?: AgentEventSink },
+  dependencies: {
+    runtime: AgentRuntime;
+    host: ForgeHost;
+    runs: RunRepository;
+    onAgentEvent?: AgentEventSink;
+  },
 ): Promise<AgentRunResult<ScopeAdjudication>> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= input.maxAttempts; attempt++) {
@@ -744,21 +891,71 @@ async function adjudicateFindingScope(
           ...(input.model !== undefined ? { model: input.model } : {}),
         },
       };
+      let observedSessionRef: string | undefined;
+      let drainExpired = false;
       const result = await withReviewerAttemptTimeout<AgentRunResult<ScopeAdjudication>>(
         (signal) => dependencies.runtime.run(task, {
           signal,
-          ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+          onEvent: (event) => {
+            if (event.type === "session.started" && event.taskId === task.id) {
+              const identityArrivedLate = drainExpired && observedSessionRef === undefined;
+              observedSessionRef = event.sessionRef;
+              if (identityArrivedLate) {
+                void recordAdjudicationProgress(
+                  dependencies.runs,
+                  input.run.runId,
+                  `${task.id} · late session identity reconciled after bounded drain · session ${event.sessionRef}`,
+                );
+              }
+            }
+            dependencies.onAgentEvent?.(event);
+          },
         }),
         {
           ...(input.signal !== undefined ? { externalSignal: input.signal } : {}),
           timeoutMs: input.reviewerAttemptTimeoutMs,
           taskId: task.id,
+          getSessionRef: () => observedSessionRef,
+          onDrainExpired: () => { drainExpired = true; },
+          onLateResult: async (lateResult) => {
+            try {
+              assertCompleteScopeAdjudication(lateResult.output, input.findings);
+              const marker = scopeAdjudicationMarker(input.run.runId, input.headSha, input.reviewPlanId);
+              await dependencies.host.publishPullRequestComment({
+                repo: input.pullRequest.repo,
+                pullRequest: input.pullRequest.number,
+                marker,
+                body: renderLateScopeAdjudicationComment({
+                  runId: input.run.runId,
+                  pullRequest: input.pullRequest.number,
+                  headSha: input.headSha,
+                  reviewPlanId: input.reviewPlanId,
+                  adjudication: lateResult.output,
+                  sessionLineage: lateResult.sessionLineage ?? [lateResult.sessionRef],
+                  marker,
+                }),
+              });
+              await recordAdjudicationProgress(
+                dependencies.runs,
+                input.run.runId,
+                `${task.id} · late scope adjudication reconciled after bounded drain · session ${lateResult.sessionRef}`,
+              );
+            } catch (lateError) {
+              const reason = lateError instanceof Error ? lateError.message : String(lateError);
+              await recordAdjudicationProgress(
+                dependencies.runs,
+                input.run.runId,
+                `${task.id} · late scope adjudication could not be published · session ${lateResult.sessionRef} · ${reason}`,
+              );
+            }
+          },
         },
       );
       assertCompleteScopeAdjudication(result.output, input.findings);
       return result;
     } catch (error) {
       if (input.signal?.aborted) throw error;
+      if (error instanceof ReviewerAttemptTimeoutError && error.drainExpired) throw error;
       lastError = error;
     }
   }
@@ -814,17 +1011,73 @@ export function reviewerSubmissionMarker(runId: string, headSha: string, role: R
   return `<!-- FORGEDOCK:REVIEWER-SUBMISSION v1 ${identity} -->`;
 }
 
+function scopeAdjudicationMarker(runId: string, headSha: string, reviewPlanId: string): string {
+  const identity = [runId, headSha, reviewPlanId].map((part) => safeInline(part, 200)).join(":");
+  return `<!-- FORGEDOCK:SCOPE-ADJUDICATION-LATE v1 ${identity} -->`;
+}
+
+function renderLateScopeAdjudicationComment(input: {
+  runId: string;
+  pullRequest: number;
+  headSha: string;
+  reviewPlanId: string;
+  adjudication: ScopeAdjudication;
+  sessionLineage: readonly string[];
+  marker: string;
+}): string {
+  const decisions = input.adjudication.decisions.flatMap((decision) => [
+    `- **${safeInline(decision.findingId, 300)}:** ${decision.disposition} - ${safeText(decision.rationale, 2_000)}`,
+  ]);
+  return [
+    "## ForgeDock Late Scope Adjudication",
+    "",
+    "> This provider ignored the timeout abort request and completed after the bounded drain. The same frozen-head/plan result is preserved as evidence, but the timed-out review remains blocked and this result cannot publish a partial verdict.",
+    "",
+    `- **PR:** #${input.pullRequest}`,
+    `- **Reviewed SHA:** \`${safeInline(input.headSha, 64)}\``,
+    `- **Run:** \`${safeInline(input.runId, 200)}\``,
+    `- **Frozen review plan:** \`${safeInline(input.reviewPlanId, 200)}\``,
+    `- **Session lineage:** ${input.sessionLineage.map((ref) => `\`${safeInline(ref, 200)}\``).join(" -> ")}`,
+    "",
+    "### Decisions",
+    "",
+    ...(decisions.length ? decisions : ["No scope decisions were returned."]),
+    "",
+    input.marker,
+  ].join("\n");
+}
+
+async function recordAdjudicationProgress(
+  runs: RunRepository,
+  runId: string,
+  message: string,
+): Promise<void> {
+  try {
+    await runs.recordProgress({
+      runId,
+      phase: "review",
+      message: message.slice(0, 500),
+      occurredAt: new Date().toISOString(),
+    });
+  } catch {
+    // Progress is an operational projection; durable GitHub evidence above is
+    // the reconciliation authority when local persistence is unavailable.
+  }
+}
+
 const MAX_REVIEWER_COMMENT_CHARS = 60_000;
 
 export function renderReviewerSubmissionComment(input: {
   runId: string;
   pullRequest: number;
   headSha: string;
+  reviewPlanId?: string;
   role: ReviewerRole;
   submission: ReviewerSubmission;
   sessionLineage?: readonly string[];
   selection?: ReviewPlan["selected"][number];
   marker?: string;
+  lateAfterDrain?: boolean;
 }): string {
   const marker = input.marker ?? reviewerSubmissionMarker(input.runId, input.headSha, input.role);
   const findings = input.submission.findings.length
@@ -849,10 +1102,14 @@ export function renderReviewerSubmissionComment(input: {
     `## ForgeDock Independent Review · ${input.role}`,
     "",
     `> Provisional report from one ${input.sessionLineage && input.sessionLineage.length > 1 ? "resumed persisted" : "fresh"}, read-only reviewer. The controller's consolidated Review Verdict remains authoritative.`,
+    ...(input.lateAfterDrain ? [
+      "> This provider ignored the timeout abort request and completed after the bounded drain. The same frozen-head/plan result is preserved here, but the timed-out wave remains blocked and cannot issue a partial approval.",
+    ] : []),
     "",
     `- **PR:** #${input.pullRequest}`,
     `- **Reviewed SHA:** \`${safeInline(input.headSha, 64)}\``,
     `- **Run:** \`${safeInline(input.runId, 200)}\``,
+    ...(input.reviewPlanId ? [`- **Frozen review plan:** \`${safeInline(input.reviewPlanId, 200)}\``] : []),
     ...(input.sessionLineage?.length ? [`- **Session lineage:** ${input.sessionLineage.map((ref) => `\`${safeInline(ref, 200)}\``).join(" → ")}`] : []),
     ...(input.selection ? [
       `- **Selection score:** ${input.selection.score}${input.selection.required ? " · required" : ""}`,

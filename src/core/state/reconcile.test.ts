@@ -20,6 +20,78 @@ describe("GitHub artifact reconciliation", () => {
     assert.equal(reconcileArtifacts([intent, investigation, packet, build, verdict]).state, "merging");
   });
 
+  it("keeps a terminal Investigation recoverable until its Outcome is durable", () => {
+    for (const investigationOutcome of ["invalid", "decompose"] as const) {
+      const terminalInvestigation = createArtifact({
+        ...common,
+        kind: "Investigation",
+        payload: {
+          outcome: investigationOutcome,
+          confidence: "high",
+          summary: `${investigationOutcome} result`,
+          evidence: [{ claim: "classified", source: "a", detail: "durable proof" }],
+          affectedSurfaces: ["a"],
+          risks: [],
+          recommendation: "Finalize the controller projection",
+          ...(investigationOutcome === "decompose" ? {
+            decomposition: [
+              { title: "One", outcome: "First", dependsOn: [] },
+              { title: "Two", outcome: "Second", dependsOn: ["One"] },
+            ],
+          } : {}),
+        },
+      });
+      const reconciled = reconcileArtifacts([intent, terminalInvestigation]);
+      assert.equal(reconciled.state, "investigating");
+      assert.match(reconciled.warnings[0] ?? "", /missing its terminal Outcome/);
+    }
+  });
+
+  it("does not let a post-projection failure mask a terminal Investigation", () => {
+    for (const investigationOutcome of ["invalid", "decompose"] as const) {
+      const terminalInvestigation = createArtifact({
+        ...common,
+        kind: "Investigation",
+        payload: {
+          outcome: investigationOutcome,
+          confidence: "high",
+          summary: `${investigationOutcome} result`,
+          evidence: [{ claim: "classified", source: "a", detail: "durable proof" }],
+          affectedSurfaces: ["a"],
+          risks: [],
+          recommendation: "Preserve the terminal projection",
+          ...(investigationOutcome === "decompose" ? {
+            decomposition: [
+              { title: "One", outcome: "First", dependsOn: [] },
+              { title: "Two", outcome: "Second", dependsOn: ["One"] },
+            ],
+          } : {}),
+        },
+      });
+      const terminalOutcome = createArtifact({
+        ...common,
+        kind: "Outcome",
+        payload: {
+          status: investigationOutcome === "invalid" ? "invalid" : "decomposed",
+          reason: "semantic projection committed",
+          childIssues: [],
+          ...(investigationOutcome === "invalid" ? {
+            issueClosure: { status: "pending" as const, repo: "a/b", issue: 1 },
+          } : {}),
+        },
+      });
+      const operationalFailure = createArtifact({
+        ...common,
+        kind: "Outcome",
+        payload: { status: "failed", reason: "transition receipt lost", childIssues: [] },
+      });
+      assert.equal(
+        reconcileArtifacts([intent, terminalInvestigation, terminalOutcome, operationalFailure] as DurableArtifact[]).state,
+        investigationOutcome === "invalid" ? "invalid" : "decomposed",
+      );
+    }
+  });
+
   it("continues past an interrupted checkpoint when a resumed build result is newer", () => {
     for (const status of ["blocked", "failed"] as const) {
       const interrupted = createArtifact({

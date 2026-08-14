@@ -36,7 +36,7 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const latest = new Map<string, DurableArtifact>();
   for (const artifact of ordered) latest.set(artifact.kind, artifact);
   const warnings: string[] = [];
-  const outcome = latest.get("Outcome") as DurableArtifact<"Outcome"> | undefined;
+  const latestOutcome = latest.get("Outcome") as DurableArtifact<"Outcome"> | undefined;
   const verdict = latest.get("ReviewVerdict") as DurableArtifact<"ReviewVerdict"> | undefined;
   const remediationCheckpoint = latest.get("RemediationBlocked") as DurableArtifact<"RemediationBlocked"> | undefined;
   const build = latest.get("BuildResult") as DurableArtifact<"BuildResult"> | undefined;
@@ -44,7 +44,35 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const investigation = latest.get("Investigation") as DurableArtifact<"Investigation"> | undefined;
   const intent = latest.get("Intent");
 
-  const outcomeIndex = lastArtifactIndex(ordered, "Outcome");
+  const latestOutcomeIndex = lastArtifactIndex(ordered, "Outcome");
+  const investigationIndex = lastArtifactIndex(ordered, "Investigation");
+  const terminalInvestigationOutcomeIndex = investigation?.payload.outcome === "invalid"
+    ? lastOutcomeIndex(ordered, "invalid")
+    : investigation?.payload.outcome === "decompose"
+      ? lastOutcomeIndex(ordered, "decomposed")
+      : -1;
+  const terminalInvestigationOutcomeCandidate = terminalInvestigationOutcomeIndex >= 0
+    ? ordered[terminalInvestigationOutcomeIndex]
+    : undefined;
+  const terminalInvestigationOutcome = terminalInvestigationOutcomeCandidate?.kind === "Outcome"
+    ? terminalInvestigationOutcomeCandidate
+    : undefined;
+  const laterOutcomesAreOnlyFailures = terminalInvestigationOutcomeIndex >= 0
+    && ordered.slice(terminalInvestigationOutcomeIndex + 1)
+      .every((artifact) => artifact.kind !== "Outcome" || artifact.payload.status === "failed");
+  // A controller may record an operational failure after the semantic
+  // terminal projection was durably accepted but before the transition
+  // receipt returned. Preserve that earlier projection so recovery closes an
+  // invalid issue (or recognizes decomposition) instead of masking it as a
+  // fresh failed run.
+  const recoverableTerminalOutcome = terminalInvestigationOutcomeIndex > investigationIndex
+    && latestOutcomeIndex > terminalInvestigationOutcomeIndex
+    && latestOutcome?.payload.status === "failed"
+    && laterOutcomesAreOnlyFailures
+    ? terminalInvestigationOutcome
+    : undefined;
+  const outcome = recoverableTerminalOutcome ?? latestOutcome;
+  const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
   const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
 
@@ -86,8 +114,10 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
       state = "blocked";
     }
   } else if (!checkpointIsLatest && investigation) {
-    state = investigation.payload.outcome === "confirmed" ? "preparing"
-      : investigation.payload.outcome === "invalid" ? "invalid" : "decomposed";
+    state = investigation.payload.outcome === "confirmed" ? "preparing" : "investigating";
+    if (investigation.payload.outcome !== "confirmed") {
+      warnings.push(`${investigation.payload.outcome === "invalid" ? "Invalid" : "Decomposed"} Investigation is missing its terminal Outcome`);
+    }
   } else if (!checkpointIsLatest && intent) {
     state = "investigating";
   }
@@ -102,6 +132,17 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
 function lastArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
   for (let index = artifacts.length - 1; index >= 0; index--) {
     if (artifacts[index]?.kind === kind) return index;
+  }
+  return -1;
+}
+
+function lastOutcomeIndex(
+  artifacts: readonly DurableArtifact[],
+  status: DurableArtifact<"Outcome">["payload"]["status"],
+): number {
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === "Outcome" && artifact.payload.status === status) return index;
   }
   return -1;
 }

@@ -40,7 +40,7 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
   });
 
-  it("uses the newest run when GitHub reports duplicate check names", async () => {
+  it("preserves contradictory same-name check runs so a newer success cannot mask a failure", async () => {
     const client = new GitHubClient();
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
       if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
@@ -54,10 +54,13 @@ describe("GitHub promotion transport", () => {
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
-    assert.deepEqual(gate.requiredChecks, [{ name: "Unit tests (node --test)", state: "passed", detailsUrl: "https://github.test/new" }]);
+    assert.deepEqual(gate.requiredChecks, [
+      { name: "Unit tests (node --test)", state: "failed", detailsUrl: "https://github.test/old" },
+      { name: "Unit tests (node --test)", state: "passed", detailsUrl: "https://github.test/new" },
+    ]);
   });
 
-  it("keeps a newer in-progress duplicate check ahead of an older completed run", async () => {
+  it("preserves both completed and in-progress same-name observations", async () => {
     const client = new GitHubClient();
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
       if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
@@ -71,7 +74,10 @@ describe("GitHub promotion transport", () => {
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
-    assert.deepEqual(gate.requiredChecks, [{ name: "Unit tests (node --test)", state: "pending", detailsUrl: "https://github.test/new" }]);
+    assert.deepEqual(gate.requiredChecks, [
+      { name: "Unit tests (node --test)", state: "passed", detailsUrl: "https://github.test/old" },
+      { name: "Unit tests (node --test)", state: "pending", detailsUrl: "https://github.test/new" },
+    ]);
   });
 
   it("keeps API mergeability separate from the self-reporting deployment gate check", async () => {

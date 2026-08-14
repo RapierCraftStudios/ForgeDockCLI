@@ -15,13 +15,22 @@ import {
 import { Type } from "typebox";
 import { findArtifacts } from "../core/artifacts/codec.js";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
-import type { OrchestrationRecord, OrchestrationRepository } from "../core/ports/orchestration.js";
+import type {
+  OrchestrationExecutionAdmission,
+  OrchestrationPlanMetadata,
+  OrchestrationRecord,
+  OrchestrationRepository,
+  OrchestrationWorkerAttemptRecord,
+} from "../core/ports/orchestration.js";
 import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type EffectiveOrchestrationConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
 import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
 import { createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
+import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
+import { buildPlanningPacket, PlanningSessionStore } from "../core/planning/frontier.js";
+import { PlanningPacketDraftSchema, PlanningPacketSchema, PlanningQuestionSchema, type PlanningAnswer, type PlanningPacket, type PlanningQuestionInput } from "../core/planning/schema.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import {
   affectedFilesFromIssueBody,
@@ -36,23 +45,24 @@ import {
 } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
+import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
-import { orchestrationEventFromSchedule, type OrchestrationEvent } from "../workflows/orchestrate/events.js";
+import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
+import { OrchestrationController, type OrchestrationWorkerReconciliation } from "../workflows/orchestrate/controller.js";
 import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
 import {
   buildSchedulePreview,
   materializeClaimDependencies,
-  runSchedule,
-  validateGraph,
   type ScheduledWorkItem,
   type ClaimSerializationEdge,
+  type ScheduleResult,
   type ScheduleWorkerResult,
 } from "../workflows/orchestrate/scheduler.js";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
 import { startNestedAgentBridge } from "./nested-agent-bridge.js";
-import { runDecisionFlow, validateDecisionFlow, type DecisionFlowInput } from "./decision-flow.js";
-import { ForgeDockBackgroundTasks, renderRecord, terminateProcessTree } from "./background-tasks.js";
+import { runDecisionFlow, validateDecisionFlow, type DecisionFlowInput, type DecisionFlowResult } from "./decision-flow.js";
+import { ForgeDockBackgroundTasks, renderRecord, terminateProcessTree, type BackgroundTaskRecord } from "./background-tasks.js";
 import { classifyIssueLane, provisionMissingMilestoneBranches } from "../workflows/work-on/lane.js";
 import {
   OrchestrationBoardController,
@@ -67,9 +77,11 @@ export const WORKFLOW_TOOLS = {
   "work-on": "forgedock_work_on",
   "review-pr": "forgedock_review_pr",
   orchestrate: "forgedock_orchestrate",
+  "deep-plan": "forgedock_deep_plan",
   status: "forgedock_status",
   promote: "forgedock_promote",
 } as const;
+export const DEEP_PLAN_TOOL = WORKFLOW_TOOLS["deep-plan"];
 export const HUMAN_DECISION_TOOL = "forgedock_ask_user";
 export const CONFIG_TOOL = "forgedock_configure";
 export const MEMORY_TOOL = "forgedock_remember";
@@ -80,7 +92,25 @@ export const FORGEDOCK_NATIVE_RUNTIME = "semantic-tools+live-subagents-v2";
 export const LAZY_FORGEDOCK_TOOLS = new Set<string>([...Object.values(WORKFLOW_TOOLS), HUMAN_DECISION_TOOL, ORCHESTRATION_RESUME_TOOL]);
 export const HIDDEN_SUBAGENT_TOOLS = new Set(["subagent", "subagent_wait", "subagent_supervisor", "intercom"]);
 
+const DEEP_PLAN_MUTATING_TOOLS = new Set([
+  "bash", "edit", "write", "apply_patch",
+  "forgedock_work_on", "forgedock_review_pr", "forgedock_orchestrate",
+  CONFIG_TOOL, MEMORY_TOOL, ORCHESTRATION_RESUME_TOOL, BACKGROUND_TASK_TOOL,
+]);
+let deepPlanRequested = false;
+let deepPlanSessionActive = false;
+
 export type WorkflowCommand = keyof typeof WORKFLOW_TOOLS;
+
+export function requestDeepPlanMode(): void { deepPlanRequested = true; }
+export function clearDeepPlanRequest(): void { deepPlanRequested = false; }
+export function setDeepPlanSessionActive(active: boolean): void { deepPlanSessionActive = active; }
+export function resetDeepPlanMode(): void { deepPlanRequested = false; deepPlanSessionActive = false; }
+export function isDeepPlanActive(): boolean { return deepPlanRequested || deepPlanSessionActive; }
+export function deepPlanToolBlockReason(toolName: string): string | undefined {
+  if (!isDeepPlanActive() || !DEEP_PLAN_MUTATING_TOOLS.has(toolName)) return undefined;
+  return `Deep Plan is active and read-only; ${toolName} is blocked until the user confirms the typed planning packet.`;
+}
 
 export const ORCHESTRATION_ROUTING_KINDS = ["issue-set", "milestone", "github-query", "natural-language"] as const;
 export type OrchestrationRoutingKind = (typeof ORCHESTRATION_ROUTING_KINDS)[number];
@@ -233,7 +263,12 @@ function loadOrchestrationPreview(pi: ExtensionAPI, token: string | undefined): 
 }
 
 function clonePreviewValue<T>(value: T): T {
-  return value === undefined ? value : JSON.parse(JSON.stringify(value)) as T;
+  if (value === undefined) return value;
+  try {
+    return JSON.parse(JSON.stringify(value)) as T;
+  } catch {
+    return value;
+  }
 }
 
 function canonicalPreviewJson(value: unknown): string {
@@ -847,6 +882,7 @@ interface ControllerTaskTransport {
   start(spec: ControllerTaskSpec): Promise<string>;
   wait(taskId: string): Promise<void>;
   stop?(taskId: string): void;
+  list?(): readonly BackgroundTaskRecord[];
 }
 
 type DagRecoveryMode = "initial" | "resume" | "rerun";
@@ -860,6 +896,7 @@ interface VisibleDagInput {
   serializationEdges?: readonly ClaimSerializationEdge[];
   repository?: string;
   autoMerge?: boolean;
+  plan?: OrchestrationPlanMetadata;
   taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => { agent: string; task: string; cwd: string; model?: string };
   /** Optional direct typed-controller transport used by the live TUI. */
   controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => ControllerTaskSpec;
@@ -867,7 +904,7 @@ interface VisibleDagInput {
   waitControllerTask?: (taskId: string) => Promise<void>;
   stopControllerTask?: (taskId: string) => void;
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<ScheduleWorkerResult | void>;
-  onComplete: (result: Awaited<ReturnType<typeof runSchedule>>, orchestrationId: string) => void;
+  onComplete: (result: ScheduleResult, orchestrationId: string) => void;
   onEvent?: (event: OrchestrationEvent) => void;
 }
 
@@ -876,10 +913,12 @@ interface StoredDagRun {
   input: VisibleDagInput;
   childRunIds: string[];
   directChildRunIds: Set<string>;
-  result?: Awaited<ReturnType<typeof runSchedule>>;
+  result?: ScheduleResult;
   running: boolean;
   durableRecord: OrchestrationRecord;
   persistence: Promise<void>;
+  firstDispatch: Promise<void>;
+  notifyFirstDispatch: () => void;
 }
 
 interface ToolDetails {
@@ -898,17 +937,22 @@ interface OrchestrationToolDetails extends ToolDetails {
 
 export interface ForgeDockToolRegistrationOptions {
   getObservationSink?: () => ObservationSink | undefined;
+  /** Test/embedder seam; production leaves these undefined and uses witnessed SQLite. */
+  orchestrationRepository?: OrchestrationRepository;
+  orchestrationExecutionAdmission?: OrchestrationExecutionAdmission;
 }
 
 export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolRegistrationOptions = {}): ForgeDockBackgroundTasks {
   const backgroundTasks = new ForgeDockBackgroundTasks(pi);
+  const planningSessions = new PlanningSessionStore();
+  const confirmedPlanningPackets = new Map<string, PlanningPacket>();
   const orchestrationBoard = new OrchestrationBoardController();
   let orchestrationCwd = process.cwd();
   let orchestrationContext: ExtensionContext | undefined;
   let orchestrationRepository: SqliteRepositories | undefined;
   const dagDelegator = new VisibleDagDelegator(
     pi,
-    () => orchestrationRepository,
+    () => orchestrationRepository ?? options.orchestrationRepository,
     (record) => rebuildVisibleDagInput(orchestrationCwd, record),
     {
       start: async (spec) => {
@@ -917,13 +961,21 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       },
       wait: async (taskId) => { await backgroundTasks.waitForTerminal(taskId); },
       stop: (taskId) => { try { backgroundTasks.cancel(taskId); } catch { /* task already terminal */ } },
+      list: () => backgroundTasks.list(),
     },
+    () => options.orchestrationExecutionAdmission
+      ?? (orchestrationRepository ? new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository) : undefined),
   );
   pi.on("session_shutdown", async () => {
+    planningSessions.clear();
+    confirmedPlanningPackets.clear();
+    resetDeepPlanMode();
     orchestrationBoard.dispose();
-    await dagDelegator.shutdown();
-    orchestrationRepository?.close();
-    orchestrationRepository = undefined;
+    const settled = await dagDelegator.shutdown();
+    if (settled) {
+      orchestrationRepository?.close();
+      orchestrationRepository = undefined;
+    }
   });
   pi.registerTool({
     ...forgeDockToolPresentation("Resume orchestration"),
@@ -943,9 +995,9 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (ctx) {
         orchestrationCwd = ctx.cwd;
         orchestrationContext = ctx;
-        if (ctx.mode === "tui" && !orchestrationRepository) {
+        if (ctx.mode === "tui" && !orchestrationRepository && !options.orchestrationRepository) {
           const witness = createConfiguredLeaseWitness(ctx.cwd);
-          if (!witness) throw new Error("Lease witness configuration is required before TUI recovery inspection; token-only local leases are disabled");
+          if (!witness) throw new Error("Authenticated lease witness is required before TUI recovery inspection; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
           orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
         }
       }
@@ -1087,19 +1139,180 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     ...forgeDockToolPresentation("ForgeDock status"),
     name: WORKFLOW_TOOLS.status,
     label: "ForgeDock status",
-    description: "Show ForgeDock run state from the local operational cache or reconstruct one issue from durable GitHub artifacts.",
+    description: "Show ForgeDock run, durable orchestration DAG, or promotion state; issue recovery can be reconstructed from durable GitHub artifacts.",
     parameters: Type.Object({
       issue: Type.Optional(Type.Integer({ minimum: 1 })),
       repo: Type.Optional(Type.String()),
+      orchestrationId: Type.Optional(Type.String({ minLength: 1, description: "Durable dag_* orchestration identity" })),
+      promotions: Type.Optional(Type.Boolean()),
       json: Type.Optional(Type.Boolean()),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
       const args: string[] = [];
+      if (params.orchestrationId && (params.issue || params.promotions)) throw new Error("Status orchestrationId, issue, and promotions scopes are mutually exclusive");
+      if (params.issue && params.promotions) throw new Error("Status issue and promotions scopes are mutually exclusive");
       if (params.issue) args.push("--issue", String(params.issue));
       if (params.repo) args.push("--repo", params.repo);
+      if (params.orchestrationId) args.push("--orchestration", params.orchestrationId);
+      if (params.promotions) args.push("--promotions");
       if (params.json) args.push("--json");
       return runControllerTool(pi, "status", args, signal, onUpdate, ctx, false, options.getObservationSink?.());
+    },
+  });
+
+  pi.registerTool({
+    ...forgeDockToolPresentation("ForgeDock deep plan"),
+    name: DEEP_PLAN_TOOL,
+    label: "ForgeDock deep plan",
+    description: "Run a ForgeDock-native, confirmation-gated planning interview. Start or continue bounded decision rounds with evidence-backed recommendations and custom answers, then validate a typed planning packet before handoff.",
+    parameters: Type.Object({
+      action: Type.String({ enum: ["start", "continue", "finish", "materialize"] }),
+      sessionId: Type.Optional(Type.String({ minLength: 1 })),
+      title: Type.Optional(Type.String()),
+      objective: Type.Optional(Type.String()),
+      repo: Type.Optional(Type.String({ minLength: 1, description: "Explicit owner/repo target required for post-confirmation materialization" })),
+      packet: Type.Optional(PlanningPacketSchema),
+      questions: Type.Optional(Type.Array(PlanningQuestionSchema, {
+        minItems: 1,
+        maxItems: 6,
+        description: "The current independent decision frontier; dependencies must already be answered",
+      })),
+      draft: Type.Optional(PlanningPacketDraftSchema),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (process.env.PI_SUBAGENT_CHILD_AGENT) {
+        throw new Error("Deep Plan is supervisor-only; background workers must escalate decisions to the parent supervisor");
+      }
+      if (ctx.mode !== "tui") {
+        return {
+          content: [{ type: "text", text: "Deep Plan requires interactive TUI mode so the user can answer its decision frontier." }],
+          details: { status: "blocked", reason: "interactive-ui-required" },
+        };
+      }
+      if (params.action === "materialize") {
+        if (!params.sessionId) throw new Error("Deep Plan materialize requires a sessionId");
+        if (!params.repo?.trim()) throw new Error("Deep Plan materialize requires an explicit owner/repo");
+        if (!params.packet) throw new Error("Deep Plan materialize requires the confirmed planning packet returned by finish");
+        const session = planningSessions.get(params.sessionId);
+        if (session.status !== "confirmed") throw new Error(`Deep Plan session ${session.id} is ${session.status}, not confirmed`);
+        const confirmed = confirmedPlanningPackets.get(session.id);
+        if (!confirmed || confirmed.status !== "confirmed") throw new Error(`Deep Plan session ${session.id} has no confirmed ready packet`);
+        if (previewDigest({ ...params.packet, status: "confirmed" }) !== previewDigest(confirmed)) {
+          throw new Error("Deep Plan materialization packet differs from the explicitly confirmed packet");
+        }
+        if (!orchestrationRepository) {
+          const witness = createConfiguredLeaseWitness(ctx.cwd);
+          if (!witness) throw new Error("Authenticated lease witness is required before Deep Plan materialization; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
+          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
+        }
+        const github = new GitHubClient(ctx.cwd, orchestrationRepository);
+        const checkout = await github.getRepository();
+        if (checkout.repo.toLowerCase() !== params.repo.trim().toLowerCase()) {
+          throw new Error(`Deep Plan repository ${params.repo.trim()} conflicts with controller checkout ${checkout.repo}`);
+        }
+        const leaseItem = `deep-plan-materialization:${checkout.repo.toLowerCase()}:${session.id}:${confirmed.revision}`;
+        const lease = orchestrationRepository.acquire(leaseItem, `deep-plan:${process.pid}:${crypto.randomUUID()}`, 60_000);
+        if (!lease) throw new Error(`Deep Plan ${session.id} is already being materialized by another controller`);
+        const leaseGuard = orchestrationRepository.guard(leaseItem, lease.token);
+        let leaseFailure: unknown;
+        const heartbeat = setInterval(() => {
+          try { orchestrationRepository?.heartbeat(leaseItem, lease.token, 60_000); }
+          catch (error) { leaseFailure = error; }
+        }, 20_000);
+        heartbeat.unref?.();
+        let handoff: Awaited<ReturnType<typeof materializeConfirmedPlan>>;
+        try {
+          leaseGuard.assertValid();
+          handoff = await materializeConfirmedPlan({ repo: checkout.repo, packet: confirmed, host: github });
+          if (leaseFailure !== undefined) throw leaseFailure;
+          leaseGuard.assertValid();
+        } finally {
+          clearInterval(heartbeat);
+          try { orchestrationRepository.release(leaseItem, lease.token); } catch { /* continuity failure remains fail-closed */ }
+        }
+        const issueByNode = new Map(handoff.materialization.nodes.map((node) => [node.nodeId, node.issue.number] as const));
+        const executionPlan = confirmed.nodes.map((node) => ({
+          issue: issueByNode.get(node.id)!,
+          title: node.title,
+          summary: node.outcome,
+          priority: node.priority,
+          dependsOn: node.dependsOn.map((dependency) => issueByNode.get(dependency)!),
+          claims: [...node.claims],
+          affectedFiles: [...node.affectedFiles],
+          riskClass: node.riskClass,
+        }));
+        const issueNumbers = handoff.items.map((item) => item.issue);
+        setDeepPlanSessionActive(false);
+        clearDeepPlanRequest();
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `Deep Plan ${session.id} materialized in ${checkout.repo}.`,
+              ...handoff.materialization.nodes.map((node) => `${node.nodeId} → #${node.issue.number}${node.dependencyIssueNumbers.length ? ` · depends on ${node.dependencyIssueNumbers.map((issue) => `#${issue}`).join(", ")}` : ""}`),
+              "The returned orchestrationHandoff is ready for an explicit /orchestrate confirmation; materialization did not dispatch workers.",
+            ].join("\n"),
+          }],
+          details: {
+            sessionId: session.id,
+            status: "handed-off",
+            packet: confirmed,
+            handoffPacket: handoff.packet,
+            materialization: handoff.materialization,
+            items: handoff.items,
+            orchestrationHandoff: {
+              repository: checkout.repo,
+              issueNumbers,
+              executionPlan,
+              plan: {
+                sessionId: session.id,
+                revision: confirmed.revision,
+                packetDigest: previewDigest(confirmed),
+              },
+              routing: {
+                kind: "issue-set",
+                rationale: `Issues were idempotently materialized from confirmed Deep Plan ${session.id} revision ${confirmed.revision}.`,
+                repository: checkout.repo,
+              },
+            },
+          },
+        };
+      }
+      if (params.action === "start") {
+        if (params.sessionId) throw new Error("A new Deep Plan cannot provide an existing sessionId");
+        if (!params.objective?.trim()) throw new Error("Deep Plan start requires an objective");
+        if (!params.questions?.length) throw new Error("Deep Plan start requires an initial question round");
+        const state = planningSessions.start({
+          ...(params.title?.trim() ? { title: params.title.trim() } : {}),
+          objective: params.objective,
+        });
+        return runDeepPlanRound(ctx, planningSessions, state.id, params.questions);
+      }
+      if (params.action === "continue") {
+        if (!params.sessionId) throw new Error("Deep Plan continue requires a sessionId");
+        if (!params.questions?.length) throw new Error("Deep Plan continue requires the next question round");
+        return runDeepPlanRound(ctx, planningSessions, params.sessionId, params.questions);
+      }
+      if (!params.sessionId) throw new Error("Deep Plan finish requires a sessionId");
+      if (!params.draft) throw new Error("Deep Plan finish requires a typed planning draft");
+      const state = planningSessions.get(params.sessionId);
+      const packet = buildPlanningPacket(state, params.draft);
+      const preview = renderPlanningPacketPreview(packet);
+      if (!ctx.hasUI || !(await ctx.ui.confirm("Confirm Deep Plan?", preview))) {
+        return {
+          content: [{ type: "text", text: `Deep Plan ${state.id} remains ready for review; no handoff occurred.` }],
+          details: { sessionId: state.id, status: "ready", packet },
+        };
+      }
+      const confirmed = planningSessions.confirm(state.id, packet);
+      confirmedPlanningPackets.set(state.id, structuredClone(confirmed.packet));
+      setDeepPlanSessionActive(false);
+      return {
+        content: [{ type: "text", text: `${renderPlanningPacketPreview(confirmed.packet)}\n\nDeep Plan confirmed. To create the issue DAG, call ${DEEP_PLAN_TOOL} with action=materialize, this sessionId, an explicit owner/repo, and the exact confirmed packet. No issue or worker was created automatically.` }],
+        details: { sessionId: confirmed.state.id, status: confirmed.state.status, packet: confirmed.packet },
+      };
     },
   });
 
@@ -1116,11 +1329,15 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (ctx?.mode === "tui") {
         orchestrationCwd = ctx.cwd;
-        orchestrationRepository ??= new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"));
+        if (!orchestrationRepository && !options.orchestrationRepository) {
+          const witness = createConfiguredLeaseWitness(ctx.cwd);
+          if (witness) orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
+        }
       }
       if (params.action === "list") {
         const records = backgroundTasks.list();
-        const orchestrations = orchestrationRepository ? await orchestrationRepository.listOrchestrations(20) : [];
+        const durableOrchestrations = orchestrationRepository ?? options.orchestrationRepository;
+        const orchestrations = durableOrchestrations ? await durableOrchestrations.listOrchestrations(20) : [];
         const taskLines = records.map(renderRecord);
         const dagLines = orchestrations.map((record) => {
           const completed = record.nodes.filter((node) => node.status === "completed").length;
@@ -1135,7 +1352,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       }
       if (!params.taskId) throw new Error(`taskId is required for ${params.action}`);
       if (params.action === "output") {
-        const orchestrations = orchestrationRepository ? await orchestrationRepository.listOrchestrations(50) : [];
+        const durableOrchestrations = orchestrationRepository ?? options.orchestrationRepository;
+        const orchestrations = durableOrchestrations ? await durableOrchestrations.listOrchestrations(50) : [];
         const orchestration = orchestrations.find((record) => record.orchestrationId === params.taskId);
         if (params.taskId.startsWith("dag_") && !orchestration) {
           throw new Error(`Unknown durable orchestration DAG: ${params.taskId}. Use forgedock_tasks action=list to inspect available DAG IDs, or forgedock_tasks action=output with a native task_ ID for process logs.`);
@@ -1544,12 +1762,13 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         details: { command: "orchestrate", args: issues.map(String), state: "running", ui: dispatchingView } satisfies OrchestrationToolDetails,
       });
       const workerModel = resolvedWorkerModel;
+      const nativeWorker = controllerWorkerSelection(workerModel, config.workerThinking);
       const artifacts = new GitHubArtifactRepository(github);
       orchestrationCwd = ctx.cwd;
       orchestrationContext = ctx;
-      if (ctx.mode === "tui" && !orchestrationRepository) {
+      if (!orchestrationRepository && !options.orchestrationRepository) {
         const witness = createConfiguredLeaseWitness(ctx.cwd);
-        if (!witness) throw new Error("Lease witness configuration is required before TUI orchestration dispatch; token-only local leases are disabled");
+        if (!witness) throw new Error("Authenticated lease witness is required before orchestration dispatch; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
         orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
       }
       const orchestration = await dagDelegator.start({
@@ -1558,6 +1777,22 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         maxParallel,
         repository: repository!.repo,
         autoMerge,
+        plan: {
+          adapter: "tui",
+          batchingPolicy: effective.batchingPolicy,
+          scopeExpansion: effective.scopeExpansion,
+          maxRemediationCycles: effective.maxRemediationCycles,
+          maxRemediationDepth: effective.maxRemediationDepth,
+          maxRemediationChildren: effective.maxRemediationChildren,
+          workerProvider: nativeWorker.provider ?? null,
+          workerModel: nativeWorker.model ?? null,
+          workerThinking: nativeWorker.thinking ?? null,
+          planningModel: config.planningModel ?? null,
+          planningThinking: config.planningThinking ?? null,
+          routingKind: routing?.kind ?? null,
+          routingRationale: routing?.rationale ?? null,
+          proposalDigest,
+        },
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         serializationEdges: schedule.edges,
         taskFor: (item, recovery, adjudicationReason) => {
@@ -1598,6 +1833,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 ...policy,
                 ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
                 dependencies: item.dependencies.map(issueNumberFromId),
+                ...nativeWorker,
               }),
               cwd: ctx.cwd,
               env: {
@@ -1927,10 +2163,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
 }
 
 export function activateOnly(pi: ExtensionAPI, names: readonly string[]): void {
-  // Resume is a maintenance action, not part of a fresh workflow's tool
-  // surface. Keeping it active while /orchestrate is running lets the model
-  // mistake a stale durable DAG for the current request. It is re-added only
-  // when the session-start maintenance set explicitly requests it.
+  // Maintenance tools are available in assistant mode but are still removed
+  // when a fresh workflow narrows authority to its own semantic surface.
   const active = pi.getActiveTools().filter((name) => !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name));
   pi.setActiveTools([...new Set([...active, ...names])]);
 }
@@ -1939,8 +2173,100 @@ export function deactivateWorkflowTools(pi: ExtensionAPI): void {
   pi.setActiveTools(pi.getActiveTools().filter((name) => !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name)));
 }
 
+async function runDeepPlanRound(
+  ctx: ExtensionContext,
+  planningSessions: PlanningSessionStore,
+  sessionId: string,
+  questions: readonly PlanningQuestionInput[],
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+  setDeepPlanSessionActive(true);
+  const state = planningSessions.openRound(sessionId, questions);
+  const input: DecisionFlowInput = {
+    ...(state.title ? { title: `${state.title} · Round ${state.round + 1}` } : { title: `Deep Plan · Round ${state.round + 1}` }),
+    questions: state.currentQuestions.map((question) => ({
+      id: question.id,
+      label: question.label,
+      prompt: question.prompt,
+      type: question.type,
+      options: question.options.map((option) => ({
+        value: option.value,
+        label: option.label,
+        ...(option.description !== undefined ? { description: option.description } : {}),
+        ...(option.preview !== undefined ? { preview: option.preview } : {}),
+      })),
+      recommendedValue: question.recommendedValue,
+      recommendation: question.recommendation,
+    })),
+  };
+  const validation = validateDecisionFlow(input);
+  if (validation.length) throw new Error(`Invalid Deep Plan decision round: ${validation.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`);
+  const result = await runDecisionFlow(ctx, input);
+  if (result.cancelled) {
+    const cancelled = planningSessions.cancel(sessionId);
+    setDeepPlanSessionActive(false);
+    return { content: [{ type: "text", text: `Deep Plan ${cancelled.id} cancelled.` }], details: { sessionId: cancelled.id, status: cancelled.status } };
+  }
+  const answers = planningAnswersFromResult(result);
+  let next;
+  try {
+    next = planningSessions.acceptRound(sessionId, answers, result.mode);
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+      details: { sessionId, status: "blocked", mode: result.mode, answers: result.answers },
+    };
+  }
+  const answerLines = Object.entries(result.answers).map(([questionId, answer]) => `${questionId}: ${answer.labels.join(", ") || "unanswered"}`);
+  const text = result.mode === "elaborate"
+    ? `Deep Plan ${next.id} needs elaboration. Explain the requested tradeoffs, preserve the committed answers, and reopen the unresolved frontier with action=continue.`
+    : [
+        `Deep Plan ${next.id} completed round ${next.round}.`,
+        answerLines.length ? `Answers:\n${answerLines.join("\n")}` : "No answers were submitted.",
+        `Call ${DEEP_PLAN_TOOL} with action=continue and the next independent frontier, or action=finish with a typed draft when the frontier is empty. Do not dispatch a workflow before confirmation.`,
+      ].join("\n\n");
+  return {
+    content: [{ type: "text", text }],
+    details: { sessionId: next.id, status: next.status, round: next.round, mode: result.mode, answers: result.answers, ...(result.elaboration ? { elaboration: result.elaboration } : {}) },
+  };
+}
+
+function planningAnswersFromResult(result: DecisionFlowResult): Record<string, PlanningAnswer> {
+  return Object.fromEntries(Object.entries(result.answers).map(([questionId, answer]) => [questionId, {
+    values: [...answer.values],
+    labels: [...answer.labels],
+    indices: [...answer.indices],
+    ...(answer.customText !== undefined ? { customText: answer.customText } : {}),
+    ...(answer.note !== undefined ? { note: answer.note } : {}),
+    ...(answer.optionNotes !== undefined ? { optionNotes: { ...answer.optionNotes } } : {}),
+  }])) as Record<string, PlanningAnswer>;
+}
+
+function renderPlanningPacketPreview(packet: PlanningPacket): string {
+  const nodes = packet.nodes.map((node, index) => {
+    const dependencies = node.dependsOn.length ? ` · depends on ${node.dependsOn.join(", ")}` : "";
+    return `${index + 1}. ${node.title}${dependencies}\n   Outcome: ${node.outcome}\n   Acceptance: ${node.acceptanceCriteria.join("; ")}`;
+  });
+  return [
+    `Objective: ${packet.objective}`,
+    `Decisions resolved: ${packet.decisions.length}`,
+    `Nodes: ${packet.nodes.length}`,
+    packet.openQuestions.length ? `Open questions: ${packet.openQuestions.join("; ")}` : "Open questions: none",
+    "",
+    ...nodes,
+  ].join("\n").slice(0, 12_000);
+}
+
 export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: string): string {
   const tool = WORKFLOW_TOOLS[command];
+  if (command === "deep-plan") {
+    return [
+      `The user invoked /deep-plan ${rawArgs}`.trim(),
+      "Deep Plan is ForgeDock's native, interactive planning mode. Inspect repository and GitHub facts with read-only tools before asking the user for judgment calls; do not load external skill files or legacy Markdown command specs.",
+      "Build a dependency-aware decision frontier. Start with action=start, an objective, and no more than six independent questions. Every question must have 2–8 options, a recommendedValue, an evidence-backed recommendation, and a stable id. The native UI supplies the custom-answer path, notes, preview panes, review, and elaboration.",
+      `After the user answers, preserve the sessionId and call ${tool} with action=continue for the next independent frontier. Use action=finish only when the frontier is resolved and provide a complete typed draft with assumptions, evidence, vocabulary, outOfScope, openQuestions, and implementation nodes. The tool owns confirmation. Only after it returns a confirmed packet may you offer the separate action=materialize handoff with an explicit owner/repo and that exact packet; materialization creates issues but never dispatches workers.`,
+      "Use Deep Plan for consequential ambiguity, multiple dependent architectural choices, cross-subsystem scope, migrations, security/auth/billing/concurrency risk, or hard-to-reverse decisions. Do not use it for a trivial, fully specified local edit.",
+    ].join("\n");
+  }
   if (command === "orchestrate") {
     return [
       `The user invoked /orchestrate ${rawArgs}`.trim(),
@@ -2152,7 +2478,21 @@ export function resolveIssueWorkerRecovery(
 async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord): Promise<VisibleDagInput> {
   if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
   const config = readForgeDockConfig(cwd);
-  const effective = resolveOrchestrationConfig(config, { maxParallel: record.maxParallel });
+  const frozenScopeExpansion = orchestrationMetadataString(record.plan, "scopeExpansion");
+  const effective = resolveOrchestrationConfig(config, {
+    maxParallel: record.maxParallel,
+    ...(frozenScopeExpansion === "scope-locked" || frozenScopeExpansion === "recursive" ? { scopeExpansion: frozenScopeExpansion } : {}),
+    ...(orchestrationMetadataInteger(record.plan, "maxRemediationCycles", 1) !== undefined ? { maxRemediationCycles: orchestrationMetadataInteger(record.plan, "maxRemediationCycles", 1)! } : {}),
+    ...(orchestrationMetadataInteger(record.plan, "maxRemediationDepth", 0) !== undefined ? { maxRemediationDepth: orchestrationMetadataInteger(record.plan, "maxRemediationDepth", 0)! } : {}),
+    ...(orchestrationMetadataInteger(record.plan, "maxRemediationChildren", 1) !== undefined ? { maxRemediationChildren: orchestrationMetadataInteger(record.plan, "maxRemediationChildren", 1)! } : {}),
+  });
+  const frozenWorker = controllerWorkerSelection(
+    orchestrationMetadataModel(record.plan) ?? config.workerModel,
+    orchestrationMetadataThinking(record.plan, "workerThinking") ?? config.workerThinking,
+  );
+  const frozenWorkerModel = frozenWorker.provider && frozenWorker.model
+    ? modelWithThinking(`${frozenWorker.provider}/${frozenWorker.model}`, frozenWorker.thinking)
+    : frozenWorker.model ? modelWithThinking(frozenWorker.model, frozenWorker.thinking) : undefined;
   const github = new GitHubClient(cwd);
   const artifacts = new GitHubArtifactRepository(github);
   const items: VisibleOrchestrationItem[] = record.nodes.map((node) => ({
@@ -2174,6 +2514,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
   return {
     repository: record.repository,
     autoMerge: record.autoMerge,
+    ...(record.plan !== undefined ? { plan: structuredClone(record.plan) } : {}),
     ...(record.productionTarget !== undefined ? { productionTarget: record.productionTarget } : {}),
     requestedIssueNumbers: [...(record.requestedIssueNumbers ?? record.issueNumbers)],
     items,
@@ -2193,6 +2534,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
             ...policy,
             ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
             dependencies: item.dependencies.map(issueNumberFromId),
+            ...frozenWorker,
           }),
           cwd,
           env: {
@@ -2219,7 +2561,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
           dependencies: item.dependencies.map(issueNumberFromId),
         }, { issue: item.issue, title: item.title ?? `Issue #${item.issue}`, summary: item.summary ?? "Resumed from durable orchestration state" }),
         cwd,
-        ...(config.workerModel ? { model: config.workerModel } : {}),
+        ...(frozenWorkerModel !== undefined ? { model: frozenWorkerModel } : {}),
       };
     },
     assertCompleted: async (item) => {
@@ -2251,6 +2593,9 @@ function buildIssueWorkerControllerArgs(
     resume: boolean;
     adjudicateVerification?: string;
     dependencies: number[];
+    provider?: string;
+    model?: string;
+    thinking?: ThinkingLevel;
   },
 ): string[] {
   const args = [String(issue), "--repo", options.repository, options.autoMerge ? "--auto-merge" : "--no-auto-merge", "--scope-expansion", options.scopeExpansion,
@@ -2261,7 +2606,68 @@ function buildIssueWorkerControllerArgs(
   if (options.rerun) args.push("--rerun");
   if (options.resume) args.push("--resume");
   if (options.adjudicateVerification) args.push("--adjudicate-verification", options.adjudicateVerification);
+  if (options.provider) args.push("--provider", options.provider);
+  if (options.model) args.push("--model", options.model);
+  if (options.thinking) args.push("--thinking", options.thinking);
   return args;
+}
+
+function controllerWorkerSelection(
+  reference: string | undefined,
+  fallbackThinking: ThinkingLevel | undefined,
+): { provider?: string; model?: string; thinking?: ThinkingLevel } {
+  const suffix = reference?.match(/:(off|minimal|low|medium|high|xhigh|max)$/)?.[1] as ThinkingLevel | undefined;
+  const withoutThinking = suffix ? reference!.slice(0, -(suffix.length + 1)) : reference;
+  const split = splitConfiguredModel(withoutThinking);
+  return {
+    ...(split ? { provider: split.provider, model: split.model } : withoutThinking ? { model: withoutThinking } : {}),
+    ...((suffix ?? fallbackThinking) ? { thinking: (suffix ?? fallbackThinking)! } : {}),
+  };
+}
+
+function orchestrationMetadataString(plan: OrchestrationPlanMetadata | undefined, key: string): string | undefined {
+  const value = plan?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function orchestrationMetadataInteger(
+  plan: OrchestrationPlanMetadata | undefined,
+  key: string,
+  minimum: number,
+): number | undefined {
+  const value = plan?.[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= minimum ? value : undefined;
+}
+
+function orchestrationMetadataThinking(plan: OrchestrationPlanMetadata | undefined, key: string): ThinkingLevel | undefined {
+  const value = orchestrationMetadataString(plan, key);
+  return value && THINKING_LEVELS.includes(value as ThinkingLevel) ? value as ThinkingLevel : undefined;
+}
+
+function orchestrationMetadataModel(plan: OrchestrationPlanMetadata | undefined): string | undefined {
+  const provider = orchestrationMetadataString(plan, "workerProvider");
+  const model = orchestrationMetadataString(plan, "workerModel");
+  return provider && model ? `${provider}/${model}` : model;
+}
+
+function controllerInvocationModelArgs(
+  command: WorkflowCommand,
+  args: readonly string[],
+  ctx: ExtensionContext,
+  config: ReturnType<typeof readForgeDockConfig>,
+): string[] {
+  const configured = command === "work-on"
+    ? controllerWorkerSelection(config.workerModel, config.workerThinking)
+    : command === "review-pr"
+      ? controllerWorkerSelection(config.reviewerModel, config.reviewerThinking)
+      : {};
+  const provider = configured.provider ?? ctx.model?.provider;
+  const model = configured.model ?? ctx.model?.id;
+  return [
+    ...(!args.includes("--provider") && provider ? ["--provider", provider] : []),
+    ...(!args.includes("--model") && model ? ["--model", model] : []),
+    ...(!args.includes("--thinking") && configured.thinking ? ["--thinking", configured.thinking] : []),
+  ];
 }
 
 function buildIssueWorkerTask(
@@ -2306,6 +2712,7 @@ async function startNativeControllerTask(
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   const nestedBridge = await startNestedAgentBridge(pi);
   const config = readForgeDockConfig(ctx.cwd);
+  const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);
   const env = {
@@ -2313,14 +2720,21 @@ async function startNativeControllerTask(
     ...(spec.env ?? {}),
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
     ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
+    ...(worker.provider && worker.model ? { FORGEDOCK_WORKER_MODEL: `${worker.provider}/${worker.model}` } : {}),
+    ...(worker.thinking ? { FORGEDOCK_WORKER_THINKING: worker.thinking } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
     ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
+  const workerArgs = [
+    ...(!spec.args.includes("--provider") && worker.provider ? ["--provider", worker.provider] : []),
+    ...(!spec.args.includes("--model") && worker.model ? ["--model", worker.model] : []),
+    ...(!spec.args.includes("--thinking") && worker.thinking ? ["--thinking", worker.thinking] : []),
+  ];
   try {
     const record = tasks.start({
       command: process.execPath,
-      args: [entry, "work-on", ...spec.args],
+      args: [entry, "work-on", ...spec.args, ...workerArgs],
       cwd: spec.cwd,
       env,
       cleanup: () => nestedBridge.close(),
@@ -2342,17 +2756,18 @@ async function runControllerToolBackground(
 ) {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
-  const modelArgs = ctx.model && !args.includes("--provider") && !args.includes("--model")
-    ? ["--provider", ctx.model.provider, "--model", ctx.model.id]
-    : [];
-  const nestedBridge = await startNestedAgentBridge(pi);
   const config = readForgeDockConfig(ctx.cwd);
+  const modelArgs = controllerInvocationModelArgs(command, args, ctx, config);
+  const nestedBridge = await startNestedAgentBridge(pi);
+  const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);
   const env = {
     ...nestedBridge.env,
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
     ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
+    ...(worker.provider && worker.model ? { FORGEDOCK_WORKER_MODEL: `${worker.provider}/${worker.model}` } : {}),
+    ...(worker.thinking ? { FORGEDOCK_WORKER_THINKING: worker.thinking } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
     ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
@@ -2391,18 +2806,19 @@ async function runControllerTool(
 ) {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
-  const modelArgs = includeModel && ctx.model && !args.includes("--provider") && !args.includes("--model")
-    ? ["--provider", ctx.model.provider, "--model", ctx.model.id]
-    : [];
+  const config = includeModel ? readForgeDockConfig(ctx.cwd) : {};
+  const modelArgs = includeModel ? controllerInvocationModelArgs(command, args, ctx, config) : [];
   const invocationArgs = [entry, command, ...args, ...modelArgs];
   ctx.ui.setStatus("forgedock", `◆ ${workflowCommandDisplay(command)} running`);
   const nestedBridge = includeModel ? await startNestedAgentBridge(pi) : undefined;
-  const config = includeModel ? readForgeDockConfig(ctx.cwd) : {};
+  const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);
   const configEnv = {
     ...(reviewer ? { FORGEDOCK_REVIEWER_MODEL: `${reviewer.provider}/${reviewer.model}` } : {}),
     ...(planning ? { FORGEDOCK_PLANNING_MODEL: `${planning.provider}/${planning.model}` } : {}),
+    ...(worker.provider && worker.model ? { FORGEDOCK_WORKER_MODEL: `${worker.provider}/${worker.model}` } : {}),
+    ...(worker.thinking ? { FORGEDOCK_WORKER_THINKING: worker.thinking } : {}),
     ...(config.reviewerThinking ? { FORGEDOCK_REVIEWER_THINKING: config.reviewerThinking } : {}),
     ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
@@ -2518,47 +2934,9 @@ function terminalArtifactResult(
   return undefined;
 }
 
-function createDurableOrchestrationRecord(id: string, input: VisibleDagInput, now: string): OrchestrationRecord {
-  const requestedIssueNumbers = [...new Set(input.requestedIssueNumbers ?? input.items.flatMap((item) => [item.issue, ...item.memberIssues]))];
-  return {
-    schema: "forgedock.orchestration/v1",
-    orchestrationId: id,
-    repository: input.repository ?? "unknown/unknown",
-    requestedIssueNumbers,
-    issueNumbers: requestedIssueNumbers,
-    maxParallel: input.maxParallel,
-    autoMerge: input.autoMerge ?? true,
-    ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
-    status: "running",
-    createdAt: now,
-    updatedAt: now,
-    serializationEdges: (input.serializationEdges ?? []).map((edge) => ({
-      predecessor: edge.predecessor,
-      successor: edge.successor,
-      overlappingClaims: [...edge.overlappingClaims],
-    })),
-    nodes: input.items.map((item) => ({
-      id: item.id,
-      issue: item.issue,
-      priority: item.priority,
-      dependencies: [...item.dependencies],
-      claims: [...item.claims],
-      ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
-      ...(item.lane !== undefined ? { lane: item.lane } : {}),
-      ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
-      ...(item.productionTarget !== undefined ? { productionTarget: item.productionTarget } : {}),
-      ...(item.affectedFiles ? { affectedFiles: [...item.affectedFiles] } : {}),
-      ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
-      ...(item.title ? { title: item.title } : {}),
-      ...(item.summary ? { summary: item.summary } : {}),
-      status: "queued" as const,
-      childRunIds: [],
-    })),
-  };
-}
-
 export class VisibleDagDelegator {
   private readonly waiting = new Map<string, { resolve: (event: unknown) => void }>();
+  private readonly completedAsyncRuns = new Set<string>();
   private readonly active = new Set<string>();
   private readonly runs = new Map<string, StoredDagRun>();
   private readonly unsubscribe: (() => void) | undefined;
@@ -2568,31 +2946,57 @@ export class VisibleDagDelegator {
     private readonly getOrchestrationRepository: () => OrchestrationRepository | undefined = () => undefined,
     private readonly rebuildInput?: (record: OrchestrationRecord) => Promise<VisibleDagInput>,
     private readonly directControllerTransport?: ControllerTaskTransport,
+    private readonly getExecutionAdmission: () => OrchestrationExecutionAdmission | undefined = () => undefined,
   ) {
     this.unsubscribe = pi.events.on("subagent:async-complete", (event: unknown) => {
-      const runId = typeof event === "object" && event !== null && "runId" in event ? String((event as { runId: unknown }).runId) : "";
+      const runId = typeof event === "object" && event !== null && "runId" in event
+        ? String((event as { runId: unknown }).runId)
+        : "";
       if (!runId) return;
       const waiter = this.waiting.get(runId);
-      if (!waiter) return;
+      if (!waiter) {
+        this.completedAsyncRuns.add(runId);
+        return;
+      }
       this.waiting.delete(runId);
       waiter.resolve(event);
     });
   }
 
   async start(input: VisibleDagInput): Promise<VisibleDagRun> {
-    const id = `dag_${crypto.randomUUID()}`;
-    const now = new Date().toISOString();
+    const id = "dag_" + crypto.randomUUID();
     const normalizedInput: VisibleDagInput = {
       ...input,
       serializationEdges: [...(input.serializationEdges ?? [])],
       ...(input.requestedIssueNumbers !== undefined ? { requestedIssueNumbers: [...input.requestedIssueNumbers] } : {}),
     };
-    const durableRecord = createDurableOrchestrationRecord(id, normalizedInput, now);
-    const stored: StoredDagRun = { id, input: normalizedInput, childRunIds: [], directChildRunIds: new Set(), running: false, durableRecord, persistence: Promise.resolve() };
-    const repository = this.getOrchestrationRepository();
-    if (repository) await repository.createOrchestration(durableRecord);
+    let stored: StoredDagRun | undefined;
+    const controller = this.buildController(normalizedInput, () => stored);
+    const durableRecord = await controller.create({
+      orchestrationId: id,
+      repository: normalizedInput.repository ?? "unknown/unknown",
+      items: normalizedInput.items,
+      maxParallel: normalizedInput.maxParallel,
+      ...(normalizedInput.requestedIssueNumbers !== undefined ? { requestedIssueNumbers: normalizedInput.requestedIssueNumbers } : {}),
+      ...(normalizedInput.serializationEdges !== undefined ? { serializationEdges: normalizedInput.serializationEdges } : {}),
+      ...(normalizedInput.autoMerge !== undefined ? { autoMerge: normalizedInput.autoMerge } : {}),
+      ...(normalizedInput.productionTarget !== undefined ? { productionTarget: normalizedInput.productionTarget } : {}),
+      ...(normalizedInput.plan !== undefined ? { plan: normalizedInput.plan } : {}),
+    });
+    const dispatch = deferredSignal();
+    stored = {
+      id,
+      input: normalizedInput,
+      childRunIds: [],
+      directChildRunIds: new Set(),
+      running: false,
+      durableRecord,
+      persistence: Promise.resolve(),
+      firstDispatch: dispatch.promise,
+      notifyFirstDispatch: dispatch.resolve,
+    };
     this.runs.set(id, stored);
-    return this.launch(stored, input.items);
+    return this.launch(stored, controller, false);
   }
 
   async resume(
@@ -2601,247 +3005,300 @@ export class VisibleDagDelegator {
   ): Promise<VisibleDagRun> {
     let stored = this.runs.get(orchestrationId);
     if (!stored) {
-      const repository = this.getOrchestrationRepository();
-      const record = repository ? await repository.loadOrchestration(orchestrationId) : undefined;
+      const record = await this.repository().loadOrchestration(orchestrationId);
       if (record && this.rebuildInput) {
         const input = await this.rebuildInput(record);
-        const statuses = new Map(record.nodes.map((node) => [node.id, node.status] as const));
-        const errors = new Map(record.nodes.filter((node) => node.error).map((node) => [node.id, new Error(node.error!)] as const));
+        const dispatch = deferredSignal();
         stored = {
           id: record.orchestrationId,
           input,
           childRunIds: record.nodes.flatMap((node) => node.childRunIds),
-          directChildRunIds: new Set(),
-          result: { status: statuses, errors, startOrder: record.nodes.map((node) => node.id) },
+          directChildRunIds: new Set(record.nodes.flatMap((node) =>
+            (node.attempts ?? []).flatMap((attempt) => attempt.taskId ? [attempt.taskId] : []))),
+          result: scheduleResultFromDurableRecord(record),
           running: false,
           durableRecord: record,
           persistence: Promise.resolve(),
+          firstDispatch: dispatch.promise,
+          notifyFirstDispatch: dispatch.resolve,
         };
         this.runs.set(stored.id, stored);
       }
     }
-    if (!stored) throw new Error(`No resumable orchestration DAG ${orchestrationId} exists in this supervisor session or durable state`);
-    if (stored.running) throw new Error(`Orchestration DAG ${stored.id} is still running`);
-    if (!stored.result) throw new Error(`Orchestration DAG ${stored.id} has no completed scheduling attempt to resume`);
-    if (stored.durableRecord.status !== "failed" && stored.durableRecord.status !== "running") {
-      throw new Error(`Orchestration DAG ${stored.id} has durable status ${stored.durableRecord.status}; only failed or interrupted DAGs are resumable`);
+    if (!stored) throw new Error("No resumable orchestration DAG " + orchestrationId + " exists in this supervisor session or durable state");
+    if (stored.running) throw new Error("Orchestration DAG " + stored.id + " is still running");
+    const decomposed = stored.durableRecord.nodes.filter((node) => node.status === "skipped").map((node) => node.id);
+    if (decomposed.length) {
+      throw new Error("Orchestration DAG " + stored.id + " contains terminally decomposed work (" + decomposed.join(", ") + "); invoke /orchestrate again to freeze its authoritative child scope");
     }
-    const skipped = [...stored.result.status].filter(([, status]) => status === "skipped").map(([id]) => id);
-    if (skipped.length) {
-      throw new Error(`Orchestration DAG ${stored.id} contains terminally decomposed work (${skipped.join(", ")}); invoke /orchestrate again to freeze its authoritative child scope`);
-    }
-    const invalid = [...stored.result.status].filter(([, status]) => status === "invalid").map(([id]) => id);
-    if (invalid.length) {
-      throw new Error(`Orchestration DAG ${stored.id} contains terminally invalid work (${invalid.join(", ")}); invalid issues are not retryable`);
-    }
-    const completed = new Set([...stored.result.status].filter(([, status]) => status === "completed").map(([id]) => id));
-    const remainingIds = new Set(stored.input.items.filter((item) => !completed.has(item.id)).map((item) => item.id));
-    if (!remainingIds.size) throw new Error(`Orchestration DAG ${stored.id} is already complete`);
-    const remaining = stored.input.items
-      .filter((item) => remainingIds.has(item.id))
-      .map((item) => ({ ...item, dependencies: item.dependencies.filter((dependency) => remainingIds.has(dependency)) }));
-    const remainingSerializationEdges = (stored.input.serializationEdges ?? []).filter((edge) =>
-      remainingIds.has(edge.predecessor) && remainingIds.has(edge.successor));
-    // Validate the reduced graph before launching any recovery worker. Older
-    // records may not contain serialization edges, so an empty list remains a
-    // valid backward-compatible input.
-    validateGraph(remaining, remainingSerializationEdges);
+    const invalid = stored.durableRecord.nodes.filter((node) => node.status === "invalid").map((node) => node.id);
+    if (invalid.length) throw new Error("Orchestration DAG " + stored.id + " contains terminally invalid work (" + invalid.join(", ") + "); invalid issues are not retryable");
+    if (stored.durableRecord.status === "completed") throw new Error("Orchestration DAG " + stored.id + " is already complete");
+    if (stored.durableRecord.status === "cancelled") throw new Error("Orchestration DAG " + stored.id + " is cancelled");
+
+    const remaining = stored.durableRecord.nodes.filter((node) => node.status !== "completed");
     const rerunIssueNumbers = new Set(options.rerunIssueNumbers ?? []);
-    const unknownReruns = [...rerunIssueNumbers].filter((issue) => !remaining.some((item) => item.issue === issue || item.memberIssues.includes(issue)));
+    const unknownReruns = [...rerunIssueNumbers].filter((issue) =>
+      !remaining.some((item) => item.issue === issue || (item.memberIssues ?? []).includes(issue)));
     if (unknownReruns.length) {
-      throw new Error(`Fresh rerun override does not match a failed or blocked DAG issue: ${unknownReruns.map((issue) => `#${issue}`).join(", ")}`);
+      throw new Error("Fresh rerun override does not match a failed or blocked DAG issue: " + unknownReruns.map((issue) => "#" + issue).join(", "));
     }
     const adjudications = options.adjudications ?? new Map<number, string>();
-    const unknownAdjudications = [...adjudications.keys()].filter((issue) => !remaining.some((item) => item.issue === issue || item.memberIssues.includes(issue)));
+    const unknownAdjudications = [...adjudications.keys()].filter((issue) =>
+      !remaining.some((item) => item.issue === issue || (item.memberIssues ?? []).includes(issue)));
     if (unknownAdjudications.length) {
-      throw new Error(`Verification adjudication does not match a failed or blocked DAG issue: ${unknownAdjudications.map((issue) => `#${issue}`).join(", ")}`);
+      throw new Error("Verification adjudication does not match a failed or blocked DAG issue: " + unknownAdjudications.map((issue) => "#" + issue).join(", "));
     }
     const overlapping = [...adjudications.keys()].filter((issue) => rerunIssueNumbers.has(issue));
-    if (overlapping.length) throw new Error(`Verification adjudication cannot be combined with fresh rerun authorization: ${overlapping.map((issue) => `#${issue}`).join(", ")}`);
-    return this.launch(stored, remaining, rerunIssueNumbers, adjudications, remainingSerializationEdges);
+    if (overlapping.length) {
+      throw new Error("Verification adjudication cannot be combined with fresh rerun authorization: " + overlapping.map((issue) => "#" + issue).join(", "));
+    }
+    const dispatch = deferredSignal();
+    stored.firstDispatch = dispatch.promise;
+    stored.notifyFirstDispatch = dispatch.resolve;
+    const controller = this.buildController(stored.input, () => stored, { rerunIssueNumbers, adjudications });
+    return this.launch(stored, controller, true);
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(): Promise<boolean> {
     const active = [...this.active];
     await Promise.allSettled(active.map((id) => callSubagentRpc(this.pi, "stop", { id })));
-    for (const run of this.runs.values()) {
-      const stopControllerTask = run.input.stopControllerTask ?? this.directControllerTransport?.stop;
-      if (stopControllerTask) {
-        for (const taskId of run.directChildRunIds) stopControllerTask(taskId);
+    for (const id of active) {
+      const waiter = this.waiting.get(id);
+      if (waiter) {
+        this.waiting.delete(id);
+        waiter.resolve({ runId: id, cancelled: true });
       }
     }
-    await Promise.allSettled([...this.runs.values()].map((run) => run.persistence));
     this.active.clear();
     this.unsubscribe?.();
+    return ![...this.runs.values()].some((run) => run.running);
   }
 
-  private async launch(
-    stored: StoredDagRun,
-    items: readonly VisibleOrchestrationItem[],
-    rerunIssueNumbers: ReadonlySet<number> = new Set(),
-    adjudications: ReadonlyMap<number, string> = new Map(),
-    serializationEdges: readonly ClaimSerializationEdge[] = stored.input.serializationEdges ?? [],
-  ): Promise<VisibleDagRun> {
-    stored.running = true;
-    this.queueDurableRecord(stored, { ...stored.durableRecord, status: "running", updatedAt: new Date().toISOString() });
-    const initialLaunches: Promise<unknown>[] = [];
-    let collectingInitial = true;
-    const stopControllerTask = stored.input.stopControllerTask ?? this.directControllerTransport?.stop;
-    const result = runSchedule(items, stored.input.maxParallel, async (scheduled) => {
-      const item = scheduled as VisibleOrchestrationItem;
-      const explicitlyRerun = rerunIssueNumbers.has(item.issue) || item.memberIssues.some((issue) => rerunIssueNumbers.has(issue));
-      const adjudication = adjudications.get(item.issue) ?? item.memberIssues.map((issue) => adjudications.get(issue)).find((reason): reason is string => reason !== undefined);
-      const recovery: DagRecoveryMode = explicitlyRerun ? "rerun" : stored.result ? "resume" : "initial";
-      const startControllerTask = stored.input.startControllerTask ?? this.directControllerTransport?.start;
-      const waitControllerTask = stored.input.waitControllerTask ?? this.directControllerTransport?.wait;
-      const stopControllerTask = stored.input.stopControllerTask ?? this.directControllerTransport?.stop;
-      const directStart = stored.input.controllerTaskFor && startControllerTask && waitControllerTask
-        ? (async () => {
-          const spec = stored.input.controllerTaskFor!(item, recovery, adjudication);
+  private repository(): OrchestrationRepository {
+    const repository = this.getOrchestrationRepository();
+    if (!repository) throw new Error("Durable orchestration repository is required; initialize witnessed SQLite before DAG execution");
+    return repository;
+  }
+
+  private admission(): OrchestrationExecutionAdmission {
+    const admission = this.getExecutionAdmission();
+    if (!admission) throw new Error("Witnessed orchestration execution admission is required; process-local fallback is disabled");
+    return admission;
+  }
+
+  private buildController(
+    input: VisibleDagInput,
+    getStored: () => StoredDagRun | undefined,
+    overrides: {
+      rerunIssueNumbers?: ReadonlySet<number>;
+      adjudications?: ReadonlyMap<number, string>;
+    } = {},
+  ): OrchestrationController {
+    return new OrchestrationController({
+      repository: this.repository(),
+      executionAdmission: this.admission(),
+      transportCapacity: () => this.transportCapacity(getStored()),
+      worker: async (scheduled, context) => {
+        const stored = requiredStoredRun(getStored());
+        const item = requiredVisibleItem(input, scheduled.id);
+        const explicitlyRerun = overrides.rerunIssueNumbers?.has(item.issue)
+          || item.memberIssues.some((issue) => overrides.rerunIssueNumbers?.has(issue));
+        const adjudication = overrides.adjudications?.get(item.issue)
+          ?? item.memberIssues.map((issue) => overrides.adjudications?.get(issue)).find((reason): reason is string => reason !== undefined);
+        const recovery: DagRecoveryMode = explicitlyRerun
+          ? "rerun"
+          : context.recovery === "initial" ? "initial" : "resume";
+        const startControllerTask = input.startControllerTask ?? this.directControllerTransport?.start;
+        const waitControllerTask = input.waitControllerTask ?? this.directControllerTransport?.wait;
+        if (input.controllerTaskFor && startControllerTask && waitControllerTask) {
+          const spec = input.controllerTaskFor(item, recovery, adjudication);
           const taskId = await startControllerTask({
             ...spec,
             env: { ...(spec.env ?? {}), FORGEDOCK_ORCHESTRATION_ID: stored.id },
           });
-          stored.childRunIds.push(taskId);
           stored.directChildRunIds.add(taskId);
-          this.queueDurableRecord(stored, {
-            ...stored.durableRecord,
-            updatedAt: new Date().toISOString(),
-            nodes: stored.durableRecord.nodes.map((node) => node.id === item.id
-              ? { ...node, childRunIds: [...node.childRunIds, taskId] }
-              : node),
-          });
-          return taskId;
-        })()
-        : undefined;
-      if (directStart) {
-        if (collectingInitial) initialLaunches.push(directStart);
-        const taskId = await directStart;
-        await waitControllerTask!(taskId);
-        return await stored.input.assertCompleted(item);
-      }
-      const launch = callSubagentRpc(this.pi, "spawn", {
-        ...stored.input.taskFor(item, recovery, adjudication), async: true, context: "fresh", artifacts: true,
-      });
-      if (collectingInitial) initialLaunches.push(launch);
-      const response = await launch;
-      const runId = asyncRunId(response);
-      stored.childRunIds.push(runId);
-      this.queueDurableRecord(stored, {
-        ...stored.durableRecord,
-        updatedAt: new Date().toISOString(),
-        nodes: stored.durableRecord.nodes.map((node) => node.id === item.id
-          ? { ...node, childRunIds: [...node.childRunIds, runId] }
-          : node),
-      });
-      this.active.add(runId);
-      try {
-        await this.waitForCompletion(runId);
-        return await stored.input.assertCompleted(item);
-      } finally {
-        this.active.delete(runId);
-      }
-    }, {
-      serializationEdges,
-      onEvent: (scheduleEvent) => {
-        const snapshot = buildOrchestrationSnapshot({
-          orchestrationId: stored.id,
-          items,
-          serializationEdges,
-          result: {
-            status: new Map(scheduleEvent.status),
-            errors: new Map(scheduleEvent.errors),
-            ...(scheduleEvent.waitReasons ? { waitReasons: new Map(scheduleEvent.waitReasons) } : {}),
-          },
-        });
-        this.queueDurableRecord(stored, {
-          ...stored.durableRecord,
-          updatedAt: new Date().toISOString(),
-          nodes: stored.durableRecord.nodes.map((node) => {
-            const status = scheduleEvent.status.get(node.id);
-            const error = scheduleEvent.errors.get(node.id);
-            const waitReason = scheduleEvent.waitReasons?.get(node.id);
-            const { waitReason: _previousWaitReason, ...withoutWaitReason } = node;
-            return {
-              ...withoutWaitReason,
-              ...(status !== undefined ? { status } : {}),
-              ...(waitReason ? { waitReason } : {}),
-              ...(error !== undefined ? { error: error.message } : {}),
-            };
-          }),
-        });
-        stored.input.onEvent?.(orchestrationEventFromSchedule(scheduleEvent, snapshot));
-      },
-      resumedItemIds: stored.result ? items.map((item) => item.id) : [],
-    });
-    try {
-      await Promise.all(initialLaunches);
-    } catch (error) {
-      stored.running = false;
-      this.queueDurableRecord(stored, { ...stored.durableRecord, status: "failed", updatedAt: new Date().toISOString() });
-      await Promise.allSettled(stored.childRunIds.map((runId) => {
-        if (stored.directChildRunIds.has(runId)) {
-          stopControllerTask?.(runId);
-          return Promise.resolve();
+          if (!stored.childRunIds.includes(taskId)) stored.childRunIds.push(taskId);
+          await context.recordTask({ taskId, controllerTaskId: taskId });
+          stored.notifyFirstDispatch();
+          await waitControllerTask(taskId);
+          return await input.assertCompleted(item);
         }
-        return callSubagentRpc(this.pi, "stop", { id: runId });
-      }));
-      await stored.persistence;
-      throw error;
+
+        const response = await callSubagentRpc(this.pi, "spawn", {
+          ...input.taskFor(item, recovery, adjudication),
+          async: true,
+          context: "fresh",
+          artifacts: true,
+        });
+        const runId = asyncRunId(response);
+        if (!stored.childRunIds.includes(runId)) stored.childRunIds.push(runId);
+        await context.recordTask({ agentTaskId: runId, runId });
+        stored.notifyFirstDispatch();
+        this.active.add(runId);
+        try {
+          await this.waitForCompletion(runId);
+          return await input.assertCompleted(item);
+        } finally {
+          this.active.delete(runId);
+        }
+      },
+      reconcileWorker: async ({ item: scheduled, attempt }) => {
+        const stored = requiredStoredRun(getStored());
+        const item = requiredVisibleItem(input, scheduled.id);
+        return this.reconcileWorker(stored, item, attempt);
+      },
+      onEvent: (event) => {
+        const stored = getStored();
+        stored?.input.onEvent?.(event);
+      },
+    });
+  }
+
+  private transportCapacity(stored: StoredDagRun | undefined): number {
+    const records = this.directControllerTransport?.list?.();
+    if (!records) return 4;
+    const owned = new Set((stored?.durableRecord.nodes ?? []).flatMap((node) =>
+      (node.attempts ?? []).flatMap((attempt) => attempt.taskId ? [attempt.taskId] : [])));
+    const externalActive = records.filter((record) =>
+      (record.status === "running" || record.status === "detached") && !owned.has(record.id)).length;
+    const available = 4 - externalActive;
+    if (available < 1) throw new Error("Native controller transport is at capacity; wait for a task to finish or cancel it explicitly");
+    return available;
+  }
+
+  private async reconcileWorker(
+    stored: StoredDagRun,
+    item: VisibleOrchestrationItem,
+    attempt: Readonly<OrchestrationWorkerAttemptRecord> | undefined,
+  ): Promise<OrchestrationWorkerReconciliation> {
+    const taskId = attempt?.taskId ?? attempt?.controllerTaskId;
+    if (taskId) {
+      const transport = stored.input.waitControllerTask && this.directControllerTransport
+        ? { ...this.directControllerTransport, wait: stored.input.waitControllerTask }
+        : this.directControllerTransport;
+      const record = transport?.list?.().find((candidate) => candidate.id === taskId);
+      if (record?.status === "running" || record?.status === "detached") {
+        return {
+          disposition: "live",
+          ...(attempt?.attemptId !== undefined ? { attemptId: attempt.attemptId } : {}),
+          identity: { taskId, controllerTaskId: taskId },
+          wait: async () => {
+            await transport!.wait(taskId);
+            return await stored.input.assertCompleted(item);
+          },
+        };
+      }
+      if (record && ["completed", "blocked", "failed", "cancelled"].includes(record.status)) {
+        const terminal = await this.authoritativeTerminal(stored, item);
+        if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Native controller task ${taskId} stopped at a resumable workflow checkpoint` };
+        if (terminal) return { disposition: "terminal", result: terminal, reason: "Native controller task is terminal and durable workflow state was reconciled" };
+        return { disposition: "interrupted", reason: "Native controller task " + taskId + " ended without authoritative terminal workflow state" };
+      }
     }
-    collectingInitial = false;
-    const completion = result.then(async (attempt) => {
-      const merged = mergeScheduleResults(stored.result, attempt);
-      stored.result = merged;
+
+    const runId = attempt?.agentTaskId ?? attempt?.runId;
+    if (runId && this.active.has(runId)) {
+      return {
+        disposition: "live",
+        ...(attempt?.attemptId !== undefined ? { attemptId: attempt.attemptId } : {}),
+        identity: { agentTaskId: runId, runId },
+        wait: async () => {
+          await this.waitForCompletion(runId);
+          return await stored.input.assertCompleted(item);
+        },
+      };
+    }
+    if (runId && this.completedAsyncRuns.has(runId)) {
+      const terminal = await this.authoritativeTerminal(stored, item);
+      if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Pi worker ${runId} stopped at a resumable workflow checkpoint` };
+      if (terminal) return { disposition: "terminal", result: terminal, reason: "Pi worker completion was observed and durable workflow state was reconciled" };
+    }
+    const terminal = await this.authoritativeTerminal(stored, item);
+    if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `${item.id} stopped at a resumable workflow checkpoint` };
+    if (terminal) return { disposition: "terminal", result: terminal, reason: "Durable workflow state is terminal" };
+    return { disposition: "interrupted", reason: "No live worker transport could be reconciled for " + item.id };
+  }
+
+  private async authoritativeTerminal(
+    stored: StoredDagRun,
+    item: VisibleOrchestrationItem,
+  ): Promise<Exclude<ScheduleWorkerResult, void> | undefined> {
+    try {
+      const result = await stored.input.assertCompleted(item);
+      return result ?? { status: "completed" };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async launch(
+    stored: StoredDagRun,
+    controller: OrchestrationController,
+    resume: boolean,
+  ): Promise<VisibleDagRun> {
+    stored.running = true;
+    const execution = resume ? controller.resume(stored.id) : controller.run(stored.id);
+    const completion = execution.then(async (result) => {
+      stored.result = result.schedule;
+      stored.durableRecord = result.record;
+      stored.childRunIds.splice(0, stored.childRunIds.length, ...new Set([
+        ...stored.childRunIds,
+        ...result.record.nodes.flatMap((node) => node.childRunIds),
+      ]));
       stored.running = false;
-      const failed = [...merged.status.values()].some((status) => status === "failed" || status === "blocked" || status === "suspended" || status === "invalid");
-      this.queueDurableRecord(stored, {
-        ...stored.durableRecord,
-        status: failed ? "failed" : "completed",
-        updatedAt: new Date().toISOString(),
-      });
-      await stored.persistence;
-      stored.input.onComplete(merged, stored.id);
+      stored.notifyFirstDispatch();
+      stored.input.onComplete(result.schedule, stored.id);
     }, async (error) => {
       stored.running = false;
-      this.queueDurableRecord(stored, { ...stored.durableRecord, status: "failed", updatedAt: new Date().toISOString() });
-      await stored.persistence;
+      stored.notifyFirstDispatch();
+      const latest = await this.repository().loadOrchestration(stored.id).catch(() => undefined);
+      if (latest) stored.durableRecord = latest;
       throw error;
     });
     completion.catch(() => undefined);
+    await Promise.race([stored.firstDispatch, completion]);
     return { id: stored.id, childRunIds: stored.childRunIds, completion };
   }
 
-  private queueDurableRecord(stored: StoredDagRun, record: OrchestrationRecord): void {
-    stored.durableRecord = record;
-    const repository = this.getOrchestrationRepository();
-    if (!repository) return;
-    stored.persistence = stored.persistence.then(() => repository.saveOrchestration(record));
-  }
-
   private waitForCompletion(runId: string): Promise<unknown> {
+    if (this.completedAsyncRuns.delete(runId)) return Promise.resolve({ runId });
     return new Promise((resolve) => this.waiting.set(runId, { resolve }));
   }
 }
 
-function mergeScheduleResults(
-  previous: Awaited<ReturnType<typeof runSchedule>> | undefined,
-  attempt: Awaited<ReturnType<typeof runSchedule>>,
-): Awaited<ReturnType<typeof runSchedule>> {
-  if (!previous) return attempt;
-  const status = new Map(previous.status);
-  const errors = new Map(previous.errors);
-  const waitReasons = new Map(previous.waitReasons);
-  for (const [id, value] of attempt.status) {
-    status.set(id, value);
-    if (value === "completed" || value === "skipped") errors.delete(id);
-    if (value !== "queued") waitReasons.delete(id);
-  }
-  for (const [id, error] of attempt.errors) errors.set(id, error);
-  for (const [id, reason] of attempt.waitReasons ?? []) waitReasons.set(id, reason);
-  return { status, errors, startOrder: [...previous.startOrder, ...attempt.startOrder], ...(waitReasons.size ? { waitReasons } : {}) };
+function deferredSignal(): { promise: Promise<void>; resolve: () => void } {
+  let settled = false;
+  let resolvePromise!: () => void;
+  const promise = new Promise<void>((resolve) => { resolvePromise = resolve; });
+  return {
+    promise,
+    resolve: () => {
+      if (settled) return;
+      settled = true;
+      resolvePromise();
+    },
+  };
 }
 
+function requiredStoredRun(run: StoredDagRun | undefined): StoredDagRun {
+  if (!run) throw new Error("Orchestration adapter was invoked before its durable run was initialized");
+  return run;
+}
+
+function requiredVisibleItem(input: VisibleDagInput, id: string): VisibleOrchestrationItem {
+  const item = input.items.find((candidate) => candidate.id === id);
+  if (!item) throw new Error("Durable orchestration item " + id + " is absent from the rebuilt adapter input");
+  return item;
+}
+
+function scheduleResultFromDurableRecord(record: OrchestrationRecord): ScheduleResult {
+  return {
+    status: new Map(record.nodes.map((node) => [node.id, node.status])),
+    errors: new Map(record.nodes.filter((node) => node.error).map((node) => [node.id, new Error(node.error!)])),
+    startOrder: record.nodes.flatMap((node) => (node.attempts ?? []).length ? [node.id] : []),
+  };
+}
 function asyncRunId(response: unknown): string {
   if (!response || typeof response !== "object") throw new Error("Subagent runtime returned no async run identity");
   const details = "details" in response && typeof response.details === "object" && response.details !== null

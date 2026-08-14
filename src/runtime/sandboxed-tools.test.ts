@@ -110,6 +110,101 @@ describe("runtime workspace confinement", () => {
     }
   });
 
+  it("provides guarded regex, glob, ignore-case, and truncation without external ripgrep", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "forgedock-portable-grep-"));
+    const root = join(parent, "worktree");
+    const outside = join(parent, "outside");
+    mkdirSync(join(root, "src", "nested"), { recursive: true });
+    mkdirSync(join(root, "ignored"));
+    mkdirSync(outside);
+    writeFileSync(join(root, ".gitignore"), "ignored/\nsrc/nested/notes.txt\n");
+    writeFileSync(join(root, "src", "alpha.ts"), "Needle [42]\nneedle 7\n");
+    writeFileSync(join(root, "src", "nested", "bravo.test.ts"), "NEEDLE 8\n");
+    writeFileSync(join(root, "src", "nested", "notes.txt"), "needle 9\n");
+    writeFileSync(join(root, "ignored", "ignored.ts"), "needle 10\n");
+    writeFileSync(join(outside, "secret.ts"), "needle 11\n");
+    symlinkSync(outside, join(root, "outside-link"), process.platform === "win32" ? "junction" : "dir");
+
+    const previousPath = process.env.PATH;
+    const previousOffline = process.env.PI_OFFLINE;
+    process.env.PATH = join(parent, "missing-bin");
+    process.env.PI_OFFLINE = "1";
+    try {
+      const grep = (await createSandboxedTools(root, ["grep"])).find((tool) => tool.name === "grep");
+      assert.ok(grep);
+
+      const literal = await grep.execute(
+        "grep-literal-portable",
+        { pattern: "Needle [42]", path: ".", glob: "*.ts", context: 1, literal: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      assert.match((literal.content[0] as { text: string }).text, /src\/alpha\.ts:1: Needle \[42\]/);
+      assert.match((literal.content[0] as { text: string }).text, /src\/alpha\.ts-2- needle 7/);
+
+      const regex = await grep.execute(
+        "grep-regex-portable",
+        { pattern: "^needle \\d+$", path: ".", glob: "**/*.test.ts", ignoreCase: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      const regexOutput = (regex.content[0] as { text: string }).text;
+      assert.match(regexOutput, /src\/nested\/bravo\.test\.ts:1: NEEDLE 8/);
+      assert.doesNotMatch(regexOutput, /notes\.txt|ignored\.ts|secret\.ts/);
+
+      const nestedIgnored = await grep.execute(
+        "grep-nested-ignore",
+        { pattern: "needle 9", path: "src", literal: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      assert.equal((nestedIgnored.content[0] as { text: string }).text, "No matches found");
+
+      const limited = await grep.execute(
+        "grep-limit",
+        { pattern: "needle ", path: ".", glob: "**/*.ts", ignoreCase: true, limit: 1, literal: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      assert.equal((limited.details as { matchLimitReached?: number } | undefined)?.matchLimitReached, 1);
+      assert.match((limited.content[0] as { text: string }).text, /1 matches limit reached/);
+
+      const confined = await grep.execute(
+        "grep-confined",
+        { pattern: "needle 11", path: ".", literal: true },
+        undefined,
+        undefined,
+        {} as never,
+      );
+      assert.equal((confined.content[0] as { text: string }).text, "No matches found");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = previousOffline;
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts sandbox grep without waiting for traversal to finish", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-abort-grep-"));
+    try {
+      writeFileSync(join(root, "large.txt"), "search me\n".repeat(10_000));
+      const grep = (await createSandboxedTools(root, ["grep"])).find((tool) => tool.name === "grep");
+      assert.ok(grep);
+      const controller = new AbortController();
+      const execution = grep.execute("grep-abort", { pattern: "search", path: "." }, controller.signal, undefined, {} as never);
+      controller.abort();
+      await assert.rejects(execution, /Operation aborted/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("provides side-effect-free deterministic Ed25519 test-vector computation", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-compute-"));
     const compute = (await createSandboxedTools(root, ["compute"])).find((tool) => tool.name === "compute");

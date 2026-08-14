@@ -27,6 +27,104 @@ export interface DecompositionChild {
   dependsOn: string[];
 }
 
+export type PlanEvidenceAuthority =
+  | "user"
+  | "github"
+  | "repository"
+  | "forge-guidance"
+  | "devdocs"
+  | "prototype";
+
+export interface PlanMaterializationEvidence {
+  id: string;
+  authority: PlanEvidenceAuthority;
+  source: string;
+  locator: string;
+  claim: string;
+  detail: string;
+}
+
+export interface PlanMaterializationDecision {
+  round: number;
+  questionId: string;
+  values: readonly string[];
+  labels: readonly string[];
+  customText?: string;
+  note?: string;
+  optionNotes?: Readonly<Record<string, string>>;
+  authority: "user";
+}
+
+export interface PlanMaterializationTerm {
+  id: string;
+  term: string;
+  definition: string;
+  aliases: readonly string[];
+  evidenceIds: readonly string[];
+  status: "proposed" | "accepted" | "rejected";
+}
+
+/**
+ * Immutable node input for GitHub projection. `planId`, `revision`, and
+ * `nodeId` together are the adapter's idempotency identity; titles are never
+ * identity because users may refine wording between plan revisions.
+ */
+export interface PlanMaterializationNode {
+  planId: string;
+  revision: number;
+  nodeId: string;
+  title: string;
+  outcome: string;
+  dependsOnNodeIds: readonly string[];
+  acceptanceCriteria: readonly string[];
+  affectedFiles: readonly string[];
+  claims: readonly string[];
+  verificationPlan: readonly string[];
+  priority: number;
+  riskClass: "routine" | "security" | "auth" | "billing";
+  evidenceIds: readonly string[];
+}
+
+export interface PlanMaterializationRequest {
+  repo: string;
+  planId: string;
+  revision: number;
+  objective: string;
+  assumptions: readonly string[];
+  evidence: readonly PlanMaterializationEvidence[];
+  vocabulary: readonly PlanMaterializationTerm[];
+  decisions: readonly PlanMaterializationDecision[];
+  outOfScope: readonly string[];
+  nodes: readonly PlanMaterializationNode[];
+}
+
+/** Authoritative node-to-issue/dependency mapping returned by the host. */
+export interface MaterializedPlanNode {
+  planId: string;
+  revision: number;
+  nodeId: string;
+  issue: IssueSnapshot;
+  dependsOnNodeIds: readonly string[];
+  dependencyIssueNumbers: readonly number[];
+}
+
+export interface PlanMaterializationResult {
+  repo: string;
+  planId: string;
+  revision: number;
+  nodes: readonly MaterializedPlanNode[];
+}
+
+/**
+ * Required capability for Deep Plan handoff. Kept as a named contract so
+ * focused workflow doubles need not implement every ForgeHost operation.
+ */
+export interface PlanMaterializationHost {
+  materializePlan(
+    input: PlanMaterializationRequest,
+  ): Promise<PlanMaterializationResult>;
+}
+
 export interface ReviewFindingInput {
   id: string;
   severity: "critical" | "high" | "medium" | "low";
@@ -119,6 +217,12 @@ export interface ForgeHost {
     parentIssue: number;
     children: DecompositionChild[];
   }): Promise<IssueSnapshot[]>;
+  /**
+   * Additive migration capability. The GitHub adapter must implement the exact
+   * PlanMaterializationHost signature before native Deep Plan handoff is
+   * enabled; optionality temporarily preserves legacy ForgeHost test doubles.
+   */
+  materializePlan?: PlanMaterializationHost["materializePlan"];
   createPullRequest(input: {
     repo: string;
     issue: number;

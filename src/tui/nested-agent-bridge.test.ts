@@ -3,7 +3,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createScopeManifestReceipt, scopeManifestForReviewer } from "../runtime/agent-runtime.js";
 import { startNestedAgentBridge, subagentRpc } from "./nested-agent-bridge.js";
+
+const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
 
 class FakeEvents {
   handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -78,6 +81,7 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
         instructions: "Read only",
         context: [],
         cwd: process.cwd(),
+        ...REVIEWER_SCOPE,
         tools: ["read", "grep", "find", "ls"],
         outputSchema: { type: "object" },
         provider: "openai-codex",
@@ -93,6 +97,39 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
     assert.match(events.requests[0]?.task ?? "", /^ForgeDock review · correctness\n/);
     assert.equal(events.requests[0]?.context, "fresh");
     assert.equal(events.requests[0]?.result.kind, "structured");
+    assert.equal(events.requests[0]?.scope, undefined, "ForgeDock scope is carried in task text, not as an unsupported upstream field");
+    assert.match(events.requests[0]?.task ?? "", new RegExp(`scope contract: v1 sha256:${REVIEWER_SCOPE.scopeDigest}`));
+    assert.equal(result.scopeVersion, REVIEWER_SCOPE.scopeVersion);
+    assert.equal(result.scopeDigest, REVIEWER_SCOPE.scopeDigest);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("nested reviewer scope receipts fail closed on omission, tampering, or narrowed/write authority", async () => {
+  const events = new FakeEvents();
+  const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
+  const base = {
+    ownerRunId: "run-scope", id: "run-scope:review:abc:correctness", role: "reviewer",
+    objective: "Review", instructions: "Read only", context: [], cwd: process.cwd(),
+    tools: ["read"], outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test",
+  };
+  const post = (body: unknown) => fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+    method: "POST",
+    headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  try {
+    assert.equal((await post(base)).status, 500);
+    assert.equal((await post({ ...base, ...REVIEWER_SCOPE, scopeVersion: 2 })).status, 500);
+    assert.equal((await post({ ...base, ...REVIEWER_SCOPE, scopeDigest: "0".repeat(64) })).status, 500);
+    assert.equal((await post({ ...base, ...REVIEWER_SCOPE, unversionedScopeHint: "src" })).status, 500);
+    const narrow = createScopeManifestReceipt({ readRoots: ["src"], writeRoots: [], source: "issue-hints" });
+    assert.equal((await post({ ...base, ...narrow })).status, 500);
+    const writable = createScopeManifestReceipt({ readRoots: ["."], writeRoots: ["src"], source: "issue-hints" });
+    assert.equal((await post({ ...base, ...writable })).status, 500);
+    assert.equal((await post({ ...base, ...REVIEWER_SCOPE, tools: ["read", "verify"] })).status, 500);
+    assert.equal(events.requests.length, 0, "invalid scope must be rejected before nested dispatch");
   } finally {
     await bridge.close();
   }
@@ -116,6 +153,7 @@ test("incomplete persisted reviewers are resumed through the package-owned RPC l
         instructions: "Read only",
         context: [],
         cwd: process.cwd(),
+        ...REVIEWER_SCOPE,
         tools: ["read", "grep", "find", "ls"],
         outputSchema: { type: "object" },
         provider: "openai-codex",
@@ -146,6 +184,7 @@ test("schema-valid output from a resumed reviewer survives a trailing failed sta
       body: JSON.stringify({
         ownerRunId: "run-resume-transport", id: "run-resume-transport:review:abc:correctness:resume", role: "reviewer",
         objective: "Resume", instructions: "Read only", context: [], cwd: process.cwd(), tools: ["read"],
+        ...REVIEWER_SCOPE,
         outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test", resumeSessionRef: "source-run",
       }),
     });
@@ -179,6 +218,7 @@ test("cancelling during resume interrupts a revived child even when its RPC repl
       body: JSON.stringify({
         ownerRunId: "run-cancel-resume", id: "run-cancel-resume:review:abc:correctness:resume", role: "reviewer",
         objective: "Resume", instructions: "Read only", context: [], cwd: process.cwd(), tools: ["read"],
+        ...REVIEWER_SCOPE,
         outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test", resumeSessionRef: "source-run",
       }),
       signal: controller.signal,
@@ -218,7 +258,7 @@ test("a schema-valid structured result survives a trailing failed terminal statu
         role: "reviewer",
         objective: "Review",
         instructions: "Read only",
-        context: [], cwd: process.cwd(), tools: ["read"], outputSchema: { type: "object" },
+        context: [], cwd: process.cwd(), ...REVIEWER_SCOPE, tools: ["read"], outputSchema: { type: "object" },
         provider: "openai-codex", model: "gpt-test",
       }),
     });
@@ -247,7 +287,7 @@ test("an incomplete failed delegation returns its persisted session reference fo
       headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify({
         ownerRunId: "run-incomplete", id: "run-incomplete:review:abc:correctness", role: "reviewer",
-        objective: "Review", instructions: "Read only", context: [], cwd: process.cwd(), tools: ["read"],
+        objective: "Review", instructions: "Read only", context: [], cwd: process.cwd(), ...REVIEWER_SCOPE, tools: ["read"],
         outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test",
       }),
     });
@@ -291,6 +331,7 @@ test("nested reviewers have no fixed wall-clock lifetime and stop on explicit cl
         instructions: "Read only",
         context: [],
         cwd: process.cwd(),
+        ...REVIEWER_SCOPE,
         tools: ["read", "grep", "find", "ls"],
         outputSchema: { type: "object" },
         provider: "openai-codex",

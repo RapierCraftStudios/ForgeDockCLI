@@ -97,6 +97,40 @@ describe("lean orchestration scheduler", () => {
     assert.match(result.errors.get("second")?.message ?? "", /active work/);
   });
 
+  it("checks late claim promotion against workers that started afterward", async () => {
+    let signalSecondPromoted!: () => void;
+    const secondPromoted = new Promise<void>((resolve) => { signalSecondPromoted = resolve; });
+    let signalFirstAttempted!: () => void;
+    const firstAttempted = new Promise<void>((resolve) => { signalFirstAttempted = resolve; });
+    let releaseSecond!: () => void;
+    const keepSecondActive = new Promise<void>((resolve) => { releaseSecond = resolve; });
+
+    const schedule = runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
+    ], 2, async (item, scheduler) => {
+      if (item.id === "first") {
+        await secondPromoted;
+        try {
+          scheduler.promoteClaims(["src/shared"]);
+        } finally {
+          signalFirstAttempted();
+        }
+        return;
+      }
+      scheduler.promoteClaims(["src/shared"]);
+      signalSecondPromoted();
+      await keepSecondActive;
+    });
+
+    await firstAttempted;
+    releaseSecond();
+    const result = await schedule;
+    assert.equal(result.status.get("first"), "failed");
+    assert.equal(result.status.get("second"), "completed");
+    assert.match(result.errors.get("first")?.message ?? "", /active work/);
+  });
+
   it("streams a newly ready successor without waiting for an unrelated ready node", async () => {
     const releases = new Map<string, () => void>();
     const started: string[] = [];
@@ -127,6 +161,22 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("parent"), "suspended");
     assert.equal(result.status.get("child"), "queued");
     assert.ok(events.includes("suspended"));
+  });
+
+  it("blocks on any failed dependency even when an earlier dependency is suspended", async () => {
+    const result = await runSchedule([
+      { id: "suspended", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "failed", issue: 2, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 3, priority: 1, dependencies: ["suspended", "failed"], claims: [] },
+    ], 2, async (scheduled) => scheduled.id === "suspended"
+      ? { status: "suspended", error: "durable recovery" }
+      : { status: "failed", error: "terminal prerequisite failure" });
+
+    assert.equal(result.status.get("suspended"), "suspended");
+    assert.equal(result.status.get("failed"), "failed");
+    assert.equal(result.status.get("dependent"), "blocked");
+    assert.match(result.errors.get("dependent")?.message ?? "", /failed/);
+    assert.equal(result.waitReasons?.has("dependent") ?? false, false);
   });
 
   it("turns a thrown lease continuity failure into suspension without dispatching dependents", async () => {

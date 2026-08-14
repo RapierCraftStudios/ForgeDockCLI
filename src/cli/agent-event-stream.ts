@@ -76,6 +76,10 @@ export class AgentEventStreamWriter {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "session.completed") {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · session complete${milestone ? ` · ${milestone}` : ""}\n`);
+    } else if (event.type === "session.failed") {
+      this.#write(`  ${statusGlyph("failed", this.#mode)} ${task} · session failed · ${sanitizeTerminalText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
+    } else if (event.type === "session.cancelled") {
+      this.#write(`  ${statusGlyph("blocked", this.#mode)} ${task} · session cancelled · ${sanitizeTerminalText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
     }
   }
 

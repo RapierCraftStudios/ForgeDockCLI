@@ -9,7 +9,9 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
+import { InMemoryLeaseRepository } from "../core/ports/lease.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
+import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
   bindOrchestrationInvocation,
@@ -81,8 +83,26 @@ function fakePi(
     },
   } as unknown as ExtensionAPI;
   Object.assign(state, { pi, tools, commands, handlers, sent, messageRenderers, active, emitted });
-  forgedockExtension(pi);
+  forgedockExtension(pi, {
+    orchestrationRepository: new InMemoryOrchestrationRepository(),
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+  });
   return state;
+}
+
+function witnessedDagDelegator(
+  pi: ExtensionAPI,
+  repository = new InMemoryOrchestrationRepository(),
+  rebuildInput?: ConstructorParameters<typeof VisibleDagDelegator>[2],
+): VisibleDagDelegator {
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  return new VisibleDagDelegator(
+    pi,
+    () => repository,
+    rebuildInput,
+    undefined,
+    () => admission,
+  );
 }
 
 function commandContext(idle = true): ExtensionCommandContext {
@@ -103,14 +123,18 @@ test("commands lazily activate separate semantic native tools without loading Ma
   const state = fakePi();
   assert.deepEqual(
     [...state.tools.keys()].sort(),
-    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_promote", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
+    ["forgedock_ask_user", "forgedock_configure", "forgedock_deep_plan", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_promote", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
   );
 
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
   assert.ok(state.tools.get("forgedock_resume_orchestration"));
   const resumeTool = state.tools.get("forgedock_resume_orchestration") as any;
   assert.equal(resumeTool.parameters.properties.orchestrationId.type, "string");
+  const deepPlanTool = state.tools.get("forgedock_deep_plan") as any;
+  assert.deepEqual(deepPlanTool.parameters.properties.action.enum, ["start", "continue", "finish", "materialize"]);
+  assert.equal(deepPlanTool.parameters.properties.repo.type, "string");
+  assert.ok(deepPlanTool.parameters.properties.packet);
 
   await state.commands.get("orchestrate")?.("throwaway-milestone --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
@@ -226,7 +250,7 @@ test("keeps native workflow tools active through a transient provider retry", as
   assert.deepEqual(state.active, activeDuringWorkflow);
 
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
 });
 
 test("natural configuration resolves a friendly live model name for all subagents", async () => {
@@ -317,7 +341,7 @@ test("idle TUI shows actionable workflow entrypoints without reserving a help wi
   await state.handlers.get("session_start")?.[0]?.({}, ctx);
   assert.deepEqual(widgets, []);
   assert.equal(statuses.at(-1), FORGEDOCK_READY_STATUS);
-  assert.match(statuses.at(-1) ?? "", /\/work-on · \/review-pr · \/orchestrate/);
+  assert.match(statuses.at(-1) ?? "", /\/deep-plan · \/work-on · \/review-pr · \/orchestrate/);
   assert.doesNotMatch(statuses.at(-1) ?? "", /semantic-tools|authoritative/i);
 
   await state.handlers.get("agent_end")?.[0]?.({}, ctx);
@@ -336,7 +360,7 @@ test("supervisor escalations lazily expose decision-interview and reply tools", 
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "subagent_supervisor"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "forgedock_deep_plan", "subagent_supervisor"]);
 });
 
 test("human checkpoints use the tabbed decision interview and return typed answers", async () => {
@@ -536,7 +560,7 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
 
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
   assert.equal(state.active.includes("forgedock_orchestrate"), true);
-  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
   const continued = await tool.execute("confirmed-checkpoint", {
     issueNumbers: [7],
     confirmed: true,
@@ -607,7 +631,7 @@ test("fresh orchestration never invokes the implicit resume tool", async () => {
   const resume = state.tools.get("forgedock_resume_orchestration");
   assert.ok(resume);
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
-  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
   assert.equal((resume as any).parameters.properties.orchestrationId.type, "string");
   const result = await tool.execute("fresh-preview", {
     issueNumbers: [7],
@@ -632,7 +656,7 @@ test("visible DAG delegation dispatches a successor on its predecessor completio
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi);
+  const delegator = witnessedDagDelegator(state.pi);
   const completed: number[] = [];
   const run = await delegator.start({
     items: [
@@ -674,7 +698,7 @@ test("visible DAG persists its durable parent record and terminal node state", a
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi, () => repository);
+  const delegator = witnessedDagDelegator(state.pi, repository);
   const run = await delegator.start({
     repository: "a/b", autoMerge: true,
     requestedIssueNumbers: [21, 22],
@@ -708,7 +732,7 @@ test("visible DAG rebuilds and resumes a durable parent after supervisor restart
       }));
     }
   }) as typeof firstState.pi.events.emit;
-  const first = new VisibleDagDelegator(firstState.pi, () => repository);
+  const first = witnessedDagDelegator(firstState.pi, repository);
   const input = {
     repository: "a/b", autoMerge: true,
     items: [{ id: "issue-22", issue: 22, title: "Twenty-two", summary: "Restart", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [22] }],
@@ -732,7 +756,7 @@ test("visible DAG rebuilds and resumes a durable parent after supervisor restart
       }));
     }
   }) as typeof secondState.pi.events.emit;
-  const second = new VisibleDagDelegator(secondState.pi, () => repository, async (record) => ({
+  const second = witnessedDagDelegator(secondState.pi, repository, async (record) => ({
     ...input,
     items: record.nodes.map((node) => ({ ...node, title: node.title ?? `Issue #${node.issue}`, summary: node.summary ?? "Restart", labels: [], memberIssues: node.memberIssues ?? [node.issue], affectedFiles: node.affectedFiles ?? [] })),
     assertCompleted: async () => undefined,
@@ -760,7 +784,7 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi);
+  const delegator = witnessedDagDelegator(state.pi);
   let assertions = 0;
   const results: string[] = [];
   const recoveryModes: string[] = [];
@@ -801,7 +825,7 @@ test("visible DAG refuses to retry terminally decomposed work", async () => {
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi);
+  const delegator = witnessedDagDelegator(state.pi);
   const run = await delegator.start({
     items: [{ id: "issue-7", issue: 7, title: "Seven", summary: "Seven", priority: 1, dependencies: [], claims: [], labels: ["workflow:decomposed"], affectedFiles: [], memberIssues: [7] }],
     maxParallel: 1,
@@ -830,7 +854,7 @@ test("visible DAG recovery applies an explicitly authorized fresh rerun to the f
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi);
+  const delegator = witnessedDagDelegator(state.pi);
   const recoveryModes: string[] = [];
   let assertions = 0;
   const first = await delegator.start({
@@ -874,7 +898,7 @@ test("visible DAG resume carries typed verification adjudication without fresh r
       }));
     }
   }) as typeof state.pi.events.emit;
-  const delegator = new VisibleDagDelegator(state.pi);
+  const delegator = witnessedDagDelegator(state.pi);
   let assertions = 0;
   const first = await delegator.start({
     items: [{ id: "issue-73", issue: 73, title: "Seventy-three", summary: "Seventy-three", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [73] }],

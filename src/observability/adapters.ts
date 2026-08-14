@@ -53,12 +53,18 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       void observer.emit({ ...base, channel: "artifact", kind: "artifact.submitted", payload: { ...observabilityPayload(event) } });
       return;
     }
+    const terminal = event.type === "session.completed"
+      ? { kind: "agent.session.completed", severity: "info" as const, payload: observabilityPayload(event) }
+      : event.type === "session.failed"
+        ? { kind: "agent.session.failed", severity: "error" as const, payload: { summary: event.errorSummary, ...observabilityPayload(event) } }
+        : { kind: "agent.session.cancelled", severity: "warning" as const, payload: { summary: event.errorSummary, ...observabilityPayload(event) } };
     void observer.emit({
       ...base,
       identity: { ...identity, piSessionRef: event.sessionRef },
       channel: "lifecycle",
-      kind: "agent.session.completed",
-      payload: { ...observabilityPayload(event) },
+      kind: terminal.kind,
+      severity: terminal.severity,
+      payload: terminal.payload,
     });
   };
 }

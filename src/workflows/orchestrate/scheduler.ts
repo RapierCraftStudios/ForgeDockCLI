@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LeaseContinuityError } from "../../core/ports/lease.js";
-import type { OrchestrationWaitReason } from "../../core/ports/orchestration.js";
+import type { OrchestrationPlanMetadata, OrchestrationWaitReason } from "../../core/ports/orchestration.js";
 
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 export { LeaseContinuityError };
@@ -23,6 +23,8 @@ export interface ScheduledWorkItem {
   memberIssues?: readonly number[];
   title?: string;
   summary?: string;
+  /** Caller-frozen evidence retained without influencing scheduler policy. */
+  plan?: OrchestrationPlanMetadata;
 }
 
 export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid";
@@ -204,16 +206,26 @@ export async function runSchedule(
       // Only explicit semantic dependencies block their successors on
       // failure. Claim-serialization predecessors merely hold the resource
       // until they reach a terminal state, including failed/blocked/invalid.
+      const blockingDependency = item.dependencies.find((id) => {
+        const dependencyStatus = status.get(id);
+        return dependencyStatus === "failed"
+          || dependencyStatus === "blocked"
+          || dependencyStatus === "skipped"
+          || dependencyStatus === "invalid";
+      });
+      if (blockingDependency) {
+        const dependencyStatus = status.get(blockingDependency);
+        status.set(item.id, "blocked");
+        errors.set(item.id, new Error(`Blocked by dependency ${blockingDependency} (${dependencyStatus ?? "unknown"})`));
+        waitReasons.delete(item.id);
+        queuedCount--;
+        emit("blocked", item.id);
+        continue;
+      }
       const dependency = item.dependencies.find((id) => status.get(id) !== "completed");
       if (dependency) {
         const dependencyStatus = status.get(dependency);
-        if (["failed", "blocked", "skipped", "invalid"].includes(dependencyStatus ?? "")) {
-          status.set(item.id, "blocked");
-          errors.set(item.id, new Error(`Blocked by dependency ${dependency} (${dependencyStatus ?? "unknown"})`));
-          waitReasons.delete(item.id);
-          queuedCount--;
-          emit("blocked", item.id);
-        } else if (dependencyStatus === "suspended") {
+        if (dependencyStatus === "suspended") {
           waitReasons.set(item.id, { kind: "suspended-predecessor", predecessor: dependency, checkpoint: "durable-recovery" });
         } else {
           waitReasons.set(item.id, { kind: "dependency", predecessor: dependency });
@@ -258,10 +270,12 @@ export async function runSchedule(
       const context: ScheduleWorkerContext = {
         promoteClaims: (claims) => {
           const merged = [...new Set([...(currentClaims.get(item.id) ?? []), ...claims.map((claim) => claim.trim()).filter(Boolean)])];
-          const conflicts = activeItems
-            .filter((active) => active.id !== item.id)
-            .filter((active) => claimsConflict(merged, currentClaims.get(active.id) ?? []))
-            .map((active) => active.id);
+          // Re-read the live set here. A worker can discover Build Packet
+          // paths after later workers have started, so the dispatch-time
+          // `activeItems` snapshot is insufficient for promotion safety.
+          const conflicts = [...running.keys()]
+            .filter((activeId) => activeId !== item.id)
+            .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
           if (conflicts.length) throw new ClaimPromotionConflictError(item.id, conflicts);
           currentClaims.set(item.id, merged);
           options.onClaimsPromoted?.(item.id, merged);

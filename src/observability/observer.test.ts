@@ -107,6 +107,26 @@ test("agent adapter preserves user-visible events but discards private thinking 
   observer.close();
 });
 
+test("agent adapter preserves failed and cancelled terminal semantics", async () => {
+  const observer = observerWithStore();
+  const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-terminal" }, producer });
+  sink({ type: "session.failed", taskId: "agent-failed", sessionRef: "pi-failed", errorSummary: "provider unavailable" });
+  sink({ type: "session.cancelled", taskId: "agent-cancelled", sessionRef: "pi-cancelled", errorSummary: "operator cancelled" });
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-terminal" });
+  assert.deepEqual(events.map((event) => ({
+    kind: event.kind,
+    severity: event.severity,
+    summary: (event.payload as { summary?: string }).summary,
+    session: event.identity.piSessionRef,
+  })), [
+    { kind: "agent.session.failed", severity: "error", summary: "provider unavailable", session: "pi-failed" },
+    { kind: "agent.session.cancelled", severity: "warning", summary: "operator cancelled", session: "pi-cancelled" },
+  ]);
+  observer.close();
+});
+
 test("workspace layouts survive observer restart in the operational journal", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-layout-test-"));
   const path = join(root, "observations.db");

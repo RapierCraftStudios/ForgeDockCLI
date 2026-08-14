@@ -7,7 +7,7 @@ import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFromArtifacts } from "./trajectory.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 
 /**
@@ -62,6 +62,8 @@ export async function completeInvalidWorkItem(
           verifiedAt: new Date().toISOString(),
         },
       },
+    }, {
+      id: deterministicOutcomeId(input.run.runId, input.run.subject, "invalid:closure-completed"),
     });
     await dependencies.artifacts.append(finalized);
     return { run: input.run, outcome: finalized };
@@ -117,28 +119,50 @@ export async function completeWorkItem(
     if (!issue) throw new Error("work-on completion requires an issue subject");
     const childIssues = [...new Set(input.childIssues ?? [])]
       .filter((child) => Number.isSafeInteger(child) && child > 0 && child !== issue);
-    const outcome = createArtifact({
-      kind: "Outcome",
-      runId: run.runId,
-      subject: run.subject,
-      producer: { role: "controller", runtime: "forgedock" },
-      payload: {
-        status: "merged",
-        reason: `Merged PR #${pullRequest.number} after independent review of ${pullRequest.headSha}.`,
-        ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
-        ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
-        ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
-        finalSha: pullRequest.headSha,
-        prUrl: pullRequest.url,
-        childIssues: childIssues.map((child) => `issue-${child}`),
-      },
-    });
+    const terminalOutcomeId = deterministicOutcomeId(
+      run.runId,
+      run.subject,
+      `merged:pr:${pullRequest.number}:sha:${pullRequest.headSha}`,
+    );
+    const durableTerminal = (await dependencies.artifacts.list(run.subject, "Outcome"))
+      .find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.id === terminalOutcomeId);
+    if (durableTerminal) {
+      assertMatchingMergedOutcome(durableTerminal, run, pullRequest, childIssues);
+      const completedChildren = new Set(durableTerminal.payload.childIssues.map(parseChildIssueReference));
+      for (const childIssue of childIssues) {
+        const observed = await readIssue(dependencies.host, run.subject.repo, childIssue);
+        if (completedChildren.has(childIssue) && observed.state !== "CLOSED") {
+          throw new Error(`Durable batch Outcome ${durableTerminal.id} names reopened issue #${childIssue}; refusing to re-close it automatically`);
+        }
+      }
+      await assertClosedIssue(dependencies.host, run.subject.repo, issue);
+      run = attachArtifact(run, "Outcome", durableTerminal.id);
+      const closed = transition(run, "CLOSE_COMPLETED");
+      await dependencies.runs.commit(run.version, closed.state, closed.record);
+      return { run: closed.state, awaitingHuman: false, outcome: durableTerminal };
+    }
     const childOutcomes: Array<{ issue: number; artifact: DurableArtifact<"Outcome"> }> = [];
+    const preservedChildren: Array<{ issue: number; labels: string[] }> = [];
     for (const childIssue of childIssues) {
+      const observed = await readIssue(dependencies.host, run.subject.repo, childIssue);
+      const protectedLabels = protectedClosureLabels(observed.labels ?? []);
+      if (protectedLabels.length) {
+        preservedChildren.push({ issue: childIssue, labels: protectedLabels });
+        continue;
+      }
+      if (observed.state === "OPEN") {
+        await dependencies.host.closeIssue(
+          run.subject.repo,
+          childIssue,
+          `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`,
+        );
+        await assertClosedIssue(dependencies.host, run.subject.repo, childIssue);
+      }
+      const childSubject = { repo: run.subject.repo, issue: childIssue };
       const childOutcome = createArtifact({
         kind: "Outcome",
         runId: run.runId,
-        subject: { repo: run.subject.repo, issue: childIssue },
+        subject: childSubject,
         producer: { role: "controller", runtime: "forgedock" },
         payload: {
           status: "merged",
@@ -151,9 +175,43 @@ export async function completeWorkItem(
           childIssues: [],
           batchParent: issue,
         },
+      }, {
+        id: deterministicOutcomeId(
+          run.runId,
+          childSubject,
+          `merged:batch:${issue}:pr:${pullRequest.number}:sha:${pullRequest.headSha}`,
+        ),
       });
       childOutcomes.push({ issue: childIssue, artifact: childOutcome });
     }
+
+    await dependencies.host.closeIssue(
+      run.subject.repo,
+      issue,
+      `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`,
+    );
+    await assertClosedIssue(dependencies.host, run.subject.repo, issue);
+
+    const completedChildIssues = childOutcomes.map(({ issue: childIssue }) => childIssue);
+    const preservedReason = preservedChildren.length
+      ? ` Batch members ${preservedChildren.map((child) => `#${child.issue} (${child.labels.join(", ")})`).join(", ")} remain open for human or operator action.`
+      : "";
+    const outcome = createArtifact({
+      kind: "Outcome",
+      runId: run.runId,
+      subject: run.subject,
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        status: "merged",
+        reason: `Merged PR #${pullRequest.number} after independent review of ${pullRequest.headSha}.${preservedReason}`,
+        ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+        ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+        ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+        finalSha: pullRequest.headSha,
+        prUrl: pullRequest.url,
+        childIssues: completedChildIssues.map((child) => `issue-${child}`),
+      },
+    }, { id: terminalOutcomeId });
 
     const parentArtifacts = await dependencies.artifacts.list({ repo: run.subject.repo, issue });
     const contracts = new Map((input.memberContracts ?? []).map((contract) => [contract.issue, contract]));
@@ -185,7 +243,7 @@ export async function completeWorkItem(
       artifacts: trajectoryArtifacts,
       pullRequest: { url: pullRequest.url, number: pullRequest.number, finalSha: pullRequest.headSha, targetBranch: pullRequest.baseBranch },
       disposition: childIssues.length ? "recursive-remediation" : "direct-merge",
-      childIssues,
+      childIssues: completedChildIssues,
       childOutcomeIds: childOutcomes.map(({ artifact }) => artifact.id),
       ...(telemetry !== undefined ? { telemetry } : {}),
       controllerTiming,
@@ -196,20 +254,6 @@ export async function completeWorkItem(
       marker: trajectoryCommentMarker(parentReceipt),
       body: renderTrajectoryComment(parentReceipt),
     });
-    for (const childIssue of childIssues) {
-      await dependencies.host.closeIssue(
-        run.subject.repo,
-        childIssue,
-        `Completed by batch issue #${issue} via ${pullRequest.url} at ${pullRequest.headSha}.`,
-      );
-      await assertClosedIssue(dependencies.host, run.subject.repo, childIssue);
-    }
-    await dependencies.host.closeIssue(
-      run.subject.repo,
-      issue,
-      `Completed by ${pullRequest.url} at ${pullRequest.headSha}.`,
-    );
-    await assertClosedIssue(dependencies.host, run.subject.repo, issue);
     // A merged Outcome is the durable terminal projection. Publish it only
     // after every idempotent trajectory and closure side effect succeeds, so
     // an interruption remains recoverable from the approving verdict.
@@ -297,6 +341,21 @@ async function blockMergeAdmission(
         })),
       },
     },
+  }, {
+    id: deterministicOutcomeId(
+      run.runId,
+      run.subject,
+      [
+        "blocked:merge-admission",
+        gate.pullRequest,
+        gate.headSha,
+        gate.baseBranch,
+        gate.mergeable,
+        ...gate.requiredChecks
+          .map((check) => `${check.name}:${check.state}`)
+          .sort(),
+      ].join(":"),
+    ),
   });
   await dependencies.artifacts.append(outcome);
   const blocked = transition(run, "BLOCK", { reason });
@@ -305,14 +364,62 @@ async function blockMergeAdmission(
 }
 
 async function assertClosedIssue(host: ForgeHost, expectedRepo: string, expectedNumber: number): Promise<void> {
+  const issue = await readIssue(host, expectedRepo, expectedNumber);
+  if (issue.state !== "CLOSED") {
+    throw new Error(`Issue #${expectedNumber} close command completed but authoritative host state is ${issue.state}`);
+  }
+}
+
+function assertMatchingMergedOutcome(
+  outcome: DurableArtifact<"Outcome">,
+  run: RunState,
+  pullRequest: PullRequestSnapshot,
+  childIssues: readonly number[],
+): void {
+  if (outcome.runId !== run.runId
+    || outcome.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || outcome.subject.issue !== run.subject.issue
+    || outcome.subject.pr !== run.subject.pr
+    || outcome.payload.status !== "merged") {
+    throw new Error(`Durable terminal artifact ${outcome.id} is not a merged Outcome for run ${run.runId}`);
+  }
+  if (outcome.payload.finalSha?.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || outcome.payload.prUrl !== pullRequest.url) {
+    throw new Error(`Durable terminal Outcome ${outcome.id} does not match PR #${pullRequest.number} at ${pullRequest.headSha}`);
+  }
+  const expectedChildren = new Set(childIssues);
+  for (const reference of outcome.payload.childIssues) {
+    const childIssue = parseChildIssueReference(reference);
+    if (!expectedChildren.has(childIssue)) {
+      throw new Error(`Durable terminal Outcome ${outcome.id} names unexpected batch member ${reference}`);
+    }
+  }
+}
+
+function parseChildIssueReference(reference: string): number {
+  const match = /^issue-(\d+)$/.exec(reference);
+  const issue = Number(match?.[1]);
+  if (!Number.isSafeInteger(issue) || issue < 1) {
+    throw new Error(`Invalid batch member reference '${reference}' in durable terminal Outcome`);
+  }
+  return issue;
+}
+
+const CLOSURE_PROTECTED_LABELS = new Set(["blocked", "needs-human", "operator-only"]);
+
+function protectedClosureLabels(labels: readonly string[]): string[] {
+  return labels
+    .map((label) => label.trim().toLowerCase())
+    .filter((label) => CLOSURE_PROTECTED_LABELS.has(label));
+}
+
+async function readIssue(host: ForgeHost, expectedRepo: string, expectedNumber: number) {
   if (!host.getIssue) throw new Error("Issue closure confirmation requires authoritative getIssue support");
   const issue = await host.getIssue(expectedNumber, expectedRepo);
   if (issue.repo.toLowerCase() !== expectedRepo.toLowerCase() || issue.number !== expectedNumber) {
     throw new Error(`Issue closure proof identified ${issue.repo}#${issue.number}, expected ${expectedRepo}#${expectedNumber}`);
   }
-  if (issue.state !== "CLOSED") {
-    throw new Error(`Issue #${expectedNumber} close command completed but authoritative host state is ${issue.state}`);
-  }
+  return issue;
 }
 
 async function publishTrajectory(

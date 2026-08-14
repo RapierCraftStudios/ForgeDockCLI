@@ -3,8 +3,14 @@ import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { DecompositionChild, IssueSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
+import { createRun, transition, type RunState } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { investigateWorkItem, latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
+import {
+  investigateWorkItem,
+  latestPriorLearningArtifacts,
+  resumeInvestigationWorkItem,
+  WorkflowExecutionError,
+} from "./investigate.js";
 
 function intent(runId = "run_investigate") {
   return createArtifact({
@@ -52,6 +58,22 @@ function dependencies(runtime: FakeAgentRuntime) {
       },
     },
   };
+}
+
+async function investigatingRun(
+  intentArtifact: ReturnType<typeof intent>,
+  runs: InMemoryRunRepository,
+): Promise<RunState> {
+  const queued = createRun({
+    workflow: "work-on",
+    subject: intentArtifact.subject,
+    runId: intentArtifact.runId,
+    target: { lane: "fast", targetBranch: "main" },
+  });
+  await runs.create(queued);
+  const started = transition(queued, "START_INVESTIGATION");
+  await runs.commit(queued.version, started.state, started.record);
+  return started.state;
 }
 
 describe("work-on investigation", () => {
@@ -143,5 +165,83 @@ describe("work-on investigation", () => {
       investigateWorkItem({ intent: intent("run_provider_failure"), cwd: process.cwd() }, deps),
       (error: unknown) => error instanceof WorkflowExecutionError && error.run.failure === "provider unavailable",
     );
+  });
+
+  it("recovers an Intent-only crash by dispatching exactly one investigator", async () => {
+    const intentArtifact = intent("run_intent_recovery");
+    const runtime = new FakeAgentRuntime([confirmed()]);
+    const deps = dependencies(runtime);
+    await deps.artifacts.append(intentArtifact);
+    const run = await investigatingRun(intentArtifact, deps.runs);
+
+    const result = await resumeInvestigationWorkItem({
+      run,
+      intent: intentArtifact,
+      cwd: process.cwd(),
+    }, deps);
+
+    assert.equal(result.run.state, "preparing");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator"]);
+    assert.equal(deps.artifacts.artifacts.filter((artifact) => artifact.kind === "Intent").length, 1);
+  });
+
+  it("adopts a durable Investigation after fault injection without replaying any agent outcome", async () => {
+    for (const outcome of ["confirmed", "invalid", "decompose"] as const) {
+      const { rootCause: _rootCause, ...classified } = confirmed();
+      const payload: InvestigationPayload = outcome === "confirmed"
+        ? confirmed()
+        : {
+          ...classified,
+          outcome,
+          ...(outcome === "decompose" ? {
+            decomposition: [
+              { title: "Add locking", outcome: "Serialize updates", dependsOn: [] },
+              { title: "Add regression coverage", outcome: "Prove safety", dependsOn: ["Add locking"] },
+            ],
+          } : {}),
+        };
+      const intentArtifact = intent(`run_fault_${outcome}`);
+      const runtime = new FakeAgentRuntime([payload]);
+      const deps = dependencies(runtime);
+      const artifacts = deps.artifacts;
+      let injected = false;
+      const originalAppend = artifacts.append.bind(artifacts);
+      artifacts.append = async (artifact) => {
+        await originalAppend(artifact);
+        if (!injected && artifact.kind === "Investigation") {
+          injected = true;
+          throw new Error("fault after durable Investigation append");
+        }
+      };
+
+      await assert.rejects(
+        investigateWorkItem({ intent: intentArtifact, cwd: process.cwd() }, deps),
+        /fault after durable Investigation append/,
+      );
+      const durableInvestigation = artifacts.artifacts.find(
+        (artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation",
+      );
+      assert.ok(durableInvestigation);
+
+      const recover = async () => {
+        const recoveredRuns = new InMemoryRunRepository();
+        const recoveredRun = await investigatingRun(intentArtifact, recoveredRuns);
+        return resumeInvestigationWorkItem({
+          run: recoveredRun,
+          intent: intentArtifact,
+          investigation: durableInvestigation,
+          cwd: process.cwd(),
+        }, { ...deps, runs: recoveredRuns });
+      };
+      const recovered = await recover();
+      assert.equal(recovered.run.state, outcome === "confirmed" ? "preparing" : outcome === "invalid" ? "invalid" : "decomposed");
+      assert.equal(runtime.tasks.length, 1, `${outcome} recovery must not replay the investigator`);
+
+      if (outcome !== "confirmed") {
+        const retried = await recover();
+        assert.equal(retried.outcome?.id, recovered.outcome?.id);
+        assert.equal(artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome").length, 1);
+      }
+    }
   });
 });
