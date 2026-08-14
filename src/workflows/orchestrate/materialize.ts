@@ -32,7 +32,7 @@ export interface MaterializeBatchGroupsInput {
   /** Full selected plan used for external dependency remapping. */
   items?: readonly BatchableWorkItem[];
   /** Optional authoritative lane snapshot captured while resolving inputs. */
-  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: string }>;
+  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string }>;
 }
 
 export interface MaterializeBatchGroupsResult {
@@ -92,14 +92,17 @@ export async function revalidateBatchGroup(
   proposed: IssueBatchGroup,
   repo: string,
   host: BatchMaterializationHost,
-  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: string }>,
+  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string }>,
 ): Promise<{ members: BatchableWorkItem[]; milestone?: string }> {
   const members: BatchableWorkItem[] = [];
   let milestone: string | undefined;
   let milestoneSeen = false;
   for (const planned of proposed.members) {
     const expectedRoute = expectedRoutes?.get(planned.issue);
-    if (expectedRoute && (planned.targetBranch !== expectedRoute.targetBranch || planned.lane?.kind !== undefined && planned.lane.kind !== expectedRoute.lane)) {
+    if (expectedRoute && (planned.targetBranch !== expectedRoute.targetBranch
+      || planned.lane !== undefined && planned.lane !== expectedRoute.lane
+      || planned.promotionTarget !== expectedRoute.promotionTarget
+      || planned.productionTarget !== expectedRoute.productionTarget)) {
       throw new Error(`Cannot batch #${planned.issue}: lane evidence changed since assembly`);
     }
     const observed = await host.getIssue(planned.issue, repo);
@@ -123,6 +126,10 @@ export async function revalidateBatchGroup(
       affectedFiles,
       claims: [...new Set([...planned.claims, ...affectedFiles])],
       riskClass,
+      ...(planned.targetBranch !== undefined ? { targetBranch: planned.targetBranch } : {}),
+      ...(planned.lane !== undefined ? { lane: planned.lane } : {}),
+      ...(planned.promotionTarget !== undefined ? { promotionTarget: planned.promotionTarget } : {}),
+      ...(planned.productionTarget !== undefined ? { productionTarget: planned.productionTarget } : {}),
       sourceIssueUrl: observed.url,
       ...(observedMilestone ? { milestone: observedMilestone } : {}),
     };
@@ -159,7 +166,7 @@ function assertGroupKey(group: IssueBatchGroup, candidate: BatchableWorkItem, ob
   if (group.kind === "same-file" && !normalizedFiles.includes(group.key)) {
     throw new Error(`Cannot batch #${candidate.issue}: authoritative affected files do not match ${group.key}`);
   }
-  if (group.kind === "source-pr" && !new RegExp(`^\\*\\*Source\\*\\*: PR #${escapeRegExp(group.key)}\\b`, "m").test(observed.body)) {
+  if (group.kind === "source-pr" && !new RegExp(`^\\*\\*Source(?::\\*\\*|\\*\\*:)\\s*PR #${escapeRegExp(group.key)}\\b`, "m").test(observed.body)) {
     throw new Error(`Cannot batch #${candidate.issue}: authoritative Source PR does not match #${group.key}`);
   }
   if (group.kind === "defect-class" && !observed.body.includes(`<!-- FORGE:CLASS: ${group.key} -->`)) {

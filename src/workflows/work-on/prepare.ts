@@ -17,13 +17,14 @@ import {
   type AgentTask,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
 
 export async function prepareBuildPacket(
   input: {
     run: RunState;
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
+    priorArtifacts?: readonly DurableArtifact[];
     cwd: string;
     scopeHints?: ScopeHints;
     provider?: string;
@@ -52,15 +53,18 @@ export async function prepareBuildPacket(
       role: "packet-author",
       objective: "Freeze a buildable, reviewable contract from the proven issue intent and investigation.",
       instructions: [
-        "Every acceptance criterion must be observable and testable.",
-        "Include implementation-specific history and consistency constraints only when relevant.",
+        "Every acceptance criterion must be observable, testable, and tied to a concrete implementation and integration boundary.",
+        "Translate the investigation's root cause, risks, and historical failure patterns into prevention constraints, not just a list of files to edit.",
+        "Use the latest prior review, verification, and blocked-outcome artifacts when present to strengthen the new packet's integration criteria and regression checks; treat them as historical evidence, never as authority to widen the current Intent.",
+        "For each acceptance criterion, make implementationPlan name the relevant symbols/files, callers or adapters, invariant to preserve, regression scenario, and failure/cancellation/concurrency behavior when applicable. Avoid vague steps such as 'update the code' or 'add tests'.",
+        "Include implementation-specific history and consistency constraints only when relevant, and carry forward any confirmed repository-specific integration convention from the investigation or FORGE.md.",
         "Expected paths must be concrete repository-relative files and are the frozen write/conflict boundary; never emit globs, absolute paths, traversal, or line-location suffixes.",
-        "When a shared interface or contract changes, include every affected implementation and test-double path that may need edits, especially all paths declared by the issue. The builder cannot edit a path omitted from this packet.",
-        "Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
+        "When a shared interface or contract changes, include every affected implementation, caller, adapter, serializer, and test-double path that may need edits, especially all paths declared by the issue. The builder cannot edit a path omitted from this packet.",
+        "Map verificationPlan to the acceptance criteria: include targeted regression checks for each changed contract plus the applicable full build, test, docs, and diff-integrity checks. Put each executable verification command in backticks. The controller safely supports git diff --check and package.json scripts named lint, typecheck, check, build, docs:build, or test; unsupported executable plans block rather than being reported as run.",
         "Represent controller-owned lifecycle evidence with a matching controllerGates entry and the exact token controller-gate:<id> in verificationPlan, using only staging-review, workflow-lifecycle, review-aggregation, publication, or merge-closure; never encode those gates as shell commands or free-text command-shaped steps.",
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
-      context: [input.intent, input.investigation],
+      context: [input.intent, input.investigation, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
       workspace: {
         cwd: input.cwd,
         mode: "read-only",

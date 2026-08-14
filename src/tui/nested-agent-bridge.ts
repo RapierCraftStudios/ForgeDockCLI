@@ -20,7 +20,10 @@ const SUBAGENT_RPC_LATE_REPLY_CLEANUP_MS = 30_000;
 
 interface NestedAgentRequest {
   ownerRunId: string;
+  /** Unique wire identity for this delegation attempt. */
   id: string;
+  /** Stable controller-owned identity shared by bounded retries. */
+  logicalTaskId?: string;
   role: AgentRole;
   description?: string;
   objective: string;
@@ -340,12 +343,13 @@ function asRecord(value: unknown): Record<string, any> | undefined {
 
 function buildTask(input: NestedAgentRequest): string {
   const context = input.context.map((artifact) => ({ kind: artifact.kind, id: artifact.id, payload: artifact.payload }));
+  const logicalTaskId = input.logicalTaskId ?? input.id;
   const reviewSpecialty = input.role === "reviewer"
-    ? /:review:[^:\r\n]+:(?:cycle-\d+-of-\d+:)?([^:\r\n]+)/.exec(input.id)?.[1]
+    ? /:review:[^:\r\n]+:(?:cycle-\d+-of-\d+:)?([^:\r\n]+)/.exec(logicalTaskId)?.[1]
     : undefined;
   return [
     input.description?.trim() || (reviewSpecialty ? `ForgeDock review · ${reviewSpecialty}` : `ForgeDock nested task · ${input.role}`),
-    `ForgeDock nested task id: ${input.id}`,
+    `ForgeDock nested task id: ${logicalTaskId}`,
     `Role: ${input.role}`,
     "",
     "# Objective",
@@ -373,6 +377,9 @@ function validateRequest(value: unknown): NestedAgentRequest {
     if (typeof input[key] !== "string" || !input[key]) throw new Error(`Nested request ${key} is required`);
   }
   if (input.role !== "reviewer") throw new Error(`Nested role is not authorized: ${input.role}`);
+  if (input.logicalTaskId !== undefined && (typeof input.logicalTaskId !== "string" || !input.logicalTaskId.trim() || input.logicalTaskId.length > 256 || /[\r\n]/.test(input.logicalTaskId))) {
+    throw new Error("Nested request logicalTaskId is invalid");
+  }
   if (!Array.isArray(input.context) || !Array.isArray(input.tools)) throw new Error("Nested request context and tools must be arrays");
   if (!input.outputSchema || typeof input.outputSchema !== "object" || Array.isArray(input.outputSchema)) throw new Error("Nested request outputSchema is required");
   if (input.description !== undefined && (typeof input.description !== "string" || !input.description.trim() || input.description.length > 2048 || /[\r\n]/.test(input.description))) {

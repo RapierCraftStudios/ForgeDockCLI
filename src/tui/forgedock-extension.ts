@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { PiAsyncObservationAdapter, type PiAsyncStatusSnapshot } from "../observability/adapters.js";
 import { ForgeDockObservationControlGateway } from "../observability/control-gateway.js";
 import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
@@ -18,6 +19,7 @@ import {
   activateOnly,
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
+  hasOrchestrationPreview,
   clearOrchestrationInvocation,
   controlSubagentRun,
   deactivateWorkflowTools,
@@ -26,10 +28,12 @@ import {
   type WorkflowCommand,
   workflowCommandDisplay,
 } from "./forgedock-tools.js";
+import { formatOrchestrationInvocationLabel } from "./orchestration-board.js";
 
 export const FORGEDOCK_READY_STATUS = "◆ ForgeDock ready · /work-on · /review-pr · /orchestrate";
+export const FORGEDOCK_NATIVE_WORKFLOW_MESSAGE = "forgedock_native_workflow";
 
-const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
+const WORKFLOWS = ["work-on", "review-pr", "orchestrate", "promote"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 
 export default function forgedockExtension(pi: ExtensionAPI): void {
@@ -82,6 +86,12 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     if (status) asyncObservation.completed(status);
   });
 
+  pi.registerMessageRenderer(FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, (message, _options, theme) => {
+    const details = message.details as { invocationLabel?: unknown } | undefined;
+    const label = typeof details?.invocationLabel === "string" ? details.invocationLabel : "/orchestrate";
+    return new Text(theme.fg("toolTitle", theme.bold(label)), 1, 0);
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
       activateOnly(pi, [WORKFLOW_TOOLS["work-on"]]);
@@ -89,7 +99,7 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     }
     backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
-    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, ORCHESTRATION_RESUME_TOOL]);
+    activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL]);
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
     await ensureObserver(ctx.cwd);
     if (ctx.mode !== "tui") return;
@@ -146,6 +156,13 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => {
     clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
+    activateOnly(pi, [
+      CONFIG_TOOL,
+      MEMORY_TOOL,
+      MEMORY_SEARCH_TOOL,
+      BACKGROUND_TASK_TOOL,
+      ...(hasOrchestrationPreview(pi) ? [WORKFLOW_TOOLS.orchestrate, HUMAN_DECISION_TOOL] : []),
+    ]);
     if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
 
@@ -286,7 +303,7 @@ function normalizePiAsyncStatus(raw: unknown): PiAsyncStatusSnapshot | undefined
 }
 
 export function isLifecycleControllerShellCommand(command: string): boolean {
-  const lifecycle = "(?:work-on|review-pr|orchestrate|reset)";
+  const lifecycle = "(?:work-on|review-pr|orchestrate|promote|reset)";
   const directEntry = new RegExp(`(?:dist[\\\\/]cli[\\\\/]main\\.js|bin[\\\\/]forgedock-next\\.mjs|forgedock-next(?:\\.cmd|\\.exe)?)[\"']?\\s+${lifecycle}\\b`, "i");
   const packageScript = new RegExp(`npm(?:\\.cmd)?\\s+(?:--silent\\s+)?run\\s+(?:--silent\\s+)?(?:next|forgedock-next)\\s+--\\s+${lifecycle}\\b`, "i");
   return directEntry.test(command) || packageScript.test(command);
@@ -325,21 +342,33 @@ async function queueNativeWorkflow(
   activateOnly(pi, command === "orchestrate" ? [tool, HUMAN_DECISION_TOOL] : [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs);
-  // Slash-command dispatch itself occupies Pi's prompt pipeline, so ctx.isIdle()
-  // can race with the transition into streaming. followUp is safe while idle
-  // and guarantees the native workflow prompt is queued when that race occurs.
+  // Slash-command dispatch itself occupies Pi's prompt pipeline, so deliverAs
+  // remains followUp while triggerTurn covers the idle case. The custom message
+  // keeps the complete prompt in model context while its renderer shows only a
+  // concise invocation label in the ordinary TUI.
+  if (command === "orchestrate") {
+    pi.sendMessage({
+      customType: FORGEDOCK_NATIVE_WORKFLOW_MESSAGE,
+      content: prompt,
+      display: true,
+      details: { command, invocationLabel: formatOrchestrationInvocationLabel(command, rawArgs) },
+    }, { triggerTurn: true, deliverAs: "followUp" });
+    return;
+  }
   pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 }
 
 function workflowDescription(workflow: Workflow): string {
   if (workflow === "work-on") return "Run the full typed ForgeDock issue pipeline";
   if (workflow === "review-pr") return "Run a fresh-context, SHA-anchored pull-request review";
+  if (workflow === "promote") return "Promote an explicit feature or integration branch through durable gates";
   return "Resolve and schedule issues through visible parallel subagents";
 }
 
 function workflowUsage(workflow: Workflow): string {
   if (workflow === "work-on") return "Usage: /work-on <issue or natural-language issue reference> [--no-auto-merge]";
   if (workflow === "review-pr") return "Usage: /review-pr <PR or natural-language PR reference>";
+  if (workflow === "promote") return "Usage: /promote --from <branch> [--to <target>] [--confirm] [--authorize-merge]";
   return "Usage: /orchestrate <issue set or natural-language scope> [--no-auto-merge] [policy options]";
 }
 
@@ -347,7 +376,9 @@ async function confirmWorkflow(workflow: Workflow, args: string, ctx: ExtensionC
   if (!ctx.hasUI) return true;
   const risk = workflow === "review-pr"
     ? "This may publish a SHA-anchored review and update durable GitHub state."
-    : workflow === "orchestrate"
+    : workflow === "promote"
+      ? "This may create a promotion PR or merge an explicitly reviewed SHA when separately authorized."
+      : workflow === "orchestrate"
       ? "This may launch parallel workers, create branches/PRs, publish artifacts, and merge when policy allows."
       : "This may create a branch/PR, publish artifacts, and merge when policy allows.";
   return ctx.ui.confirm(`Run ForgeDock ${workflow}?`, `Target: ${args}\n\n${risk}`);

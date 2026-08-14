@@ -122,6 +122,39 @@ test("the controller rejects a malformed nested structured result even after bri
   }
 });
 
+test("fresh nested reviewer attempts use unique wire nodes but retain the logical task identity", async () => {
+  const requests: Array<Record<string, any>> = [];
+  const endpoint = await listen((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    request.on("end", () => {
+      requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, any>);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ output: { summary: "complete" }, sessionRef: `nested-${requests.length}` }));
+    });
+  });
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  process.env.FORGEDOCK_NESTED_AGENT_URL = endpoint.url;
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = "test-token";
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  const task = taskForRole("reviewer", {}) as any;
+  task.id = "run-review:review:sha:correctness";
+  try {
+    await runtime.run(task);
+    await runtime.run(task);
+    assert.equal(requests.length, 2);
+    assert.notEqual(requests[0]?.id, requests[1]?.id);
+    assert.deepEqual(requests.map((request) => request.logicalTaskId), [task.id, task.id]);
+  } finally {
+    if (previousUrl === undefined) delete process.env.FORGEDOCK_NESTED_AGENT_URL;
+    else process.env.FORGEDOCK_NESTED_AGENT_URL = previousUrl;
+    if (previousToken === undefined) delete process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+    else process.env.FORGEDOCK_NESTED_AGENT_TOKEN = previousToken;
+    await endpoint.close();
+  }
+});
+
 test("verification agency requires a frozen controller-approved plan", async () => {
   const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
   await assert.rejects(runtime.run({

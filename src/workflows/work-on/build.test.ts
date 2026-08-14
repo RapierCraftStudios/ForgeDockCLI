@@ -46,6 +46,8 @@ describe("builder boundary", () => {
     assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "verify", "edit", "write"]);
     assert.equal(runtime.tasks[2]?.verification?.commands[0]?.id, "test");
     assert.match(runtime.tasks[2]?.instructions ?? "", /test=npm test/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /criterion-by-criterion implementation checklist/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /self-review the complete diff/);
     assert.ok(!runtime.tasks[2]?.tools.includes("bash"));
     assert.ok(runtime.tasks[2]?.workspace.scope.readRoots.includes("src"));
     assert.deepEqual(runtime.tasks[2]?.workspace.scope.writeRoots, []);

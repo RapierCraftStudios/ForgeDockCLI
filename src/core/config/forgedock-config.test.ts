@@ -99,7 +99,7 @@ describe("ForgeDock Next project configuration", () => {
       updateForgeDockConfig(cwd, {
         orchestration: {
           batching: { policy: "conservative", maxBatchSize: 6, maxSensitiveBatchSize: 2 },
-          scopeExpansion: "recursive", maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 2, fastLaneTarget: "staging",
+          scopeExpansion: "recursive", maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 2, fastLaneTarget: "staging", featurePromotionTarget: "staging", productionTarget: "main", dispatchMode: "preview",
         },
       });
       const raw = readFileSync(join(cwd, "forge.yaml"), "utf8");
@@ -111,7 +111,7 @@ describe("ForgeDock Next project configuration", () => {
       assert.equal(config.scopeExpansion, "recursive");
       assert.deepEqual(resolveOrchestrationConfig(config, { batchingPolicy: "none", maxParallel: 1 }), {
         batchingPolicy: "none", maxBatchSize: 6, maxSensitiveBatchSize: 2, scopeExpansion: "recursive",
-        maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 1, autoMerge: true, fastLaneTarget: "staging",
+        maxRemediationCycles: 3, maxRemediationDepth: 2, maxRemediationChildren: 5, maxParallel: 1, autoMerge: true, fastLaneTarget: "staging", featurePromotionTarget: "staging", productionTarget: "main", dispatchMode: "preview",
       });
     } finally {
       rmSync(cwd, { recursive: true, force: true });

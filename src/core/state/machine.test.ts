@@ -32,6 +32,8 @@ describe("workflow state machine", () => {
     const started = transition(run, "START_INVESTIGATION").state;
     assert.equal(started.lane, "feature");
     assert.equal(started.targetBranch, target.targetBranch);
+    assert.equal(started.promotionTarget, undefined);
+    assert.equal(started.productionTarget, undefined);
     assert.deepEqual(started.milestone, target.milestone);
   });
 
@@ -39,6 +41,16 @@ describe("workflow state machine", () => {
     const started = transition(createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 1 } }), "START_INVESTIGATION").state;
     assert.equal(transition(started, "INVESTIGATION_INVALID").state.state, "invalid");
     assert.equal(transition(started, "INVESTIGATION_DECOMPOSED").state.state, "decomposed");
+  });
+
+  it("persists promotion and protected production targets in RunState", () => {
+    const run = createRun({
+      workflow: "work-on",
+      subject: { repo: "a/b", issue: 12 },
+      target: { lane: "feature", targetBranch: "milestone/ship", promotionTarget: "staging", productionTarget: "main", milestone: { number: 2, title: "Ship" } },
+    });
+    assert.equal(run.promotionTarget, "staging");
+    assert.equal(run.productionTarget, "main");
   });
 
   it("records a new attempt when resuming an interrupted build", () => {

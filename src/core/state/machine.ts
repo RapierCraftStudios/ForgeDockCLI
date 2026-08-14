@@ -54,6 +54,10 @@ export type TransitionEvent =
 export interface RunTarget {
   lane: "fast" | "feature";
   targetBranch: string;
+  /** Integration target for a feature-lane delivery; never an implicit merge target. */
+  promotionTarget?: string;
+  /** Protected production target; reached only through a separate promotion workflow. */
+  productionTarget?: string;
   milestone?: { number: number; title: string };
 }
 
@@ -72,6 +76,8 @@ export interface RunState {
   state: RunStateName;
   lane?: RunTarget["lane"];
   targetBranch?: string;
+  promotionTarget?: RunTarget["promotionTarget"];
+  productionTarget?: RunTarget["productionTarget"];
   milestone?: RunTarget["milestone"];
   scopeManifest?: PersistedScopeManifest;
   attempt: number;
@@ -155,6 +161,8 @@ export function createRun(input: {
 }): RunState {
   const now = input.now ?? new Date().toISOString();
   if (input.target && !input.target.targetBranch.trim()) throw new Error("Run target branch is required");
+  if (input.target?.promotionTarget !== undefined && !input.target.promotionTarget.trim()) throw new Error("Run promotion target must not be blank");
+  if (input.target?.productionTarget !== undefined && !input.target.productionTarget.trim()) throw new Error("Run production target must not be blank");
   if (input.target?.lane === "feature" && !input.target.milestone) throw new Error("Feature-lane runs require milestone identity");
   return {
     schema: "forgedock.run/v1",
@@ -165,6 +173,8 @@ export function createRun(input: {
     ...(input.target ? {
       lane: input.target.lane,
       targetBranch: input.target.targetBranch,
+      ...(input.target.promotionTarget !== undefined ? { promotionTarget: input.target.promotionTarget } : {}),
+      ...(input.target.productionTarget !== undefined ? { productionTarget: input.target.productionTarget } : {}),
       ...(input.target.milestone ? { milestone: input.target.milestone } : {}),
     } : {}),
     ...(input.scopeManifest ? { scopeManifest: input.scopeManifest } : {}),

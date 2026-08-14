@@ -49,6 +49,9 @@ describe("Build Packet preparation", () => {
     assert.ok(prepared.run.scopeManifest?.readRoots.includes("src"));
     assert.ok(prepared.run.scopeManifest?.readRoots.includes("test"));
     assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /implementationPlan name the relevant symbols\/files/);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /Map verificationPlan to the acceptance criteria/);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /latest prior review, verification/);
     assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
     assert.deepEqual(runtime.tasks[1]?.modelPolicy, {
       planningProvider: "anthropic",

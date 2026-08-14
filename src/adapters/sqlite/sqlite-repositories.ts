@@ -8,6 +8,7 @@ import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject }
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
 import type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
+import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
@@ -15,7 +16,7 @@ import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
 
   constructor(path: string) {
@@ -94,6 +95,15 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         record_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS orchestrations_updated ON orchestrations(updated_at);
+      CREATE TABLE IF NOT EXISTS promotion_records (
+        promotion_id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS promotions_updated ON promotion_records(updated_at);
     `);
   }
 
@@ -165,6 +175,45 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   async listOrchestrations(limit = 50): Promise<OrchestrationRecord[]> {
     const rows = this.#database.prepare("SELECT record_json FROM orchestrations ORDER BY updated_at DESC LIMIT ?").all(limit);
     return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
+  }
+
+  async createPromotion(record: PromotionRecord): Promise<void> {
+    try {
+      await withSqliteBusyRetry(() => this.#database.prepare(`
+        INSERT INTO promotion_records (promotion_id, repository, phase, version, updated_at, record_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(record.promotionId, record.repository, record.phase, record.version, record.updatedAt, JSON.stringify(record)));
+    } catch (error) {
+      if (String(error).includes("UNIQUE constraint failed")) throw new Error(`Promotion already exists: ${record.promotionId}`);
+      throw error;
+    }
+  }
+
+  async loadPromotion(promotionId: string): Promise<PromotionRecord | undefined> {
+    const row = this.#database.prepare("SELECT record_json FROM promotion_records WHERE promotion_id = ?")
+      .get(promotionId) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as PromotionRecord : undefined;
+  }
+
+  async savePromotion(expectedVersion: number, record: PromotionRecord): Promise<void> {
+    if (record.version !== expectedVersion + 1) throw new Error("Promotion save must advance exactly one version");
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      const result = this.#database.prepare(`
+        UPDATE promotion_records SET phase = ?, version = ?, updated_at = ?, record_json = ?
+        WHERE promotion_id = ? AND version = ?
+      `).run(record.phase, record.version, record.updatedAt, JSON.stringify(record), record.promotionId, expectedVersion);
+      if (result.changes !== 1) {
+        const row = this.#database.prepare("SELECT version FROM promotion_records WHERE promotion_id = ?")
+          .get(record.promotionId) as { version: number } | undefined;
+        if (!row) throw new Error(`Unknown promotion: ${record.promotionId}`);
+        throw new ConcurrentPromotionUpdateError(record.promotionId, expectedVersion, row.version);
+      }
+    }));
+  }
+
+  async listPromotions(limit = 50): Promise<PromotionRecord[]> {
+    const rows = this.#database.prepare("SELECT record_json FROM promotion_records ORDER BY updated_at DESC LIMIT ?").all(limit);
+    return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as PromotionRecord);
   }
 
   async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {

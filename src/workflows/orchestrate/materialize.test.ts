@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
-import { materializeBatchGroups, type BatchMaterializationHost } from "./materialize.js";
+import { materializeBatchGroups, revalidateBatchGroup, type BatchMaterializationHost } from "./materialize.js";
 import { assembleWorkUnits } from "./assemble.js";
 import type { BatchableWorkItem } from "./batching.js";
 
@@ -71,6 +71,23 @@ describe("authoritative batch materialization", () => {
     );
     assert.equal(host.writes, 1);
     assert.deepEqual(host.closedIssues, [20]);
+  });
+
+  it("accepts the controller's Markdown Source field during source-PR revalidation", async () => {
+    const base = item(68);
+    const sourceBody = "**Source:** PR #57 — docs\n**Reviewers:** security\n\n## Affected Files\n- `src/api/a.ts`";
+    const members = [
+      { ...base, sourcePullRequest: 57, riskClass: "security" as const, labels: ["review-finding", "priority:P2"] },
+      { ...base, id: "issue-69", issue: 69, sourcePullRequest: 57, riskClass: "security" as const, labels: ["review-finding", "priority:P2"] },
+    ];
+    const group = { id: "batch:source-pr:57-68-69", kind: "source-pr" as const, key: "57", riskClass: "security" as const, members };
+    const result = await revalidateBatchGroup(group, "owner/repo", {
+      async getIssue(number) { return { repo: "owner/repo", number, title: `Issue ${number}`, body: sourceBody, url: `https://example.test/issues/${number}`, state: "OPEN" as const, labels: ["review-finding", "priority:P2"] }; },
+      async materializeBatchIssue() { throw new Error("not expected"); },
+      async closeIssue() { return; },
+    });
+    assert.equal(result.members.length, 2);
+    assert.equal(result.members[0]?.sourcePullRequest, 57);
   });
 
   it("removes HTML comment fragments from materialized batch titles", async () => {

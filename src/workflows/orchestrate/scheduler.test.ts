@@ -28,6 +28,22 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("d"), "completed");
   });
 
+  it("releases a claim successor after a failed predecessor without blocking it semantically", async () => {
+    const started: string[] = [];
+    const result = await runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: ["src/shared"] },
+    ], 1, async (item) => {
+      started.push(item.id);
+      if (item.id === "first") throw new Error("first failed");
+    }, {
+      serializationEdges: [{ predecessor: "first", successor: "second", overlappingClaims: ["src/shared"] }],
+    });
+    assert.deepEqual(started, ["first", "second"]);
+    assert.equal(result.status.get("first"), "failed");
+    assert.equal(result.status.get("second"), "completed");
+  });
+
   it("materializes claim conflicts as stable DAG edges instead of static batches", () => {
     const materialized = materializeClaimDependencies([
       { id: "a", issue: 1, priority: 2, dependencies: [], claims: ["src/core"] },
@@ -36,7 +52,7 @@ describe("lean orchestration scheduler", () => {
       { id: "d", issue: 4, priority: 1, dependencies: ["a"], claims: ["src/api"] },
     ]);
     assert.deepEqual(materialized.edges.map((edge) => [edge.predecessor, edge.successor]), [["a", "b"]]);
-    const preview = buildSchedulePreview(materialized.items);
+    const preview = buildSchedulePreview(materialized.items, materialized.edges);
     assert.deepEqual(preview.initialReady.map((item) => item.id), ["c", "a"]);
     assert.equal(preview.criticalPath.length, 2);
     assert.equal(preview.criticalPath[0]?.id, "a");

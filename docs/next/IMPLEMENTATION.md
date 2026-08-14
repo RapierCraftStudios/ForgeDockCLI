@@ -78,6 +78,9 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Verification-stage resume from retained workspaces without replaying investigation or build; exhausted baselines require a durable human adjudication before typed resume
 - [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
 - [x] Explicit staging-review source-branch evidence, immutable recovery base refs, and fail-closed cross-branch resume validation
+- [x] Repository-aware lane policy: configurable staging delivery, feature-lane promotion target, protected production target, preview-only orchestration by default, and confirmed canonical milestone-branch provisioning from the repository default
+- [x] Separate durable feature→integration and integration→production promotion controller with typed PR transport, verification/review gates, protected-target checks, exact-SHA merge authorization, resume, and status inspection
+- [x] Claim serialization remains separate from semantic dependencies and releases successors after any terminal predecessor
 - [x] Frozen verification-plan coverage: every controller-approved diff/package command executes and contributes evidence instead of stopping after the first failure or claiming unobserved success
 - [x] Typed controller-owned verification gates plus legacy manual-gate recognition prevent staging/lifecycle evidence from being parsed as unsupported shell commands
 - [x] Script-free isolated dependency preparation reapplies only the pinned pi-subagents visibility patch before verification
@@ -129,7 +132,8 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
 - [x] Durable same-checkout cross-process leases and heartbeats
 - [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
-- [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, and per-node errors for CLI/status restart inspection
+- [x] Native orchestration does not implicitly resume stale DAGs; durable DAG IDs are shown separately from background task IDs, and DAG output requests resolve through orchestration status
+- [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, route metadata, and per-node errors for CLI/status restart inspection
 - [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
 - [ ] Cross-machine/GitHub-backed lease coordination
 - [ ] Promote Build Packet paths into live scheduler claims

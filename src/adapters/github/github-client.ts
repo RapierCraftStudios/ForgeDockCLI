@@ -601,12 +601,29 @@ export class GitHubClient implements ForgeHost {
   async createPullRequest(input: {
     repo: string; issue: number; headBranch: string; baseBranch: string; title: string; body: string;
   }): Promise<PullRequestSnapshot> {
+    return this.createBranchPullRequest(input);
+  }
+
+  async createPromotionPullRequest(input: {
+    repo: string; headBranch: string; baseBranch: string; title: string; body: string;
+  }): Promise<PullRequestSnapshot> {
+    return this.createBranchPullRequest(input);
+  }
+
+  private async createBranchPullRequest(input: {
+    repo: string; headBranch: string; baseBranch: string; title: string; body: string;
+  }): Promise<PullRequestSnapshot> {
+    if (!input.headBranch || !input.baseBranch || input.headBranch === input.baseBranch) {
+      throw new Error("Promotion pull request requires distinct source and target branches");
+    }
     const url = (await this.gh([
       "pr", "create", "--repo", input.repo, "--head", input.headBranch, "--base", input.baseBranch,
       "--title", input.title, "--body-file", "-",
     ], input.body)).trim();
     if (!url) throw new Error("GitHub did not return a pull request URL");
-    return this.getPullRequest(input.repo, Number(url.split("/").at(-1)));
+    const number = Number(url.split("/").at(-1));
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error("GitHub returned an invalid pull request URL");
+    return this.getPullRequest(input.repo, number);
   }
 
   async getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot> {
@@ -629,6 +646,22 @@ export class GitHubClient implements ForgeHost {
     const value = JSON.parse(result) as { object?: { sha?: string } };
     if (!value.object?.sha) throw new Error(`GitHub did not return a head SHA for ${repo}:${branch}`);
     return value.object.sha;
+  }
+
+  async createBranch(repo: string, branch: string, fromBranch: string): Promise<BranchSnapshot> {
+    if (!branch || !fromBranch || branch === fromBranch || !/^\S+$/.test(branch) || !/^\S+$/.test(fromBranch)) {
+      throw new Error("GitHub branch creation requires distinct non-empty branch names");
+    }
+    const sha = await this.getBranchHead(repo, fromBranch);
+    try {
+      await this.gh(["api", `repos/${repo}/git/refs`, "--method", "POST", "--input", "-"], JSON.stringify({ ref: `refs/heads/${branch}`, sha }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/already exists|Reference already exists|422/i.test(message)) throw error;
+    }
+    const createdSha = await this.getBranchHead(repo, branch);
+    if (!createdSha) throw new Error(`GitHub did not return the created branch head for ${repo}:${branch}`);
+    return { name: branch, headSha: createdSha };
   }
 
   async listBranches(repo: string, prefix: string): Promise<BranchSnapshot[]> {
@@ -668,6 +701,32 @@ export class GitHubClient implements ForgeHost {
       "pr", "merge", String(number), "--repo", repo, "--merge", "--delete-branch",
       "--match-head-commit", expectedHeadSha,
     ]);
+  }
+
+  async findOpenPromotionPullRequest(repo: string, headBranch: string, baseBranch: string): Promise<PullRequestSnapshot | undefined> {
+    const result = await this.gh([
+      "pr", "list", "--repo", repo, "--state", "open", "--head", headBranch, "--base", baseBranch,
+      "--json", "number", "--limit", "10",
+    ]);
+    const values = JSON.parse(result) as Array<{ number?: number }>;
+    for (const value of values) {
+      if (value.number && Number.isSafeInteger(value.number)) {
+        const pullRequest = await this.getPullRequest(repo, value.number);
+        if (pullRequest.headBranch === headBranch && pullRequest.baseBranch === baseBranch) return pullRequest;
+      }
+    }
+    return undefined;
+  }
+
+  async isBranchProtected(repo: string, branch: string): Promise<boolean> {
+    try {
+      await this.gh(["api", `repos/${repo}/branches/${encodeURIComponent(branch)}/protection`]);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/\b404\b|not found/i.test(message)) return false;
+      throw new Error(`Unable to prove branch protection for ${repo}:${branch}`, { cause: error });
+    }
   }
 
   async closeIssue(repo: string, number: number, reason: string): Promise<void> {

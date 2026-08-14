@@ -131,6 +131,8 @@ export const CheckResultSchema = Type.Object({
 export const BuildResultPayloadSchema = Type.Object({
   branch: NonEmptyString,
   targetBranch: Type.Optional(NonEmptyString),
+  promotionTarget: Type.Optional(NonEmptyString),
+  productionTarget: Type.Optional(NonEmptyString),
   headSha: Sha,
   baseSha: Type.Optional(Sha),
   changedPaths: Type.Array(NonEmptyString),
@@ -296,6 +298,9 @@ export const OutcomePayloadSchema = Type.Object({
     Type.Literal("abandoned"),
   ]),
   reason: NonEmptyString,
+  targetBranch: Type.Optional(NonEmptyString),
+  promotionTarget: Type.Optional(NonEmptyString),
+  productionTarget: Type.Optional(NonEmptyString),
   /** Invalid outcomes are provisional until the controller proves issue closure. */
   issueClosure: Type.Optional(Type.Object({
     status: Type.Union([Type.Literal("pending"), Type.Literal("completed")]),
@@ -312,6 +317,8 @@ export const OutcomePayloadSchema = Type.Object({
     workspacePath: NonEmptyString,
     baseRef: Type.Optional(NonEmptyString),
     targetBranch: Type.Optional(NonEmptyString),
+    promotionTarget: Type.Optional(NonEmptyString),
+    productionTarget: Type.Optional(NonEmptyString),
     baseSha: Type.Optional(Sha),
     builderSummary: NonEmptyString,
     changedPaths: Type.Array(NonEmptyString),

@@ -49,11 +49,13 @@ export async function buildWorkItem(
         ? `Repair the in-packet implementation after controller verification failed: ${input.priorVerificationFailure.payload.reason}`
         : "Implement exactly the accepted Build Packet in the assigned worktree.",
       instructions: [
-        "Read the affected code before editing.",
+        "Read the Build Packet, investigation evidence, affected code, integration boundaries, and existing tests before editing.",
+        "Turn the Build Packet into a criterion-by-criterion implementation checklist before making changes. For every criterion, identify the invariant, all relevant callers/implementations/adapters, and the regression scenario that must remain true.",
         ...(input.priorVerificationFailure ? [
           "This is a bounded repair of the retained implementation. Use the controller-recorded failed checks as evidence and change only frozen Build Packet paths.",
         ] : []),
-        "Do not expand scope or perform unrelated cleanup.",
+        "Do not expand scope or perform unrelated cleanup. If the packet omits a required integration path, report the packet gap instead of silently widening the change.",
+        "Prefer the smallest complete integration change: preserve existing public shapes, serialization, error/cancellation, concurrency, and repository conventions unless the frozen criteria explicitly require changing them.",
         ...(input.verification?.length ? [
           `Typed verification feedback is available only for these frozen command IDs: ${input.verification.map((command) => `${command.id}=${command.command} ${command.args.join(" ")}`).join("; ")}.`,
         ] : []),
@@ -61,7 +63,8 @@ export async function buildWorkItem(
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
         "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion and use implementation only for the concrete evidence.",
-        "Before submitting, re-read changed files for malformed edits and whitespace damage.",
+        "Before submitting, self-review the complete diff against every criterion and integration boundary: check callers, implementations, adapters, serialization, error/cancellation/concurrency paths, tests, and docs/configuration that the packet identifies. Do not mark a criterion covered from intent alone; cite concrete code, test, or verification evidence.",
+        "Run the narrowest relevant frozen verification commands after editing, then re-read changed files for malformed edits, whitespace damage, and accidental mechanical churn.",
         "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",
       ].join("\n"),
       context: [

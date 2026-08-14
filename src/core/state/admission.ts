@@ -11,6 +11,13 @@ export type SubjectAdmissionDecision =
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
+export interface DurableLaneMismatch {
+  runId: string;
+  durableTargetBranch: string;
+  currentTargetBranch: string;
+  reason: string;
+}
+
 /**
  * Prevent repeated commands from creating a new semantic run over an issue that
  * already has a terminal or in-flight durable delivery run. The newest run
@@ -82,7 +89,11 @@ export function verificationRepairAttemptCount(artifacts: readonly DurableArtifa
 
 export function decideSubjectAdmission(
   artifacts: readonly DurableArtifact[],
-  options: { rerun?: boolean } = {},
+  options: {
+    rerun?: boolean;
+    currentTargetBranch?: string;
+    durableTargetBranches?: ReadonlyMap<string, string | undefined>;
+  } = {},
 ): SubjectAdmissionDecision {
   if (artifacts.length === 0) return { action: "start" };
 
@@ -90,6 +101,17 @@ export function decideSubjectAdmission(
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
+  const durableTargetBranch = options.durableTargetBranches?.get(latest.runId)
+    ?? latestArtifactOfKind(latest.artifacts, "BuildResult")?.payload.targetBranch
+    ?? latestArtifactOfKind(latest.artifacts, "Outcome")?.payload.failureEvidence?.targetBranch;
+  if (!options.rerun && options.currentTargetBranch && durableTargetBranch && durableTargetBranch !== options.currentTargetBranch) {
+    return {
+      action: "block",
+      runId: latest.runId,
+      state: reconciled.state,
+      reason: `Durable run ${latest.runId} targets ${durableTargetBranch}, but the current issue lane targets ${options.currentTargetBranch}; refusing cross-branch recovery. Use --rerun to start a fresh run on ${options.currentTargetBranch}.`,
+    };
+  }
   const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
   const invalidClosurePending = reconciled.state === "invalid"
     && latestOutcome?.payload.status === "invalid"

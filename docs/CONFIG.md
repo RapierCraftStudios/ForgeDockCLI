@@ -104,6 +104,10 @@ paths:
 
 **Commands that use this section**: `work-on` (Phase 3E), `quality-gate`, `deploy-info`
 
+ForgeDock Next mirrors this repository model in its managed `forge.yaml` block. Set `fast_lane_target` for ordinary delivery, `feature_promotion_target` for the integration branch receiving milestone work, and `production_target` for the protected promotion target. `dispatch_mode` controls orchestration admission: `preview` (default) renders the complete DAG without dispatch, `confirm` requires explicit plan confirmation, and `auto` permits configured dispatch. A confirmed orchestration automatically provisions a missing canonical `milestone/{slug}` branch from the repository default before dispatch; preview only reports the planned lane and performs no branch mutation. The controller never silently falls back to `staging` for a milestone issue.
+
+Promotion is a separate controller, never an implicit issue-delivery merge: `forgedock-next promote --from milestone/<slug> --to staging --confirm` creates and verifies a feature-lane promotion PR; `forgedock-next promote --production --confirm` proposes staging → the configured `production_target`. Merge authorization is separate (`--authorize-merge`, or `--resume <promotion-id> --authorize-merge`) and production promotion fails closed unless the target's branch protection is proven.
+
 ---
 
 ## `branches` (REQUIRED)

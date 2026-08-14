@@ -2,7 +2,7 @@
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { Lease } from "../../core/ports/lease.js";
-import type { ScheduledWorkItem, ScheduleResult, ScheduledStatus } from "./scheduler.js";
+import type { ClaimSerializationEdge, ScheduledWorkItem, ScheduleResult, ScheduledStatus } from "./scheduler.js";
 import type { OrchestrationNode, OrchestrationSnapshot } from "./events.js";
 
 export function buildOrchestrationSnapshot(input: {
@@ -11,6 +11,7 @@ export function buildOrchestrationSnapshot(input: {
   result?: Pick<ScheduleResult, "status" | "errors">;
   activeLeases?: readonly Lease[];
   remediationCheckpoints?: readonly DurableArtifact<"RemediationBlocked">[];
+  serializationEdges?: readonly ClaimSerializationEdge[];
   updatedAt?: string;
 }): OrchestrationSnapshot {
   const status = input.result?.status ?? new Map(input.items.map((item) => [item.id, "queued" as ScheduledStatus]));
@@ -22,12 +23,26 @@ export function buildOrchestrationSnapshot(input: {
     status: status.get(item.id) ?? "queued",
     dependencies: [...item.dependencies],
     claims: [...item.claims],
+    ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
     ...(errors.get(item.id) ? { error: errors.get(item.id)!.message } : {}),
   }));
+  const serializationPredecessors = new Map<string, string[]>();
+  for (const edge of input.serializationEdges ?? []) {
+    const predecessors = serializationPredecessors.get(edge.successor) ?? [];
+    predecessors.push(edge.predecessor);
+    serializationPredecessors.set(edge.successor, predecessors);
+  }
+  const isTerminal = (value: ScheduledStatus | undefined): boolean => value === "completed"
+    || value === "failed"
+    || value === "blocked"
+    || value === "skipped"
+    || value === "invalid";
   return {
     orchestrationId: input.orchestrationId,
     nodes,
-    readyNodes: nodes.filter((node) => node.status === "queued" && node.dependencies.every((dependency) => status.get(dependency) === "completed")).map((node) => node.id),
+    readyNodes: nodes.filter((node) => node.status === "queued"
+      && node.dependencies.every((dependency) => status.get(dependency) === "completed")
+      && (serializationPredecessors.get(node.id) ?? []).every((predecessor) => isTerminal(status.get(predecessor)))).map((node) => node.id),
     blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed" || node.status === "skipped").map((node) => node.id),
     invalidNodes: nodes.filter((node) => node.status === "invalid").map((node) => node.id),
     suspendedNodes: nodes.filter((node) => node.status === "suspended").map((node) => node.id),
@@ -46,8 +61,9 @@ export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): strin
   const lines = [`Orchestration ${snapshot.orchestrationId}`, `Updated ${snapshot.updatedAt}`, ""];
   for (const node of snapshot.nodes) {
     const members = node.memberIssues.length > 1 ? ` members=${node.memberIssues.map((issue) => `#${issue}`).join(",")}` : "";
+    const promotion = node.promotionTarget ? ` promotion=${node.promotionTarget}` : "";
     const error = node.error ? ` — ${node.error}` : "";
-    lines.push(`${statusGlyph(node.status)} #${node.issue}${members} [${node.status}] deps=${node.dependencies.join(",") || "none"}${error}`);
+    lines.push(`${statusGlyph(node.status)} #${node.issue}${members} [${node.status}] deps=${node.dependencies.join(",") || "none"}${promotion}${error}`);
   }
   if (snapshot.remediationCheckpoints.length) {
     lines.push("", "Review Desk");

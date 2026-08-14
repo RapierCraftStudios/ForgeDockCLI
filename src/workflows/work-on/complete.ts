@@ -51,6 +51,9 @@ export async function completeInvalidWorkItem(
       producer: { role: "controller", runtime: "forgedock" },
       payload: {
         ...input.outcome.payload,
+        ...(input.run.targetBranch ? { targetBranch: input.run.targetBranch } : {}),
+        ...(input.run.promotionTarget ? { promotionTarget: input.run.promotionTarget } : {}),
+        ...(input.run.productionTarget ? { productionTarget: input.run.productionTarget } : {}),
         reason: `${reason} Authoritative GitHub state is CLOSED.`,
         issueClosure: {
           status: "completed",
@@ -117,6 +120,9 @@ export async function completeWorkItem(
       payload: {
         status: "merged",
         reason: `Merged PR #${pullRequest.number} after independent review of ${pullRequest.headSha}.`,
+        ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+        ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+        ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
         finalSha: pullRequest.headSha,
         prUrl: pullRequest.url,
         childIssues: childIssues.map((child) => `issue-${child}`),
@@ -132,6 +138,9 @@ export async function completeWorkItem(
         payload: {
           status: "merged",
           reason: `Completed as member of batch issue #${issue} by PR #${pullRequest.number}.`,
+          ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+          ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+          ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
           finalSha: pullRequest.headSha,
           prUrl: pullRequest.url,
           childIssues: [],

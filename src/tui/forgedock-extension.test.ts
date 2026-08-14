@@ -10,7 +10,7 @@ import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
-import forgedockExtension, { executeController, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
+import forgedockExtension, { executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
@@ -26,7 +26,14 @@ interface FakePiState {
   tools: Map<string, ToolDefinition>;
   commands: Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>;
   handlers: Map<string, Array<(event: any, ctx?: any) => unknown>>;
-  sent: Array<{ content: string; options?: { deliverAs?: "steer" | "followUp" } }>;
+  sent: Array<{
+    content: string;
+    customType?: string | undefined;
+    display?: boolean | undefined;
+    details?: unknown;
+    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" } | undefined;
+  }>;
+  messageRenderers: Map<string, (message: any, options: any, theme: any) => any>;
   active: string[];
   emitted: Array<{ event: string; data: any }>;
 }
@@ -38,6 +45,7 @@ function fakePi(
   const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
   const handlers = new Map<string, Array<(event: any, ctx?: any) => unknown>>();
   const sent: FakePiState["sent"] = [];
+  const messageRenderers: FakePiState["messageRenderers"] = new Map();
   const emitted: FakePiState["emitted"] = [];
   let active = [...initialActive];
   const eventHandlers = new Map<string, Array<(data: unknown) => void>>();
@@ -50,11 +58,14 @@ function fakePi(
     registerCommand: (name: string, options: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => {
       commands.set(name, options.handler);
     },
+    registerMessageRenderer: (customType: string, renderer: (message: any, options: any, theme: any) => any) => {
+      messageRenderers.set(customType, renderer);
+    },
     sendUserMessage: (content: string, options?: { deliverAs?: "steer" | "followUp" }) => {
       sent.push(options ? { content, options } : { content });
     },
-    sendMessage: (message: { content: string }) => {
-      sent.push({ content: message.content });
+    sendMessage: (message: { content: string; customType?: string; display?: boolean; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" }) => {
+      sent.push({ content: message.content, customType: message.customType, display: message.display, details: message.details, options });
     },
     getActiveTools: () => active,
     setActiveTools: (names: string[]) => { active = names; state.active = names; },
@@ -69,7 +80,7 @@ function fakePi(
       },
     },
   } as unknown as ExtensionAPI;
-  Object.assign(state, { pi, tools, commands, handlers, sent, active, emitted });
+  Object.assign(state, { pi, tools, commands, handlers, sent, messageRenderers, active, emitted });
   forgedockExtension(pi);
   return state;
 }
@@ -92,23 +103,37 @@ test("commands lazily activate separate semantic native tools without loading Ma
   const state = fakePi();
   assert.deepEqual(
     [...state.tools.keys()].sort(),
-    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
+    ["forgedock_ask_user", "forgedock_configure", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_promote", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
   );
 
   await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
+  assert.ok(state.tools.get("forgedock_resume_orchestration"));
+  const resumeTool = state.tools.get("forgedock_resume_orchestration") as any;
+  assert.equal(resumeTool.parameters.properties.orchestrationId.type, "string");
 
   await state.commands.get("orchestrate")?.("throwaway-milestone --dry-run", commandContext());
   assert.equal(state.sent.length, 1);
-  assert.deepEqual(state.sent[0]?.options, { deliverAs: "followUp" });
+  assert.deepEqual(state.sent[0]?.options, { triggerTurn: true, deliverAs: "followUp" });
+  assert.equal(state.sent[0]?.customType, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE);
+  assert.equal(state.sent[0]?.display, true);
+  assert.equal((state.sent[0]?.details as { invocationLabel?: string } | undefined)?.invocationLabel, "/orchestrate throwaway-milestone --dry-run");
   assert.match(state.sent[0]?.content ?? "", /Every \/orchestrate invocation must go through your natural-language intent routing/);
+  const invocationRenderer = state.messageRenderers.get(FORGEDOCK_NATIVE_WORKFLOW_MESSAGE);
+  assert.ok(invocationRenderer);
+  const renderedInvocation = invocationRenderer({ details: state.sent[0]?.details, content: state.sent[0]?.content }, { expanded: true, outputPad: 1 }, {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  }).render(160).join("\\n").trim();
+  assert.equal(renderedInvocation, "/orchestrate throwaway-milestone --dry-run");
+  assert.doesNotMatch(renderedInvocation, /Every \/orchestrate invocation/);
   assert.match(state.sent[0]?.content ?? "", /classify (?:it|the request) as issue-set, milestone, github-query, or natural-language/i);
   assert.match(state.sent[0]?.content ?? "", /routing=\{kind,rationale/);
   assert.match(state.sent[0]?.content ?? "", /call forgedock_orchestrate exactly once/);
   assert.match(state.sent[0]?.content ?? "", /execution DAG/);
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration", "forgedock_orchestrate", "forgedock_ask_user"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate", "forgedock_ask_user"]);
 });
 
 test("keeps native workflow tools active through a transient provider retry", async () => {
@@ -122,7 +147,7 @@ test("keeps native workflow tools active through a transient provider retry", as
   assert.deepEqual(state.active, activeDuringWorkflow);
 
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks"]);
 });
 
 test("natural configuration resolves a friendly live model name for all subagents", async () => {
@@ -232,7 +257,7 @@ test("supervisor escalations lazily expose decision-interview and reply tools", 
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_resume_orchestration", "forgedock_ask_user", "subagent_supervisor"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "subagent_supervisor"]);
 });
 
 test("human checkpoints use the tabbed decision interview and return typed answers", async () => {
@@ -335,7 +360,6 @@ test("orchestrate starts only the live DAG ready set without static batch phases
       }));
     }
   }) as typeof state.pi.events.emit;
-
   const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   process.env.FORGEDOCK_CONTROLLER_ENTRY = "C:/Forge Dock/bin/forgedock-next.mjs";
   try {
@@ -352,6 +376,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
       maxRemediationCycles: 2,
       maxRemediationDepth: 2,
       maxRemediationChildren: 8,
+      confirmed: true,
       workerModel: "openai-codex/gpt-worker",
     }, undefined, undefined, commandContext() as any);
     assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
@@ -387,10 +412,130 @@ test("headless orchestration requires explicit dispatch authorization", async ()
   const tool = state.tools.get("forgedock_orchestrate");
   assert.ok(tool);
   bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
-  await assert.rejects(() => tool.execute("headless", {
+  const result = await tool.execute("headless", {
     issueNumbers: [7],
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /requires explicit confirmed=true/);
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  assert.match((result.content[0] as { text: string }).text, /Dispatch is disabled in preview mode/);
+});
+
+test("native promotion exposes an explicit mutation-aware entrypoint", async () => {
+  const state = fakePi();
+  const promote = state.tools.get("forgedock_promote") as any;
+  assert.ok(promote);
+  assert.equal(promote.parameters.properties.confirm.type, "boolean");
+  assert.equal(promote.parameters.properties.authorizeMerge.type, "boolean");
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  assert.equal(state.active.includes("forgedock_promote"), false);
+});
+
+test("orchestration preview exposes a single-use continuation checkpoint", async () => {
+  const state = fakePi();
+  const spawnRequests: any[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      spawnRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "preview-continuation-run" } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
+  const preview = await tool.execute("preview-checkpoint", {
+    issueNumbers: [7],
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  const previewDetails = preview.details as { previewToken?: string };
+  assert.match(previewDetails.previewToken ?? "", /^[0-9a-f-]{36}$/);
+  assert.match((preview.content[0] as { text: string }).text, /confirmation checkpoint/);
+  assert.match((preview.content[0] as { text: string }).text, /FORGEDOCK_PREVIEW_CONTINUATION/);
+  assert.match((preview.content[0] as { text: string }).text, /previewToken/);
+
+  await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
+  assert.equal(state.active.includes("forgedock_orchestrate"), true);
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
+  const continued = await tool.execute("confirmed-checkpoint", {
+    issueNumbers: [7],
+    confirmed: true,
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  assert.match((continued.content[0] as { text: string }).text, /started streaming DAG/);
+  assert.equal(spawnRequests.length, 1);
+});
+
+test("bound decomposed scope rebinds a parent execution plan before DAG validation", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, {
+    rawArgs: "open issues",
+    issueNumbers: [110, 111],
+    noMilestone: true,
+    decomposedReplacements: [{ parent: 7, children: [110, 111] }],
+  });
+  const result = await tool.execute("rebind-parent-plan", {
+    issueNumbers: [110, 111],
+    executionPlan: [{ issue: 7, title: "Decomposed parent", summary: "Original parent scope", dependsOn: [], claims: ["src/orchestration"], labels: ["workflow:decomposed"] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  assert.match((result.content[0] as { text: string }).text, /Selected issues: #110, #111/);
+  assert.doesNotMatch((result.content[0] as { text: string }).text, /executionPlan must exactly match/);
+});
+
+test("preview confirmation rejects changed execution plans", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
+  await tool.execute("preview-plan-freeze", {
+    issueNumbers: [7],
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Original", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  await assert.rejects(() => tool.execute("changed-plan", {
+    issueNumbers: [7],
+    confirmed: true,
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Changed", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /executionPlan changed after confirmation/);
+});
+
+test("preview continuation rejects a wrong token and issue substitution", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
+  await tool.execute("preview-replay-guards", {
+    issueNumbers: [7],
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Original", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  await assert.rejects(() => tool.execute("wrong-token", {
+    issueNumbers: [7],
+    confirmed: true,
+    previewToken: "not-the-live-token",
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /missing, expired, or belongs to another preview/);
+  await assert.rejects(() => tool.execute("wrong-scope", {
+    issueNumbers: [8],
+    confirmed: true,
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /issue substitution rejected/);
+});
+
+test("fresh orchestration never invokes the implicit resume tool", async () => {
+  const state = fakePi();
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
+  const resume = state.tools.get("forgedock_resume_orchestration");
+  assert.ok(resume);
+  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
+  assert.equal((resume as any).parameters.properties.orchestrationId.type, "string");
+  const result = await tool.execute("fresh-preview", {
+    issueNumbers: [7],
+    executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  assert.match((result.content[0] as { text: string }).text, /Dispatch is disabled in preview mode/);
+  assert.equal(state.sent.some(({ content }) => /Resume orchestration|forgedock_resume_orchestration/i.test(content)), false);
 });
 
 test("visible DAG delegation dispatches a successor on its predecessor completion event", async () => {
@@ -583,6 +728,8 @@ test("visible DAG refuses to retry terminally decomposed work", async () => {
   });
   originalEmit("subagent:async-complete", { runId: "decomposed-run" });
   await run.completion;
+  const durable = (delegator as any).runs.get(run.id).durableRecord;
+  durable.status = "failed";
   await assert.rejects(() => delegator.resume(run.id), /terminally decomposed work.*invoke \/orchestrate again/);
   await delegator.shutdown();
 });
@@ -618,10 +765,14 @@ test("visible DAG recovery applies an explicitly authorized fresh rerun to the f
   originalEmit("subagent:async-complete", { runId: "rerun-override-1" });
   await first.completion;
 
+  const durable = (delegator as any).runs.get(first.id).durableRecord;
+  durable.status = "failed";
   const resumed = await delegator.resume(first.id, { rerunIssueNumbers: [6] });
   originalEmit("subagent:async-complete", { runId: "rerun-override-2" });
   await resumed.completion;
   assert.deepEqual(recoveryModes, ["initial", "rerun"]);
+  const completedDurable = (delegator as any).runs.get(first.id).durableRecord;
+  completedDurable.status = "failed";
   await assert.rejects(() => delegator.resume(first.id, { rerunIssueNumbers: [99] }), /already complete|does not match/);
   await delegator.shutdown();
 });
@@ -654,11 +805,24 @@ test("visible DAG resume carries typed verification adjudication without fresh r
   });
   originalEmit("subagent:async-complete", { runId: "adjudication-run-1" });
   await first.completion;
+  const durable = (delegator as any).runs.get(first.id).durableRecord;
+  durable.status = "failed";
   const resumed = await delegator.resume(first.id, { adjudications: new Map([[73, "Clean worktree baseline repaired and independently checked."]]) });
   originalEmit("subagent:async-complete", { runId: "adjudication-run-2" });
   await resumed.completion;
   assert.deepEqual(adjudications, ["Clean worktree baseline repaired and independently checked."]);
   await delegator.shutdown();
+});
+
+test("forgedock tasks distinguishes durable DAG output from native process output", async () => {
+  const state = fakePi();
+  const tasks = state.tools.get("forgedock_tasks");
+  assert.ok(tasks);
+  const ctx = commandContext() as any;
+  await assert.rejects(
+    () => tasks.execute("unknown-dag", { action: "output", taskId: "dag_missing" }, undefined, undefined, ctx),
+    /Unknown durable orchestration DAG.*native task_/,
+  );
 });
 
 test("controller subprocess output streams before completion", async () => {
@@ -779,6 +943,7 @@ test("shell fallback cannot impose a wall-clock timeout on lifecycle controllers
   assert.equal(guard({ toolName: "bash", input: { command: "npm test" } }), undefined);
   assert.equal(isLifecycleControllerShellCommand("forgedock-next orchestrate 6,7"), true);
   assert.equal(isLifecycleControllerShellCommand("npm run next -- work-on 6 --rerun"), true);
+  assert.equal(isLifecycleControllerShellCommand("forgedock-next promote --from milestone/feature --confirm"), true);
 });
 
 test("native orchestrate prompts always perform LLM intent routing", () => {
@@ -786,6 +951,10 @@ test("native orchestrate prompts always perform LLM intent routing", () => {
   assert.match(prompt, /\/orchestrate 2 issues from/);
   assert.match(prompt, /Every \/orchestrate invocation must go through your natural-language intent routing/);
   assert.match(prompt, /Interpret the complete request semantically/);
+  assert.match(prompt, /remote\.origin\.url/);
+  assert.match(prompt, /--repo <resolved-origin-repository>/);
+  assert.match(prompt, /blank, omitted, collapsed, or truncated issue-list result/);
+  assert.match(prompt, /bounded summary/);
   assert.match(prompt, /routing=\{kind,rationale,requestedCount\?/);
   assert.match(prompt, /forgedock_ask_user/);
   assert.match(prompt, /Do not guess/);
@@ -794,6 +963,87 @@ test("native orchestrate prompts always perform LLM intent routing", () => {
   assert.match(prompt, /Never invoke forgedock-next, dist\/cli\/main\.js, or another lifecycle controller through bash\/shell/);
   assert.match(buildNativeCommandPrompt("work-on", "6 --resume"), /Never invoke the lifecycle CLI through bash\/shell or add a wall-clock timeout/);
   assert.doesNotMatch(prompt, /No deterministic orchestration binding|invoke \/orchestrate again with exact/);
+});
+
+test("complete GitHub queries replace decomposed parents with authoritative children", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-decomposed-query",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#110 — First child", "#111 — Second child"] },
+  });
+  const scope = await resolveRoutedOrchestrationScope(
+    "https://github.com/a/b/issues?q=is%3Aissue%20state%3Aopen%20no%3Amilestone",
+    { kind: "github-query", rationale: "Complete open no-milestone query", noMilestone: true, repository: "a/b" },
+    [7, 8, 110, 111],
+    {
+      async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+      async getMilestone(number) { return { number, title: "unused", state: "open" as const }; },
+      async listOpenIssueNumbersForMilestone() { return []; },
+      async listOpenIssueNumbersForSearch() { return [7, 8, 110, 111]; },
+      async getIssue(number) {
+        if (number === 7) return { number, state: "OPEN" as const, labels: ["workflow:decomposed"], comments: [{ body: renderArtifactComment(outcome) }] };
+        return { number, state: "OPEN" as const, labels: [], comments: [] };
+      },
+    },
+  );
+  assert.deepEqual(scope.issueNumbers, [8, 110, 111]);
+  assert.equal(scope.noMilestone, true);
+  assert.deepEqual(scope.decomposedReplacements, [{ parent: 7, children: [110, 111] }]);
+});
+
+test("milestone and direct scopes expose decomposed replacements for plan rebinding", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-decomposed-rebind",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#110 — First child", "#111 — Second child"] },
+  });
+  const host = {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number: number) { return { number, title: "Milestone One", state: "open" as const }; },
+    async listOpenIssueNumbersForMilestone() { return [7, 110, 111]; },
+    async getIssue(number: number) {
+      return number === 7
+        ? { number, state: "OPEN" as const, labels: ["workflow:decomposed"], milestone: { number: 1, title: "Milestone One" }, comments: [{ body: renderArtifactComment(outcome) }] }
+        : { number, state: "OPEN" as const, labels: [], milestone: { number: 1, title: "Milestone One" }, comments: [] };
+    },
+  };
+  const milestone = await resolveOrchestrationInvocationScope("Milestone One", process.cwd(), host);
+  assert.deepEqual(milestone.issueNumbers, [110, 111]);
+  assert.deepEqual(milestone.decomposedReplacements, [{ parent: 7, children: [110, 111] }]);
+  const direct = await resolveOrchestrationInvocationScope("7", process.cwd(), host);
+  assert.deepEqual(direct.issueNumbers, [110, 111]);
+  assert.deepEqual(direct.decomposedReplacements, [{ parent: 7, children: [110, 111] }]);
+});
+
+test("routed decomposed replacements rebind parent plan entries to child issues", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-decomposed-plan",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#110 — First child", "#111 — Second child"] },
+  });
+  const scope = await resolveRoutedOrchestrationScope(
+    "https://github.com/a/b/issues?q=is%3Aissue%20state%3Aopen%20no%3Amilestone",
+    { kind: "github-query", rationale: "Complete open no-milestone query", noMilestone: true, repository: "a/b" },
+    [7, 8, 110, 111],
+    {
+      async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+      async getMilestone(number) { return { number, title: "unused", state: "open" as const }; },
+      async listOpenIssueNumbersForMilestone() { return []; },
+      async listOpenIssueNumbersForSearch() { return [7, 8, 110, 111]; },
+      async getIssue(number) {
+        if (number === 7) return { number, state: "OPEN" as const, labels: ["workflow:decomposed"], comments: [{ body: renderArtifactComment(outcome) }] };
+        return { number, state: "OPEN" as const, labels: [], comments: [] };
+      },
+    },
+  );
+  assert.deepEqual(scope.issueNumbers, [8, 110, 111]);
+  assert.deepEqual(scope.decomposedReplacements, [{ parent: 7, children: [110, 111] }]);
 });
 
 test("LLM-routed GitHub issue URLs resolve natural-language count and membership", async () => {
@@ -823,6 +1073,7 @@ test("LLM-routed GitHub issue URLs resolve natural-language count and membership
     rawArgs: "2 issues from https://github.com/a/b/issues?q=is%3Aissue%20state%3Aopen%20no%3Amilestone",
     issueNumbers: [7, 8],
     repository: "a/b",
+    defaultBranch: "main",
     noMilestone: true,
   });
   assert.deepEqual(calls, [{ query: "is:issue state:open no:milestone", repo: "a/b" }]);
@@ -854,6 +1105,7 @@ test("controller leaves prose issue interpretation to the routed model", async (
     rawArgs: "148 and 149 from https://github.com/a/b/issues",
     issueNumbers: [148, 149],
     repository: "a/b",
+    defaultBranch: "main",
     noMilestone: true,
   });
   assert.deepEqual(calls, [{ number: 148, repo: "a/b" }, { number: 149, repo: "a/b" }]);
@@ -887,6 +1139,7 @@ test("orchestration scope resolution still supports an exact milestone fast path
     rawArgs: "throwaway-milestone --auto",
     issueNumbers: [129],
     repository: "a/b",
+    defaultBranch: "main",
     milestone: "throwaway-milestone",
     noMilestone: false,
   });
@@ -905,6 +1158,7 @@ test("orchestration scope resolves a GitHub milestone URL before selecting open 
     rawArgs: "https://github.com/a/b/milestone/1",
     issueNumbers: [7, 8],
     repository: "a/b",
+    defaultBranch: "main",
     milestone: "Milestone One",
     noMilestone: false,
   });

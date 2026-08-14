@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { DecompositionChild, IssueSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
+import { investigateWorkItem, latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
 
 function intent(runId = "run_investigate") {
   return createArtifact({
@@ -55,6 +55,14 @@ function dependencies(runtime: FakeAgentRuntime) {
 }
 
 describe("work-on investigation", () => {
+  it("projects only the latest durable learning artifact for each phase", () => {
+    const artifact = (kind: DurableArtifact["kind"], index: number) => ({ kind, id: `${kind}-${index}` } as unknown as DurableArtifact);
+    const projected = latestPriorLearningArtifacts([
+      artifact("ReviewVerdict", 1), artifact("Outcome", 1), artifact("ReviewVerdict", 2), artifact("BuildResult", 1), artifact("Outcome", 2),
+    ]);
+    assert.deepEqual(projected.map(({ kind, id }) => `${kind}:${id}`), ["ReviewVerdict:ReviewVerdict-2", "BuildResult:BuildResult-1", "Outcome:Outcome-2"]);
+  });
+
   it("commits confirmed evidence and stops at the Build Packet boundary", async () => {
     const runtime = new FakeAgentRuntime([confirmed()]);
     const deps = dependencies(runtime);
@@ -71,6 +79,8 @@ describe("work-on investigation", () => {
     assert.equal(deps.artifacts.artifacts.map((artifact) => artifact.kind).join(","), "Intent,Investigation");
     assert.deepEqual(runtime.tasks[0]?.tools, ["read", "grep", "find", "ls"]);
     assert.match(runtime.tasks[0]?.instructions ?? "", /missing implementation.*confirmed, not invalid/);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /integration boundaries/);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /repeated mechanical or integration failure patterns/);
     assert.equal(runtime.tasks[0]?.workspace.mode, "read-only");
     assert.deepEqual(runtime.tasks[0]?.modelPolicy, {
       planningProvider: "anthropic",

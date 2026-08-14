@@ -17,10 +17,12 @@ export const DEFAULT_ORCHESTRATION = {
   maxRemediationChildren: 8,
   maxParallel: 4,
   autoMerge: DEFAULT_AUTO_MERGE,
+  dispatchMode: "preview" as const,
 };
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type BatchingPolicy = "aggressive" | "conservative" | "none";
 export type ScopeExpansion = "scope-locked" | "recursive";
+export type OrchestrationDispatchMode = "preview" | "confirm" | "auto";
 
 export interface ForgeDockOrchestrationPatch {
   batching?: { policy?: BatchingPolicy; maxBatchSize?: number; maxSensitiveBatchSize?: number };
@@ -32,6 +34,12 @@ export interface ForgeDockOrchestrationPatch {
   autoMerge?: boolean;
   /** Explicit fast-lane target; absent means the repository default branch. */
   fastLaneTarget?: string;
+  /** Feature/milestone branches are promoted into this integration lane. */
+  featurePromotionTarget?: string;
+  /** Protected production/promotion target for this repository. */
+  productionTarget?: string;
+  /** Default orchestration dispatch policy. */
+  dispatchMode?: OrchestrationDispatchMode;
 }
 
 export interface ForgeDockNextConfig {
@@ -54,6 +62,12 @@ export interface ForgeDockNextConfig {
   autoMerge?: boolean;
   /** Explicit fast-lane target; absent means the repository default branch. */
   fastLaneTarget?: string;
+  /** Feature/milestone branches are promoted into this integration lane. */
+  featurePromotionTarget?: string;
+  /** Protected production/promotion target for this repository. */
+  productionTarget?: string;
+  /** Default orchestration dispatch policy. */
+  dispatchMode?: OrchestrationDispatchMode;
   orchestration?: ForgeDockOrchestrationPatch;
 }
 
@@ -70,6 +84,9 @@ export interface EffectiveOrchestrationConfig {
   maxParallel: number;
   autoMerge: boolean;
   fastLaneTarget?: string;
+  featurePromotionTarget?: string;
+  productionTarget?: string;
+  dispatchMode: OrchestrationDispatchMode;
 }
 
 export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
@@ -104,6 +121,9 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
     maxParallel: parsed("max_parallel", parsePositiveInteger),
     autoMerge: parsed("auto_merge", parseBoolean),
     fastLaneTarget: parsed("fast_lane_target", parseString),
+    featurePromotionTarget: parsed("feature_promotion_target", parseString),
+    productionTarget: parsed("production_target", parseString),
+    dispatchMode: parsed("dispatch_mode", parseDispatchMode),
   }) as ForgeDockNextConfig;
   validatePatch(config, false);
   return config;
@@ -157,6 +177,9 @@ export function resolveOrchestrationConfig(
     maxParallel: merged.maxParallel ?? DEFAULT_ORCHESTRATION.maxParallel,
     autoMerge: merged.autoMerge ?? DEFAULT_ORCHESTRATION.autoMerge,
     ...(merged.fastLaneTarget !== undefined ? { fastLaneTarget: merged.fastLaneTarget } : {}),
+    ...(merged.featurePromotionTarget !== undefined ? { featurePromotionTarget: merged.featurePromotionTarget } : {}),
+    ...(merged.productionTarget !== undefined ? { productionTarget: merged.productionTarget } : {}),
+    dispatchMode: merged.dispatchMode ?? DEFAULT_ORCHESTRATION.dispatchMode,
   };
   validateEffectiveOrchestration(result);
   return result;
@@ -181,6 +204,9 @@ export function orchestrationConfigSources(
     maxParallel: source("maxParallel"),
     autoMerge: source("autoMerge"),
     fastLaneTarget: source("fastLaneTarget"),
+    featurePromotionTarget: source("featurePromotionTarget"),
+    productionTarget: source("productionTarget"),
+    dispatchMode: source("dispatchMode"),
   };
 }
 
@@ -212,7 +238,8 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
   const hasBatching = config.batchingPolicy !== undefined || config.maxBatchSize !== undefined || config.maxSensitiveBatchSize !== undefined;
   const hasOrchestration = hasBatching || config.scopeExpansion !== undefined || config.maxRemediationCycles !== undefined
     || config.maxRemediationDepth !== undefined || config.maxRemediationChildren !== undefined
-    || config.maxParallel !== undefined || config.autoMerge !== undefined || config.fastLaneTarget !== undefined;
+    || config.maxParallel !== undefined || config.autoMerge !== undefined || config.fastLaneTarget !== undefined
+    || config.featurePromotionTarget !== undefined || config.productionTarget !== undefined || config.dispatchMode !== undefined;
   const lines = [START, "next:", hasAgents ? "  agents:" : "  agents: {}"];
   if (config.workerModel !== undefined) lines.push(`    worker_model: ${JSON.stringify(config.workerModel)}`);
   if (config.workerThinking !== undefined) lines.push(`    worker_thinking: ${JSON.stringify(config.workerThinking)}`);
@@ -238,6 +265,9 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
     if (config.maxParallel !== undefined) lines.push(`    max_parallel: ${config.maxParallel}`);
     if (config.autoMerge !== undefined) lines.push(`    auto_merge: ${config.autoMerge}`);
     if (config.fastLaneTarget !== undefined) lines.push(`    fast_lane_target: ${JSON.stringify(config.fastLaneTarget)}`);
+    if (config.featurePromotionTarget !== undefined) lines.push(`    feature_promotion_target: ${JSON.stringify(config.featurePromotionTarget)}`);
+    if (config.productionTarget !== undefined) lines.push(`    production_target: ${JSON.stringify(config.productionTarget)}`);
+    if (config.dispatchMode !== undefined) lines.push(`    dispatch_mode: ${JSON.stringify(config.dispatchMode)}`);
   }
   lines.push(END);
   return lines.join("\n");
@@ -262,6 +292,13 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (patch.fastLaneTarget !== undefined && !isSafeBranchName(patch.fastLaneTarget)) {
     throw new Error(`fastLaneTarget must be a safe Git branch name: ${patch.fastLaneTarget}`);
   }
+  if (patch.featurePromotionTarget !== undefined && !isSafeBranchName(patch.featurePromotionTarget)) {
+    throw new Error(`featurePromotionTarget must be a safe Git branch name: ${patch.featurePromotionTarget}`);
+  }
+  if (patch.productionTarget !== undefined && !isSafeBranchName(patch.productionTarget)) {
+    throw new Error(`productionTarget must be a safe Git branch name: ${patch.productionTarget}`);
+  }
+  if (patch.dispatchMode !== undefined && !["preview", "confirm", "auto"].includes(patch.dispatchMode)) throw new Error("dispatchMode must be preview, confirm, or auto");
   if (patch.batchingPolicy !== undefined && !["aggressive", "conservative", "none"].includes(patch.batchingPolicy)) throw new Error("batchingPolicy must be aggressive, conservative, or none");
   if (patch.scopeExpansion !== undefined && !["scope-locked", "recursive"].includes(patch.scopeExpansion)) throw new Error("scopeExpansion must be scope-locked or recursive");
   for (const [name, value] of [["maxBatchSize", patch.maxBatchSize], ["maxSensitiveBatchSize", patch.maxSensitiveBatchSize], ["maxRemediationCycles", patch.maxRemediationCycles], ["maxRemediationChildren", patch.maxRemediationChildren]] as const) {
@@ -282,6 +319,9 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (nested?.maxRemediationChildren !== undefined && (!Number.isSafeInteger(nested.maxRemediationChildren) || nested.maxRemediationChildren < 1 || nested.maxRemediationChildren > 100)) throw new Error("maxRemediationChildren must be a positive integer");
   if (nested?.maxParallel !== undefined && (!Number.isSafeInteger(nested.maxParallel) || nested.maxParallel < 1 || nested.maxParallel > 20)) throw new Error("maxParallel must be an integer from 1 to 20");
   if (nested?.fastLaneTarget !== undefined && !isSafeBranchName(nested.fastLaneTarget)) throw new Error(`orchestration.fastLaneTarget must be a safe Git branch name: ${nested.fastLaneTarget}`);
+  if (nested?.featurePromotionTarget !== undefined && !isSafeBranchName(nested.featurePromotionTarget)) throw new Error(`orchestration.featurePromotionTarget must be a safe Git branch name: ${nested.featurePromotionTarget}`);
+  if (nested?.productionTarget !== undefined && !isSafeBranchName(nested.productionTarget)) throw new Error(`orchestration.productionTarget must be a safe Git branch name: ${nested.productionTarget}`);
+  if (nested?.dispatchMode !== undefined && !["preview", "confirm", "auto"].includes(nested.dispatchMode)) throw new Error("orchestration.dispatchMode must be preview, confirm, or auto");
 }
 
 function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextConfig {
@@ -299,6 +339,9 @@ function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextCon
   if (result.maxParallel === undefined && nested.maxParallel !== undefined) result.maxParallel = nested.maxParallel;
   if (result.autoMerge === undefined && nested.autoMerge !== undefined) result.autoMerge = nested.autoMerge;
   if (result.fastLaneTarget === undefined && nested.fastLaneTarget !== undefined) result.fastLaneTarget = nested.fastLaneTarget;
+  if (result.featurePromotionTarget === undefined && nested.featurePromotionTarget !== undefined) result.featurePromotionTarget = nested.featurePromotionTarget;
+  if (result.productionTarget === undefined && nested.productionTarget !== undefined) result.productionTarget = nested.productionTarget;
+  if (result.dispatchMode === undefined && nested.dispatchMode !== undefined) result.dispatchMode = nested.dispatchMode;
   return result;
 }
 
@@ -312,6 +355,9 @@ function validateEffectiveOrchestration(config: EffectiveOrchestrationConfig): v
   if (!Number.isSafeInteger(config.maxRemediationChildren) || config.maxRemediationChildren < 1) throw new Error("Invalid effective remediation child limit");
   if (!Number.isSafeInteger(config.maxParallel) || config.maxParallel < 1) throw new Error("Invalid effective maxParallel");
   if (config.fastLaneTarget !== undefined && !isSafeBranchName(config.fastLaneTarget)) throw new Error(`Invalid effective fastLaneTarget: ${config.fastLaneTarget}`);
+  if (config.featurePromotionTarget !== undefined && !isSafeBranchName(config.featurePromotionTarget)) throw new Error(`Invalid effective featurePromotionTarget: ${config.featurePromotionTarget}`);
+  if (config.productionTarget !== undefined && !isSafeBranchName(config.productionTarget)) throw new Error(`Invalid effective productionTarget: ${config.productionTarget}`);
+  if (!["preview", "confirm", "auto"].includes(config.dispatchMode)) throw new Error(`Invalid effective dispatchMode: ${config.dispatchMode}`);
 }
 
 function parseString(value: string | undefined): string | undefined {
@@ -337,6 +383,11 @@ function parseBatchingPolicy(value: string | undefined): BatchingPolicy | undefi
 function parseScopeExpansion(value: string | undefined): ScopeExpansion | undefined {
   const parsed = parseString(value);
   return parsed === "scope-locked" || parsed === "recursive" ? parsed : undefined;
+}
+
+function parseDispatchMode(value: string | undefined): OrchestrationDispatchMode | undefined {
+  const parsed = parseString(value);
+  return parsed === "preview" || parsed === "confirm" || parsed === "auto" ? parsed : undefined;
 }
 
 function parsePositiveInteger(value: string | undefined): number | undefined {

@@ -164,7 +164,9 @@ export class ForgeDockBackgroundTasks {
 
   output(id: string): string {
     const record = this.recordsFromDisk().get(id);
-    if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
+    if (!record) {
+      throw new Error(`Unknown ForgeDock background task: ${id}. Orchestration IDs are durable DAG records; use forgedock_tasks action=list for the DAG status or forgedock_resume_orchestration to resume one explicitly.`);
+    }
     const stdout = existsSync(record.logPath) ? readFileSync(record.logPath, "utf8") : "";
     const stderr = record.stderrLogPath && existsSync(record.stderrLogPath) ? readFileSync(record.stderrLogPath, "utf8") : "";
     const output = [stdout, stderr].filter(Boolean).join("\n");

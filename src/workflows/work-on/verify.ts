@@ -58,6 +58,8 @@ export async function verifyAndCommit(
           workspacePath: input.workspace.path,
           baseRef: input.workspace.baseRef,
           ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+          ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+          ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
           ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
           builderSummary: input.submission.summary,
           changedPaths,
@@ -201,6 +203,8 @@ export async function verifyAndCommit(
       payload: {
         branch: input.workspace.branch,
         targetBranch: run.targetBranch,
+        ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+        ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
         headSha,
         ...(input.workspace.baseSha ? { baseSha: input.workspace.baseSha } : {}),
         changedPaths: revisionChangedPaths,

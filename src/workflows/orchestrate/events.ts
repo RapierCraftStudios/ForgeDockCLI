@@ -12,6 +12,7 @@ export interface OrchestrationNode {
   status: ScheduledStatus;
   dependencies: readonly string[];
   claims: readonly string[];
+  promotionTarget?: string;
   error?: string;
 }
 

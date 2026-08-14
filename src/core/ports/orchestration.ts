@@ -17,6 +17,10 @@ export interface OrchestrationItemRecord {
   priority: number;
   dependencies: string[];
   claims: string[];
+  targetBranch?: string;
+  lane?: "fast" | "feature";
+  promotionTarget?: string;
+  productionTarget?: string;
   affectedFiles?: string[];
   memberIssues?: number[];
   title?: string;
@@ -29,6 +33,13 @@ export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
   childRunIds: string[];
 }
 
+/** Release-only ordering derived from overlapping claims, not a semantic dependency. */
+export interface OrchestrationSerializationEdgeRecord {
+  predecessor: string;
+  successor: string;
+  overlappingClaims: string[];
+}
+
 export interface OrchestrationRecord {
   schema: "forgedock.orchestration/v1";
   orchestrationId: string;
@@ -36,10 +47,14 @@ export interface OrchestrationRecord {
   issueNumbers: number[];
   maxParallel: number;
   autoMerge: boolean;
+  /** Protected promotion target is policy metadata; dispatch never targets it implicitly. */
+  productionTarget?: string;
   status: "running" | "completed" | "failed" | "cancelled";
   createdAt: string;
   updatedAt: string;
   nodes: OrchestrationNodeRecord[];
+  /** Optional for backward compatibility with pre-serialization-edge records. */
+  serializationEdges?: OrchestrationSerializationEdgeRecord[];
 }
 
 /** Durable operational record for a scheduler DAG; semantic issue state remains in artifacts and RunState. */

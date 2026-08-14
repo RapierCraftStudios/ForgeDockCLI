@@ -5,6 +5,8 @@ const ORCHESTRATE_VALUE_OPTIONS = new Set([
   "--max-remediation-depth", "--max-remediation-children", "--max-parallel", "--provider", "--model",
 ]);
 
+export const PROMOTION_VALUE_OPTIONS = new Set(["--from", "--to", "--resume", "--repo", "--provider", "--model"]);
+
 export function parseOrchestrationIssueNumbers(argv: readonly string[]): number[] {
   const issues: number[] = [];
   for (let index = 0; index < argv.length; index++) {

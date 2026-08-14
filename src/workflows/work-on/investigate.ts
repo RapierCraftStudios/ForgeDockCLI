@@ -37,6 +37,23 @@ export interface InvestigateInput {
   signal?: AbortSignal;
 }
 
+const PRIOR_LEARNING_KINDS = new Set<DurableArtifact["kind"]>([
+  "Investigation", "BuildPacket", "BuildResult", "ReviewVerdict", "Outcome", "RemediationBlocked", "VerificationAdjudication",
+]);
+
+/**
+ * Keep the investigator's historical feedback focused on the newest durable
+ * evidence for each phase. The full artifact ledger remains authoritative;
+ * this projection prevents old repair waves from crowding out current code.
+ */
+export function latestPriorLearningArtifacts(artifacts: readonly DurableArtifact[]): DurableArtifact[] {
+  const latest = new Map<DurableArtifact["kind"], { artifact: DurableArtifact; index: number }>();
+  for (const [index, artifact] of artifacts.entries()) {
+    if (PRIOR_LEARNING_KINDS.has(artifact.kind)) latest.set(artifact.kind, { artifact, index });
+  }
+  return [...latest.values()].sort((left, right) => left.index - right.index).map(({ artifact }) => artifact);
+}
+
 export interface InvestigateResult {
   run: RunState;
   investigation: DurableArtifact<"Investigation">;
@@ -85,14 +102,18 @@ export async function investigateWorkItem(
       role: "investigator",
       objective: "Determine whether the issue is confirmed, invalid, or must be decomposed. Prove the result from repository evidence before any code is changed.",
       instructions: [
-        "Inspect the relevant implementation and tests before deciding.",
+        "Inspect the relevant implementation, integration boundaries, and tests before deciding.",
+        "Trace the reported behavior through its callers, implementations, adapters, persistence/serialization, error and cancellation paths, and existing regression tests; do not stop at the first matching function.",
         "Every evidence item must identify a concrete repository source such as a path, symbol, test, or command result.",
+        "State the observable contract, the failure mode that violates it, and the smallest repository surfaces that must change to restore it.",
+        "When prior durable artifacts are present, mine prior ReviewVerdict findings, verification failures, and blocked Outcomes for repeated mechanical or integration failure patterns. Treat them as historical evidence only, distinguish stale or foreign evidence, and turn confirmed patterns into explicit risks and prevention constraints for the Build Packet.",
+        "For each confirmed outcome, identify the regression scenario and the integration checks that would prove both the happy path and the relevant failure/concurrency path.",
         "Choose invalid only when positive repository or issue evidence proves the claim is already fixed, superseded, unreproducible, or contradicted; an enhancement/refactor with missing implementation is confirmed, not invalid.",
         "Absence of a matching implementation or test is evidence that a requested change may be needed, never sufficient evidence that the issue is invalid. Describe the missing contract as the root cause when the request is confirmed.",
         "Choose decompose only when independently deliverable outcomes need separate acceptance and review.",
         "Do not modify files or perform GitHub writes.",
       ].join("\n"),
-      context: [input.intent, ...(input.priorArtifacts ?? [])],
+      context: [input.intent, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
       workspace: {
         cwd: input.cwd,
         mode: "read-only",
@@ -142,6 +163,9 @@ export async function investigateWorkItem(
         payload: {
           status: agentResult.output.outcome === "invalid" ? "invalid" : "decomposed",
           reason: agentResult.output.summary,
+          ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+          ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+          ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
           ...(agentResult.output.outcome === "invalid" ? {
             issueClosure: {
               status: "pending" as const,

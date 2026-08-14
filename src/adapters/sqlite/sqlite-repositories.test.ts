@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
+import { ConcurrentPromotionUpdateError, type PromotionRecord } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
@@ -110,6 +111,36 @@ describe("SQLite operational repositories", () => {
       const completed = { ...record, status: "completed" as const, updatedAt: "2026-01-01T00:01:00.000Z" };
       await store.saveOrchestration(completed);
       assert.equal((await store.listOrchestrations())[0]?.status, "completed");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("persists promotion checkpoints with optimistic versions", async () => {
+    const store = new SqliteRepositories(":memory:");
+    const record: PromotionRecord = {
+      schema: "forgedock.promotion/v1",
+      promotionId: "promotion_test",
+      repository: "a/b",
+      mode: "production",
+      sourceBranch: "staging",
+      targetBranch: "main",
+      sourceHeadSha: "a".repeat(40),
+      targetHeadSha: "b".repeat(40),
+      authorized: true,
+      mergeAuthorized: false,
+      phase: "planned",
+      version: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    try {
+      await store.createPromotion(record);
+      assert.deepEqual(await store.loadPromotion(record.promotionId), record);
+      const next = { ...record, phase: "pr-created" as const, version: 1, updatedAt: "2026-01-01T00:00:01.000Z" };
+      await store.savePromotion(record.version, next);
+      assert.equal((await store.listPromotions())[0]?.phase, "pr-created");
+      await assert.rejects(store.savePromotion(record.version, { ...next, version: 1 }), ConcurrentPromotionUpdateError);
     } finally {
       store.close();
     }

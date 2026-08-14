@@ -235,13 +235,19 @@ function groupingKeys(item: BatchableWorkItem, kind: IssueBatchGroup["kind"]): s
 
 function compatibilityKey(item: BatchableWorkItem, groupingKey: string): string | undefined {
   const repository = item.repository ?? item.repo;
-  const targetBranch = item.targetBranch ?? item.lane?.targetBranch;
+  const targetBranch = item.targetBranch;
+  // Older typed issue plans may omit the explicit lane while still carrying an
+  // authoritative target branch. Keep those plans batchable only within that
+  // exact target; an explicitly classified lane never shares its key with an
+  // unclassified plan.
+  const lane = item.lane ?? `target:${targetBranch ?? "unknown"}`;
   const urgency = item.urgencyTier ?? (priorityOf(item) === "unknown" ? undefined : ["P0", "P1"].includes(priorityOf(item)) ? "urgent" : "normal");
   const risk = item.riskClass ?? "routine";
   if (!repository || !targetBranch || !urgency || risk === "billing") return undefined;
   if ((risk === "security" || risk === "auth") && groupingKey === "") return undefined;
   const milestone = milestoneValue(item.milestone);
-  return [repository, targetBranch, urgency, risk, milestone ?? "none"].join("\u0001");
+  const promotionTarget = item.promotionTarget ?? "none";
+  return [repository, targetBranch, lane, promotionTarget, item.productionTarget ?? "none", urgency, risk, milestone ?? "none"].join("\u0001");
 }
 
 function isConvexGroup(allItems: readonly BatchableWorkItem[], members: readonly BatchableWorkItem[]): boolean {

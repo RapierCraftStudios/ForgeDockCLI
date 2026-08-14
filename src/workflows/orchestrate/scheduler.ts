@@ -9,6 +9,11 @@ export interface ScheduledWorkItem {
   priority: number;
   dependencies: readonly string[];
   claims: readonly string[];
+  /** Frozen repository delivery route retained through scheduling and durable recovery. */
+  targetBranch?: string;
+  lane?: "fast" | "feature";
+  promotionTarget?: string;
+  productionTarget?: string;
   /** Bounded issue-derived paths retained through scheduling for worker scope hints. */
   affectedFiles?: readonly string[];
   memberIssues?: readonly number[];
@@ -41,6 +46,8 @@ export interface ScheduleWorkerContext {
 export interface RunScheduleOptions {
   onEvent?: ScheduleEventSink;
   onClaimsPromoted?: ScheduleClaimsSink;
+  /** Derived release-only edges; semantic dependencies remain on each item. */
+  serializationEdges?: readonly ClaimSerializationEdge[];
   /** IDs being retried from a durable orchestration attempt. */
   resumedItemIds?: readonly string[];
 }
@@ -55,7 +62,7 @@ export class ClaimPromotionConflictError extends Error {
 export interface ClaimSerializationEdge {
   predecessor: string;
   successor: string;
-  overlappingClaims: string[];
+  overlappingClaims: readonly string[];
 }
 
 export interface SchedulePreview {
@@ -68,8 +75,23 @@ export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]
   edges: ClaimSerializationEdge[];
 } {
   validateGraph(items);
-  const mutable = new Map(items.map((item) => [item.id, { ...item, dependencies: [...item.dependencies], claims: [...item.claims] }]));
-  const ordered = [...mutable.values()].sort((left, right) => left.issue - right.issue || left.id.localeCompare(right.id));
+  // Keep claim serialization separate from semantic dependencies. A claim
+  // conflict only means "wait until the predecessor releases its claim"; it
+  // must not turn an invalid or failed predecessor into a reason to block
+  // otherwise independent work.
+  const graph = new Map(
+    items.map((item) => [
+      item.id,
+      {
+        ...item,
+        dependencies: [...item.dependencies],
+        claims: [...item.claims],
+      },
+    ]),
+  );
+  const ordered = [...graph.values()].sort(
+    (left, right) => left.issue - right.issue || left.id.localeCompare(right.id),
+  );
   const edges: ClaimSerializationEdge[] = [];
 
   for (let leftIndex = 0; leftIndex < ordered.length; leftIndex++) {
@@ -77,34 +99,62 @@ export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]
       const left = ordered[leftIndex]!;
       const right = ordered[rightIndex]!;
       if (!claimsConflict(left.claims, right.claims)) continue;
-      if (dependsTransitively(mutable, right.id, left.id) || dependsTransitively(mutable, left.id, right.id)) continue;
-      right.dependencies.push(left.id);
-      edges.push({ predecessor: left.id, successor: right.id, overlappingClaims: overlappingClaims(left.claims, right.claims) });
+      if (
+        dependsTransitively(graph, right.id, left.id)
+        || dependsTransitively(graph, left.id, right.id)
+      ) continue;
+      // Track the derived edge only in the temporary ordering graph so later
+      // conflicts do not create redundant transitive edges. It is deliberately
+      // not copied to the returned item's semantic dependencies.
+      graph.get(right.id)?.dependencies.push(left.id);
+      edges.push({
+        predecessor: left.id,
+        successor: right.id,
+        overlappingClaims: overlappingClaims(left.claims, right.claims),
+      });
     }
   }
 
-  const result = items.map((item) => mutable.get(item.id)!);
-  validateGraph(result);
+  const result = items.map((item) => ({
+    ...item,
+    dependencies: [...item.dependencies],
+    claims: [...item.claims],
+  }));
+  validateGraph(result, edges);
   return { items: result, edges };
 }
 
-export function buildSchedulePreview(items: readonly ScheduledWorkItem[]): SchedulePreview {
-  validateGraph(items);
+export function buildSchedulePreview(
+  items: readonly ScheduledWorkItem[],
+  serializationEdges: readonly ClaimSerializationEdge[] = [],
+): SchedulePreview {
+  validateGraph(items, serializationEdges);
   const byId = new Map(items.map((item) => [item.id, item]));
+  const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
+  const predecessorsFor = (item: ScheduledWorkItem): string[] => [
+    ...new Set([
+      ...item.dependencies,
+      ...(predecessorsBySuccessor.get(item.id) ?? []),
+    ]),
+  ];
   const initialReady = items
-    .filter((item) => item.dependencies.length === 0)
+    .filter((item) => predecessorsFor(item).length === 0)
     .sort((left, right) => left.priority - right.priority || left.issue - right.issue);
   const paths = new Map<string, ScheduledWorkItem[]>();
   const pathTo = (item: ScheduledWorkItem): ScheduledWorkItem[] => {
     const known = paths.get(item.id);
     if (known) return known;
-    const predecessors = item.dependencies.map((dependency) => pathTo(byId.get(dependency)!));
-    const longest = predecessors.sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
+    const predecessors = predecessorsFor(item).map((dependency) => pathTo(byId.get(dependency)!));
+    const longest = predecessors.sort(
+      (left, right) => right.length - left.length || comparePaths(left, right),
+    )[0] ?? [];
     const path = [...longest, item];
     paths.set(item.id, path);
     return path;
   };
-  const criticalPath = items.map(pathTo).sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
+  const criticalPath = items
+    .map(pathTo)
+    .sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
   return { initialReady, criticalPath };
 }
 
@@ -115,10 +165,14 @@ export async function runSchedule(
   options: RunScheduleOptions = {},
 ): Promise<ScheduleResult> {
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
-  validateGraph(items);
+  const serializationEdges = options.serializationEdges ?? [];
+  validateGraph(items, serializationEdges);
+  const orderedItems = [...items].sort((left, right) => left.priority - right.priority || left.issue - right.issue);
   const byId = new Map(items.map((item) => [item.id, item]));
+  const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
   const status = new Map(items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = new Map<string, Error>();
+  let queuedCount = items.length;
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
@@ -131,25 +185,28 @@ export async function runSchedule(
     emit("resumed", itemId);
   }
 
-  while (running.size || items.some((item) => status.get(item.id) === "queued")) {
-    for (const item of items) {
+  while (running.size || queuedCount > 0) {
+    for (const item of orderedItems) {
       if (status.get(item.id) !== "queued") continue;
-      if (item.dependencies.some((id) => status.get(id) === "failed" || status.get(id) === "blocked" || status.get(id) === "skipped" || status.get(id) === "invalid")) {
+      // Only explicit semantic dependencies block their successors on
+      // failure. Claim-serialization predecessors merely hold the resource
+      // until they reach a terminal state, including failed/blocked/invalid.
+      if (item.dependencies.some((id) => ["failed", "blocked", "skipped", "invalid"].includes(status.get(id) ?? ""))) {
         status.set(item.id, "blocked");
+        queuedCount--;
         emit("blocked", item.id);
       }
     }
 
-    const candidates = items
-      .filter((item) => status.get(item.id) === "queued")
-      .filter((item) => item.dependencies.every((id) => status.get(id) === "completed"))
-      .sort((left, right) => left.priority - right.priority || left.issue - right.issue);
-
-    for (const item of candidates) {
+    for (const item of orderedItems) {
+      if (status.get(item.id) !== "queued"
+        || !item.dependencies.every((id) => status.get(id) === "completed")
+        || !(predecessorsBySuccessor.get(item.id) ?? []).every((id) => isTerminal(status.get(id)))) continue;
       if (running.size >= maxParallel) break;
       const activeItems = [...running.keys()].map((id) => byId.get(id)).filter((value): value is ScheduledWorkItem => Boolean(value));
       if (activeItems.some((active) => claimsConflict(currentClaims.get(item.id) ?? [], currentClaims.get(active.id) ?? []))) continue;
       status.set(item.id, "running");
+      queuedCount--;
       startOrder.push(item.id);
       emit("started", item.id);
       const context: ScheduleWorkerContext = {
@@ -252,17 +309,46 @@ function comparePaths(left: readonly ScheduledWorkItem[], right: readonly Schedu
   return left.map((item) => item.issue).join(",").localeCompare(right.map((item) => item.issue).join(","));
 }
 
-export function validateGraph(items: readonly ScheduledWorkItem[]): void {
+function isTerminal(status: ScheduledStatus | undefined): boolean {
+  return status === "completed"
+    || status === "failed"
+    || status === "blocked"
+    || status === "skipped"
+    || status === "invalid";
+}
+
+function indexSerializationEdges(
+  edges: readonly ClaimSerializationEdge[],
+): Map<string, string[]> {
+  const predecessors = new Map<string, string[]>();
+  for (const edge of edges) {
+    const values = predecessors.get(edge.successor) ?? [];
+    values.push(edge.predecessor);
+    predecessors.set(edge.successor, values);
+  }
+  return predecessors;
+}
+
+export function validateGraph(
+  items: readonly ScheduledWorkItem[],
+  serializationEdges: readonly ClaimSerializationEdge[] = [],
+): void {
   const ids = new Set<string>();
   for (const item of items) {
     if (ids.has(item.id)) throw new Error(`Duplicate work item id: ${item.id}`);
     ids.add(item.id);
   }
+  const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
   for (const item of items) {
     for (const dependency of item.dependencies) {
       if (!ids.has(dependency)) throw new Error(`Unknown dependency ${dependency} for ${item.id}`);
       if (dependency === item.id) throw new Error(`Work item ${item.id} depends on itself`);
     }
+  }
+  for (const edge of serializationEdges) {
+    if (!ids.has(edge.predecessor)) throw new Error(`Unknown serialization predecessor ${edge.predecessor} for ${edge.successor}`);
+    if (!ids.has(edge.successor)) throw new Error(`Unknown serialization successor ${edge.successor} for ${edge.predecessor}`);
+    if (edge.predecessor === edge.successor) throw new Error(`Work item ${edge.successor} serializes against itself`);
   }
   const byId = new Map(items.map((item) => [item.id, item]));
   const visiting = new Set<string>();
@@ -272,7 +358,11 @@ export function validateGraph(items: readonly ScheduledWorkItem[]): void {
     if (visited.has(id)) return;
     visiting.add(id);
     const item = byId.get(id);
-    for (const dependency of item?.dependencies ?? []) visit(dependency, [...path, id]);
+    const predecessors = [
+      ...(item?.dependencies ?? []),
+      ...(predecessorsBySuccessor.get(id) ?? []),
+    ];
+    for (const dependency of new Set(predecessors)) visit(dependency, [...path, id]);
     visiting.delete(id);
     visited.add(id);
   };

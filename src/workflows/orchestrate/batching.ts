@@ -16,7 +16,9 @@ export interface BatchableWorkItem extends ScheduledWorkItem {
   /** Alias accepted at the boundary when an issue plan calls it `repo`. */
   repo?: string;
   targetBranch?: string;
-  lane?: { targetBranch: string; kind?: string };
+  lane?: "fast" | "feature";
+  promotionTarget?: string;
+  productionTarget?: string;
   urgencyTier?: "urgent" | "normal";
   milestone?: string | { number?: number; title: string };
   sourcePullRequest?: number;
@@ -136,12 +138,18 @@ export function contractBatchGroups(
       issue: issue.issue,
       title: issue.title,
       summary: issue.summary,
+      ...(group.members[0]?.repository !== undefined ? { repository: group.members[0].repository } : group.members[0]?.repo !== undefined ? { repo: group.members[0].repo } : {}),
       priority: Math.min(...group.members.map((member) => member.priority)),
       dependencies,
       claims,
       labels,
       affectedFiles,
       riskClass: group.riskClass,
+      ...(group.members[0]?.targetBranch !== undefined ? { targetBranch: group.members[0].targetBranch } : {}),
+      ...(group.members[0]?.lane !== undefined ? { lane: group.members[0].lane } : {}),
+      ...(group.members[0]?.promotionTarget !== undefined ? { promotionTarget: group.members[0].promotionTarget } : {}),
+      ...(group.members[0]?.productionTarget !== undefined ? { productionTarget: group.members[0].productionTarget } : {}),
+      ...(group.members[0]?.milestone !== undefined ? { milestone: group.members[0].milestone } : {}),
       memberIssues: uniqueNumbers(memberIssues),
     });
   }

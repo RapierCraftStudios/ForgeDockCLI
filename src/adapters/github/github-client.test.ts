@@ -71,6 +71,22 @@ describe("GitHub issue-search resolution", () => {
   });
 });
 
+describe("GitHub branch provisioning", () => {
+  it("creates a milestone branch from an authoritative default head and reconciles its SHA", async () => {
+    const client = new GitHubClient();
+    const calls: Array<{ args: string[]; input?: string }> = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+      calls.push({ args, ...(input !== undefined ? { input } : {}) });
+      if (args[0] === "api" && args[1] === "repos/a/b/git/ref/heads/main") return JSON.stringify({ object: { sha: "a".repeat(40) } });
+      if (args[0] === "api" && args[1] === "repos/a/b/git/refs") return "";
+      if (args[0] === "api" && args[1] === "repos/a/b/git/ref/heads/milestone%2Fship") return JSON.stringify({ object: { sha: "a".repeat(40) } });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    assert.deepEqual(await client.createBranch("a/b", "milestone/ship", "main"), { name: "milestone/ship", headSha: "a".repeat(40) });
+    assert.deepEqual(JSON.parse(calls.find(({ args }) => args[1] === "repos/a/b/git/refs")?.input ?? "{}"), { ref: "refs/heads/milestone/ship", sha: "a".repeat(40) });
+  });
+});
+
 describe("GitHub workflow label projection", () => {
   it("maps typed run states to the canonical legacy-compatible labels", () => {
     assert.equal(workflowLabelForState("investigating"), "workflow:investigating");

@@ -111,12 +111,25 @@ export interface ForgeHost {
     title: string;
     body: string;
   }): Promise<PullRequestSnapshot>;
+  /** Create a branch-to-branch promotion PR without inventing an issue subject. */
+  createPromotionPullRequest?(input: {
+    repo: string;
+    headBranch: string;
+    baseBranch: string;
+    title: string;
+    body: string;
+  }): Promise<PullRequestSnapshot>;
   findOpenPullRequest?(repo: string, headBranch: string): Promise<PullRequestSnapshot | undefined>;
+  findOpenPromotionPullRequest?(repo: string, headBranch: string, baseBranch: string): Promise<PullRequestSnapshot | undefined>;
+  /** Production promotion fails closed when branch protection cannot be proven. */
+  isBranchProtected?(repo: string, branch: string): Promise<boolean>;
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
   /** Read the Git ref directly when a PR projection may lag a successful push. */
   getBranchHead?(repo: string, branch: string): Promise<string>;
   /** Enumerate a bounded ref namespace for deterministic lane classification. */
   listBranches?(repo: string, prefix: string): Promise<BranchSnapshot[]>;
+  /** Create a branch ref from an authoritative existing branch head. */
+  createBranch?(repo: string, branch: string, fromBranch: string): Promise<BranchSnapshot>;
   getPullRequestDiff(repo: string, number: number): Promise<string>;
   /** Exact changed paths between two controller-reviewed commits, when the host can prove them. */
   getChangedPathsBetween?(repo: string, baseSha: string, headSha: string): Promise<readonly string[]>;

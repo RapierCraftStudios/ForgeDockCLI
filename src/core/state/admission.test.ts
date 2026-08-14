@@ -194,6 +194,22 @@ describe("subject run admission", () => {
     ], { rerun: true }), { action: "start" });
   });
 
+  it("rejects a recoverable checkpoint when its durable target is on another lane", () => {
+    const runId = "run_wrong_lane";
+    const build = createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: {
+        branch: "forgedock/issue-1", targetBranch: "main", headSha: "a".repeat(40),
+        changedPaths: ["docs/a.md"], summary: "built",
+        acceptanceEvidence: [{ criterion: "documented", status: "passed", evidence: "verified" }],
+        checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [],
+      },
+    });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), build], { currentTargetBranch: "staging" });
+    assert.equal(decision.action, "block");
+    if (decision.action === "block") assert.match(decision.reason, /targets main.*current issue lane targets staging.*--rerun/);
+  });
+
   it("resumes an interrupted build from its frozen durable packet", () => {
     const investigation = createArtifact({
       kind: "Investigation", runId: "run_build", subject, producer: { role: "investigator" },

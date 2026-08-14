@@ -317,6 +317,11 @@ async function runNestedReviewer<T>(
   const token = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
   if (!url || !token) throw new Error("Nested reviewer bridge is unavailable");
   const ownerRunId = task.id.split(":review:", 1)[0] ?? task.id;
+  // The controller's task ID is the logical reviewer identity. The nested
+  // delegation protocol also owns a live node by (ownerRunId, nodeId), so a
+  // timed-out fresh retry must not reuse the first attempt's node while its
+  // cancellation is still propagating through the child runtime.
+  const delegationNodeId = `forgedock-review-attempt-${crypto.randomUUID()}`;
   const provisionalSessionRef = `nested_pending_${crypto.randomUUID()}`;
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
   const response = await postNestedAgentRequest<{ output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean }>({
@@ -324,7 +329,8 @@ async function runNestedReviewer<T>(
     token,
     body: {
       ownerRunId,
-      id: task.id,
+      id: delegationNodeId,
+      logicalTaskId: task.id,
       role: task.role,
       ...(task.description ? { description: task.description } : {}),
       objective: task.objective,

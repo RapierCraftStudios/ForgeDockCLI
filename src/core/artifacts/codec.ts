@@ -94,7 +94,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     }
     case "BuildResult": {
       const payload = artifact.payload as BuildResultPayload;
-      return [heading, meta, "", `**Branch:** \`${payload.branch}\` · **Head:** \`${payload.headSha}\`${payload.baseSha ? ` · **Frozen base:** \`${payload.baseSha}\`` : ""}`, "", payload.summary,
+      return [heading, meta, "", `**Branch:** \`${payload.branch}\` · **Target:** \`${payload.targetBranch ?? "unset"}\`${payload.promotionTarget ? ` · **Promotion:** \`${payload.promotionTarget}\`` : ""}${payload.productionTarget ? ` · **Production:** \`${payload.productionTarget}\`` : ""} · **Head:** \`${payload.headSha}\`${payload.baseSha ? ` · **Frozen base:** \`${payload.baseSha}\`` : ""}`, "", payload.summary,
         listSection("Changed paths", payload.changedPaths.map(code)),
         checklistSection("Acceptance evidence", payload.acceptanceEvidence.map((item) => `${item.criterion} — ${item.status}: ${item.evidence}`), payload.acceptanceEvidence.map((item) => item.status === "passed")),
         checkTable(payload.checks),
@@ -127,7 +127,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
     }
     case "Outcome": {
       const payload = artifact.payload as OutcomePayload;
-      return [heading, meta, "", `**Status:** \`${payload.status}\``, "", payload.reason,
+      return [heading, meta, "", `**Status:** \`${payload.status}\`${payload.targetBranch ? ` · **Target:** \`${payload.targetBranch}\`` : ""}${payload.promotionTarget ? ` · **Promotion:** \`${payload.promotionTarget}\`` : ""}${payload.productionTarget ? ` · **Production:** \`${payload.productionTarget}\`` : ""}`, "", payload.reason,
         payload.finalSha ? `**Final SHA:** \`${payload.finalSha}\`` : "",
         payload.prUrl ? `**Pull request:** ${payload.prUrl}` : "",
         payload.failureEvidence ? [

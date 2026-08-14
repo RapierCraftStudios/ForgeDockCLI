@@ -5,6 +5,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Native orchestration now provisions missing canonical milestone branches only at explicit dispatch, keeps previews mutation-free, prevents stale DAG auto-resume, and distinguishes durable orchestration output from background-task output.
+- The orchestration scheduler now preserves deterministic priority order without repeatedly sorting or scanning the full queued set after every completion, while retaining dependency and claim-conflict semantics.
+- Preview confirmation now emits a compact first-line continuation record, permits an explicit tokenless continuation against the sole live checkpoint, and freezes the routed plan and policy against replay mutation.
+- Routed orchestration now carries authoritative decomposed-parent replacements into plan assembly, rebinding stale parent plan entries to leaf child issues before DAG validation.
+- Work-on now carries the latest durable review and verification learning into investigation, requires packet plans to map criteria to integration boundaries and regression checks, and makes builders self-review complete revisions before submission without weakening downstream review or verification.
+- Source-PR batch revalidation now accepts both `**Source:** PR #N` and `**Source**: PR #N` Markdown forms used by durable review-finding issues.
+
 ### Added
 
 - Provider-neutral typed ForgeDock runtime with durable v2 workflow artifacts, guarded state transitions, isolated worktrees, deterministic verification, GitHub projection, reconciliation, and resumable verification checkpoints.
@@ -12,9 +21,11 @@
 - Source-pinned ForgeDock Pi fork and packaged runtime staging with explicit provenance and fork policy.
 - Isolated live GitHub lifecycle probes covering investigation, Build Packet creation, build, verification, PR publication, parallel independent review, merge, closure, and cleanup.
 - Evidence-backed orchestration DAGs with deterministic priority ordering, claim-derived serialization edges, streaming ready-set dispatch, authoritative prerequisite admission, and real P2/P3 concern batching into one batch issue/work-on unit.
+- Explicit, durable branch promotion checkpoints for milestone lanes → staging and staging → protected production, with typed PR transport, frozen verification command/plan identity, independent review coverage, exact-SHA merge authorization, resume, cancellation, native `/promote`, and status inspection.
 - Automatic minimal `forge.yaml` bootstrap on normal parent-terminal launch, plus natural-language ForgeDock Next configuration with live-catalog model alias resolution and independent planning, worker, and reviewer model settings.
 - `FORGE.md` project guidance plus token-bounded, Obsidian-compatible `devdocs/` memory retrieval with anchors, links, and backlinks.
 - Native session-scoped background controller tasks for direct work/review runs, with task IDs, bounded log inspection, passive completion notices, cancellation, and shutdown cleanup—without another runtime dependency.
+- Native `/orchestrate` preview checkpoints now carry a short-lived continuation token so an explicit “proceed” resumes the exact reviewed scope once instead of looping through discovery, configuration changes, or stale DAG recovery.
 - A dependency-free, pi-native decision interview inspired by pi-ask: tabbed single/multi/preview questions, evidence-backed recommendations, number-key selection, inline custom answers, question/option notes, dirty-dismiss protection, and a Submit/Elaborate/Cancel review step.
 - Nested reviewer grandchildren now appear as selectable connector-tree rows in the fleet inspector, with `(+N agents)` summarized on their parent worker; each independent reviewer also publishes an idempotent provisional PR report while the consolidated controller verdict remains authoritative.
 - ForgeDock-owned renderer-neutral observability now journals typed workflow/run/artifact events, bounded stdout/stderr, attention, async/background/reviewer activity, durable workspace layouts, restart hydration, redaction, terminal-sequence sanitization, bounded backpressure markers, and guarded observer controls; the internal observer workspace is available through `/forgedock-observe`, with tmux retained as a future optional renderer.
@@ -30,7 +41,7 @@
 - Verification is serialized per machine, bounds Node test fanout, and terminates complete subprocess trees on timeout or cancellation to prevent orphaned Node workers and resource storms.
 - Bundled subagent artifacts use temp storage and are excluded from delivery diffs. Review routing now freezes an immutable, identified Review Plan before execution, separates risk capabilities from hard-bounded execution groups, preserves all mandatory dimensions through many-to-one grouping, and removes reviewer-finding-triggered topology expansion.
 - Same- and cross-reviewer finding proposals are normalized by acceptance criterion, authority boundary, and causal failure mode before policy/adjudication, with stable IDs and source/session lineage. Low-quality candidates are filtered before LLM scope adjudication; normal remediation retains blockers in the verdict and terminal materialization emits one bounded aggregate instead of an issue storm.
-- Reviewer recovery now permits at most two attempts under one stable logical group ID, resumes an exact persisted session first, and uses cancellation-aware, parallel-budgeted all-settled waves so successful sibling reports survive a failed peer without allowing partial approval. Frozen totals for reviewer attempts, model calls, and scope-adjudication attempts are now enforced rather than descriptive.
+- Reviewer recovery now permits at most two attempts under one stable logical group ID, resumes an exact persisted session first, and uses cancellation-aware, parallel-budgeted all-settled waves so successful sibling reports survive a failed peer without allowing partial approval. Fresh nested retries use unique wire node identities, preventing `duplicate_node` rejection while preserving the logical group. Frozen totals for reviewer attempts, model calls, and scope-adjudication attempts are now enforced rather than descriptive.
 - Automatic review remediation refuses changes outside the frozen Build Packet instead of widening scope and emitting oversized operational-artifact failure comments.
 - npm publication now reconciles already-published versions and retries version metadata pushes against current `main` rather than wedging after a concurrent push.
 - Direct terminal work/review runs background by default while orchestration children remain synchronously owned by their worker, preserving typed dependency and nested-review lifetimes.
@@ -45,7 +56,8 @@
 - GitHub API operations retry once after a configured GitHub App token refresh when an installation token expires during a long controller run, preserving the semantic checkpoint instead of failing on a transient 401.
 - npm publication triggers and changed-path guards now include both exact Pi submodule gitlinks and recursive Pi/staged-runtime paths, with focused regression coverage for both forms.
 - Initial visible DAG dispatch no longer converts stale `workflow:*` labels into checkpoint resumes; only explicit DAG recovery can resume a prior child run.
-- CLI and visible orchestration now persist parent DAG records, node dependencies/status/errors, and associated child run IDs in SQLite for durable status inspection.
+- CLI and visible orchestration now persist parent DAG records, node dependencies/status/errors, route metadata, and associated child run IDs in SQLite for durable status inspection.
+- Issue-delivery artifacts now retain target, feature-promotion, and protected-production route metadata across Build Results, Outcomes, RunState, and recovery validation.
 - Publication retries reconcile a PR created before a crash at the publication transition boundary instead of creating a duplicate.
 - Runtime startup now preflights the staged Pi HTTP dispatcher and its resolved `undici` entry before semantic work, smoke-loads the dispatcher, rejects stale bundle metadata, and reports incomplete npm trees as setup failures instead of late Build Packet/review failures. Managed worktrees validate direct package entrypoints, serialize dependency installation with a heartbeating lease, reuse verified installs, and repair partial trees deterministically.
 - Required verification now fail-closes unsupported executable plan steps, executes every frozen command instead of inferring success from package-script prose, validates the complete base-to-head delivery revision against frozen scope and builder reports before verification and again after commit, binds passing checks to stable file-content digests and raw committed blobs in a hook-disabled asserted Git tree, and automatically gives the retained in-packet implementation at most two evidence-backed repair attempts in the same lifecycle invocation—including post-review remediation without spending repair slots on interrupted dispatches or infrastructure spawn failures. Recovery selects runs and artifacts by durable publication order and preserves configured scope and remediation budgets across every checkpoint.

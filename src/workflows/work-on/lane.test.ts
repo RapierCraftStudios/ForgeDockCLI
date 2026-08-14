@@ -47,10 +47,11 @@ describe("issue lane classification", () => {
     const lane = classifyIssueLane(issue, "main", [
       branch("milestone/verifiable-workflow-authority-portability"),
       branch("milestone/unrelated"),
-    ]);
+    ], "staging", "staging");
     assert.equal(lane.kind, "feature");
     assert.equal(lane.targetBranch, "milestone/verifiable-workflow-authority-portability");
     assert.equal(lane.resolution, "canonical");
+    assert.equal(lane.promotionTarget, "staging");
   });
 
   it("follows an established pre-qualifier branch after a milestone title gains an ampersand suffix", () => {
@@ -130,6 +131,33 @@ describe("issue lane classification", () => {
     );
   });
 
+  it("can preview a canonical milestone lane before provisioning its branch", () => {
+    const lane = classifyIssueLane(issue, "main", [], "staging", "staging", "main", { allowMissingMilestoneBranch: true });
+    assert.equal(lane.kind, "feature");
+    assert.equal(lane.targetBranch, "milestone/verifiable-workflow-authority-portability");
+    assert.equal(lane.resolution, "planned-canonical");
+  });
+
+  it("provisions each missing milestone branch once from the default branch", async () => {
+    const calls: string[] = [];
+    let catalog: BranchSnapshot[] = [];
+    const branches = {
+      async listBranches() { return catalog; },
+      async getBranchHead(_repo: string, branchName: string) { calls.push(`head:${branchName}`); return sha; },
+      async createBranch(_repo: string, branchName: string, fromBranch: string) {
+        calls.push(`create:${branchName}<- ${fromBranch}`);
+        catalog = [...catalog, branch(branchName)];
+        return branch(branchName);
+      },
+    };
+    const created = await (await import("./lane.js")).provisionMissingMilestoneBranches([issue], "main", branches);
+    assert.deepEqual(created, ["milestone/verifiable-workflow-authority-portability"]);
+    assert.deepEqual(calls, [
+      "head:main",
+      "create:milestone/verifiable-workflow-authority-portability<- main",
+    ]);
+  });
+
   it("revalidates the selected remote ref before returning it", async () => {
     const reads: string[] = [];
     const lane = await resolveIssueLane(issue, "main", {
@@ -147,6 +175,19 @@ describe("issue lane classification", () => {
     assert.deepEqual(reads, ["a/b:milestone/verifiable-workflow-authority"]);
   });
 
+  it("freezes promotion and production targets and rejects policy drift", () => {
+    const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")], "staging", "staging");
+    const run = createRun({
+      workflow: "work-on",
+      subject: { repo: issue.repo, issue: issue.number },
+      target: runTargetForLane(feature, "main"),
+    });
+    assert.equal(run.promotionTarget, "staging");
+    assert.equal(run.productionTarget, "main");
+    assert.doesNotThrow(() => assertRunFollowsLane(run, feature, "main"));
+    assert.throws(() => assertRunFollowsLane(run, feature, "production"), /production target/);
+  });
+
   it("prevents a persisted run from crossing to a newly classified lane", () => {
     const fast = classifyIssueLane(issueWithoutMilestone, "main");
     const run = createRun({
@@ -154,7 +195,7 @@ describe("issue lane classification", () => {
       subject: { repo: issue.repo, issue: issue.number },
       target: runTargetForLane(fast),
     });
-    const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")]);
+    const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")], "staging", "staging");
     assert.throws(() => assertRunFollowsLane(run, feature), /refusing cross-lane continuation/);
   });
 });

@@ -78,6 +78,7 @@ export async function workOn(
     scopeExpansion?: "scope-locked" | "recursive";
     parentRemediation?: ParentRemediationTarget;
     maxReviewSpecialists?: number;
+    productionTarget?: string;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
@@ -145,8 +146,8 @@ export async function workOn(
       baseRef: `origin/${deliveryBranch}`,
     });
     const laneTarget = input.parentRemediation
-      ? { ...runTargetForLane(input.lane), targetBranch: input.parentRemediation.parentBranch }
-      : runTargetForLane(input.lane);
+      ? { ...runTargetForLane(input.lane, input.productionTarget), targetBranch: input.parentRemediation.parentBranch }
+      : runTargetForLane(input.lane, input.productionTarget);
     const investigated = await investigateWorkItem({
       intent: input.intent,
       ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
@@ -182,6 +183,7 @@ export async function workOn(
       run,
       intent: input.intent,
       investigation: investigated.investigation,
+      ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
       cwd: workspace.path,
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
       ...runtimeOptions,
@@ -204,6 +206,7 @@ export async function workOn(
       ...(input.scopeExpansion !== undefined ? { scopeExpansion: input.scopeExpansion } : {}),
       ...(input.parentRemediation !== undefined ? { parentRemediation: input.parentRemediation } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+      ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
       subjectEvidence: [...(input.subjectEvidence ?? []), laneEvidence(input.lane)],
       ...(input.batchMembers !== undefined ? { batchMembers: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { batchMemberContracts: input.batchMemberContracts } : {}),
@@ -245,6 +248,9 @@ async function appendVerificationRepairCheckpoint(
     payload: {
       status: "blocked",
       reason: `Verification repair attempt ${repairAttempt} dispatched: ${failure.payload.reason}`,
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
       childIssues: [],
       failureEvidence: { ...failureEvidence, repairAttempt },
     },
@@ -454,6 +460,7 @@ async function continueBuildDelivery(
     scopeExpansion?: "scope-locked" | "recursive";
     parentRemediation?: ParentRemediationTarget;
     maxReviewSpecialists?: number;
+    productionTarget?: string;
     subjectEvidence?: readonly string[];
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
@@ -1342,7 +1349,13 @@ async function appendFailureOutcome(run: RunState, reason: string, dependencies:
     runId: run.runId,
     subject: run.subject,
     producer: { role: "controller", runtime: "forgedock" },
-    payload: { status: "failed", reason, childIssues: [] },
+    payload: {
+      status: "failed", reason,
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+      childIssues: [],
+    },
   }));
 }
 
@@ -1427,7 +1440,13 @@ async function blockForBudget(run: RunState, dependencies: WorkOnDependencies, r
   const outcome = createArtifact({
     kind: "Outcome", runId: run.runId, subject: run.subject,
     producer: { role: "controller", runtime: "forgedock" },
-    payload: { status: "blocked", reason, childIssues: [] },
+    payload: {
+      status: "blocked", reason,
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+      childIssues: [],
+    },
   });
   await dependencies.artifacts.append(outcome);
   run = attachArtifact(run, "Outcome", outcome.id);

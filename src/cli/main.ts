@@ -21,7 +21,6 @@ import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
 import {
-  scopeManifestFor,
   scopeManifestForBuildPacket,
   STANDARD_SCOPE_METADATA_ROOTS,
   TelemetryAgentRuntime,
@@ -37,9 +36,10 @@ import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, spli
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
-import { assertRunFollowsLane, classifyIssueLane, laneEvidence, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
+import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
+import { promoteBranch, PromotionExecutionError } from "../workflows/promotion/promotion.js";
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
@@ -113,6 +113,10 @@ async function main(argv: string[]): Promise<void> {
       await reviewPr(argv.slice(1));
       return;
     }
+    if (command === "promote") {
+      await promote(argv.slice(1));
+      return;
+    }
     if (command === "reset") {
       await resetIssue(argv.slice(1));
       return;
@@ -139,6 +143,19 @@ async function status(argv: string[]): Promise<void> {
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   try {
+    if (argv.includes("--promotions")) {
+      const promotions = await store.listPromotions();
+      if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(promotions, null, 2)}\n`);
+      else {
+        process.stdout.write(`${renderHeader({ subtitle: "status · durable promotions" })}\n\n`);
+        if (!promotions.length) process.stdout.write("No durable promotions.\n");
+        for (const promotion of promotions) {
+          const pullRequest = promotion.pullRequest ? ` · PR #${promotion.pullRequest.number}` : "";
+          process.stdout.write(`${statusGlyph(promotion.phase === "completed" ? "passed" : promotion.phase === "failed" ? "failed" : "active", mode)} ${promotion.promotionId} · ${promotion.mode} · ${promotion.sourceBranch} → ${promotion.targetBranch} · ${promotion.phase}${pullRequest}\n`);
+        }
+      }
+      return;
+    }
     const orchestrationId = option(argv, "--orchestration");
     if (orchestrationId !== undefined) {
       const orchestration = await store.loadOrchestration(orchestrationId);
@@ -211,7 +228,7 @@ async function status(argv: string[]): Promise<void> {
       return;
     }
     process.stdout.write(`${renderHeader({ subtitle: "status · local operational cache" })}\n\n`);
-    process.stdout.write(`Effective orchestration: batching=${policy.batchingPolicy}, scope=${policy.scopeExpansion}, maxParallel=${policy.maxParallel}, remediation=${policy.maxRemediationCycles}/${policy.maxRemediationDepth}/${policy.maxRemediationChildren}\n`);
+    process.stdout.write(`Effective orchestration: batching=${policy.batchingPolicy}, scope=${policy.scopeExpansion}, dispatch=${policy.dispatchMode}, fast=${policy.fastLaneTarget ?? "repository-default"}, feature-promotion=${policy.featurePromotionTarget ?? "unset"}, production=${policy.productionTarget ?? "repository-default"}, maxParallel=${policy.maxParallel}, remediation=${policy.maxRemediationCycles}/${policy.maxRemediationDepth}/${policy.maxRemediationChildren}\n`);
     process.stdout.write(`Policy sources: ${Object.entries(policySources).map(([key, source]) => `${key}=${source}`).join(", ")}\n\n`);
     if (!runs.length) {
       process.stdout.write("No local runs. Durable semantic artifacts may still exist on GitHub.\n");
@@ -264,7 +281,7 @@ async function workOn(argv: string[]): Promise<void> {
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
-  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget);
+  const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget, effectiveOrchestration.featurePromotionTarget, effectiveOrchestration.productionTarget);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   let authoritativeArtifacts = new GitHubArtifactRepository(github);
@@ -334,7 +351,7 @@ async function workOn(argv: string[]): Promise<void> {
   let resumeCheckpoint: string | undefined;
   let resumeArtifacts: DurableArtifact[] = [];
   if (!dryRun) {
-    const admission = decideSubjectAdmission(priorArtifacts, { rerun: argv.includes("--rerun") });
+    const admission = decideSubjectAdmission(priorArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: deliveryTargetBranch });
     if (admission.action === "skip") {
       process.stdout.write(`${statusGlyph("passed", mode)} Existing run ${admission.runId} is already ${admission.state}; no duplicate run was created.\n`);
       return;
@@ -460,7 +477,8 @@ async function workOn(argv: string[]): Promise<void> {
     }, 20_000);
 
     if (resumeRunId) {
-      const admission = decideSubjectAdmission(resumeArtifacts);
+      const admission = decideSubjectAdmission(resumeArtifacts, { currentTargetBranch: deliveryTargetBranch });
+      if (admission.action === "block") throw new Error(admission.reason);
       if (admission.action !== "resume" || admission.runId !== resumeRunId) {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
       }
@@ -475,7 +493,7 @@ async function workOn(argv: string[]): Promise<void> {
         }
         const artifactIds: Partial<Record<ArtifactKind, string[]>> = {};
         for (const artifact of runArtifacts) artifactIds[artifact.kind] = [...(artifactIds[artifact.kind] ?? []), artifact.id];
-        const frozenTarget = runTargetForLane(lane);
+        const frozenTarget = runTargetForLane(lane, effectiveOrchestration.productionTarget);
         const recoveredRun = {
           schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
           state: "invalid" as const, attempt: 1, version: 0,
@@ -496,7 +514,7 @@ async function workOn(argv: string[]): Promise<void> {
           await store.rebuildRun(recoveredRun);
           run = recoveredRun;
         } else {
-          assertRunFollowsLane(run, lane);
+          assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
         }
         const finalized = await completeInvalidWorkItem({ run, investigation, outcome: invalidOutcome }, { host: github, artifacts });
         process.stdout.write(`${statusGlyph("passed", mode)} Resumed invalid run ${finalized.run.runId} · issue #${issue.number} is authoritatively closed\n`);
@@ -538,6 +556,19 @@ async function workOn(argv: string[]): Promise<void> {
           `Durable run target ${durableTargetBranch} conflicts with current issue lane target ${deliveryTargetBranch}; refusing cross-branch recovery`,
         );
       }
+      const durablePromotionTarget = retainedBuildResult?.payload.promotionTarget
+        ?? latestOutcome?.payload.failureEvidence?.promotionTarget
+        ?? (lane.kind === "feature" ? lane.promotionTarget : undefined);
+      const expectedPromotionTarget = lane.kind === "feature" ? lane.promotionTarget : undefined;
+      if (durablePromotionTarget !== expectedPromotionTarget) {
+        throw new Error(`Durable run promotion target ${durablePromotionTarget ?? "unset"} conflicts with current issue lane target ${expectedPromotionTarget ?? "unset"}; refusing cross-lane recovery`);
+      }
+      const durableProductionTarget = retainedBuildResult?.payload.productionTarget
+        ?? latestOutcome?.payload.failureEvidence?.productionTarget
+        ?? effectiveOrchestration.productionTarget;
+      if (durableProductionTarget !== effectiveOrchestration.productionTarget) {
+        throw new Error(`Durable run production target ${durableProductionTarget ?? "unset"} conflicts with configured target ${effectiveOrchestration.productionTarget ?? "unset"}; refusing policy drift during recovery`);
+      }
       const persistedBaseRef = latestOutcome?.payload.failureEvidence?.baseRef;
       const expectedBaseRef = `origin/${durableTargetBranch}`;
       if (persistedBaseRef !== undefined && persistedBaseRef !== expectedBaseRef) {
@@ -567,8 +598,8 @@ async function workOn(argv: string[]): Promise<void> {
         );
       }
       const frozenTarget = parentRemediation
-        ? { ...runTargetForLane(lane), targetBranch: parentRemediation.parentBranch }
-        : runTargetForLane(lane);
+        ? { ...runTargetForLane(lane, effectiveOrchestration.productionTarget), targetBranch: parentRemediation.parentBranch }
+        : runTargetForLane(lane, effectiveOrchestration.productionTarget);
       const recoveredRun = {
         schema: "forgedock.run/v1" as const, runId: resumeRunId, workflow: "work-on" as const, subject,
         state: admission.state,
@@ -592,7 +623,7 @@ async function workOn(argv: string[]): Promise<void> {
         await store.rebuildRun(recoveredRun);
         run = recoveredRun;
       } else if (run.targetBranch) {
-        assertRunFollowsLane(run, lane);
+        assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
       } else {
         run = { ...run, ...frozenTarget, scopeManifest: recoveredScopeManifest };
       }
@@ -655,6 +686,7 @@ async function workOn(argv: string[]): Promise<void> {
         remediationDepth: parentRemediation?.remediationDepth ?? 0,
         ...(parentRemediation !== undefined ? { parentRemediation } : {}),
         subjectEvidence,
+        ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
         ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
         ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
         autoMerge,
@@ -674,6 +706,7 @@ async function workOn(argv: string[]): Promise<void> {
           ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
           ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
           autoMerge,
+          ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
         }, dependencies)
         : admission.checkpoint === "build"
           ? await resumeBuildWorkOn(common, dependencies)
@@ -732,7 +765,7 @@ async function workOn(argv: string[]): Promise<void> {
     if (through === "investigate") {
       process.stdout.write(`${statusGlyph("active", mode)} Investigating ${issue.repo}#${issue.number} — ${issue.title}\n`);
       const result = await investigateWorkItem({
-        intent, priorArtifacts, cwd: process.cwd(), target: runTargetForLane(lane),
+        intent, priorArtifacts, cwd: process.cwd(), target: runTargetForLane(lane, effectiveOrchestration.productionTarget),
         scopeHints: {
           affectedFiles: affectedFilesFromIssueBody(issue.body),
           metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
@@ -771,6 +804,7 @@ async function workOn(argv: string[]): Promise<void> {
       ...(batchMembers.length ? { batchMembers } : {}),
       ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
       autoMerge,
+      ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
       scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
       maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
       maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
@@ -834,6 +868,105 @@ async function resetIssue(argv: string[]): Promise<void> {
   process.stdout.write(`Reset ${issue.repo}#${issue.number}; run ${latestRun.runId} is abandoned and audit comments are retained.\n`);
 }
 
+async function promote(argv: string[]): Promise<void> {
+  requirePiNodeVersion();
+  const resumeId = option(argv, "--resume");
+  const sourceOption = option(argv, "--from");
+  const targetOption = option(argv, "--to");
+  const provider = option(argv, "--provider");
+  const model = option(argv, "--model");
+  const outputMode = mode;
+  const authorizeCreation = argv.includes("--confirm");
+  const authorizeMerge = argv.includes("--authorize-merge");
+  const cancel = argv.includes("--cancel");
+  const cancellationReason = option(argv, "--reason");
+  if (authorizeMerge && !authorizeCreation && !resumeId) {
+    throw new Error("--authorize-merge requires --confirm for a fresh promotion; use --resume <promotion-id> for an existing PR");
+  }
+  if (cancel && !resumeId) throw new Error("--cancel requires --resume <promotion-id>");
+  if (cancel && (authorizeCreation || authorizeMerge)) throw new Error("--cancel cannot be combined with creation or merge authorization");
+  const configured = readForgeDockConfig(process.cwd());
+  const effective = resolveOrchestrationConfig(configured);
+  const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
+  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
+  const resumeRecord = resumeId ? await store.loadPromotion(resumeId) : undefined;
+  if (resumeId && !resumeRecord) throw new Error(`Unknown promotion ${resumeId}`);
+  const production = resumeRecord?.mode === "production" || argv.includes("--production");
+  const promotionMode = resumeRecord?.mode ?? (production ? "production" as const : "feature" as const);
+  const sourceBranch = sourceOption ?? resumeRecord?.sourceBranch ?? (production ? effective.featurePromotionTarget : undefined);
+  const targetBranch = targetOption ?? resumeRecord?.targetBranch ?? (production ? effective.productionTarget : effective.featurePromotionTarget);
+  if (!resumeId && (!sourceBranch || !targetBranch)) {
+    throw new Error(production
+      ? "Production promotion requires configured feature_promotion_target and production_target (or --from/--to)"
+      : "Feature promotion requires --from <milestone/branch> and configured feature_promotion_target (or --to)");
+  }
+  if (sourceBranch && targetBranch && sourceBranch === targetBranch) throw new Error("Promotion source and target branches must differ");
+  const host = new GitHubClient(process.cwd(), store);
+  const repository = await host.getRepository(option(argv, "--repo"));
+  const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(host), store);
+  const targetForChecks = targetBranch ?? resumeRecord?.targetBranch;
+  if (!targetForChecks) throw new Error("Promotion verification requires a resolved target branch");
+  const verification = resumeRecord || cancel
+    ? []
+    : discoverVerificationCommands(process.cwd(), `origin/${targetForChecks}`);
+  const runtime = createCliRuntime({
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+  }, store);
+  try {
+    if (authorizeCreation || authorizeMerge || resumeId) {
+      await preflightRuntime(runtime, {
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        role: "reviewer",
+      });
+    }
+    const result = await promoteBranch({
+      repository: repository.repo,
+      mode: promotionMode,
+      ...(sourceBranch !== undefined ? { sourceBranch } : {}),
+      ...(targetBranch !== undefined ? { targetBranch } : {}),
+      ...(effective.featurePromotionTarget !== undefined ? { configuredPromotionTarget: effective.featurePromotionTarget } : {}),
+      ...(effective.productionTarget !== undefined ? { configuredProductionTarget: effective.productionTarget } : {}),
+      cwd: process.cwd(),
+      verification,
+      ...(authorizeCreation ? { authorizeCreation: true } : {}),
+      ...(authorizeMerge ? { authorizeMerge: true } : {}),
+      ...(resumeId !== undefined ? { promotionId: resumeId } : {}),
+      ...(provider !== undefined ? { provider } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(cancel ? { cancel: true } : {}),
+      ...(cancellationReason !== undefined ? { cancellationReason } : {}),
+    }, {
+      host,
+      promotions: store,
+      artifacts,
+      runs: store,
+      workspaces: new GitWorktreeManager(process.cwd()),
+      verifier: new ProcessVerificationRunner(),
+      ...(configuredMaxReviewSpecialists() !== undefined ? { maxReviewSpecialists: configuredMaxReviewSpecialists()! } : {}),
+      runtime,
+      onAgentEvent: (event) => writeAgentEvent(event),
+    });
+    if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    else {
+      const pullRequest = result.pullRequest ? ` · PR ${result.pullRequest.url}` : "";
+      process.stdout.write(`${statusGlyph(result.phase === "completed" ? "passed" : result.phase === "failed" ? "failed" : "active", outputMode)} Promotion ${result.promotionId} · ${result.sourceBranch} → ${result.targetBranch} · ${result.phase}${pullRequest}\n`);
+      if (result.phase === "planned") process.stdout.write("Preview only. Re-run with --confirm to create the promotion PR.\n");
+      if (result.phase === "awaiting-merge") process.stdout.write("Review passed. Re-run with --resume <promotion-id> --authorize-merge to merge the exact reviewed SHA.\n");
+    }
+    if (result.phase !== "completed" && result.phase !== "awaiting-merge" && result.phase !== "planned" && result.phase !== "cancelled") process.exitCode = 2;
+  } catch (error) {
+    if (error instanceof PromotionExecutionError) {
+      process.stderr.write(`${statusGlyph("failed", outputMode)} Promotion ${error.record.promotionId} · ${error.record.phase}: ${error.message}\n`);
+    }
+    throw error;
+  } finally {
+    await runtime.close();
+    store.close();
+  }
+}
+
 async function reviewPr(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const prArg = argv.find((arg) => !arg.startsWith("-"));
@@ -888,7 +1021,7 @@ async function reviewPr(argv: string[]): Promise<void> {
 async function orchestrate(argv: string[]): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--confirm] [--rerun]");
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm|--auto] [--rerun]");
   const config = readForgeDockConfig(process.cwd());
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
@@ -907,23 +1040,34 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (remediationDepthValue !== undefined && !/^\d+$/.test(remediationDepthValue)) throw new Error("--max-remediation-depth must be a non-negative integer");
   if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
+  const dispatchMode = argv.includes("--confirm") || argv.includes("--auto") ? "authorized" : effective.dispatchMode;
+  const dispatchAuthorized = !argv.includes("--dry-run") && (dispatchMode === "authorized" || dispatchMode === "auto");
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
   let github = new GitHubClient(process.cwd());
   const repository = await github.getRepository();
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
-  const readAuthoritativeItems = async () => {
+  const readAuthoritativeItems = async (allowMissingMilestoneBranch = !dispatchAuthorized) => {
     const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
-    const milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
+    let milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
       ? await github.listBranches(repository.repo, "milestone/")
       : [];
+    if (!allowMissingMilestoneBranch && issueSnapshots.some((issue) => issue.milestone)) {
+      await provisionMissingMilestoneBranches(issueSnapshots, repository.defaultBranch, github);
+      milestoneBranches = await github.listBranches(repository.repo, "milestone/");
+    }
     const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
     for (const issue of issueSnapshots) {
       routedIssues.set(issue.number, {
         issue,
-        lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget),
+        lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget, {
+          ...(allowMissingMilestoneBranch ? { allowMissingMilestoneBranch: true } : {}),
+        }),
       });
     }
-    await Promise.all([...new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))]
+    await Promise.all([...new Set([...routedIssues.values()]
+      .map(({ lane }) => lane)
+      .filter((lane) => lane.resolution !== "planned-canonical")
+      .map((lane) => lane.targetBranch))]
       .map((branch) => github.getBranchHead(repository.repo, branch)));
     const items: BatchableWorkItem[] = baseItems.map((item) => {
       const observed = requiredIssueRoute(routedIssues, item.issue).issue;
@@ -933,6 +1077,9 @@ async function orchestrate(argv: string[]): Promise<void> {
         ...item,
         repository: repository.repo,
         targetBranch: lane.targetBranch,
+        lane: lane.kind,
+        ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+        ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         ...(observed.milestone ? { milestone: observed.milestone } : {}),
         labels: observed.labels,
         title: observed.title,
@@ -947,30 +1094,40 @@ async function orchestrate(argv: string[]): Promise<void> {
   let { items, routedIssues } = await readAuthoritativeItems();
   const priorityOption = option(argv, "--priority");
   const milestoneOption = option(argv, "--milestone");
-  const assembly = assembleWorkUnits(items, {
+  const assemblyOptions = {
     policy: effective.batchingPolicy,
     maxBatchSize: effective.maxBatchSize,
     maxSensitiveBatchSize: effective.maxSensitiveBatchSize,
     ...(priorityOption !== undefined ? { priorities: priorityOption.split(",") } : {}),
     ...(milestoneOption !== undefined ? { milestone: milestoneOption } : {}),
     ...(argv.includes("--no-milestone") ? { noMilestone: true } : {}),
-  });
+  };
+  let assembly = assembleWorkUnits(items, assemblyOptions);
   const virtualBase = Math.max(...issueNumbers) + 1;
   const virtualBatches = assembly.groups.map((group, index) => ({ groupId: group.id, issue: virtualBase + index, title: `Proposed batch ${index + 1}`, summary: "Proposed batch" }));
   const proposed = materializeClaimDependencies(contractBatchGroups(assembly.selected, assembly.groups, virtualBatches));
-  if (argv.includes("--dry-run")) {
+  if (argv.includes("--dry-run") || dispatchMode === "preview") {
+    process.stdout.write(`ForgeDock orchestration preview · dispatch_mode=${effective.dispatchMode}\n`);
     for (const item of proposed.items) {
-      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
-      process.stdout.write(`${item.id} · ${lane.kind} → ${lane.targetBranch} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
+      const route = routedIssues.get(item.issue);
+      const lane = route?.lane;
+      const target = item.targetBranch ?? lane?.targetBranch ?? "unknown-target";
+      process.stdout.write(`${item.id} · ${item.lane ?? lane?.kind ?? "unknown-lane"} → ${target} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
     }
     process.stdout.write(`batching=${assembly.policy.policy} groups=${assembly.groups.length} ungrouped=${assembly.ungrouped.length} excluded=${assembly.excluded.length}\n`);
+    process.stdout.write("Dispatch is disabled in preview mode. Re-run with --confirm/--auto or configure dispatch_mode: confirm|auto.\n");
     return;
   }
-  if (!argv.includes("--confirm")) throw new Error("orchestrate requires --confirm after the authoritative work-unit proposal (use --dry-run to inspect it)");
+  if (dispatchMode !== "authorized" && dispatchMode !== "confirm" && dispatchMode !== "auto") throw new Error(`Unsupported orchestration dispatch mode: ${dispatchMode}`);
+  if (dispatchMode === "confirm" && !argv.includes("--confirm")) throw new Error("orchestrate requires --confirm after the authoritative work-unit proposal (use --dry-run to inspect it)");
   // Confirmation is a boundary, not a freshness grant. Re-read every selected
   // issue before freezing the DAG so ungrouped work cannot dispatch stale body,
   // label, state, or lane evidence.
   ({ items, routedIssues } = await readAuthoritativeItems());
+  // Rebuild the pure proposal from the authoritative confirmation read. The
+  // initial preview is not a freshness grant and must not carry stale groups,
+  // claims, or route metadata into materialization.
+  assembly = assembleWorkUnits(items, assemblyOptions);
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
   const planning = configuredPlanningOptions(argv);
@@ -1004,8 +1161,12 @@ async function orchestrate(argv: string[]): Promise<void> {
         groups: assembly.groups,
         items,
         host: github,
-        expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, { targetBranch: value.lane.targetBranch, lane: value.lane.kind }])),
-      })
+        expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, {
+          targetBranch: value.lane.targetBranch,
+          lane: value.lane.kind,
+          ...(value.lane.kind === "feature" && value.lane.promotionTarget !== undefined ? { promotionTarget: value.lane.promotionTarget } : {}),
+          ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+        }])),      })
       : { groups: [], materialized: [], validatedItems: items };
     const contracted = materializedResult.validatedItems;
     for (const materialized of materializedResult.materialized) {
@@ -1035,15 +1196,23 @@ async function orchestrate(argv: string[]): Promise<void> {
       issueNumbers: [...issueNumbers],
       maxParallel: effective.maxParallel,
       autoMerge,
+      ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       status: "running",
       createdAt: orchestrationCreatedAt,
       updatedAt: orchestrationCreatedAt,
+      serializationEdges: scheduleItems.edges.map((edge) => ({
+        predecessor: edge.predecessor,
+        successor: edge.successor,
+        overlappingClaims: [...edge.overlappingClaims],
+      })),
       nodes: scheduleItems.items.map((item): OrchestrationNodeRecord => ({
         id: item.id,
         issue: item.issue,
         priority: item.priority,
         dependencies: [...item.dependencies],
         claims: [...item.claims],
+        ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
+        ...(item.productionTarget !== undefined ? { productionTarget: item.productionTarget } : {}),
         ...(item.affectedFiles ? { affectedFiles: [...item.affectedFiles] } : {}),
         ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
         ...(item.title ? { title: item.title } : {}),
@@ -1088,7 +1257,7 @@ async function orchestrate(argv: string[]): Promise<void> {
       }, 20_000);
       try {
         const subject = { repo: repository.repo, issue: item.issue };
-        const admission = decideSubjectAdmission(await artifacts.list(subject), { rerun: argv.includes("--rerun") });
+        const admission = decideSubjectAdmission(await artifacts.list(subject), { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue).lane.targetBranch });
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
           outcomes.set(item.id, admission.state);
@@ -1155,7 +1324,9 @@ async function orchestrate(argv: string[]): Promise<void> {
         try {
           result = await executeWorkOn({
             intent, repoPath: process.cwd(), lane,
-            verification, autoMerge, signal: controller.signal,
+            verification, autoMerge,
+            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+            signal: controller.signal,
             scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
             maxRemediationCycles: effective.maxRemediationCycles,
             maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
@@ -1215,10 +1386,12 @@ async function orchestrate(argv: string[]): Promise<void> {
         store.release(item.id, lease.token);
       }
     }, {
+      serializationEdges: scheduleItems.edges,
       onEvent: (scheduleEvent) => {
         const snapshot = buildOrchestrationSnapshot({
           orchestrationId,
           items: scheduleItems.items,
+          serializationEdges: scheduleItems.edges,
           result: { status: new Map(scheduleEvent.status), errors: new Map(scheduleEvent.errors) },
         });
         const nodes = orchestrationRecord.nodes.map((node) => {
@@ -1368,12 +1541,8 @@ function configuredPlanningOptions(argv: string[]): {
   const configured = readForgeDockConfig(process.cwd());
   const reference = option(argv, "--planning-model") ?? configured.planningModel ?? process.env.FORGEDOCK_PLANNING_MODEL;
   const planningThinkingValue = option(argv, "--planning-thinking") ?? configured.planningThinking ?? process.env.FORGEDOCK_PLANNING_THINKING;
-  if (planningThinkingValue !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(planningThinkingValue)) {
-    throw new Error(`Unsupported planning thinking level: ${planningThinkingValue}`);
-  }
-  if (reference !== undefined && !splitConfiguredModel(reference)) {
-    throw new Error(`Planning model must use provider/model form: ${reference}`);
-  }
+  if (planningThinkingValue !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(planningThinkingValue)) throw new Error(`Unsupported planning thinking level: ${planningThinkingValue}`);
+  if (reference !== undefined && !splitConfiguredModel(reference)) throw new Error(`Planning model must use provider/model form: ${reference}`);
   const selected = splitConfiguredModel(reference);
   return {
     ...(selected ? { planningProvider: selected.provider, planningModel: selected.model } : {}),
@@ -1530,12 +1699,13 @@ function requirePiNodeVersion(): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number]\n");
+  process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm] [--rerun]\n");
-  process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID]\n\n");
-  process.stdout.write("Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--planning-model provider/model] [--planning-thinking high] [--dry-run|--confirm|--auto] [--rerun]\n");
+  process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID | --promotions]\n\n");
+  process.stdout.write("Orchestration defaults to preview-only; use --confirm/--auto or forge.yaml dispatch_mode: confirm|auto to dispatch. Automatic merge is enabled by default after verification and independent approval; use --no-auto-merge or forge.yaml to require a human merge.\n");
   process.stdout.write("Model selection uses --provider/--model or PI_PROVIDER/PI_MODEL.\n");
 }

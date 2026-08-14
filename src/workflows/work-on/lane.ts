@@ -12,9 +12,11 @@ export type IssueLane =
   | {
     kind: "feature";
     targetBranch: string;
-    resolution: "canonical" | "stable-title-prefix";
+    resolution: "canonical" | "stable-title-prefix" | "planned-canonical";
     milestone: IssueMilestone;
     canonicalBranch: string;
+    /** Integration branch receiving this feature lane after review. */
+    promotionTarget?: string;
   };
 
 export interface ParentRemediationTarget {
@@ -33,6 +35,18 @@ export interface ParentRemediationTarget {
 export interface IssueLaneBranchReader {
   listBranches(repo: string, prefix: string): Promise<BranchSnapshot[]>;
   getBranchHead(repo: string, branch: string): Promise<string>;
+}
+
+export interface IssueLaneBranchProvisioner extends IssueLaneBranchReader {
+  createBranch?(repo: string, branch: string, fromBranch: string): Promise<BranchSnapshot>;
+}
+
+export interface LaneClassificationOptions {
+  /**
+   * Allow a dispatch preview to describe the branch it would create. This is
+   * never accepted by resolveIssueLane, which remains strict before delivery.
+   */
+  allowMissingMilestoneBranch?: boolean;
 }
 
 /**
@@ -55,9 +69,20 @@ export function classifyIssueLane(
   defaultBranch: string,
   milestoneBranches: readonly BranchSnapshot[] = [],
   fastLaneTarget = defaultBranch,
+  featurePromotionTarget?: string,
+  productionTarget?: string,
+  options: LaneClassificationOptions = {},
 ): IssueLane {
   assertBranchName(defaultBranch, "repository default branch");
   assertBranchName(fastLaneTarget, "configured fast-lane target");
+  if (featurePromotionTarget !== undefined) assertBranchName(featurePromotionTarget, "configured feature promotion target");
+  if (productionTarget !== undefined) assertBranchName(productionTarget, "configured production target");
+  if (productionTarget !== undefined && fastLaneTarget === productionTarget) {
+    throw new Error(`Configured fast-lane target ${fastLaneTarget} is the protected production target; configure an integration branch instead`);
+  }
+  if (productionTarget !== undefined && featurePromotionTarget === productionTarget) {
+    throw new Error(`Configured feature promotion target ${featurePromotionTarget} is the protected production target; use a separate integration branch`);
+  }
   const explicitSourceBranch = sourceBranchFromIssue(issue);
   if (explicitSourceBranch) {
     return { kind: "fast", targetBranch: explicitSourceBranch, resolution: "explicit-source-branch" };
@@ -90,6 +115,7 @@ export function classifyIssueLane(
       resolution: "canonical",
       milestone: issue.milestone,
       canonicalBranch,
+      ...(featurePromotionTarget !== undefined ? { promotionTarget: featurePromotionTarget } : {}),
     };
   }
 
@@ -106,6 +132,18 @@ export function classifyIssueLane(
       resolution: "stable-title-prefix",
       milestone: issue.milestone,
       canonicalBranch,
+      ...(featurePromotionTarget !== undefined ? { promotionTarget: featurePromotionTarget } : {}),
+    };
+  }
+
+  if (options.allowMissingMilestoneBranch) {
+    return {
+      kind: "feature",
+      targetBranch: canonicalBranch,
+      resolution: "planned-canonical",
+      milestone: issue.milestone,
+      canonicalBranch,
+      ...(featurePromotionTarget !== undefined ? { promotionTarget: featurePromotionTarget } : {}),
     };
   }
 
@@ -123,16 +161,18 @@ export async function resolveIssueLane(
   defaultBranch: string,
   branches: IssueLaneBranchReader,
   fastLaneTarget = defaultBranch,
+  featurePromotionTarget?: string,
+  productionTarget?: string,
 ): Promise<IssueLane> {
   const catalog = issue.milestone ? await branches.listBranches(issue.repo, "milestone/") : [];
-  const lane = classifyIssueLane(issue, defaultBranch, catalog, fastLaneTarget);
+  const lane = classifyIssueLane(issue, defaultBranch, catalog, fastLaneTarget, featurePromotionTarget, productionTarget);
   await branches.getBranchHead(issue.repo, lane.targetBranch);
   return lane;
 }
 
 export function laneEvidence(lane: IssueLane): string {
   return lane.kind === "feature"
-    ? `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution}).`
+    ? `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution})${lane.resolution === "planned-canonical" ? "; branch will be provisioned from the repository default before dispatch" : ""}${lane.promotionTarget ? `; promotion target ${lane.promotionTarget}` : ""}.`
     : lane.resolution === "explicit-source-branch"
       ? `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`
       : lane.resolution === "configured-fast-lane"
@@ -140,15 +180,58 @@ export function laneEvidence(lane: IssueLane): string {
         : `Fast lane: no milestone targets repository default branch ${lane.targetBranch}.`;
 }
 
-export function runTargetForLane(lane: IssueLane): RunTarget {
+export function missingMilestoneBranchForIssue(
+  issue: Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">,
+  milestoneBranches: readonly BranchSnapshot[],
+): { branch: string; milestone: IssueMilestone } | undefined {
+  if (!issue.milestone || sourceBranchFromIssue(issue)) return undefined;
+  const canonicalSlug = sanitizeMilestoneSlug(issue.milestone.title);
+  if (!canonicalSlug) return undefined;
+  const canonicalBranch = `milestone/${canonicalSlug}`;
+  const branchNames = new Set(milestoneBranches.map((branch) => branch.name));
+  if (branchNames.has(canonicalBranch)) return undefined;
+  const stableSlug = issue.milestone.title.trim().split(/\s+&\s+/u, 1)[0] ?? issue.milestone.title;
+  const stableBranch = `milestone/${sanitizeMilestoneSlug(stableSlug)}`;
+  if (stableBranch !== canonicalBranch && branchNames.has(stableBranch)) return undefined;
+  return { branch: canonicalBranch, milestone: issue.milestone };
+}
+
+export async function provisionMissingMilestoneBranches(
+  issues: readonly Pick<IssueSnapshot, "repo" | "number" | "milestone" | "body" | "labels">[],
+  defaultBranch: string,
+  branches: IssueLaneBranchProvisioner,
+): Promise<readonly string[]> {
+  if (!issues.length) return [];
+  const repo = issues[0]?.repo;
+  if (!repo) return [];
+  const catalog = await branches.listBranches(repo, "milestone/");
+  const missing = [...new Map(issues
+    .map((issue) => missingMilestoneBranchForIssue(issue, catalog))
+    .filter((value): value is { branch: string; milestone: IssueMilestone } => value !== undefined)
+    .map((value) => [value.branch, value])).values()];
+  if (!missing.length) return [];
+  if (!branches.createBranch) {
+    throw new Error(`Milestone branch provisioning is unavailable; create ${missing.map((value) => value.branch).join(", ")} from ${defaultBranch} before dispatch`);
+  }
+  await branches.getBranchHead(repo, defaultBranch);
+  for (const value of missing) await branches.createBranch(repo, value.branch, defaultBranch);
+  const refreshed = await branches.listBranches(repo, "milestone/");
+  const missingAfter = missing.filter((value) => !refreshed.some((branch) => branch.name === value.branch));
+  if (missingAfter.length) throw new Error(`Milestone branch provisioning did not become authoritative: ${missingAfter.map((value) => value.branch).join(", ")}`);
+  return missing.map((value) => value.branch);
+}
+
+export function runTargetForLane(lane: IssueLane, productionTarget?: string): RunTarget {
   return {
     lane: lane.kind,
     targetBranch: lane.targetBranch,
+    ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+    ...(productionTarget !== undefined ? { productionTarget } : {}),
     ...(lane.kind === "feature" ? { milestone: lane.milestone } : {}),
   };
 }
 
-export function assertRunFollowsLane(run: RunState, lane: IssueLane): void {
+export function assertRunFollowsLane(run: RunState, lane: IssueLane, productionTarget?: string): void {
   if (!run.targetBranch || !run.lane) {
     throw new Error(`Run ${run.runId} has no frozen lane target and cannot perform branch-authoritative delivery`);
   }
@@ -156,6 +239,13 @@ export function assertRunFollowsLane(run: RunState, lane: IssueLane): void {
     throw new Error(
       `Run ${run.runId} is frozen to ${run.lane}:${run.targetBranch}, but issue #${run.subject.issue ?? "?"} currently classifies to ${lane.kind}:${lane.targetBranch}; refusing cross-lane continuation`,
     );
+  }
+  const expectedPromotionTarget = lane.kind === "feature" ? lane.promotionTarget : undefined;
+  if (run.promotionTarget !== expectedPromotionTarget) {
+    throw new Error(`Run ${run.runId} promotion target ${run.promotionTarget ?? "unset"} no longer matches issue lane target ${expectedPromotionTarget ?? "unset"}`);
+  }
+  if (run.productionTarget !== productionTarget) {
+    throw new Error(`Run ${run.runId} production target ${run.productionTarget ?? "unset"} no longer matches configured target ${productionTarget ?? "unset"}`);
   }
   if (lane.kind === "feature" && run.milestone?.number !== lane.milestone.number) {
     throw new Error(`Run ${run.runId} milestone identity no longer matches issue #${run.subject.issue ?? "?"}`);
