@@ -11,7 +11,7 @@ import { AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, freezeReviewPlan, planReviewPanel, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -255,7 +255,9 @@ export async function reviewPullRequest(
       : [];
     const runReviewer = async (selection: ReviewPlan["executionGroups"][number]) => {
       const role = selection.role;
-      const roleDiff = scopedReviewDiff(reviewPlan, role, diff);
+      const roleDiff = scopedReviewDiff(reviewPlan, role, diff, input.deployment
+        ? { maxInitialDiffChars: DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS }
+        : undefined);
       let priorFailure: string | undefined;
       let resumeSessionRef: string | undefined;
       let completed: { role: ReviewerRole; output: ReviewerSubmission; sessionRef: string; sessionLineage: readonly string[] } | undefined;

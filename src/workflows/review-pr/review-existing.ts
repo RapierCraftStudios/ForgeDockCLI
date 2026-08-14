@@ -107,7 +107,10 @@ async function reviewDeploymentPullRequest(
       workspace: workspace.path,
       ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),
       ...(input.input.model !== undefined ? { model: input.input.model } : {}),
-      ...(input.input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.input.maxReviewSpecialists } : {}),
+      // Deployment diffs are often repository-wide. Pack specialist
+      // capabilities into one independent group by default so the provider
+      // is not asked to process several near-identical giant contexts at once.
+      maxReviewSpecialists: input.input.maxReviewSpecialists ?? 1,
       ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
     }, {
       runtime: dependencies.runtime,

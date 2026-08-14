@@ -192,6 +192,8 @@ describe("evidence-backed review planning", () => {
     const plan = planReviewPanel({ changedPaths: ["src/first.ts", "src/last.ts"], diff, packet: packet() });
     const bounded = scopedReviewDiff(plan, "correctness", diff);
     assert.ok(bounded.length <= 160_000);
+    const deploymentBounded = scopedReviewDiff(plan, "correctness", diff, { maxInitialDiffChars: 60_000 });
+    assert.ok(deploymentBounded.length <= 60_000);
     assert.match(bounded, /src\/first\.ts/);
     assert.match(bounded, /src\/last\.ts/);
     assert.match(bounded, /read\/grep/);

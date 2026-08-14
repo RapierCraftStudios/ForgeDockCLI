@@ -109,6 +109,7 @@ const CAPABILITY_BY_ROLE: Record<ReviewerRole, ReviewCapabilityId> = {
 const SELECTION_THRESHOLD = 60;
 const DEFAULT_SPECIALIST_BUDGET = 3;
 const MAX_INITIAL_REVIEW_DIFF_CHARS = 160_000;
+export const DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS = 60_000;
 
 const SECURITY = /\b(?:auth(?:entication|orization)?|capabilit(?:y|ies)|crypt(?:o|ographic|ography)|signature|trust root|permission|privilege|secret|credential|token|replay|tamper|revocation)\b/i;
 const DATA = /\b(?:database|migration|sql|storage|persist(?:ed|ence|ent)?|canonical(?:ization| bytes?)?|schema registry|payload schema|encoding|portable bundle|manifest|digest format)\b/i;
@@ -359,19 +360,25 @@ export function assertReviewPlan(plan: ReviewPlan): void {
   }
 }
 
-export function scopedReviewDiff(plan: ReviewPlan, role: ReviewerRole, diff: string): string {
+export function scopedReviewDiff(
+  plan: ReviewPlan,
+  role: ReviewerRole,
+  diff: string,
+  options: { maxInitialDiffChars?: number } = {},
+): string {
   const sections = parseDiffSections(diff);
-  if (role === "correctness" || role === "security") return boundInitialDiff(diff, sections);
+  const maximumChars = options.maxInitialDiffChars ?? MAX_INITIAL_REVIEW_DIFF_CHARS;
+  if (role === "correctness" || role === "security") return boundInitialDiff(diff, sections, maximumChars);
   const selection = plan.executionGroups.find((item) => item.role === role);
-  if (!selection?.scope.length || !sections.length) return boundInitialDiff(diff, sections);
+  if (!selection?.scope.length || !sections.length) return boundInitialDiff(diff, sections, maximumChars);
   const wanted = new Set(selection.scope.map(normalizePath));
   const scoped = sections.filter((section) => wanted.has(normalizePath(section.path)));
-  if (!scoped.length || scoped.length === sections.length) return boundInitialDiff(diff, sections);
+  if (!scoped.length || scoped.length === sections.length) return boundInitialDiff(diff, sections, maximumChars);
   return boundInitialDiff([
     `# Reviewer-scoped diff (${scoped.length}/${sections.length} changed files)`,
     ...scoped.map((section) => section.text),
     "# Other changed files were omitted from the initial slice; follow evidence into them with read/grep when required.",
-  ].join("\n"), scoped);
+  ].join("\n"), scoped, maximumChars);
 }
 
 function buildSpecialistExecutionGroups(
@@ -415,11 +422,11 @@ function groupAffinity(existing: readonly ReviewCapabilityId[], incoming: Review
   return compatibility.some((set) => set.has(incoming) && existing.some((capability) => set.has(capability))) ? 1 : 0;
 }
 
-function boundInitialDiff(diff: string, sections: readonly DiffSection[]): string {
-  if (diff.length <= MAX_INITIAL_REVIEW_DIFF_CHARS) return diff;
-  if (!sections.length) return `${diff.slice(0, MAX_INITIAL_REVIEW_DIFF_CHARS - 160)}\n\n# Initial diff truncated; inspect the frozen workspace with read/grep for complete evidence.`;
-  const overhead = 8_000;
-  const perSection = Math.max(24, Math.floor((MAX_INITIAL_REVIEW_DIFF_CHARS - overhead) / sections.length));
+function boundInitialDiff(diff: string, sections: readonly DiffSection[], maximumChars: number): string {
+  if (diff.length <= maximumChars) return diff;
+  if (!sections.length) return `${diff.slice(0, maximumChars - 160)}\n\n# Initial diff truncated; inspect the frozen workspace with read/grep for complete evidence.`;
+  const overhead = Math.min(8_000, Math.floor(maximumChars / 4));
+  const perSection = Math.max(24, Math.floor((maximumChars - overhead) / sections.length));
   const chunks = sections.map((section) => {
     if (section.text.length <= perSection) return section.text;
     const marker = `\n# … ${section.path} truncated; read frozen file.`;
@@ -427,7 +434,7 @@ function boundInitialDiff(diff: string, sections: readonly DiffSection[]): strin
   });
   const note = "# Initial diff was size-bounded across all changed files; inspect the frozen workspace with read/grep before concluding on omitted hunks.";
   const result = [...chunks, note].join("\n");
-  return result.length <= MAX_INITIAL_REVIEW_DIFF_CHARS ? result : `${result.slice(0, MAX_INITIAL_REVIEW_DIFF_CHARS - note.length - 2)}\n${note}`;
+  return result.length <= maximumChars ? result : `${result.slice(0, maximumChars - note.length - 2)}\n${note}`;
 }
 
 export function parseDiffPaths(diff: string): string[] {
