@@ -57,6 +57,7 @@
 
 ### Fixed
 
+- Standalone review now supports staging→main deployment PRs without an originating issue or BuildResult, while freezing the PR SHA and required-check gate before dispatch.
 - Terminal review-finding projection now runs only after the complete reviewer wave, uses stricter cross-reviewer paraphrase deduplication and stable aggregate identity, and adopts one open PR-lane issue instead of creating a duplicate when a root set changes; duplicate lane projections are reconciled afterward.
 - Post-remediation findings can no longer claim introduction from cumulative Build Result paths or generic current route facts; only exact prior-reviewed-SHA delta paths, explicit changed authority facts, or accepted prior-finding lineage preserve blocking continuity.
 - Finding consolidation derives policy-bearing severity, confidence, scope, and corroboration from qualifying source attestations, preventing low-confidence or rejected duplicates from laundering another source into a blocker.

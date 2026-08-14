@@ -43,6 +43,15 @@ const ScopeAdjudicationSchema = Type.Object({
 type ScopeAdjudication = Static<typeof ScopeAdjudicationSchema>;
 export type { ReviewerRole } from "./planner.js";
 export type FindingIssuePolicy = "all" | "approved-only" | "none";
+export type ReviewChecks = DurableArtifact<"BuildResult">["payload"]["checks"];
+
+export interface DeploymentReviewEvidence {
+  headSha: string;
+  headBranch: string;
+  baseBranch: string;
+  changedPaths: readonly string[];
+  checks: ReviewChecks;
+}
 
 export const DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
@@ -121,7 +130,8 @@ export async function reviewPullRequest(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
-    buildResult: DurableArtifact<"BuildResult">;
+    buildResult?: DurableArtifact<"BuildResult">;
+    deployment?: DeploymentReviewEvidence;
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
     reviewCycle?: { current: number; total: number };
     workspace: string;
@@ -159,18 +169,35 @@ export async function reviewPullRequest(
         // Progress is operational projection data and must not change workflow authority.
       }
     };
-    const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
-    if (frozen.headSha !== input.pullRequest.headSha || frozen.headSha !== input.buildResult.payload.headSha) {
-      throw new Error("Cannot start review: PR head does not match the verified Build Result");
+    if (input.buildResult === undefined && input.deployment === undefined) {
+      throw new Error("Review requires a verified Build Result or deployment review evidence");
     }
-    const buildTargetBranch = input.buildResult.payload.targetBranch ?? input.run.targetBranch;
-    const expectedDeliveryRunId = input.deliveryRunId ?? input.run.runId;
-    if (input.buildResult.runId !== expectedDeliveryRunId
+    if (input.buildResult !== undefined && input.deployment !== undefined) {
+      throw new Error("Review cannot combine Build Result and deployment review evidence");
+    }
+    const expectedHeadSha = input.buildResult?.payload.headSha ?? input.deployment?.headSha;
+    const changedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
+    if (!expectedHeadSha || !changedPaths) throw new Error("Review evidence is missing its head SHA or changed paths");
+    const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+    if (frozen.headSha !== input.pullRequest.headSha || frozen.headSha !== expectedHeadSha) {
+      throw new Error(input.deployment
+        ? "Cannot start deployment review: PR head changed before review"
+        : "Cannot start review: PR head does not match the verified Build Result");
+    }
+    const buildTargetBranch = input.buildResult?.payload.targetBranch ?? input.run.targetBranch ?? input.deployment?.baseBranch;
+    const expectedDeliveryRunId = input.deliveryRunId ?? input.buildResult?.runId ?? input.run.runId;
+    if (!buildTargetBranch) throw new Error("Review evidence is missing its target branch");
+    if (input.buildResult && (
+      input.buildResult.runId !== expectedDeliveryRunId
       || input.buildResult.subject.repo !== input.run.subject.repo
       || input.buildResult.subject.issue !== input.run.subject.issue
       || input.buildResult.payload.branch !== frozen.headBranch
-      || buildTargetBranch !== frozen.baseBranch) {
+      || buildTargetBranch !== frozen.baseBranch
+    )) {
       throw new Error("Cannot start review: PR branches or run identity do not match the verified Build Result delivery route");
+    }
+    if (input.deployment && (input.deployment.headBranch !== frozen.headBranch || input.deployment.baseBranch !== frozen.baseBranch)) {
+      throw new Error("Cannot start deployment review: PR branches changed before review");
     }
     const planContext: Omit<ReviewPlanContext, "packetId" | "packetDigest"> = {
       runId: input.run.runId,
@@ -178,9 +205,9 @@ export async function reviewPullRequest(
       ...(input.run.subject.issue !== undefined ? { issue: input.run.subject.issue } : {}),
       pullRequest: frozen.number,
       deliveryRunId: expectedDeliveryRunId,
-      buildResultBranch: input.buildResult.payload.branch,
+      buildResultBranch: input.buildResult?.payload.branch ?? input.deployment?.headBranch ?? frozen.headBranch,
       targetBranch: buildTargetBranch,
-      ...(input.buildResult.payload.baseSha !== undefined ? { baseSha: input.buildResult.payload.baseSha } : {}),
+      ...(input.buildResult?.payload.baseSha !== undefined ? { baseSha: input.buildResult.payload.baseSha } : {}),
     };
     const priorRevisionPaths = await assertPriorVerdictAuthority(input.priorVerdict, {
       run: input.run,
@@ -196,7 +223,7 @@ export async function reviewPullRequest(
     })
       ? freezeReviewPlan(priorReviewPlan)
       : planReviewPanel({
-        changedPaths: input.buildResult.payload.changedPaths,
+        changedPaths,
         diff,
         packet: input.packet,
         context: planContext,
@@ -208,7 +235,7 @@ export async function reviewPullRequest(
     const reviewerRoles = reviewPlan.executionGroups.map((selection) => selection.role);
     const reviewDescription = (role: string): string => [
       `ForgeDock review · cycle ${reviewCycle.current}/${reviewCycle.total} · ${role}`,
-      `BuildResult ${input.buildResult.createdAt}`,
+      input.buildResult ? `BuildResult ${input.buildResult.createdAt}` : "deployment review evidence captured from PR metadata and required checks",
       input.priorVerdict ? `previous ReviewVerdict ${input.priorVerdict.createdAt}` : "no previous ReviewVerdict",
       `remediation remaining ${Math.max(0, reviewCycle.total - reviewCycle.current)}`,
     ].join(" · ");
@@ -223,7 +250,9 @@ export async function reviewPullRequest(
       remainingModelCalls--;
     };
     const remediationDeltaPaths = input.priorVerdict?.payload.disposition === "request_changes" ? priorRevisionPaths : [];
-    const changedRemediationAuthorityReferences = changedDeliveryAuthorityFacts(input.priorVerdict, frozen, input.buildResult, buildTargetBranch);
+    const changedRemediationAuthorityReferences = input.buildResult
+      ? changedDeliveryAuthorityFacts(input.priorVerdict, frozen, input.buildResult, buildTargetBranch)
+      : [];
     const runReviewer = async (selection: ReviewPlan["executionGroups"][number]) => {
       const role = selection.role;
       const roleDiff = scopedReviewDiff(reviewPlan, role, diff);
@@ -247,7 +276,7 @@ export async function reviewPullRequest(
               activeChild: role,
               reviewerRoles,
               latestArtifacts: {
-                buildResult: input.buildResult.createdAt,
+                buildResult: input.buildResult?.createdAt ?? `deployment:${frozen.headSha}`,
                 ...(input.priorVerdict ? { reviewVerdict: input.priorVerdict.createdAt } : {}),
               },
               remainingRemediationCycles: Math.max(0, reviewCycle.total - reviewCycle.current),
@@ -280,12 +309,18 @@ export async function reviewPullRequest(
               `Attempt ${attempt}/${reviewPlan.budget.maxAttemptsPerExecutionGroup} under the same logical task ID; attempts are not separate reviewers.`,
               `Your execution-group role is ${role}; cover capabilities ${selection.capabilities.join(", ")}.`,
             ].join("\n"),
-            context: [input.intent, input.investigation, input.packet, input.buildResult, ...(input.priorVerdict ? [input.priorVerdict] : [])],
+            context: [
+              input.intent,
+              input.investigation,
+              input.packet,
+              ...(input.buildResult ? [input.buildResult] : []),
+              ...(input.priorVerdict ? [input.priorVerdict] : []),
+            ],
             workspace: {
               cwd: input.workspace,
               mode: "read-only",
               scope: scopeManifestFor("build-packet", {
-                affectedFiles: [...input.packet.payload.expectedPaths, ...input.buildResult.payload.changedPaths],
+                affectedFiles: [...input.packet.payload.expectedPaths, ...changedPaths],
                 metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
               }),
             },
@@ -386,15 +421,21 @@ export async function reviewPullRequest(
     const blocking = new Set<ReviewerSubmission["findings"][number]["severity"]>(input.blockingSeverities ?? ["critical", "high", "medium"]);
     const verifiedAuthorityReferences = [
       `PR.headSha=${frozen.headSha}`, `PR.headBranch=${frozen.headBranch}`, `PR.baseBranch=${frozen.baseBranch}`,
-      `BuildResult.headSha=${input.buildResult.payload.headSha}`, `BuildResult.branch=${input.buildResult.payload.branch}`,
-      `BuildResult.targetBranch=${buildTargetBranch}`,
+      ...(input.buildResult
+        ? [
+          `BuildResult.headSha=${input.buildResult.payload.headSha}`,
+          `BuildResult.branch=${input.buildResult.payload.branch}`,
+          `BuildResult.targetBranch=${buildTargetBranch}`,
+        ]
+        : [`DeploymentReview.headSha=${frozen.headSha}`, `DeploymentReview.targetBranch=${buildTargetBranch}`]),
       ...changedRemediationAuthorityReferences,
     ];
-    const verifiedCheckReferences = input.buildResult.payload.checks
+    const reviewChecks = input.buildResult?.payload.checks ?? input.deployment?.checks ?? [];
+    const verifiedCheckReferences = reviewChecks
       .filter((check) => check.status === "failed")
-      .map((check) => `BuildResult.check=${check.command}:${check.status}`);
+      .map((check) => `${input.buildResult ? "BuildResult" : "DeploymentReview"}.check=${check.command}:${check.status}`);
     const consolidated = consolidateReviewerFindings(reviewerResults, blocking, {
-      reviewedPaths: input.buildResult.payload.changedPaths,
+      reviewedPaths: changedPaths,
       expectedPaths: input.packet.payload.expectedPaths,
       verifiedAuthorityReferences,
       verifiedCheckReferences,
@@ -409,7 +450,7 @@ export async function reviewPullRequest(
     const adjudication = adjudicationCandidates.length
       ? await adjudicateFindingScope({
         run, headSha: frozen.headSha, intent: input.intent, investigation: input.investigation,
-        packet: input.packet, buildResult: input.buildResult, findings: adjudicationCandidates, workspace: input.workspace,
+        packet: input.packet, ...(input.buildResult ? { buildResult: input.buildResult } : {}), findings: adjudicationCandidates, workspace: input.workspace,
         ...(input.priorVerdict ? { priorVerdict: input.priorVerdict } : {}),
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
@@ -459,7 +500,7 @@ export async function reviewPullRequest(
         disposition,
         reviewerRoles: roles,
         findings,
-        checks: input.buildResult.payload.checks,
+        checks: input.buildResult?.payload.checks ?? input.deployment?.checks ?? [],
         reviewPlan,
         ...(adjudication ? {
           scopeAdjudication: { sessionRef: adjudication.sessionRef, decisions: adjudication.output.decisions },
@@ -577,7 +618,7 @@ function isReusableFrozenReviewPlan(
 function changedDeliveryAuthorityFacts(
   priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined,
   pullRequest: PullRequestSnapshot,
-  buildResult: DurableArtifact<"BuildResult">,
+  buildResult: DurableArtifact<"BuildResult"> | undefined,
   targetBranch: string,
 ): string[] {
   if (!priorVerdict) return [];
@@ -589,7 +630,7 @@ function changedDeliveryAuthorityFacts(
     facts.push(`ReviewVerdict.baseBranch=${priorVerdict.payload.baseBranch}->PR.baseBranch=${pullRequest.baseBranch}`);
   }
   const priorContext = priorVerdict.payload.reviewPlan?.context;
-  if (priorContext?.buildResultBranch !== undefined && priorContext.buildResultBranch !== buildResult.payload.branch) {
+  if (buildResult && priorContext?.buildResultBranch !== undefined && priorContext.buildResultBranch !== buildResult.payload.branch) {
     facts.push(`BuildResult.branch=${priorContext.buildResultBranch}->${buildResult.payload.branch}`);
   }
   if (priorContext?.targetBranch !== undefined && priorContext.targetBranch !== targetBranch) {
@@ -645,7 +686,7 @@ async function adjudicateFindingScope(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
-    buildResult: DurableArtifact<"BuildResult">;
+    buildResult?: DurableArtifact<"BuildResult">;
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
     findings: readonly ConsolidatedFinding[];
     workspace: string;
@@ -682,7 +723,13 @@ async function adjudicateFindingScope(
           ...(attempt > 1 ? [`The prior adjudication attempt was invalid: ${lastError instanceof Error ? lastError.message : String(lastError)}`] : []),
           "Do not inspect files, edit, review correctness, or propose additional findings. Classify only the supplied IDs.",
         ].join("\n"),
-        context: [input.intent, input.investigation, input.packet, input.buildResult, ...(input.priorVerdict ? [input.priorVerdict] : [])],
+        context: [
+          input.intent,
+          input.investigation,
+          input.packet,
+          ...(input.buildResult ? [input.buildResult] : []),
+          ...(input.priorVerdict ? [input.priorVerdict] : []),
+        ],
         workspace: {
           cwd: input.workspace,
           mode: "read-only",
