@@ -680,24 +680,38 @@ export class GitHubClient implements ForgeHost {
     const parseChecks = (result: string): PullRequestMergeGate["requiredChecks"] => {
       const parsed: unknown = JSON.parse(result);
       if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
-      return parsed.map((entry: unknown) => {
+      const checks = parsed.map((entry: unknown, index) => {
         if (!entry || typeof entry !== "object") throw new Error("GitHub checks response contains an invalid entry");
-        const check = entry as { name?: unknown; state?: unknown; link?: unknown };
+        const check = entry as { name?: unknown; state?: unknown; link?: unknown; completedAt?: unknown; startedAt?: unknown };
         const name = typeof check.name === "string" ? check.name.trim() : "";
         const state = typeof check.state === "string" ? check.state : undefined;
         const detailsUrl = typeof check.link === "string" ? check.link : undefined;
+        const completedAt = typeof check.completedAt === "string" ? check.completedAt : undefined;
+        const startedAt = typeof check.startedAt === "string" ? check.startedAt : undefined;
         return {
           name: name || "unnamed-required-check",
           state: mergeCheckState(state),
           ...(detailsUrl ? { detailsUrl } : {}),
+          timestamp: completedAt ?? startedAt,
+          index,
         };
       });
+      const latestByName = new Map<string, (typeof checks)[number]>();
+      for (const check of checks) {
+        const key = check.name.toLowerCase();
+        const current = latestByName.get(key);
+        const newer = !current
+          || (check.timestamp !== undefined && (current.timestamp === undefined || check.timestamp >= current.timestamp))
+          || (check.timestamp === undefined && current.timestamp === undefined && check.index > current.index);
+        if (newer) latestByName.set(key, check);
+      }
+      return [...latestByName.values()].map(({ timestamp: _timestamp, index: _index, ...check }) => check);
     };
     let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
     try {
       const result = await this.gh([
         "pr", "checks", String(number), "--repo", repo, "--required",
-        "--json", "name,state,link",
+        "--json", "name,state,link,completedAt,startedAt",
       ]);
       requiredChecks = parseChecks(result);
     } catch (error) {
@@ -708,7 +722,7 @@ export class GitHubClient implements ForgeHost {
           // converting a normal GitHub response into an unavailable blocker.
           const result = await this.gh([
             "pr", "checks", String(number), "--repo", repo,
-            "--json", "name,state,link",
+            "--json", "name,state,link,completedAt,startedAt",
           ]);
           requiredChecks = parseChecks(result);
         } catch (fallbackError) {

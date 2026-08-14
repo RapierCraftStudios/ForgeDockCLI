@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Deployment review gates now collapse duplicate GitHub check runs by check name and use the newest run, preventing a stale failure from blocking a later successful run at the same SHA.
 - Large deployment reviews now keep all risk capabilities while packing specialist coverage into one default group and sending a smaller bounded initial diff, preventing parallel reviewer attempts from exhausting their timeout without a verdict.
 - Deployment review now bootstraps its self-reporting gate check, publishes trusted `FORGE:GATE_PASS`/`FORGE:GATE_FAILURE` markers, and keeps GitHub mergeability separate from required-check state.
 - Standalone advisory review no longer requires mutation-only lease-witness configuration; lease enforcement remains fail-closed for commands that acquire leases.
