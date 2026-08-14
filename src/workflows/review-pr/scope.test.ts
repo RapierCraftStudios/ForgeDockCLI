@@ -12,7 +12,7 @@ const packet = createArtifact({
   kind: "BuildPacket", runId, subject, producer: { role: "packet-author" },
   payload: {
     scope: ["Guard the update"], acceptanceCriteria: [criterion], context: [], implementationPlan: ["Edit src/a.ts"],
-    expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: ["Redesign deployment", "Lease and heartbeat behavior", "Runtime/controller behavior"],
+    expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: ["Redesign deployment", "Implementing a GitHub-backed or cross-machine lease service", "Runtime/controller behavior"],
   },
 });
 
@@ -29,18 +29,21 @@ function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
 
 describe("review finding scope policy", () => {
   it("downgrades path and criterion expansion before remediation", () => {
-    const [outside, excludedTopic, excludedRuntime] = applyFindingScopePolicy([
+    const [outside, excludedTopic, excludedRuntime, localLease] = applyFindingScopePolicy([
       finding({ location: "deploy/production.yml:2", matchedAcceptanceCriteria: ["Invent a deployment contract"] }),
-      finding({ title: "Lease heartbeat can expire", evidence: "The heartbeat generation stalls", remediation: "Redesign lease heartbeat generations" }),
+      finding({ title: "Cross-machine lease service is missing", evidence: "The GitHub-backed lease service is not implemented", remediation: "Implement a cross-machine lease service" }),
       finding({ title: "Runtime controller bypass", evidence: "The agent runtime skips the controller", remediation: "Redesign the runtime adapter" }),
+      finding({ title: "Lease heartbeat can expire", evidence: "The retained witness heartbeat stalls", remediation: "Keep the local witness fail-closed" }),
     ], packet);
     assert.equal(outside?.scopeDisposition, "follow_up");
     assert.equal(outside?.blocking, false);
     assert.match(outside?.scopeRationale ?? "", /no exact frozen acceptance criterion|outside the frozen expected paths/);
     assert.equal(excludedTopic?.blocking, false);
-    assert.match(excludedTopic?.scopeRationale ?? "", /excluded lease\/coordination behavior/);
+    assert.match(excludedTopic?.scopeRationale ?? "", /excluded cross-machine lease\/coordination service/);
     assert.equal(excludedRuntime?.blocking, false);
     assert.match(excludedRuntime?.scopeRationale ?? "", /excluded runtime\/controller behavior/);
+    assert.equal(localLease?.blocking, true);
+    assert.equal(localLease?.scopeDisposition, "in_scope");
   });
 
   it("gives explicit runtime exclusions precedence over affirmative adapter wording", () => {

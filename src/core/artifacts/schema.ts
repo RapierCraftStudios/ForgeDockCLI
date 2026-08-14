@@ -160,6 +160,8 @@ export const FindingSchema = Type.Object({
   title: NonEmptyString,
   /** Stable reviewer-proposed failure-mode label used only after controller normalization. */
   causalRoot: Type.Optional(NonEmptyString),
+  /** Stable controller-normalized root identity used for projection adoption. */
+  normalizedRoot: Type.Optional(NonEmptyString),
   evidence: NonEmptyString,
   location: Type.Optional(NonEmptyString),
   intentRelevance: NonEmptyString,

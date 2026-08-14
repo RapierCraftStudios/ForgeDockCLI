@@ -429,6 +429,9 @@ export async function reviewPullRequest(
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
     const findingIssuePolicy = input.findingIssuePolicy ?? "all";
     const projectionEnabled = findingIssuePolicy === "all" || (findingIssuePolicy === "approved-only" && disposition === "approve");
+    // The reviewer wave is fully settled above. Only this deterministic
+    // post-wave path may project findings: scope filtering and consolidation
+    // are complete before any GitHub issue lookup or creation occurs.
     const activeProjectionFindings = projectionEnabled ? terminalReviewFindings(findings) : [];
     if (projectionEnabled) {
       await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings }, dependencies.host);
@@ -866,7 +869,7 @@ function aggregateTerminalFindings(
   if (findings.length === 1) return findings[0]!;
   const severityOrder = { critical: 3, high: 2, medium: 1, low: 0 } as const;
   const ordered = [...findings].sort((left, right) => severityOrder[right.severity] - severityOrder[left.severity] || left.id.localeCompare(right.id));
-  const identity = ordered.map(({ id }) => id).join("\n");
+  const identity = ordered.map(({ normalizedRoot, id }) => normalizedRoot ?? id).join("\n");
   const digest = createHash("sha256").update(identity).digest("hex").slice(0, 16);
   const compactEvidence = ordered.map((item) => `- [${item.severity.toUpperCase()}] ${item.id}: ${safeInline(item.title, 240)} — ${safeText(item.evidence, 500)}`).join("\n");
   const compactRemediation = ordered.map((item) => `- ${item.id}: ${safeText(item.remediation, 360)}`).join("\n");
@@ -877,6 +880,7 @@ function aggregateTerminalFindings(
   return {
     ...base,
     id: `review-terminal-${digest}`,
+    normalizedRoot: identity,
     title: `${ordered.length} normalized review root causes require terminal remediation`,
     evidence: safeText(compactEvidence, 7_900),
     remediation: safeText(compactRemediation, 3_900),

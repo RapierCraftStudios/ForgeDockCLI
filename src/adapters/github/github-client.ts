@@ -262,19 +262,26 @@ export class GitHubClient implements ForgeHost {
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const legacyMarker = compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
+    const laneAggregate = input.finding.id.startsWith("review-terminal-");
+    const admissionMarker = laneAggregate ? laneMarker : marker;
     const admissionKey: RemediationAdmissionKey = {
       repo: input.repo,
-      // The review-finding marker is independent of the delivery issue and
-      // reviewed SHA, so the admission key must be stable across both.
+      // Terminal review findings are one aggregate projection per PR lane, so
+      // their admission must be lane-stable even when the normalized root set
+      // changes between review cycles. Non-aggregate projections retain their
+      // root marker and cannot collapse independent findings.
       parentIssue: 0,
       parentPullRequest: input.pullRequest.number,
-      headSha: marker,
-      marker,
+      headSha: admissionMarker,
+      marker: admissionMarker,
     };
     const claim = await this.remediationAdmissions.claim(admissionKey);
     if (claim.status === "materialized") return claim.snapshot;
-    const existing = (await this.listAllIssues(input.repo)).find((issue) => issue.body.includes(marker)
-      || (marker !== legacyMarker && issue.body.includes(legacyMarker)));
+    const existingIssues = await this.listAllIssues(input.repo);
+    const existing = existingIssues.find((issue) => issue.state === "OPEN" && (issue.body.includes(marker)
+      || (marker !== legacyMarker && issue.body.includes(legacyMarker))))
+      ?? existingIssues.find((issue) => issue.state === "OPEN" && issue.body.includes(laneMarker));
     if (existing) {
       await this.remediationAdmissions.complete(admissionKey, existing);
       return existing;
@@ -337,6 +344,7 @@ export class GitHubClient implements ForgeHost {
       ...(priority === "priority:P3" && !sensitive ? ["", "<!-- FORGE:BATCHABLE -->"] : []),
       "",
       marker,
+      laneMarker,
     ].join("\n");
 
     const metadata = JSON.parse(await this.gh(["api", `repos/${input.repo}/issues/${input.pullRequest.number}`])) as {
@@ -919,13 +927,31 @@ export function reviewFindingReconciliationCandidates(
     reviewFindingMarker(input.repo, input.pullRequest.number, finding),
     compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, finding),
   ]));
+  const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
   const runMarker = `**Run:** \`${input.runId}\``;
   const sourceMarker = `**Source:** PR #${input.pullRequest.number} `;
-  return issues.filter((issue) => issue.state === "OPEN"
-    && issue.body.includes(runMarker)
-    && issue.body.includes(sourceMarker)
-    && /<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->/.test(issue.body)
-    && ![...activeMarkers].some((marker) => issue.body.includes(marker)));
+  const markerPattern = /<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->/;
+  const laneIssues = issues
+    .filter((issue) => issue.state === "OPEN" && issue.body.includes(sourceMarker)
+      && issue.body.includes(laneMarker) && markerPattern.test(issue.body))
+    .sort((left, right) => left.number - right.number);
+  const canonicalLaneIssue = laneIssues.find((issue) => [...activeMarkers].some((marker) => issue.body.includes(marker)))
+    ?? (input.activeFindings.length ? laneIssues[0] : undefined);
+  const duplicateLaneNumbers = new Set(laneIssues
+    .filter((issue) => issue.number !== canonicalLaneIssue?.number)
+    .map((issue) => issue.number));
+  return issues.filter((issue) => duplicateLaneNumbers.has(issue.number)
+    || (issue.state === "OPEN"
+      && issue.body.includes(runMarker)
+      && issue.body.includes(sourceMarker)
+      && markerPattern.test(issue.body)
+      && issue.number !== canonicalLaneIssue?.number
+      && ![...activeMarkers].some((marker) => issue.body.includes(marker))));
+}
+
+export function reviewFindingLaneMarker(repo: string, pullRequest: number): string {
+  const identity = `${repo.toLowerCase()}\n${pullRequest}`;
+  return `<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
 }
 
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {

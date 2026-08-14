@@ -34,6 +34,8 @@ export interface ReviewFindingInput {
   blocking: boolean;
   title: string;
   causalRoot?: string;
+  /** Stable controller-normalized root identity used for projection adoption. */
+  normalizedRoot?: string;
   evidence: string;
   location?: string;
   intentRelevance: string;

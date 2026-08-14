@@ -30,7 +30,7 @@ function submission(findings: FindingInput[]): ReviewerSubmission {
 }
 
 const defaultPolicy = {
-  reviewedPaths: ["docs/next/VERIFIABLE-WORKFLOW-AUTHORITY.md", "docs/spec.md", "src/schema.ts", "src/a.ts", "src/b.ts", "src/adapters/github/admission-store.ts"],
+  reviewedPaths: ["docs/next/VERIFIABLE-WORKFLOW-AUTHORITY.md", "docs/spec.md", "src/schema.ts", "src/a.ts", "src/b.ts", "src/adapters/github/admission-store.ts", "src/adapters/sqlite/sqlite-repositories.ts"],
   expectedPaths: [] as string[],
 };
 function consolidateReviewerFindings(
@@ -132,6 +132,21 @@ describe("cross-reviewer finding consolidation", () => {
     ]) }], new Set(["critical", "high", "medium"]));
     assert.equal(findings.length, 1);
     assert.deepEqual(findings[0]?.sourceFindingIds, ["correctness:A", "correctness:B"]);
+  });
+
+  it("merges strongly corroborated paraphrases with different causal-root wording", () => {
+    const findings = consolidateReviewerFindings([
+      { role: "correctness", output: submission([{
+        ...base, id: "EXPIRY-A", causalRoot: "lease guard omits expiry", title: "LeaseGuard authorizes expired leases",
+        evidence: "The guard checks the token but not expires_at.", location: "src/adapters/sqlite/sqlite-repositories.ts:323-329",
+      }]) },
+      { role: "data", output: submission([{
+        ...base, id: "EXPIRY-B", causalRoot: "expired lease passes mutation guard", title: "Expired lease remains valid at the mutation boundary",
+        evidence: "A worker can pass guard after the TTL because guard never reads expires_at.", location: "src/adapters/sqlite/sqlite-repositories.ts:344-354",
+      }]) },
+    ], new Set(["critical", "high", "medium"]));
+    assert.equal(findings.length, 1);
+    assert.deepEqual(findings[0]?.reviewerRoles, ["correctness", "data"]);
   });
 
   it("collapses PR #162-like cross-reviewer admission-store duplicates", () => {

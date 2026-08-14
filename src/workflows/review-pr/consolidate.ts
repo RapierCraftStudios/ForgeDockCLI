@@ -86,7 +86,25 @@ function duplicateFinding(left: Finding, right: Finding): boolean {
   if (leftCriteria.size && rightCriteria.size && intersection(leftCriteria, rightCriteria).length === 0) return false;
   const explicitLeft = normalize(left.causalRoot ?? "");
   const explicitRight = normalize(right.causalRoot ?? "");
-  if (explicitLeft && explicitRight) return explicitLeft === explicitRight;
+  if (explicitLeft && explicitRight) {
+    if (explicitLeft === explicitRight) return true;
+    // Reviewers often describe the same concrete failure mode with different
+    // causalRoot prose. Permit that paraphrase only when the frozen criterion,
+    // repository surface, and at least two domain tags agree; otherwise keep
+    // distinct roots separate even when their titles share broad vocabulary.
+    const sameCriterion = leftCriteria.size > 0 && intersection(leftCriteria, rightCriteria).length > 0;
+    const sameSurface = findingPaths(left).some((leftPath) => findingPaths(right)
+      .some((rightPath) => pathMatches(leftPath, rightPath) || pathMatches(rightPath, leftPath)));
+    const leftTags = conceptTags(left);
+    const rightTags = conceptTags(right);
+    const sharedTags = intersection(leftTags, rightTags);
+    const rootSimilarity = overlapCoefficient(failureModeTokens(explicitLeft), failureModeTokens(explicitRight));
+    const titleSimilarity = overlapCoefficient(failureModeTokens(left.title), failureModeTokens(right.title));
+    const evidenceSimilarity = overlapCoefficient(failureModeTokens(left.evidence), failureModeTokens(right.evidence));
+    if (sameCriterion && sameSurface && sharedTags.length >= 1
+      && rootSimilarity >= 0.45 && titleSimilarity >= 0.2 && evidenceSimilarity >= 0.2) return true;
+    return false;
+  }
 
   const leftTags = conceptTags(left);
   const rightTags = conceptTags(right);

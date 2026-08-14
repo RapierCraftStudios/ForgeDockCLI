@@ -6,7 +6,7 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { terminalReviewFindings } from "../../workflows/review-pr/review.js";
-import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -113,6 +113,8 @@ describe("GitHub review finding projection", () => {
     const second = reviewFindingMarker("a/b", 57, { ...finding, id: "renamed", evidence: "Expanded evidence" });
     assert.equal(first, second);
     assert.match(first, /^<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->$/);
+    assert.equal(reviewFindingLaneMarker("A/B", 57), reviewFindingLaneMarker("a/b", 57));
+    assert.match(reviewFindingLaneMarker("a/b", 57), /^<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 [a-f0-9]{64} -->$/);
   });
 
   it("reconciles only stale open findings from the same run and pull request", () => {
@@ -154,7 +156,7 @@ describe("GitHub review finding projection", () => {
     );
   });
 
-  it("creates distinct issues for same-count aggregate root sets and closes the stale aggregate", async () => {
+  it("adopts an existing open lane issue when an aggregate root set changes and closes duplicates", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
       state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
@@ -198,12 +200,19 @@ describe("GitHub review finding projection", () => {
     const baseInput = { repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-1", reviewedHeadSha: pullRequest.headSha, reviewerRoles: ["correctness"] };
     const firstIssue = await client.materializeReviewFinding({ ...baseInput, finding: firstAggregate });
     const secondIssue = await client.materializeReviewFinding({ ...baseInput, finding: secondAggregate });
-    assert.notEqual(firstIssue.number, secondIssue.number);
-    assert.equal(issues.length, 2);
+    assert.equal(firstIssue.number, secondIssue.number);
+    assert.equal(issues.length, 1);
+    issues.push({
+      number: 999,
+      title: "duplicate lane finding",
+      body: `**Source:** PR #57 — Fix\n**Run:** \`run-old\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, firstAggregate)}`,
+      html_url: "https://github.test/a/b/issues/999",
+      state: "open",
+    });
     assert.deepEqual(await client.reconcileReviewFindings({
       repo: "a/b", pullRequest, runId: "run-1", activeFindings: [secondAggregate],
-    }), [firstIssue.number]);
-    assert.deepEqual(closed, [firstIssue.number]);
+    }), [999]);
+    assert.deepEqual(closed, [999]);
   });
 });
 
