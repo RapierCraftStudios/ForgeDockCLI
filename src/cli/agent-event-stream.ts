@@ -1,12 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AgentEvent } from "../runtime/agent-runtime.js";
+import { createAgentEventObservationSink } from "../observability/adapters.js";
+import { sanitizeTerminalText, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import { statusGlyph, type ColorMode } from "../tui/brand.js";
 
 const TOOL_ARG_KEYS = ["path", "file_path", "pattern", "query", "glob", "command", "offset", "limit"] as const;
 const MAX_ARG_PREVIEW = 240;
 
 export type AgentEventWrite = (text: string) => void;
+
+let agentObservationSink: ((event: AgentEvent) => void) | undefined;
+let agentObservationObserver: ObservationSink | undefined;
+let agentObservationIdentity: ObservationIdentity = {};
+
+export function setAgentEventObservationSink(observer: ObservationSink | undefined, identity: ObservationIdentity = {}): void {
+  agentObservationObserver = observer;
+  agentObservationIdentity = { ...identity };
+  agentObservationSink = observer ? createAgentEventObservationSink(observer, { identity: agentObservationIdentity }) : undefined;
+}
+
+export function setAgentEventObservationIdentity(identity: ObservationIdentity): void {
+  agentObservationIdentity = { ...identity };
+  agentObservationSink = agentObservationObserver
+    ? createAgentEventObservationSink(agentObservationObserver, { identity: agentObservationIdentity })
+    : undefined;
+}
+
+export function observeAgentEvent(event: AgentEvent): void {
+  agentObservationSink?.(event);
+}
 
 /**
  * Projects bounded AgentRuntime activity into the controller's stdout stream.
@@ -17,7 +40,7 @@ export type AgentEventWrite = (text: string) => void;
 export class AgentEventStreamWriter {
   readonly #write: AgentEventWrite;
   readonly #mode: ColorMode;
-  #stream: { task: string; kind: "assistant" | "thinking"; lineOpen: boolean } | undefined;
+  #stream: { task: string; kind: "assistant"; lineOpen: boolean } | undefined;
 
   constructor(write: AgentEventWrite, mode: ColorMode) {
     this.#write = write;
@@ -26,8 +49,13 @@ export class AgentEventStreamWriter {
 
   write(event: AgentEvent, prefix?: string): void {
     const task = prefix ? `${prefix} · ${event.taskId}` : event.taskId;
-    if (event.type === "text.delta" || event.type === "thinking.delta") {
-      this.writeDelta(task, event.type === "thinking.delta" ? "thinking" : "assistant", event.text);
+    if (event.type === "thinking.delta") {
+      // Private model reasoning is intentionally neither rendered nor persisted.
+      this.finishDelta();
+      return;
+    }
+    if (event.type === "text.delta") {
+      this.writeDelta(task, "assistant", event.text);
       return;
     }
 
@@ -42,7 +70,7 @@ export class AgentEventStreamWriter {
     } else if (event.type === "tool.completed") {
       const status = event.isError ? "failed" : "passed";
       const call = toolCallPreview(event.toolCallId);
-      const error = event.isError && event.errorSummary ? ` · ${event.errorSummary}` : "";
+      const error = event.isError && event.errorSummary ? ` · ${sanitizeTerminalText(event.errorSummary)}` : "";
       this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool}[${call}] ${event.isError ? "failed" : "complete"}${error}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "artifact.submitted") {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted${milestone ? ` · ${milestone}` : ""}\n`);
@@ -55,7 +83,7 @@ export class AgentEventStreamWriter {
     this.finishDelta();
   }
 
-  private writeDelta(task: string, kind: "assistant" | "thinking", rawText: string): void {
+  private writeDelta(task: string, kind: "assistant", rawText: string): void {
     if (!rawText) return;
     if (!this.#stream || this.#stream.task !== task || this.#stream.kind !== kind) {
       this.finishDelta();
@@ -63,7 +91,7 @@ export class AgentEventStreamWriter {
       this.#stream = { task, kind, lineOpen: false };
     }
 
-    const text = rawText.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const text = sanitizeTerminalText(rawText).replaceAll("\r\n", "\n").replaceAll("\r", "\n");
     for (const part of text.split(/(\n)/)) {
       if (!part) continue;
       if (part === "\n") {
@@ -116,7 +144,7 @@ function toolArgPreview(tool: string, args: unknown): string | undefined {
 }
 
 function scalar(value: unknown): string | undefined {
-  if (typeof value === "string" && value.trim()) return JSON.stringify(value);
+  if (typeof value === "string" && value.trim()) return JSON.stringify(sanitizeTerminalText(value));
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return undefined;
 }

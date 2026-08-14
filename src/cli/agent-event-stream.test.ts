@@ -12,7 +12,7 @@ function capture() {
   };
 }
 
-test("streams inner assistant and thinking deltas with task context", () => {
+test("streams user-visible assistant deltas with task context", () => {
   const stream = capture();
   stream.writer.write({ type: "session.started", taskId: "build:1", sessionRef: "pi_1", provider: "openai-codex", model: "gpt-test" });
   stream.writer.write({ type: "thinking.delta", taskId: "build:1", text: "Inspecting the packet" });
@@ -21,8 +21,20 @@ test("streams inner assistant and thinking deltas with task context", () => {
   stream.writer.finish();
 
   assert.match(stream.output(), /◆ build:1 · openai-codex\/gpt-test/);
-  assert.match(stream.output(), /◆ build:1 · thinking\n      │ Inspecting the packet and repository\.\n      │ Next step\./);
+  assert.doesNotMatch(stream.output(), /private|thinking|Inspecting the packet/);
   assert.match(stream.output(), /◆ build:1 · assistant\n      │ I will update the scoped file\./);
+});
+
+test("removes terminal control sequences from untrusted streamed text", () => {
+  const stream = capture();
+  const escape = String.fromCharCode(0x1b);
+  const bell = String.fromCharCode(0x07);
+  stream.writer.write({ type: "text.delta", taskId: "build:1", text: `${escape}]8;;https://example.test${bell}visible${escape}[31m warning` });
+  stream.writer.finish();
+
+  assert.match(stream.output(), /visible warning/);
+  assert.doesNotMatch(stream.output(), /https:\/\/example|31m/);
+  assert.equal(stream.output().includes(escape), false);
 });
 
 test("shows typed review milestones and artifact timestamps in the live stream", () => {

@@ -17,6 +17,7 @@
 - Native session-scoped background controller tasks for direct work/review runs, with task IDs, bounded log inspection, passive completion notices, cancellation, and shutdown cleanup—without another runtime dependency.
 - A dependency-free, pi-native decision interview inspired by pi-ask: tabbed single/multi/preview questions, evidence-backed recommendations, number-key selection, inline custom answers, question/option notes, dirty-dismiss protection, and a Submit/Elaborate/Cancel review step.
 - Nested reviewer grandchildren now appear as selectable connector-tree rows in the fleet inspector, with `(+N agents)` summarized on their parent worker; each independent reviewer also publishes an idempotent provisional PR report while the consolidated controller verdict remains authoritative.
+- ForgeDock-owned renderer-neutral observability now journals typed workflow/run/artifact events, bounded stdout/stderr, attention, async/background/reviewer activity, durable workspace layouts, restart hydration, redaction, terminal-sequence sanitization, bounded backpressure markers, and guarded observer controls; the internal observer workspace is available through `/forgedock-observe`, with tmux retained as a future optional renderer.
 
 ### Changed
 

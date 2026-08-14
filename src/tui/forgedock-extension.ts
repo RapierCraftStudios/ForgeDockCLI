@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { PiAsyncObservationAdapter, type PiAsyncStatusSnapshot } from "../observability/adapters.js";
+import { ForgeDockObservationControlGateway } from "../observability/control-gateway.js";
+import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
+import { openForgeDockObserverWorkspace } from "./observer-workspace.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import {
   BACKGROUND_TASK_TOOL,
@@ -15,6 +19,7 @@ import {
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
   clearOrchestrationInvocation,
+  controlSubagentRun,
   deactivateWorkflowTools,
   inspectSubagentRuntime,
   registerForgeDockTools,
@@ -28,7 +33,54 @@ const WORKFLOWS = ["work-on", "review-pr", "orchestrate"] as const;
 type Workflow = (typeof WORKFLOWS)[number];
 
 export default function forgedockExtension(pi: ExtensionAPI): void {
-  const backgroundTasks = registerForgeDockTools(pi);
+  let observer: ForgeDockObserver | undefined;
+  let asyncObservation: PiAsyncObservationAdapter | undefined;
+  let controlGateway: ForgeDockObservationControlGateway | undefined;
+  const ensureObserver = async (cwd: string): Promise<ForgeDockObserver> => {
+    if (!observer) {
+      observer = await createForgeDockObserver(cwd, { component: "forgedock-extension" });
+      asyncObservation = new PiAsyncObservationAdapter(observer);
+      controlGateway = new ForgeDockObservationControlGateway(observer, {
+        resume: async (request) => {
+          assertLeafAsyncControl(request.identity);
+          const runId = request.identity.piAsyncId;
+          if (!runId) throw new Error("Resume requires a persisted pi-subagents async run identity");
+          await controlSubagentRun(pi, "resume", { id: runId, message: controlMessage(request.payload, "Continue the same bounded run") });
+        },
+        cancel: async (request) => {
+          assertLeafAsyncControl(request.identity);
+          const taskId = request.identity.controllerTaskId;
+          if (taskId) {
+            backgroundTasks.cancel(taskId);
+            return;
+          }
+          const runId = request.identity.piAsyncId;
+          if (!runId) throw new Error("Cancellation requires a native controller task or persisted pi-subagents async run identity");
+          await controlSubagentRun(pi, "stop", { id: runId });
+        },
+        steer: async (request) => {
+          assertLeafAsyncControl(request.identity);
+          const runId = request.identity.piAsyncId;
+          if (!runId) throw new Error("Steering requires a persisted pi-subagents async run identity");
+          await controlSubagentRun(pi, "steer", { id: runId, message: controlMessage(request.payload, "Continue the current bounded objective") });
+        },
+      });
+      backgroundTasks.setObservationSink(observer);
+    }
+    return observer;
+  };
+  const backgroundTasks = registerForgeDockTools(pi, { getObservationSink: () => observer });
+
+  pi.events.on("subagent:async-started", (raw) => {
+    if (!asyncObservation) return;
+    const status = normalizePiAsyncStatus(raw);
+    if (status) asyncObservation.started(status);
+  });
+  pi.events.on("subagent:async-complete", (raw) => {
+    if (!asyncObservation) return;
+    const status = normalizePiAsyncStatus(raw);
+    if (status) asyncObservation.completed(status);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     if (process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker") {
@@ -38,6 +90,8 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     backgroundTasks.initialize(ctx);
     deactivateWorkflowTools(pi);
     activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, ORCHESTRATION_RESUME_TOOL]);
+    if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
+    await ensureObserver(ctx.cwd);
     if (ctx.mode !== "tui") return;
     ctx.ui.setTitle(`ForgeDock — ${ctx.cwd}`);
     ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
@@ -97,6 +151,12 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     await backgroundTasks.shutdown();
+    backgroundTasks.setObservationSink(undefined);
+    await observer?.flush();
+    observer?.close();
+    observer = undefined;
+    asyncObservation = undefined;
+    controlGateway = undefined;
   });
 
   for (const workflow of WORKFLOWS) registerWorkflow(pi, workflow);
@@ -160,6 +220,17 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("forgedock-observe", {
+    description: "Open the ForgeDock-owned semantic observer workspace",
+    handler: async (args, ctx) => {
+      const activeObserver = await ensureObserver(ctx.cwd);
+      await openForgeDockObserverWorkspace(ctx, activeObserver, {
+        ...(args.trim() ? { initialEntityId: args.trim() } : {}),
+        ...(controlGateway ? { gateway: controlGateway } : {}),
+      });
+    },
+  });
+
   pi.registerCommand("forgedock-runtime", {
     description: "Verify semantic-tool and bundled-subagent runtime provenance",
     handler: async (_args, ctx) => {
@@ -179,6 +250,39 @@ export default function forgedockExtension(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+function assertLeafAsyncControl(identity: { depth?: number }): void {
+  if (identity.depth !== undefined && identity.depth > 0) throw new Error("Nested reviewer controls must go through the parent reviewer bridge");
+}
+
+function controlMessage(payload: unknown, fallback: string): string {
+  const message = payload && typeof payload === "object" && !Array.isArray(payload) && typeof (payload as { message?: unknown }).message === "string"
+    ? (payload as { message: string }).message.trim()
+    : fallback;
+  if (Buffer.byteLength(message, "utf8") > 8 * 1024) throw new Error("Control message exceeds the 8 KiB bounded request limit");
+  return message || fallback;
+}
+
+function normalizePiAsyncStatus(raw: unknown): PiAsyncStatusSnapshot | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const id = typeof value.id === "string" ? value.id : typeof value.runId === "string" ? value.runId : undefined;
+  if (!id) return undefined;
+  return {
+    id,
+    ...(typeof value.state === "string" ? { state: value.state } : {}),
+    ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+    ...(typeof value.asyncDir === "string" ? { asyncDir: value.asyncDir } : {}),
+    ...(typeof value.agent === "string" ? { agent: value.agent } : {}),
+    ...(typeof value.currentTool === "string" ? { currentTool: value.currentTool } : {}),
+    ...(typeof value.currentPath === "string" ? { currentPath: value.currentPath } : {}),
+    ...(typeof value.pid === "number" ? { pid: value.pid } : {}),
+    ...(typeof value.parentRunId === "string" ? { parentRunId: value.parentRunId } : {}),
+    ...(typeof value.parentStepIndex === "number" ? { parentStepIndex: value.parentStepIndex } : {}),
+    ...(typeof value.depth === "number" ? { depth: value.depth } : {}),
+    ...(typeof value.error === "string" ? { summary: value.error } : {}),
+  };
 }
 
 export function isLifecycleControllerShellCommand(command: string): boolean {

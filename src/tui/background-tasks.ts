@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
+import { BackgroundTaskObservationAdapter } from "../observability/adapters.js";
+import type { ObservationSink } from "../observability/contracts.js";
 
 export type BackgroundTaskStatus = "running" | "detached" | "completed" | "blocked" | "failed" | "cancelled";
 
@@ -16,6 +18,7 @@ export interface BackgroundTaskRecord {
   cwd: string;
   pid: number;
   logPath: string;
+  stderrLogPath?: string;
   status: BackgroundTaskStatus;
   startedAt: string;
   completedAt?: string;
@@ -27,6 +30,9 @@ const MAX_BACKGROUND_TASKS = 4;
 interface LiveTask {
   record: BackgroundTaskRecord;
   child?: ChildProcess;
+  stderrLogPath?: string;
+  stdoutOffset: number;
+  stderrOffset: number;
   adopted: boolean;
   cleanup?: () => Promise<void>;
 }
@@ -37,9 +43,18 @@ export class ForgeDockBackgroundTasks {
   readonly #records = new Map<string, BackgroundTaskRecord>();
   #ticker: NodeJS.Timeout | undefined;
   #ctx: ExtensionContext | undefined;
+  #observationAdapter: BackgroundTaskObservationAdapter | undefined;
 
   constructor(pi: ExtensionAPI) {
     this.#pi = pi;
+  }
+
+  setObservationSink(sink: ObservationSink | undefined): void {
+    this.#observationAdapter = sink ? new BackgroundTaskObservationAdapter(sink) : undefined;
+    if (!this.#observationAdapter) return;
+    for (const live of this.#live.values()) {
+      if (live.adopted) this.#observationAdapter.adopted(live.record.id, live.record.pid);
+    }
   }
 
   initialize(ctx: ExtensionContext): void {
@@ -57,7 +72,13 @@ export class ForgeDockBackgroundTasks {
             // false failure. Adopt it as a detached task and supervise its PID
             // and durable log until it exits.
             record.status = "detached";
-            this.#live.set(record.id, { record, adopted: true });
+            this.#live.set(record.id, {
+              record,
+              ...(record.stderrLogPath ? { stderrLogPath: record.stderrLogPath } : {}),
+              stdoutOffset: fileSize(record.logPath),
+              stderrOffset: fileSize(record.stderrLogPath),
+              adopted: true,
+            });
           } else {
             record.status = "failed";
             record.completedAt = new Date().toISOString();
@@ -87,19 +108,25 @@ export class ForgeDockBackgroundTasks {
     const directory = join(input.cwd, ".forgedock", "tasks");
     mkdirSync(directory, { recursive: true });
     const logPath = join(directory, `${id}.log`);
-    const descriptor = openSync(logPath, "w");
+    const stderrLogPath = join(directory, `${id}.stderr.log`);
+    const stdoutFd = openSync(logPath, "w");
+    const stderrFd = openSync(stderrLogPath, "w");
     let child: ChildProcess;
     try {
       child = spawn(input.command, input.args, {
         cwd: input.cwd,
-        env: controllerEnvironment(process.env, input.env),
+        env: controllerEnvironment(process.env, { ...input.env, FORGEDOCK_CONTROLLER_TASK_ID: id }),
         windowsHide: true,
         detached: process.platform !== "win32",
-        stdio: ["ignore", descriptor, descriptor],
+        stdio: ["ignore", stdoutFd, stderrFd],
       });
-    } finally {
-      closeSync(descriptor);
+    } catch (error) {
+      closeSync(stdoutFd);
+      closeSync(stderrFd);
+      throw error;
     }
+    closeSync(stdoutFd);
+    closeSync(stderrFd);
     if (!child.pid) throw new Error("ForgeDock background controller failed to start");
     const record: BackgroundTaskRecord = {
       id,
@@ -108,13 +135,16 @@ export class ForgeDockBackgroundTasks {
       cwd: input.cwd,
       pid: child.pid,
       logPath,
+      stderrLogPath,
       status: "running",
       startedAt: new Date().toISOString(),
     };
     this.#ctx = input.ctx;
+    const live: LiveTask = { record, child, stderrLogPath, stdoutOffset: 0, stderrOffset: 0, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) };
     this.#records.set(id, record);
-    this.#live.set(id, { record, child, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) });
+    this.#live.set(id, live);
     this.persist(record);
+    this.#observationAdapter?.started(record);
     child.once("error", (error) => void this.finish(id, "failed", undefined, error.message));
     child.once("exit", (code, signal) => {
       const status: BackgroundTaskStatus = signal ? "cancelled" : code === 0 ? "completed" : code === 2 ? "blocked" : "failed";
@@ -135,7 +165,9 @@ export class ForgeDockBackgroundTasks {
   output(id: string): string {
     const record = this.recordsFromDisk().get(id);
     if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
-    const output = existsSync(record.logPath) ? readFileSync(record.logPath, "utf8") : "";
+    const stdout = existsSync(record.logPath) ? readFileSync(record.logPath, "utf8") : "";
+    const stderr = record.stderrLogPath && existsSync(record.stderrLogPath) ? readFileSync(record.stderrLogPath, "utf8") : "";
+    const output = [stdout, stderr].filter(Boolean).join("\n");
     const limited = truncateTail(output, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
     return `${renderRecord(record)}\n${limited.content || "(no output yet)"}${limited.truncated ? `\n[Output truncated; full log: ${record.logPath}]` : ""}`;
   }
@@ -173,7 +205,9 @@ export class ForgeDockBackgroundTasks {
     if (live.record.status !== "cancelled") live.record.status = status;
     live.record.completedAt ??= new Date().toISOString();
     if (exitCode !== undefined) live.record.exitCode = exitCode;
+    this.captureLogDeltas(live);
     this.persist(live.record);
+    this.#observationAdapter?.finished(id, live.record.status, exitCode);
     this.#live.delete(id);
     await live.cleanup?.().catch(() => undefined);
     const message = `${renderRecord(live.record)}${detail ? ` — ${detail}` : ""}\nLog: ${live.record.logPath}`;
@@ -185,6 +219,20 @@ export class ForgeDockBackgroundTasks {
     }
     this.renderStatus();
     if (!this.#live.size) this.stopTicker();
+  }
+
+  private captureLogDeltas(live: LiveTask): void {
+    for (const [channel, path, offset] of [["stdout", live.record.logPath, live.stdoutOffset] as const, ["stderr", live.stderrLogPath, live.stderrOffset] as const]) {
+      let currentOffset = offset;
+      while (true) {
+        const delta = readLogDelta(path, currentOffset);
+        if (!delta) break;
+        currentOffset = delta.nextOffset;
+        this.#observationAdapter?.output(live.record.id, channel, delta.text, currentOffset);
+      }
+      if (channel === "stdout") live.stdoutOffset = currentOffset;
+      else live.stderrOffset = currentOffset;
+    }
   }
 
   private recordsFromDisk(): Map<string, BackgroundTaskRecord> {
@@ -201,6 +249,7 @@ export class ForgeDockBackgroundTasks {
   private ensureTicker(): void {
     if (this.#ticker) return;
     this.#ticker = setInterval(() => {
+      for (const task of this.#live.values()) this.captureLogDeltas(task);
       this.reconcileAdoptedTasks();
       this.renderStatus();
     }, 1_000);
@@ -230,6 +279,28 @@ export class ForgeDockBackgroundTasks {
     const recent = running[0]?.record;
     const elapsed = recent ? Math.max(0, Math.round((Date.now() - Date.parse(recent.startedAt)) / 1_000)) : 0;
     this.#ctx.ui.setStatus("forgedock-tasks", `◆ ${running.length} background task${running.length === 1 ? "" : "s"} · ${recent?.id ?? ""} · ${elapsed}s`);
+  }
+}
+
+function fileSize(path: string | undefined): number {
+  if (!path) return 0;
+  try { return statSync(path).size; } catch { return 0; }
+}
+
+function readLogDelta(path: string | undefined, offset: number): { text: string; nextOffset: number } | undefined {
+  if (!path) return undefined;
+  let size: number;
+  try { size = statSync(path).size; } catch { return undefined; }
+  if (size <= offset) return undefined;
+  const length = Math.min(size - offset, 64 * 1024);
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const bytesRead = readSync(fd, buffer, 0, length, offset);
+    if (bytesRead <= 0) return undefined;
+    return { text: buffer.subarray(0, bytesRead).toString("utf8"), nextOffset: offset + bytesRead };
+  } finally {
+    closeSync(fd);
   }
 }
 

@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { randomUUID } from "node:crypto";
+
+export const OBSERVATION_SCHEMA_VERSION = "forgedock.observation/v1" as const;
+export const DEFAULT_OBSERVATION_MAX_STRING_BYTES = 8 * 1024;
+export const DEFAULT_OBSERVATION_MAX_PAYLOAD_BYTES = 64 * 1024;
+export const DEFAULT_OBSERVATION_MAX_OUTPUT_BYTES = 32 * 1024;
+export const DEFAULT_OBSERVATION_RETENTION: ObservationRetentionPolicy = {
+  maxAgeMs: 14 * 24 * 60 * 60 * 1000,
+  maxEventsPerScope: 20_000,
+  maxOutputBytesPerScope: 64 * 1024 * 1024,
+};
+
+export type ObservationSource =
+  | "workflow"
+  | "controller"
+  | "agent"
+  | "reviewer"
+  | "tool"
+  | "process"
+  | "artifact"
+  | "pi-subagents"
+  | "observer";
+
+export type ObservationChannel =
+  | "lifecycle"
+  | "activity"
+  | "stdout"
+  | "stderr"
+  | "tool"
+  | "supervisor"
+  | "decision"
+  | "review"
+  | "artifact"
+  | "diagnostic";
+
+export type ObservationSeverity = "debug" | "info" | "notice" | "warning" | "error" | "critical";
+export type ObservationSensitivity = "public" | "internal" | "sensitive";
+
+/** Canonical cross-process identity. Every adapter should populate all fields it knows. */
+export interface ObservationIdentity {
+  repository?: string;
+  issueNumber?: number;
+  forgeRunId?: string;
+  orchestrationId?: string;
+  workUnitId?: string;
+  nodeId?: string;
+  agentTaskId?: string;
+  agentRole?: string;
+  parentAgentId?: string;
+  childIndex?: number;
+  depth?: number;
+  controllerTaskId?: string;
+  piSessionRef?: string;
+  piAsyncId?: string;
+  checkpointId?: string;
+  reviewId?: string;
+  artifactId?: string;
+}
+
+export interface ObservationProducer {
+  component: string;
+  processInstanceId: string;
+  pid?: number;
+}
+
+export interface ObservationDelivery {
+  truncated?: boolean;
+  droppedEvents?: number;
+  originalBytes?: number;
+  coalesced?: boolean;
+}
+
+export interface ObservationSecurity {
+  redacted: boolean;
+  sensitivity?: ObservationSensitivity;
+}
+
+export interface ObservationOutputChunk {
+  channel: "stdout" | "stderr";
+  text: string;
+  chunkSequence: number;
+  bytes: number;
+}
+
+export interface ObservationEnvelopeV1 {
+  schemaVersion: typeof OBSERVATION_SCHEMA_VERSION;
+  eventId: string;
+  runSequence: number;
+  producerSequence: number;
+  occurredAt: string;
+  ingestedAt: string;
+  identity: ObservationIdentity;
+  producer: ObservationProducer;
+  source: ObservationSource;
+  channel: ObservationChannel;
+  kind: string;
+  severity: ObservationSeverity;
+  payload: unknown;
+  delivery: ObservationDelivery;
+  security: ObservationSecurity;
+  output?: ObservationOutputChunk;
+}
+
+export interface ObservationDraft {
+  identity?: ObservationIdentity;
+  producer: ObservationProducer;
+  source: ObservationSource;
+  channel: ObservationChannel;
+  kind: string;
+  severity?: ObservationSeverity;
+  payload?: unknown;
+  occurredAt?: string;
+  producerSequence?: number;
+  delivery?: ObservationDelivery;
+  security?: Partial<ObservationSecurity>;
+  output?: {
+    channel: "stdout" | "stderr";
+    text: string;
+    chunkSequence?: number;
+  };
+}
+
+export interface ObservationQuery {
+  scopeKey?: string;
+  forgeRunId?: string;
+  orchestrationId?: string;
+  source?: ObservationSource;
+  channel?: ObservationChannel;
+  kinds?: readonly string[];
+  sinceRunSequence?: number;
+  limit?: number;
+  newestFirst?: boolean;
+}
+
+export interface ObservationRetentionPolicy {
+  maxAgeMs?: number;
+  maxEventsPerScope?: number;
+  maxOutputBytesPerScope?: number;
+}
+
+export interface ObservationRetentionResult {
+  deletedEvents: number;
+  deletedOutputChunks: number;
+  remainingEvents: number;
+}
+
+export interface ObservationStore {
+  append(draft: ObservationDraft): Promise<ObservationEnvelopeV1>;
+  query(query?: ObservationQuery): Promise<ObservationEnvelopeV1[]>;
+  prune(scopeKey: string | undefined, policy: ObservationRetentionPolicy): Promise<ObservationRetentionResult>;
+  close(): void;
+}
+
+export interface ObservationLayoutStore {
+  saveLayout(layout: import("./workspace-layout.js").WorkspaceLayout): Promise<void>;
+  loadLayout(id: string): Promise<import("./workspace-layout.js").WorkspaceLayout | undefined>;
+}
+
+export interface ObservationSink {
+  emit(draft: ObservationDraft): Promise<ObservationEnvelopeV1>;
+}
+
+export interface ObservationSubscription {
+  unsubscribe(): void;
+}
+
+export interface ObservationRedactionPolicy {
+  maxStringBytes?: number;
+  maxPayloadBytes?: number;
+  maxOutputBytes?: number;
+  maxDepth?: number;
+  maxArrayItems?: number;
+  maxObjectKeys?: number;
+}
+
+export interface RedactedValue {
+  value: unknown;
+  redacted: boolean;
+  originalBytes: number;
+  outputBytes: number;
+  truncated: boolean;
+}
+
+const SENSITIVE_KEY = /(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)/i;
+const SENSITIVE_VALUE = /(?:bearer\s+|gh[pousr]_\w+|sk-[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]+ PRIVATE KEY-----)/i;
+
+export function observationScopeKey(identity: ObservationIdentity): string {
+  return identity.forgeRunId
+    ?? identity.orchestrationId
+    ?? identity.workUnitId
+    ?? identity.controllerTaskId
+    ?? identity.piAsyncId
+    ?? identity.agentTaskId
+    ?? "global";
+}
+
+export function observationEntityId(identity: ObservationIdentity, producer: ObservationProducer): string {
+  return identity.agentTaskId
+    ?? identity.workUnitId
+    ?? identity.controllerTaskId
+    ?? identity.piAsyncId
+    ?? identity.piSessionRef
+    ?? identity.nodeId
+    ?? identity.forgeRunId
+    ?? identity.orchestrationId
+    ?? `${producer.component}:${producer.processInstanceId}`;
+}
+
+export function createObservationProducer(component: string, pid = process.pid): ObservationProducer {
+  return { component, processInstanceId: `${component}:${pid}:${randomUUID()}`, pid };
+}
+
+export function redactObservationValue(value: unknown, policy: ObservationRedactionPolicy = {}, depth = 0): RedactedValue {
+  const maxStringBytes = policy.maxStringBytes ?? DEFAULT_OBSERVATION_MAX_STRING_BYTES;
+  const maxPayloadBytes = policy.maxPayloadBytes ?? DEFAULT_OBSERVATION_MAX_PAYLOAD_BYTES;
+  const maxDepth = policy.maxDepth ?? 8;
+  const maxArrayItems = policy.maxArrayItems ?? 64;
+  const maxObjectKeys = policy.maxObjectKeys ?? 128;
+  const serializedInput = safeJson(value);
+  const originalBytes = Buffer.byteLength(serializedInput, "utf8");
+
+  if (depth > maxDepth) {
+    return { value: "[observation depth limit]", redacted: true, originalBytes, outputBytes: 28, truncated: true };
+  }
+
+  if (typeof value === "string") {
+    const sanitized = sanitizeTerminalText(value);
+    if (SENSITIVE_VALUE.test(sanitized)) {
+      return { value: "[REDACTED]", redacted: true, originalBytes, outputBytes: 11, truncated: false };
+    }
+    const terminalSequencesRemoved = sanitized !== value;
+    const bytes = Buffer.byteLength(sanitized, "utf8");
+    if (bytes <= maxStringBytes) return { value: sanitized, redacted: terminalSequencesRemoved, originalBytes, outputBytes: bytes, truncated: false };
+    const clipped = clipUtf8(sanitized, maxStringBytes);
+    return {
+      value: `${clipped}… [truncated]`,
+      redacted: true,
+      originalBytes,
+      outputBytes: Buffer.byteLength(clipped, "utf8") + 14,
+      truncated: true,
+    };
+  }
+
+  if (Array.isArray(value)) {
+    const selected = value.slice(0, maxArrayItems);
+    const children = selected.map((item) => redactObservationValue(item, policy, depth + 1));
+    const output = children.map((child) => child.value);
+    const truncated = selected.length !== value.length || children.some((child) => child.truncated);
+    if (truncated) output.push("[items truncated]");
+    const result = { value: output, redacted: truncated || children.some((child) => child.redacted), originalBytes, outputBytes: Buffer.byteLength(safeJson(output), "utf8"), truncated };
+    return enforcePayloadLimit(result, maxPayloadBytes);
+  }
+
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    const output: Record<string, unknown> = {};
+    let redacted = false;
+    let truncated = false;
+    for (const [key, childValue] of entries.slice(0, maxObjectKeys)) {
+      if (SENSITIVE_KEY.test(key)) {
+        output[key] = "[REDACTED]";
+        redacted = true;
+        continue;
+      }
+      const child = redactObservationValue(childValue, policy, depth + 1);
+      output[key] = child.value;
+      redacted ||= child.redacted;
+      truncated ||= child.truncated;
+    }
+    if (entries.length > maxObjectKeys) {
+      output.__observationTruncated = `${entries.length - maxObjectKeys} object field(s) omitted`;
+      redacted = true;
+      truncated = true;
+    }
+    const result = { value: output, redacted, originalBytes, outputBytes: Buffer.byteLength(safeJson(output), "utf8"), truncated };
+    return enforcePayloadLimit(result, maxPayloadBytes);
+  }
+
+  return { value, redacted: false, originalBytes, outputBytes: originalBytes, truncated: false };
+}
+
+export function normalizeObservationDraft(draft: ObservationDraft, policy: ObservationRedactionPolicy = {}): ObservationDraft {
+  const identity = { ...(draft.identity ?? {}) };
+  const payload = redactObservationValue(draft.payload ?? {}, policy);
+  const output = draft.output
+    ? redactObservationValue(draft.output.text, { ...policy, maxPayloadBytes: policy.maxOutputBytes ?? DEFAULT_OBSERVATION_MAX_OUTPUT_BYTES })
+    : undefined;
+  const delivery: ObservationDelivery = {
+    ...(draft.delivery ?? {}),
+    ...(payload.truncated || output?.truncated ? { truncated: true } : {}),
+    ...(payload.originalBytes > payload.outputBytes ? { originalBytes: payload.originalBytes } : {}),
+  };
+  return {
+    ...draft,
+    identity,
+    payload: payload.value,
+    severity: draft.severity ?? "info",
+    delivery,
+    security: {
+      redacted: draft.security?.redacted === true || payload.redacted || output?.redacted === true,
+      ...(draft.security?.sensitivity ? { sensitivity: draft.security.sensitivity } : {}),
+    },
+    ...(output ? {
+      output: {
+        ...draft.output!,
+        text: String(output.value),
+      },
+    } : {}),
+  };
+}
+
+export function sanitizeTerminalText(value: string): string {
+  return value
+    // OSC hyperlinks, titles, and clipboard sequences can execute in some terminal emulators.
+    .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, "")
+    // CSI/SS3 and other ANSI control sequences are not part of the observation payload.
+    .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])/g, "")
+    // Preserve newline, carriage return, and tab while removing other C0 controls.
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function enforcePayloadLimit(value: RedactedValue, maxBytes: number): RedactedValue {
+  if (value.outputBytes <= maxBytes) return value;
+  const clipped = clipUtf8(safeJson(value.value), maxBytes);
+  return {
+    value: `${clipped}… [payload truncated]`,
+    redacted: true,
+    originalBytes: value.originalBytes,
+    outputBytes: Buffer.byteLength(clipped, "utf8") + 19,
+    truncated: true,
+  };
+}
+
+function clipUtf8(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  return bytes.subarray(0, Math.max(0, maxBytes)).toString("utf8").replace(/[\uD800-\uDFFF]$/u, "");
+}
+
+function safeJson(value: unknown): string {
+  try {
+    const result = JSON.stringify(value);
+    return result === undefined ? String(value) : result;
+  } catch {
+    return "[unserializable observation payload]";
+  }
+}

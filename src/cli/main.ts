@@ -4,8 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
-import { CachedArtifactRepository, ProjectedRunRepository, type RunRepository } from "../core/ports/repositories.js";
+import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
+import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
   decideSubjectAdmission,
   latestArtifactOfKind,
@@ -46,13 +47,17 @@ import { ClaimPromotionConflictError, materializeClaimDependencies, runSchedule,
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { orchestrationEventFromSchedule } from "../workflows/orchestrate/events.js";
 import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
-import { AgentEventStreamWriter } from "./agent-event-stream.js";
+import { AgentEventStreamWriter, observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "./agent-event-stream.js";
+import { ControllerObservationAdapter } from "../observability/adapters.js";
+import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
+import type { RunState } from "../core/state/machine.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers } from "./argument-parser.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
 const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
+let activeObserver: ForgeDockObserver | undefined;
 
 await main(args).catch((error: unknown) => {
   agentEventStream.finish();
@@ -81,27 +86,53 @@ async function main(argv: string[]): Promise<void> {
     printHelp();
     return;
   }
-  if (command === "work-on") {
-    await workOn(argv.slice(1));
-    return;
+  const observer: ForgeDockObserver = await createForgeDockObserver(process.cwd(), { component: "forgedock-controller" });
+  activeObserver = observer;
+  const controllerObservation = new ControllerObservationAdapter(observer, {
+    identity: {
+      ...(process.env.FORGEDOCK_RUN_ID ? { forgeRunId: process.env.FORGEDOCK_RUN_ID } : {}),
+      ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+    },
+  });
+  controllerObservation.started(command, argv.slice(1));
+  setAgentEventObservationSink(observer, {
+    ...(process.env.FORGEDOCK_RUN_ID ? { forgeRunId: process.env.FORGEDOCK_RUN_ID } : {}),
+    ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+  });
+  let controllerFailed = false;
+  try {
+    if (command === "work-on") {
+      await workOn(argv.slice(1));
+      return;
+    }
+    if (command === "status") {
+      await status(argv.slice(1));
+      return;
+    }
+    if (command === "review-pr") {
+      await reviewPr(argv.slice(1));
+      return;
+    }
+    if (command === "reset") {
+      await resetIssue(argv.slice(1));
+      return;
+    }
+    if (command === "orchestrate") {
+      await orchestrate(argv.slice(1));
+      return;
+    }
+    throw new Error(`Unknown command: ${command}`);
+  } catch (error) {
+    controllerFailed = true;
+    controllerObservation.failed(error);
+    throw error;
+  } finally {
+    controllerObservation.completed(controllerFailed ? 1 : (typeof process.exitCode === "number" ? process.exitCode : 0));
+    await observer.flush();
+    observer.close();
+    activeObserver = undefined;
+    setAgentEventObservationSink(undefined);
   }
-  if (command === "status") {
-    await status(argv.slice(1));
-    return;
-  }
-  if (command === "review-pr") {
-    await reviewPr(argv.slice(1));
-    return;
-  }
-  if (command === "reset") {
-    await resetIssue(argv.slice(1));
-    return;
-  }
-  if (command === "orchestrate") {
-    await orchestrate(argv.slice(1));
-    return;
-  }
-  throw new Error(`Unknown command: ${command}`);
 }
 
 async function status(argv: string[]): Promise<void> {
@@ -321,6 +352,12 @@ async function workOn(argv: string[]): Promise<void> {
       resumeArtifacts = admission.artifacts;
     }
   }
+  setAgentEventObservationIdentity({
+    repository: issue.repo,
+    issueNumber: issue.number,
+    forgeRunId: progressRunId,
+    ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+  });
   const intent = createArtifact({
     kind: "Intent", runId, subject,
     producer: { role: "controller", runtime: "forgedock" },
@@ -352,8 +389,14 @@ async function workOn(argv: string[]): Promise<void> {
   // repository, including a later --resume invocation in another process.
   github = new GitHubClient(process.cwd(), store);
   authoritativeArtifacts = new GitHubArtifactRepository(github);
-  const artifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
-  const runs = dryRun ? store : projectRunsToGitHub(store, github);
+  const baseArtifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
+  const artifacts = activeObserver
+    ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: issue.repo, issueNumber: issue.number, forgeRunId: progressRunId })
+    : baseArtifacts;
+  const baseRuns = dryRun ? store : projectRunsToGitHub(store, github);
+  const runs = activeObserver
+    ? observeRunRepository(baseRuns, activeObserver, { repository: issue.repo, issueNumber: issue.number, forgeRunId: progressRunId })
+    : baseRuns;
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -939,8 +982,11 @@ async function orchestrate(argv: string[]): Promise<void> {
     ...(model !== undefined ? { model } : {}),
     ...planning,
   }, store);
-  const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
-  const runs = projectRunsToGitHub(store, github);
+  const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
+  const artifacts = activeObserver
+    ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: repository.repo })
+    : baseArtifacts;
+  const baseRuns = projectRunsToGitHub(store, github);
   const git = new GitWorktreeManager(process.cwd());
   const verifier = new ProcessVerificationRunner();
   try {
@@ -973,6 +1019,14 @@ async function orchestrate(argv: string[]): Promise<void> {
     }
     const scheduleItems = materializeClaimDependencies(contracted);
     const orchestrationId = `dag_${crypto.randomUUID()}`;
+    setAgentEventObservationIdentity({
+      repository: repository.repo,
+      orchestrationId,
+      ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+    });
+    const runs = activeObserver
+      ? observeRunRepository(baseRuns, activeObserver, { repository: repository.repo, orchestrationId })
+      : baseRuns;
     const orchestrationCreatedAt = new Date().toISOString();
     let orchestrationRecord: OrchestrationRecord = {
       schema: "forgedock.orchestration/v1",
@@ -999,6 +1053,16 @@ async function orchestrate(argv: string[]): Promise<void> {
       })),
     };
     await store.createOrchestration(orchestrationRecord);
+    if (activeObserver) {
+      await activeObserver.emit({
+        producer: activeObserver.producer,
+        identity: { repository: repository.repo, orchestrationId },
+        source: "workflow",
+        channel: "lifecycle",
+        kind: "orchestration.created",
+        payload: { status: orchestrationRecord.status, nodeCount: orchestrationRecord.nodes.length },
+      });
+    }
     let orchestrationPersistQueue = Promise.resolve();
     const persistOrchestration = (next: OrchestrationRecord): void => {
       orchestrationRecord = next;
@@ -1055,6 +1119,11 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (planning.planningProvider !== undefined && planning.planningModel !== undefined) resumeArgs.push("--planning-model", `${planning.planningProvider}/${planning.planningModel}`);
           if (planning.planningThinking !== undefined) resumeArgs.push("--planning-thinking", planning.planningThinking);
           await workOn(resumeArgs);
+          setAgentEventObservationIdentity({
+            repository: repository.repo,
+            orchestrationId,
+            ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+          });
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
           updateOrchestrationNode(item.id, { childRunIds: resumed.runId ? [resumed.runId] : [] });
           outcomes.set(item.id, resumed.state);
@@ -1163,6 +1232,14 @@ async function orchestrate(argv: string[]): Promise<void> {
         });
         persistOrchestration({ ...orchestrationRecord, updatedAt: new Date().toISOString(), nodes });
         const event = orchestrationEventFromSchedule(scheduleEvent, snapshot);
+        void activeObserver?.emit({
+          producer: activeObserver.producer,
+          identity: { repository: repository.repo, orchestrationId },
+          source: "workflow",
+          channel: "lifecycle",
+          kind: "orchestration.state.changed",
+          payload: { name: event.name, itemId: event.itemId, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes },
+        });
         process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
@@ -1187,6 +1264,16 @@ async function orchestrate(argv: string[]): Promise<void> {
       }),
     });
     await orchestrationPersistQueue;
+    if (activeObserver) {
+      await activeObserver.emit({
+        producer: activeObserver.producer,
+        identity: { repository: repository.repo, orchestrationId },
+        source: "workflow",
+        channel: "lifecycle",
+        kind: "orchestration.completed",
+        payload: { status: orchestrationFailed ? "failed" : "completed", completed, failed: failed.length, invalid: invalid.length, suspended: suspended.length },
+      });
+    }
     process.stdout.write(`\nOrchestration ${orchestrationId} complete · ${completed - satisfiedExisting} dispatched successfully · ${skipped.size} already terminal · ${failed.length} blocked/failed · ${invalid.length} invalid · ${suspended.length} suspended/awaiting-human\n`);
     for (const [id, state] of outcomes) process.stdout.write(`  ${id}: ${state}\n`);
     if (failed.length || invalid.length || suspended.length) process.exitCode = 2;
@@ -1269,6 +1356,7 @@ async function collectBaselineChecks(input: {
 }
 
 function writeAgentEvent(event: AgentEvent, prefix?: string): void {
+  observeAgentEvent(event);
   agentEventStream.write(event, prefix);
 }
 
@@ -1317,6 +1405,80 @@ function createCliRuntime(options: { provider?: string; model?: string; planning
 async function preflightRuntime(runtime: AgentRuntime, options: RuntimePreflightOptions): Promise<void> {
   if (!runtime.preflight) throw new Error("Configured agent runtime does not support preflight; refusing to publish or dispatch semantic work");
   await runtime.preflight(options);
+}
+
+function observeArtifactRepository(inner: ArtifactRepository, observer: ObservationSink, context: ObservationIdentity): ArtifactRepository {
+  const producer = createObservationProducer("forgedock-artifact");
+  return {
+    async append(artifact) {
+      await inner.append(artifact);
+      void observer.emit({
+        producer,
+        identity: {
+          ...context,
+          forgeRunId: artifact.runId,
+          artifactId: artifact.id,
+          ...(artifact.subject.issue !== undefined ? { issueNumber: artifact.subject.issue } : {}),
+        },
+        source: "artifact",
+        channel: "artifact",
+        kind: "artifact.created",
+        payload: { artifactId: artifact.id, artifactKind: artifact.kind, runId: artifact.runId, subject: artifact.subject },
+      });
+    },
+    list: (subject, kind) => inner.list(subject, kind),
+  };
+}
+
+function observeRunRepository(inner: RunRepository, observer: ObservationSink, context: ObservationIdentity): RunRepository {
+  const producer = createObservationProducer("forgedock-workflow");
+  const emit = (state: RunState, kind: string, payload: Record<string, unknown>, occurredAt = state.updatedAt): void => {
+    void observer.emit({
+      producer,
+      identity: { ...context, forgeRunId: state.runId },
+      source: "workflow",
+      channel: "lifecycle",
+      kind,
+      occurredAt,
+      payload: {
+        ...payload,
+        runId: state.runId,
+        workflow: state.workflow,
+        state: state.state,
+        attempt: state.attempt,
+        version: state.version,
+        ...(context.orchestrationId ? { parentId: context.orchestrationId } : {}),
+      },
+    });
+  };
+  const emitProgress = (progress: RunProgressRecord): void => {
+    void observer.emit({
+      producer,
+      identity: { ...context, forgeRunId: progress.runId },
+      source: "workflow",
+      channel: "activity",
+      kind: "workflow.progress",
+      occurredAt: progress.occurredAt,
+      payload: { phase: progress.phase, message: progress.message, runId: progress.runId },
+    });
+  };
+  return {
+    async create(state) {
+      await inner.create(state);
+      emit(state, "workflow.created", { phase: "queued" });
+    },
+    load: (runId) => inner.load(runId),
+    async commit(expectedVersion, state, record) {
+      await inner.commit(expectedVersion, state, record);
+      emit(state, "workflow.state.changed", { event: record.event, from: record.from, to: record.to, ...(record.reason ? { reason: record.reason } : {}) }, record.occurredAt);
+    },
+    history: (runId) => inner.history(runId),
+    async recordProgress(progress) {
+      await inner.recordProgress(progress);
+      emitProgress(progress);
+    },
+    listProgress: (runId) => inner.listProgress(runId),
+  };
 }
 
 function renderTelemetryLine(summary: ReturnType<typeof summarizeTelemetry>, prefix = ""): void {

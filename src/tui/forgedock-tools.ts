@@ -33,6 +33,8 @@ import {
 } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
+import { ControllerObservationAdapter } from "../observability/adapters.js";
+import type { ObservationSink } from "../observability/contracts.js";
 import { orchestrationEventFromSchedule, type OrchestrationEvent } from "../workflows/orchestrate/events.js";
 import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
 import {
@@ -489,7 +491,11 @@ interface ToolDetails {
   delegation?: unknown;
 }
 
-export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTasks {
+export interface ForgeDockToolRegistrationOptions {
+  getObservationSink?: () => ObservationSink | undefined;
+}
+
+export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolRegistrationOptions = {}): ForgeDockBackgroundTasks {
   const backgroundTasks = new ForgeDockBackgroundTasks(pi);
   let orchestrationCwd = process.cwd();
   let orchestrationRepository: SqliteRepositories | undefined;
@@ -593,7 +599,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
         ? runControllerToolBackground(pi, backgroundTasks, "work-on", args, ctx)
-        : runControllerTool(pi, "work-on", args, signal, onUpdate, ctx);
+        : runControllerTool(pi, "work-on", args, signal, onUpdate, ctx, true, options.getObservationSink?.());
     },
   });
 
@@ -616,7 +622,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
         ? runControllerToolBackground(pi, backgroundTasks, "review-pr", args, ctx)
-        : runControllerTool(pi, "review-pr", args, signal, onUpdate, ctx);
+        : runControllerTool(pi, "review-pr", args, signal, onUpdate, ctx, true, options.getObservationSink?.());
     },
   });
 
@@ -636,7 +642,7 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       if (params.issue) args.push("--issue", String(params.issue));
       if (params.repo) args.push("--repo", params.repo);
       if (params.json) args.push("--json");
-      return runControllerTool(pi, "status", args, signal, onUpdate, ctx, false);
+      return runControllerTool(pi, "status", args, signal, onUpdate, ctx, false, options.getObservationSink?.());
     },
   });
 
@@ -1488,6 +1494,7 @@ async function runControllerTool(
   onUpdate: ((result: { content: Array<{ type: "text"; text: string }>; details: ToolDetails }) => void) | undefined,
   ctx: ExtensionContext,
   includeModel = true,
+  observationSink?: ObservationSink,
 ) {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
@@ -1507,6 +1514,11 @@ async function runControllerTool(
     ...(config.planningThinking ? { FORGEDOCK_PLANNING_THINKING: config.planningThinking } : {}),
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
+  const controllerId = `controller_${crypto.randomUUID()}`;
+  const observation = observationSink
+    ? new ControllerObservationAdapter(observationSink, { identity: { controllerTaskId: controllerId } })
+    : undefined;
+  observation?.started(command, args);
   let result: ControllerResult;
   try {
     result = await executeController(process.execPath, invocationArgs, ctx.cwd, signal, (output) => {
@@ -1514,7 +1526,11 @@ async function runControllerTool(
         content: [{ type: "text", text: output || `Running ForgeDock ${command}…` }],
         details: { command, args, state: "running" },
       });
-    }, { ...nestedBridge?.env, ...configEnv });
+    }, { ...nestedBridge?.env, ...configEnv, FORGEDOCK_CONTROLLER_TASK_ID: controllerId }, (channel, output) => observation?.output(channel, output));
+    observation?.completed(result.code, result.truncated);
+  } catch (error) {
+    observation?.failed(error);
+    throw error;
   } finally {
     await nestedBridge?.close();
   }
@@ -1533,6 +1549,15 @@ async function runControllerTool(
 
 export async function inspectSubagentRuntime(pi: ExtensionAPI): Promise<unknown> {
   return callSubagentRpc(pi, "ping", undefined);
+}
+
+export async function controlSubagentRun(
+  pi: ExtensionAPI,
+  method: "steer" | "stop" | "resume",
+  params: unknown,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  return callSubagentRpc(pi, method, params, signal);
 }
 
 export function resolveModelReference(reference: string, ctx: ExtensionContext): string {
@@ -1879,6 +1904,7 @@ export function executeController(
   signal: AbortSignal | undefined,
   onOutput: (output: string) => void,
   envOverrides: Record<string, string> = {},
+  onChannelOutput?: (channel: "stdout" | "stderr", output: string) => void,
 ): Promise<ControllerResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env: controllerEnvironment(process.env, envOverrides), windowsHide: true });
@@ -1922,8 +1948,8 @@ export function executeController(
     };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout = append(stdout, chunk); scheduleEmit(); });
-    child.stderr.on("data", (chunk: string) => { stderr = append(stderr, chunk); scheduleEmit(); });
+    child.stdout.on("data", (chunk: string) => { stdout = append(stdout, chunk); onChannelOutput?.("stdout", chunk); scheduleEmit(); });
+    child.stderr.on("data", (chunk: string) => { stderr = append(stderr, chunk); onChannelOutput?.("stderr", chunk); scheduleEmit(); });
     child.once("error", (error) => {
       if (!settled) {
         settled = true;
