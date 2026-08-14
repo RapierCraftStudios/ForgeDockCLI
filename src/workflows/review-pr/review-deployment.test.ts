@@ -131,10 +131,11 @@ describe("issue-less deployment PR review", () => {
   it("preserves a pending marker check as non-green evidence instead of skipped", async () => {
     const host = new DeploymentHost("pending");
     const artifactStore = new InMemoryArtifactRepository();
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
     const result = await reviewExistingPullRequest(
       { repo: deploymentPr.repo, pr: deploymentPr.number },
       {
-        runtime: new FakeAgentRuntime(Array.from({ length: 8 }, () => clean)),
+        runtime,
         host,
         workspaces: new TestWorkspaces(),
         artifacts: artifactStore,
@@ -147,10 +148,13 @@ describe("issue-less deployment PR review", () => {
     assert.equal(markerCheck?.failureClass, "infrastructure");
     assert.deepEqual(markerCheck?.failureSignatures, ["github-required-check:pending"]);
     assert.equal(markerCheck?.summary, "GitHub state: pending; Self-referential deployment gate; this review must publish its terminal marker before the check can turn green");
-    const investigation = (await artifactStore.list({ repo: deploymentPr.repo, pr: deploymentPr.number }))
+    const investigation = runtime.tasks
+      .flatMap((task) => task.context)
       .find((artifact) => artifact.kind === "Investigation");
     assert.ok(investigation);
     assert.ok(investigation.payload.evidence.some(({ detail }) => detail.includes("GitHub state: pending")));
+    const published = await artifactStore.list({ repo: deploymentPr.repo, pr: deploymentPr.number });
+    assert.deepEqual(published.map(({ kind }) => kind), ["ReviewVerdict"]);
   });
 
   it("publishes a current-head failure gate when deployment setup throws", async () => {

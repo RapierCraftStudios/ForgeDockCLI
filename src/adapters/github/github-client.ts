@@ -64,6 +64,9 @@ const WORKFLOW_LABELS = [
 
 const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
+const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
+const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
+const MAX_FALLBACK_PATCH_CHARS_PER_FILE = 16_384;
 
 const REVIEW_FINDING_LABELS = [
   { name: "review-finding", color: "D93F0B", description: "Defect or improvement found during independent PR review" },
@@ -114,6 +117,95 @@ export interface BatchIssueInput {
   body: string;
   priorityLabel: "priority:P0" | "P0" | "priority:P1" | "P1" | "priority:P2" | "P2" | "priority:P3" | "P3";
   milestone?: string;
+}
+
+interface GitHubPullRequestFile {
+  filename?: unknown;
+  previous_filename?: unknown;
+  status?: unknown;
+  additions?: unknown;
+  deletions?: unknown;
+  changes?: unknown;
+  patch?: unknown;
+}
+
+function isOversizedPullRequestDiffError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /HTTP 406/i.test(message)
+    && /diff exceeded the maximum number of lines|PullRequest\.diff too_large|could not find pull request diff/i.test(message);
+}
+
+function pullRequestDiffPath(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value || value.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`GitHub pull request file response contains an invalid ${field}`);
+  }
+  const normalized = value.replaceAll("\\", "/");
+  if (normalized.startsWith("/")
+    || /^[A-Za-z]:\//u.test(normalized)
+    || normalized.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
+    throw new Error(`GitHub pull request file response contains an unsafe ${field}`);
+  }
+  return normalized;
+}
+
+function pullRequestFileCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+export function renderPaginatedPullRequestDiff(raw: string): string {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch (error) {
+    throw new Error("GitHub returned malformed paginated pull request files JSON", { cause: error });
+  }
+  if (!Array.isArray(decoded) || decoded.some((page) => !Array.isArray(page))) {
+    throw new Error("GitHub returned an invalid paginated pull request files response");
+  }
+  const files = decoded.flat() as GitHubPullRequestFile[];
+  if (!files.length) throw new Error("GitHub returned no files for the oversized pull request diff");
+  if (files.length >= MAX_GITHUB_PULL_REQUEST_FILES) {
+    throw new Error(`Pull request has at least ${MAX_GITHUB_PULL_REQUEST_FILES} changed files; GitHub cannot prove the complete file set`);
+  }
+
+  const patchBudgetPerFile = Math.max(
+    512,
+    Math.min(MAX_FALLBACK_PATCH_CHARS_PER_FILE, Math.floor(MAX_FALLBACK_PATCH_CHARS / files.length)),
+  );
+  return files.map((file) => {
+    const filename = pullRequestDiffPath(file.filename, "filename");
+    const previousFilename = file.previous_filename === undefined
+      ? filename
+      : pullRequestDiffPath(file.previous_filename, "previous_filename");
+    const status = typeof file.status === "string" ? file.status : "modified";
+    const oldPath = status === "added" ? "/dev/null" : `a/${previousFilename}`;
+    const newPath = status === "removed" ? "/dev/null" : `b/${filename}`;
+    const additions = pullRequestFileCount(file.additions);
+    const deletions = pullRequestFileCount(file.deletions);
+    const changes = pullRequestFileCount(file.changes);
+    const summary = [
+      `status=${status}`,
+      ...(additions !== undefined ? [`additions=${additions}`] : []),
+      ...(deletions !== undefined ? [`deletions=${deletions}`] : []),
+      ...(changes !== undefined ? [`changes=${changes}`] : []),
+    ].join(" ");
+    const originalPatch = typeof file.patch === "string" ? file.patch : undefined;
+    const patch = originalPatch?.length
+      ? originalPatch.slice(0, patchBudgetPerFile)
+      : undefined;
+    const patchNotice = patch === undefined
+      ? "# ForgeDock: GitHub omitted this file patch; inspect the file in the frozen review workspace."
+      : originalPatch!.length > patchBudgetPerFile
+        ? `${patch}\n# ForgeDock: patch excerpt truncated; inspect the file in the frozen review workspace.`
+        : patch;
+    return [
+      `diff --git a/${previousFilename} b/${filename}`,
+      `# ForgeDock oversized-diff fallback: ${summary}`,
+      `--- ${oldPath}`,
+      `+++ ${newPath}`,
+      patchNotice,
+    ].join("\n");
+  }).join("\n");
 }
 
 export class GitHubClient implements ForgeHost {
@@ -941,7 +1033,15 @@ export class GitHubClient implements ForgeHost {
   }
 
   async getPullRequestDiff(repo: string, number: number): Promise<string> {
-    return this.gh(["pr", "diff", String(number), "--repo", repo]);
+    try {
+      return await this.gh(["pr", "diff", String(number), "--repo", repo]);
+    } catch (error) {
+      if (!isOversizedPullRequestDiffError(error)) throw error;
+      const files = await this.gh([
+        "api", `repos/${repo}/pulls/${number}/files?per_page=100`, "--paginate", "--slurp",
+      ]);
+      return renderPaginatedPullRequestDiff(files);
+    }
   }
 
   async getChangedPathsBetween(repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {

@@ -7,6 +7,8 @@
 
 ### Fixed
 
+- Pull-request review now recovers from GitHub's 20,000-line diff limit through a bounded paginated-files fallback that preserves every changed path and marks omitted or truncated patches for frozen-workspace inspection.
+- Issue-less deployment reviews now keep their synthetic scoping context internal instead of publishing work-on Intent, Investigation, and Build Packet comments to the pull request.
 - Deployment review gates now retain contradictory same-name GitHub check observations at the reviewed SHA and fail closed instead of allowing a later push check to mask a failed pull-request check.
 - Reviewer execution now binds durable attempt and session identity to the frozen head and review plan, drains cancellation before retry, reconciles late terminal results, and publishes current-head deployment gate markers on every terminal path.
 - Work-on now resumes Intent-only and Investigation checkpoints without replaying completed semantic work, uses deterministic terminal Outcomes, and preserves blocked or operator-owned batch members during closure.

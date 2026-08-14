@@ -114,10 +114,10 @@ async function reviewDeploymentPullRequest(
     let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
     run = { ...run, headSha: frozen.headSha };
     const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
-    for (const artifact of [context.intent, context.investigation, context.packet]) {
-      await dependencies.artifacts.append(artifact);
-      run = attachArtifact(run, artifact.kind, artifact.id);
-    }
+    // Deployment reviews have no single delivery issue, so their Intent,
+    // Investigation, and Build Packet are deterministic reviewer context rather
+    // than workflow artifacts. Keep them in the isolated reviewer input; do not
+    // project work-on lifecycle comments onto the deployment pull request.
     await dependencies.runs.create(run);
     const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: frozen.number, headSha: frozen.headSha });
     const result = await (async () => {

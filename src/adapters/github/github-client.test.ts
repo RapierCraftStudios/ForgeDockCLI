@@ -7,7 +7,7 @@ import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { terminalReviewFindings } from "../../workflows/review-pr/review.js";
-import { GitHubArtifactRepository, GitHubClient, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -110,6 +110,65 @@ describe("GitHub branch provisioning", () => {
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     await assert.rejects(client.createBranch("a/b", "milestone/ship", "main"), /invalid reference name/);
+  });
+});
+
+describe("GitHub pull request diff retrieval", () => {
+  it("uses the ordinary complete diff when GitHub accepts it", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      return "diff --git a/src/a.ts b/src/a.ts\n+change";
+    } });
+
+    assert.match(await client.getPullRequestDiff("a/b", 7), /src\/a\.ts/);
+    assert.deepEqual(calls, [["pr", "diff", "7", "--repo", "a/b"]]);
+  });
+
+  it("paginates files when GitHub rejects a diff over 20,000 lines", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr") {
+        throw new Error("gh pr failed (1): could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) PullRequest.diff too_large");
+      }
+      return JSON.stringify([[
+        { filename: "src/added.ts", status: "added", additions: 2, deletions: 0, changes: 2, patch: "@@ -0,0 +1,2 @@\n+one\n+two" },
+      ], [
+        { filename: "assets/binary.png", status: "modified", additions: 0, deletions: 0, changes: 0 },
+      ]]);
+    } });
+
+    const diff = await client.getPullRequestDiff("a/b", 186);
+    assert.match(diff, /diff --git a\/src\/added\.ts b\/src\/added\.ts/);
+    assert.match(diff, /--- \/dev\/null/);
+    assert.match(diff, /\+one/);
+    assert.match(diff, /diff --git a\/assets\/binary\.png b\/assets\/binary\.png/);
+    assert.match(diff, /GitHub omitted this file patch/);
+    assert.deepEqual(calls[1], [
+      "api", "repos/a/b/pulls/186/files?per_page=100", "--paginate", "--slurp",
+    ]);
+  });
+
+  it("does not disguise ordinary GitHub failures as oversized diffs", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async () => {
+      throw new Error("gh pr failed (1): HTTP 403: forbidden");
+    } });
+    await assert.rejects(client.getPullRequestDiff("a/b", 7), /HTTP 403/);
+  });
+
+  it("rejects malformed or unprovably complete fallback file sets", () => {
+    assert.throws(() => renderPaginatedPullRequestDiff("{}"), /invalid paginated/);
+    assert.throws(() => renderPaginatedPullRequestDiff(JSON.stringify([[]])), /returned no files/);
+    assert.throws(() => renderPaginatedPullRequestDiff(JSON.stringify([[{ filename: "bad\npath", status: "modified" }]])), /invalid filename/);
+    assert.throws(() => renderPaginatedPullRequestDiff(JSON.stringify([[{ filename: "../outside", status: "modified" }]])), /unsafe filename/);
+    assert.throws(
+      () => renderPaginatedPullRequestDiff(JSON.stringify([Array.from({ length: 3_000 }, (_, index) => ({ filename: `f${index}`, status: "modified" }))])),
+      /cannot prove the complete file set/,
+    );
   });
 });
 
