@@ -128,6 +128,31 @@ describe("fresh-context PR review", () => {
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
   });
 
+  it("settles the full reviewer wave before one deduplicated issue projection", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const duplicateA = {
+      ...inScope, id: "FINDING-A", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Guarded write can escape the lock", evidence: "The write occurs after the lock is released.",
+      location: "src/lock.ts:20", intentRelevance: "Allows concurrent updates", remediation: "Keep the write inside the lock.",
+    };
+    const duplicateB = {
+      ...duplicateA, id: "FINDING-B", title: "Concurrent update is not fenced", evidence: "A second update can enter after lock release.",
+    };
+    const events: string[] = [];
+    const host = new FakeHost(events);
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([{ summary: "correctness", findings: [duplicateA] }, { summary: "concurrency", findings: [duplicateB] }, acceptAdjudication]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.verdict.payload.findings.length, 1);
+    assert.equal(host.findingIssues.length, 1);
+    const lastReviewerComment = Math.max(...events.map((event, index) => event.startsWith("comment:") ? index : -1));
+    const issueProjection = events.findIndex((event) => event.startsWith("issue:"));
+    assert.ok(issueProjection > lastReviewerComment, "issue projection must follow every reviewer comment");
+  });
+
   it("fails closed when the PR target branch changes during review", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);

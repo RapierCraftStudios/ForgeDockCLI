@@ -48,7 +48,7 @@
 
 ### Fixed
 
-- Terminal review-finding materialization and reconciliation now use the same normalized aggregate identity, retaining the active aggregate while closing stale component projections.
+- Terminal review-finding projection now runs only after the complete reviewer wave, uses stricter cross-reviewer paraphrase deduplication and stable aggregate identity, and adopts one open PR-lane issue instead of creating a duplicate when a root set changes; duplicate lane projections are reconciled afterward.
 - Post-remediation findings can no longer claim introduction from cumulative Build Result paths or generic current route facts; only exact prior-reviewed-SHA delta paths, explicit changed authority facts, or accepted prior-finding lineage preserve blocking continuity.
 - Finding consolidation derives policy-bearing severity, confidence, scope, and corroboration from qualifying source attestations, preventing low-confidence or rejected duplicates from laundering another source into a blocker.
 - Review Plan identity now canonically covers all authority-bearing fields and validates run/repository/PR/packet/delivery lineage before reuse; foreign, legacy, and mutated plans replan deterministically while old verdict artifacts remain readable.
