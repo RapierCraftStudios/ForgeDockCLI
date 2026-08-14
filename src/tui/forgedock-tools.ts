@@ -18,6 +18,7 @@ import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrches
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
 import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
+import { createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import {
@@ -521,7 +522,9 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       if (ctx) {
         orchestrationCwd = ctx.cwd;
         if (ctx.mode === "tui" && !orchestrationRepository) {
-          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"));
+          const witness = createConfiguredLeaseWitness(ctx.cwd);
+          if (!witness) throw new Error("Lease witness configuration is required before TUI recovery inspection; token-only local leases are disabled");
+          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
         }
       }
       const rerunIssueNumbers = [...new Set(params.rerunIssueNumbers ?? [])];
@@ -861,7 +864,9 @@ export function registerForgeDockTools(pi: ExtensionAPI): ForgeDockBackgroundTas
       const artifacts = new GitHubArtifactRepository(github);
       orchestrationCwd = ctx.cwd;
       if (ctx.mode === "tui" && !orchestrationRepository) {
-        orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"));
+        const witness = createConfiguredLeaseWitness(ctx.cwd);
+        if (!witness) throw new Error("Lease witness configuration is required before TUI orchestration dispatch; token-only local leases are disabled");
+        orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
       }
       const orchestration = await dagDelegator.start({
         items: schedule.items as VisibleOrchestrationItem[],

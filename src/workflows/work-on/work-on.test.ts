@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -718,6 +719,44 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual((await runs.history(verdict.runId)).map((record) => record.event).slice(-3), [
       "RESUME_COMPLETION", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("denies completion mutations after lease continuity is lost", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const subject = { repo: "a/b", issue: 8 };
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_completion_fenced", subject: { ...subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: { headSha: sha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    let run = createRun({ workflow: "work-on", subject, runId: verdict.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED",
+    ] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    let guardChecks = 0;
+    const leaseGuard = {
+      assertValid: () => {
+        guardChecks += 1;
+        if (guardChecks >= 2) throw new LeaseContinuityError("retained checkpoint is unverifiable");
+      },
+      check: () => undefined,
+    };
+
+    await assert.rejects(resumeCompletionWorkOn({
+      run, verdict, pullRequest: host.snapshot, autoMerge: true,
+    }, {
+      runtime: new FakeAgentRuntime([]), artifacts, runs, git, verifier: new EndToEndVerifier(), host, leaseGuard,
+    }), LeaseContinuityError);
+    assert.ok(guardChecks >= 2);
+    assert.equal(host.snapshot.state, "OPEN", "lease loss must fence merge and later completion writes");
   });
 
   it("resumes retained verification without replaying investigation, packet authoring, or build", async () => {
