@@ -686,8 +686,12 @@ export class GitHubClient implements ForgeHost {
         const name = typeof check.name === "string" ? check.name.trim() : "";
         const state = typeof check.state === "string" ? check.state : undefined;
         const detailsUrl = typeof check.link === "string" ? check.link : undefined;
-        const completedAt = typeof check.completedAt === "string" ? check.completedAt : undefined;
-        const startedAt = typeof check.startedAt === "string" ? check.startedAt : undefined;
+        const timestamp = (value: unknown): string | undefined => {
+          if (typeof value !== "string" || !value || value.startsWith("0001-01-01")) return undefined;
+          return value;
+        };
+        const completedAt = timestamp(check.completedAt);
+        const startedAt = timestamp(check.startedAt);
         return {
           name: name || "unnamed-required-check",
           state: mergeCheckState(state),
