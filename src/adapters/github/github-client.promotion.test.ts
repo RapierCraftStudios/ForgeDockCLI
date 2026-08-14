@@ -55,6 +55,21 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Check for FORGE gate markers", "failed"]]);
   });
 
+  it("falls back to all checks when the branch has no required-check configuration", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
+        return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "UNSTABLE" });
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) throw new Error("gh: no required checks reported on the 'staging' branch");
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Unit Tests", state: "SUCCESS" }, { name: "Check for FORGE gate markers", state: "FAILURE" }]);
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Check for FORGE gate markers", "failed"]]);
+  });
+
   it("rechecks exact SHA/base before merge", async () => {
     const client = new GitHubClient();
     let current = { ...pr };

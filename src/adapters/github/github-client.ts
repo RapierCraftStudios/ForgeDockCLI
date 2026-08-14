@@ -677,24 +677,54 @@ export class GitHubClient implements ForgeHost {
       mergeable = false;
     }
 
+    const parseChecks = (result: string): PullRequestMergeGate["requiredChecks"] => {
+      const parsed: unknown = JSON.parse(result);
+      if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
+      return parsed.map((entry: unknown) => {
+        if (!entry || typeof entry !== "object") throw new Error("GitHub checks response contains an invalid entry");
+        const check = entry as { name?: unknown; state?: unknown; link?: unknown };
+        const name = typeof check.name === "string" ? check.name.trim() : "";
+        const state = typeof check.state === "string" ? check.state : undefined;
+        const detailsUrl = typeof check.link === "string" ? check.link : undefined;
+        return {
+          name: name || "unnamed-required-check",
+          state: mergeCheckState(state),
+          ...(detailsUrl ? { detailsUrl } : {}),
+        };
+      });
+    };
     let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
     try {
       const result = await this.gh([
         "pr", "checks", String(number), "--repo", repo, "--required",
         "--json", "name,state,link",
       ]);
-      const checks = JSON.parse(result) as Array<{ name?: string; state?: string; link?: string }>;
-      requiredChecks = checks.map((check) => ({
-        name: check.name?.trim() || "unnamed-required-check",
-        state: mergeCheckState(check.state),
-        ...(check.link ? { detailsUrl: check.link } : {}),
-      }));
+      requiredChecks = parseChecks(result);
     } catch (error) {
-      requiredChecks = [{
-        name: "required-checks-query",
-        state: "unavailable",
-        detailsUrl: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
-      }];
+      if (error instanceof Error && /no required checks reported/i.test(error.message)) {
+        try {
+          // Repositories without branch-protection required checks still
+          // expose check runs. Use them as the review gate rather than
+          // converting a normal GitHub response into an unavailable blocker.
+          const result = await this.gh([
+            "pr", "checks", String(number), "--repo", repo,
+            "--json", "name,state,link",
+          ]);
+          requiredChecks = parseChecks(result);
+        } catch (fallbackError) {
+          requiredChecks = [{
+            name: "required-checks-query",
+            state: "unavailable",
+            detailsUrl: fallbackError instanceof Error ? fallbackError.message.slice(0, 500) : String(fallbackError).slice(0, 500),
+          }];
+        }
+      } else {
+        requiredChecks = [{
+          name: "required-checks-query",
+          state: "unavailable",
+          detailsUrl: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+        }];
+      }
     }
     // The checks query is PR-scoped. Re-read the PR after it so a head/base
     // race cannot attach current checks to a different reviewed revision.
