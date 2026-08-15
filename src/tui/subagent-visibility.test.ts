@@ -150,7 +150,17 @@ describe("bundled subagent live visibility", () => {
   it("accepts a completed read-only ForgeDock review despite an earlier optional probe failure", () => {
     const execution = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8");
     assert.match(execution, /agent\.name === "forgedock-reviewer"[\s\S]*?structuredOutputToolInvoked[\s\S]*?detectSubagentError\(\[\]\)/);
-    assert.match(execution, /recoveredForgeDockTransportReview[\s\S]*?websocket[\s\S]*?result\.exitCode = 0[\s\S]*?result\.error = undefined/);
+    assert.match(execution, /completedForgeDockStructuredReview[\s\S]*?structured_output is the terminating contract[\s\S]*?result\.exitCode = 0[\s\S]*?result\.error = undefined/);
+    assert.doesNotMatch(execution, /completedForgeDockStructuredReview[\s\S]{0,800}?websocket/);
+  });
+
+  it("keeps typed ForgeDock reviewers off the interactive supervisor channel", () => {
+    const executor = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/subagent-executor.ts"), "utf8");
+    const reviewer = readFileSync(resolve("agents/forgedock-reviewer.md"), "utf8");
+    assert.match(executor, /agent\.name === "forgedock-reviewer" \? agent : applyIntercomBridgeToAgent/);
+    assert.match(readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8"), /completedForgeDockStructuredReview[\s\S]*?!interruptedByControl/);
+    assert.match(reviewer, /Do not send progress updates, contact a supervisor, or ask for interactive scope decisions/);
+    assert.match(reviewer, /structured output tool, then stop immediately/);
   });
 
   it("projects streaming tool updates into the per-worker fleet transcript", async () => {

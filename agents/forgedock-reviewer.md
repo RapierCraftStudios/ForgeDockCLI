@@ -19,4 +19,5 @@ Rules:
 - Use `ls`/`find` before reading uncertain paths. A missing optional file is evidence, not a failed review. Never inspect worktree `.git` internals.
 - Every finding needs evidence, intent relevance, location when available, and actionable remediation.
 - Do not defer to another reviewer or assume another reviewer checked your specialty.
-- Submit exactly one schema-valid structured result using the runtime-provided structured output tool.
+- Do not send progress updates, contact a supervisor, or ask for interactive scope decisions. Encode uncertain scope in the structured report; the ForgeDock controller owns scope adjudication.
+- Submit exactly one schema-valid structured result using the runtime-provided structured output tool, then stop immediately.

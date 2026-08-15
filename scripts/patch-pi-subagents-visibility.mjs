@@ -53,20 +53,32 @@ patch(join(root, "src", "extension", "index.ts"), [[
 ]]);
 
 // A ForgeDock reviewer is read-only and its schema-valid structured submission
-// is the authoritative result. A failed optional probe must remain negative
-// evidence instead of invalidating an artifact the reviewer subsequently
-// completed. Keep this exception scoped to the ForgeDock reviewer; mutating
-// or general-purpose subagents retain pi-subagents' fail-on-tool-error policy.
+// is the authoritative terminal result. Once the terminating tool has written
+// that result, a later provider/context/process error cannot invalidate it.
+// Cancellation, operator stop, and timeout remain authoritative. Keep this
+// exception scoped to ForgeDock reviewers; mutating and general-purpose agents
+// retain pi-subagents' ordinary fail-on-error policy.
+patchAny(join(root, "src", "runs", "foreground", "execution.ts"), [
+  "\tresult.exitCode = exitCode;\n\tif (interruptedByControl) {",
+  "\tresult.exitCode = exitCode;\n\tconst recoveredForgeDockTransportReview = agent.name === \"forgedock-reviewer\"\n\t\t&& options.structuredOutput !== undefined\n\t\t&& structuredOutputToolInvoked\n\t\t&& existsSync(options.structuredOutput.outputPath)\n\t\t&& !result.timedOut\n\t\t&& !result.stopped\n\t\t&& !options.signal?.aborted\n\t\t&& /websocket|socket hang up|econnreset|etimedout|transport failed|response failed|network error/i.test(result.error ?? \"\");\n\tif (recoveredForgeDockTransportReview) {\n\t\t// The terminating structured artifact is authoritative for a read-only\n\t\t// reviewer. A transport failure after that tool completed must not burn\n\t\t// the finished session; normal schema validation still runs below.\n\t\tresult.exitCode = 0;\n\t\tresult.error = undefined;\n\t}\n\tif (interruptedByControl) {",
+  "\tresult.exitCode = exitCode;\n\tconst completedForgeDockStructuredReview = agent.name === \"forgedock-reviewer\"\n\t\t&& options.structuredOutput !== undefined\n\t\t&& structuredOutputToolInvoked\n\t\t&& existsSync(options.structuredOutput.outputPath)\n\t\t&& !result.timedOut\n\t\t&& !result.stopped\n\t\t&& !options.signal?.aborted;\n\tif (completedForgeDockStructuredReview) {\n\t\t// structured_output is the terminating contract for this read-only role.\n\t\t// Validate the captured file below and ignore only errors that happened\n\t\t// after the tool completed (including context overflow during teardown).\n\t\tresult.exitCode = 0;\n\t\tresult.error = undefined;\n\t}\n\tif (interruptedByControl) {",
+], "\tresult.exitCode = exitCode;\n\tconst completedForgeDockStructuredReview = agent.name === \"forgedock-reviewer\"\n\t\t&& options.structuredOutput !== undefined\n\t\t&& structuredOutputToolInvoked\n\t\t&& existsSync(options.structuredOutput.outputPath)\n\t\t&& !result.timedOut\n\t\t&& !result.stopped\n\t\t&& !interruptedByControl\n\t\t&& !options.signal?.aborted;\n\tif (completedForgeDockStructuredReview) {\n\t\t// structured_output is the terminating contract for this read-only role.\n\t\t// Validate the captured file below and ignore only errors that happened\n\t\t// after the tool completed (including context overflow during teardown).\n\t\tresult.exitCode = 0;\n\t\tresult.error = undefined;\n\t}\n\tif (interruptedByControl) {");
+
 patch(join(root, "src", "runs", "foreground", "execution.ts"), [
-  [
-    "\tresult.exitCode = exitCode;\n\tif (interruptedByControl) {",
-    "\tresult.exitCode = exitCode;\n\tconst recoveredForgeDockTransportReview = agent.name === \"forgedock-reviewer\"\n\t\t&& options.structuredOutput !== undefined\n\t\t&& structuredOutputToolInvoked\n\t\t&& existsSync(options.structuredOutput.outputPath)\n\t\t&& !result.timedOut\n\t\t&& !result.stopped\n\t\t&& !options.signal?.aborted\n\t\t&& /websocket|socket hang up|econnreset|etimedout|transport failed|response failed|network error/i.test(result.error ?? \"\");\n\tif (recoveredForgeDockTransportReview) {\n\t\t// The terminating structured artifact is authoritative for a read-only\n\t\t// reviewer. A transport failure after that tool completed must not burn\n\t\t// the finished session; normal schema validation still runs below.\n\t\tresult.exitCode = 0;\n\t\tresult.error = undefined;\n\t}\n\tif (interruptedByControl) {",
-  ],
   [
     "\t\tconst errInfo = detectSubagentError(messages);",
     "\t\tconst completedForgeDockReview = agent.name === \"forgedock-reviewer\" && options.structuredOutput !== undefined && structuredOutputToolInvoked && existsSync(options.structuredOutput.outputPath);\n\t\tconst errInfo = completedForgeDockReview ? detectSubagentError([]) : detectSubagentError(messages);",
   ],
 ]);
+
+// ForgeDock's typed review controller, not the interactive parent model, owns
+// scope classification and reviewer synthesis. Do not inject the generic
+// supervisor/intercom tools into reviewer children: their progress remains
+// visible in the fleet while their sole handoff is structured_output.
+patch(join(root, "src", "runs", "foreground", "subagent-executor.ts"), [[
+  "\t\tconst agents = intercomBridge.active\n\t\t\t? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))\n\t\t\t: discoveredAgents;",
+  "\t\tconst agents = intercomBridge.active\n\t\t\t? discoveredAgents.map((agent) => agent.name === \"forgedock-reviewer\" ? agent : applyIntercomBridgeToAgent(agent, intercomBridge))\n\t\t\t: discoveredAgents;",
+]]);
 
 patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
@@ -264,4 +276,13 @@ function patch(file, replacements) {
     changed = true;
   }
   if (changed) writeFileSync(file, source, "utf8");
+}
+
+function patchAny(file, candidates, after) {
+  let source = readFileSync(file, "utf8");
+  if (source.includes(after)) return;
+  const matches = candidates.filter((candidate) => source.includes(candidate));
+  if (matches.length !== 1) throw new Error(`ForgeDock visibility patch could not find one supported block in ${file}; found ${matches.length}`);
+  source = source.replace(matches[0], after);
+  writeFileSync(file, source, "utf8");
 }

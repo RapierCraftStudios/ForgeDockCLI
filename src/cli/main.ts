@@ -34,6 +34,7 @@ import {
   type RuntimePreflightOptions,
 } from "../runtime/agent-runtime.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
+import { persistControllerTaskTerminal } from "../runtime/controller-task-record.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
@@ -66,12 +67,21 @@ const mode = colorMode();
 const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
 let activeObserver: ForgeDockObserver | undefined;
 
-await main(args).catch((error: unknown) => {
+try {
+  await main(args);
+} catch (error: unknown) {
   agentEventStream.finish();
   const message = error instanceof Error ? error.message : String(error);
   console.error(`${statusGlyph("failed", mode)} ${message}`);
   process.exitCode = 1;
-});
+} finally {
+  try {
+    persistControllerTaskTerminal(typeof process.exitCode === "number" ? process.exitCode : 0);
+  } catch {
+    // Operational task projection is rebuildable. Attached supervisors still
+    // observe process exit; durable workflow/GitHub state remains authority.
+  }
+}
 
 type RunDisplayGlyph = "active" | "passed" | "failed" | "blocked";
 
