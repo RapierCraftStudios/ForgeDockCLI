@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Large pull-request planning now balances diff weight across the minimum path-bounded reviewer groups instead of treating the already-bounded initial diff size as a reason to manufacture duplicate sessions and exceed the review-plan ceiling.
 - Standalone review no longer treats conditionally skipped or neutral GitHub Actions jobs as unavailable failures when a repository has no explicit branch-protection check set and ForgeDock falls back to observing all PR checks.
 - Large pull-request reviews now freeze deterministic bounded path shards, compact reviewer authority and diff inputs, enforce per-shard turn/tool ceilings, preserve shard-scoped finding provenance, and surface the real nested session identity for safe cancellation and recovery instead of repeating context-exhausted reviews.
 - Removed comment-driven deployment admission and ForgeDock Next's `FORGE:GATE_*` lifecycle marker publication; standalone review verdicts plus configured exact-head GitHub CI and mechanical checks now provide PR review authority without requiring ForgeDock-created gate comments.

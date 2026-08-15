@@ -115,6 +115,7 @@ const DEFAULT_SPECIALIST_BUDGET = 3;
 const MAX_INITIAL_REVIEW_DIFF_CHARS = 30_000;
 export const DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS = MAX_INITIAL_REVIEW_DIFF_CHARS;
 export const MAX_REVIEW_EXECUTION_GROUP_PATHS = 24;
+/** Per-path weight ceiling used to balance shards; scopedReviewDiff owns the hard prompt-size bound. */
 export const MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS = 60_000;
 const MAX_REVIEW_EXECUTION_GROUPS = 64;
 const MAX_PARALLEL_REVIEW_SESSIONS = 4;
@@ -425,28 +426,37 @@ export function scopedReviewDiff(
 }
 
 function shardExecutionGroup(group: ReviewExecutionGroup, sections: readonly DiffSection[]): ReviewExecutionGroup[] {
-  if (!group.scope.length) return [group];
+  if (group.scope.length <= MAX_REVIEW_EXECUTION_GROUP_PATHS) return [group];
   const sectionChars = new Map(sections.map((section) => [normalizePath(section.path), section.text.length]));
-  const shards: string[][] = [];
-  let current: string[] = [];
-  let currentChars = 0;
-  for (const path of group.scope) {
-    const estimatedChars = Math.max(1, Math.min(sectionChars.get(normalizePath(path)) ?? 1_000, MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS));
-    if (current.length && (current.length >= MAX_REVIEW_EXECUTION_GROUP_PATHS
-      || currentChars + estimatedChars > MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS)) {
-      shards.push(current);
-      current = [];
-      currentChars = 0;
-    }
-    current.push(path);
-    currentChars += estimatedChars;
+  const shardCount = Math.ceil(group.scope.length / MAX_REVIEW_EXECUTION_GROUP_PATHS);
+  const shards = Array.from({ length: shardCount }, (_, index) => ({ index, chars: 0, scope: [] as string[] }));
+  const weightedPaths = group.scope.map((path) => ({
+    path,
+    chars: Math.max(1, Math.min(
+      sectionChars.get(normalizePath(path)) ?? 1_000,
+      MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS,
+    )),
+  })).sort((left, right) => right.chars - left.chars
+    || (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+
+  // The initial diff passed to a reviewer is independently hard-capped by
+  // scopedReviewDiff. Use diff size only to balance the minimum number of
+  // path-bounded shards; otherwise one large diff can manufacture dozens of
+  // redundant reviewer sessions and then exceed the plan's own session cap.
+  for (const weighted of weightedPaths) {
+    const target = shards
+      .filter(({ scope }) => scope.length < MAX_REVIEW_EXECUTION_GROUP_PATHS)
+      .sort((left, right) => left.chars - right.chars
+        || left.scope.length - right.scope.length
+        || left.index - right.index)[0]!;
+    target.scope.push(weighted.path);
+    target.chars += weighted.chars;
   }
-  if (current.length) shards.push(current);
-  if (shards.length === 1) return [group];
-  return shards.map((scope, index) => ({
+
+  return shards.map(({ scope }, index) => ({
     ...group,
-    id: `${group.id}-part-${index + 1}-of-${shards.length}`,
-    scope,
+    id: `${group.id}-part-${index + 1}-of-${shardCount}`,
+    scope: scope.sort(),
   }));
 }
 

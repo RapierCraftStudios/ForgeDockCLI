@@ -221,7 +221,7 @@ describe("evidence-backed review planning", () => {
     assert.equal(plan.schemaVersion, 3);
     assert.equal(correctness.length, 3);
     assert.ok(correctness.every(({ scope }) => scope.length > 0 && scope.length <= 24));
-    assert.deepEqual(correctness.flatMap(({ scope }) => scope), paths);
+    assert.deepEqual(correctness.flatMap(({ scope }) => scope).sort(), paths);
     assert.equal(new Set(correctness.map(({ id }) => id)).size, correctness.length);
     assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness"]);
     assert.equal(plan.budget.maxLogicalReviewerSessions, correctness.length);
@@ -237,5 +237,24 @@ describe("evidence-backed review planning", () => {
       () => assertReviewPlan({ ...malformed, planId: computeReviewPlanId(malformed) }),
       /exactly and uniquely cover/,
     );
+  });
+
+  it("balances oversized deployment diffs without manufacturing more reviewer sessions than path coverage requires", () => {
+    const paths = Array.from({ length: 232 }, (_, index) => `src/lease-module-${String(index).padStart(3, "0")}.ts`);
+    const diff = paths.map((path, index) => [
+      `diff --git a/${path} b/${path}`,
+      `+export const leaseChange${index} = "${"x".repeat(12_000)}";`,
+    ].join("\n")).join("\n");
+    const plan = planReviewPanel({ changedPaths: paths, diff, packet: packet(), maxSpecialists: 1 });
+    const correctness = plan.executionGroups.filter(({ role }) => role === "correctness");
+    const concurrency = plan.executionGroups.filter(({ role }) => role === "concurrency");
+
+    assert.equal(correctness.length, 10);
+    assert.equal(concurrency.length, 10);
+    assert.equal(plan.executionGroups.length, 20);
+    assert.ok(plan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
+    assert.deepEqual(correctness.flatMap(({ scope }) => scope).sort(), paths);
+    assert.deepEqual(concurrency.flatMap(({ scope }) => scope).sort(), paths);
+    assert.doesNotThrow(() => assertReviewPlan(plan));
   });
 });
