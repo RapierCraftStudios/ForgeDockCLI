@@ -70,7 +70,12 @@ export class PiAgentRuntime implements AgentRuntime {
   async capabilities(): Promise<RuntimeCapabilities> {
     return {
       runtime: "pi",
-      resumableSessions: Boolean(process.env.FORGEDOCK_NESTED_AGENT_URL && process.env.FORGEDOCK_NESTED_AGENT_TOKEN),
+      // The package's generic resume RPC appends its own acceptance contract
+      // and does not restore a V2 structured-output schema. Advertising that
+      // path as resumable would revive typed reviewers under two incompatible
+      // completion contracts. Retry those attempts as fresh typed delegations
+      // until pi-subagents exposes a schema-preserving resume protocol.
+      resumableSessions: false,
       tools: ["read", "grep", "find", "ls", "compute", "edit", "write"],
     };
   }
@@ -272,29 +277,10 @@ export class PiAgentRuntime implements AgentRuntime {
   ): Promise<AgentRunResult<T>> {
     throwIfAborted(options.signal);
     assertToolPolicy(suppliedTask);
-    const task = effectiveRuntimeTask(suppliedTask);
-    await assertRuntimeInstallAsync();
-    throwIfAborted(options.signal);
-    if (task.role !== "reviewer" || !process.env.FORGEDOCK_NESTED_AGENT_URL || !process.env.FORGEDOCK_NESTED_AGENT_TOKEN) {
-      throw new AgentRunError("Pi can resume ForgeDock reviewers only through the persisted nested-agent bridge");
-    }
-    const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
-    if (!provider || !modelId) throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
-    const startedAt = Date.now();
-    const execution = this.beginExecution(options.signal);
-    try {
-      const result = await runNestedReviewer(task, {
-        provider,
-        model: modelId,
-        emit: options.onEvent ?? (() => undefined),
-        resumeSessionRef: sessionRef,
-        ...(thinking !== undefined ? { thinking } : {}),
-        signal: execution.controller.signal,
-      });
-      return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageUnavailable(), 0, sessionRef) };
-    } finally {
-      execution.complete();
-    }
+    throw new AgentRunError(
+      "Pi cannot resume a typed ForgeDock reviewer without losing its structured-output contract; retry with a fresh bounded delegation",
+      { sessionRef, resumable: false },
+    );
   }
 
   async close(): Promise<void> {
@@ -447,7 +433,7 @@ async function runNestedReviewer<T>(
     const sessionRef = observedSessionRef ?? provisionalSessionRef;
     emitNestedTerminal(task, input, cancelled ? "session.cancelled" : "session.failed", sessionRef, error);
     const detail = error instanceof Error ? error : new Error(String(error));
-    throw new AgentRunError(detail.message, { sessionRef, resumable: observedSessionRef !== undefined, cause: error });
+    throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: error });
   }
   const payload = response.payload;
   if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
@@ -455,7 +441,9 @@ async function runNestedReviewer<T>(
     emitNestedTerminal(task, input, input.signal?.aborted ? "session.cancelled" : "session.failed", sessionRef, payload.error);
     throw new AgentRunError(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
       sessionRef,
-      resumable: payload.resumable === true,
+      // A persisted session identity remains useful evidence, but the generic
+      // bridge resume path cannot preserve this typed output contract.
+      resumable: false,
     });
   }
   const sessionRef = observedSessionRef ?? payload.sessionRef ?? provisionalSessionRef;

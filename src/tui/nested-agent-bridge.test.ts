@@ -323,7 +323,7 @@ test("a schema-valid structured result survives a trailing failed terminal statu
   }
 });
 
-test("a terminal-only failed delegation returns its persisted session reference for one resume attempt", async () => {
+test("a terminal-only failed delegation preserves its session reference but requires a fresh typed retry", async () => {
   const events = new FakeEvents();
   events.autoRespond = false;
   const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
@@ -348,7 +348,7 @@ test("a terminal-only failed delegation returns its persisted session reference 
     assert.equal(response.headers.get("x-forgedock-nested-session-ref"), "persisted-incomplete");
     const result = await response.json() as any;
     assert.equal(result.sessionRef, "persisted-incomplete");
-    assert.equal(result.resumable, true);
+    assert.equal(result.resumable, undefined);
   } finally {
     await bridge.close();
   }

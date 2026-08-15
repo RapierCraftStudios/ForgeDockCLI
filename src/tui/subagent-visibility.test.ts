@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
@@ -156,11 +156,69 @@ describe("bundled subagent live visibility", () => {
 
   it("keeps typed ForgeDock reviewers off the interactive supervisor channel", () => {
     const executor = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/subagent-executor.ts"), "utf8");
+    const resultWatcher = readFileSync(resolve("node_modules/pi-subagents/src/runs/background/result-watcher.ts"), "utf8");
+    const asyncTracker = readFileSync(resolve("node_modules/pi-subagents/src/runs/background/async-job-tracker.ts"), "utf8");
     const reviewer = readFileSync(resolve("agents/forgedock-reviewer.md"), "utf8");
     assert.match(executor, /agent\.name === "forgedock-reviewer" \? agent : applyIntercomBridgeToAgent/);
+    assert.match(executor, /event\.agent === "forgedock-reviewer"\) return/);
+    assert.match(executor, /forgeDockReviewerOnly[\s\S]*?effectiveAsync \|\| forgeDockReviewerOnly \? undefined : DEFAULT_FOREGROUND_TIMEOUT_MS/);
+    assert.match(resultWatcher, /internalForgeDockReview[\s\S]*?\? true[\s\S]*?: await notifier\.deliver/);
+    assert.match(resultWatcher, /if \(!internalForgeDockReview\) \{[\s\S]*?SUBAGENT_ASYNC_COMPLETE_EVENT/);
+    assert.match(asyncTracker, /record\.event\.agent === "forgedock-reviewer"\) return/);
     assert.match(readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8"), /completedForgeDockStructuredReview[\s\S]*?!interruptedByControl/);
     assert.match(reviewer, /Do not send progress updates, contact a supervisor, or ask for interactive scope decisions/);
     assert.match(reviewer, /structured output tool, then stop immediately/);
+  });
+
+  it("consumes internal reviewer result files without notifying or waking the parent", async () => {
+    const jiti = createJiti(import.meta.url, { interopDefault: true });
+    const loaded = await jiti.import(resolve("node_modules/pi-subagents/src/runs/background/result-watcher.ts")) as {
+      createResultWatcher(
+        pi: { events: { emit(name: string, value: unknown): void } },
+        state: Record<string, any>,
+        resultsDir: string,
+        completionTtlMs: number,
+        deps: { notifier: { deliver(value: unknown): Promise<boolean> } },
+      ): { primeExistingResults(): void; stopResultWatcher(): void };
+    };
+    const resultsDir = mkdtempSync(join(tmpdir(), "forgedock-review-results-"));
+    const resultPath = join(resultsDir, "review.json");
+    writeFileSync(resultPath, JSON.stringify({
+      id: "review-child",
+      runId: "review-child",
+      sessionId: "parent-session",
+      agent: "forgedock-reviewer",
+      success: true,
+      summary: "internal structured review complete",
+      results: [{ agent: "forgedock-reviewer", success: true, output: "internal structured review complete" }],
+    }));
+    const emitted: string[] = [];
+    let notified = 0;
+    const state: Record<string, any> = {
+      currentSessionId: "parent-session",
+      completionSeen: new Map(),
+      watcher: null,
+      watcherRestartTimer: null,
+      resultFileCoalescer: { schedule() {}, clear() {} },
+    };
+    const watcher = loaded.createResultWatcher(
+      { events: { emit: (name) => { emitted.push(name); } } },
+      state,
+      resultsDir,
+      60_000,
+      { notifier: { deliver: async () => { notified += 1; return true; } } },
+    );
+    try {
+      watcher.primeExistingResults();
+      for (let attempt = 0; attempt < 100 && existsSync(resultPath); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(resultPath), false, "internal result is acknowledged and removed");
+      assert.equal(notified, 0, "generic completion notifier is bypassed");
+      assert.deepEqual(emitted, [], "generic async-complete/intercom events are bypassed");
+    } finally {
+      watcher.stopResultWatcher();
+    }
   });
 
   it("projects streaming tool updates into the per-worker fleet transcript", async () => {

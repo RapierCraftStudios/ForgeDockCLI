@@ -281,6 +281,7 @@ test("nested terminal failure carries the persisted child session identity", asy
   try {
     await assert.rejects(runtime.run(taskForRole("reviewer") as any, { onEvent: (event) => events.push(event) }), (error: any) => {
       assert.equal(error.sessionRef, "nested-real-session");
+      assert.equal(error.resumable, false, "typed reviewers must retry with a fresh V2 schema contract");
       return true;
     });
     const terminal = events.find((event) => event.type === "session.failed");
@@ -290,6 +291,25 @@ test("nested terminal failure carries the persisted child session identity", asy
     await runtime.close();
     restoreNestedEnvironment(previousUrl, previousToken);
     await endpoint.close();
+  }
+});
+
+test("Pi does not advertise generic session resume as typed reviewer recovery", async () => {
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  process.env.FORGEDOCK_NESTED_AGENT_URL = "http://127.0.0.1:1/v1/run";
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = "test-token";
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  try {
+    assert.equal((await runtime.capabilities()).resumableSessions, false);
+    await assert.rejects(
+      runtime.resume!("persisted-review", taskForRole("reviewer") as any),
+      (error: any) => error.sessionRef === "persisted-review" && error.resumable === false
+        && /fresh bounded delegation/.test(error.message),
+    );
+  } finally {
+    await runtime.close();
+    restoreNestedEnvironment(previousUrl, previousToken);
   }
 });
 

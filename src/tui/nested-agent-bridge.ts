@@ -210,20 +210,17 @@ function delegate(
 }
 
 function isPersistedDelegationResumable(
-  status: SubagentDelegationV2Response["status"],
-  error: string | undefined,
-  hasPersistedSession: boolean,
+  _status: SubagentDelegationV2Response["status"],
+  _error: string | undefined,
+  _hasPersistedSession: boolean,
 ): boolean {
-  if (!hasPersistedSession) return false;
-  // Budget exhaustion and structured-contract failures are completed child
-  // executions, not interrupted transport. Their persisted conversation has
-  // no remaining bounded authority (or already declined the required output
-  // contract), so retrying must use fresh context under the same logical task.
-  if (status === "failed" && /structured (?:result|output)|did not capture|missing structured_output/i.test(error ?? "")) return false;
-  return status === "failed"
-    || status === "timed_out"
-    || status === "cancelled"
-    || status === "interrupted";
+  // Generic pi-subagents resume does not restore the V2 output schema and
+  // appends an attested acceptance-report contract. That conflicts with the
+  // review controller's structured_output contract, so no typed reviewer
+  // terminal may advertise automatic resume through that channel. The
+  // controller retains the session reference as evidence and spends its next
+  // bounded attempt on a fresh V2 delegation.
+  return false;
 }
 
 async function resumeDelegation(

@@ -80,6 +80,53 @@ patch(join(root, "src", "runs", "foreground", "subagent-executor.ts"), [[
   "\t\tconst agents = intercomBridge.active\n\t\t\t? discoveredAgents.map((agent) => agent.name === \"forgedock-reviewer\" ? agent : applyIntercomBridgeToAgent(agent, intercomBridge))\n\t\t\t: discoveredAgents;",
 ]]);
 
+// Reviewer shards are implementation details of ForgeDock's typed review
+// controller. Keep them visible in the fleet, but do not wake or steer the
+// foreground parent through pi-subagents' generic completion/control channels.
+patch(join(root, "src", "runs", "foreground", "subagent-executor.ts"), [
+  [
+    '}): void {\n\tif (!shouldNotifyControlEvent(input.controlConfig, input.event)) return;',
+    '}): void {\n\tif (input.event.agent === "forgedock-reviewer") return;\n\tif (!shouldNotifyControlEvent(input.controlConfig, input.event)) return;',
+    'if (input.event.agent === "forgedock-reviewer") return;',
+  ],
+  [
+    '\t\tconst effectiveAsync = requestedAsync && effectiveParams.clarify !== true;\n\t\tconst foregroundTimeout = resolveForegroundTimeout(\n\t\t\teffectiveParams,\n\t\t\teffectiveAsync ? undefined : DEFAULT_FOREGROUND_TIMEOUT_MS,\n\t\t);',
+    '\t\tconst effectiveAsync = requestedAsync && effectiveParams.clarify !== true;\n\t\tconst requestedAgentNames = collectRequestedAgentNames(effectiveParams);\n\t\tconst forgeDockReviewerOnly = requestedAgentNames.length > 0\n\t\t\t&& requestedAgentNames.every((name) => name === "forgedock-reviewer");\n\t\tconst foregroundTimeout = resolveForegroundTimeout(\n\t\t\teffectiveParams,\n\t\t\teffectiveAsync || forgeDockReviewerOnly ? undefined : DEFAULT_FOREGROUND_TIMEOUT_MS,\n\t\t);',
+    'const forgeDockReviewerOnly = requestedAgentNames.length > 0',
+  ],
+]);
+
+patch(join(root, "src", "runs", "background", "async-job-tracker.ts"), [[
+  '\t\t\t\tif (!record.event || !Array.isArray(record.channels)) return;\n\t\t\t\tconst payload = {',
+  '\t\t\t\tif (!record.event || !Array.isArray(record.channels)) return;\n\t\t\t\tif (record.event.agent === "forgedock-reviewer") return;\n\t\t\t\tconst payload = {',
+]]);
+
+patch(join(root, "src", "runs", "background", "result-watcher.ts"), [
+  [
+    '\t\t\tconst resultChildren: ResultFileChild[] = hasResultChildren\n\t\t\t\t? data.results!\n\t\t\t\t: [{ agent: data.agent ?? undefined, output: data.summary, outputState: "unknown", success: data.success }];\n\t\t\tconst normalizedChildren =',
+    '\t\t\tconst resultChildren: ResultFileChild[] = hasResultChildren\n\t\t\t\t? data.results!\n\t\t\t\t: [{ agent: data.agent ?? undefined, output: data.summary, outputState: "unknown", success: data.success }];\n\t\t\tconst internalForgeDockReview = resultChildren.length > 0\n\t\t\t\t&& resultChildren.every((result) => result.agent === "forgedock-reviewer");\n\t\t\tconst normalizedChildren =',
+    'const internalForgeDockReview = resultChildren.length > 0',
+  ],
+  [
+    '\t\t\tif (deliverIntercomResults && intercomTarget && triggerTurn) {',
+    '\t\t\tif (!internalForgeDockReview && deliverIntercomResults && intercomTarget && triggerTurn) {',
+  ],
+  [
+    '\t\t\tconst accepted = await notifier.deliver({',
+    '\t\t\tconst accepted = internalForgeDockReview ? true : await notifier.deliver({',
+  ],
+  [
+    '\t\t\ttry {\n\t\t\t\tpi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {',
+    '\t\t\tif (!internalForgeDockReview) {\n\t\t\t\ttry {\n\t\t\t\t\tpi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {',
+    'if (!internalForgeDockReview) {\n\t\t\t\ttry {\n\t\t\t\t\tpi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT',
+  ],
+  [
+    '\t\t\t\t});\n\t\t\t} catch (error) {\n\t\t\t\tconsole.error(`Completion observer failed for \'${resultPath}\':`, error);\n\t\t\t}\n\t\t\tif (!ownsSession',
+    '\t\t\t\t\t});\n\t\t\t\t} catch (error) {\n\t\t\t\t\tconsole.error(`Completion observer failed for \'${resultPath}\':`, error);\n\t\t\t\t}\n\t\t\t}\n\t\t\tif (!ownsSession',
+    '\t\t\t\t\tconsole.error(`Completion observer failed for \'${resultPath}\':`, error);\n\t\t\t\t}\n\t\t\t}',
+  ],
+]);
+
 patch(join(root, "src", "extension", "fanout-child.ts"), [
   [
     'import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";',

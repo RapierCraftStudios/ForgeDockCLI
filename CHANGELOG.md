@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Internal typed review shards now remain fleet-visible without emitting generic completion or inactivity prompts into the parent terminal; they no longer inherit Pi's hidden foreground timeout, and failed attempts retry with a fresh schema-bound delegation instead of an incompatible generic acceptance-report resume.
 - Schema-valid reviewer output now remains terminal even if context overflow occurs during child teardown; typed reviewers no longer flood the interactive supervisor channel, and detached controller processes persist their own final task status for restart-safe notification.
 - Native `/review-pr` now yields immediately after starting its background task instead of busy-polling task status; passive terminal notifications remain the sole automatic completion signal.
 - Reviewer shards now run without default wall-clock or tool-call cutoffs, preserve explicit opt-in timeout compatibility, recover schema-valid terminal JSON from a resumed child, and prevent shard completion notices from being presented as the parent review verdict.
