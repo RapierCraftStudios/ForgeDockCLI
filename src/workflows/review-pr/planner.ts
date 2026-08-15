@@ -43,7 +43,8 @@ export interface ReviewBudget {
   /** Concrete execution shards; retained under the legacy field name for artifact compatibility. */
   maxLogicalReviewerSessions: number;
   maxParallelSessions: number;
-  maxTurnsPerExecutionGroup: number;
+  /** Legacy review-plan field. New reviews have no assistant-turn cutoff. */
+  maxTurnsPerExecutionGroup?: number;
   maxToolCallsPerExecutionGroup: number;
   maxAttemptsPerExecutionGroup: 2;
   maxReviewerAttempts: number;
@@ -247,7 +248,6 @@ export function planReviewPanel(input: {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
     maxParallelSessions: Math.min(MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions),
-    maxTurnsPerExecutionGroup: 24,
     maxToolCallsPerExecutionGroup: 64,
     maxAttemptsPerExecutionGroup: 2,
     maxReviewerAttempts: 2 * maxLogicalReviewerSessions,
@@ -316,7 +316,6 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     budget.maxSpecialistExecutionGroups,
     budget.maxLogicalReviewerSessions,
     budget.maxParallelSessions,
-    budget.maxTurnsPerExecutionGroup,
     budget.maxToolCallsPerExecutionGroup,
     budget.maxAttemptsPerExecutionGroup,
     budget.maxReviewerAttempts,
@@ -349,8 +348,8 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     || plan.executionGroups.length !== budget.maxLogicalReviewerSessions
     || budget.maxParallelSessions! < 1
     || budget.maxParallelSessions! > budget.maxLogicalReviewerSessions!
-    || budget.maxTurnsPerExecutionGroup! < 1
-    || budget.maxTurnsPerExecutionGroup! > 24
+    || (budget.maxTurnsPerExecutionGroup !== undefined
+      && (budget.maxTurnsPerExecutionGroup < 1 || budget.maxTurnsPerExecutionGroup > 24))
     || budget.maxToolCallsPerExecutionGroup! < 1
     || budget.maxToolCallsPerExecutionGroup! > 64
     || budget.maxAttemptsPerExecutionGroup !== 2

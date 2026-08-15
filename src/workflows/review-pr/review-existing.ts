@@ -54,12 +54,12 @@ export async function reviewExistingPullRequest(
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+      ...(input.ci !== undefined ? { beforeVerdictPublication: () => assertFinalPullRequestCi(pullRequest, input.ci, dependencies.host) } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, {
       runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
-    await assertFinalPullRequestCi(pullRequest, input.ci, dependencies.host);
     return result;
   } finally {
     await dependencies.workspaces.remove(workspace);
@@ -99,18 +99,8 @@ async function reviewDeploymentPullRequest(
   const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
   const changedPaths = parseDiffPaths(diff);
   if (!changedPaths.length) throw new Error("Deployment PR diff does not contain any changed paths");
-  const mergeGate = dependencies.host.getPullRequestMergeGate
-    ? await dependencies.host.getPullRequestMergeGate(
-      frozen.repo,
-      frozen.number,
-      frozen.headSha,
-      frozen.baseBranch,
-    )
-    : undefined;
-  if (mergeGate) {
-    assertDeploymentMergeGateAuthority(mergeGate, frozen);
-    if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
-  }
+  const mergeGate = await readDeploymentMergeGate(frozen, dependencies.host);
+  if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
   const checks = toReviewChecks(mergeGate);
   let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
   run = { ...run, headSha: frozen.headSha };
@@ -141,6 +131,7 @@ async function reviewDeploymentPullRequest(
         // capabilities into one independent group by default so the provider
         // is not asked to process several near-identical giant contexts at once.
         maxReviewSpecialists: input.input.maxReviewSpecialists ?? 1,
+        beforeVerdictPublication: () => assertFinalDeploymentPullRequestCi(frozen, input.input.ci, dependencies.host),
         ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
       }, {
         runtime: dependencies.runtime,
@@ -153,15 +144,14 @@ async function reviewDeploymentPullRequest(
       await dependencies.workspaces.remove(workspace);
     }
   })();
-  const current = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
-  assertPullRequestHeadStable(frozen, current);
-  await assertFinalPullRequestCi(current, input.input.ci, dependencies.host);
   return result;
 }
 async function assertInitialPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (ci) assertInitialAssessment(await readPullRequestCi(pr, ci, host), ci.policy.failureAction); }
 function assertInitialAssessment(a: PullRequestCiAssessment, action: EffectiveReviewCiConfig["failureAction"]): void { if (!a.mergeable || a.failed.length) assertPullRequestCiReady(a, action, "before"); }
 async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (!ci) return; const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); assertPullRequestCiReady(await readPullRequestCi(current, ci, host), ci.policy.failureAction, "after"); }
 async function readPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput, host: ForgeHost): Promise<PullRequestCiAssessment> { if (!host.getPullRequestMergeGate) throw new Error("Standalone review CI policy requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return assessmentFor(pr, gate, ci); }
+async function readDeploymentMergeGate(pr: PullRequestSnapshot, host: ForgeHost): Promise<PullRequestMergeGate> { if (!host.getPullRequestMergeGate) throw new Error("Deployment review requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return gate; }
+async function assertFinalDeploymentPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); const gate = await readDeploymentMergeGate(current, host); if (ci) assertPullRequestCiReady(assessmentFor(current, gate, ci), ci.policy.failureAction, "after"); else assertDeploymentMergeGate(gate); }
 function assessmentFor(pr: PullRequestSnapshot, gate: PullRequestMergeGate, ci: StandaloneReviewCiInput): PullRequestCiAssessment { return assessPullRequestCi(pr, gate, ci.policy, { ...(ci.featurePromotionTarget ? { featurePromotionTarget: ci.featurePromotionTarget } : {}), ...(ci.productionTarget ? { productionTarget: ci.productionTarget } : {}) }); }
 
 function isDeploymentPullRequest(

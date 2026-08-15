@@ -8,7 +8,7 @@ import { createRun, transition, type RunState, type TransitionEvent } from "../.
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
-import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -31,7 +31,7 @@ class FakeHost implements ForgeHost {
   }
   async publishPullRequestComment(input: { marker: string; body: string }): Promise<void> {
     this.comments.push(input);
-    this.events?.push(`comment:${/Independent Review · ([^\n]+)/.exec(input.body)?.[1] ?? "unknown"}`);
+    this.events?.push(`comment:${input.body.includes("ForgeDock Review Evidence") ? "wave" : "other"}`);
   }
   async materializeReviewFinding(input: { finding: { id: string }; reviewerRoles: readonly string[] }) {
     this.findingIssues.push(input);
@@ -122,13 +122,15 @@ describe("fresh-context PR review", () => {
     assert.equal(result.verdict.payload.headBranch, "fix");
     assert.equal(result.verdict.payload.baseBranch, "main");
     assert.equal(new Set(result.sessionRefs).size, 2);
-    assert.equal(host.comments.length, 2);
-    assert.deepEqual(host.comments.map(({ body }) => /Independent Review · ([^\n]+)/.exec(body)?.[1]).sort(), ["concurrency", "correctness"]);
+    assert.equal(host.comments.length, 1);
+    assert.match(host.comments[0]?.body ?? "", /ForgeDock Review Evidence/);
+    assert.match(host.comments[0]?.body ?? "", /review-correctness · correctness · completed/);
+    assert.match(host.comments[0]?.body ?? "", /review-concurrency · concurrency · completed/);
     assert.ok(host.comments.every(({ body, marker }) => body.includes(marker) && body.includes("consolidated Review Verdict remains authoritative") && body.includes("Session lineage")));
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
   });
 
-  it("executes a large review as compact bounded shards with distinct durable reports", async () => {
+  it("executes a large review as compact bounded shards with one folded durable report", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const base = artifacts(run);
@@ -156,11 +158,12 @@ describe("fresh-context PR review", () => {
     assert.deepEqual([...new Set(result.reviewPlan.executionGroups.map(({ role }) => role))], ["correctness", "concurrency"]);
     assert.ok(result.reviewPlan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
     assert.ok(tasks.every((task) => task.context.length === 0));
-    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === 24 && task.executionBudget.maxToolCalls === 64));
+    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === undefined && task.executionBudget?.maxToolCalls === 64));
     assert.ok(tasks.every((task) => task.objective.length < 60_000));
     assert.ok(tasks.every((task) => task.objective.includes('"totalExpectedPaths": 55')));
     assert.ok(tasks.every((task) => !task.objective.includes('"expectedPaths"')));
-    assert.equal(new Set(host.comments.map(({ marker }) => marker)).size, result.reviewPlan.executionGroups.length);
+    assert.equal(host.comments.length, 1);
+    assert.equal((host.comments[0]?.body.match(/<details><summary>/g) ?? []).length, result.reviewPlan.executionGroups.length);
     assert.deepEqual(result.verdict.payload.reviewerRoles, ["correctness", "concurrency"]);
   });
 
@@ -521,7 +524,8 @@ describe("fresh-context PR review", () => {
     assert.equal(runtime.tasks.length, 3);
     assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length <= 2));
     assert.equal(host.comments.length, 1);
-    assert.match(host.comments[0]?.body ?? "", /Independent Review · concurrency/);
+    assert.match(host.comments[0]?.body ?? "", /ForgeDock Review Evidence/);
+    assert.match(host.comments[0]?.body ?? "", /wave is incomplete; no partial approval was issued/i);
     assert.equal(artifactStore.artifacts.some(({ kind }) => kind === "ReviewVerdict"), false);
     assert.equal((await runs.load(run.runId))?.state, "blocked");
     assert.equal(isTransientReviewerTransportFailure("read failed: optional path missing"), false);
@@ -759,13 +763,13 @@ describe("fresh-context PR review", () => {
     assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 1));
 
     await runtime.allReturned;
-    for (let attempt = 0; attempt < 20 && host.comments.length < 2; attempt++) {
+    for (let attempt = 0; attempt < 20 && host.comments.filter(({ body }) => body.includes("completed after the bounded drain")).length < 2; attempt++) {
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
-    assert.equal(host.comments.length, 2);
-    assert.ok(host.comments.every(({ body }) => body.includes("completed after the bounded drain")));
-    assert.ok(host.comments.every(({ body }) => /Frozen review plan:\*\* `review-plan-[a-f0-9]{20}`/.test(body)));
-    assert.ok(host.comments.every(({ body }) => body.includes("post-drain-session-")));
+    const lateComments = host.comments.filter(({ body }) => body.includes("completed after the bounded drain"));
+    assert.equal(lateComments.length, 2);
+    assert.ok(lateComments.every(({ body }) => /Frozen review plan:\*\* `review-plan-[a-f0-9]{20}`/.test(body)));
+    assert.ok(lateComments.every(({ body }) => body.includes("post-drain-session-")));
     const progress = await runs.listProgress(run.runId);
     assert.ok(progress.some(({ message }) => message.includes("late session identity reconciled after bounded drain")));
     assert.equal(progress.filter(({ message }) => message.includes("late completion reconciled after bounded drain")).length, 2);
@@ -895,7 +899,7 @@ describe("fresh-context PR review", () => {
     assert.equal(maxActive, 1);
   });
 
-  it("publishes every reviewer report and finding issue before the consolidated verdict", async () => {
+  it("publishes the folded reviewer wave and finding issue before the consolidated verdict", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -921,7 +925,7 @@ describe("fresh-context PR review", () => {
     });
     const verdictIndex = events.indexOf("artifact:ReviewVerdict");
     const issueIndex = events.findIndex((event) => event.startsWith("issue:"));
-    assert.equal(events.filter((event) => event.startsWith("comment:")).length, 2);
+    assert.equal(events.filter((event) => event.startsWith("comment:")).length, 1);
     assert.ok(issueIndex > Math.max(...events.map((event, index) => event.startsWith("comment:") ? index : -1)));
     assert.ok(verdictIndex > issueIndex);
   });
@@ -1057,6 +1061,20 @@ describe("fresh-context PR review", () => {
     assert.ok(bounded.length <= 60_000);
     assert.match(bounded, /projection truncated/);
     assert.match(bounded, /FORGEDOCK:REVIEWER-SUBMISSION v1/);
+  });
+
+  it("renders one bounded review-wave projection for many execution groups", () => {
+    const body = renderReviewerWaveComment({
+      runId: "run-wave", pullRequest: 4, headSha: sha, reviewPlanId: "review-plan-1234567890abcdef1234",
+      results: Array.from({ length: 16 }, (_, index) => ({
+        executionGroupId: `review-correctness-part-${index + 1}-of-16`, role: "correctness" as const,
+        output: { summary: `Shard ${index + 1}`, findings: [] }, sessionRef: `session-${index + 1}`, sessionLineage: [`session-${index + 1}`],
+      })),
+      failures: [],
+    });
+    assert.ok(body.length <= 60_000);
+    assert.equal((body.match(/<details><summary>/g) ?? []).length, 16);
+    assert.match(body, /FORGEDOCK:REVIEW-WAVE v1/);
   });
 
   it("requires causalRoot in current reviewer submissions", () => {

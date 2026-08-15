@@ -127,17 +127,55 @@ describe("issue-less deployment PR review", () => {
     const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
     const workspaces = new TestWorkspaces();
 
+    const artifacts = new InMemoryArtifactRepository();
     await assert.rejects(
       reviewExistingPullRequest(
         { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: DEFAULT_REVIEW_CI } },
-        { runtime, host, workspaces, artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+        { runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository() },
       ),
       /CI=pending.*Please fix.*rerun \/review-pr/s,
     );
 
     assert.ok(runtime.tasks.length > 0);
+    assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }), []);
     assert.equal(workspaces.removed, true);
     assertNoDeploymentGate(host.publications);
+  });
+
+  it("rechecks the exact-head merge gate before persisting an approving verdict", async () => {
+    const host = new DeploymentHost();
+    const artifacts = new InMemoryArtifactRepository();
+    const runtime = new FakeAgentRuntime([
+      async () => {
+        host.requiredChecks = [{ name: "CI", state: "failed", detailsUrl: "https://github.test/checks/ci" }];
+        return clean;
+      },
+      ...Array.from({ length: 7 }, () => clean),
+    ]);
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number },
+        { runtime, host, workspaces: new TestWorkspaces(), artifacts, runs: new InMemoryRunRepository() },
+      ),
+      /Deployment PR checks are not green: CI=failed/,
+    );
+
+    assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }), []);
+    assertNoDeploymentGate(host.publications);
+  });
+
+  it("fails closed when deployment merge-gate authority is unavailable", async () => {
+    const host = new DeploymentHost();
+    Object.defineProperty(host, "getPullRequestMergeGate", { value: undefined });
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number },
+        { runtime: new FakeAgentRuntime(), host, workspaces: new TestWorkspaces(), artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+      ),
+      /Deployment review requires an authoritative merge-gate adapter/,
+    );
   });
 
   it("re-freezes an advanced head immediately before reviewer setup", async () => {

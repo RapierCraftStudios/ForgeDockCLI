@@ -169,6 +169,7 @@ test("fresh nested reviewer attempts use unique wire nodes but retain the logica
   const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
   const task = taskForRole("reviewer", {}) as any;
   task.id = "run-review:review:sha:correctness";
+  task.executionBudget = { maxToolCalls: 64 };
   try {
     await runtime.run(task);
     await runtime.run(task);
@@ -178,6 +179,8 @@ test("fresh nested reviewer attempts use unique wire nodes but retain the logica
     assert.deepEqual(requests.map((request) => request.scopeVersion), [1, 1]);
     assert.deepEqual(requests.map((request) => request.scope), [REVIEWER_SCOPE.scope, REVIEWER_SCOPE.scope]);
     assert.deepEqual(requests.map((request) => request.scopeDigest), [REVIEWER_SCOPE.scopeDigest, REVIEWER_SCOPE.scopeDigest]);
+    assert.deepEqual(requests.map((request) => request.toolBudget), [64, 64]);
+    assert.deepEqual(requests.map((request) => request.turnBudget), [undefined, undefined]);
   } finally {
     if (previousUrl === undefined) delete process.env.FORGEDOCK_NESTED_AGENT_URL;
     else process.env.FORGEDOCK_NESTED_AGENT_URL = previousUrl;

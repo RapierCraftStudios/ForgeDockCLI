@@ -190,7 +190,7 @@ function delegate(
       finish(() => reject(new NestedDelegationError(
         value.error ?? `Nested ${input.role} ended with ${value.status}`,
         sessionRef,
-        Boolean(terminalRunId ?? observedRunId),
+        isPersistedDelegationResumable(value.status, value.error, Boolean(terminalRunId ?? observedRunId)),
       )));
     });
     const abort = () => {
@@ -205,6 +205,23 @@ function delegate(
       pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
     }
   });
+}
+
+function isPersistedDelegationResumable(
+  status: SubagentDelegationV2Response["status"],
+  error: string | undefined,
+  hasPersistedSession: boolean,
+): boolean {
+  if (!hasPersistedSession) return false;
+  // Budget exhaustion and structured-contract failures are completed child
+  // executions, not interrupted transport. Their persisted conversation has
+  // no remaining bounded authority (or already declined the required output
+  // contract), so retrying must use fresh context under the same logical task.
+  if (status === "failed" && /structured (?:result|output)|did not capture|missing structured_output/i.test(error ?? "")) return false;
+  return status === "failed"
+    || status === "timed_out"
+    || status === "cancelled"
+    || status === "interrupted";
 }
 
 async function resumeDelegation(

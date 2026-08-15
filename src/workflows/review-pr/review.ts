@@ -217,6 +217,8 @@ export async function reviewPullRequest(
     reviewerAttemptTimeoutMs?: number;
     findingIssuePolicy?: FindingIssuePolicy;
     deliveryRunId?: string;
+    /** Exact-head authority check that must pass before any verdict-side projection or durable verdict write. */
+    beforeVerdictPublication?: () => Promise<void>;
     signal?: AbortSignal;
   },
   dependencies: {
@@ -438,7 +440,6 @@ export async function reviewPullRequest(
             },
             tools: ["read", "grep", "find", "ls"],
             executionBudget: {
-              maxTurns: reviewPlan.budget.maxTurnsPerExecutionGroup,
               maxToolCalls: reviewPlan.budget.maxToolCallsPerExecutionGroup,
             },
             outputSchema: ReviewerSubmissionSchema,
@@ -528,7 +529,6 @@ export async function reviewPullRequest(
         }
       }
       if (!completed) throw new Error(`${role} reviewer exhausted its retry budget`);
-      await publishCompletedReviewer(completed, false);
       return completed;
     };
     const settledReviewers = await settleAllWithConcurrency(
@@ -542,13 +542,30 @@ export async function reviewPullRequest(
       .sort((left, right) => reviewPlan.executionGroups.findIndex(({ id }) => id === left.executionGroupId)
         - reviewPlan.executionGroups.findIndex(({ id }) => id === right.executionGroupId));
     const failedReviewers = settledReviewers.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    const failedGroups = failedReviewers.map((failure, index) => {
+      const settledIndex = settledReviewers.indexOf(failure);
+      return {
+        executionGroupId: reviewPlan.executionGroups[settledIndex]?.id ?? `group-${index + 1}`,
+        reason: failure.reason instanceof Error ? failure.reason.message : String(failure.reason),
+      };
+    });
+    const waveMarker = reviewerWaveMarker(run.runId, frozen.headSha, reviewPlan.planId);
+    await dependencies.host.publishPullRequestComment({
+      repo: frozen.repo,
+      pullRequest: frozen.number,
+      marker: waveMarker,
+      body: renderReviewerWaveComment({
+        runId: run.runId,
+        pullRequest: frozen.number,
+        headSha: frozen.headSha,
+        reviewPlanId: reviewPlan.planId,
+        results: reviewerResults,
+        failures: failedGroups,
+        marker: waveMarker,
+      }),
+    });
     if (failedReviewers.length) {
-      const failedRoles = failedReviewers.map((failure, index) => {
-        const settledIndex = settledReviewers.indexOf(failure);
-        const group = reviewPlan.executionGroups[settledIndex]?.id ?? `group-${index + 1}`;
-        const reason = failure.reason instanceof Error ? failure.reason.message : String(failure.reason);
-        return `${group}: ${reason}`;
-      });
+      const failedRoles = failedGroups.map(({ executionGroupId, reason }) => `${executionGroupId}: ${reason}`);
       throw new ReviewWaveIncompleteError(`Review incomplete at frozen plan ${reviewPlan.planId}: ${failedRoles.join(", ")} failed after all siblings settled; successful reviewer reports were preserved and no partial approval was issued`);
     }
     const roles = [...new Set(reviewPlan.executionGroups.map((selection) => selection.role))];
@@ -618,6 +635,7 @@ export async function reviewPullRequest(
     const disposition = findings.some((finding) => finding.blocking) ? "request_changes" as const : "approve" as const;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
+    await input.beforeVerdictPublication?.();
     const findingIssuePolicy = input.findingIssuePolicy ?? "all";
     const projectionEnabled = findingIssuePolicy === "all" || (findingIssuePolicy === "approved-only" && disposition === "approve");
     // The reviewer wave is fully settled above. Only this deterministic
@@ -1132,6 +1150,11 @@ export function reviewerSubmissionMarker(
   return `<!-- FORGEDOCK:REVIEWER-SUBMISSION v1 ${identity} -->`;
 }
 
+export function reviewerWaveMarker(runId: string, headSha: string, reviewPlanId: string): string {
+  const identity = [runId, headSha, reviewPlanId].map((part) => safeInline(part, 200)).join(":");
+  return `<!-- FORGEDOCK:REVIEW-WAVE v1 ${identity} -->`;
+}
+
 function scopeAdjudicationMarker(runId: string, headSha: string, reviewPlanId: string): string {
   const identity = [runId, headSha, reviewPlanId].map((part) => safeInline(part, 200)).join(":");
   return `<!-- FORGEDOCK:SCOPE-ADJUDICATION-LATE v1 ${identity} -->`;
@@ -1187,6 +1210,70 @@ async function recordAdjudicationProgress(
 }
 
 const MAX_REVIEWER_COMMENT_CHARS = 60_000;
+
+export function renderReviewerWaveComment(input: {
+  runId: string;
+  pullRequest: number;
+  headSha: string;
+  reviewPlanId: string;
+  results: readonly {
+    executionGroupId: string;
+    role: ReviewerRole;
+    output: ReviewerSubmission;
+    sessionRef: string;
+    sessionLineage: readonly string[];
+  }[];
+  failures: readonly { executionGroupId: string; reason: string }[];
+  marker?: string;
+}): string {
+  const marker = input.marker ?? reviewerWaveMarker(input.runId, input.headSha, input.reviewPlanId);
+  const completed = input.results.flatMap((result) => {
+    const findings = result.output.findings.length
+      ? result.output.findings.flatMap((finding) => [
+        `  - **${finding.severity.toUpperCase()} · ${safeText(finding.title, 500)}**${finding.location ? ` — \`${safeInline(finding.location, 500)}\`` : ""}`,
+        `    - Evidence: ${safeText(finding.evidence, 1_500)}`,
+        `    - Remediation: ${safeText(finding.remediation, 1_000)}`,
+      ])
+      : ["  - No actionable findings reported."];
+    return [
+      `<details><summary>${safeInline(result.executionGroupId, 300)} · ${result.role} · completed</summary>`,
+      "",
+      `- **Session lineage:** ${result.sessionLineage.map((ref) => `\`${safeInline(ref, 200)}\``).join(" → ")}`,
+      `- **Summary:** ${safeText(result.output.summary, 1_500)}`,
+      "- **Findings:**",
+      ...findings,
+      "",
+      "</details>",
+      "",
+    ];
+  });
+  const failures = input.failures.length
+    ? input.failures.map(({ executionGroupId, reason }) => `- \`${safeInline(executionGroupId, 300)}\`: ${safeText(reason, 2_000)}`)
+    : ["None."];
+  const body = [
+    "## ForgeDock Review Evidence",
+    "",
+    `> One bounded projection for the complete frozen reviewer wave. ${input.failures.length ? "The wave is incomplete; no partial approval was issued." : "The controller's consolidated Review Verdict remains authoritative."}`,
+    "",
+    `- **PR:** #${input.pullRequest}`,
+    `- **Reviewed SHA:** \`${safeInline(input.headSha, 64)}\``,
+    `- **Run:** \`${safeInline(input.runId, 200)}\``,
+    `- **Frozen review plan:** \`${safeInline(input.reviewPlanId, 200)}\``,
+    `- **Groups:** ${input.results.length} completed · ${input.failures.length} failed`,
+    "",
+    "### Completed groups",
+    "",
+    ...(completed.length ? completed : ["None.", ""]),
+    "### Failed groups",
+    "",
+    ...failures,
+    "",
+    marker,
+  ].join("\n");
+  if (body.length <= MAX_REVIEWER_COMMENT_CHARS) return body;
+  const suffix = `\n\n… review-wave projection truncated at GitHub's bounded comment limit; the controller still consumes every complete structured submission.\n\n${marker}`;
+  return `${body.slice(0, MAX_REVIEWER_COMMENT_CHARS - suffix.length).trimEnd()}${suffix}`;
+}
 
 export function renderReviewerSubmissionComment(input: {
   runId: string;

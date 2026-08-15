@@ -314,6 +314,41 @@ test("a terminal-only failed delegation returns its persisted session reference 
   }
 });
 
+test("turn-budget and structured-output terminal failures require a fresh bounded retry", async () => {
+  for (const terminal of [
+    { status: "turn_budget_exhausted", error: "Subagent exceeded turn budget" },
+    { status: "structured_output_failed", error: "Missing structured_output call" },
+    { status: "failed", error: "Delegated subagent did not capture the requested structured result" },
+  ]) {
+    const events = new FakeEvents();
+    events.autoRespond = false;
+    const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
+    try {
+      const pending = fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+        method: "POST",
+        headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          ownerRunId: `run-${terminal.status}`, id: `run-${terminal.status}:review:abc:correctness`, role: "reviewer",
+          objective: "Review", instructions: "Read only", context: [], cwd: process.cwd(), ...REVIEWER_SCOPE, tools: ["read"],
+          outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test",
+        }),
+      });
+      while (events.requests.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+      const request = events.requests[0];
+      events.emit("prompt-template:subagent:response", {
+        version: 2, requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId,
+        ...terminal, runId: `persisted-${terminal.status}`,
+      });
+      const response = await pending;
+      const result = await response.json() as any;
+      assert.equal(result.sessionRef, `persisted-${terminal.status}`);
+      assert.equal(result.resumable, undefined);
+    } finally {
+      await bridge.close();
+    }
+  }
+});
+
 test("nested reviewers have no fixed wall-clock lifetime and stop on explicit client cancellation", async () => {
   const events = new FakeEvents();
   events.autoRespond = false;

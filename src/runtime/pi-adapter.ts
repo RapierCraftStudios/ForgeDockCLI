@@ -420,10 +420,8 @@ async function runNestedReviewer<T>(
         cwd: task.workspace.cwd,
         ...scopeReceipt,
         tools: task.tools,
-        ...(task.executionBudget ? {
-          turnBudget: task.executionBudget.maxTurns,
-          toolBudget: task.executionBudget.maxToolCalls,
-        } : {}),
+        ...(task.executionBudget?.maxTurns !== undefined ? { turnBudget: task.executionBudget.maxTurns } : {}),
+        ...(task.executionBudget?.maxToolCalls !== undefined ? { toolBudget: task.executionBudget.maxToolCalls } : {}),
         outputSchema: task.outputSchema,
         provider: input.provider,
         model: input.model,
@@ -786,10 +784,13 @@ function terminalErrorSummary(error: unknown, cancelled: boolean): string {
 
 function assertToolPolicy<T>(task: AgentTask<T>): void {
   const grants = new Set<ToolGrant>(task.tools);
-  if (task.executionBudget && (!Number.isSafeInteger(task.executionBudget.maxTurns)
-    || task.executionBudget.maxTurns < 1 || task.executionBudget.maxTurns > 1_000
-    || !Number.isSafeInteger(task.executionBudget.maxToolCalls)
-    || task.executionBudget.maxToolCalls < 1 || task.executionBudget.maxToolCalls > 1_000)) {
+  if (task.executionBudget && (
+    (task.executionBudget.maxTurns === undefined && task.executionBudget.maxToolCalls === undefined)
+    || (task.executionBudget.maxTurns !== undefined && (!Number.isSafeInteger(task.executionBudget.maxTurns)
+      || task.executionBudget.maxTurns < 1 || task.executionBudget.maxTurns > 1_000))
+    || (task.executionBudget.maxToolCalls !== undefined && (!Number.isSafeInteger(task.executionBudget.maxToolCalls)
+      || task.executionBudget.maxToolCalls < 1 || task.executionBudget.maxToolCalls > 1_000))
+  )) {
     throw new Error(`Task ${task.id} execution budget must use integers from 1 to 1000`);
   }
   if (!task.workspace.scope || !task.workspace.scope.readRoots.length) {
