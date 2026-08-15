@@ -7,19 +7,18 @@
 
 ### Fixed
 
+- Removed comment-driven deployment admission and ForgeDock Next's `FORGE:GATE_*` lifecycle marker publication; standalone review verdicts plus configured exact-head GitHub CI and mechanical checks now provide PR review authority without requiring ForgeDock-created gate comments.
 - Standalone `/review-pr` now owns repository-configured CI and mechanical gates by delivery, promotion, or deployment PR type; pending checks may overlap review, failed checks produce an actionable user handoff by default, and opt-in bounded auto-fix creates only exact-head fast-forward repair commits after independent local verification.
 - Pull-request review now recovers from GitHub's 20,000-line diff limit through a bounded paginated-files fallback that preserves every changed path and marks omitted or truncated patches for frozen-workspace inspection.
 - Issue-less deployment reviews now keep their synthetic scoping context internal instead of publishing work-on Intent, Investigation, and Build Packet comments to the pull request.
 - Deployment review gates now retain contradictory same-name GitHub check observations at the reviewed SHA and fail closed instead of allowing a later push check to mask a failed pull-request check.
-- Reviewer execution now binds durable attempt and session identity to the frozen head and review plan, drains cancellation before retry, reconciles late terminal results, and publishes current-head deployment gate markers on every terminal path.
+- Reviewer execution now binds durable attempt and session identity to the frozen head and review plan, drains cancellation before retry, and reconciles late terminal results.
 - Work-on now resumes Intent-only and Investigation checkpoints without replaying completed semantic work, uses deterministic terminal Outcomes, and preserves blocked or operator-owned batch members during closure.
 - ForgeDock orchestration now runs through one headless, fenced controller shared by CLI and TUI, with durable attempts, task identities, heartbeats, recovery reconciliation, CLI resume, detached-worker adoption, and transport-capacity enforcement.
 - Native Deep Plan can explicitly materialize a confirmed plan into an idempotent GitHub issue DAG and return a typed orchestration handoff; no GitHub writes occur before confirmation.
 - Agent runtime cancellation now stops before Pi session creation, emits real completed/failed/cancelled session identities, binds nested reviewers to tamper-evident whole-checkout read-only scope receipts, and reconciles detached task records without treating process disappearance as semantic failure.
 - Sandboxed grep now has a workspace-confined Node fallback supplied through the Pi tool port, so offline or clean-machine execution no longer depends on downloading or preinstalling ripgrep.
-- Deployment gate Actions now accept only trusted markers bound to the exact repository, PR, and current head, with current-head failures taking precedence over passes.
 - Large deployment reviews now keep all risk capabilities while packing specialist coverage into one default group and sending a smaller bounded initial diff, preventing parallel reviewer attempts from exhausting their timeout without a verdict.
-- Deployment review now bootstraps its self-reporting gate check, publishes trusted `FORGE:GATE_PASS`/`FORGE:GATE_FAILURE` markers, and keeps GitHub mergeability separate from required-check state.
 - Standalone advisory review no longer requires mutation-only lease-witness configuration; lease enforcement remains fail-closed for commands that acquire leases.
 - Orchestration now preserves the original authorized issue scope separately from contracted work units, keeps inherited batch-labelled decomposition children dispatchable as singletons, and reports the correct preview/work-unit counts instead of silently dropping selected issues.
 - The TUI now persists and enforces claim-serialization edges, filters them during recovery, and exposes typed dependency, claim, capacity, and suspension wait reasons in live snapshots.

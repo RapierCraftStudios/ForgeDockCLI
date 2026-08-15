@@ -909,8 +909,8 @@ export class GitHubClient implements ForgeHost {
       const value = JSON.parse(result) as { mergeable?: string };
       // GitHub's mergeable field reports whether the head can be merged
       // without conflicts. mergeStateStatus also includes branch-protection
-      // and required-check state; deployment review must inspect those checks
-      // separately so its own marker check can bootstrap from a red state.
+      // and required-check state; review evaluates the individual exact-head
+      // check observations separately so contradictory results remain visible.
       mergeable = String(value.mergeable ?? "UNKNOWN").toUpperCase() === "MERGEABLE";
     } catch {
       mergeable = false;

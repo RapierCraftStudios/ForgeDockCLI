@@ -83,121 +83,84 @@ async function reviewDeploymentPullRequest(
   if (!isDeploymentPullRequest(input.pullRequest)) {
     throw new Error("PR does not identify its original issue and is not a staging-to-main deployment; pass --issue <number>");
   }
-  let latestTrustedSnapshot = input.pullRequest;
-  try {
-    if (input.pullRequest.state !== "OPEN") {
-      throw new Error(`Cannot start deployment review: PR #${input.pullRequest.number} must be OPEN at freeze, found ${input.pullRequest.state}`);
-    }
-    // Re-read immediately before the start marker. The initial snapshot is
-    // routing evidence only; the marker and every subsequent review artifact
-    // bind the actual current head frozen at review start.
-    const frozen = await dependencies.host.getPullRequest(input.input.repo, input.input.pr);
-    assertRequestedPullRequestIdentity(input.input.repo, input.input.pr, frozen, "pre-start read");
-    latestTrustedSnapshot = frozen;
-    if (!isDeploymentPullRequest(frozen)) {
-      throw new Error(`Cannot start deployment review: PR #${frozen.number} no longer routes staging to main`);
-    }
-    if (frozen.state !== "OPEN") {
-      throw new Error(`Cannot start deployment review: PR #${frozen.number} must be OPEN at freeze, found ${frozen.state}`);
-    }
-    await publishDeploymentGateMarker(dependencies.host, frozen, "start");
-    const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
-    const changedPaths = parseDiffPaths(diff);
-    if (!changedPaths.length) throw new Error("Deployment PR diff does not contain any changed paths");
-    const mergeGate = dependencies.host.getPullRequestMergeGate
-      ? await dependencies.host.getPullRequestMergeGate(
-        frozen.repo,
-        frozen.number,
-        frozen.headSha,
-        frozen.baseBranch,
-      )
-      : undefined;
-    if (mergeGate) {
-      assertDeploymentMergeGateAuthority(mergeGate, frozen);
-      if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
-    }
-    const checks = toReviewChecks(mergeGate);
-    let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
-    run = { ...run, headSha: frozen.headSha };
-    const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
-    // Deployment reviews have no single delivery issue, so their Intent,
-    // Investigation, and Build Packet are deterministic reviewer context rather
-    // than workflow artifacts. Keep them in the isolated reviewer input; do not
-    // project work-on lifecycle comments onto the deployment pull request.
-    await dependencies.runs.create(run);
-    const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: frozen.number, headSha: frozen.headSha });
-    const result = await (async () => {
-      try {
-        return await reviewPullRequest({
-          run,
-          pullRequest: frozen,
-          ...context,
-          deployment: {
-            headSha: frozen.headSha,
-            headBranch: frozen.headBranch,
-            baseBranch: frozen.baseBranch,
-            changedPaths,
-            checks,
-          },
-          workspace: workspace.path,
-          ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),
-          ...(input.input.model !== undefined ? { model: input.input.model } : {}),
-          // Deployment diffs are often repository-wide. Pack specialist
-          // capabilities into one independent group by default so the provider
-          // is not asked to process several near-identical giant contexts at once.
-          maxReviewSpecialists: input.input.maxReviewSpecialists ?? 1,
-          ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
-        }, {
-          runtime: dependencies.runtime,
-          host: dependencies.host,
-          artifacts: dependencies.artifacts,
-          runs: dependencies.runs,
-          ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
-        });
-      } finally {
-        await dependencies.workspaces.remove(workspace);
-      }
-    })();
-    const current = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
-    assertDeploymentMarkerHead(frozen, current);
-    await assertFinalPullRequestCi(current, input.input.ci, dependencies.host);
-    await publishDeploymentGateMarker(
-      dependencies.host,
-      current,
-      result.verdict.payload.disposition === "approve" ? "pass" : "failure",
-      result.verdict.payload.disposition === "approve"
-        ? undefined
-        : `Review disposition: ${result.verdict.payload.disposition}`,
-    );
-    return result;
-  } catch (error) {
-    let reason = error instanceof Error ? error.message : String(error);
-    let current = latestTrustedSnapshot;
-    try {
-      const candidate = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
-      if (samePullRequestIdentity(input.pullRequest, candidate)) {
-        current = candidate;
-      } else {
-        reason += `; host re-read returned mismatched PR identity ${candidate.repo}#${candidate.number}`;
-      }
-    } catch {
-      // The frozen snapshot remains the only identity available when the host
-      // cannot be re-read; publication below still attempts a fail-closed gate.
-    }
-    try {
-      await publishDeploymentGateMarker(dependencies.host, current, "failure", reason);
-    } catch (publicationError) {
-      const publicationReason = publicationError instanceof Error ? publicationError.message : String(publicationError);
-      throw new Error(`${reason}; deployment failure marker publication also failed: ${publicationReason}`, {
-        cause: new AggregateError([error, publicationError]),
-      });
-    }
-    throw error;
+  if (input.pullRequest.state !== "OPEN") {
+    throw new Error(`Cannot start deployment review: PR #${input.pullRequest.number} must be OPEN at freeze, found ${input.pullRequest.state}`);
   }
+  // The initial snapshot is routing evidence only. Re-read immediately before
+  // reviewer setup and bind every review artifact to the actual current head.
+  const frozen = await dependencies.host.getPullRequest(input.input.repo, input.input.pr);
+  assertRequestedPullRequestIdentity(input.input.repo, input.input.pr, frozen, "pre-review read");
+  if (!isDeploymentPullRequest(frozen)) {
+    throw new Error(`Cannot start deployment review: PR #${frozen.number} no longer routes staging to main`);
+  }
+  if (frozen.state !== "OPEN") {
+    throw new Error(`Cannot start deployment review: PR #${frozen.number} must be OPEN at freeze, found ${frozen.state}`);
+  }
+  const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
+  const changedPaths = parseDiffPaths(diff);
+  if (!changedPaths.length) throw new Error("Deployment PR diff does not contain any changed paths");
+  const mergeGate = dependencies.host.getPullRequestMergeGate
+    ? await dependencies.host.getPullRequestMergeGate(
+      frozen.repo,
+      frozen.number,
+      frozen.headSha,
+      frozen.baseBranch,
+    )
+    : undefined;
+  if (mergeGate) {
+    assertDeploymentMergeGateAuthority(mergeGate, frozen);
+    if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
+  }
+  const checks = toReviewChecks(mergeGate);
+  let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
+  run = { ...run, headSha: frozen.headSha };
+  const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
+  // Deployment reviews have no single delivery issue, so their Intent,
+  // Investigation, and Build Packet are deterministic reviewer context rather
+  // than workflow artifacts. Keep them in the isolated reviewer input; do not
+  // project work-on lifecycle comments onto the deployment pull request.
+  await dependencies.runs.create(run);
+  const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: frozen.number, headSha: frozen.headSha });
+  const result = await (async () => {
+    try {
+      return await reviewPullRequest({
+        run,
+        pullRequest: frozen,
+        ...context,
+        deployment: {
+          headSha: frozen.headSha,
+          headBranch: frozen.headBranch,
+          baseBranch: frozen.baseBranch,
+          changedPaths,
+          checks,
+        },
+        workspace: workspace.path,
+        ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),
+        ...(input.input.model !== undefined ? { model: input.input.model } : {}),
+        // Deployment diffs are often repository-wide. Pack specialist
+        // capabilities into one independent group by default so the provider
+        // is not asked to process several near-identical giant contexts at once.
+        maxReviewSpecialists: input.input.maxReviewSpecialists ?? 1,
+        ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
+      }, {
+        runtime: dependencies.runtime,
+        host: dependencies.host,
+        artifacts: dependencies.artifacts,
+        runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+    } finally {
+      await dependencies.workspaces.remove(workspace);
+    }
+  })();
+  const current = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
+  assertPullRequestHeadStable(frozen, current);
+  await assertFinalPullRequestCi(current, input.input.ci, dependencies.host);
+  return result;
 }
 async function assertInitialPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (ci) assertInitialAssessment(await readPullRequestCi(pr, ci, host), ci.policy.failureAction); }
 function assertInitialAssessment(a: PullRequestCiAssessment, action: EffectiveReviewCiConfig["failureAction"]): void { if (!a.mergeable || a.failed.length) assertPullRequestCiReady(a, action, "before"); }
-async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (!ci) return; const current = await host.getPullRequest(pr.repo, pr.number); assertDeploymentMarkerHead(pr, current); assertPullRequestCiReady(await readPullRequestCi(current, ci, host), ci.policy.failureAction, "after"); }
+async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (!ci) return; const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); assertPullRequestCiReady(await readPullRequestCi(current, ci, host), ci.policy.failureAction, "after"); }
 async function readPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput, host: ForgeHost): Promise<PullRequestCiAssessment> { if (!host.getPullRequestMergeGate) throw new Error("Standalone review CI policy requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return assessmentFor(pr, gate, ci); }
 function assessmentFor(pr: PullRequestSnapshot, gate: PullRequestMergeGate, ci: StandaloneReviewCiInput): PullRequestCiAssessment { return assessPullRequestCi(pr, gate, ci.policy, { ...(ci.featurePromotionTarget ? { featurePromotionTarget: ci.featurePromotionTarget } : {}), ...(ci.productionTarget ? { productionTarget: ci.productionTarget } : {}) }); }
 
@@ -206,8 +169,6 @@ function isDeploymentPullRequest(
 ): boolean {
   return pullRequest.headBranch === "staging" && pullRequest.baseBranch === "main";
 }
-
-const DEPLOYMENT_GATE_MARKER_CHECK = "check for forge gate markers";
 
 function assertDeploymentMergeGateAuthority(gate: PullRequestMergeGate, pullRequest: PullRequestSnapshot): void {
   if (gate.repo.trim().toLowerCase() !== pullRequest.repo.trim().toLowerCase()
@@ -223,70 +184,20 @@ function assertDeploymentMergeGateAuthority(gate: PullRequestMergeGate, pullRequ
 
 function assertDeploymentMergeGate(gate: PullRequestMergeGate): void {
   if (!gate.mergeable) throw new Error(`Deployment PR #${gate.pullRequest} is not currently mergeable`);
-  const blocked = gate.requiredChecks.filter((check) => {
-    if (check.state === "passed") return false;
-    // This check is intentionally red until this review posts its trusted
-    // marker. It must not deadlock the review that is responsible for it.
-    return !(isDeploymentGateMarkerCheck(check.name)
-      && (check.state === "pending" || check.state === "failed"));
-  });
+  const blocked = gate.requiredChecks.filter((check) => check.state !== "passed");
   if (blocked.length) {
     throw new Error(`Deployment PR checks are not green: ${blocked.map((check) => `${check.name}=${check.state}`).join(", ")}`);
   }
 }
 
-function isDeploymentGateMarkerCheck(name: string): boolean {
-  return name.trim().toLowerCase() === DEPLOYMENT_GATE_MARKER_CHECK;
-}
-
-type DeploymentGateMarkerState = "start" | "failure" | "pass";
-
-async function publishDeploymentGateMarker(
-  host: ForgeHost,
-  pullRequest: PullRequestSnapshot,
-  state: DeploymentGateMarkerState,
-  detail?: string,
-): Promise<void> {
-  const repo = pullRequest.repo.trim().toLowerCase();
-  const headSha = pullRequest.headSha.trim().toLowerCase();
-  const identity = `repo=${repo} pr=${pullRequest.number} head=${headSha}`;
-  // ForgeHost publication is create-once by canonical marker, so each state
-  // needs its own deterministic marker. Repeated publication of the same
-  // state/head remains idempotent without suppressing the later terminal state.
-  const idempotencyMarker = `<!-- FORGEDOCK:DEPLOYMENT_GATE_${state.toUpperCase()} v2 ${identity} -->`;
-  const gateMarker = state === "pass"
-    ? "<!-- FORGE:GATE_PASS -->"
-    : state === "failure" ? "<!-- FORGE:GATE_FAILURE -->" : undefined;
-  await host.publishPullRequestComment({
-    repo: pullRequest.repo,
-    pullRequest: pullRequest.number,
-    marker: idempotencyMarker,
-    body: [
-      ...(gateMarker ? [gateMarker] : []),
-      "<!-- FORGE:SPEC_LOADED -->",
-      idempotencyMarker,
-      `ForgeDock deployment review ${state === "start" ? "started" : state === "pass" ? "passed" : "blocked"} for ${pullRequest.repo}#${pullRequest.number}.`,
-      `Repository: ${pullRequest.repo}`,
-      `Pull request: ${pullRequest.number}`,
-      `Reviewed head: ${pullRequest.headSha}`,
-      `Gate state: ${state}`,
-      ...(detail ? [`Detail: ${safeDeploymentMarkerDetail(detail)}`] : []),
-    ].join("\n"),
-  });
-}
-
-function safeDeploymentMarkerDetail(value: string): string {
-  return value.slice(0, 1_000).replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-function assertDeploymentMarkerHead(frozen: PullRequestSnapshot, current: PullRequestSnapshot): void {
+function assertPullRequestHeadStable(frozen: PullRequestSnapshot, current: PullRequestSnapshot): void {
   if (!samePullRequestIdentity(frozen, current)
     || current.headSha.toLowerCase() !== frozen.headSha.toLowerCase()
     || current.headBranch !== frozen.headBranch
     || current.baseBranch !== frozen.baseBranch
     || current.state !== "OPEN") {
     throw new Error(
-      `Deployment PR route changed before gate publication: ${frozen.repo}#${frozen.number} ${frozen.headBranch}@${frozen.headSha} -> ${frozen.baseBranch} (OPEN)`
+      `Pull request route changed before review completion: ${frozen.repo}#${frozen.number} ${frozen.headBranch}@${frozen.headSha} -> ${frozen.baseBranch} (OPEN)`
       + ` became ${current.repo}#${current.number} ${current.headBranch}@${current.headSha} -> ${current.baseBranch} (${current.state})`,
     );
   }
@@ -312,30 +223,24 @@ function assertRequestedPullRequestIdentity(
 }
 
 function toReviewChecks(gate: PullRequestMergeGate | undefined): ReviewChecks {
-  return (gate?.requiredChecks ?? []).map((check) => {
-    const bootstrapMarkerCheck = isDeploymentGateMarkerCheck(check.name);
-    return {
-      command: `GitHub required check: ${check.name}`,
-      // CheckResult has no pending/cancelled/unavailable state. Preserve the
-      // exact GitHub state in summary and fail closed instead of claiming that
-      // an observed non-green check was intentionally skipped.
-      status: check.state === "passed" ? "passed" : "failed",
-      durationMs: 0,
-      ...(check.state !== "passed" ? {
-        failureClass: check.state === "failed" && !bootstrapMarkerCheck ? "command" as const : "infrastructure" as const,
-        failureSignatures: [`github-required-check:${check.state}`],
-      } : {}),
-      ...(check.detailsUrl || check.state !== "passed" ? {
-        summary: [
-          `GitHub state: ${check.state}`,
-          ...(bootstrapMarkerCheck && check.state !== "passed"
-            ? ["Self-referential deployment gate; this review must publish its terminal marker before the check can turn green"]
-            : []),
-          ...(check.detailsUrl ? [`Details: ${check.detailsUrl}`] : []),
-        ].join("; "),
-      } : {}),
-    };
-  });
+  return (gate?.requiredChecks ?? []).map((check) => ({
+    command: `GitHub required check: ${check.name}`,
+    // CheckResult has no pending/cancelled/unavailable state. Preserve the
+    // exact GitHub state in summary and fail closed instead of claiming that
+    // an observed non-green check was intentionally skipped.
+    status: check.state === "passed" ? "passed" : "failed",
+    durationMs: 0,
+    ...(check.state !== "passed" ? {
+      failureClass: check.state === "failed" ? "command" as const : "infrastructure" as const,
+      failureSignatures: [`github-required-check:${check.state}`],
+    } : {}),
+    ...(check.detailsUrl || check.state !== "passed" ? {
+      summary: [
+        `GitHub state: ${check.state}`,
+        ...(check.detailsUrl ? [`Details: ${check.detailsUrl}`] : []),
+      ].join("; "),
+    } : {}),
+  }));
 }
 
 function createDeploymentReviewArtifacts(input: {
@@ -365,7 +270,6 @@ function createDeploymentReviewArtifacts(input: {
       constraints: [
         `Review exactly PR #${pullRequest.number} at head ${pullRequest.headSha}.`,
         "Do not merge or change the deployment pull request as part of review.",
-        "The self-referential Forge gate-marker check may be pending or failed until this review publishes its terminal marker; preserve that observation, but do not treat it alone as a deployment defect.",
       ],
       acceptanceHints: [
         "The complete deployment diff is free of actionable correctness, security, data, compatibility, infrastructure, frontend, and concurrency defects.",
