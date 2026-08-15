@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
 import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -8,9 +9,11 @@ import { attachArtifact, createRun } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
 import { parseDiffPaths } from "./planner.js";
 import { reviewPullRequest, type ReviewChecks } from "./review.js";
+import { assessPullRequestCi, assertPullRequestCiReady, type PullRequestCiAssessment } from "./ci-policy.js";
+interface StandaloneReviewCiInput { policy: EffectiveReviewCiConfig; featurePromotionTarget?: string; productionTarget?: string; }
 
 export async function reviewExistingPullRequest(
-  input: { repo: string; pr: number; issue?: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal },
+  input: { repo: string; pr: number; issue?: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal; ci?: StandaloneReviewCiInput },
   dependencies: {
     runtime: AgentRuntime;
     host: ForgeHost;
@@ -30,6 +33,7 @@ export async function reviewExistingPullRequest(
   if (pullRequest.state !== "OPEN") {
     throw new Error(`Cannot start review: PR #${pullRequest.number} must be OPEN at freeze, found ${pullRequest.state}`);
   }
+  await assertInitialPullRequestCi(pullRequest, input.ci, dependencies.host);
   const source = await dependencies.artifacts.list({ repo: input.repo, issue });
   const { intent, investigation, packet, buildResult } = reviewArtifactsForHead(
     source,
@@ -44,7 +48,7 @@ export async function reviewExistingPullRequest(
   await dependencies.runs.create(run);
   const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: input.pr, headSha: pullRequest.headSha });
   try {
-    return await reviewPullRequest({
+    const result = await reviewPullRequest({
       run, pullRequest, intent, investigation, packet, buildResult, workspace: workspace.path,
       deliveryRunId: buildResult.runId,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -55,6 +59,8 @@ export async function reviewExistingPullRequest(
       runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
+    await assertFinalPullRequestCi(pullRequest, input.ci, dependencies.host);
+    return result;
   } finally {
     await dependencies.workspaces.remove(workspace);
   }
@@ -62,7 +68,7 @@ export async function reviewExistingPullRequest(
 
 async function reviewDeploymentPullRequest(
   input: {
-    input: { repo: string; pr: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal };
+    input: { repo: string; pr: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal; ci?: StandaloneReviewCiInput };
     pullRequest: PullRequestSnapshot;
   },
   dependencies: {
@@ -108,7 +114,7 @@ async function reviewDeploymentPullRequest(
       : undefined;
     if (mergeGate) {
       assertDeploymentMergeGateAuthority(mergeGate, frozen);
-      assertDeploymentMergeGate(mergeGate);
+      if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
     }
     const checks = toReviewChecks(mergeGate);
     let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
@@ -154,6 +160,7 @@ async function reviewDeploymentPullRequest(
     })();
     const current = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertDeploymentMarkerHead(frozen, current);
+    await assertFinalPullRequestCi(current, input.input.ci, dependencies.host);
     await publishDeploymentGateMarker(
       dependencies.host,
       current,
@@ -188,6 +195,11 @@ async function reviewDeploymentPullRequest(
     throw error;
   }
 }
+async function assertInitialPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (ci) assertInitialAssessment(await readPullRequestCi(pr, ci, host), ci.policy.failureAction); }
+function assertInitialAssessment(a: PullRequestCiAssessment, action: EffectiveReviewCiConfig["failureAction"]): void { if (!a.mergeable || a.failed.length) assertPullRequestCiReady(a, action, "before"); }
+async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (!ci) return; const current = await host.getPullRequest(pr.repo, pr.number); assertDeploymentMarkerHead(pr, current); assertPullRequestCiReady(await readPullRequestCi(current, ci, host), ci.policy.failureAction, "after"); }
+async function readPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput, host: ForgeHost): Promise<PullRequestCiAssessment> { if (!host.getPullRequestMergeGate) throw new Error("Standalone review CI policy requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return assessmentFor(pr, gate, ci); }
+function assessmentFor(pr: PullRequestSnapshot, gate: PullRequestMergeGate, ci: StandaloneReviewCiInput): PullRequestCiAssessment { return assessPullRequestCi(pr, gate, ci.policy, { ...(ci.featurePromotionTarget ? { featurePromotionTarget: ci.featurePromotionTarget } : {}), ...(ci.productionTarget ? { productionTarget: ci.productionTarget } : {}) }); }
 
 function isDeploymentPullRequest(
   pullRequest: Pick<PullRequestSnapshot, "headBranch" | "baseBranch">,

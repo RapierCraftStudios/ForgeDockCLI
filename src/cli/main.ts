@@ -37,13 +37,15 @@ import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
-import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type ThinkingLevel, resolveOrchestrationConfig } from "../core/config/forgedock-config.js";
+import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
+import { PullRequestCiBlockedError } from "../workflows/review-pr/ci-policy.js";
+import { makePullRequestCiGreen } from "../workflows/review-pr/fix-ci.js";
 import { promoteBranch, PromotionExecutionError } from "../workflows/promotion/promotion.js";
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
@@ -1128,6 +1130,9 @@ async function reviewPr(argv: string[]): Promise<void> {
   const model = option(argv, "--model");
   const thinking = configuredWorkerThinking(argv);
   const maxReviewSpecialists = configuredMaxReviewSpecialists();
+  const configured = readForgeDockConfig(process.cwd());
+  const reviewCi = resolveReviewCiConfig(configured);
+  const orchestration = resolveOrchestrationConfig(configured);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const reviewWitness = createConfiguredLeaseWitness(process.cwd());
   // Standalone review is advisory and never acquires a lease. Keep an
@@ -1154,16 +1159,20 @@ async function reviewPr(argv: string[]): Promise<void> {
       ...(model !== undefined ? { model } : {}),
       role: "reviewer",
     });
-    const result = await reviewExistingPullRequest({
+    const workspaces = new GitWorktreeManager(process.cwd());
+    if (reviewCi.failureAction === "auto-fix") try { const fixed = await makePullRequestCiGreen({ repo, pullRequest: Number(prArg), policy: reviewCi, ...(orchestration.featurePromotionTarget ? { featurePromotionTarget: orchestration.featurePromotionTarget } : {}), ...(orchestration.productionTarget ? { productionTarget: orchestration.productionTarget } : {}), ...(provider ? { provider } : {}), ...(model ? { model } : {}) }, { runtime, host: github, workspaces, verifier: new ProcessVerificationRunner(), verificationCommands: discoverVerificationCommands, onAgentEvent: (event) => writeAgentEvent(event) }); if (fixed.attempts) process.stdout.write(`ForgeDock made PR CI green after ${fixed.attempts} repair attempt(s): ${fixed.fixes.join("; ")}\n`); } catch (error) { process.stderr.write(`ForgeDock could not safely auto-fix PR #${prArg}: ${error instanceof Error ? error.message : String(error)}\nPlease fix the listed PR CI/mechanical checks, push, then rerun /review-pr.\n`); process.exitCode = 2; return; }
+    let result: Awaited<ReturnType<typeof reviewExistingPullRequest>>;
+    try { result = await reviewExistingPullRequest({
       repo, pr: Number(prArg),
       ...(issueValue !== undefined ? { issue: Number(issueValue) } : {}),
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
       ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
+      ci: { policy: reviewCi, ...(orchestration.featurePromotionTarget ? { featurePromotionTarget: orchestration.featurePromotionTarget } : {}), ...(orchestration.productionTarget ? { productionTarget: orchestration.productionTarget } : {}) },
     }, {
-      runtime, host: github, workspaces: new GitWorktreeManager(process.cwd()), artifacts, runs,
+      runtime, host: github, workspaces, artifacts, runs,
       onAgentEvent: (event) => writeAgentEvent(event),
-    });
+    }); } catch (error) { if (!(error instanceof PullRequestCiBlockedError)) throw error; process.stderr.write(`${error.message}\n`); process.exitCode = 2; return; }
     process.stdout.write(`\n${renderArtifactMarkdown(result.verdict)}\n\n`);
     const approved = result.verdict.payload.disposition === "approve";
     process.stdout.write(`${statusGlyph(approved ? "passed" : "blocked", mode)} Review ${result.verdict.payload.disposition} at ${result.verdict.payload.headSha}\n`);

@@ -1967,6 +1967,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       productionTarget: Type.Optional(Type.String({ description: "Protected production/promotion target branch" })),
       dispatchMode: Type.Optional(Type.String({ enum: ["preview", "confirm", "auto"], description: "Default orchestration dispatch policy; preview is safest" })),
       autoMerge: Type.Optional(Type.Boolean({ description: "Default automatic merge policy for work-on and orchestrate; defaults enabled when omitted" })),
+      reviewCiFailureAction: Type.Optional(Type.String({ enum: ["ask", "auto-fix"], description: "Ask the user to repair failed standalone-review checks, or let ForgeDock attempt bounded same-branch repairs" })),
+      reviewCiMaxFixAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
+      reviewCiDeliveryChecks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 100 })),
+      reviewCiPromotionChecks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 100 })),
+      reviewCiDeploymentChecks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 100 })),
+      reviewCiRepairPaths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 200 })),
     }),
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -2002,6 +2008,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(params.productionTarget !== undefined ? { productionTarget: params.productionTarget } : {}),
         ...(params.dispatchMode !== undefined ? { dispatchMode: params.dispatchMode as "preview" | "confirm" | "auto" } : {}),
         ...(params.autoMerge !== undefined ? { autoMerge: params.autoMerge } : {}),
+        ...(params.reviewCiFailureAction !== undefined ? { reviewCiFailureAction: params.reviewCiFailureAction as "ask" | "auto-fix" } : {}),
+        ...(params.reviewCiMaxFixAttempts !== undefined ? { reviewCiMaxFixAttempts: params.reviewCiMaxFixAttempts } : {}),
+        ...(params.reviewCiDeliveryChecks !== undefined ? { reviewCiDeliveryChecks: params.reviewCiDeliveryChecks } : {}),
+        ...(params.reviewCiPromotionChecks !== undefined ? { reviewCiPromotionChecks: params.reviewCiPromotionChecks } : {}),
+        ...(params.reviewCiDeploymentChecks !== undefined ? { reviewCiDeploymentChecks: params.reviewCiDeploymentChecks } : {}),
+        ...(params.reviewCiRepairPaths !== undefined ? { reviewCiRepairPaths: params.reviewCiRepairPaths } : {}),
       };
       const preview = Object.entries(patch).map(([key, value]) => `${key}: ${String(value)}`).join("\n");
       if (ctx.hasUI && !await ctx.ui.confirm("Update forge.yaml?", preview || "No settings supplied")) throw new Error("ForgeDock configuration update cancelled");

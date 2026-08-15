@@ -13,6 +13,7 @@ import type {
   PlanMaterializationNode,
   PlanMaterializationRequest,
   PlanMaterializationResult,
+  PullRequestCheckDiagnostic,
   PullRequestMergeGate,
   PullRequestSnapshot,
   ReviewFindingInput,
@@ -990,6 +991,8 @@ export class GitHubClient implements ForgeHost {
     };
   }
 
+  async getPullRequestHeadRepository(repo: string, number: number, expectedHeadSha: string): Promise<{ repo: string; isCrossRepository: boolean }> { const result = await this.gh(["pr", "view", String(number), "--repo", repo, "--json", "number,headRefOid,headRepository,headRepositoryOwner,isCrossRepository"]); const value = JSON.parse(result) as { number?: unknown; headRefOid?: unknown; headRepository?: { name?: unknown; nameWithOwner?: unknown }; headRepositoryOwner?: { login?: unknown }; isCrossRepository?: unknown }; if (value.number !== number || value.headRefOid !== expectedHeadSha) throw new Error("Pull request head identity changed while resolving its writable repository"); const name = typeof value.headRepository?.nameWithOwner === "string" ? value.headRepository.nameWithOwner : typeof value.headRepositoryOwner?.login === "string" && typeof value.headRepository?.name === "string" ? `${value.headRepositoryOwner.login}/${value.headRepository.name}` : undefined; if (!name) throw new Error(`GitHub did not return an authoritative head repository for PR #${number}`); return { repo: name, isCrossRepository: value.isCrossRepository === true }; }
+  async getPullRequestCheckDiagnostics(repo: string, number: number, expectedHeadSha: string, names: readonly string[]): Promise<readonly PullRequestCheckDiagnostic[]> { if (names.length > 20) throw new Error("Pull-request check diagnostics are bounded to 20 checks"); const pr = await this.getPullRequest(repo, number); if (pr.headSha !== expectedHeadSha) throw new Error("Pull request head changed before CI diagnostics"); const gate = await this.getPullRequestMergeGate(repo, number, expectedHeadSha, pr.baseBranch); const requested = new Set(names.map((name) => name.toLowerCase())); const result: PullRequestCheckDiagnostic[] = []; for (const check of gate.requiredChecks) { if (!requested.has(check.name.toLowerCase())) continue; let logExcerpt = "Failed check logs are unavailable; inspect the details URL and repository mechanical checks."; if (check.detailsUrl && githubActionsRunBelongsToRepo(check.detailsUrl, repo)) try { logExcerpt = (await this.gh(["run", "view", check.detailsUrl, "--repo", repo, "--log-failed"])).slice(-50_000) || logExcerpt; } catch (error) { logExcerpt = `Failed check logs could not be read: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2_000); } result.push({ name: check.name, state: check.state, ...(check.detailsUrl ? { detailsUrl: check.detailsUrl } : {}), logExcerpt }); } return result; }
   async getBranchHead(repo: string, branch: string): Promise<string> {
     const result = await this.gh(["api", `repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`]);
     const value = JSON.parse(result) as { object?: { sha?: string } };
@@ -1506,6 +1509,7 @@ function mergeCheckState(value: string | undefined): PullRequestMergeGate["requi
   if (["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"].includes(normalized)) return "pending";
   return "unavailable";
 }
+function githubActionsRunBelongsToRepo(value: string, repo: string): boolean { try { const url = new URL(value); const [owner, name] = repo.toLowerCase().split("/"); const parts = url.pathname.split("/").filter(Boolean).map((part) => part.toLowerCase()); return url.hostname.toLowerCase() === "github.com" && parts[0] === owner && parts[1] === name && parts[2] === "actions" && parts[3] === "runs" && /^\d+$/.test(parts[4] ?? ""); } catch { return false; } }
 
 function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
   if (!gate.mergeable) return `Pull request #${gate.pullRequest} is not mergeable at ${gate.baseBranch} for reviewed ${gate.headSha}`;

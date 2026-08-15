@@ -12,6 +12,7 @@ export interface ReviewWorkspaceManager {
   createReview(input: { runId: string; pr: number; headSha: string }): Promise<GitWorkspace>;
   remove(workspace: GitWorkspace): Promise<void>;
 }
+export interface PullRequestRepairWorkspaceManager extends ReviewWorkspaceManager { changedPaths(workspace: GitWorkspace): Promise<string[]>; commit(workspace: GitWorkspace, message: string): Promise<string>; head(workspace: GitWorkspace): Promise<string>; publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void>; }
 
 export interface GitWorkspaceManager {
   create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace>;

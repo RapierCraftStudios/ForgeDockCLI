@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { GitWorkspace, GitWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import type { GitWorkspace, GitWorkspaceManager, PullRequestRepairWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,7 +27,7 @@ type DependencyLease = {
   heartbeat: NodeJS.Timeout;
 };
 
-export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager {
+export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager {
   readonly #repo: string;
   readonly #root: string;
 
@@ -232,6 +232,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       "push", "--no-verify", "--set-upstream", "origin", workspace.branch,
     ], workspace.path);
   }
+  async publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void> { if (!isSafeRepairBranch(input.branch) || ["main", "master"].includes(input.branch)) throw new Error(`CI repair refuses to publish to protected or unsafe branch '${input.branch}'`); if (!/^[0-9a-f]{40,64}$/i.test(input.expectedRemoteHeadSha)) throw new Error("CI repair requires an exact expected remote head SHA"); await this.git(["fetch", "--no-tags", "origin", `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`], workspace.path); const remote = (await this.git(["rev-parse", `refs/remotes/origin/${input.branch}`], workspace.path)).trim(); if (remote.toLowerCase() !== input.expectedRemoteHeadSha.toLowerCase()) throw new Error(`PR head changed before CI repair push: expected ${input.expectedRemoteHeadSha}, current ${remote}`); const local = await this.head(workspace); try { await this.git(["merge-base", "--is-ancestor", input.expectedRemoteHeadSha, local], workspace.path); } catch (error) { throw new Error(`CI repair commit ${local} is not a descendant of reviewed PR head ${input.expectedRemoteHeadSha}`, { cause: error }); } const disabledHooksPath = process.platform === "win32" ? "NUL" : "/dev/null"; await this.git(["-c", `core.hooksPath=${disabledHooksPath}`, "push", "--no-verify", "origin", `HEAD:refs/heads/${input.branch}`], workspace.path); }
 
   async head(workspace: GitWorkspace): Promise<string> {
     return (await this.git(["rev-parse", "HEAD"], workspace.path)).trim();
@@ -555,6 +556,7 @@ function isOperationalPath(path: string): boolean {
     || normalized === "node_modules"
     || normalized.startsWith("node_modules/");
 }
+function isSafeRepairBranch(value: string): boolean { return Boolean(value) && value.length <= 240 && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") && !/[\s~^:?*\[\\]/.test(value) && value.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== ".."); }
 
 function assertInside(root: string, candidate: string): void {
   const path = relative(root, resolve(candidate));

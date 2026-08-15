@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, updateForgeDockConfig } from "./forgedock-config.js";
+import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, resolveReviewCiConfig, updateForgeDockConfig } from "./forgedock-config.js";
 
 describe("ForgeDock Next project configuration", () => {
   it("bootstraps a valid minimal forge.yaml exactly once", () => {
@@ -17,6 +17,7 @@ describe("ForgeDock Next project configuration", () => {
       assert.match(raw, /^# forge\.yaml — ForgeDock project configuration/m);
       assert.match(raw, /agents: \{\}/);
       assert.match(raw, /orchestration: \{\}/);
+      assert.match(raw, /review: \{\}/);
       assert.deepEqual(readForgeDockConfig(cwd), {});
 
       writeFileSync(first.path, `${raw}# user content\n`);
@@ -122,4 +123,6 @@ describe("ForgeDock Next project configuration", () => {
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol", "max"), "openai-codex/gpt-5.6-sol:max");
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol:high", "max"), "openai-codex/gpt-5.6-sol:max");
   });
+  it("round-trips repository-owned review CI policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.deepEqual(resolveReviewCiConfig(), { failureAction: "ask", maxFixAttempts: 2, deliveryChecks: ["*"], promotionChecks: ["*"], deploymentChecks: ["*"], repairPaths: [] }); updateForgeDockConfig(cwd, { review: { ci: { failureAction: "auto-fix", maxFixAttempts: 3, deliveryChecks: ["build"], repairPaths: [".github/workflows"] } } }); assert.equal(resolveReviewCiConfig(readForgeDockConfig(cwd)).failureAction, "auto-fix"); assert.match(readFileSync(join(cwd, "forge.yaml"), "utf8"), /failure_action: "auto-fix"/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
+  it("rejects unsafe CI repair policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.throws(() => updateForgeDockConfig(cwd, { reviewCiMaxFixAttempts: 6 }), /1 to 5/); assert.throws(() => updateForgeDockConfig(cwd, { reviewCiRepairPaths: ["../outside"] }), /repository-relative/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
 });

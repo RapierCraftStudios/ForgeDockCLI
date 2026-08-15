@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Standalone `/review-pr` now owns repository-configured CI and mechanical gates by delivery, promotion, or deployment PR type; pending checks may overlap review, failed checks produce an actionable user handoff by default, and opt-in bounded auto-fix creates only exact-head fast-forward repair commits after independent local verification.
 - Pull-request review now recovers from GitHub's 20,000-line diff limit through a bounded paginated-files fallback that preserves every changed path and marks omitted or truncated patches for frozen-workspace inspection.
 - Issue-less deployment reviews now keep their synthetic scoping context internal instead of publishing work-on Intent, Investigation, and Build Packet comments to the pull request.
 - Deployment review gates now retain contradictory same-name GitHub check observations at the reviewed SHA and fail closed instead of allowing a later push check to mask a failed pull-request check.

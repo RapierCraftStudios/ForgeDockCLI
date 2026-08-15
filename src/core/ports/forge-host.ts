@@ -177,6 +177,7 @@ export interface PullRequestMergeGate {
   }>;
   observedAt: string;
 }
+export interface PullRequestCheckDiagnostic { name: string; state: PullRequestMergeGate["requiredChecks"][number]["state"]; detailsUrl?: string; logExcerpt: string; }
 
 export interface ForgeHost {
   getIssue?(number: number, repo?: string): Promise<IssueSnapshot>;
@@ -246,6 +247,8 @@ export interface ForgeHost {
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
   /** Read authoritative PR mergeability and required-check state before merge. */
   getPullRequestMergeGate?(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate>;
+  getPullRequestHeadRepository?(repo: string, number: number, expectedHeadSha: string): Promise<{ repo: string; isCrossRepository: boolean }>;
+  getPullRequestCheckDiagnostics?(repo: string, number: number, expectedHeadSha: string, checks: readonly string[]): Promise<readonly PullRequestCheckDiagnostic[]>;
   /** Read the Git ref directly when a PR projection may lag a successful push. */
   getBranchHead?(repo: string, branch: string): Promise<string>;
   /** Enumerate a bounded ref namespace for deterministic lane classification. */

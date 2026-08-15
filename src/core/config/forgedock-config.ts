@@ -7,6 +7,7 @@ const START = "# FORGEDOCK:NEXT-CONFIG:START";
 const END = "# FORGEDOCK:NEXT-CONFIG:END";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const DEFAULT_AUTO_MERGE = true;
+export const DEFAULT_REVIEW_CI = { failureAction: "ask" as const, maxFixAttempts: 2, deliveryChecks: ["*"] as readonly string[], promotionChecks: ["*"] as readonly string[], deploymentChecks: ["*"] as readonly string[], repairPaths: [] as readonly string[] };
 export const DEFAULT_ORCHESTRATION = {
   batchingPolicy: "aggressive" as const,
   maxBatchSize: 8,
@@ -23,6 +24,9 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type BatchingPolicy = "aggressive" | "conservative" | "none";
 export type ScopeExpansion = "scope-locked" | "recursive";
 export type OrchestrationDispatchMode = "preview" | "confirm" | "auto";
+export type ReviewCiFailureAction = "ask" | "auto-fix";
+export interface ForgeDockReviewCiPatch { failureAction?: ReviewCiFailureAction; maxFixAttempts?: number; deliveryChecks?: readonly string[]; promotionChecks?: readonly string[]; deploymentChecks?: readonly string[]; repairPaths?: readonly string[]; }
+export interface ForgeDockReviewPatch { ci?: ForgeDockReviewCiPatch; }
 
 export interface ForgeDockOrchestrationPatch {
   batching?: { policy?: BatchingPolicy; maxBatchSize?: number; maxSensitiveBatchSize?: number };
@@ -69,7 +73,15 @@ export interface ForgeDockNextConfig {
   /** Default orchestration dispatch policy. */
   dispatchMode?: OrchestrationDispatchMode;
   orchestration?: ForgeDockOrchestrationPatch;
+  reviewCiFailureAction?: ReviewCiFailureAction;
+  reviewCiMaxFixAttempts?: number;
+  reviewCiDeliveryChecks?: readonly string[];
+  reviewCiPromotionChecks?: readonly string[];
+  reviewCiDeploymentChecks?: readonly string[];
+  reviewCiRepairPaths?: readonly string[];
+  review?: ForgeDockReviewPatch;
 }
+export interface EffectiveReviewCiConfig { failureAction: ReviewCiFailureAction; maxFixAttempts: number; deliveryChecks: readonly string[]; promotionChecks: readonly string[]; deploymentChecks: readonly string[]; repairPaths: readonly string[]; }
 
 export type OrchestrationConfigSource = "invocation" | "forge.yaml" | "default";
 
@@ -124,6 +136,12 @@ export function readForgeDockConfig(cwd: string): ForgeDockNextConfig {
     featurePromotionTarget: parsed("feature_promotion_target", parseString),
     productionTarget: parsed("production_target", parseString),
     dispatchMode: parsed("dispatch_mode", parseDispatchMode),
+    reviewCiFailureAction: parsed("failure_action", parseReviewCiFailureAction),
+    reviewCiMaxFixAttempts: parsed("max_fix_attempts", parsePositiveInteger),
+    reviewCiDeliveryChecks: parsed("delivery_checks", parseStringArray),
+    reviewCiPromotionChecks: parsed("promotion_checks", parseStringArray),
+    reviewCiDeploymentChecks: parsed("deployment_checks", parseStringArray),
+    reviewCiRepairPaths: parsed("repair_paths", parseStringArray),
   }) as ForgeDockNextConfig;
   validatePatch(config, false);
   return config;
@@ -140,7 +158,7 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
   validatePatch(patch);
   const path = join(cwd, "forge.yaml");
   const current = readForgeDockConfig(cwd);
-  const normalizedPatch = flattenOrchestrationPatch(patch);
+  const normalizedPatch = flattenReviewPatch(flattenOrchestrationPatch(patch));
   const config = compact({ ...current, ...normalizedPatch });
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "# forge.yaml — ForgeDock project configuration\n";
   const rendered = renderManagedBlock(config);
@@ -160,6 +178,7 @@ export function updateForgeDockConfig(cwd: string, patch: ForgeDockNextConfig): 
 export function resolveAutoMerge(requested: boolean | undefined, configured: boolean | undefined): boolean {
   return requested ?? configured ?? DEFAULT_AUTO_MERGE;
 }
+export function resolveReviewCiConfig(configured: ForgeDockNextConfig = {}): EffectiveReviewCiConfig { const flat = flattenReviewPatch(configured); const result = { failureAction: flat.reviewCiFailureAction ?? DEFAULT_REVIEW_CI.failureAction, maxFixAttempts: flat.reviewCiMaxFixAttempts ?? DEFAULT_REVIEW_CI.maxFixAttempts, deliveryChecks: [...(flat.reviewCiDeliveryChecks ?? DEFAULT_REVIEW_CI.deliveryChecks)], promotionChecks: [...(flat.reviewCiPromotionChecks ?? DEFAULT_REVIEW_CI.promotionChecks)], deploymentChecks: [...(flat.reviewCiDeploymentChecks ?? DEFAULT_REVIEW_CI.deploymentChecks)], repairPaths: [...(flat.reviewCiRepairPaths ?? DEFAULT_REVIEW_CI.repairPaths)] } satisfies EffectiveReviewCiConfig; validateReviewCiPatch({ reviewCiFailureAction: result.failureAction, reviewCiMaxFixAttempts: result.maxFixAttempts, reviewCiDeliveryChecks: result.deliveryChecks, reviewCiPromotionChecks: result.promotionChecks, reviewCiDeploymentChecks: result.deploymentChecks, reviewCiRepairPaths: result.repairPaths }); return result; }
 
 export function resolveOrchestrationConfig(
   configured: ForgeDockNextConfig = {},
@@ -231,6 +250,7 @@ function managedBlock(raw: string): string | undefined {
 }
 
 function renderManagedBlock(config: ForgeDockNextConfig): string {
+  config = flattenReviewPatch(config);
   const hasAgents = config.workerModel !== undefined || config.workerThinking !== undefined
     || config.reviewerModel !== undefined || config.reviewerThinking !== undefined
     || config.planningModel !== undefined || config.planningThinking !== undefined
@@ -269,11 +289,14 @@ function renderManagedBlock(config: ForgeDockNextConfig): string {
     if (config.productionTarget !== undefined) lines.push(`    production_target: ${JSON.stringify(config.productionTarget)}`);
     if (config.dispatchMode !== undefined) lines.push(`    dispatch_mode: ${JSON.stringify(config.dispatchMode)}`);
   }
+  const hasReviewCi = config.reviewCiFailureAction !== undefined || config.reviewCiMaxFixAttempts !== undefined || config.reviewCiDeliveryChecks !== undefined || config.reviewCiPromotionChecks !== undefined || config.reviewCiDeploymentChecks !== undefined || config.reviewCiRepairPaths !== undefined;
+  if (!hasReviewCi) lines.push("  review: {}"); else { lines.push("  review:", "    ci:"); if (config.reviewCiFailureAction !== undefined) lines.push(`      failure_action: ${JSON.stringify(config.reviewCiFailureAction)}`); if (config.reviewCiMaxFixAttempts !== undefined) lines.push(`      max_fix_attempts: ${config.reviewCiMaxFixAttempts}`); if (config.reviewCiDeliveryChecks !== undefined) lines.push(`      delivery_checks: ${JSON.stringify(config.reviewCiDeliveryChecks)}`); if (config.reviewCiPromotionChecks !== undefined) lines.push(`      promotion_checks: ${JSON.stringify(config.reviewCiPromotionChecks)}`); if (config.reviewCiDeploymentChecks !== undefined) lines.push(`      deployment_checks: ${JSON.stringify(config.reviewCiDeploymentChecks)}`); if (config.reviewCiRepairPaths !== undefined) lines.push(`      repair_paths: ${JSON.stringify(config.reviewCiRepairPaths)}`); }
   lines.push(END);
   return lines.join("\n");
 }
 
 function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
+  patch = flattenReviewPatch(patch);
   if (requireValue && !Object.values(patch).some((value) => value !== undefined)) throw new Error("At least one ForgeDock setting is required");
   for (const model of [patch.workerModel, patch.reviewerModel, patch.planningModel]) {
     if (model !== undefined && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._@:/-]+$/.test(model)) {
@@ -299,6 +322,7 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
     throw new Error(`productionTarget must be a safe Git branch name: ${patch.productionTarget}`);
   }
   if (patch.dispatchMode !== undefined && !["preview", "confirm", "auto"].includes(patch.dispatchMode)) throw new Error("dispatchMode must be preview, confirm, or auto");
+  validateReviewCiPatch(patch);
   if (patch.batchingPolicy !== undefined && !["aggressive", "conservative", "none"].includes(patch.batchingPolicy)) throw new Error("batchingPolicy must be aggressive, conservative, or none");
   if (patch.scopeExpansion !== undefined && !["scope-locked", "recursive"].includes(patch.scopeExpansion)) throw new Error("scopeExpansion must be scope-locked or recursive");
   for (const [name, value] of [["maxBatchSize", patch.maxBatchSize], ["maxSensitiveBatchSize", patch.maxSensitiveBatchSize], ["maxRemediationCycles", patch.maxRemediationCycles], ["maxRemediationChildren", patch.maxRemediationChildren]] as const) {
@@ -323,6 +347,9 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (nested?.productionTarget !== undefined && !isSafeBranchName(nested.productionTarget)) throw new Error(`orchestration.productionTarget must be a safe Git branch name: ${nested.productionTarget}`);
   if (nested?.dispatchMode !== undefined && !["preview", "confirm", "auto"].includes(nested.dispatchMode)) throw new Error("orchestration.dispatchMode must be preview, confirm, or auto");
 }
+function flattenReviewPatch(patch: ForgeDockNextConfig): ForgeDockNextConfig { const nested = patch.review?.ci; if (!nested) return { ...patch }; const result: ForgeDockNextConfig = { ...patch }; delete result.review; if (result.reviewCiFailureAction === undefined && nested.failureAction !== undefined) result.reviewCiFailureAction = nested.failureAction; if (result.reviewCiMaxFixAttempts === undefined && nested.maxFixAttempts !== undefined) result.reviewCiMaxFixAttempts = nested.maxFixAttempts; if (result.reviewCiDeliveryChecks === undefined && nested.deliveryChecks !== undefined) result.reviewCiDeliveryChecks = [...nested.deliveryChecks]; if (result.reviewCiPromotionChecks === undefined && nested.promotionChecks !== undefined) result.reviewCiPromotionChecks = [...nested.promotionChecks]; if (result.reviewCiDeploymentChecks === undefined && nested.deploymentChecks !== undefined) result.reviewCiDeploymentChecks = [...nested.deploymentChecks]; if (result.reviewCiRepairPaths === undefined && nested.repairPaths !== undefined) result.reviewCiRepairPaths = [...nested.repairPaths]; return result; }
+function validateReviewCiPatch(patch: ForgeDockNextConfig): void { if (patch.reviewCiFailureAction !== undefined && !["ask", "auto-fix"].includes(patch.reviewCiFailureAction)) throw new Error("review.ci.failureAction must be ask or auto-fix"); if (patch.reviewCiMaxFixAttempts !== undefined && (!Number.isSafeInteger(patch.reviewCiMaxFixAttempts) || patch.reviewCiMaxFixAttempts < 1 || patch.reviewCiMaxFixAttempts > 5)) throw new Error("review.ci.maxFixAttempts must be an integer from 1 to 5"); for (const [name, selectors] of [["deliveryChecks", patch.reviewCiDeliveryChecks], ["promotionChecks", patch.reviewCiPromotionChecks], ["deploymentChecks", patch.reviewCiDeploymentChecks]] as const) if (selectors !== undefined && (!selectors.length || selectors.length > 100 || selectors.some((value) => !value.trim() || value.length > 200 || /[\r\n]/.test(value)))) throw new Error(`review.ci.${name} must contain 1 to 100 non-empty check selectors`); if (patch.reviewCiRepairPaths !== undefined && (patch.reviewCiRepairPaths.length > 200 || patch.reviewCiRepairPaths.some((value) => !isSafeRepositoryPath(value)))) throw new Error("review.ci.repairPaths must contain safe repository-relative paths"); }
+function isSafeRepositoryPath(value: string): boolean { return Boolean(value) && value.length <= 500 && !value.includes("\\") && !value.startsWith("/") && !/^[A-Za-z]:/.test(value) && value.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== ".."); }
 
 function flattenOrchestrationPatch(patch: ForgeDockNextConfig): ForgeDockNextConfig {
   const nested = patch.orchestration;
@@ -389,6 +416,8 @@ function parseDispatchMode(value: string | undefined): OrchestrationDispatchMode
   const parsed = parseString(value);
   return parsed === "preview" || parsed === "confirm" || parsed === "auto" ? parsed : undefined;
 }
+function parseReviewCiFailureAction(value: string | undefined): ReviewCiFailureAction | undefined { const parsed = parseString(value); return parsed === "ask" || parsed === "auto-fix" ? parsed : undefined; }
+function parseStringArray(value: string | undefined): readonly string[] | undefined { if (value === undefined) return undefined; try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) && parsed.every((entry) => typeof entry === "string") ? parsed : undefined; } catch { return undefined; } }
 
 function parsePositiveInteger(value: string | undefined): number | undefined {
   const parsed = parseNonNegativeInteger(value);

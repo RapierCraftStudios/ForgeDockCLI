@@ -268,7 +268,8 @@ export class ForgeDockBackgroundTasks {
     this.#observationAdapter?.finished(id, live.record.status, exitCode);
     this.#live.delete(id);
     await live.cleanup?.().catch(() => undefined);
-    const message = `${renderRecord(live.record)}${detail ? ` — ${detail}` : ""}\nLog: ${live.record.logPath}`;
+    const terminalDetail = detail ?? (live.record.status === "completed" ? undefined : boundedTerminalError(live.record.stderrLogPath));
+    const message = [`${renderRecord(live.record)}${terminalDetail ? ` — ${terminalDetail}` : ""}`, `Log: ${live.record.logPath}`, ...(live.record.stderrLogPath ? [`Error log: ${live.record.stderrLogPath}`] : [])].join("\n");
     this.#ctx?.ui.notify(message, live.record.status === "completed" ? "info" : "warning");
     try {
       this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
@@ -402,6 +403,7 @@ function fileSize(path: string | undefined): number {
   if (!path) return 0;
   try { return statSync(path).size; } catch { return 0; }
 }
+function boundedTerminalError(path: string | undefined): string | undefined { if (!path || !existsSync(path)) return undefined; const raw = readFileSync(path, "utf8").trim(); if (!raw) return undefined; return truncateTail(raw, { maxBytes: 2_000, maxLines: 8 }).content.replace(/\s*\n\s*/g, " | "); }
 
 function readLogDelta(path: string | undefined, offset: number): { text: string; nextOffset: number } | undefined {
   if (!path) return undefined;
