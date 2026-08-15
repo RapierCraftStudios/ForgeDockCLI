@@ -96,6 +96,28 @@ describe("artifact codec", () => {
     assert.deepEqual(findArtifacts(comment)[0], verdict);
   });
 
+  it("compresses and byte-bounds large verdicts without losing durable data", () => {
+    const repeatedEvidence = "Unicode evidence → 🔒 ".repeat(4_000);
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_large_review", subject: { repo: "acme/widget", pr: 9 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        headSha: "b".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], checks: [],
+        findings: [{
+          id: "review-large", severity: "high", confidence: "high", blocking: true, title: "Large finding",
+          evidence: repeatedEvidence, location: "src/large.ts:1", intentRelevance: "Exercises bounded projection",
+          remediation: "Apply the focused correction", reviewerRoles: ["correctness"],
+        }],
+      },
+    });
+
+    const comment = renderArtifactComment(verdict);
+    assert.ok(Buffer.byteLength(comment, "utf8") <= 60_000);
+    assert.match(comment, /FORGEDOCK:ARTIFACT v3 gz:/);
+    assert.match(comment, /Human-readable projection truncated/);
+    assert.deepEqual(findArtifacts(comment)[0], verdict);
+  });
+
   it("never renders a baseline-equivalent required failure as passed", () => {
     const outcome = createArtifact({
       kind: "Outcome",

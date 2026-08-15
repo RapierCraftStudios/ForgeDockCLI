@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { gzipSync, gunzipSync } from "node:zlib";
 import {
   assertArtifact,
   type BuildPacketPayload,
@@ -13,7 +14,10 @@ import {
   type ReviewVerdictPayload,
 } from "./schema.js";
 
-const MARKER = /<!--\s*FORGEDOCK:ARTIFACT\s+v2\s+b64:([A-Za-z0-9_-]+)\s*-->/g;
+const MARKER = /<!--\s*FORGEDOCK:ARTIFACT\s+v(?:2\s+b64|3\s+gz):([A-Za-z0-9_-]+)\s*-->/g;
+const GITHUB_COMMENT_BUDGET_BYTES = 60_000;
+const MAX_DECOMPRESSED_ARTIFACT_BYTES = 4 * 1024 * 1024;
+const TRUNCATED_PROJECTION_NOTICE = "\n\n_Human-readable projection truncated; the complete durable artifact is retained below._";
 
 export function encodeArtifactMarker(artifact: DurableArtifact): string {
   assertArtifact(artifact);
@@ -22,11 +26,15 @@ export function encodeArtifactMarker(artifact: DurableArtifact): string {
 }
 
 export function decodeArtifactMarker(marker: string): DurableArtifact {
-  const match = /<!--\s*FORGEDOCK:ARTIFACT\s+v2\s+b64:([A-Za-z0-9_-]+)\s*-->/.exec(marker);
-  if (!match?.[1]) throw new Error("ForgeDock v2 artifact marker not found");
+  const match = /<!--\s*FORGEDOCK:ARTIFACT\s+v(2|3)\s+(b64|gz):([A-Za-z0-9_-]+)\s*-->/.exec(marker);
+  if (!match?.[1] || !match[2] || !match[3]) throw new Error("ForgeDock artifact marker not found");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(match[1], "base64url").toString("utf8"));
+    const encoded = Buffer.from(match[3], "base64url");
+    const json = match[1] === "3" && match[2] === "gz"
+      ? gunzipSync(encoded, { maxOutputLength: MAX_DECOMPRESSED_ARTIFACT_BYTES }).toString("utf8")
+      : encoded.toString("utf8");
+    parsed = JSON.parse(json);
   } catch (error) {
     throw new Error("ForgeDock artifact marker contains invalid JSON", { cause: error });
   }
@@ -48,7 +56,39 @@ export function findArtifacts(text: string): DurableArtifact[] {
 }
 
 export function renderArtifactComment(artifact: DurableArtifact): string {
-  return `${escapeArtifactText(renderArtifactMarkdown(artifact))}\n\n${encodeArtifactMarker(artifact)}`;
+  const markdown = escapeArtifactText(renderArtifactMarkdown(artifact));
+  const legacy = `${markdown}\n\n${encodeArtifactMarker(artifact)}`;
+  if (Buffer.byteLength(legacy, "utf8") <= GITHUB_COMMENT_BUDGET_BYTES) return legacy;
+
+  const marker = encodeCompressedArtifactMarker(artifact);
+  const fixedBytes = Buffer.byteLength(`${TRUNCATED_PROJECTION_NOTICE}\n\n${marker}`, "utf8");
+  if (fixedBytes > GITHUB_COMMENT_BUDGET_BYTES) {
+    throw new Error(`Durable artifact ${artifact.id} exceeds the single-comment projection budget after compression`);
+  }
+  const readable = truncateUtf8(markdown, GITHUB_COMMENT_BUDGET_BYTES - fixedBytes).trimEnd();
+  return `${readable}${TRUNCATED_PROJECTION_NOTICE}\n\n${marker}`;
+}
+
+function encodeCompressedArtifactMarker(artifact: DurableArtifact): string {
+  assertArtifact(artifact);
+  const encoded = gzipSync(Buffer.from(JSON.stringify(artifact), "utf8"), { level: 9 }).toString("base64url");
+  return `<!-- FORGEDOCK:ARTIFACT v3 gz:${encoded} -->`;
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  let lower = 0;
+  let upper = value.length;
+  while (lower < upper) {
+    const candidate = Math.ceil((lower + upper) / 2);
+    const boundary = candidate > 0 && /[\uD800-\uDBFF]/.test(value[candidate - 1] ?? "") ? candidate - 1 : candidate;
+    if (Buffer.byteLength(value.slice(0, boundary), "utf8") <= maximumBytes) lower = candidate;
+    else upper = candidate - 1;
+  }
+  let boundary = lower;
+  if (boundary > 0 && /[\uD800-\uDBFF]/.test(value[boundary - 1] ?? "")) boundary -= 1;
+  while (boundary > 0 && Buffer.byteLength(value.slice(0, boundary), "utf8") > maximumBytes) boundary -= 1;
+  return value.slice(0, boundary);
 }
 
 export function renderArtifactMarkdown(artifact: DurableArtifact): string {

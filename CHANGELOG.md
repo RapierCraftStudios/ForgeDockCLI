@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Large durable review verdicts now use a backwards-compatible compressed artifact marker and byte-bounded human projection, preventing GitHub HTTP 422 failures without splitting one verdict across noisy comments or losing machine-readable evidence.
 - Large pull-request planning now balances diff weight across the minimum path-bounded reviewer groups instead of treating the already-bounded initial diff size as a reason to manufacture duplicate sessions and exceed the review-plan ceiling.
 - Standalone review no longer treats conditionally skipped or neutral GitHub Actions jobs as unavailable failures when a repository has no explicit branch-protection check set and ForgeDock falls back to observing all PR checks.
 - Large pull-request reviews now freeze deterministic bounded path shards, compact reviewer authority and diff inputs, enforce per-shard tool ceilings without an arbitrary assistant-turn cutoff, preserve shard-scoped finding provenance, and surface the real nested session identity for safe cancellation and recovery instead of repeating context-exhausted reviews.
