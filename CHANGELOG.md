@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Standalone review no longer treats conditionally skipped or neutral GitHub Actions jobs as unavailable failures when a repository has no explicit branch-protection check set and ForgeDock falls back to observing all PR checks.
 - Large pull-request reviews now freeze deterministic bounded path shards, compact reviewer authority and diff inputs, enforce per-shard turn/tool ceilings, preserve shard-scoped finding provenance, and surface the real nested session identity for safe cancellation and recovery instead of repeating context-exhausted reviews.
 - Removed comment-driven deployment admission and ForgeDock Next's `FORGE:GATE_*` lifecycle marker publication; standalone review verdicts plus configured exact-head GitHub CI and mechanical checks now provide PR review authority without requiring ForgeDock-created gate comments.
 - Standalone `/review-pr` now owns repository-configured CI and mechanical gates by delivery, promotion, or deployment PR type; pending checks may overlap review, failed checks produce an actionable user handoff by default, and opt-in bounded auto-fix creates only exact-head fast-forward repair commits after independent local verification.

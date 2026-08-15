@@ -103,7 +103,12 @@ describe("GitHub promotion transport", () => {
       }
       if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
       if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) throw new Error("gh: no required checks reported on the 'staging' branch");
-      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Unit Tests", state: "SUCCESS" }, { name: "Deployment smoke test", state: "FAILURE" }]);
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([
+        { name: "Unit Tests", state: "SUCCESS" },
+        { name: "Full corpus", state: "SKIPPED" },
+        { name: "Optional advisory", state: "NEUTRAL" },
+        { name: "Deployment smoke test", state: "FAILURE" },
+      ]);
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");

@@ -916,23 +916,24 @@ export class GitHubClient implements ForgeHost {
       mergeable = false;
     }
 
-    const parseChecks = (result: string): PullRequestMergeGate["requiredChecks"] => {
+    const parseChecks = (result: string, omitInapplicable = false): PullRequestMergeGate["requiredChecks"] => {
       const parsed: unknown = JSON.parse(result);
       if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
       // A push run and a pull_request run can publish the same check name at
       // the same head SHA. Preserve every observation so a later success can
       // never erase a contradictory failure from the controller's merge gate.
-      return parsed.map((entry: unknown) => {
+      return parsed.flatMap((entry: unknown) => {
         if (!entry || typeof entry !== "object") throw new Error("GitHub checks response contains an invalid entry");
         const check = entry as { name?: unknown; state?: unknown; link?: unknown };
         const name = typeof check.name === "string" ? check.name.trim() : "";
         const state = typeof check.state === "string" ? check.state : undefined;
         const detailsUrl = typeof check.link === "string" ? check.link : undefined;
-        return {
+        if (omitInapplicable && ["SKIPPED", "NEUTRAL"].includes(String(state ?? "").toUpperCase())) return [];
+        return [{
           name: name || "unnamed-required-check",
           state: mergeCheckState(state),
           ...(detailsUrl ? { detailsUrl } : {}),
-        };
+        }];
       });
     };
     let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
@@ -952,7 +953,7 @@ export class GitHubClient implements ForgeHost {
             "pr", "checks", String(number), "--repo", repo,
             "--json", "name,state,link,completedAt,startedAt",
           ]);
-          requiredChecks = parseChecks(result);
+          requiredChecks = parseChecks(result, true);
         } catch (fallbackError) {
           requiredChecks = [{
             name: "required-checks-query",
