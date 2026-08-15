@@ -46,7 +46,7 @@ If the counts differ, update this section and `docs/next/IMPLEMENTATION.md` befo
 | ID | Problem | Current evidence | Cost |
 | --- | --- | --- | --- |
 | P1 | **The enforcement model is hard to see.** Users still associate ForgeDock with a Markdown checklist and model-controlled phase changes. | Legacy `commands/work-on.md` is prompt material; Next uses `machine.ts` and typed `AgentTask<T>` contracts. | Trust/adoption |
-| P2 | **A blocked review stops delivery.** Out-of-packet findings and exhausted remediation budgets become human blocks. | `work-on.ts` calls `blockingFindingOutsidePacket` and `blockForReviewFindings`; review uses `findingIssuePolicy: "approved-only"`. | Merge throughput |
+| P2 | **A blocked review stops delivery.** Out-of-packet findings and exhausted remediation budgets become human blocks, while every accepted root cause is preserved as an independently actionable issue. | `work-on.ts` calls `blockingFindingOutsidePacket` and `blockForReviewFindings`; review uses `findingIssuePolicy: "all"` and reconciles resolved roots after later cycles. | Merge throughput |
 | P3 | **Arbitrary issue sets do not contract.** Current batching is deliberately limited to compatible P2/P3 review findings. | `batching.ts#batchExclusionReason` excludes ordinary, urgent, unscoped, and human-state issues. | Token/cost scale |
 | P4 | **Batch members receive only a thin completion projection.** | `complete.ts` closes members and appends typed Outcome artifacts, but does not publish a complete per-member trajectory. | Provenance/learning |
 | P5 | **Blocks are difficult to operate.** | Section 5 of `docs/next/IMPLEMENTATION.md` still lists the event bus, timeline, Review Desk, and Orchestration Board as incomplete. | Human triage |

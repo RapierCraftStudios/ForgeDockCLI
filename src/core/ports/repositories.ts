@@ -22,6 +22,8 @@ export type RemediationAdmissionClaim =
 export interface RemediationAdmissionRepository {
   claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim>;
   complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void>;
+  /** Atomically discard one stale materialized projection without releasing a live pending claim. */
+  invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean>;
 }
 
 export interface ArtifactRepository {
@@ -118,6 +120,13 @@ export class InMemoryRemediationAdmissionRepository implements RemediationAdmiss
     const admissionKey = remediationAdmissionKey(key);
     if (!this.records.has(admissionKey)) throw new Error(`Unknown remediation admission: ${admissionKey}`);
     this.records.set(admissionKey, { status: "materialized", snapshot: structuredClone(snapshot) });
+  }
+
+  async invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean> {
+    const admissionKey = remediationAdmissionKey(key);
+    const existing = this.records.get(admissionKey);
+    if (existing?.status !== "materialized" || existing.snapshot?.number !== expectedIssueNumber) return false;
+    return this.records.delete(admissionKey);
   }
 }
 

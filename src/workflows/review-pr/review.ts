@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 import { createArtifact, FindingSchema, type DurableArtifact } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
@@ -656,7 +655,7 @@ export async function reviewPullRequest(
     if (projectionEnabled) {
       await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings }, dependencies.host);
     }
-    if (findingIssuePolicy !== "none" && dependencies.host.reconcileReviewFindings) {
+    if (projectionEnabled && dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
         repo: frozen.repo,
         pullRequest: frozen,
@@ -1374,53 +1373,26 @@ export async function materializeReviewFindings(
   },
   host: ForgeHost,
 ): Promise<void> {
-  const [finding] = terminalReviewFindings(input.findings);
-  if (!finding) return;
-  await host.materializeReviewFinding({
-    repo: input.pullRequest.repo,
-    ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
-    pullRequest: input.pullRequest,
-    runId: input.run.runId,
-    reviewedHeadSha: input.pullRequest.headSha,
-    reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
-    finding,
-  });
+  for (const finding of terminalReviewFindings(input.findings)) {
+    await host.materializeReviewFinding({
+      repo: input.pullRequest.repo,
+      ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
+      pullRequest: input.pullRequest,
+      runId: input.run.runId,
+      reviewedHeadSha: input.pullRequest.headSha,
+      reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
+      finding,
+    });
+  }
 }
 
 export function terminalReviewFindings(
   findings: ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]>,
 ): ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]> {
-  const roots = findings.filter(shouldMaterializeFinding);
-  return roots.length ? [aggregateTerminalFindings(roots)] : [];
-}
-
-function aggregateTerminalFindings(
-  findings: ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]>,
-): DurableArtifact<"ReviewVerdict">["payload"]["findings"][number] {
-  if (findings.length === 1) return findings[0]!;
   const severityOrder = { critical: 3, high: 2, medium: 1, low: 0 } as const;
-  const ordered = [...findings].sort((left, right) => severityOrder[right.severity] - severityOrder[left.severity] || left.id.localeCompare(right.id));
-  const identity = ordered.map(({ normalizedRoot, id }) => normalizedRoot ?? id).join("\n");
-  const digest = createHash("sha256").update(identity).digest("hex").slice(0, 16);
-  const compactEvidence = ordered.map((item) => `- [${item.severity.toUpperCase()}] ${item.id}: ${safeInline(item.title, 240)} — ${safeText(item.evidence, 500)}`).join("\n");
-  const compactRemediation = ordered.map((item) => `- ${item.id}: ${safeText(item.remediation, 360)}`).join("\n");
-  const representative = ordered[0]!;
-  const { location: _location, sourceSessionRefs: _sessionRefs, reviewerRoles: _roles, ...base } = representative;
-  const sourceSessionRefs = [...new Set(ordered.flatMap((item) => item.sourceSessionRefs ?? []))];
-  const reviewerRoles = [...new Set(ordered.flatMap((item) => item.reviewerRoles ?? []))];
-  return {
-    ...base,
-    id: `review-terminal-${digest}`,
-    normalizedRoot: identity,
-    title: `${ordered.length} normalized review root causes require terminal remediation`,
-    evidence: safeText(compactEvidence, 7_900),
-    remediation: safeText(compactRemediation, 3_900),
-    intentRelevance: `Terminal aggregate of ${ordered.length} controller-accepted normalized root causes; the ReviewVerdict remains the complete authority.`,
-    sourceFindingIds: ordered.flatMap((item) => item.sourceFindingIds ?? [item.id]),
-    ...(sourceSessionRefs.length ? { sourceSessionRefs } : {}),
-    ...(reviewerRoles.length ? { reviewerRoles } : {}),
-    matchedAcceptanceCriteria: [...new Set(ordered.flatMap((item) => item.matchedAcceptanceCriteria ?? []))],
-    matchedPriorFindingIds: [...new Set(ordered.flatMap((item) => item.matchedPriorFindingIds ?? []))],
-    blocking: ordered.some((item) => item.blocking),
-  };
+  return findings
+    .filter(shouldMaterializeFinding)
+    .sort((left, right) => severityOrder[right.severity] - severityOrder[left.severity]
+      || left.title.localeCompare(right.title)
+      || left.id.localeCompare(right.id));
 }

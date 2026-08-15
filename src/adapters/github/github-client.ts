@@ -100,6 +100,16 @@ export interface GitHubIssueComment {
   containsArtifact: boolean;
 }
 
+interface ReviewFindingMaterializationInput {
+  repo: string;
+  sourceIssue?: number;
+  pullRequest: PullRequestSnapshot;
+  runId: string;
+  reviewedHeadSha: string;
+  reviewerRoles: readonly string[];
+  finding: ReviewFindingInput;
+}
+
 export interface GitHubIssue {
   repo: string;
   number: number;
@@ -360,126 +370,172 @@ export class GitHubClient implements ForgeHost {
     await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
   }
 
-  async materializeReviewFinding(input: {
-    repo: string;
-    sourceIssue?: number;
-    pullRequest: PullRequestSnapshot;
-    runId: string;
-    reviewedHeadSha: string;
-    reviewerRoles: readonly string[];
-    finding: ReviewFindingInput;
-  }): Promise<IssueSnapshot> {
+  async materializeReviewFinding(input: ReviewFindingMaterializationInput): Promise<IssueSnapshot> {
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
-    const legacyMarker = compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
-    const laneAggregate = input.finding.id.startsWith("review-terminal-");
-    const admissionMarker = laneAggregate ? laneMarker : marker;
     const admissionKey: RemediationAdmissionKey = {
       repo: input.repo,
-      // Terminal review findings are one aggregate projection per PR lane, so
-      // their admission must be lane-stable even when the normalized root set
-      // changes between review cycles. Non-aggregate projections retain their
-      // root marker and cannot collapse independent findings.
       parentIssue: 0,
       parentPullRequest: input.pullRequest.number,
-      headSha: admissionMarker,
-      marker: admissionMarker,
+      headSha: input.reviewedHeadSha,
+      marker,
     };
     const claim = await this.remediationAdmissions.claim(admissionKey);
-    const expectedMarkers = laneAggregate
-      ? [laneMarker]
-      : [...new Set([marker, legacyMarker])];
     const isAuthoritativeProjection = (issue: IssueSnapshot): boolean => issue.state === "OPEN"
-      && expectedMarkers.some((candidate) => hasCanonicalMarker(issue.body, candidate));
+      && hasCanonicalMarker(issue.body, marker);
     if (claim.status === "materialized") {
       const authoritative = await this.authoritativeIssueSnapshot(claim.snapshot);
-      if (!isAuthoritativeProjection(authoritative)) {
-        throw new Error(`Cached review-finding admission no longer matches authoritative GitHub issue #${authoritative.number}`);
+      if (authoritative.state !== "OPEN") {
+        const invalidated = await this.remediationAdmissions.invalidateMaterialized(admissionKey, claim.snapshot.number);
+        if (!invalidated) throw new RemediationMaterializationPendingError(marker);
+        return this.materializeReviewFinding(input);
       }
-      return authoritative;
+      if (!hasCanonicalMarker(authoritative.body, marker)) {
+        throw new Error(`Cached review-finding issue #${authoritative.number} lost its canonical root marker`);
+      }
+      return this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
     }
     const existingIssues = await this.listAllIssues(input.repo);
     const existing = existingIssues.find((issue) => isAuthoritativeProjection(issue));
     if (existing) {
-      await this.remediationAdmissions.complete(admissionKey, existing);
-      return existing;
+      const authoritative = await this.authoritativeIssueSnapshot(existing);
+      if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${existing.number} changed during adoption`);
+      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+      await this.remediationAdmissions.complete(admissionKey, refreshed);
+      return refreshed;
     }
     if (claim.status !== "claimed") {
-      const visible = await this.reconcileReviewFindingMarker(input.repo, expectedMarkers);
+      const visible = await this.reconcileReviewFindingMarker(input.repo, [marker]);
       if (visible) {
-        await this.remediationAdmissions.complete(admissionKey, visible);
-        return visible;
+        const authoritative = await this.authoritativeIssueSnapshot(visible);
+        if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${visible.number} changed during reconciliation`);
+        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+        await this.remediationAdmissions.complete(admissionKey, refreshed);
+        return refreshed;
       }
       throw new RemediationMaterializationPendingError(marker);
     }
 
-    const priority = reviewFindingPriority(input.finding.severity);
-    const title = boundedGitHubText(`fix: ${input.finding.title} (review finding — PR #${input.pullRequest.number})`, 240).replace(/[\r\n]+/g, " ");
-    const affectedFile = reviewFindingPath(input.finding.location);
-    const sensitive = /security|auth|billing|payment|stripe|credential|secret|token/i.test(`${affectedFile ?? ""} ${input.finding.title}`);
-    const body = [
-      "## Problem",
-      "",
-      boundedGitHubText(input.finding.title, 1_000),
-      "",
-      `**Source:** PR #${input.pullRequest.number} — ${boundedGitHubText(input.pullRequest.title, 500)}`,
-      ...(input.sourceIssue ? [`**Delivery issue:** #${input.sourceIssue}`] : []),
-      `**Reviewed SHA:** \`${input.reviewedHeadSha}\``,
-      `**Run:** \`${boundedGitHubCode(input.runId)}\``,
-      `**Reviewers:** ${input.reviewerRoles.map((role) => `\`${boundedGitHubCode(role)}\``).join(", ")}`,
-      ...(input.finding.sourceFindingIds?.length ? [`**Source findings:** ${input.finding.sourceFindingIds.map((id) => `\`${boundedGitHubCode(id)}\``).join(", ")}`] : []),
-      ...(input.finding.sourceSessionRefs?.length ? [`**Reviewer sessions:** ${input.finding.sourceSessionRefs.map((ref) => `\`${boundedGitHubCode(ref)}\``).join(", ")}`] : []),
-      `**Confidence:** ${input.finding.confidence.toUpperCase()}`,
-      `**Severity:** ${input.finding.severity.toUpperCase()}`,
-      `**Controller disposition:** ${input.finding.blocking ? "blocking" : "non-blocking"}`,
-      ...(input.finding.scopeDisposition ? [`**Scope disposition:** ${input.finding.scopeDisposition}`] : []),
-      ...(input.finding.scopeRationale ? [`**Scope rationale:** ${boundedGitHubText(input.finding.scopeRationale, 3_000)}`] : []),
-      ...(input.finding.matchedAcceptanceCriteria?.length
-        ? [`**Matched acceptance criteria:** ${input.finding.matchedAcceptanceCriteria.map((criterion) => boundedGitHubText(criterion, 1_000)).join("; ")}`]
-        : []),
-      "",
-      "## Affected Files",
-      "",
-      affectedFile ? `- \`${boundedGitHubCode(affectedFile)}\`${input.finding.location ? ` — ${boundedGitHubText(input.finding.location, 1_000)}` : ""}` : "- Location not reported; validate during investigation.",
-      "",
-      "## Evidence",
-      "",
-      boundedGitHubText(input.finding.evidence, 8_000),
-      "",
-      "## Intent Relevance",
-      "",
-      boundedGitHubText(input.finding.intentRelevance, 4_000),
-      "",
-      "## Required Remediation",
-      "",
-      boundedGitHubText(input.finding.remediation, 4_000),
-      "",
-      "## Acceptance Criteria",
-      "",
-      "- [ ] Validate the finding against the reviewed SHA and current target branch.",
-      "- [ ] Implement or explicitly reject the finding with concrete evidence.",
-      "- [ ] Add focused regression coverage when applicable.",
-      ...(priority === "priority:P3" && !sensitive ? ["", "<!-- FORGE:BATCHABLE -->"] : []),
-      "",
-      marker,
-      laneMarker,
-    ].join("\n");
+    const regression = existingIssues
+      .filter((issue) => issue.state === "CLOSED" && hasCanonicalMarker(issue.body, marker))
+      .sort((left, right) => right.number - left.number)[0];
+    const derivedPriority = reviewFindingPriority(input.finding.severity);
+    const priority = regression && derivedPriority !== "priority:P0" ? "priority:P1" : derivedPriority;
+    const { title, body } = renderReviewFindingIssue(input, marker, laneMarker, priority, regression);
 
-    const metadata = JSON.parse(await this.gh(["api", `repos/${input.repo}/issues/${input.pullRequest.number}`])) as {
-      milestone?: { title?: string } | null;
-    };
+    const milestoneTitle = await this.resolveReviewFindingMilestone(input);
     const args = [
       "issue", "create", "--repo", input.repo, "--title", title, "--body-file", "-",
       "--label", "review-finding", "--label", "needs-validation", "--label", priority,
     ];
-    if (metadata.milestone?.title) args.push("--milestone", metadata.milestone.title);
+    if (milestoneTitle) args.push("--milestone", milestoneTitle);
     const url = (await this.gh(args, body)).trim();
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
-    const snapshot = { repo: input.repo, number, title, body, url, state: "OPEN" as const };
-    await this.remediationAdmissions.complete(admissionKey, snapshot);
-    return snapshot;
+    const authoritative = await this.authoritativeIssueSnapshot({ repo: input.repo, number, title, body, url, state: "OPEN" });
+    if (!isCurrentReviewFindingProjection(authoritative, { title, body, marker, priority, milestoneTitle })) {
+      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation`);
+    }
+    await this.remediationAdmissions.complete(admissionKey, authoritative);
+    return authoritative;
+  }
+
+  private async refreshReviewFindingProjection(
+    input: ReviewFindingMaterializationInput,
+    issue: IssueSnapshot,
+    marker: string,
+    laneMarker: string,
+  ): Promise<IssueSnapshot> {
+    await this.publishReviewFindingRecurrence(input, issue, marker);
+    const priority = reviewFindingPriority(input.finding.severity);
+    const milestoneTitle = await this.resolveReviewFindingMilestone(input);
+    const { title, body } = renderReviewFindingIssue(input, marker, laneMarker, priority);
+    const currentPriorityLabels = (issue.labels ?? []).filter((label) => /^priority:P[0-3]$/.test(label));
+    const expected = { title, body, marker, priority, milestoneTitle };
+
+    let authoritative = issue;
+    if (!isCurrentReviewFindingProjection(issue, expected)) {
+      const args = [
+        "issue", "edit", String(issue.number), "--repo", input.repo,
+        "--title", title, "--body-file", "-", "--add-label", `review-finding,needs-validation,${priority}`,
+      ];
+      const obsoletePriorities = currentPriorityLabels.filter((label) => label !== priority);
+      if (obsoletePriorities.length) args.push("--remove-label", obsoletePriorities.join(","));
+      if (milestoneTitle) args.push("--milestone", milestoneTitle);
+      else if (issue.milestone) args.push("--remove-milestone");
+      await this.gh(args, body);
+      authoritative = await this.authoritativeIssueSnapshot(issue);
+    }
+
+    if (!isCurrentReviewFindingProjection(authoritative, expected)) {
+      throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh`);
+    }
+    return authoritative;
+  }
+
+  private async publishReviewFindingRecurrence(
+    input: { repo: string; pullRequest: PullRequestSnapshot; runId: string; reviewedHeadSha: string; finding: ReviewFindingInput },
+    issue: IssueSnapshot,
+    marker: string,
+  ): Promise<void> {
+    const priorHeadSha = reviewedShaFromFindingBody(issue.body);
+    if (priorHeadSha === input.reviewedHeadSha.toLowerCase()) return;
+    const recurrenceMarker = reviewFindingRecurrenceMarker(input.repo, input.pullRequest.number, issue.number, input.reviewedHeadSha, marker);
+    await this.publishIssueComment({
+      repo: input.repo,
+      issue: issue.number,
+      marker: recurrenceMarker,
+      body: [
+        `This review finding recurred in PR #${input.pullRequest.number} at reviewed SHA \`${input.reviewedHeadSha}\`.`,
+        ...(priorHeadSha ? [`Previously recorded reviewed SHA: \`${priorHeadSha}\`.`] : []),
+        `Run: \`${boundedGitHubCode(input.runId)}\``,
+        "",
+        `**Current evidence:** ${boundedGitHubText(input.finding.evidence, 4_000)}`,
+        "",
+        `**Current remediation:** ${boundedGitHubText(input.finding.remediation, 2_000)}`,
+        "",
+        recurrenceMarker,
+      ].join("\n"),
+    });
+  }
+
+  private async resolveReviewFindingMilestone(input: {
+    repo: string;
+    sourceIssue?: number;
+    pullRequest: PullRequestSnapshot;
+  }): Promise<string | undefined> {
+    const metadata = JSON.parse(await this.gh(["api", `repos/${input.repo}/issues/${input.pullRequest.number}`])) as {
+      milestone?: { title?: string } | null;
+    };
+    if (metadata.milestone?.title) return metadata.milestone.title;
+
+    const sourceIssue = input.sourceIssue ?? closingIssueFromPullRequestBody(input.pullRequest.body);
+    if (sourceIssue !== undefined) {
+      try {
+        const issue = JSON.parse(await this.gh([
+          "issue", "view", String(sourceIssue), "--repo", input.repo, "--json", "milestone",
+        ])) as { milestone?: { title?: string } | null };
+        if (issue.milestone?.title) return issue.milestone.title;
+      } catch {
+        // Milestone inheritance is best-effort after the authoritative PR lookup.
+      }
+    }
+
+    const milestoneBranch = [input.pullRequest.baseBranch, input.pullRequest.headBranch]
+      .find((branch) => branch.startsWith("milestone/"));
+    if (!milestoneBranch) return undefined;
+    const branchSlug = milestoneBranch.slice("milestone/".length).toLowerCase();
+    try {
+      const pages = JSON.parse(await this.gh([
+        "api", `repos/${input.repo}/milestones?state=open&per_page=100`, "--paginate", "--slurp",
+      ])) as Array<Array<{ title?: string }>>;
+      const milestones = pages.flat().flatMap(({ title }) => title ? [{ title, slug: milestoneTitleSlug(title) }] : []);
+      return milestones.find(({ slug }) => slug === branchSlug)?.title
+        ?? milestones.find(({ slug }) => slug.includes(branchSlug))?.title;
+    } catch {
+      return undefined;
+    }
   }
 
   async reconcileReviewFindings(input: {
@@ -1307,30 +1363,25 @@ export function reviewFindingReconciliationCandidates(
   issues: readonly IssueSnapshot[],
   input: { repo: string; pullRequest: PullRequestSnapshot; runId: string; activeFindings: readonly ReviewFindingInput[] },
 ): IssueSnapshot[] {
-  const activeMarkers = new Set(input.activeFindings.flatMap((finding) => [
-    reviewFindingMarker(input.repo, input.pullRequest.number, finding),
-    compatibleLegacyReviewFindingMarker(input.repo, input.pullRequest.number, finding),
-  ]));
+  const activeMarkerOwners = new Map<string, string>();
+  for (const finding of input.activeFindings) {
+    activeMarkerOwners.set(reviewFindingMarker(input.repo, input.pullRequest.number, finding), finding.id);
+  }
   const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
-  const runMarker = `**Run:** \`${input.runId}\``;
   const sourceMarker = `**Source:** PR #${input.pullRequest.number} `;
   const markerPattern = /<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->/;
   const laneIssues = issues
     .filter((issue) => issue.state === "OPEN" && hasCanonicalLinePrefix(issue.body, sourceMarker)
       && hasCanonicalMarker(issue.body, laneMarker) && findCanonicalMarker(issue.body, markerPattern) !== undefined)
     .sort((left, right) => left.number - right.number);
-  const canonicalLaneIssue = laneIssues.find((issue) => [...activeMarkers].some((marker) => hasCanonicalMarker(issue.body, marker)))
-    ?? (input.activeFindings.length ? laneIssues[0] : undefined);
-  const duplicateLaneNumbers = new Set(laneIssues
-    .filter((issue) => issue.number !== canonicalLaneIssue?.number)
-    .map((issue) => issue.number));
-  return issues.filter((issue) => duplicateLaneNumbers.has(issue.number)
-    || (issue.state === "OPEN"
-      && hasCanonicalMarker(issue.body, runMarker)
-      && hasCanonicalLinePrefix(issue.body, sourceMarker)
-      && findCanonicalMarker(issue.body, markerPattern) !== undefined
-      && issue.number !== canonicalLaneIssue?.number
-      && ![...activeMarkers].some((marker) => hasCanonicalMarker(issue.body, marker))));
+  const retainedOwners = new Set<string>();
+  return laneIssues.filter((issue) => {
+    const owner = [...activeMarkerOwners].find(([marker]) => hasCanonicalMarker(issue.body, marker))?.[1];
+    if (!owner) return true;
+    if (retainedOwners.has(owner)) return true;
+    retainedOwners.add(owner);
+    return false;
+  });
 }
 
 export function reviewFindingLaneMarker(repo: string, pullRequest: number): string {
@@ -1339,27 +1390,7 @@ export function reviewFindingLaneMarker(repo: string, pullRequest: number): stri
 }
 
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  const legacyIdentity = reviewFindingIdentity(repo, pullRequest, finding);
-  // Controller-normalized individual and terminal aggregate IDs encode their
-  // causal root set. Keep arbitrary/legacy reviewer IDs on the old identity so
-  // existing individual issues remain adoptable across evidence-only edits.
-  const controllerIdentity = /^review-(?:[a-f0-9]{16}|terminal-[a-f0-9]{16})$/.test(finding.id)
-    ? `\n${finding.id}`
-    : "";
-  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${legacyIdentity}${controllerIdentity}`).digest("hex")} -->`;
-}
-
-function compatibleLegacyReviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  // Count-only terminal aggregates never had a safe legacy identity: adopting
-  // it can bind a new root set to a stale issue. Individual findings retain
-  // legacy adoption so existing durable projections are not duplicated.
-  return /^review-terminal-[a-f0-9]{16}$/.test(finding.id)
-    ? reviewFindingMarker(repo, pullRequest, finding)
-    : legacyReviewFindingMarker(repo, pullRequest, finding);
-}
-
-function legacyReviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(reviewFindingIdentity(repo, pullRequest, finding)).digest("hex")} -->`;
+  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${reviewFindingIdentity(repo, pullRequest, finding)}\n${finding.id.trim()}`).digest("hex")} -->`;
 }
 
 function reviewFindingIdentity(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
@@ -1376,6 +1407,111 @@ function reviewFindingPriority(severity: ReviewFindingInput["severity"]): "prior
   if (severity === "high") return "priority:P1";
   if (severity === "medium") return "priority:P2";
   return "priority:P3";
+}
+
+function renderReviewFindingIssue(
+  input: ReviewFindingMaterializationInput,
+  marker: string,
+  laneMarker: string,
+  priority: "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3",
+  regression?: IssueSnapshot,
+): { title: string; body: string } {
+  const title = boundedGitHubText(`fix: ${input.finding.title} (review finding — PR #${input.pullRequest.number})`, 240).replace(/[\r\n]+/g, " ");
+  const affectedFile = reviewFindingPath(input.finding.location);
+  const sensitive = /security|auth|billing|payment|stripe|charge|invoice|credential|secret|token/i.test(`${affectedFile ?? ""} ${input.finding.title}`);
+  const body = [
+    "## Problem",
+    "",
+    boundedGitHubText(input.finding.title, 1_000),
+    ...(regression ? ["", `> **Regression:** Previously tracked in #${regression.number}; this root recurred at reviewed SHA \`${input.reviewedHeadSha}\`.`] : []),
+    "",
+    `**Source:** PR #${input.pullRequest.number} — ${boundedGitHubText(input.pullRequest.title, 500)}`,
+    ...(input.sourceIssue ? [`**Delivery issue:** #${input.sourceIssue}`] : []),
+    `**Reviewed SHA:** \`${input.reviewedHeadSha}\``,
+    `**Run:** \`${boundedGitHubCode(input.runId)}\``,
+    `**Reviewers:** ${input.reviewerRoles.map((role) => `\`${boundedGitHubCode(role)}\``).join(", ")}`,
+    ...(input.finding.sourceFindingIds?.length ? [`**Source findings:** ${input.finding.sourceFindingIds.map((id) => `\`${boundedGitHubCode(id)}\``).join(", ")}`] : []),
+    ...(input.finding.sourceSessionRefs?.length ? [`**Reviewer sessions:** ${input.finding.sourceSessionRefs.map((ref) => `\`${boundedGitHubCode(ref)}\``).join(", ")}`] : []),
+    `**Confidence:** ${input.finding.confidence.toUpperCase()}`,
+    `**Severity:** ${input.finding.severity.toUpperCase()}`,
+    `**Controller disposition:** ${input.finding.blocking ? "blocking" : "non-blocking"}`,
+    ...(input.finding.scopeDisposition ? [`**Scope disposition:** ${input.finding.scopeDisposition}`] : []),
+    ...(input.finding.scopeRationale ? [`**Scope rationale:** ${boundedGitHubText(input.finding.scopeRationale, 3_000)}`] : []),
+    ...(input.finding.matchedAcceptanceCriteria?.length
+      ? [`**Matched acceptance criteria:** ${input.finding.matchedAcceptanceCriteria.map((criterion) => boundedGitHubText(criterion, 1_000)).join("; ")}`]
+      : []),
+    "",
+    "## Affected Files",
+    "",
+    affectedFile ? `- \`${boundedGitHubCode(affectedFile)}\`${input.finding.location ? ` — ${boundedGitHubText(input.finding.location, 1_000)}` : ""}` : "- Location not reported; validate during investigation.",
+    "",
+    "## Evidence",
+    "",
+    boundedGitHubText(input.finding.evidence, 8_000),
+    "",
+    "## Intent Relevance",
+    "",
+    boundedGitHubText(input.finding.intentRelevance, 4_000),
+    "",
+    "## Required Remediation",
+    "",
+    boundedGitHubText(input.finding.remediation, 4_000),
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- [ ] Validate the finding against the reviewed SHA and current target branch.",
+    "- [ ] Implement or explicitly reject the finding with concrete evidence.",
+    "- [ ] Add focused regression coverage when applicable.",
+    ...(priority === "priority:P3" && !sensitive ? ["", "<!-- FORGE:BATCHABLE -->"] : []),
+    "",
+    marker,
+    laneMarker,
+  ].join("\n");
+  return { title, body };
+}
+
+function isCurrentReviewFindingProjection(
+  issue: IssueSnapshot,
+  expected: {
+    title: string;
+    body: string;
+    marker: string;
+    priority: "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3";
+    milestoneTitle: string | undefined;
+  },
+): boolean {
+  const labels = issue.labels ?? [];
+  const priorityLabels = labels.filter((label) => /^priority:P[0-3]$/.test(label));
+  return issue.state === "OPEN"
+    && issue.title === expected.title
+    && issue.body === expected.body
+    && hasCanonicalMarker(issue.body, expected.marker)
+    && reviewedShaFromFindingBody(issue.body) !== undefined
+    && ["review-finding", "needs-validation", expected.priority].every((label) => labels.includes(label))
+    && priorityLabels.length === 1
+    && priorityLabels[0] === expected.priority
+    && (expected.milestoneTitle !== undefined
+      ? issue.milestone?.title === expected.milestoneTitle
+      : issue.milestone === undefined);
+}
+
+function reviewedShaFromFindingBody(body: string): string | undefined {
+  return findCanonicalMarker(body, /^\*\*Reviewed SHA:\*\* `([a-f0-9]{40,64})`$/i)?.[1]?.toLowerCase();
+}
+
+function reviewFindingRecurrenceMarker(repo: string, pullRequest: number, issue: number, reviewedHeadSha: string, rootMarker: string): string {
+  const identity = `${repo.toLowerCase()}\n${pullRequest}\n${issue}\n${reviewedHeadSha.toLowerCase()}\n${rootMarker}`;
+  return `<!-- FORGEDOCK:REVIEW-FINDING-RECURRENCE ${createHash("sha256").update(identity).digest("hex")} -->`;
+}
+
+function closingIssueFromPullRequestBody(body: string): number | undefined {
+  const match = /(?:^|[^a-z])(?:closes|fixes|resolves)\s+#([0-9]+)/i.exec(body);
+  const issue = Number(match?.[1]);
+  return Number.isSafeInteger(issue) && issue > 0 ? issue : undefined;
+}
+
+function milestoneTitleSlug(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
 function reviewFindingPath(location: string | undefined): string | undefined {

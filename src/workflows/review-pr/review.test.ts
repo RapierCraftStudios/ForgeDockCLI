@@ -954,7 +954,7 @@ describe("fresh-context PR review", () => {
     assert.ok(verdictIndex > issueIndex);
   });
 
-  it("materializes terminal root causes as one bounded aggregate instead of an issue storm", async () => {
+  it("materializes each controller-accepted root cause as independently actionable work", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const host = new FakeHost();
@@ -973,11 +973,10 @@ describe("fresh-context PR review", () => {
       reviewerRoles: ["correctness"],
     }));
     await materializeReviewFindings({ run, pullRequest: pr, findings: roots }, host);
-    assert.equal(host.findingIssues.length, 1);
-    assert.match(host.findingIssues[0]?.finding.id ?? "", /^review-terminal-/);
+    assert.deepEqual(host.findingIssues.map(({ finding }) => finding.id), ["root-a", "root-b"]);
   });
 
-  it("reconciles the same aggregate identity it materializes", async () => {
+  it("reconciles the same individual root identities it materializes", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -999,10 +998,9 @@ describe("fresh-context PR review", () => {
       runtime: new FakeAgentRuntime([{ summary: "two roots", findings }, clean, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });
-    assert.equal(host.findingIssues.length, 1);
+    assert.equal(host.findingIssues.length, 2);
     assert.equal(host.reconciliations.length, 1);
-    assert.deepEqual(host.reconciliations[0]?.activeFindings.map(({ id }) => id), [host.findingIssues[0]?.finding.id]);
-    assert.match(host.findingIssues[0]?.finding.id ?? "", /^review-terminal-/);
+    assert.deepEqual(host.reconciliations[0]?.activeFindings.map(({ id }) => id), host.findingIssues.map(({ finding }) => finding.id));
   });
 
   for (const severity of ["high", "medium"] as const) {
@@ -1027,8 +1025,8 @@ describe("fresh-context PR review", () => {
       assert.deepEqual(result.verdict.payload.findings[0]?.reviewerRoles, ["correctness"]);
       assert.deepEqual(result.verdict.payload.findings[0]?.sourceFindingIds, ["correctness:f1"]);
       assert.equal(result.verdict.payload.findings[0]?.sourceSessionRefs?.length, 1);
-      assert.equal(host.findingIssues.length, expectedBlocking ? 1 : 0);
-      if (expectedBlocking) assert.deepEqual(host.findingIssues[0]?.reviewerRoles, ["correctness"]);
+      assert.equal(host.findingIssues.length, 1);
+      assert.deepEqual(host.findingIssues[0]?.reviewerRoles, ["correctness"]);
     });
   }
 
@@ -1051,7 +1049,7 @@ describe("fresh-context PR review", () => {
     assert.equal(result.verdict.payload.findings[0]?.blocking, false);
     assert.equal(result.verdict.payload.findings[0]?.scopeDisposition, "follow_up");
     assert.equal(result.verdict.payload.scopeAdjudication?.decisions[0]?.disposition, "follow_up");
-    assert.equal(host.findingIssues.length, 0);
+    assert.equal(host.findingIssues.length, 1);
   });
 
   it("renders bounded provisional reviewer reports without allowing nested comment markers", () => {

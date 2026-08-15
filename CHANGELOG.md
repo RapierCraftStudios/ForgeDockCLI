@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Completed reviews now materialize every controller-accepted root cause as its own qualitative, labeled GitHub issue across standalone, work-on, and promotion paths; exact-head per-root admission prevents cross-finding collapse, authoritatively validates and refreshes projections on new-head recurrence, elevates closed-root regressions, inherits delivery milestones, and reconciles stale aggregate or duplicate projections without hiding active findings.
 - Review execution now keeps path-adjacent files in coherent shards and applies a scope-derived read/search evidence budget with an early synthesis warning; typed reviewers can still submit a valid report after browsing is blocked, while a truly exhausted shard fails once without an automatic token-burning retry.
 - Internal typed review shards now remain fleet-visible without emitting generic completion or inactivity prompts into the parent terminal; they no longer inherit Pi's hidden foreground timeout, and failed attempts retry with a fresh schema-bound delegation instead of an incompatible generic acceptance-report resume.
 - Schema-valid reviewer output now remains terminal even if context overflow occurs during child teardown; typed reviewers no longer flood the interactive supervisor channel, and detached controller processes persist their own final task status for restart-safe notification.
@@ -73,7 +74,7 @@
 - Successful merges remove their remote delivery branch.
 - Verification is serialized per machine, bounds Node test fanout, and terminates complete subprocess trees on timeout or cancellation to prevent orphaned Node workers and resource storms.
 - Bundled subagent artifacts use temp storage and are excluded from delivery diffs. Review routing now freezes an immutable, identified Review Plan before execution, separates risk capabilities from hard-bounded execution groups, preserves all mandatory dimensions through many-to-one grouping, and removes reviewer-finding-triggered topology expansion.
-- Same- and cross-reviewer finding proposals are normalized by acceptance criterion, authority boundary, and causal failure mode before policy/adjudication, with stable IDs and source/session lineage. Low-quality candidates are filtered before LLM scope adjudication; normal remediation retains blockers in the verdict and terminal materialization emits one bounded aggregate instead of an issue storm.
+- Same- and cross-reviewer finding proposals are normalized by acceptance criterion, authority boundary, and causal failure mode before policy/adjudication, with stable IDs and source/session lineage. Low-quality candidates are filtered before LLM scope adjudication; normal remediation retains blockers in the verdict and terminal materialization emits one idempotent qualitative issue per accepted root cause.
 - Reviewer recovery now permits at most two attempts under one stable logical group ID, resumes an exact persisted session first, and uses cancellation-aware, parallel-budgeted all-settled waves so successful sibling reports survive a failed peer without allowing partial approval. Fresh nested retries use unique wire node identities, preventing `duplicate_node` rejection while preserving the logical group. Frozen totals for reviewer attempts, model calls, and scope-adjudication attempts are now enforced rather than descriptive.
 - Automatic review remediation refuses changes outside the frozen Build Packet instead of widening scope and emitting oversized operational-artifact failure comments.
 - npm publication now reconciles already-published versions and retries version metadata pushes against current `main` rather than wedging after a concurrent push.
@@ -82,7 +83,6 @@
 ### Fixed
 
 - Standalone review now supports staging→main deployment PRs without an originating issue or BuildResult, while freezing the PR SHA and required-check gate before dispatch.
-- Terminal review-finding projection now runs only after the complete reviewer wave, uses stricter cross-reviewer paraphrase deduplication and stable aggregate identity, and adopts one open PR-lane issue instead of creating a duplicate when a root set changes; duplicate lane projections are reconciled afterward.
 - Post-remediation findings can no longer claim introduction from cumulative Build Result paths or generic current route facts; only exact prior-reviewed-SHA delta paths, explicit changed authority facts, or accepted prior-finding lineage preserve blocking continuity.
 - Finding consolidation derives policy-bearing severity, confidence, scope, and corroboration from qualifying source attestations, preventing low-confidence or rejected duplicates from laundering another source into a blocker.
 - Review Plan identity now canonically covers all authority-bearing fields and validates run/repository/PR/packet/delivery lineage before reuse; foreign, legacy, and mutated plans replan deterministically while old verdict artifacts remain readable.

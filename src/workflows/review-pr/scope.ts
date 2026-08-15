@@ -85,14 +85,9 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
   });
 }
 
-/** Only unresolved blockers and independently corroborated high-risk follow-ups become issues. */
+/** Every controller-accepted finding becomes durable work; rejected candidates remain review evidence only. */
 export function shouldMaterializeFinding(finding: ReviewFinding): boolean {
-  if (finding.scopeDisposition === "rejected") return false;
-  if (finding.blocking) return true;
-  return finding.scopeDisposition === "follow_up"
-    && (finding.severity === "critical" || finding.severity === "high")
-    && finding.confidence === "high"
-    && (finding.reviewerRoles?.length ?? 0) >= 2;
+  return finding.scopeDisposition !== "rejected";
 }
 
 const EXCLUDED_TOPICS: ReadonlyArray<{ name: string; pattern: RegExp }> = [

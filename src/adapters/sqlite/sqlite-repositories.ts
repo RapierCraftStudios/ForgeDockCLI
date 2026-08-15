@@ -257,6 +257,19 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     });
   }
 
+  async invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean> {
+    const admissionKey = remediationAdmissionKey(key);
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      const row = this.#database.prepare("SELECT status, issue_json FROM remediation_admissions WHERE admission_key = ?")
+        .get(admissionKey) as { status: "pending" | "materialized"; issue_json?: string } | undefined;
+      if (row?.status !== "materialized" || !row.issue_json) return false;
+      const snapshot = JSON.parse(row.issue_json) as IssueSnapshot;
+      if (snapshot.number !== expectedIssueNumber) return false;
+      return this.#database.prepare("DELETE FROM remediation_admissions WHERE admission_key = ? AND status = 'materialized'")
+        .run(admissionKey).changes === 1;
+    }));
+  }
+
   async recordTelemetry(receipt: AgentRunReceipt): Promise<void> {
     await withSqliteBusyRetry(() => this.#database.prepare(`
       INSERT INTO run_telemetry (telemetry_key, run_id, task_id, session_ref, created_at, receipt_json)

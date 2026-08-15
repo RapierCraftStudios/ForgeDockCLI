@@ -257,6 +257,10 @@ describe("SQLite operational repositories", () => {
       assert.equal(claims.filter((claim) => claim.status === "pending").length, 1);
       await first.complete(key, snapshot);
       assert.deepEqual(await second.claim(key), { status: "materialized", snapshot });
+      assert.equal(await second.invalidateMaterialized(key, snapshot.number + 1), false);
+      assert.deepEqual(await first.claim(key), { status: "materialized", snapshot });
+      assert.equal(await second.invalidateMaterialized(key, snapshot.number), true);
+      assert.deepEqual(await Promise.all([first.claim(key), second.claim(key)]).then((claims) => claims.map(({ status }) => status).sort()), ["claimed", "pending"]);
     } finally {
       first.close();
       second.close();

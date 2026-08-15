@@ -394,7 +394,7 @@ async function defaultPromotionReview(input: {
     deliveryRunId: reviewRunId,
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
-    findingIssuePolicy: "none",
+    findingIssuePolicy: "all",
     ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),

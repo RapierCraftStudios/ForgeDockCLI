@@ -49,6 +49,7 @@ class EndToEndHost implements ForgeHost {
   snapshot: PullRequestSnapshot = { repo: "a/b", number: 11, title: "Fix", body: "", url: "https://github.test/a/b/pull/11", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "main" };
   issueClosed = false;
   findingIssues = 0;
+  findingReconciliations: number[] = [];
   remediationChildDepths: number[] = [];
   async createPullRequest(input: { baseBranch: string }): Promise<PullRequestSnapshot> {
     this.snapshot.baseBranch = input.baseBranch;
@@ -65,6 +66,10 @@ class EndToEndHost implements ForgeHost {
   async materializeReviewFinding() {
     this.findingIssues++;
     return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const };
+  }
+  async reconcileReviewFindings(input: { activeFindings: readonly unknown[] }): Promise<readonly number[]> {
+    this.findingReconciliations.push(input.activeFindings.length);
+    return [];
   }
   async materializeRemediationChildren(input: { remediationDepth: number }) {
     this.remediationChildDepths.push(input.remediationDepth);
@@ -563,7 +568,8 @@ describe("complete work-on trajectory", () => {
       verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
-    assert.equal(host.findingIssues, 0, "transient blocking findings remediated in the same run must not create follow-up issues");
+    assert.equal(host.findingIssues, 1, "the blocked review must preserve its accepted root as a durable issue");
+    assert.deepEqual(host.findingReconciliations, [1, 0], "the clean remediation verdict must reconcile the resolved root");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator", "remediator", "reviewer"]);
     const remediator = runtime.tasks.find((task) => task.role === "remediator");
     assert.deepEqual(remediator?.workspace.scope.writeRoots, []);
@@ -944,7 +950,8 @@ describe("complete work-on trajectory", () => {
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(result.run.state, "completed");
-    assert.equal(host.findingIssues, 0, "a single-reviewer out-of-scope concern must not proliferate into a new issue");
+    assert.equal(host.findingIssues, 1, "an accepted follow-up must remain independently actionable without blocking delivery");
+    assert.deepEqual(host.findingReconciliations, [1]);
     assert.equal(git.removed, true);
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "reviewer"]);
     assert.ok(!runtime.tasks.some((task) => task.id.includes("review-infrastructure")), "reviewer prose must not expand the frozen topology");

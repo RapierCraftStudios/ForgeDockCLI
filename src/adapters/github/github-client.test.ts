@@ -6,7 +6,6 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
-import { terminalReviewFindings } from "../../workflows/review-pr/review.js";
 import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
@@ -300,14 +299,14 @@ describe("GitHub review finding projection", () => {
       intentRelevance: "Breaks authorization", remediation: "Consume a nonce",
     };
     const first = reviewFindingMarker("A/B", 57, finding);
-    const second = reviewFindingMarker("a/b", 57, { ...finding, id: "renamed", evidence: "Expanded evidence" });
+    const second = reviewFindingMarker("a/b", 57, { ...finding, evidence: "Expanded evidence" });
     assert.equal(first, second);
     assert.match(first, /^<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->$/);
     assert.equal(reviewFindingLaneMarker("A/B", 57), reviewFindingLaneMarker("a/b", 57));
     assert.match(reviewFindingLaneMarker("a/b", 57), /^<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 [a-f0-9]{64} -->$/);
   });
 
-  it("reconciles only stale open findings from the same run and pull request", () => {
+  it("retains one issue per active root and reconciles stale or duplicate lane projections", () => {
     const finding = {
       id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
       title: "Schema is incomplete", evidence: "Request fields are missing", location: "src/schema.ts:20",
@@ -317,21 +316,20 @@ describe("GitHub review finding projection", () => {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
       state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
     };
-    const aggregate = terminalReviewFindings([
-      { ...finding, reviewerRoles: ["correctness"], scopeDisposition: "in_scope" },
-      { ...finding, id: "review-2222222222222222", title: "Response schema is incomplete", evidence: "Response fields are missing", reviewerRoles: ["data"], scopeDisposition: "in_scope" },
-    ])[0]!;
-    const body = (marker: string, run = "run-1", pr = 57) => `**Source:** PR #${pr} — Fix\n**Run:** \`${run}\`\n${marker}`;
-    const staleMarker = reviewFindingMarker("a/b", 57, finding);
+    const secondFinding = { ...finding, id: "review-2222222222222222", title: "Response schema is incomplete", evidence: "Response fields are missing" };
+    const staleFinding = { ...finding, id: "review-3333333333333333", title: "Stale schema concern", evidence: "Old evidence" };
+    const body = (marker: string, pr = 57) => `**Source:** PR #${pr} — Fix\n${reviewFindingLaneMarker("a/b", pr)}\n${marker}`;
     const issues = [
-      { repo: "a/b", number: 1, title: "active aggregate", body: body(reviewFindingMarker("a/b", 57, aggregate)), url: "u1", state: "OPEN" as const },
-      { repo: "a/b", number: 2, title: "stale component", body: body(staleMarker), url: "u2", state: "OPEN" as const },
-      { repo: "a/b", number: 3, title: "other run", body: body(staleMarker, "run-2"), url: "u3", state: "OPEN" as const },
-      { repo: "a/b", number: 4, title: "closed", body: body(staleMarker), url: "u4", state: "CLOSED" as const },
+      { repo: "a/b", number: 1, title: "active first", body: body(reviewFindingMarker("a/b", 57, finding)), url: "u1", state: "OPEN" as const },
+      { repo: "a/b", number: 2, title: "duplicate first", body: body(reviewFindingMarker("a/b", 57, finding)), url: "u2", state: "OPEN" as const },
+      { repo: "a/b", number: 3, title: "active second", body: body(reviewFindingMarker("a/b", 57, secondFinding)), url: "u3", state: "OPEN" as const },
+      { repo: "a/b", number: 4, title: "stale", body: body(reviewFindingMarker("a/b", 57, staleFinding)), url: "u4", state: "OPEN" as const },
+      { repo: "a/b", number: 5, title: "other PR", body: body(reviewFindingMarker("a/b", 58, finding), 58), url: "u5", state: "OPEN" as const },
+      { repo: "a/b", number: 6, title: "closed", body: body(reviewFindingMarker("a/b", 57, staleFinding)), url: "u6", state: "CLOSED" as const },
     ];
     assert.deepEqual(reviewFindingReconciliationCandidates(issues, {
-      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [aggregate],
-    }).map(({ number }) => number), [2]);
+      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [finding, secondFinding],
+    }).map(({ number }) => number), [2, 4]);
   });
 
   it("does not collapse distinct consolidated root causes that share a title and location", () => {
@@ -346,25 +344,39 @@ describe("GitHub review finding projection", () => {
     );
   });
 
-  it("adopts an existing open lane issue across a fresh admission store", async () => {
+  it("adopts an existing marker-matched root issue across a fresh admission store", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
       state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
     };
     const finding = {
-      id: "review-terminal-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
       title: "Retained finding", evidence: "The open lane issue already records this root.", location: "src/schema.ts:20",
       intentRelevance: "Keeps the review root durable", remediation: "Apply the recorded fix.",
     };
     const issue = {
       number: 88, title: "existing lane finding", body: `**Source:** PR #57 — Fix\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, finding)}`,
       html_url: "https://github.test/a/b/issues/88", state: "open" as const,
+      labels: ["review-finding", "needs-validation", "priority:P1"],
     };
+    issue.body = `**Source:** PR #57 - Fix\n**Reviewed SHA:** \`${pullRequest.headSha}\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, finding)}`;
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
     let created = false;
-    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([[issue]]);
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "88") return JSON.stringify({
+        number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
+        state: "OPEN", labels: issue.labels.map((name) => ({ name })), milestone: null,
+      });
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "2") return JSON.stringify({ milestone: null });
+      if (args[0] === "issue" && args[1] === "edit" && args[2] === "88") {
+        issue.title = args[args.indexOf("--title") + 1] ?? issue.title;
+        issue.body = body ?? issue.body;
+        issue.labels = [...new Set([...issue.labels, ...(args[args.indexOf("--add-label") + 1]?.split(",") ?? [])])];
+        return "";
+      }
       if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
       if (args[0] === "issue" && args[1] === "create") { created = true; return "https://github.test/a/b/issues/99\n"; }
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
@@ -376,7 +388,7 @@ describe("GitHub review finding projection", () => {
     assert.equal(adopted.number, 88);
     assert.equal(created, false);
   });
-  it("adopts an existing open lane issue when an aggregate root set changes and closes duplicates", async () => {
+  it("creates distinct root issues and reconciles a stale aggregate plus duplicate root", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
       state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
@@ -387,14 +399,10 @@ describe("GitHub review finding projection", () => {
       intentRelevance: "Breaks clients", remediation: `Fix root ${index}`,
       scopeDisposition: "in_scope" as const, reviewerRoles: ["correctness"],
     });
-    const firstAggregate = terminalReviewFindings([
-      finding("review-1111111111111111", 1), finding("review-2222222222222222", 2),
-    ])[0]!;
-    const secondAggregate = terminalReviewFindings([
-      finding("review-3333333333333333", 3), finding("review-4444444444444444", 4),
-    ])[0]!;
-    assert.notEqual(firstAggregate.id, secondAggregate.id);
-    assert.notEqual(reviewFindingMarker("a/b", 57, firstAggregate), reviewFindingMarker("a/b", 57, secondAggregate));
+    const firstRoot = finding("review-1111111111111111", 1);
+    const secondRoot = finding("review-2222222222222222", 2);
+    const staleAggregate = finding("review-terminal-3333333333333333", 3);
+    assert.notEqual(reviewFindingMarker("a/b", 57, firstRoot), reviewFindingMarker("a/b", 57, secondRoot));
 
     const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed" }> = [];
     const closed: number[] = [];
@@ -409,7 +417,7 @@ describe("GitHub review finding projection", () => {
         if (!issue) throw new Error(`Unknown issue: ${args[2] ?? ""}`);
         return JSON.stringify({
           number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
-          state: issue.state.toUpperCase(), labels: [], milestone: null,
+          state: issue.state.toUpperCase(), labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P1" }], milestone: null,
         });
       }
       if (args[0] === "issue" && args[1] === "create") {
@@ -427,21 +435,241 @@ describe("GitHub review finding projection", () => {
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const baseInput = { repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-1", reviewedHeadSha: pullRequest.headSha, reviewerRoles: ["correctness"] };
-    const firstIssue = await client.materializeReviewFinding({ ...baseInput, finding: firstAggregate });
-    const secondIssue = await client.materializeReviewFinding({ ...baseInput, finding: secondAggregate });
-    assert.equal(firstIssue.number, secondIssue.number);
-    assert.equal(issues.length, 1);
+    const firstIssue = await client.materializeReviewFinding({ ...baseInput, finding: firstRoot });
+    const secondIssue = await client.materializeReviewFinding({ ...baseInput, finding: secondRoot });
+    assert.notEqual(firstIssue.number, secondIssue.number);
+    assert.equal(issues.length, 2);
     issues.push({
       number: 999,
-      title: "duplicate lane finding",
-      body: `**Source:** PR #57 — Fix\n**Run:** \`run-old\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, firstAggregate)}`,
+      title: "duplicate root finding",
+      body: `**Source:** PR #57 — Fix\n**Run:** \`run-old\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, firstRoot)}`,
       html_url: "https://github.test/a/b/issues/999",
       state: "open",
     });
+    issues.push({
+      number: 998,
+      title: "stale aggregate finding",
+      body: `**Source:** PR #57 — Fix\n**Run:** \`run-old\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, staleAggregate)}`,
+      html_url: "https://github.test/a/b/issues/998",
+      state: "open",
+    });
     assert.deepEqual(await client.reconcileReviewFindings({
-      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [secondAggregate],
-    }), [999]);
-    assert.deepEqual(closed, [999]);
+      repo: "a/b", pullRequest, runId: "run-1", activeFindings: [firstRoot, secondRoot],
+    }), [998, 999]);
+    assert.deepEqual(closed, [998, 999]);
+  });
+
+  it("records a same-root recurrence on a new reviewed head without reusing stale evidence silently", async () => {
+    const oldHead = "a".repeat(40);
+    const newHead = "b".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: newHead, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Retained finding", evidence: "Current evidence", location: "src/schema.ts:20",
+      intentRelevance: "Breaks clients", remediation: "Apply the current fix.",
+    };
+    const issue: { number: number; title: string; body: string; html_url: string; state: "open"; labels: string[] } = {
+      number: 88, title: "existing finding",
+      body: `**Source:** PR #57 - Fix\n**Reviewed SHA:** \`${oldHead}\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, finding)}`,
+      html_url: "https://github.test/a/b/issues/88", state: "open", labels: ["review-finding", "needs-validation", "priority:P3"],
+    };
+    const recurrenceComments: string[] = [];
+    let created = false;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([[issue]]);
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({
+        number: issue.number, title: issue.title, body: issue.body, url: issue.html_url, state: "OPEN",
+        labels: issue.labels.map((name) => ({ name })), milestone: null,
+      });
+      if (args[0] === "api" && args[1]?.includes("/comments") && args.includes("POST")) {
+        recurrenceComments.push(JSON.parse(body ?? "{}").body ?? "");
+        return "{}";
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "issue" && args[1] === "edit" && args[2] === "88") {
+        issue.title = args[args.indexOf("--title") + 1] ?? issue.title;
+        issue.body = body ?? issue.body;
+        const remove = new Set(args.includes("--remove-label") ? args[args.indexOf("--remove-label") + 1]?.split(",") : []);
+        issue.labels = issue.labels.filter((label) => !remove.has(label));
+        issue.labels = [...new Set([...issue.labels, ...(args[args.indexOf("--add-label") + 1]?.split(",") ?? [])])];
+        return "";
+      }
+      if (args[0] === "issue" && args[1] === "create") { created = true; return "https://github.test/a/b/issues/99\n"; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const adopted = await client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-new-head", reviewedHeadSha: newHead,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(adopted.number, 88);
+    assert.equal(created, false);
+    assert.equal(recurrenceComments.length, 1);
+    assert.match(recurrenceComments[0] ?? "", new RegExp(newHead));
+    assert.match(recurrenceComments[0] ?? "", /Current evidence/);
+    assert.ok(issue.body.includes(`**Reviewed SHA:** \`${newHead}\``));
+    assert.match(issue.body, /Current evidence/);
+    assert.match(issue.body, /Severity:\*\* HIGH/);
+    assert.deepEqual(issue.labels.filter((label) => label.startsWith("priority:")), ["priority:P1"]);
+    assert.doesNotMatch(issue.body, /FORGE:BATCHABLE/);
+  });
+
+  it("invalidates a closed cached projection and creates an elevated regression issue", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "low" as const, confidence: "high" as const, blocking: false,
+      title: "Output is ambiguous", evidence: "Empty output", location: "src/output.ts:20",
+      intentRelevance: "Confuses users", remediation: "Render an explicit result.",
+    };
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed"; labels: string[] }> = [];
+    const createArgs: string[][] = [];
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view") {
+        const issue = issues.find((candidate) => candidate.number === Number(args[2]));
+        if (!issue) throw new Error(`Unknown issue ${args[2] ?? ""}`);
+        return JSON.stringify({
+          number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
+          state: issue.state.toUpperCase(), labels: issue.labels.map((name) => ({ name })), milestone: null,
+        });
+      }
+      if (args[0] === "issue" && args[1] === "create") {
+        createArgs.push(args);
+        const number = 101 + issues.length;
+        const labels = args.flatMap((value, index) => args[index - 1] === "--label" ? [value] : []);
+        issues.push({ number, title: args[args.indexOf("--title") + 1] ?? "Finding", body: body ?? "", html_url: `https://github.test/a/b/issues/${number}`, state: "open", labels });
+        return `https://github.test/a/b/issues/${number}\n`;
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const input = { repo: "a/b", pullRequest, runId: "run-regression", reviewedHeadSha: head, reviewerRoles: ["correctness"], finding };
+    const first = await client.materializeReviewFinding(input);
+    issues[0]!.state = "closed";
+    const second = await client.materializeReviewFinding(input);
+    assert.notEqual(first.number, second.number);
+    assert.equal(issues.length, 2);
+    assert.ok(createArgs[1]?.includes("priority:P1"));
+    assert.match(issues[1]?.body ?? "", /Regression.*#101/);
+    assert.doesNotMatch(issues[1]?.body ?? "", /FORGE:BATCHABLE/);
+  });
+
+  it("inherits the delivery milestone and keeps invoice findings out of P3 batches", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "Closes #2", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "low" as const, confidence: "high" as const, blocking: false,
+      title: "Invoice rendering is ambiguous", evidence: "Empty total", location: "src/invoice/render.ts:20",
+      intentRelevance: "Confuses billing", remediation: "Render the total.",
+    };
+    let createdBody = "";
+    let createdArgs: string[] = [];
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "2") return JSON.stringify({ milestone: { title: "Billing v2" } });
+      if (args[0] === "issue" && args[1] === "create") {
+        createdArgs = args;
+        createdBody = body ?? "";
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "101") return JSON.stringify({
+        number: 101, title: createdArgs[createdArgs.indexOf("--title") + 1], body: createdBody, url: "https://github.test/a/b/issues/101", state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P3" }], milestone: { number: 1, title: "Billing v2" },
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.materializeReviewFinding({
+      repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-milestone", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(createdArgs[createdArgs.indexOf("--milestone") + 1], "Billing v2");
+    assert.doesNotMatch(createdBody, /FORGE:BATCHABLE/);
+  });
+
+  it("falls back to a milestone-branch slug when no PR or delivery issue milestone exists", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "milestone/quality-roadmap",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "medium" as const, confidence: "high" as const, blocking: false,
+      title: "Roadmap finding", evidence: "Evidence", location: "src/a.ts:1",
+      intentRelevance: "Relevant", remediation: "Fix it",
+    };
+    let createdBody = "";
+    let createdArgs: string[] = [];
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/milestones?")) return JSON.stringify([[{ title: "Quality Roadmap" }]]);
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") {
+        createdArgs = args;
+        createdBody = body ?? "";
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "101") return JSON.stringify({
+        number: 101, title: createdArgs[createdArgs.indexOf("--title") + 1], body: createdBody, url: "https://github.test/a/b/issues/101", state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P2" }], milestone: { number: 1, title: "Quality Roadmap" },
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-branch-milestone", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(createdArgs[createdArgs.indexOf("--milestone") + 1], "Quality Roadmap");
+  });
+
+  it("fails closed when GitHub does not preserve the created finding marker", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Finding", evidence: "Evidence", location: "src/a.ts:1", intentRelevance: "Relevant", remediation: "Fix it",
+    };
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") return "https://github.test/a/b/issues/101\n";
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({
+        number: 101, title: "Finding", body: "marker removed", url: "https://github.test/a/b/issues/101", state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P1" }], milestone: null,
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-bad-readback", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    }), /failed authoritative identity validation/);
   });
 });
 

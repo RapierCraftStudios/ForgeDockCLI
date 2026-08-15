@@ -716,7 +716,7 @@ async function continueBuildDelivery(
     const reviewed = await reviewPullRequest({
       run, pullRequest, intent: input.intent, investigation: input.investigation,
       packet: input.packet, buildResult, workspace: input.workspace.path,
-      findingIssuePolicy: "approved-only",
+      findingIssuePolicy: "all",
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(priorVerdict !== undefined ? { priorVerdict } : {}),
       reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
@@ -874,7 +874,7 @@ export async function resumeWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
-        findingIssuePolicy: "approved-only",
+        findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
         reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
@@ -1028,7 +1028,7 @@ export async function resumeReviewWorkOn(
       const reassessed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
-        findingIssuePolicy: "approved-only",
+        findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
         reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
@@ -1104,7 +1104,7 @@ export async function resumeReviewWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
-        findingIssuePolicy: "approved-only",
+        findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
         reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
@@ -1247,7 +1247,7 @@ export async function resumeExpandedReviewWorkOn(
     packet: input.packet,
     buildResult: proof.buildResult,
     workspace: input.workspace.path,
-    findingIssuePolicy: "approved-only",
+    findingIssuePolicy: "all",
     priorVerdict: input.priorVerdict,
     reviewCycle: { current: 1, total: 1 },
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -1368,7 +1368,7 @@ export async function resumePublicationWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
-        findingIssuePolicy: "approved-only",
+        findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
         reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },

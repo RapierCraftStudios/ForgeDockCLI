@@ -110,9 +110,9 @@ describe("review finding scope policy", () => {
     assert.equal(explicitAuthorityChange?.blocking, true);
   });
 
-  it("materializes blockers but requires corroboration for nonblocking follow-ups", () => {
+  it("materializes every accepted finding and retains rejected candidates only in the verdict", () => {
     assert.equal(shouldMaterializeFinding(finding()), true);
-    assert.equal(shouldMaterializeFinding(finding({ blocking: false, scopeDisposition: "follow_up" })), false);
+    assert.equal(shouldMaterializeFinding(finding({ blocking: false, scopeDisposition: "follow_up" })), true);
     assert.equal(shouldMaterializeFinding(finding({
       blocking: false, scopeDisposition: "follow_up", reviewerRoles: ["correctness", "security"],
     })), true);
