@@ -101,7 +101,7 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
     assert.equal(events.requests[0]?.context, "fresh");
     assert.equal(events.requests[0]?.result.kind, "structured");
     assert.deepEqual(events.requests[0]?.turnBudget, { maxTurns: 24, graceTurns: 2 });
-    assert.deepEqual(events.requests[0]?.toolBudget, { hard: 64 });
+    assert.deepEqual(events.requests[0]?.toolBudget, { soft: 48, hard: 64, block: ["read", "grep", "find", "ls"] });
     assert.equal(events.requests[0]?.scope, undefined, "ForgeDock scope is carried in task text, not as an unsupported upstream field");
     assert.match(events.requests[0]?.task ?? "", new RegExp(`scope contract: v1 sha256:${REVIEWER_SCOPE.scopeDigest}`));
     assert.equal(result.scopeVersion, REVIEWER_SCOPE.scopeVersion);

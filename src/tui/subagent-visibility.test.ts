@@ -149,9 +149,51 @@ describe("bundled subagent live visibility", () => {
 
   it("accepts a completed read-only ForgeDock review despite an earlier optional probe failure", () => {
     const execution = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8");
+    const delegation = readFileSync(resolve("node_modules/pi-subagents/src/slash/delegation-adapters.ts"), "utf8");
     assert.match(execution, /agent\.name === "forgedock-reviewer"[\s\S]*?structuredOutputToolInvoked[\s\S]*?detectSubagentError\(\[\]\)/);
     assert.match(execution, /completedForgeDockStructuredReview[\s\S]*?structured_output is the terminating contract[\s\S]*?result\.exitCode = 0[\s\S]*?result\.error = undefined/);
     assert.doesNotMatch(execution, /completedForgeDockStructuredReview[\s\S]{0,800}?websocket/);
+    assert.match(delegation, /toolBudgetBlocked && child\?\.structuredOutput === undefined/);
+  });
+
+  it("projects a schema-valid review as completed after its evidence budget blocks another read", async () => {
+    const jiti = createJiti(import.meta.url, { interopDefault: true });
+    const delegation = await jiti.import(resolve("node_modules/pi-subagents/src/slash/delegation-adapters.ts")) as {
+      toSubagentDelegationV2Response(request: Record<string, unknown>, result: Record<string, unknown>, aborted: boolean): {
+        status: string;
+        result?: { kind: string; value?: unknown };
+      };
+    };
+    const response = delegation.toSubagentDelegationV2Response({
+      version: 2,
+      requestId: "review-budget-boundary",
+      ownerRunId: "parent-review",
+      nodeId: "review-correctness-part-1-of-1",
+      agent: "forgedock-reviewer",
+      task: "Review the supplied frozen scope.",
+      context: "fresh",
+      cwd: process.cwd(),
+      result: { kind: "structured", schema: { type: "object" } },
+    }, {
+      content: [],
+      details: {
+        runId: "review-child",
+        results: [{
+          agent: "forgedock-reviewer",
+          model: "gpt-5.6-luna",
+          exitCode: 0,
+          toolBudgetBlocked: true,
+          structuredOutput: { summary: "No blocking findings.", findings: [] },
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+          progressSummary: { toolCount: 36, durationMs: 1, tokens: 2 },
+        }],
+      },
+    }, false);
+    assert.equal(response.status, "completed");
+    assert.deepEqual(response.result, {
+      kind: "structured",
+      value: { summary: "No blocking findings.", findings: [] },
+    });
   });
 
   it("keeps typed ForgeDock reviewers off the interactive supervisor channel", () => {

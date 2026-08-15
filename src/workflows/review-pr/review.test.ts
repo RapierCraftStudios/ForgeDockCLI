@@ -158,7 +158,11 @@ describe("fresh-context PR review", () => {
     assert.deepEqual([...new Set(result.reviewPlan.executionGroups.map(({ role }) => role))], ["correctness", "concurrency"]);
     assert.ok(result.reviewPlan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
     assert.ok(tasks.every((task) => task.context.length === 0));
-    assert.ok(tasks.every((task) => task.executionBudget === undefined));
+    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === undefined));
+    assert.ok(tasks.every((task) => Number.isSafeInteger(task.executionBudget?.maxToolCalls)));
+    assert.ok(tasks.every((task) => (task.executionBudget?.maxToolCalls ?? 0) >= 16 && (task.executionBudget?.maxToolCalls ?? 0) <= 48));
+    assert.ok(tasks.every((task) => task.instructions.includes("runtime warns before exhaustion")));
+    assert.ok(tasks.every((task) => task.instructions.includes("Do not list the checkout root")));
     assert.ok(tasks.every((task) => task.objective.length < 60_000));
     assert.ok(tasks.every((task) => task.objective.includes('"totalExpectedPaths": 55')));
     assert.ok(tasks.every((task) => !task.objective.includes('"expectedPaths"')));
@@ -455,6 +459,26 @@ describe("fresh-context PR review", () => {
     );
     assert.equal(runtime.tasks.length, 2);
     assert.equal(runtime.tasks.filter((task) => task.id.endsWith(":review-correctness")).length, 1);
+  });
+
+  it("does not spend a fresh reviewer attempt after the frozen evidence budget is exhausted", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new FakeAgentRuntime([
+      async () => { throw new Error("Nested reviewer ended with tool_budget_exhausted"); },
+      clean,
+    ]);
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /tool_budget_exhausted/,
+    );
+    assert.equal(runtime.tasks.length, 2);
+    assert.equal(runtime.tasks.filter((task) => task.id.endsWith(":review-correctness")).length, 1);
+    const progress = await runs.listProgress(run.runId);
+    assert.ok(progress.some(({ message }) => message.includes("evidence budget was exhausted")));
   });
 
   it("resumes an incomplete persisted reviewer once before spending a fresh session", async () => {

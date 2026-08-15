@@ -11,7 +11,7 @@ import { AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -349,6 +349,7 @@ export async function reviewPullRequest(
         ? { maxInitialDiffChars: DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS }
         : undefined);
       const authorityBrief = reviewerAuthorityBrief(input, selection, expectedHeadSha, buildTargetBranch);
+      const explorationBudget = reviewerToolCallBudget(selection, reviewPlan);
       let priorFailure: string | undefined;
       let resumeSessionRef: string | undefined;
       let completed: { executionGroupId: string; role: ReviewerRole; output: ReviewerSubmission; sessionRef: string; sessionLineage: readonly string[] } | undefined;
@@ -426,7 +427,10 @@ export async function reviewPullRequest(
                 : "This is the initial review. matchedPriorFindingIds must be empty and introducedByRemediation must be false.",
               "Do not duplicate a concern already covered by another title in your own report; report distinct root causes only.",
               "Review only this execution group's paths. Every other changed path is assigned to another frozen group; follow outside the shard only for a concrete dependency needed to prove a finding in this shard.",
+              "The initial diff and exact execution-group path list are already your inventory. Do not list the checkout root, enumerate broad directories, or search the repository to rediscover them.",
+              "Do not read every assigned file by default. Start from the supplied hunks, then use targeted reads/searches only to prove or disprove a concrete risk or trace one necessary dependency.",
               "Do not read generated source maps or vendored generated artifacts in full. Trace them to authored source and use bounded parity/manifest evidence.",
+              `This shard has ${explorationBudget} total read/search calls. The runtime warns before exhaustion and then blocks further browsing so you can synthesize. A clean report with findings=[] is complete; submit it instead of continuing speculative exploration.`,
               "Conclude and submit as soon as the bounded shard has enough evidence; do not perform a repository-wide inventory.",
               "Use ls/find before reading uncertain paths. Missing optional files are evidence, not a reason to fail the review. Do not inspect worktree .git internals.",
               "Do not edit files, perform remediation, approve, merge, or write to GitHub.",
@@ -444,9 +448,7 @@ export async function reviewPullRequest(
               }),
             },
             tools: ["read", "grep", "find", "ls"],
-            ...(reviewPlan.budget.maxToolCallsPerExecutionGroup !== undefined ? {
-              executionBudget: { maxToolCalls: reviewPlan.budget.maxToolCallsPerExecutionGroup },
-            } : {}),
+            executionBudget: { maxToolCalls: explorationBudget },
             outputSchema: ReviewerSubmissionSchema,
             modelPolicy: {
               ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -520,6 +522,10 @@ export async function reviewPullRequest(
           await recordReviewProgress(`${taskId} · attempt ${attempt}/${retryLimit} ${failureKind} · ${priorFailure}`);
           if (isReviewerContextLimitFailure(priorFailure)) {
             await recordReviewProgress(`${taskId} · retry suppressed because the provider rejected the context size`);
+            throw error;
+          }
+          if (isReviewerExplorationLimitFailure(priorFailure)) {
+            await recordReviewProgress(`${taskId} · retry suppressed because the frozen read/search evidence budget was exhausted`);
             throw error;
           }
           if (error instanceof ReviewerAttemptTimeoutError && error.drainExpired) {
@@ -1039,6 +1045,10 @@ export function isTransientReviewerTransportFailure(message: string): boolean {
 
 export function isReviewerContextLimitFailure(message: string): boolean {
   return /context (?:window|length)|input exceeds the context|maximum context|too many (?:input )?tokens/i.test(message);
+}
+
+export function isReviewerExplorationLimitFailure(message: string): boolean {
+  return /tool_budget_exhausted|tool budget (?:hard limit|exhausted)/i.test(message);
 }
 
 function reviewerAuthorityBrief(

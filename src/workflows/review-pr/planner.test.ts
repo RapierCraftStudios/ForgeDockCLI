@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { assertReviewPlan, computeReviewPlanId, planReviewPanel, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
+import { assertReviewPlan, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
   return createArtifact({
@@ -80,6 +80,8 @@ describe("evidence-backed review planning", () => {
     assert.equal(plan.budget.maxSpecialistExecutionGroups, 2);
     assert.equal(plan.budget.maxLogicalReviewerSessions, 3);
     assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 2);
+    assert.equal(plan.budget.maxToolCallsPerExecutionGroup, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP);
+    assert.ok(plan.executionGroups.every((group) => reviewerToolCallBudget(group, plan) <= MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP));
     assert.deepEqual(new Set(plan.capabilities.map(({ id }) => id)), new Set([
       "acceptance-correctness", "security", "data-integrity", "frontend", "release", "concurrency",
     ]));
@@ -219,6 +221,9 @@ describe("evidence-backed review planning", () => {
     assert.equal(plan.schemaVersion, 3);
     assert.equal(correctness.length, 3);
     assert.ok(correctness.every(({ scope }) => scope.length > 0 && scope.length <= 24));
+    assert.deepEqual(correctness[0]?.scope, paths.slice(0, 24));
+    assert.deepEqual(correctness[1]?.scope, paths.slice(24, 48));
+    assert.deepEqual(correctness[2]?.scope, paths.slice(48));
     assert.deepEqual(correctness.flatMap(({ scope }) => scope).sort(), paths);
     assert.equal(new Set(correctness.map(({ id }) => id)).size, correctness.length);
     assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness"]);
@@ -237,7 +242,7 @@ describe("evidence-backed review planning", () => {
     );
   });
 
-  it("balances oversized deployment diffs without manufacturing more reviewer sessions than path coverage requires", () => {
+  it("keeps oversized deployment shards component-coherent without manufacturing extra sessions", () => {
     const paths = Array.from({ length: 232 }, (_, index) => `src/lease-module-${String(index).padStart(3, "0")}.ts`);
     const diff = paths.map((path, index) => [
       `diff --git a/${path} b/${path}`,
@@ -251,6 +256,8 @@ describe("evidence-backed review planning", () => {
     assert.equal(concurrency.length, 10);
     assert.equal(plan.executionGroups.length, 20);
     assert.ok(plan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
+    assert.deepEqual(correctness[0]?.scope, paths.slice(0, 24));
+    assert.deepEqual(concurrency[0]?.scope, paths.slice(0, 24));
     assert.deepEqual(correctness.flatMap(({ scope }) => scope).sort(), paths);
     assert.deepEqual(concurrency.flatMap(({ scope }) => scope).sort(), paths);
     assert.doesNotThrow(() => assertReviewPlan(plan));

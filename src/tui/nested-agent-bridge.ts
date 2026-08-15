@@ -145,7 +145,7 @@ function delegate(
     model: `${input.provider}/${input.model}`,
     thinking: input.thinking ?? "high",
     ...(input.turnBudget !== undefined ? { turnBudget: { maxTurns: input.turnBudget, graceTurns: 2 } } : {}),
-    ...(input.toolBudget !== undefined ? { toolBudget: { hard: input.toolBudget } } : {}),
+    ...(input.toolBudget !== undefined ? { toolBudget: nestedReviewerToolBudget(input.toolBudget) } : {}),
     artifacts: true,
     result: { kind: "structured", schema: input.outputSchema },
   };
@@ -207,6 +207,14 @@ function delegate(
       pi.events.emit(SUBAGENT_DELEGATION_REQUEST_EVENT, request);
     }
   });
+}
+
+export function nestedReviewerToolBudget(hard: number): { soft: number; hard: number; block: string[] } {
+  return {
+    soft: Math.max(1, Math.floor(hard * 0.75)),
+    hard,
+    block: ["read", "grep", "find", "ls"],
+  };
 }
 
 function isPersistedDelegationResumable(

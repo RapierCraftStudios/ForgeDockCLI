@@ -71,6 +71,14 @@ patch(join(root, "src", "runs", "foreground", "execution.ts"), [
   ],
 ]);
 
+// The hard budget blocks only additional read/search probes. A reviewer that
+// then submits schema-valid structured output has converged successfully; do
+// not discard that result merely because one final probe was denied.
+patch(join(root, "src", "slash", "delegation-adapters.ts"), [[
+  'if (child?.toolBudgetBlocked) return "tool_budget_exhausted";',
+  'if (child?.toolBudgetBlocked && child?.structuredOutput === undefined) return "tool_budget_exhausted";',
+]]);
+
 // ForgeDock's typed review controller, not the interactive parent model, owns
 // scope classification and reviewer synthesis. Do not inject the generic
 // supervisor/intercom tools into reviewer children: their progress remains

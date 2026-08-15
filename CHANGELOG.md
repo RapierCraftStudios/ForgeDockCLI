@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Review execution now keeps path-adjacent files in coherent shards and applies a scope-derived read/search evidence budget with an early synthesis warning; typed reviewers can still submit a valid report after browsing is blocked, while a truly exhausted shard fails once without an automatic token-burning retry.
 - Internal typed review shards now remain fleet-visible without emitting generic completion or inactivity prompts into the parent terminal; they no longer inherit Pi's hidden foreground timeout, and failed attempts retry with a fresh schema-bound delegation instead of an incompatible generic acceptance-report resume.
 - Schema-valid reviewer output now remains terminal even if context overflow occurs during child teardown; typed reviewers no longer flood the interactive supervisor channel, and detached controller processes persist their own final task status for restart-safe notification.
 - Native `/review-pr` now yields immediately after starting its background task instead of busy-polling task status; passive terminal notifications remain the sole automatic completion signal.

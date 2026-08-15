@@ -45,7 +45,7 @@ export interface ReviewBudget {
   maxParallelSessions: number;
   /** Legacy review-plan field. New reviews have no assistant-turn cutoff. */
   maxTurnsPerExecutionGroup?: number;
-  /** Legacy review-plan field. New reviews rely on scoped read-only tools and explicit cancellation. */
+  /** Absolute read/search ceiling; each shard derives a smaller scope-sized budget from it. */
   maxToolCallsPerExecutionGroup?: number;
   maxAttemptsPerExecutionGroup: 2;
   maxReviewerAttempts: number;
@@ -121,6 +121,11 @@ export const MAX_REVIEW_EXECUTION_GROUP_PATHS = 24;
 export const MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS = 60_000;
 const MAX_REVIEW_EXECUTION_GROUPS = 64;
 const MAX_PARALLEL_REVIEW_SESSIONS = 4;
+/** Read/search remains available to validate a coherent shard, never for an open-ended repository audit. */
+export const MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP = 48;
+const MIN_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP = 16;
+const REVIEW_TOOL_CALL_OVERHEAD = 12;
+const REVIEW_TOOL_CALLS_PER_EXTRA_CAPABILITY = 4;
 
 const SECURITY = /\b(?:auth(?:entication|orization)?|capabilit(?:y|ies)|crypt(?:o|ographic|ography)|signature|trust root|permission|privilege|secret|credential|token|replay|tamper|revocation)\b/i;
 const DATA = /\b(?:database|migration|sql|storage|persist(?:ed|ence|ent)?|canonical(?:ization| bytes?)?|schema registry|payload schema|encoding|portable bundle|manifest|digest format)\b/i;
@@ -221,7 +226,7 @@ export function planReviewPanel(input: {
   };
   const logicalGroups = [correctnessGroup, ...specialistGroups]
     .sort((left, right) => ROLE_ORDER.indexOf(left.role) - ROLE_ORDER.indexOf(right.role));
-  const executionGroups = logicalGroups.flatMap((group) => shardExecutionGroup(group, sections));
+  const executionGroups = logicalGroups.flatMap((group) => shardExecutionGroup(group));
   if (executionGroups.length > MAX_REVIEW_EXECUTION_GROUPS) {
     throw new Error(`Review Plan requires ${executionGroups.length} bounded execution groups; maximum is ${MAX_REVIEW_EXECUTION_GROUPS}`);
   }
@@ -249,6 +254,7 @@ export function planReviewPanel(input: {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
     maxParallelSessions: Math.min(MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions),
+    maxToolCallsPerExecutionGroup: MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP,
     maxAttemptsPerExecutionGroup: 2,
     maxReviewerAttempts: 2 * maxLogicalReviewerSessions,
     maxScopeAdjudicationAttempts: 2,
@@ -285,6 +291,16 @@ export function planReviewPanel(input: {
     ...identity,
   };
   return deepFreeze(plan);
+}
+
+/** Derive a concrete evidence allowance entirely from frozen plan data. */
+export function reviewerToolCallBudget(group: ReviewExecutionGroup, plan: ReviewPlan): number {
+  const ceiling = plan.budget.maxToolCallsPerExecutionGroup;
+  if (ceiling === undefined) return MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP;
+  const requested = REVIEW_TOOL_CALL_OVERHEAD
+    + group.scope.length
+    + Math.max(0, group.capabilities.length - 1) * REVIEW_TOOL_CALLS_PER_EXTRA_CAPABILITY;
+  return Math.min(ceiling, Math.max(MIN_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, requested));
 }
 
 export function canonicalReviewDigest(value: unknown): string {
@@ -423,38 +439,20 @@ export function scopedReviewDiff(
   ].join("\n"), scoped, maximumChars);
 }
 
-function shardExecutionGroup(group: ReviewExecutionGroup, sections: readonly DiffSection[]): ReviewExecutionGroup[] {
+function shardExecutionGroup(group: ReviewExecutionGroup): ReviewExecutionGroup[] {
   if (group.scope.length <= MAX_REVIEW_EXECUTION_GROUP_PATHS) return [group];
-  const sectionChars = new Map(sections.map((section) => [normalizePath(section.path), section.text.length]));
-  const shardCount = Math.ceil(group.scope.length / MAX_REVIEW_EXECUTION_GROUP_PATHS);
-  const shards = Array.from({ length: shardCount }, (_, index) => ({ index, chars: 0, scope: [] as string[] }));
-  const weightedPaths = group.scope.map((path) => ({
-    path,
-    chars: Math.max(1, Math.min(
-      sectionChars.get(normalizePath(path)) ?? 1_000,
-      MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS,
-    )),
-  })).sort((left, right) => right.chars - left.chars
-    || (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
-
-  // The initial diff passed to a reviewer is independently hard-capped by
-  // scopedReviewDiff. Use diff size only to balance the minimum number of
-  // path-bounded shards; otherwise one large diff can manufacture dozens of
-  // redundant reviewer sessions and then exceed the plan's own session cap.
-  for (const weighted of weightedPaths) {
-    const target = shards
-      .filter(({ scope }) => scope.length < MAX_REVIEW_EXECUTION_GROUP_PATHS)
-      .sort((left, right) => left.chars - right.chars
-        || left.scope.length - right.scope.length
-        || left.index - right.index)[0]!;
-    target.scope.push(weighted.path);
-    target.chars += weighted.chars;
+  // Paths are normalized and sorted. Keep adjacent components together rather
+  // than diff-size bin-packing unrelated docs, runtime, workflow, and generated
+  // files into one shard. The prompt-size bound still protects large hunks.
+  const paths = [...group.scope].sort();
+  const shards: string[][] = [];
+  for (let index = 0; index < paths.length; index += MAX_REVIEW_EXECUTION_GROUP_PATHS) {
+    shards.push(paths.slice(index, index + MAX_REVIEW_EXECUTION_GROUP_PATHS));
   }
-
-  return shards.map(({ scope }, index) => ({
+  return shards.map((scope, index) => ({
     ...group,
-    id: `${group.id}-part-${index + 1}-of-${shardCount}`,
-    scope: scope.sort(),
+    id: `${group.id}-part-${index + 1}-of-${shards.length}`,
+    scope,
   }));
 }
 
