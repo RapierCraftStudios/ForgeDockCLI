@@ -400,6 +400,7 @@ async function runNestedReviewer<T>(
   // cancellation is still propagating through the child runtime.
   const delegationNodeId = `forgedock-review-attempt-${crypto.randomUUID()}`;
   const provisionalSessionRef = input.resumeSessionRef ?? `nested_pending_${crypto.randomUUID()}`;
+  let observedSessionRef = input.resumeSessionRef;
   const scopeReceipt = createScopeManifestReceipt(task.workspace.scope);
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
   let response: { status: number; payload: { output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean; scopeVersion?: number; scopeDigest?: string } };
@@ -419,6 +420,10 @@ async function runNestedReviewer<T>(
         cwd: task.workspace.cwd,
         ...scopeReceipt,
         tools: task.tools,
+        ...(task.executionBudget ? {
+          turnBudget: task.executionBudget.maxTurns,
+          toolBudget: task.executionBudget.maxToolCalls,
+        } : {}),
         outputSchema: task.outputSchema,
         provider: input.provider,
         model: input.model,
@@ -426,23 +431,36 @@ async function runNestedReviewer<T>(
         ...(input.resumeSessionRef ? { resumeSessionRef: input.resumeSessionRef } : {}),
       },
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      onSessionRef: (sessionRef) => {
+        if (sessionRef === observedSessionRef) return;
+        observedSessionRef = sessionRef;
+        input.emit({
+          type: "session.started",
+          taskId: task.id,
+          sessionRef,
+          provider: input.provider,
+          model: input.model,
+          ...(task.observability ? { observability: task.observability } : {}),
+        });
+      },
     });
   } catch (error) {
     const cancelled = input.signal?.aborted === true;
-    emitNestedTerminal(task, input, cancelled ? "session.cancelled" : "session.failed", provisionalSessionRef, error);
+    const sessionRef = observedSessionRef ?? provisionalSessionRef;
+    emitNestedTerminal(task, input, cancelled ? "session.cancelled" : "session.failed", sessionRef, error);
     const detail = error instanceof Error ? error : new Error(String(error));
-    throw new AgentRunError(detail.message, { sessionRef: provisionalSessionRef, resumable: false, cause: error });
+    throw new AgentRunError(detail.message, { sessionRef, resumable: observedSessionRef !== undefined, cause: error });
   }
   const payload = response.payload;
   if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
-    const sessionRef = payload.sessionRef ?? provisionalSessionRef;
+    const sessionRef = observedSessionRef ?? payload.sessionRef ?? provisionalSessionRef;
     emitNestedTerminal(task, input, input.signal?.aborted ? "session.cancelled" : "session.failed", sessionRef, payload.error);
     throw new AgentRunError(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
       sessionRef,
       resumable: payload.resumable === true,
     });
   }
-  const sessionRef = payload.sessionRef ?? provisionalSessionRef;
+  const sessionRef = observedSessionRef ?? payload.sessionRef ?? provisionalSessionRef;
   if (payload.scopeVersion !== scopeReceipt.scopeVersion || payload.scopeDigest !== scopeReceipt.scopeDigest) {
     const error = new Error("Nested reviewer bridge did not acknowledge the exact scope manifest receipt");
     emitNestedTerminal(task, input, "session.failed", sessionRef, error);
@@ -550,6 +568,7 @@ export function postNestedAgentRequest<T>(input: {
   token: string;
   body: unknown;
   signal?: AbortSignal;
+  onSessionRef?: (sessionRef: string) => void;
 }): Promise<{ status: number; payload: T }> {
   let target: URL;
   try {
@@ -573,6 +592,11 @@ export function postNestedAgentRequest<T>(input: {
       },
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, (response) => {
+      const sessionHeader = response.headers["x-forgedock-nested-session-ref"];
+      const sessionRef = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+      if (typeof sessionRef === "string" && sessionRef.length > 0 && sessionRef.length <= 256 && !/[\r\n]/.test(sessionRef)) {
+        input.onSessionRef?.(sessionRef);
+      }
       const chunks: Buffer[] = [];
       let received = 0;
       const fail = (error: Error) => {
@@ -762,6 +786,12 @@ function terminalErrorSummary(error: unknown, cancelled: boolean): string {
 
 function assertToolPolicy<T>(task: AgentTask<T>): void {
   const grants = new Set<ToolGrant>(task.tools);
+  if (task.executionBudget && (!Number.isSafeInteger(task.executionBudget.maxTurns)
+    || task.executionBudget.maxTurns < 1 || task.executionBudget.maxTurns > 1_000
+    || !Number.isSafeInteger(task.executionBudget.maxToolCalls)
+    || task.executionBudget.maxToolCalls < 1 || task.executionBudget.maxToolCalls > 1_000)) {
+    throw new Error(`Task ${task.id} execution budget must use integers from 1 to 1000`);
+  }
   if (!task.workspace.scope || !task.workspace.scope.readRoots.length) {
     throw new Error(`Task ${task.id} must carry a non-empty scope manifest`);
   }

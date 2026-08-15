@@ -253,6 +253,11 @@ export interface AgentTask<_T> {
   context: readonly DurableArtifact[];
   workspace: WorkspaceGrant;
   tools: readonly ToolGrant[];
+  /** Controller-owned exploration ceiling for bounded provider-backed work. */
+  executionBudget?: {
+    maxTurns: number;
+    maxToolCalls: number;
+  };
   /** Optional live phase/cycle context projected into controller and fleet observability. */
   observability?: AgentObservability;
   /** Optional typed authority to run only controller-approved checks in this worktree. */

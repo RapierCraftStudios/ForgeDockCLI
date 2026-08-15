@@ -5,7 +5,7 @@ import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
-import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
+import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
 import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
@@ -126,6 +126,42 @@ describe("fresh-context PR review", () => {
     assert.deepEqual(host.comments.map(({ body }) => /Independent Review · ([^\n]+)/.exec(body)?.[1]).sort(), ["concurrency", "correctness"]);
     assert.ok(host.comments.every(({ body, marker }) => body.includes(marker) && body.includes("consolidated Review Verdict remains authoritative") && body.includes("Session lineage")));
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
+  });
+
+  it("executes a large review as compact bounded shards with distinct durable reports", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const base = artifacts(run);
+    const paths = Array.from({ length: 55 }, (_, index) => `src/module-${String(index).padStart(2, "0")}.ts`);
+    const packet = { ...base.packet, payload: { ...base.packet.payload, expectedPaths: paths } };
+    const buildResult = { ...base.buildResult, payload: { ...base.buildResult.payload, changedPaths: paths } };
+    const host = new FakeHost();
+    host.getPullRequestDiff = async () => paths
+      .map((path) => `diff --git a/${path} b/${path}\n+export const changed = true;`)
+      .join("\n");
+    const tasks: AgentTask<unknown>[] = [];
+    const runtime: AgentRuntime = {
+      async capabilities() { return { runtime: "test", resumableSessions: false, tools: ["read", "grep", "find", "ls"] }; },
+      async run<T>(task: AgentTask<T>): Promise<AgentRunResult<T>> {
+        tasks.push(task);
+        return { output: clean as T, sessionRef: `session-${tasks.length}`, provider: "test", model: "test" };
+      },
+      async close() {},
+    };
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...base, packet, buildResult, workspace: process.cwd() }, {
+      runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.reviewPlan.executionGroups.length, 6);
+    assert.equal(tasks.length, result.reviewPlan.executionGroups.length);
+    assert.deepEqual([...new Set(result.reviewPlan.executionGroups.map(({ role }) => role))], ["correctness", "concurrency"]);
+    assert.ok(result.reviewPlan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
+    assert.ok(tasks.every((task) => task.context.length === 0));
+    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === 24 && task.executionBudget.maxToolCalls === 64));
+    assert.ok(tasks.every((task) => task.objective.length < 60_000));
+    assert.ok(tasks.every((task) => task.objective.includes('"totalExpectedPaths": 55')));
+    assert.ok(tasks.every((task) => !task.objective.includes('"expectedPaths"')));
+    assert.equal(new Set(host.comments.map(({ marker }) => marker)).size, result.reviewPlan.executionGroups.length);
+    assert.deepEqual(result.verdict.payload.reviewerRoles, ["correctness", "concurrency"]);
   });
 
   it("settles the full reviewer wave before one deduplicated issue projection", async () => {
@@ -361,7 +397,7 @@ describe("fresh-context PR review", () => {
       diff: await new FakeHost().getPullRequestDiff(), packet: context.packet, context: reviewPlanContext(run),
     });
     const { maxParallelSessions: _parallel, maxModelCalls: _modelCalls, ...legacyBudget } = planned.budget;
-    const compatibilityCandidate = { ...planned, budget: legacyBudget } as unknown as ReviewPlan;
+    const compatibilityCandidate = { ...planned, schemaVersion: 2, budget: legacyBudget } as unknown as ReviewPlan;
     const compatibilityPlan = { ...compatibilityCandidate, planId: computeReviewPlanId(compatibilityCandidate) };
     const priorVerdict = createArtifact({
       kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
@@ -398,6 +434,24 @@ describe("fresh-context PR review", () => {
     assert.equal(correctnessTasks.length, 2);
     assert.equal(new Set(correctnessTasks.map(({ id }) => id)).size, 1);
     assert.ok(correctnessTasks[1]?.instructions.includes("previous operational attempt failed"));
+  });
+
+  it("does not repeat a reviewer request the provider has rejected for context size", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new FakeAgentRuntime([
+      async () => { throw new Error("Your input exceeds the context window of this model"); },
+      clean,
+    ]);
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /context window/,
+    );
+    assert.equal(runtime.tasks.length, 2);
+    assert.equal(runtime.tasks.filter((task) => task.id.endsWith(":review-correctness")).length, 1);
   });
 
   it("resumes an incomplete persisted reviewer once before spending a fresh session", async () => {

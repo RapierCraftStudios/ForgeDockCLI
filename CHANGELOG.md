@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Large pull-request reviews now freeze deterministic bounded path shards, compact reviewer authority and diff inputs, enforce per-shard turn/tool ceilings, preserve shard-scoped finding provenance, and surface the real nested session identity for safe cancellation and recovery instead of repeating context-exhausted reviews.
 - Removed comment-driven deployment admission and ForgeDock Next's `FORGE:GATE_*` lifecycle marker publication; standalone review verdicts plus configured exact-head GitHub CI and mechanical checks now provide PR review authority without requiring ForgeDock-created gate comments.
 - Standalone `/review-pr` now owns repository-configured CI and mechanical gates by delivery, promotion, or deployment PR type; pending checks may overlap review, failed checks produce an actionable user handoff by default, and opt-in bounded auto-fix creates only exact-head fast-forward repair commits after independent local verification.
 - Pull-request review now recovers from GitHub's 20,000-line diff limit through a bounded paginated-files fallback that preserves every changed path and marks omitted or truncated patches for frozen-workspace inspection.

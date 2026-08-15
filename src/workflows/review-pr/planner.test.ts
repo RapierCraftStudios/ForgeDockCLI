@@ -167,6 +167,8 @@ describe("evidence-backed review planning", () => {
       "maxSpecialistExecutionGroups",
       "maxLogicalReviewerSessions",
       "maxParallelSessions",
+      "maxTurnsPerExecutionGroup",
+      "maxToolCallsPerExecutionGroup",
       "maxAttemptsPerExecutionGroup",
       "maxReviewerAttempts",
       "maxScopeAdjudicationAttempts",
@@ -191,7 +193,7 @@ describe("evidence-backed review planning", () => {
     ].join("\n");
     const plan = planReviewPanel({ changedPaths: ["src/first.ts", "src/last.ts"], diff, packet: packet() });
     const bounded = scopedReviewDiff(plan, "correctness", diff);
-    assert.ok(bounded.length <= 160_000);
+    assert.ok(bounded.length <= 30_000);
     const deploymentBounded = scopedReviewDiff(plan, "correctness", diff, { maxInitialDiffChars: 60_000 });
     assert.ok(deploymentBounded.length <= 60_000);
     assert.match(bounded, /src\/first\.ts/);
@@ -209,5 +211,31 @@ describe("evidence-backed review planning", () => {
     assert.match(dataSlice, /db\/migration\.sql/);
     assert.doesNotMatch(dataSlice, /web\/src\/App\.tsx/);
     assert.equal(scopedReviewDiff(plan, "correctness", diff), diff);
+  });
+
+  it("freezes large reviews into bounded deterministic execution groups without losing changed-path coverage", () => {
+    const paths = Array.from({ length: 70 }, (_, index) => `src/module-${String(index).padStart(2, "0")}.ts`);
+    const diff = paths.map((path) => `diff --git a/${path} b/${path}\n+export const changed = true;`).join("\n");
+    const plan = planReviewPanel({ changedPaths: paths, diff, packet: packet() });
+    const correctness = plan.executionGroups.filter(({ role }) => role === "correctness");
+    assert.equal(plan.schemaVersion, 3);
+    assert.equal(correctness.length, 3);
+    assert.ok(correctness.every(({ scope }) => scope.length > 0 && scope.length <= 24));
+    assert.deepEqual(correctness.flatMap(({ scope }) => scope), paths);
+    assert.equal(new Set(correctness.map(({ id }) => id)).size, correctness.length);
+    assert.deepEqual(plan.selected.map(({ role }) => role), ["correctness"]);
+    assert.equal(plan.budget.maxLogicalReviewerSessions, correctness.length);
+    assert.ok(plan.budget.maxParallelSessions <= 4);
+    assert.doesNotThrow(() => assertReviewPlan(plan));
+    const reversed = planReviewPanel({ changedPaths: [...paths].reverse(), diff, packet: packet() });
+    assert.deepEqual(reversed.executionGroups, plan.executionGroups);
+    const duplicateScope = plan.executionGroups.map((group, index) => index === 1
+      ? { ...group, scope: [correctness[0]!.scope[0]!, ...group.scope.slice(1)] }
+      : group);
+    const malformed = { ...plan, executionGroups: duplicateScope };
+    assert.throws(
+      () => assertReviewPlan({ ...malformed, planId: computeReviewPlanId(malformed) }),
+      /exactly and uniquely cover/,
+    );
   });
 });

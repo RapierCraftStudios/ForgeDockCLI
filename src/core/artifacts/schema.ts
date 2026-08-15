@@ -221,7 +221,7 @@ const ReviewCapabilitySchema = Type.Object({
 export const ReviewPlanSchema = Type.Object({
   /** Current identity fields remain optional so legacy durable verdicts decode. */
   planId: Type.Optional(NonEmptyString),
-  schemaVersion: Type.Optional(Type.Literal(2)),
+  schemaVersion: Type.Optional(Type.Union([Type.Literal(2), Type.Literal(3)])),
   context: Type.Optional(Type.Object({
     runId: NonEmptyString,
     repo: NonEmptyString,
@@ -239,12 +239,14 @@ export const ReviewPlanSchema = Type.Object({
   riskTier: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]),
   budget: Type.Optional(Type.Object({
     maxSpecialistExecutionGroups: Type.Integer({ minimum: 1, maximum: 6 }),
-    maxLogicalReviewerSessions: Type.Integer({ minimum: 1, maximum: 7 }),
-    maxParallelSessions: Type.Optional(Type.Integer({ minimum: 1, maximum: 7 })),
+    maxLogicalReviewerSessions: Type.Integer({ minimum: 1, maximum: 64 }),
+    maxParallelSessions: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+    maxTurnsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 24 })),
+    maxToolCallsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
     maxAttemptsPerExecutionGroup: Type.Literal(2),
-    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 14 }),
+    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 128 }),
     maxScopeAdjudicationAttempts: Type.Integer({ minimum: 1, maximum: 2 }),
-    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 130 })),
   })),
   capabilities: Type.Optional(Type.Array(ReviewCapabilitySchema, { minItems: 1 })),
   executionGroups: Type.Optional(Type.Array(Type.Object({

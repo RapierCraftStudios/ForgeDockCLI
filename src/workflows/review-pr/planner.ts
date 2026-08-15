@@ -38,9 +38,13 @@ export interface ReviewSkip {
 }
 
 export interface ReviewBudget {
+  /** Logical specialist roles before any path sharding. */
   maxSpecialistExecutionGroups: number;
+  /** Concrete execution shards; retained under the legacy field name for artifact compatibility. */
   maxLogicalReviewerSessions: number;
   maxParallelSessions: number;
+  maxTurnsPerExecutionGroup: number;
+  maxToolCallsPerExecutionGroup: number;
   maxAttemptsPerExecutionGroup: 2;
   maxReviewerAttempts: number;
   maxScopeAdjudicationAttempts: number;
@@ -63,7 +67,7 @@ export interface ReviewPlanContext {
 export interface ReviewPlan {
   /** Stable canonical identity over every authority-bearing plan field. */
   planId: string;
-  schemaVersion: 2;
+  schemaVersion: 3;
   context: ReviewPlanContext;
   generation: number;
   frozen: true;
@@ -108,8 +112,12 @@ const CAPABILITY_BY_ROLE: Record<ReviewerRole, ReviewCapabilityId> = {
 };
 const SELECTION_THRESHOLD = 60;
 const DEFAULT_SPECIALIST_BUDGET = 3;
-const MAX_INITIAL_REVIEW_DIFF_CHARS = 160_000;
-export const DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS = 60_000;
+const MAX_INITIAL_REVIEW_DIFF_CHARS = 30_000;
+export const DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS = MAX_INITIAL_REVIEW_DIFF_CHARS;
+export const MAX_REVIEW_EXECUTION_GROUP_PATHS = 24;
+export const MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS = 60_000;
+const MAX_REVIEW_EXECUTION_GROUPS = 64;
+const MAX_PARALLEL_REVIEW_SESSIONS = 4;
 
 const SECURITY = /\b(?:auth(?:entication|orization)?|capabilit(?:y|ies)|crypt(?:o|ographic|ography)|signature|trust root|permission|privilege|secret|credential|token|replay|tamper|revocation)\b/i;
 const DATA = /\b(?:database|migration|sql|storage|persist(?:ed|ence|ent)?|canonical(?:ization| bytes?)?|schema registry|payload schema|encoding|portable bundle|manifest|digest format)\b/i;
@@ -133,7 +141,7 @@ export function planReviewPanel(input: {
   maxSpecialists?: number;
 }): ReviewPlan {
   const sections = parseDiffSections(input.diff);
-  const allPaths = unique([...input.changedPaths, ...sections.map((section) => section.path)].map(normalizePath).filter(Boolean));
+  const allPaths = unique([...input.changedPaths, ...sections.map((section) => section.path)].map(normalizePath).filter(Boolean)).sort();
   const riskText = input.packet.payload.risks.flatMap((risk) => [risk.risk, risk.mitigation]).join("\n");
   const addedText = sections.map((section) => section.added).join("\n");
   const specialistBudget = clampBudget(input.maxSpecialists ?? DEFAULT_SPECIALIST_BUDGET);
@@ -208,9 +216,13 @@ export function planReviewPanel(input: {
     scope: allPaths,
     required: true,
   };
-  const executionGroups: ReviewExecutionGroup[] = [correctnessGroup, ...specialistGroups]
+  const logicalGroups = [correctnessGroup, ...specialistGroups]
     .sort((left, right) => ROLE_ORDER.indexOf(left.role) - ROLE_ORDER.indexOf(right.role));
-  const selected = executionGroups.map(({ role, score, reasons, scope, required }) => ({ role, score, reasons, scope, required }));
+  const executionGroups = logicalGroups.flatMap((group) => shardExecutionGroup(group, sections));
+  if (executionGroups.length > MAX_REVIEW_EXECUTION_GROUPS) {
+    throw new Error(`Review Plan requires ${executionGroups.length} bounded execution groups; maximum is ${MAX_REVIEW_EXECUTION_GROUPS}`);
+  }
+  const selected = logicalGroups.map(({ role, score, reasons, scope, required }) => ({ role, score, reasons, scope, required }));
   const executionRoles = new Set(specialistGroups.map(({ role }) => role));
   const coveredCapabilities = new Set(specialistGroups.flatMap(({ capabilities: covered }) => covered));
   const skipped: ReviewSkip[] = SPECIALISTS.filter((role) => !executionRoles.has(role)).map((role) => {
@@ -233,7 +245,9 @@ export function planReviewPanel(input: {
   const budget: ReviewBudget = {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
-    maxParallelSessions: maxLogicalReviewerSessions,
+    maxParallelSessions: Math.min(MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions),
+    maxTurnsPerExecutionGroup: 24,
+    maxToolCallsPerExecutionGroup: 64,
     maxAttemptsPerExecutionGroup: 2,
     maxReviewerAttempts: 2 * maxLogicalReviewerSessions,
     maxScopeAdjudicationAttempts: 2,
@@ -253,7 +267,7 @@ export function planReviewPanel(input: {
     packetDigest: canonicalReviewDigest(input.packet.payload),
   };
   const identity: Omit<ReviewPlan, "planId"> = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     context,
     generation: 1,
     frozen: true,
@@ -287,7 +301,7 @@ export function freezeReviewPlan(plan: ReviewPlan): ReviewPlan {
 }
 
 export function assertReviewPlan(plan: ReviewPlan): void {
-  if (!plan.frozen || plan.schemaVersion !== 2 || !Number.isSafeInteger(plan.generation) || plan.generation < 1
+  if (!plan.frozen || plan.schemaVersion !== 3 || !Number.isSafeInteger(plan.generation) || plan.generation < 1
     || !/^review-plan-[a-f0-9]{20}$/.test(plan.planId)) {
     throw new Error("Review Plan must have current immutable identity, context, generation, and frozen status");
   }
@@ -301,6 +315,8 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     budget.maxSpecialistExecutionGroups,
     budget.maxLogicalReviewerSessions,
     budget.maxParallelSessions,
+    budget.maxTurnsPerExecutionGroup,
+    budget.maxToolCallsPerExecutionGroup,
     budget.maxAttemptsPerExecutionGroup,
     budget.maxReviewerAttempts,
     budget.maxScopeAdjudicationAttempts,
@@ -321,16 +337,21 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     throw new Error("Review Plan must begin with mandatory acceptance/correctness review");
   }
   const specialistGroups = plan.executionGroups.filter(({ role }) => role !== "correctness");
+  const specialistRoles = new Set(specialistGroups.map(({ role }) => role));
   if (!Number.isSafeInteger(plan.specialistBudget) || plan.specialistBudget < 1 || plan.specialistBudget > SPECIALISTS.length
     || budget.maxSpecialistExecutionGroups! < 1
     || budget.maxSpecialistExecutionGroups! > SPECIALISTS.length
     || budget.maxSpecialistExecutionGroups !== plan.specialistBudget
-    || specialistGroups.length > budget.maxSpecialistExecutionGroups!
+    || specialistRoles.size > budget.maxSpecialistExecutionGroups!
     || budget.maxLogicalReviewerSessions! < 1
-    || budget.maxLogicalReviewerSessions! > SPECIALISTS.length + 1
+    || budget.maxLogicalReviewerSessions! > MAX_REVIEW_EXECUTION_GROUPS
     || plan.executionGroups.length !== budget.maxLogicalReviewerSessions
     || budget.maxParallelSessions! < 1
     || budget.maxParallelSessions! > budget.maxLogicalReviewerSessions!
+    || budget.maxTurnsPerExecutionGroup! < 1
+    || budget.maxTurnsPerExecutionGroup! > 24
+    || budget.maxToolCallsPerExecutionGroup! < 1
+    || budget.maxToolCallsPerExecutionGroup! > 64
     || budget.maxAttemptsPerExecutionGroup !== 2
     || budget.maxReviewerAttempts! < budget.maxLogicalReviewerSessions!
     || budget.maxReviewerAttempts! > budget.maxLogicalReviewerSessions! * budget.maxAttemptsPerExecutionGroup
@@ -349,9 +370,26 @@ export function assertReviewPlan(plan: ReviewPlan): void {
   const coveredCapabilities = new Set(plan.executionGroups.flatMap(({ capabilities }) => capabilities));
   const missing = [...requiredCapabilities].filter((capability) => !coveredCapabilities.has(capability));
   if (missing.length) throw new Error(`Review Plan does not cover required capabilities: ${missing.join(", ")}`);
-  if (plan.selected.length !== plan.executionGroups.length
-    || plan.selected.some((selection, index) => selection.role !== plan.executionGroups[index]?.role)) {
+  const executionRoles = unique(plan.executionGroups.map(({ role }) => role));
+  if (plan.selected.length !== executionRoles.length
+    || plan.selected.some((selection, index) => selection.role !== executionRoles[index])) {
     throw new Error("Review Plan compatibility selection diverges from execution groups");
+  }
+  if (plan.executionGroups.some(({ scope }) => scope.length === 0 || scope.length > MAX_REVIEW_EXECUTION_GROUP_PATHS)) {
+    throw new Error("Review Plan execution shards must have a bounded non-empty path scope");
+  }
+  for (const selection of plan.selected) {
+    const expectedPaths = unique(selection.scope.map(normalizePath)).sort();
+    const observedPaths = plan.executionGroups
+      .filter(({ role }) => role === selection.role)
+      .flatMap(({ scope }) => scope.map(normalizePath));
+    const sortedObservedPaths = [...observedPaths].sort();
+    if (expectedPaths.length === 0
+      || new Set(observedPaths).size !== observedPaths.length
+      || expectedPaths.length !== observedPaths.length
+      || expectedPaths.some((path, index) => path !== sortedObservedPaths[index])) {
+      throw new Error(`Review Plan execution shards do not exactly and uniquely cover ${selection.role}`);
+    }
   }
   for (const group of plan.executionGroups) {
     if (!Number.isSafeInteger(group.score) || group.score < 0 || !group.reasons.length || !group.capabilities.length) {
@@ -362,14 +400,19 @@ export function assertReviewPlan(plan: ReviewPlan): void {
 
 export function scopedReviewDiff(
   plan: ReviewPlan,
-  role: ReviewerRole,
+  reviewer: ReviewerRole | ReviewExecutionGroup,
   diff: string,
   options: { maxInitialDiffChars?: number } = {},
 ): string {
   const sections = parseDiffSections(diff);
   const maximumChars = options.maxInitialDiffChars ?? MAX_INITIAL_REVIEW_DIFF_CHARS;
-  if (role === "correctness" || role === "security") return boundInitialDiff(diff, sections, maximumChars);
-  const selection = plan.executionGroups.find((item) => item.role === role);
+  const role = typeof reviewer === "string" ? reviewer : reviewer.role;
+  const selection = typeof reviewer === "string"
+    ? plan.executionGroups.find((item) => item.role === role)
+    : reviewer;
+  if (typeof reviewer === "string" && (role === "correctness" || role === "security")) {
+    return boundInitialDiff(diff, sections, maximumChars);
+  }
   if (!selection?.scope.length || !sections.length) return boundInitialDiff(diff, sections, maximumChars);
   const wanted = new Set(selection.scope.map(normalizePath));
   const scoped = sections.filter((section) => wanted.has(normalizePath(section.path)));
@@ -379,6 +422,32 @@ export function scopedReviewDiff(
     ...scoped.map((section) => section.text),
     "# Other changed files were omitted from the initial slice; follow evidence into them with read/grep when required.",
   ].join("\n"), scoped, maximumChars);
+}
+
+function shardExecutionGroup(group: ReviewExecutionGroup, sections: readonly DiffSection[]): ReviewExecutionGroup[] {
+  if (!group.scope.length) return [group];
+  const sectionChars = new Map(sections.map((section) => [normalizePath(section.path), section.text.length]));
+  const shards: string[][] = [];
+  let current: string[] = [];
+  let currentChars = 0;
+  for (const path of group.scope) {
+    const estimatedChars = Math.max(1, Math.min(sectionChars.get(normalizePath(path)) ?? 1_000, MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS));
+    if (current.length && (current.length >= MAX_REVIEW_EXECUTION_GROUP_PATHS
+      || currentChars + estimatedChars > MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS)) {
+      shards.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(path);
+    currentChars += estimatedChars;
+  }
+  if (current.length) shards.push(current);
+  if (shards.length === 1) return [group];
+  return shards.map((scope, index) => ({
+    ...group,
+    id: `${group.id}-part-${index + 1}-of-${shards.length}`,
+    scope,
+  }));
 }
 
 function buildSpecialistExecutionGroups(
@@ -474,7 +543,7 @@ function addPathEvidence(candidate: Candidate, paths: readonly string[], pattern
   if (!matches.length) return;
   candidate.score += score;
   candidate.concrete = true;
-  candidate.reasons.push(`${reason}: ${matches.join(", ")}`);
+  candidate.reasons.push(`${reason}: ${summarizePaths(matches)}`);
   for (const path of matches) candidate.scope.add(path);
 }
 function addTextEvidence(candidate: Candidate, text: string, pattern: RegExp, score: number, reason: string): void {
@@ -486,8 +555,14 @@ function addSectionEvidence(candidate: Candidate, sections: readonly DiffSection
   const matches = sections.filter((section) => pattern.test(section.added));
   if (!matches.length) return;
   candidate.score += score;
-  candidate.reasons.push(`${reason}: ${matches.map((section) => section.path).join(", ")}`);
+  candidate.reasons.push(`${reason}: ${summarizePaths(matches.map((section) => section.path))}`);
   for (const section of matches) candidate.scope.add(section.path);
+}
+function summarizePaths(paths: readonly string[]): string {
+  const examples = paths.slice(0, 8);
+  return paths.length <= examples.length
+    ? examples.join(", ")
+    : `${paths.length} paths (${examples.join(", ")}, …)`;
 }
 function compareCandidates(left: Candidate, right: Candidate): number {
   if (left.policyRequired !== right.policyRequired) return left.policyRequired ? -1 : 1;

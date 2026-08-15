@@ -83,12 +83,15 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
         cwd: process.cwd(),
         ...REVIEWER_SCOPE,
         tools: ["read", "grep", "find", "ls"],
+        turnBudget: 24,
+        toolBudget: 64,
         outputSchema: { type: "object" },
         provider: "openai-codex",
         model: "gpt-test",
       }),
     });
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-forgedock-nested-session-ref"), "nested-review-run");
     const result = await response.json() as any;
     assert.deepEqual(result.output, { summary: "clean", findings: [] });
     assert.equal(result.sessionRef, "nested-review-run");
@@ -97,6 +100,8 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
     assert.match(events.requests[0]?.task ?? "", /^ForgeDock review · correctness\n/);
     assert.equal(events.requests[0]?.context, "fresh");
     assert.equal(events.requests[0]?.result.kind, "structured");
+    assert.deepEqual(events.requests[0]?.turnBudget, { maxTurns: 24, graceTurns: 2 });
+    assert.deepEqual(events.requests[0]?.toolBudget, { hard: 64 });
     assert.equal(events.requests[0]?.scope, undefined, "ForgeDock scope is carried in task text, not as an unsupported upstream field");
     assert.match(events.requests[0]?.task ?? "", new RegExp(`scope contract: v1 sha256:${REVIEWER_SCOPE.scopeDigest}`));
     assert.equal(result.scopeVersion, REVIEWER_SCOPE.scopeVersion);
@@ -162,6 +167,7 @@ test("incomplete persisted reviewers are resumed through the package-owned RPC l
       }),
     });
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-forgedock-nested-session-ref"), "revived-review");
     const result = await response.json() as any;
     assert.deepEqual(result.output, { summary: "resumed clean", findings: [] });
     assert.equal(result.sessionRef, "revived-review");
@@ -277,7 +283,7 @@ test("a schema-valid structured result survives a trailing failed terminal statu
   }
 });
 
-test("an incomplete failed delegation returns its persisted session reference for one resume attempt", async () => {
+test("a terminal-only failed delegation returns its persisted session reference for one resume attempt", async () => {
   const events = new FakeEvents();
   events.autoRespond = false;
   const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
@@ -293,16 +299,13 @@ test("an incomplete failed delegation returns its persisted session reference fo
     });
     while (events.requests.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
     const request = events.requests[0];
-    events.emit("prompt-template:subagent:update", {
-      version: 2, requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId,
-      runId: "persisted-incomplete",
-    });
     events.emit("prompt-template:subagent:response", {
       version: 2, requestId: request.requestId, ownerRunId: request.ownerRunId, nodeId: request.nodeId,
-      status: "failed", error: "provider disconnected",
+      status: "failed", error: "provider disconnected", runId: "persisted-incomplete",
     });
     const response = await pending;
-    assert.equal(response.status, 500);
+    assert.equal(response.status, 200, "the early identity header fixes the transport status before terminal failure");
+    assert.equal(response.headers.get("x-forgedock-nested-session-ref"), "persisted-incomplete");
     const result = await response.json() as any;
     assert.equal(result.sessionRef, "persisted-incomplete");
     assert.equal(result.resumable, true);

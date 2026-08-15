@@ -284,4 +284,46 @@ describe("cross-reviewer finding consolidation", () => {
     });
     assert.equal(authority?.blocking, true);
   });
+
+  it("keeps same-role shard provenance distinct without treating shards as independent reviewers", () => {
+    const shardFinding = {
+      ...base,
+      id: "SHARED",
+      severity: "medium" as const,
+      title: "Shared root",
+      evidence: "Both shards observed the same failure.",
+      location: "src/a.ts:1",
+      causalRoot: "shared failure mode",
+    };
+    const [consolidated] = consolidateReviewerFindings([
+      { role: "correctness", executionGroupId: "review-correctness-part-1-of-2", output: submission([shardFinding]) },
+      { role: "correctness", executionGroupId: "review-correctness-part-2-of-2", output: submission([shardFinding]) },
+    ], new Set(["medium"]), { reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"] });
+    assert.deepEqual(consolidated?.reviewerRoles, ["correctness"]);
+    assert.deepEqual(consolidated?.sourceFindingIds, [
+      "correctness:review-correctness-part-1-of-2:SHARED",
+      "correctness:review-correctness-part-2-of-2:SHARED",
+    ]);
+    assert.equal(consolidated?.blocking, false);
+  });
+
+  it("does not let a shard block on an unassigned path", () => {
+    const [consolidated] = consolidateReviewerFindings([{
+      role: "correctness",
+      executionGroupId: "review-correctness-part-1-of-2",
+      scope: ["src/a.ts"],
+      output: submission([{
+        ...base,
+        id: "OUTSIDE",
+        title: "Failure outside the assigned shard",
+        evidence: "The finding is anchored only to another shard.",
+        severity: "high",
+        location: "src/b.ts:10",
+      }]),
+    }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts", "src/b.ts"],
+      expectedPaths: ["src/a.ts", "src/b.ts"],
+    });
+    assert.equal(consolidated?.blocking, false);
+  });
 });

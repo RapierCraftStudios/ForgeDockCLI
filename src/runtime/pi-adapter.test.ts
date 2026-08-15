@@ -77,6 +77,30 @@ test("nested reviewer transport does not depend on fetch or an implicit wall-clo
   }
 });
 
+test("nested reviewer transport exposes the persisted child identity before terminal completion", async () => {
+  const endpoint = await listen((_request, response) => {
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "x-forgedock-nested-session-ref": "persisted-child-run",
+    });
+    response.flushHeaders();
+    setTimeout(() => response.end(JSON.stringify({ output: { summary: "complete" } })), 20);
+  });
+  const observed: string[] = [];
+  try {
+    const result = await postNestedAgentRequest<{ output: { summary: string } }>({
+      url: endpoint.url,
+      token: "test-token",
+      body: { task: "identity-bound review" },
+      onSessionRef: (sessionRef) => observed.push(sessionRef),
+    });
+    assert.deepEqual(observed, ["persisted-child-run"]);
+    assert.deepEqual(result.payload.output, { summary: "complete" });
+  } finally {
+    await endpoint.close();
+  }
+});
+
 test("nested reviewer transport rejects non-loopback bridge destinations", async () => {
   await assert.rejects(
     postNestedAgentRequest({ url: "http://attacker.example/v1/run", token: "test-token", body: {} }),
@@ -268,9 +292,14 @@ test("nested terminal failure carries the persisted child session identity", asy
 
 test("closing the runtime cancels and awaits an active nested reviewer", async () => {
   let requests = 0;
-  const endpoint = await listen((request) => {
+  const endpoint = await listen((request, response) => {
     requests += 1;
     request.resume();
+    response.writeHead(200, {
+      "content-type": "application/json",
+      "x-forgedock-nested-session-ref": "nested-active-child",
+    });
+    response.flushHeaders();
   });
   const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
   const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
@@ -280,14 +309,18 @@ test("closing the runtime cancels and awaits an active nested reviewer", async (
   const events: AgentEvent[] = [];
   try {
     const pending = runtime.run(taskForRole("reviewer") as any, { onEvent: (event) => events.push(event) });
-    for (let attempt = 0; attempt < 100 && requests === 0; attempt++) await new Promise((resolve) => setTimeout(resolve, 2));
+    for (let attempt = 0; attempt < 100
+      && !events.some((event) => event.type === "session.started" && event.sessionRef === "nested-active-child"); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
     assert.equal(requests, 1);
+    assert.ok(events.some((event) => event.type === "session.started" && event.sessionRef === "nested-active-child"));
     const closing = runtime.close();
     await assert.rejects(pending, /Pi runtime closed|aborted/i);
     await closing;
     const terminals = events.filter((event) => event.type === "session.cancelled");
     assert.equal(terminals.length, 1);
-    assert.match(terminals[0]?.sessionRef ?? "", /^nested_pending_/);
+    assert.equal(terminals[0]?.sessionRef, "nested-active-child");
   } finally {
     restoreNestedEnvironment(previousUrl, previousToken);
     await endpoint.close();

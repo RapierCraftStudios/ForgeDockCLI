@@ -23,6 +23,8 @@ export interface FindingPolicyContext {
 
 interface SourceFinding {
   role: ReviewerRole;
+  executionGroupId?: string;
+  scope?: readonly string[];
   sessionRefs: readonly string[];
   finding: Finding;
 }
@@ -38,7 +40,7 @@ const STOP_WORDS = new Set([
 
 /** Normalize/deduplicate proposals by causal root before any blocking or scope policy. */
 export function consolidateReviewerFindings(
-  results: readonly { role: ReviewerRole; output: ReviewerSubmission; sessionRef?: string; sessionLineage?: readonly string[] }[],
+  results: readonly { role: ReviewerRole; executionGroupId?: string; scope?: readonly string[]; output: ReviewerSubmission; sessionRef?: string; sessionLineage?: readonly string[] }[],
   blockingSeverities: ReadonlySet<Finding["severity"]>,
   policy: FindingPolicyContext = { reviewedPaths: [], expectedPaths: [] },
 ): ConsolidatedFinding[] {
@@ -47,6 +49,8 @@ export function consolidateReviewerFindings(
     for (const finding of result.output.findings) {
       const source: SourceFinding = {
         role: result.role,
+        ...(result.executionGroupId !== undefined ? { executionGroupId: result.executionGroupId } : {}),
+        ...(result.scope !== undefined ? { scope: result.scope } : {}),
         sessionRefs: result.sessionLineage ?? (result.sessionRef ? [result.sessionRef] : []),
         finding,
       };
@@ -137,7 +141,9 @@ function consolidateCluster(
   const attestationSet = new Set(attestations);
   const orderedAttestations = cluster.sources.filter((source) => attestationSet.has(source));
   const reviewerRoles = unique(orderedAttestations.map((source) => source.role));
-  const sourceFindingIds = unique(orderedAttestations.map((source) => `${source.role}:${source.finding.id}`));
+  const sourceFindingIds = unique(orderedAttestations.map((source) => source.executionGroupId?.includes("-part-")
+    ? `${source.role}:${source.executionGroupId}:${source.finding.id}`
+    : `${source.role}:${source.finding.id}`));
   const sourceSessionRefs = unique(orderedAttestations.flatMap((source) => source.sessionRefs));
   const matchedAcceptanceCriteria = unique(representative.finding.matchedAcceptanceCriteria);
   const matchedPriorFindingIds = unique(representative.finding.matchedPriorFindingIds);
@@ -162,7 +168,7 @@ function consolidateCluster(
     ...(sourceSessionRefs.length ? { sourceSessionRefs } : {}),
     reviewerRoles,
   };
-  result.blocking = evaluateFindingBlockingPolicy(result, blockingSeverities, policy);
+  result.blocking = qualifying.length > 0 && evaluateFindingBlockingPolicy(result, blockingSeverities, policy);
   return result;
 }
 
@@ -179,12 +185,15 @@ function sourceAttestationQualifies(
   policy: FindingPolicyContext,
 ): boolean {
   const finding = source.finding;
+  const scopedPolicy = source.scope
+    ? { ...policy, reviewedPaths: source.scope, expectedPaths: source.scope }
+    : policy;
   return Boolean(finding.causalRoot?.trim())
     && finding.scopeDisposition === "in_scope"
     && finding.confidence === "high"
     && finding.severity !== "low"
     && blockingSeverities.has(finding.severity)
-    && validatedAnchor(finding, policy) !== undefined;
+    && validatedAnchor(finding, scopedPolicy) !== undefined;
 }
 
 function validatedAnchor(

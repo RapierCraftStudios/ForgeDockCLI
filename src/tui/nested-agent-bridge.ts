@@ -34,6 +34,8 @@ interface NestedAgentRequest {
   scope: ScopeManifest;
   scopeDigest: string;
   tools: ToolGrant[];
+  turnBudget?: number;
+  toolBudget?: number;
   outputSchema: Record<string, unknown>;
   provider: string;
   model: string;
@@ -101,9 +103,17 @@ async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingM
     if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
     if (request.headers.authorization !== `Bearer ${token}`) return send(response, 401, { error: "Unauthorized" });
     const payload = validateRequest(JSON.parse(await readBody(request)) as unknown);
+    const announceSession = (sessionRef: string): void => {
+      if (response.headersSent || !sessionRef || sessionRef.length > 256 || /[\r\n]/.test(sessionRef)) return;
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "x-forgedock-nested-session-ref": sessionRef,
+      });
+      response.flushHeaders();
+    };
     const result = payload.resumeSessionRef
-      ? await resumeDelegation(pi, payload, signal)
-      : await delegate(pi, payload, signal);
+      ? await resumeDelegation(pi, payload, signal, announceSession)
+      : await delegate(pi, payload, signal, announceSession);
     send(response, 200, result);
   } catch (error) {
     send(response, 500, {
@@ -114,7 +124,12 @@ async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingM
   }
 }
 
-function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSignal): Promise<NestedAgentResponse> {
+function delegate(
+  pi: ExtensionAPI,
+  input: NestedAgentRequest,
+  signal: AbortSignal,
+  onSessionRef?: (sessionRef: string) => void,
+): Promise<NestedAgentResponse> {
   const requestId = crypto.randomUUID();
   const request: SubagentDelegationV2Request = {
     version: 2,
@@ -127,6 +142,8 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
     cwd: input.cwd,
     model: `${input.provider}/${input.model}`,
     thinking: input.thinking ?? "high",
+    ...(input.turnBudget !== undefined ? { turnBudget: { maxTurns: input.turnBudget, graceTurns: 2 } } : {}),
+    ...(input.toolBudget !== undefined ? { toolBudget: { hard: input.toolBudget } } : {}),
     artifacts: true,
     result: { kind: "structured", schema: input.outputSchema },
   };
@@ -146,6 +163,7 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
       const value = raw as SubagentDelegationV2Update;
       if (value.version === 2 && value.requestId === requestId && value.ownerRunId === input.ownerRunId && value.nodeId === input.id && value.runId) {
         observedRunId = value.runId;
+        onSessionRef?.(value.runId);
       }
     });
     const unsubscribeResponse = pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (raw) => {
@@ -155,6 +173,7 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
       const terminalResult = "result" in value ? value.result : undefined;
       const terminalModel = "model" in value ? value.model : undefined;
       const sessionRef = terminalRunId ?? observedRunId ?? `nested_${requestId}`;
+      if (terminalRunId) onSessionRef?.(terminalRunId);
       // structured_output is schema validated by pi-subagents. Preserve it even
       // when a trailing provider transport failure changes the terminal status.
       if (terminalResult?.kind === "structured") {
@@ -188,7 +207,12 @@ function delegate(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSign
   });
 }
 
-async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, signal: AbortSignal): Promise<NestedAgentResponse> {
+async function resumeDelegation(
+  pi: ExtensionAPI,
+  input: NestedAgentRequest,
+  signal: AbortSignal,
+  onSessionRef?: (sessionRef: string) => void,
+): Promise<NestedAgentResponse> {
   const sourceSessionRef = input.resumeSessionRef!;
   const bufferedCompletions: unknown[] = [];
   let targetRunId: string | undefined;
@@ -218,6 +242,7 @@ async function resumeDelegation(pi: ExtensionAPI, input: NestedAgentRequest, sig
     }
     targetRunId = resumedRunId(reply.data);
     if (!targetRunId) throw new NestedDelegationError("Nested reviewer resume did not return a revived run id", sourceSessionRef, false);
+    onSessionRef?.(targetRunId);
     const buffered = bufferedCompletions.find((candidate) => completionRunId(candidate) === targetRunId);
     const completion = buffered ?? await new Promise<unknown>((resolve, reject) => {
       const abort = () => {
@@ -391,7 +416,7 @@ function validateRequest(value: unknown): NestedAgentRequest {
   const input = value as Partial<NestedAgentRequest>;
   const supported = new Set([
     "ownerRunId", "id", "logicalTaskId", "role", "description", "objective", "instructions", "context", "cwd",
-    "scopeVersion", "scope", "scopeDigest", "tools", "outputSchema", "provider", "model", "thinking", "resumeSessionRef",
+    "scopeVersion", "scope", "scopeDigest", "tools", "turnBudget", "toolBudget", "outputSchema", "provider", "model", "thinking", "resumeSessionRef",
   ]);
   const unsupported = Object.keys(input).find((key) => !supported.has(key));
   if (unsupported) throw new Error(`Nested request field is not supported: ${unsupported}`);
@@ -403,6 +428,12 @@ function validateRequest(value: unknown): NestedAgentRequest {
     throw new Error("Nested request logicalTaskId is invalid");
   }
   if (!Array.isArray(input.context) || !Array.isArray(input.tools)) throw new Error("Nested request context and tools must be arrays");
+  for (const key of ["turnBudget", "toolBudget"] as const) {
+    const budget = input[key];
+    if (budget !== undefined && (!Number.isSafeInteger(budget) || budget < 1 || budget > 1_000)) {
+      throw new Error(`Nested request ${key} must be an integer from 1 to 1000`);
+    }
+  }
   if (!input.outputSchema || typeof input.outputSchema !== "object" || Array.isArray(input.outputSchema)) throw new Error("Nested request outputSchema is required");
   if (input.description !== undefined && (typeof input.description !== "string" || !input.description.trim() || input.description.length > 2048 || /[\r\n]/.test(input.description))) {
     throw new Error("Nested request description is invalid");
@@ -437,7 +468,6 @@ function readBody(request: IncomingMessage): Promise<string> {
 }
 
 function send(response: ServerResponse, status: number, value: unknown): void {
-  if (response.headersSent) return;
-  response.writeHead(status, { "content-type": "application/json" });
+  if (!response.headersSent) response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify(value));
 }
