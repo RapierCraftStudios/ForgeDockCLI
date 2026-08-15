@@ -179,6 +179,46 @@ test("incomplete persisted reviewers are resumed through the package-owned RPC l
   }
 });
 
+test("a resumed reviewer may recover an exact schema-valid terminal JSON report", async () => {
+  const events = new FakeEvents();
+  events.autoRespondRpc = false;
+  const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
+  try {
+    const pending = fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+      method: "POST",
+      headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        ownerRunId: "run-terminal-json", id: "run-terminal-json:review:abc:security:resume", role: "reviewer",
+        objective: "Resume", instructions: "Read only", context: [], cwd: process.cwd(), tools: ["read"],
+        ...REVIEWER_SCOPE,
+        outputSchema: {
+          type: "object", additionalProperties: false, required: ["summary", "findings"],
+          properties: { summary: { type: "string", minLength: 1 }, findings: { type: "array" } },
+        },
+        provider: "openai-codex", model: "gpt-test", resumeSessionRef: "source-terminal-json",
+      }),
+    });
+    while (events.rpcRequests.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    const request = events.rpcRequests[0];
+    events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+      version: 1, requestId: request.requestId, method: "resume", success: true,
+      data: { details: { asyncId: "resumed-terminal-json" } },
+    });
+    events.emit("subagent:async-complete", {
+      runId: "resumed-terminal-json", success: false, state: "failed",
+      results: [{
+        success: false, status: "failed", model: "gpt-test", error: "structured_output was not called",
+        finalOutput: JSON.stringify({ summary: "Recovered exact report", findings: [] }),
+      }],
+    });
+    const response = await pending;
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json() as any).output, { summary: "Recovered exact report", findings: [] });
+  } finally {
+    await bridge.close();
+  }
+});
+
 test("schema-valid output from a resumed reviewer survives a trailing failed status", async () => {
   const events = new FakeEvents();
   events.autoRespondRpc = false;

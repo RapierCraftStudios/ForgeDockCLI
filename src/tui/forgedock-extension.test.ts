@@ -1070,6 +1070,7 @@ test("native orchestrate prompts always perform LLM intent routing", () => {
   assert.doesNotMatch(prompt, /Hard-coded fast paths|concrete list written in prose|issues-page anchor/);
   assert.match(prompt, /Never invoke forgedock-next, dist\/cli\/main\.js, or another lifecycle controller through bash\/shell/);
   assert.match(buildNativeCommandPrompt("work-on", "6 --resume"), /Never invoke the lifecycle CLI through bash\/shell or add a wall-clock timeout/);
+  assert.match(buildNativeCommandPrompt("review-pr", "6"), /completion notification is one internal review shard, not the parent review verdict/);
   assert.doesNotMatch(prompt, /No deterministic orchestration binding|invoke \/orchestrate again with exact/);
 });
 

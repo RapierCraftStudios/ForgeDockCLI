@@ -4,6 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SubagentDelegationV2Request, SubagentDelegationV2Response, SubagentDelegationV2Update } from "pi-subagents/delegation";
+import type { TSchema } from "typebox";
+import { Check } from "typebox/value";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import { validateScopeManifestReceipt, type AgentRole, type ScopeManifest, type ToolGrant } from "../runtime/agent-runtime.js";
 
@@ -279,7 +281,10 @@ async function resumeDelegation(
     });
     const record = asRecord(completion);
     const child = Array.isArray(record?.results) ? asRecord(record.results[0]) : undefined;
-    const output = child?.structuredOutput ?? record?.structuredOutput;
+    const output = child?.structuredOutput
+      ?? record?.structuredOutput
+      ?? recoverTerminalStructuredOutput(input.outputSchema, child?.finalOutput)
+      ?? recoverTerminalStructuredOutput(input.outputSchema, record?.finalOutput);
     const sessionRef = completionRunId(completion) ?? targetRunId;
     // As with fresh delegation, structured_output precedes transport teardown.
     // Preserve it even if the resumed run's trailing terminal status is failed.
@@ -300,6 +305,16 @@ async function resumeDelegation(
     };
   } finally {
     if (typeof unsubscribeCompletion === "function") unsubscribeCompletion();
+  }
+}
+
+function recoverTerminalStructuredOutput(schema: Record<string, unknown>, value: unknown): unknown | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value.trim()) as unknown;
+    return Check(schema as TSchema, parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
   }
 }
 

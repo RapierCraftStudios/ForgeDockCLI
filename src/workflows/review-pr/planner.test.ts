@@ -167,7 +167,6 @@ describe("evidence-backed review planning", () => {
       "maxSpecialistExecutionGroups",
       "maxLogicalReviewerSessions",
       "maxParallelSessions",
-      "maxToolCallsPerExecutionGroup",
       "maxAttemptsPerExecutionGroup",
       "maxReviewerAttempts",
       "maxScopeAdjudicationAttempts",

@@ -45,7 +45,8 @@ export interface ReviewBudget {
   maxParallelSessions: number;
   /** Legacy review-plan field. New reviews have no assistant-turn cutoff. */
   maxTurnsPerExecutionGroup?: number;
-  maxToolCallsPerExecutionGroup: number;
+  /** Legacy review-plan field. New reviews rely on scoped read-only tools and explicit cancellation. */
+  maxToolCallsPerExecutionGroup?: number;
   maxAttemptsPerExecutionGroup: 2;
   maxReviewerAttempts: number;
   maxScopeAdjudicationAttempts: number;
@@ -248,7 +249,6 @@ export function planReviewPanel(input: {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
     maxParallelSessions: Math.min(MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions),
-    maxToolCallsPerExecutionGroup: 64,
     maxAttemptsPerExecutionGroup: 2,
     maxReviewerAttempts: 2 * maxLogicalReviewerSessions,
     maxScopeAdjudicationAttempts: 2,
@@ -316,7 +316,6 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     budget.maxSpecialistExecutionGroups,
     budget.maxLogicalReviewerSessions,
     budget.maxParallelSessions,
-    budget.maxToolCallsPerExecutionGroup,
     budget.maxAttemptsPerExecutionGroup,
     budget.maxReviewerAttempts,
     budget.maxScopeAdjudicationAttempts,
@@ -350,8 +349,8 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     || budget.maxParallelSessions! > budget.maxLogicalReviewerSessions!
     || (budget.maxTurnsPerExecutionGroup !== undefined
       && (budget.maxTurnsPerExecutionGroup < 1 || budget.maxTurnsPerExecutionGroup > 24))
-    || budget.maxToolCallsPerExecutionGroup! < 1
-    || budget.maxToolCallsPerExecutionGroup! > 64
+    || (budget.maxToolCallsPerExecutionGroup !== undefined
+      && (budget.maxToolCallsPerExecutionGroup < 1 || budget.maxToolCallsPerExecutionGroup > 64))
     || budget.maxAttemptsPerExecutionGroup !== 2
     || budget.maxReviewerAttempts! < budget.maxLogicalReviewerSessions!
     || budget.maxReviewerAttempts! > budget.maxLogicalReviewerSessions! * budget.maxAttemptsPerExecutionGroup

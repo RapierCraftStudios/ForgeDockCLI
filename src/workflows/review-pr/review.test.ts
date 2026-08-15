@@ -158,7 +158,7 @@ describe("fresh-context PR review", () => {
     assert.deepEqual([...new Set(result.reviewPlan.executionGroups.map(({ role }) => role))], ["correctness", "concurrency"]);
     assert.ok(result.reviewPlan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
     assert.ok(tasks.every((task) => task.context.length === 0));
-    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === undefined && task.executionBudget?.maxToolCalls === 64));
+    assert.ok(tasks.every((task) => task.executionBudget === undefined));
     assert.ok(tasks.every((task) => task.objective.length < 60_000));
     assert.ok(tasks.every((task) => task.objective.includes('"totalExpectedPaths": 55')));
     assert.ok(tasks.every((task) => !task.objective.includes('"expectedPaths"')));
@@ -1090,6 +1090,7 @@ describe("fresh-context PR review", () => {
   });
 
   it("validates reviewer attempt timeout overrides", () => {
+    assert.equal(resolveReviewerAttemptTimeoutMs(), undefined);
     assert.equal(resolveReviewerAttemptTimeoutMs(25), 25);
     assert.throws(() => resolveReviewerAttemptTimeoutMs(0), /must be an integer/);
     assert.throws(() => resolveReviewerAttemptTimeoutMs(Number.MAX_SAFE_INTEGER), /must be an integer/);

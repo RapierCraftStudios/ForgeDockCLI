@@ -53,7 +53,6 @@ export interface DeploymentReviewEvidence {
   checks: ReviewChecks;
 }
 
-export const DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS = 15_000;
 const MIN_REVIEWER_ATTEMPT_DRAIN_MS = 100;
@@ -92,10 +91,10 @@ export class ReviewerAttemptTimeoutError extends AgentRunError {
   }
 }
 
-export function resolveReviewerAttemptTimeoutMs(explicit?: number): number {
-  const configured = explicit ?? (process.env.FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS !== undefined
-    ? Number(process.env.FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS)
-    : DEFAULT_REVIEWER_ATTEMPT_TIMEOUT_MS);
+export function resolveReviewerAttemptTimeoutMs(explicit?: number): number | undefined {
+  const environment = process.env.FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS;
+  if (explicit === undefined && environment === undefined) return undefined;
+  const configured = explicit ?? Number(environment);
   if (!Number.isInteger(configured) || configured < 1 || configured > MAX_REVIEWER_ATTEMPT_TIMEOUT_MS) {
     throw new Error(`FORGEDOCK_REVIEW_ATTEMPT_TIMEOUT_MS must be an integer from 1 to ${MAX_REVIEWER_ATTEMPT_TIMEOUT_MS}`);
   }
@@ -106,7 +105,7 @@ async function withReviewerAttemptTimeout<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   input: {
     externalSignal?: AbortSignal;
-    timeoutMs: number;
+    timeoutMs?: number;
     taskId: string;
     sessionRef?: string;
     getSessionRef?: () => string | undefined;
@@ -131,16 +130,22 @@ async function withReviewerAttemptTimeout<T>(
         (value) => ({ status: "fulfilled" as const, value }),
         (reason: unknown) => ({ status: "rejected" as const, reason }),
       );
+    if (input.timeoutMs === undefined) {
+      const settlement = await operationResult;
+      if (settlement.status === "fulfilled") return settlement.value;
+      throw settlement.reason;
+    }
+    const timeoutMs = input.timeoutMs;
     const timeoutResult = new Promise<{ status: "timed-out" }>((resolve) => {
       timer = setTimeout(() => {
         timeoutError = new ReviewerAttemptTimeoutError(
           input.taskId,
-          input.timeoutMs,
+          timeoutMs,
           input.getSessionRef?.() ?? input.sessionRef,
         );
         controller.abort(timeoutError);
         resolve({ status: "timed-out" });
-      }, input.timeoutMs);
+      }, timeoutMs);
     });
     const first = await Promise.race([operationResult, timeoutResult]);
     if (first.status === "fulfilled") return first.value;
@@ -150,7 +155,7 @@ async function withReviewerAttemptTimeout<T>(
     // attempt stopped. Reconcile the same in-flight operation before deciding
     // whether a retry is safe. A successful late submission still belongs to
     // this frozen task/head/plan and remains authoritative.
-    const drainMs = reviewerAttemptDrainMs(input.timeoutMs);
+    const drainMs = reviewerAttemptDrainMs(timeoutMs);
     const drainExpired = new Promise<{ status: "drain-expired" }>((resolve) => {
       drainTimer = setTimeout(() => resolve({ status: "drain-expired" }), drainMs);
     });
@@ -160,7 +165,7 @@ async function withReviewerAttemptTimeout<T>(
       const sessionRef = drained.reason instanceof AgentRunError
         ? drained.reason.sessionRef ?? input.getSessionRef?.() ?? input.sessionRef
         : input.getSessionRef?.() ?? input.sessionRef;
-      throw new ReviewerAttemptTimeoutError(input.taskId, input.timeoutMs, sessionRef, {
+      throw new ReviewerAttemptTimeoutError(input.taskId, timeoutMs, sessionRef, {
         // A provider may surface a terminal, explicitly non-resumable failure
         // only after processing the abort request. Do not turn that failure
         // into resume authority merely because it arrived during the drain.
@@ -179,7 +184,7 @@ async function withReviewerAttemptTimeout<T>(
     }).catch(() => undefined);
     throw new ReviewerAttemptTimeoutError(
       input.taskId,
-      input.timeoutMs,
+      timeoutMs,
       input.getSessionRef?.() ?? input.sessionRef,
       { drainExpired: true, drainMs },
     );
@@ -439,9 +444,9 @@ export async function reviewPullRequest(
               }),
             },
             tools: ["read", "grep", "find", "ls"],
-            executionBudget: {
-              maxToolCalls: reviewPlan.budget.maxToolCallsPerExecutionGroup,
-            },
+            ...(reviewPlan.budget.maxToolCallsPerExecutionGroup !== undefined ? {
+              executionBudget: { maxToolCalls: reviewPlan.budget.maxToolCallsPerExecutionGroup },
+            } : {}),
             outputSchema: ReviewerSubmissionSchema,
             modelPolicy: {
               ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -471,7 +476,7 @@ export async function reviewPullRequest(
             },
             {
               ...(input.signal !== undefined ? { externalSignal: input.signal } : {}),
-              timeoutMs: reviewerAttemptTimeoutMs,
+              ...(reviewerAttemptTimeoutMs !== undefined ? { timeoutMs: reviewerAttemptTimeoutMs } : {}),
               taskId,
               ...(shouldResume && resumeSessionRef !== undefined ? { sessionRef: resumeSessionRef } : {}),
               getSessionRef: () => observedSessionRef,
@@ -616,7 +621,7 @@ export async function reviewPullRequest(
         ...(input.priorVerdict ? { priorVerdict: input.priorVerdict } : {}),
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
-        reviewerAttemptTimeoutMs,
+        ...(reviewerAttemptTimeoutMs !== undefined ? { reviewerAttemptTimeoutMs } : {}),
         maxAttempts: reviewPlan.budget.maxScopeAdjudicationAttempts,
         claimModelCall,
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -870,7 +875,7 @@ async function adjudicateFindingScope(
     reviewPlanId: string;
     provider?: string;
     model?: string;
-    reviewerAttemptTimeoutMs: number;
+    reviewerAttemptTimeoutMs?: number;
     maxAttempts: number;
     claimModelCall: (purpose: string) => void;
     signal?: AbortSignal;
@@ -947,7 +952,7 @@ async function adjudicateFindingScope(
         }),
         {
           ...(input.signal !== undefined ? { externalSignal: input.signal } : {}),
-          timeoutMs: input.reviewerAttemptTimeoutMs,
+          ...(input.reviewerAttemptTimeoutMs !== undefined ? { timeoutMs: input.reviewerAttemptTimeoutMs } : {}),
           taskId: task.id,
           getSessionRef: () => observedSessionRef,
           onDrainExpired: () => { drainExpired = true; },

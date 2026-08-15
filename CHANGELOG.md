@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Reviewer shards now run without default wall-clock or tool-call cutoffs, preserve explicit opt-in timeout compatibility, recover schema-valid terminal JSON from a resumed child, and prevent shard completion notices from being presented as the parent review verdict.
 - Large durable review verdicts now use a backwards-compatible compressed artifact marker and byte-bounded human projection, preventing GitHub HTTP 422 failures without splitting one verdict across noisy comments or losing machine-readable evidence.
 - Large pull-request planning now balances diff weight across the minimum path-bounded reviewer groups instead of treating the already-bounded initial diff size as a reason to manufacture duplicate sessions and exceed the review-plan ceiling.
 - Standalone review no longer treats conditionally skipped or neutral GitHub Actions jobs as unavailable failures when a repository has no explicit branch-protection check set and ForgeDock falls back to observing all PR checks.
