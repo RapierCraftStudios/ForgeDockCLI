@@ -31,7 +31,7 @@ export function createPlanMaterializationRequest(
 	repo: string,
 	packet: PlanningPacket,
 ): PlanMaterializationRequest {
-	assertHandoffReady(packet);
+	assertConfirmedForMaterialization(packet);
 	const normalizedRepo = repo.trim();
 	if (!normalizedRepo) throw new Error("Plan handoff requires a repository");
 
@@ -121,7 +121,7 @@ export function materializedPlanToScheduledWorkItems(
 	packet: PlanningPacket,
 	materialization: PlanMaterializationResult,
 ): ScheduledWorkItem[] {
-	assertHandoffReady(packet);
+	assertRecoverableHandoff(packet);
 	const mapped = assertMaterializationMatchesPacket(packet, materialization);
 	const items = topologicallyOrderPlanningNodes(packet.nodes).map((node) => {
 		const result = mapped.get(node.id)!;
@@ -156,13 +156,27 @@ export function planNodeWorkItemId(
 	return `plan/${encodeURIComponent(planId)}/revision/${revision}/node/${encodeURIComponent(nodeId)}`;
 }
 
-function assertHandoffReady(packet: PlanningPacket): void {
+function assertConfirmedForMaterialization(packet: PlanningPacket): void {
 	assertPlanningPacket(packet);
 	if (packet.status !== "confirmed") {
 		throw new Error(
 			`Plan handoff requires a confirmed packet; received ${packet.status}`,
 		);
 	}
+	assertNoOpenQuestions(packet);
+}
+
+function assertRecoverableHandoff(packet: PlanningPacket): void {
+	assertPlanningPacket(packet);
+	if (packet.status !== "confirmed" && packet.status !== "handed-off") {
+		throw new Error(
+			`Plan handoff recovery requires a confirmed or handed-off packet; received ${packet.status}`,
+		);
+	}
+	assertNoOpenQuestions(packet);
+}
+
+function assertNoOpenQuestions(packet: PlanningPacket): void {
 	if (packet.openQuestions.length) {
 		throw new Error(
 			`Plan handoff requires all open questions to be resolved: ${packet.openQuestions.join(", ")}`,
