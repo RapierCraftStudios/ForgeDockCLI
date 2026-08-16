@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
@@ -10,6 +10,7 @@ import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import { bootstrapLocalLeaseWitness, createConfiguredLeaseWitness, createSignedLeaseCheckpoint } from "./lease-witness.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
 describe("SQLite operational repositories", () => {
@@ -198,6 +199,183 @@ describe("SQLite operational repositories", () => {
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
     } finally {
       store.close();
+    }
+  });
+
+  it("bootstraps an authenticated epoch-zero witness for the first file-backed lease", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-bootstrap-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let store: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      const initial = witness.verify();
+      assert.equal(initial.state, "verified");
+      if (initial.state !== "verified") throw new Error("expected the local checkpoint to verify");
+      assert.equal(initial.epoch, 0);
+      assert.equal(initial.checkpoint?.keyId, bootstrap.keyId);
+      assert.ok(initial.checkpoint?.signature);
+      assert.equal((JSON.parse(readFileSync(bootstrap.checkpointPath, "utf8")) as { epoch: number }).epoch, 0);
+
+      store = new SqliteRepositories(databasePath, { witness });
+      const empty = store.continuity();
+      assert.equal(empty.state, "verified");
+      assert.equal(empty.epoch, 0);
+      const first = store.acquire("issue-bootstrap", "worker-a", 100, 1_000);
+      assert.ok(first);
+      assert.equal(first.epoch, 1);
+      assert.equal(first.continuity, "verified");
+      assert.equal(store.continuity().epoch, 1);
+    } finally {
+      store?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("does not adopt a rolled-back file checkpoint after lease history exists", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-rollback-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let store: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const privateKey = readFileSync(bootstrap.privateKeyPath, "utf8");
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      store = new SqliteRepositories(databasePath, { witness });
+      const first = store.acquire("issue-file-rollback", "worker-a", 100, 1_000);
+      assert.ok(first);
+      const staleGuard = store.guard("issue-file-rollback", first.token);
+
+      writeFileSync(bootstrap.checkpointPath, JSON.stringify(createSignedLeaseCheckpoint(0, privateKey, bootstrap.keyId)));
+      assert.throws(() => store!.heartbeat("issue-file-rollback", first.token, 100, 1_010), /continuity|backwards|unverifiable/i);
+      assert.throws(() => store!.release("issue-file-rollback", first.token), /continuity|backwards|unverifiable/i);
+      assert.throws(() => staleGuard.assertValid(), /continuity|backwards|unverifiable/i);
+      assert.throws(() => store!.acquire("issue-file-rollback", "worker-b", 100, 2_000), /continuity|backwards|unverifiable/i);
+
+      store!.reEnroll(createSignedLeaseCheckpoint(10, privateKey, bootstrap.keyId));
+      assert.equal(store!.continuity().state, "verified");
+      assert.equal(store!.continuity().epoch, 10);
+      assert.throws(() => store!.heartbeat("issue-file-rollback", first.token, 100, 2_010), /re-enrollment|predates/i);
+      assert.throws(() => store!.release("issue-file-rollback", first.token), /re-enrollment|predates/i);
+      assert.throws(() => staleGuard.assertValid(), /re-enrollment|predates/i);
+      const recovered = store!.acquire("issue-file-rollback", "worker-b", 100, 2_000);
+      assert.ok(recovered);
+      assert.equal(recovered.epoch, 11);
+      assert.notEqual(recovered.token, first.token);
+    } finally {
+      store?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("rejects a higher checkpoint in a historical store until explicit re-enrollment", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-higher-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let store: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const privateKey = readFileSync(bootstrap.privateKeyPath, "utf8");
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      store = new SqliteRepositories(databasePath, { witness });
+      const first = store.acquire("issue-file-higher", "worker-a", 100, 1_000);
+      assert.ok(first);
+      const staleGuard = store.guard("issue-file-higher", first.token);
+
+      writeFileSync(bootstrap.checkpointPath, JSON.stringify(createSignedLeaseCheckpoint(5, privateKey, bootstrap.keyId)));
+      assert.throws(() => store!.acquire("issue-file-higher", "worker-b", 100, 2_000), /diverge|continuity|unverifiable/i);
+      assert.throws(() => store!.heartbeat("issue-file-higher", first.token, 100, 2_010), /continuity|diverge|unverifiable/i);
+      assert.throws(() => store!.release("issue-file-higher", first.token), /continuity|diverge|unverifiable/i);
+      assert.throws(() => staleGuard.assertValid(), /continuity|diverge|unverifiable/i);
+
+      store!.reEnroll(createSignedLeaseCheckpoint(10, privateKey, bootstrap.keyId));
+      const recovered = store!.acquire("issue-file-higher", "worker-b", 100, 2_000);
+      assert.ok(recovered);
+      assert.equal(recovered.epoch, 11);
+      assert.notEqual(recovered.token, first.token);
+    } finally {
+      store?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("latches a historical store closed on an invalid checkpoint", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-tampered-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let store: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const privateKey = readFileSync(bootstrap.privateKeyPath, "utf8");
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      store = new SqliteRepositories(databasePath, { witness });
+      const first = store.acquire("issue-file-tampered", "worker-a", 100, 1_000);
+      assert.ok(first);
+      const staleGuard = store.guard("issue-file-tampered", first.token);
+
+      const tampered = createSignedLeaseCheckpoint(1, privateKey, bootstrap.keyId);
+      tampered.signature = `${tampered.signature}tampered`;
+      writeFileSync(bootstrap.checkpointPath, JSON.stringify(tampered));
+      assert.throws(() => store!.heartbeat("issue-file-tampered", first.token, 100, 1_010), /invalid|continuity|unverifiable/i);
+      assert.throws(() => store!.release("issue-file-tampered", first.token), /invalid|continuity|unverifiable/i);
+      assert.throws(() => staleGuard.assertValid(), /invalid|continuity|unverifiable/i);
+      assert.throws(() => store!.acquire("issue-file-tampered", "worker-b", 100, 2_000), /invalid|continuity|unverifiable/i);
+
+      store!.reEnroll(createSignedLeaseCheckpoint(10, privateKey, bootstrap.keyId));
+      const recovered = store!.acquire("issue-file-tampered", "worker-b", 100, 2_000);
+      assert.ok(recovered);
+      assert.equal(recovered.epoch, 11);
+      assert.notEqual(recovered.token, first.token);
+    } finally {
+      store?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("reopens a file-backed local witness without reusing an expiry epoch", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-local-restart-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let firstStore: SqliteRepositories | undefined;
+    let restarted: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const firstWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(firstWitness);
+      firstStore = new SqliteRepositories(databasePath, { witness: firstWitness });
+      const first = firstStore.acquire("issue-local-restart", "worker-a", 100, 1_000);
+      assert.ok(first);
+      firstStore.close();
+      firstStore = undefined;
+
+      const restartedWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(restartedWitness);
+      restarted = new SqliteRepositories(databasePath, { witness: restartedWitness });
+      assert.equal(restarted.continuity().epoch, first.epoch);
+      assert.equal(restarted.acquire("issue-local-restart", "worker-b", 100, 1_050), undefined);
+      const recovered = restarted.acquire("issue-local-restart", "worker-b", 100, 1_101);
+      assert.ok(recovered);
+      assert.equal(recovered.epoch, first.epoch + 1);
+      assert.notEqual(recovered.token, first.token);
+    } finally {
+      firstStore?.close();
+      restarted?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
     }
   });
 

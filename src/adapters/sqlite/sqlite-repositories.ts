@@ -15,6 +15,7 @@ import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 
 const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
+const EMPTY_LEASE_EPOCH = 0;
 
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
@@ -77,7 +78,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         max_epoch INTEGER NOT NULL
       );
-      INSERT INTO lease_state (singleton, max_epoch) VALUES (1, 0) ON CONFLICT(singleton) DO NOTHING;
+      INSERT INTO lease_state (singleton, max_epoch) VALUES (1, ${EMPTY_LEASE_EPOCH}) ON CONFLICT(singleton) DO NOTHING;
       CREATE TABLE IF NOT EXISTS run_telemetry (
         telemetry_key TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -415,11 +416,24 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   #localMaximum(): number {
-    return Number((this.#database.prepare("SELECT max_epoch FROM lease_state WHERE singleton = 1").get() as { max_epoch: number } | undefined)?.max_epoch ?? 0);
+    const row = this.#database.prepare("SELECT max_epoch FROM lease_state WHERE singleton = 1").get() as { max_epoch: number } | undefined;
+    if (!row) this.#failLease("local lease epoch state is missing");
+    const epoch = Number(row.max_epoch);
+    if (!Number.isSafeInteger(epoch) || epoch < EMPTY_LEASE_EPOCH) this.#failLease("local lease epoch state is invalid");
+    return epoch;
   }
   #acceptWitness(snapshot: LeaseWitnessSnapshot): void {
-    if (snapshot.state !== "verified" || !Number.isSafeInteger(snapshot.epoch) || snapshot.epoch < 0 || snapshot.epoch < this.#localMaximum()) this.#failLease(snapshot.reason ?? "retained witness rolled back or failed verification");
-    this.#database.prepare("UPDATE lease_state SET max_epoch = ? WHERE singleton = 1").run(snapshot.epoch);
+    const localMaximum = this.#localMaximum();
+    if (snapshot.state !== "verified" || !Number.isSafeInteger(snapshot.epoch) || snapshot.epoch < EMPTY_LEASE_EPOCH || snapshot.epoch < localMaximum) {
+      this.#failLease(snapshot.reason ?? "retained witness rolled back or failed verification");
+    }
+    // A continuity read can race another repository's committed advancement.
+    // Never let that stale read overwrite a newer durable fencing epoch.
+    const result = this.#database.prepare(`
+      UPDATE lease_state SET max_epoch = ?
+      WHERE singleton = 1 AND max_epoch <= ?
+    `).run(snapshot.epoch, snapshot.epoch);
+    if (result.changes !== 1) this.#failLease("local lease epoch changed while accepting the retained witness");
   }
   #failLease(reason: string): never {
     this.#leaseFailure = reason;

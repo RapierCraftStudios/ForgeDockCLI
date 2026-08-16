@@ -191,8 +191,15 @@ export function bootstrapLocalLeaseWitness(
       privateKey,
       keyId: paths.keyId,
     });
-    witness.reEnroll(createSignedLeaseCheckpoint(1, privateKey, paths.keyId));
-    if (witness.verify().state !== "verified") throw new LeaseContinuityError("newly seeded local witness could not be verified");
+    // An empty SQLite lease store starts at epoch 0. Seed that initial state
+    // directly: reEnroll is deliberately reserved for an explicit, strictly
+    // higher recovery checkpoint and must not be used to manufacture the
+    // generation-zero checkpoint.
+    writeInitialCheckpoint(temporaryCheckpoint, privateKey, paths.keyId);
+    const seeded = witness.verify();
+    if (seeded.state !== "verified" || seeded.epoch !== 0) {
+      throw new LeaseContinuityError("newly seeded local witness could not be verified at epoch 0");
+    }
     renameSync(temporaryDirectory, paths.witnessDirectory);
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
@@ -247,9 +254,13 @@ function readCheckpoint(path: string): AuthenticatedLeaseCheckpoint {
   }
   return { epoch, signature, keyId };
 }
+function writeInitialCheckpoint(path: string, privateKey: KeyLike, keyId: string): void {
+  writeCheckpoint(path, signCheckpoint(0, privateKey, keyId));
+}
+
 function writeCheckpoint(path: string, checkpoint: AuthenticatedLeaseCheckpoint): void {
   mkdirSync(dirname(path), { recursive: true });
-  const temporary = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
   writeFileSync(temporary, `${JSON.stringify(checkpoint)}\n`, { encoding: "utf8", mode: 0o600 });
   renameSync(temporary, path);
 }

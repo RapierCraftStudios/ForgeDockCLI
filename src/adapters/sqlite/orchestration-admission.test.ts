@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { InMemoryLeaseRepository, InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import { InMemoryLeaseRepository, InMemoryLeaseWitness, LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type LeaseRepository } from "../../core/ports/lease.js";
+import { bootstrapLocalLeaseWitness, createConfiguredLeaseWitness } from "./lease-witness.js";
 import { InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
 import { OrchestrationController } from "../../workflows/orchestrate/controller.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
@@ -73,12 +74,85 @@ describe("lease-backed orchestration execution admission", () => {
     assert.match(persisted.executionClaimId, /^\d+:[a-f0-9]{16}$/);
   });
 
+  it("admits the first orchestration claim from a freshly bootstrapped checkout", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-orchestration-bootstrap-"));
+    const checkout = join(directory, "checkout");
+    const localDataRoot = join(directory, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    mkdirSync(checkout);
+    let store: SqliteRepositories | undefined;
+    try {
+      bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      store = new SqliteRepositories(databasePath, { witness });
+      const admission = new LeaseBackedOrchestrationExecutionAdmission(store, {
+        owner: "bootstrap-test",
+        ttlMs: 100,
+        heartbeatMs: 50,
+        now: () => 1_000,
+      });
+      const claim = await admission.acquire("dag-bootstrap");
+      assert.ok(claim);
+      assert.match(claim.claimId, /^1:[a-f0-9]{16}$/);
+      claim.assertValid();
+      await claim.release();
+      assert.equal(store.continuity().epoch, 1);
+    } finally {
+      store?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates a lease continuity denial before any orchestration worker dispatch", async () => {
+    const failure = new LeaseContinuityError("injected continuity failure");
+    let dispatched = false;
+    const failingLeases: LeaseRepository = {
+      acquire: (_itemId: string, _owner: string, _ttlMs: number, _now?: number): never => { throw failure; },
+      heartbeat: (_itemId: string, _token: string, _ttlMs: number, _now?: number): never => { throw failure; },
+      release: (_itemId: string, _token: string): never => { throw failure; },
+      guard: (_itemId: string, _token: string) => ({
+        assertValid: (): never => { throw failure; },
+        check: (): never => { throw failure; },
+      }),
+      reEnroll: (_checkpoint: AuthenticatedLeaseCheckpoint): never => { throw failure; },
+      continuity: () => ({ state: "unverifiable" as const, epoch: 0, reason: failure.reason }),
+    };
+    const repository = new InMemoryOrchestrationRepository();
+    const controller = new OrchestrationController({
+      repository,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(failingLeases),
+      transportCapacity: 1,
+      worker: async () => { dispatched = true; },
+    });
+
+    await controller.create({
+      orchestrationId: "dag-continuity-denied",
+      repository: "owner/repo",
+      maxParallel: 1,
+      items: [{ id: "issue-7", issue: 7, priority: 1, dependencies: [], claims: [] }],
+    });
+    await assert.rejects(
+      controller.run("dag-continuity-denied"),
+      (error: unknown) => error === failure,
+    );
+    assert.equal(dispatched, false);
+    assert.equal((await repository.loadOrchestration("dag-continuity-denied"))?.status, "running");
+  });
+
   it("fences concurrent controllers across SQLite repository instances", async () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-orchestration-admission-"));
-    const path = join(directory, "state.db");
-    const witness = new InMemoryLeaseWitness();
-    const firstStore = new SqliteRepositories(path, { witness });
-    const secondStore = new SqliteRepositories(path, { witness });
+    const checkout = join(directory, "checkout");
+    const localDataRoot = join(directory, "local-data");
+    const path = join(checkout, ".forgedock", "state.db");
+    mkdirSync(checkout);
+    bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+    const firstWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+    const secondWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+    assert.ok(firstWitness);
+    assert.ok(secondWitness);
+    const firstStore = new SqliteRepositories(path, { witness: firstWitness });
+    const secondStore = new SqliteRepositories(path, { witness: secondWitness });
     try {
       const firstAdmission = new LeaseBackedOrchestrationExecutionAdmission(firstStore);
       const secondAdmission = new LeaseBackedOrchestrationExecutionAdmission(secondStore);
