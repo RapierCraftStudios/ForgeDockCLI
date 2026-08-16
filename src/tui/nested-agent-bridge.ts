@@ -70,8 +70,13 @@ export interface NestedAgentBridge {
 }
 
 export interface NestedAgentBridgeOptions {
-  /** Immutable filesystem roots authorized for controller and managed-review work. */
+  /** The first root is the exact controller checkout; later roots allow managed-review descendants. */
   allowedRoots: readonly string[];
+}
+
+interface CapturedAllowedRoots {
+  readonly controllerRoot: string;
+  readonly managedRoots: readonly string[];
 }
 
 export async function startNestedAgentBridge(
@@ -112,7 +117,7 @@ export async function startNestedAgentBridge(
   };
 }
 
-async function captureAllowedRoots(options: NestedAgentBridgeOptions): Promise<readonly string[]> {
+async function captureAllowedRoots(options: NestedAgentBridgeOptions): Promise<CapturedAllowedRoots> {
   if (!options || !Array.isArray(options.allowedRoots) || options.allowedRoots.length === 0) {
     throw new Error("Nested agent bridge requires at least one allowed checkout root");
   }
@@ -125,10 +130,11 @@ async function captureAllowedRoots(options: NestedAgentBridgeOptions): Promise<r
       throw new Error("Nested agent bridge allowed roots must be non-empty directory paths");
     }
     const canonical = await canonicalDirectory(root, "Nested agent bridge allowed root");
-    if (!canonicalRoots.some((candidate) => sameCanonicalPath(candidate, canonical))) canonicalRoots.push(canonical);
+    if (!canonicalRoots.some((candidate) => isExactCanonicalPath(candidate, canonical))) canonicalRoots.push(canonical);
   }
-  if (!canonicalRoots.length) throw new Error("Nested agent bridge requires at least one allowed checkout root");
-  return Object.freeze(canonicalRoots);
+  const [controllerRoot, ...managedRoots] = canonicalRoots;
+  if (!controllerRoot) throw new Error("Nested agent bridge requires at least one allowed checkout root");
+  return Object.freeze({ controllerRoot, managedRoots: Object.freeze(managedRoots) });
 }
 
 async function canonicalDirectory(value: string, label: string): Promise<string> {
@@ -145,12 +151,16 @@ function comparablePath(value: string): string {
   return process.platform === "win32" ? value.toLowerCase() : value;
 }
 
-function sameCanonicalPath(left: string, right: string): boolean {
-  const relation = relative(comparablePath(left), comparablePath(right));
-  return relation === "";
+function isExactCanonicalPath(left: string, right: string): boolean {
+  return comparablePath(left) === comparablePath(right);
 }
 
-function isWithinAllowedRoot(root: string, candidate: string): boolean {
+/**
+ * Managed worktrees may be addressed at their root or below it. Do not use
+ * this predicate for the controller checkout: the controller root is an
+ * exact-only authorization so a reviewer cannot be narrowed to a subtree.
+ */
+function isWithinManagedWorktreeRoot(root: string, candidate: string): boolean {
   const relation = relative(comparablePath(root), comparablePath(candidate));
   return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
 }
@@ -158,7 +168,7 @@ function isWithinAllowedRoot(root: string, candidate: string): boolean {
 async function handleRequest(
   pi: ExtensionAPI,
   token: string,
-  allowedRoots: readonly string[],
+  allowedRoots: CapturedAllowedRoots,
   request: IncomingMessage,
   response: ServerResponse,
   signal: AbortSignal,
@@ -510,7 +520,7 @@ function agentForRole(role: AgentRole): string {
   throw new Error(`Nested delegation is not enabled for role ${role}`);
 }
 
-async function validateRequest(value: unknown, allowedRoots: readonly string[]): Promise<NestedAgentRequest> {
+async function validateRequest(value: unknown, allowedRoots: CapturedAllowedRoots): Promise<NestedAgentRequest> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Nested request must be an object");
   const input = value as Partial<NestedAgentRequest>;
   const supported = new Set([
@@ -547,7 +557,11 @@ async function validateRequest(value: unknown, allowedRoots: readonly string[]):
     throw new Error("Nested reviewer scope must match the bridge-owned whole-checkout read-only contract");
   }
   const canonicalCwd = await canonicalDirectory(input.cwd as string, "Nested request cwd");
-  if (!allowedRoots.some((root) => isWithinAllowedRoot(root, canonicalCwd))) {
+  // The controller checkout is exact-only. Descendant authorization is
+  // reserved for the explicitly captured managed-worktree roots.
+  const isControllerRoot = isExactCanonicalPath(allowedRoots.controllerRoot, canonicalCwd);
+  const isManagedWorktreePath = allowedRoots.managedRoots.some((root) => isWithinManagedWorktreeRoot(root, canonicalCwd));
+  if (!isControllerRoot && !isManagedWorktreePath) {
     throw new Error("Nested request cwd is outside the bridge's authorized checkout roots");
   }
   return { ...input, ...REVIEWER_SCOPE_RECEIPT, cwd: canonicalCwd } as NestedAgentRequest;

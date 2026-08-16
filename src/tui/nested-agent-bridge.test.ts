@@ -71,11 +71,12 @@ test("missing child-local RPC acknowledgement fails the transport handshake inst
 test("the bridge captures canonical roots and rejects outside fresh or resumed requests before dispatch", async () => {
   const fixture = mkdtempSync(join(tmpdir(), "forgedock-nested-roots-"));
   const controllerRoot = join(fixture, "checkout");
+  const controllerDescendant = join(controllerRoot, "src");
   const managedRoot = join(fixture, ".forgedock-worktrees", "repo");
   const managedChild = join(managedRoot, "review-1");
   const outsideRoot = join(fixture, "outside");
   const siblingRoot = join(fixture, "checkout-sibling");
-  mkdirSync(controllerRoot, { recursive: true });
+  mkdirSync(controllerDescendant, { recursive: true });
   mkdirSync(managedChild, { recursive: true });
   mkdirSync(outsideRoot, { recursive: true });
   mkdirSync(siblingRoot, { recursive: true });
@@ -115,13 +116,17 @@ test("the bridge captures canonical roots and rejects outside fresh or resumed r
     assert.deepEqual(events.requests.map((request) => request.cwd).sort(), [controllerRoot, managedChild].sort());
     assert.ok(events.requests.every((request) => request.task.includes(`whole checkout rooted at ${request.cwd}`)));
 
+    const controllerDescendantResponse = await post({ ...base, id: "run-roots:controller-descendant", cwd: controllerDescendant });
+    assert.equal(controllerDescendantResponse.status, 500, "the controller checkout is exact-only");
+    assert.equal(events.requests.length, 2, "a controller-root descendant must not emit a fresh delegation request");
+
     const invalid = [outsideRoot, siblingRoot, join(fixture, "missing")];
     if (symlinkEscape) invalid.push(symlinkEscape);
     for (const [index, cwd] of invalid.entries()) {
       const response = await post({ ...base, id: `run-roots:invalid-${index}`, cwd });
       assert.equal(response.status, 500, cwd);
     }
-    const invalidResume = await post({ ...base, id: "run-roots:invalid-resume", cwd: outsideRoot, resumeSessionRef: "persisted-review" });
+    const invalidResume = await post({ ...base, id: "run-roots:invalid-resume", cwd: controllerDescendant, resumeSessionRef: "persisted-review" });
     assert.equal(invalidResume.status, 500);
     assert.equal(events.requests.length, 2, "invalid roots must not emit fresh delegation requests");
     assert.equal(events.rpcRequests.length, 0, "invalid roots must not emit resume RPC requests");
