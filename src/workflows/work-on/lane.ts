@@ -86,7 +86,7 @@ export function classifyIssueLane(
   const explicitEvidence = explicitBranchEvidence(issue);
   if (productionTarget !== undefined && explicitEvidence.branch === productionTarget) {
     throw new Error(
-      `Issue #${issue.number} explicitly targets protected production branch ${productionTarget}; ordinary work-on delivery must target an integration branch`,
+      `Issue #${issue.number} explicitly targets protected production branch ${productionTarget} (protected production target ${productionTarget}); ordinary work-on delivery must target an integration branch`,
     );
   }
   if (explicitEvidence.branch && explicitEvidence.kind === "source") {

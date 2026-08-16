@@ -29,6 +29,11 @@ const issueWithoutMilestone: IssueSnapshot = {
   url: issue.url,
   state: issue.state,
 };
+const productionEvidenceCases = [
+  { name: "Code branch", body: "**Code branch**: `main`" },
+  { name: "Worktree base", body: "**Worktree base**: `origin/main`" },
+  { name: "Target branch", body: "**Target branch**: `main`" },
+] as const;
 
 function branch(name: string): BranchSnapshot {
   return { name, headSha: sha };
@@ -47,7 +52,7 @@ describe("issue lane classification", () => {
     const lane = classifyIssueLane(issue, "main", [
       branch("milestone/verifiable-workflow-authority-portability"),
       branch("milestone/unrelated"),
-    ], "staging", "staging");
+    ], "staging", "staging", "main");
     assert.equal(lane.kind, "feature");
     assert.equal(lane.targetBranch, "milestone/verifiable-workflow-authority-portability");
     assert.equal(lane.resolution, "canonical");
@@ -82,6 +87,42 @@ describe("issue lane classification", () => {
     });
   });
 
+  it("rejects a configured fast-lane target that equals production", () => {
+    assert.throws(
+      () => classifyIssueLane(issueWithoutMilestone, "main", [], "main", "staging", "main"),
+      /Configured fast-lane target main is the protected production target/,
+    );
+  });
+
+  it("rejects a configured feature promotion target that equals production", () => {
+    assert.throws(
+      () => classifyIssueLane(issueWithoutMilestone, "main", [], "staging", "main", "main"),
+      /Configured feature promotion target main is the protected production target/,
+    );
+  });
+
+  it("rejects explicit production-target evidence for an unmilestoned issue", () => {
+    for (const evidence of productionEvidenceCases) {
+      assert.throws(
+        () => classifyIssueLane({ ...issueWithoutMilestone, body: evidence.body }, "main", [], "staging", "staging", "main"),
+        /protected production target main/,
+        evidence.name,
+      );
+    }
+  });
+
+  it("rejects explicit production-target evidence for a milestone issue before planning", () => {
+    for (const evidence of productionEvidenceCases) {
+      for (const allowMissingMilestoneBranch of [false, true]) {
+        assert.throws(
+          () => classifyIssueLane({ ...issue, body: evidence.body }, "main", [], "staging", "staging", "main", { allowMissingMilestoneBranch }),
+          /protected production target main/,
+          `${evidence.name}, allowMissingMilestoneBranch=${allowMissingMilestoneBranch}`,
+        );
+      }
+    }
+  });
+
   it("honors explicit staging-review source branch evidence instead of defaulting to main", () => {
     const stagingReview: IssueSnapshot = {
       ...issueWithoutMilestone,
@@ -91,7 +132,7 @@ describe("issue lane classification", () => {
         "**Worktree base**: `origin/staging`",
       ].join("\n"),
     };
-    assert.deepEqual(classifyIssueLane(stagingReview, "main"), {
+    assert.deepEqual(classifyIssueLane(stagingReview, "main", [], "staging", "staging", "main"), {
       kind: "fast", targetBranch: "staging", resolution: "explicit-source-branch",
     });
   });
@@ -101,7 +142,7 @@ describe("issue lane classification", () => {
       ...issueWithoutMilestone,
       body: "Open the delivery PR only against `milestone/forgedock-e2e-simple-20260809-130336-bb51b7`, never main.",
     };
-    assert.deepEqual(classifyIssueLane(explicit, "main", [], "staging"), {
+    assert.deepEqual(classifyIssueLane(explicit, "main", [], "staging", "staging", "main"), {
       kind: "fast", targetBranch: "milestone/forgedock-e2e-simple-20260809-130336-bb51b7", resolution: "explicit-target-branch",
     });
   });
@@ -135,6 +176,14 @@ describe("issue lane classification", () => {
     }
   });
 
+  it("honors an explicit staging target with a protected production target configured", () => {
+    assert.deepEqual(classifyIssueLane({
+      ...issueWithoutMilestone,
+      body: "**Target branch**: `staging`",
+    }, "main", [], "staging", "staging", "main"), {
+      kind: "fast", targetBranch: "staging", resolution: "explicit-target-branch",
+    });
+  });
   it("rejects an explicit target that conflicts with a milestone lane", () => {
     assert.throws(() => classifyIssueLane({
       ...issue,
@@ -147,7 +196,7 @@ describe("issue lane classification", () => {
       ...issueWithoutMilestone,
       labels: ["staging-review"],
       body: "**Code branch**: `staging`",
-    }, "main"), {
+    }, "main", [], "staging", "staging", "main"), {
       kind: "fast", targetBranch: "staging", resolution: "explicit-source-branch",
     });
   });
@@ -221,8 +270,29 @@ describe("issue lane classification", () => {
     assert.deepEqual(reads, ["a/b:milestone/verifiable-workflow-authority"]);
   });
 
+  it("rejects explicit production-target evidence before resolver branch-head validation", async () => {
+    const reads: string[] = [];
+    for (const evidence of productionEvidenceCases) {
+      await assert.rejects(
+        resolveIssueLane({ ...issueWithoutMilestone, body: evidence.body }, "main", {
+          async listBranches() {
+            reads.push("listBranches");
+            return [];
+          },
+          async getBranchHead() {
+            reads.push("getBranchHead");
+            return sha;
+          },
+        }, "staging", "staging", "main"),
+        /protected production target main/,
+        evidence.name,
+      );
+    }
+    assert.deepEqual(reads, []);
+  });
+
   it("freezes promotion and production targets and rejects policy drift", () => {
-    const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")], "staging", "staging");
+    const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")], "staging", "staging", "main");
     const run = createRun({
       workflow: "work-on",
       subject: { repo: issue.repo, issue: issue.number },
