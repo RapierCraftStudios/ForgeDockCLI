@@ -124,16 +124,26 @@ describe("confirmed Deep Plan handoff", () => {
 			},
 		};
 
-		await assert.rejects(
-			materializeConfirmedPlan({ repo: REPO, packet: packet("ready"), host }),
-			/requires a confirmed packet; received ready/,
+		for (const status of ["ready", "handed-off", "blocked"] as const) {
+			assert.throws(
+				() => createPlanMaterializationRequest(REPO, packet(status)),
+				new RegExp(`requires a confirmed packet; received ${status}`),
+			);
+			await assert.rejects(
+				materializeConfirmedPlan({ repo: REPO, packet: packet(status), host }),
+				new RegExp(`requires a confirmed packet; received ${status}`),
+			);
+		}
+
+		const unresolved = packet("confirmed", undefined, [
+			"Choose a rollout lane",
+		]);
+		assert.throws(
+			() => createPlanMaterializationRequest(REPO, unresolved),
+			/requires all open questions to be resolved/,
 		);
 		await assert.rejects(
-			materializeConfirmedPlan({
-				repo: REPO,
-				packet: packet("confirmed", undefined, ["Choose a rollout lane"]),
-				host,
-			}),
+			materializeConfirmedPlan({ repo: REPO, packet: unresolved, host }),
 			/requires all open questions to be resolved/,
 		);
 		assert.equal(calls, 0);
@@ -219,17 +229,27 @@ describe("confirmed Deep Plan handoff", () => {
 		assert.equal(first[1]?.id, planNodeWorkItemId("plan-stable", 3, "verify"));
 	});
 
-	it("passes the exact stable request to the host and marks only a valid mapping handed off", async () => {
-		const confirmed = packet("confirmed", [node("build")]);
+	it("round-trips the returned handed-off packet without another host mutation", async () => {
+		const confirmed = packet("confirmed", [
+			node("docs", [], 5),
+			node("verify", ["build"], 1),
+			node("build", [], 2),
+		]);
+		let calls = 0;
 		let captured: PlanMaterializationRequest | undefined;
 		const host: PlanMaterializationHost = {
 			async materializePlan(input) {
+				calls += 1;
 				captured = input;
 				return {
 					repo: REPO,
 					planId: input.planId,
 					revision: input.revision,
-					nodes: [resultNode(confirmed, "build", 101, [], [])],
+					nodes: [
+						resultNode(confirmed, "verify", 103, ["build"], [101]),
+						resultNode(confirmed, "docs", 102, [], []),
+						resultNode(confirmed, "build", 101, [], []),
+					],
 				};
 			},
 		};
@@ -239,11 +259,149 @@ describe("confirmed Deep Plan handoff", () => {
 			packet: confirmed,
 			host,
 		});
+		const recovered = materializedPlanToScheduledWorkItems(
+			handoff.packet,
+			handoff.materialization,
+		);
+
 		assert.deepEqual(
 			captured,
 			createPlanMaterializationRequest(REPO, confirmed),
 		);
 		assert.equal(handoff.packet.status, "handed-off");
-		assert.equal(handoff.items[0]?.issue, 101);
+		assert.deepEqual(recovered, handoff.items);
+		assert.deepEqual(
+			recovered.map((item) => ({ id: item.id, issue: item.issue })),
+			[
+				{ id: planNodeWorkItemId("plan-stable", 3, "build"), issue: 101 },
+				{ id: planNodeWorkItemId("plan-stable", 3, "verify"), issue: 103 },
+				{ id: planNodeWorkItemId("plan-stable", 3, "docs"), issue: 102 },
+			],
+		);
+		assert.deepEqual(recovered[1]?.dependencies, [
+			planNodeWorkItemId("plan-stable", 3, "build"),
+		]);
+		assert.equal(calls, 1);
+	});
+
+	it("rejects tampered handed-off mappings before returning scheduler items", () => {
+		const confirmed = packet("confirmed", [
+			node("docs", [], 5),
+			node("verify", ["build"], 1),
+			node("build", [], 2),
+		]);
+		const handedOff: PlanningPacket = { ...confirmed, status: "handed-off" };
+		const materialization: PlanMaterializationResult = {
+			repo: REPO,
+			planId: handedOff.sessionId,
+			revision: handedOff.revision,
+			nodes: [
+				resultNode(handedOff, "verify", 103, ["build"], [101]),
+				resultNode(handedOff, "docs", 102, [], []),
+				resultNode(handedOff, "build", 101, [], []),
+			],
+		};
+		const reject = (
+			candidate: PlanMaterializationResult,
+			message: RegExp,
+		): void => {
+			assert.throws(
+				() =>
+					materializedPlanToScheduledWorkItems(handedOff, candidate),
+				message,
+			);
+		};
+
+		reject(
+			{ ...materialization, planId: "stale-plan" },
+			/Materialized plan ID .* does not match/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "build"
+						? { ...result, planId: "stale-plan" }
+						: result,
+				),
+			},
+			/has a mismatched plan identity/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "build"
+						? { ...result, issue: { ...result.issue, repo: "foreign/repo" } }
+						: result,
+				),
+			},
+			/issue belongs to foreign\/repo/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "build"
+						? { ...result, issue: { ...result.issue, state: "CLOSED" } }
+						: result,
+				),
+			},
+			/issue is closed/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "build"
+						? { ...result, issue: { ...result.issue, number: 103 } }
+						: result,
+				),
+			},
+			/assigned issue #103 to more than one node/,
+		);
+		reject(
+			{ ...materialization, nodes: materialization.nodes.slice(0, 2) },
+			/omitted node build/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: [
+					...materialization.nodes,
+					resultNode(handedOff, "unknown", 104, [], []),
+				],
+			},
+			/unknown node unknown/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: [...materialization.nodes, materialization.nodes[0]!],
+			},
+			/duplicate node verify/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "verify"
+						? { ...result, dependsOnNodeIds: [] }
+						: result,
+				),
+			},
+			/dependencies do not match/,
+		);
+		reject(
+			{
+				...materialization,
+				nodes: materialization.nodes.map((result) =>
+					result.nodeId === "verify"
+						? { ...result, dependencyIssueNumbers: [999] }
+						: result,
+				),
+			},
+			/dependency issues do not match/,
+		);
 	});
 });
