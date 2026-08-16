@@ -5,13 +5,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
-import { GitWorktreeManager } from "./git-worktree.js";
+import { GitWorktreeManager, managedWorktreeRootFor } from "./git-worktree.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 describe("isolated Git worktrees", () => {
+  it("uses the shared managed-root derivation for the manager default", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-root-"));
+    const repo = join(root, "repo");
+    try {
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      git(repo, "add", "README.md");
+      git(repo, "commit", "-m", "base");
+
+      const manager = new GitWorktreeManager(repo);
+      const workspace = await manager.create({ runId: "run_root", issue: 1, baseRef: "HEAD" });
+      assert.equal(workspace.path, join(managedWorktreeRootFor(repo), "issue-1-run_root"));
+      await manager.remove(workspace);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("creates, inspects, commits and removes a managed worktree", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-"));
     const repo = join(root, "repo");

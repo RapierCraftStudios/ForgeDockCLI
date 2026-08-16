@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { realpath, stat } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { isAbsolute, relative, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SubagentDelegationV2Request, SubagentDelegationV2Response, SubagentDelegationV2Update } from "pi-subagents/delegation";
 import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
-import { validateScopeManifestReceipt, type AgentRole, type ScopeManifest, type ToolGrant } from "../runtime/agent-runtime.js";
+import { createScopeManifestReceipt, scopeManifestForReviewer, validateScopeManifestReceipt, type AgentRole, type ScopeManifest, type ToolGrant } from "../runtime/agent-runtime.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const SUBAGENT_DELEGATION_REQUEST_EVENT = "prompt-template:subagent:request";
@@ -19,6 +21,7 @@ const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const SUBAGENT_RPC_HANDSHAKE_MS = 30_000;
 const SUBAGENT_RPC_LATE_REPLY_CLEANUP_MS = 30_000;
+const REVIEWER_SCOPE_RECEIPT = createScopeManifestReceipt(scopeManifestForReviewer());
 
 interface NestedAgentRequest {
   ownerRunId: string;
@@ -66,7 +69,16 @@ export interface NestedAgentBridge {
   close(): Promise<void>;
 }
 
-export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAgentBridge> {
+export interface NestedAgentBridgeOptions {
+  /** Immutable filesystem roots authorized for controller and managed-review work. */
+  allowedRoots: readonly string[];
+}
+
+export async function startNestedAgentBridge(
+  pi: ExtensionAPI,
+  options: NestedAgentBridgeOptions,
+): Promise<NestedAgentBridge> {
+  const allowedRoots = await captureAllowedRoots(options);
   const token = crypto.randomUUID();
   const pending = new Set<AbortController>();
   const server = createServer((request, response) => {
@@ -76,7 +88,7 @@ export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAg
     response.once("close", () => {
       if (!response.writableEnded) controller.abort(new Error("Nested agent response disconnected"));
     });
-    void handleRequest(pi, token, request, response, controller.signal)
+    void handleRequest(pi, token, allowedRoots, request, response, controller.signal)
       .finally(() => pending.delete(controller));
   });
   await new Promise<void>((resolve, reject) => {
@@ -100,11 +112,61 @@ export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAg
   };
 }
 
-async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingMessage, response: ServerResponse, signal: AbortSignal): Promise<void> {
+async function captureAllowedRoots(options: NestedAgentBridgeOptions): Promise<readonly string[]> {
+  if (!options || !Array.isArray(options.allowedRoots) || options.allowedRoots.length === 0) {
+    throw new Error("Nested agent bridge requires at least one allowed checkout root");
+  }
+  // Copy before awaiting filesystem work so callers cannot mutate the policy
+  // while startup is canonicalizing it.
+  const requestedRoots = [...options.allowedRoots];
+  const canonicalRoots: string[] = [];
+  for (const root of requestedRoots) {
+    if (typeof root !== "string" || !root.trim()) {
+      throw new Error("Nested agent bridge allowed roots must be non-empty directory paths");
+    }
+    const canonical = await canonicalDirectory(root, "Nested agent bridge allowed root");
+    if (!canonicalRoots.some((candidate) => sameCanonicalPath(candidate, canonical))) canonicalRoots.push(canonical);
+  }
+  if (!canonicalRoots.length) throw new Error("Nested agent bridge requires at least one allowed checkout root");
+  return Object.freeze(canonicalRoots);
+}
+
+async function canonicalDirectory(value: string, label: string): Promise<string> {
+  try {
+    const canonical = await realpath(value);
+    if (!(await stat(canonical)).isDirectory()) throw new Error("not a directory");
+    return canonical;
+  } catch (error) {
+    throw new Error(`${label} must be an existing directory`, { cause: error });
+  }
+}
+
+function comparablePath(value: string): string {
+  return process.platform === "win32" ? value.toLowerCase() : value;
+}
+
+function sameCanonicalPath(left: string, right: string): boolean {
+  const relation = relative(comparablePath(left), comparablePath(right));
+  return relation === "";
+}
+
+function isWithinAllowedRoot(root: string, candidate: string): boolean {
+  const relation = relative(comparablePath(root), comparablePath(candidate));
+  return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
+}
+
+async function handleRequest(
+  pi: ExtensionAPI,
+  token: string,
+  allowedRoots: readonly string[],
+  request: IncomingMessage,
+  response: ServerResponse,
+  signal: AbortSignal,
+): Promise<void> {
   try {
     if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
     if (request.headers.authorization !== `Bearer ${token}`) return send(response, 401, { error: "Unauthorized" });
-    const payload = validateRequest(JSON.parse(await readBody(request)) as unknown);
+    const payload = await validateRequest(JSON.parse(await readBody(request)) as unknown, allowedRoots);
     const announceSession = (sessionRef: string): void => {
       if (response.headersSent || !sessionRef || sessionRef.length > 256 || /[\r\n]/.test(sessionRef)) return;
       response.writeHead(200, {
@@ -184,8 +246,8 @@ function delegate(
           sessionRef,
           provider: input.provider,
           model: terminalModel ?? input.model,
-          scopeVersion: input.scopeVersion,
-          scopeDigest: input.scopeDigest,
+          scopeVersion: REVIEWER_SCOPE_RECEIPT.scopeVersion,
+          scopeDigest: REVIEWER_SCOPE_RECEIPT.scopeDigest,
         }));
         return;
       }
@@ -252,8 +314,8 @@ async function resumeDelegation(
         `Continue the same ForgeDock review for ${input.id}.`,
         "The previous attempt ended operationally before the controller received a schema-valid result.",
         "Finish the original bounded objective against the same frozen revision, then call structured_output exactly once.",
-        `Preserve ForgeDock scope receipt v${input.scopeVersion} sha256:${input.scopeDigest}.`,
-        "Read access is the whole assigned checkout; do not write or access outside it.",
+        `Preserve ForgeDock scope receipt v${REVIEWER_SCOPE_RECEIPT.scopeVersion} sha256:${REVIEWER_SCOPE_RECEIPT.scopeDigest}.`,
+        `Read access is the whole assigned checkout rooted at ${input.cwd}; do not write or access outside it.`,
       ].join(" "),
     }, signal, (lateReply) => {
       if (lateReply.success) {
@@ -305,8 +367,8 @@ async function resumeDelegation(
       sessionRef,
       provider: input.provider,
       model: typeof child?.model === "string" ? child.model : input.model,
-      scopeVersion: input.scopeVersion,
-      scopeDigest: input.scopeDigest,
+      scopeVersion: REVIEWER_SCOPE_RECEIPT.scopeVersion,
+      scopeDigest: REVIEWER_SCOPE_RECEIPT.scopeDigest,
     };
   } finally {
     if (typeof unsubscribeCompletion === "function") unsubscribeCompletion();
@@ -448,7 +510,7 @@ function agentForRole(role: AgentRole): string {
   throw new Error(`Nested delegation is not enabled for role ${role}`);
 }
 
-function validateRequest(value: unknown): NestedAgentRequest {
+async function validateRequest(value: unknown, allowedRoots: readonly string[]): Promise<NestedAgentRequest> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Nested request must be an object");
   const input = value as Partial<NestedAgentRequest>;
   const supported = new Set([
@@ -458,7 +520,7 @@ function validateRequest(value: unknown): NestedAgentRequest {
   const unsupported = Object.keys(input).find((key) => !supported.has(key));
   if (unsupported) throw new Error(`Nested request field is not supported: ${unsupported}`);
   for (const key of ["ownerRunId", "id", "role", "objective", "instructions", "cwd", "provider", "model"] as const) {
-    if (typeof input[key] !== "string" || !input[key]) throw new Error(`Nested request ${key} is required`);
+    if (typeof input[key] !== "string" || !input[key].trim()) throw new Error(`Nested request ${key} is required`);
   }
   if (input.role !== "reviewer") throw new Error(`Nested role is not authorized: ${input.role}`);
   if (input.logicalTaskId !== undefined && (typeof input.logicalTaskId !== "string" || !input.logicalTaskId.trim() || input.logicalTaskId.length > 256 || /[\r\n]/.test(input.logicalTaskId))) {
@@ -481,11 +543,14 @@ function validateRequest(value: unknown): NestedAgentRequest {
   const reviewerTools = new Set<ToolGrant>(["read", "grep", "find", "ls"]);
   if (input.tools.some((tool) => !reviewerTools.has(tool))) throw new Error("Nested reviewers must use read-only checkout tools");
   const receipt = validateScopeManifestReceipt(input);
-  if (receipt.scope.readRoots.length !== 1 || receipt.scope.readRoots[0] !== "."
-    || receipt.scope.writeRoots.length || receipt.scope.writePaths?.length) {
-    throw new Error("Nested reviewer scope must grant whole-checkout reads and no writes");
+  if (receipt.scopeVersion !== REVIEWER_SCOPE_RECEIPT.scopeVersion || receipt.scopeDigest !== REVIEWER_SCOPE_RECEIPT.scopeDigest) {
+    throw new Error("Nested reviewer scope must match the bridge-owned whole-checkout read-only contract");
   }
-  return { ...input, ...receipt } as NestedAgentRequest;
+  const canonicalCwd = await canonicalDirectory(input.cwd as string, "Nested request cwd");
+  if (!allowedRoots.some((root) => isWithinAllowedRoot(root, canonicalCwd))) {
+    throw new Error("Nested request cwd is outside the bridge's authorized checkout roots");
+  }
+  return { ...input, ...REVIEWER_SCOPE_RECEIPT, cwd: canonicalCwd } as NestedAgentRequest;
 }
 
 function readBody(request: IncomingMessage): Promise<string> {

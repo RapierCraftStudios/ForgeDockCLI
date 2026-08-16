@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdir, realpath } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import {
@@ -60,6 +61,7 @@ import {
   type ScheduleWorkerResult,
 } from "../workflows/orchestrate/scheduler.js";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
+import { managedWorktreeRootFor } from "../adapters/git/git-worktree.js";
 import { startNestedAgentBridge } from "./nested-agent-bridge.js";
 import { runDecisionFlow, validateDecisionFlow, type DecisionFlowInput, type DecisionFlowResult } from "./decision-flow.js";
 import { ForgeDockBackgroundTasks, renderRecord, terminateProcessTree, type BackgroundTaskRecord } from "./background-tasks.js";
@@ -2714,6 +2716,19 @@ function controllerEntryAvailable(): boolean {
   return entry !== undefined && existsSync(entry);
 }
 
+async function startControllerNestedAgentBridge(pi: ExtensionAPI, childCwd: string) {
+  let controllerRoot: string;
+  try {
+    controllerRoot = await realpath(childCwd);
+  } catch (error) {
+    throw new Error("ForgeDock controller checkout must be an existing directory before starting nested review delegation", { cause: error });
+  }
+  const managedRootPath = managedWorktreeRootFor(controllerRoot);
+  await mkdir(managedRootPath, { recursive: true });
+  const managedRoot = await realpath(managedRootPath);
+  return startNestedAgentBridge(pi, { allowedRoots: [controllerRoot, managedRoot] });
+}
+
 async function startNativeControllerTask(
   pi: ExtensionAPI,
   tasks: ForgeDockBackgroundTasks,
@@ -2722,7 +2737,7 @@ async function startNativeControllerTask(
 ): Promise<string> {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
-  const nestedBridge = await startNestedAgentBridge(pi);
+  const nestedBridge = await startControllerNestedAgentBridge(pi, spec.cwd);
   const config = readForgeDockConfig(ctx.cwd);
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
@@ -2770,7 +2785,7 @@ async function runControllerToolBackground(
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   const config = readForgeDockConfig(ctx.cwd);
   const modelArgs = controllerInvocationModelArgs(command, args, ctx, config);
-  const nestedBridge = await startNestedAgentBridge(pi);
+  const nestedBridge = await startControllerNestedAgentBridge(pi, ctx.cwd);
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);
@@ -2822,7 +2837,7 @@ async function runControllerTool(
   const modelArgs = includeModel ? controllerInvocationModelArgs(command, args, ctx, config) : [];
   const invocationArgs = [entry, command, ...args, ...modelArgs];
   ctx.ui.setStatus("forgedock", `◆ ${workflowCommandDisplay(command)} running`);
-  const nestedBridge = includeModel ? await startNestedAgentBridge(pi) : undefined;
+  const nestedBridge = includeModel ? await startControllerNestedAgentBridge(pi, ctx.cwd) : undefined;
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);

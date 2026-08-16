@@ -27,11 +27,17 @@ type DependencyLease = {
   heartbeat: NodeJS.Timeout;
 };
 
+/** Canonical managed review-worktree root shared by Git and nested-agent policy. */
+export function managedWorktreeRootFor(repo: string = process.cwd()): string {
+  const checkout = resolve(repo);
+  return join(dirname(checkout), ".forgedock-worktrees", basename(checkout));
+}
+
 export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager {
   readonly #repo: string;
   readonly #root: string;
 
-  constructor(repo = process.cwd(), root = join(dirname(repo), ".forgedock-worktrees", basename(repo))) {
+  constructor(repo = process.cwd(), root = managedWorktreeRootFor(repo)) {
     this.#repo = resolve(repo);
     this.#root = resolve(root);
   }

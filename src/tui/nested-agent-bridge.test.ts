@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createScopeManifestReceipt, scopeManifestForReviewer } from "../runtime/agent-runtime.js";
-import { startNestedAgentBridge, subagentRpc } from "./nested-agent-bridge.js";
+import { startNestedAgentBridge as createNestedAgentBridge, subagentRpc } from "./nested-agent-bridge.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
+const startNestedAgentBridge = (pi: ExtensionAPI) => createNestedAgentBridge(pi, { allowedRoots: [process.cwd()] });
 
 class FakeEvents {
   handlers = new Map<string, Array<(data: unknown) => void>>();
@@ -61,6 +66,77 @@ test("missing child-local RPC acknowledgement fails the transport handshake inst
     /did not acknowledge/,
   );
   assert.equal([...events.handlers.values()].flat().length, 0);
+});
+
+test("the bridge captures canonical roots and rejects outside fresh or resumed requests before dispatch", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "forgedock-nested-roots-"));
+  const controllerRoot = join(fixture, "checkout");
+  const managedRoot = join(fixture, ".forgedock-worktrees", "repo");
+  const managedChild = join(managedRoot, "review-1");
+  const outsideRoot = join(fixture, "outside");
+  const siblingRoot = join(fixture, "checkout-sibling");
+  mkdirSync(controllerRoot, { recursive: true });
+  mkdirSync(managedChild, { recursive: true });
+  mkdirSync(outsideRoot, { recursive: true });
+  mkdirSync(siblingRoot, { recursive: true });
+  let symlinkEscape: string | undefined;
+  try {
+    symlinkEscape = join(controllerRoot, "escape");
+    symlinkSync(outsideRoot, symlinkEscape, process.platform === "win32" ? "junction" : "dir");
+  } catch {
+    symlinkEscape = undefined;
+  }
+
+  const events = new FakeEvents();
+  const bridge = await createNestedAgentBridge({ events } as unknown as ExtensionAPI, { allowedRoots: [controllerRoot, managedRoot] });
+  const base = {
+    ownerRunId: "run-roots",
+    role: "reviewer",
+    objective: "Review",
+    instructions: "Read only",
+    context: [],
+    ...REVIEWER_SCOPE,
+    tools: ["read"],
+    outputSchema: { type: "object" },
+    provider: "openai-codex",
+    model: "gpt-test",
+  };
+  const post = (body: unknown) => fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+    method: "POST",
+    headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  try {
+    const concurrent = await Promise.all([
+      post({ ...base, id: "run-roots:controller", cwd: `${controllerRoot}/.` }),
+      post({ ...base, id: "run-roots:managed", cwd: managedChild }),
+    ]);
+    assert.deepEqual(concurrent.map((response) => response.status), [200, 200]);
+    assert.deepEqual(events.requests.map((request) => request.cwd).sort(), [controllerRoot, managedChild].sort());
+    assert.ok(events.requests.every((request) => request.task.includes(`whole checkout rooted at ${request.cwd}`)));
+
+    const invalid = [outsideRoot, siblingRoot, join(fixture, "missing")];
+    if (symlinkEscape) invalid.push(symlinkEscape);
+    for (const [index, cwd] of invalid.entries()) {
+      const response = await post({ ...base, id: `run-roots:invalid-${index}`, cwd });
+      assert.equal(response.status, 500, cwd);
+    }
+    const invalidResume = await post({ ...base, id: "run-roots:invalid-resume", cwd: outsideRoot, resumeSessionRef: "persisted-review" });
+    assert.equal(invalidResume.status, 500);
+    assert.equal(events.requests.length, 2, "invalid roots must not emit fresh delegation requests");
+    assert.equal(events.rpcRequests.length, 0, "invalid roots must not emit resume RPC requests");
+  } finally {
+    await bridge.close();
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("the bridge refuses a missing allowed root before opening its endpoint", async () => {
+  const missing = join(tmpdir(), `forgedock-nested-missing-${randomUUID()}`);
+  await assert.rejects(
+    createNestedAgentBridge({ events: new FakeEvents() } as unknown as ExtensionAPI, { allowedRoots: [missing] }),
+    /existing directory/,
+  );
 });
 
 test("controller reviewer tasks use the child-safe nested delegation protocol", async () => {
@@ -129,6 +205,8 @@ test("nested reviewer scope receipts fail closed on omission, tampering, or narr
     assert.equal((await post({ ...base, ...REVIEWER_SCOPE, scopeVersion: 2 })).status, 500);
     assert.equal((await post({ ...base, ...REVIEWER_SCOPE, scopeDigest: "0".repeat(64) })).status, 500);
     assert.equal((await post({ ...base, ...REVIEWER_SCOPE, unversionedScopeHint: "src" })).status, 500);
+    const otherSourceDot = createScopeManifestReceipt({ readRoots: ["."], writeRoots: [], source: "build-packet" });
+    assert.equal((await post({ ...base, ...otherSourceDot })).status, 500);
     const narrow = createScopeManifestReceipt({ readRoots: ["src"], writeRoots: [], source: "issue-hints" });
     assert.equal((await post({ ...base, ...narrow })).status, 500);
     const writable = createScopeManifestReceipt({ readRoots: ["."], writeRoots: ["src"], source: "issue-hints" });

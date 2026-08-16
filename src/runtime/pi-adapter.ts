@@ -387,7 +387,9 @@ async function runNestedReviewer<T>(
   const delegationNodeId = `forgedock-review-attempt-${crypto.randomUUID()}`;
   const provisionalSessionRef = input.resumeSessionRef ?? `nested_pending_${crypto.randomUUID()}`;
   let observedSessionRef = input.resumeSessionRef;
-  const scopeReceipt = createScopeManifestReceipt(task.workspace.scope);
+  // The bridge owns the nested reviewer authority. Do not serialize a caller-
+  // narrowed or otherwise task-supplied scope receipt across this boundary.
+  const scopeReceipt = createScopeManifestReceipt(scopeManifestForReviewer());
   input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
   let response: { status: number; payload: { output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean; scopeVersion?: number; scopeDigest?: string } };
   try {

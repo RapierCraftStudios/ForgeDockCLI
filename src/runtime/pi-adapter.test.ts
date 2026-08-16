@@ -177,6 +177,7 @@ test("fresh nested reviewer attempts use unique wire nodes but retain the logica
     assert.notEqual(requests[0]?.id, requests[1]?.id);
     assert.deepEqual(requests.map((request) => request.logicalTaskId), [task.id, task.id]);
     assert.deepEqual(requests.map((request) => request.scopeVersion), [1, 1]);
+    assert.deepEqual(requests.map((request) => request.cwd), [task.workspace.cwd, task.workspace.cwd]);
     assert.deepEqual(requests.map((request) => request.scope), [REVIEWER_SCOPE.scope, REVIEWER_SCOPE.scope]);
     assert.deepEqual(requests.map((request) => request.scopeDigest), [REVIEWER_SCOPE.scopeDigest, REVIEWER_SCOPE.scopeDigest]);
     assert.deepEqual(requests.map((request) => request.toolBudget), [64, 64]);
