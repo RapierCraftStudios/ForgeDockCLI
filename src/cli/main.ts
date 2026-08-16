@@ -1426,6 +1426,7 @@ async function orchestrate(argv: string[]): Promise<void> {
       const lane = requiredIssueRoute(routedIssues, item.issue).lane;
       const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
       const affectedFiles = affectedFilesFromIssueBody(observed.body);
+      const claims = [...new Set([...item.claims, ...affectedFiles])];
       return {
         ...item,
         repository: repository.repo,
@@ -1438,7 +1439,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         title: observed.title,
         summary: observed.body.slice(0, 4_000),
         affectedFiles,
-        claims: [...new Set([...item.claims, ...affectedFiles])],
+        claims: claims.length ? claims : [`component:${repository.repo}`],
         riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
         ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
       };
@@ -1956,11 +1957,19 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
           if (current.state === "completed") return;
           if (current.state === "invalid") return { status: "invalid", error: `#${item.issue} is authoritatively invalid` };
           const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
-          return {
-            status: "skipped",
-            error: `#${item.issue} is decomposed; replacement scope will be admitted to this DAG`,
-            childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
-          };
+          if (current.state === "decomposed") {
+            return {
+              status: "skipped",
+              error: `#${item.issue} is decomposed; replacement scope will be admitted to this DAG`,
+              childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+            };
+          }
+          if (current.state === "cancelled") {
+            return { status: "skipped", error: `#${item.issue} is authoritatively cancelled` };
+          }
+          const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
+          if (terminal) return terminal;
+          throw new Error(`#${item.issue} has terminal state ${current.state} without a supported orchestration result`);
         }
         if (current.action === "block") throw new Error(current.reason);
         const workerArgs = [String(item.issue), "--repo", record.repository];
@@ -2132,7 +2141,10 @@ function loadOrchestrationItems(issueNumbers: number[], repo: string): Scheduled
       issue,
       priority: config?.priority ?? 100,
       dependencies,
-      claims: config?.claims?.length ? config.claims : [`component:${repo}`],
+      // Claims are completed from the authoritative issue body below. Do not
+      // seed every issue with a repository-wide component claim before that
+      // evidence is available; doing so serializes otherwise disjoint work.
+      claims: config?.claims?.length ? config.claims : [],
     };
   });
 }
