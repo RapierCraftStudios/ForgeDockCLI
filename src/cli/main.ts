@@ -971,6 +971,11 @@ async function workOn(
         ...(provider !== undefined ? { provider } : {}),
         ...(model !== undefined ? { model } : {}),
         ...planning,
+        onClaimsPromoted: async (paths: readonly string[]) => {
+          await promoteOrchestrationClaims(paths, {
+            ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
+          });
+        },
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent };
@@ -988,7 +993,6 @@ async function workOn(
         : admission.checkpoint === "build"
           ? await resumeBuildWorkOn({
             ...common,
-            ...(orchestration?.onClaimsPromoted !== undefined ? { onClaimsPromoted: orchestration.onClaimsPromoted } : {}),
           }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({

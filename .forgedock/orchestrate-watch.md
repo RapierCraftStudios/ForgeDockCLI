@@ -1789,3 +1789,26 @@ entry as the current checkpoint.
   single issue. Future improvements must reduce needless panel/rebuild work,
   preserve substantive review, and improve claim derivation without adding a
   hard wall-clock cap.
+
+#### HP-20 integration and pre-push verification (2026-08-16 18:20 local)
+
+- No orchestration process was restarted after HP-19. The durable stopped DAG
+  remains the only live-run evidence and is still resumable through its native
+  `--resume` path.
+- The staging checkout reconciled the remote issue-delivery commits for #189,
+  #190, #192, #193, and #195 with the lifecycle hardening work. The scheduler
+  now retains a newly attempted conflicting scope only in live memory to avoid
+  retry hot-loops, while refusing to publish that unadmitted scope to durable
+  node claims; the successful retry publishes it after admission. This closes
+  the observed mismatch between safe claim ownership and resumable retry.
+- Async claim-promotion call sites were made awaitable. Controller tests now
+  cover automatic transient retry, explicit durable resume, sink rollback, and
+  no durable claim publication on a conflict. The TUI claim-arbitration test
+  covers the same ownership boundary.
+- Verification: `npm run build` passed; focused controller/scheduler tests passed
+  `49/49`; focused TUI extension tests passed `56/56`; the complete native Next
+  suite passed `696/696` tests across `207` suites in about 21 seconds. No live
+  controller was started by verification.
+- This is a code/test integration checkpoint, not an end-to-end closure claim:
+  the saved seven-issue run still has one completed issue and queued/resumable
+  work awaiting a deliberate operator resume.

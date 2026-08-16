@@ -31,6 +31,13 @@ CLAUDE.md
 .forgedock/tasks/
 .forgedock/*.jsonl
 .forgedock/*.stderr
+.forgedock/*.ndjson
+.forgedock/*.log
+.forgedock/*.stdout.log
+.forgedock/*.stderr.log
+.forgedock/*.stop
+.forgedock/*.db
+.forgedock/*.db-*
 .forgedock/observations/
 .pi-subagents/
 

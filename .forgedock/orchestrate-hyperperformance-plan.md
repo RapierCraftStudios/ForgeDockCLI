@@ -983,3 +983,16 @@ Post-correction verification is green: `npm run build`; native Next suite
 `667/667` across `207` suites. No controller was restarted after this change;
 the ten-new-closure end-to-end proof remains pending and this canary does not
 count toward it.
+
+### HP-20: claim-admission integration checkpoint (2026-08-16)
+
+The stopped live run exposed broad fallback claims and expensive retry/review
+behavior. The integrated scheduler fix keeps a conflicting Build Packet scope
+in the active scheduler only, so a transient retry waits instead of repeatedly
+dispatching; durable node claims change only after the scope is admitted. The
+claim transport is now consistently awaited, and the conflict/sink/retry tests
+exercise the lifecycle rather than relying on timing.
+
+Evidence: build green; controller/scheduler `49/49`; TUI `56/56`; full native
+Next suite `696/696` across `207` suites. This is a regression-free integration
+checkpoint, not proof that the saved seven-issue DAG has closed ten issues.

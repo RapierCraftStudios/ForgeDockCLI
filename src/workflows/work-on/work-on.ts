@@ -29,7 +29,6 @@ import { remediateReview } from "./remediate.js";
 import { verifyAndCommit, type VerificationResult } from "./verify.js";
 import { materializeReviewFindings, reviewPullRequest } from "../review-pr/review.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
-import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
@@ -512,7 +511,7 @@ export async function resumeBuildWorkOn(
     batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
     /** Re-register the frozen packet paths with the owning scheduler before builder dispatch. */
-    onClaimsPromoted?: (paths: readonly string[]) => void;
+    onClaimsPromoted?: (paths: readonly string[]) => void | Promise<void>;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -554,7 +553,7 @@ export async function resumeBuildWorkOn(
     await dependencies.runs.commit(run.version, resumed.state, resumed.record);
     run = resumed.state;
     claimPromotionPending = true;
-    input.onClaimsPromoted?.(input.packet.payload.expectedPaths);
+    await input.onClaimsPromoted?.(input.packet.payload.expectedPaths);
     claimPromotionPending = false;
     const result = await continueBuildDelivery({
       ...input,

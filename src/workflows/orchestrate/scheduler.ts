@@ -281,6 +281,15 @@ export async function runSchedule(
           const conflicts = [...running.keys()]
             .filter((activeId) => activeId !== item.id)
             .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
+          if (conflicts.length) {
+            // A worker may only publish claims after the scheduler has
+            // admitted them. Keep the durable projection at its last admitted
+            // value, but retain the attempted scope in this live scheduler so
+            // an automatic retry waits for the conflicting worker instead of
+            // hot-looping the same failed promotion.
+            currentClaims.set(item.id, merged);
+            throw new ClaimPromotionConflictError(item.id, conflicts);
+          }
           const previousClaims = currentClaims.get(item.id);
           currentClaims.set(item.id, merged);
           try {
@@ -292,13 +301,6 @@ export async function runSchedule(
             if (previousClaims === undefined) currentClaims.delete(item.id);
             else currentClaims.set(item.id, previousClaims);
             throw error;
-          }
-          if (conflicts.length) {
-            // The Build Packet paths remain authoritative even though this
-            // attempt cannot proceed. Retaining them makes the retry wait on
-            // the actual live claim instead of immediately redispatching with
-            // the node's older, incomplete scope.
-            throw new ClaimPromotionConflictError(item.id, conflicts);
           }
         },
       };

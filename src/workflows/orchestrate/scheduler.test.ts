@@ -186,7 +186,7 @@ describe("lean orchestration scheduler", () => {
       { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
       { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
     ], 2, async (_item, scheduler) => {
-      scheduler.promoteClaims(["src/shared"]);
+      await scheduler.promoteClaims(["src/shared"]);
     }, {
       onClaimsPromoted: (itemId) => {
         if (itemId === "first") throw sinkError;

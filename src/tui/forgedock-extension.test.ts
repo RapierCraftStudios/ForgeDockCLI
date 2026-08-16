@@ -877,7 +877,9 @@ test("native controller tasks promote Build Packet claims into the parent schedu
   await secondRejection;
   const duringConflict = await repository.loadOrchestration(run.id);
   assert.deepEqual(duringConflict?.nodes.find((node) => node.id === "issue-1")?.claims, ["src/shared.ts"]);
-  assert.deepEqual(duringConflict?.nodes.find((node) => node.id === "issue-2")?.claims, ["src/shared.ts"]);
+  // A conflicting promotion is retained only in the live scheduler until it
+  // is admitted; the durable node projection must not claim an unowned scope.
+  assert.deepEqual(duringConflict?.nodes.find((node) => node.id === "issue-2")?.claims, []);
   releaseFirst();
   await run.completion;
   const completed = await repository.loadOrchestration(run.id);

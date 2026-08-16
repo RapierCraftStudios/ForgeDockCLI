@@ -515,7 +515,7 @@ describe("complete work-on trajectory", () => {
       baseBranch: "main",
       autoMerge: true,
       verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
-      onClaimsPromoted: (paths) => promoted.push([...paths]),
+      onClaimsPromoted: (paths) => { promoted.push([...paths]); },
     }, {
       runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
       verifier: new EndToEndVerifier(), host: fixture.host,
