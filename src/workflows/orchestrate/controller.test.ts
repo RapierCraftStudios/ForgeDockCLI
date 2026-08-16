@@ -12,7 +12,7 @@ import {
   type OrchestrationWorkerContext,
   type OrchestrationWorkOnWorker,
 } from "./controller.js";
-import { ClaimPromotionConflictError, type ScheduledWorkItem } from "./scheduler.js";
+import { ClaimPromotionConflictError, materializeClaimDependencies, type ScheduledWorkItem } from "./scheduler.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -159,6 +159,65 @@ describe("OrchestrationController", () => {
     assert.ok(events.includes("started"));
     assert.ok(events.includes("completed"));
     assert.deepEqual(await repository.loadOrchestration(result.orchestrationId), result.record);
+  });
+
+  it("retains a derived glob serialization edge through durable resume", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const predecessorGate = deferred<void>();
+    const launched: string[] = [];
+    const graph = materializeClaimDependencies([
+      { id: "glob", issue: 40, priority: 1, dependencies: [], claims: ["src/**/*.ts"] },
+      { id: "concrete", issue: 41, priority: 1, dependencies: [], claims: ["src/foo.ts"] },
+    ]);
+    const service = controller(repository, async (scheduled) => {
+      launched.push(scheduled.id);
+      if (scheduled.id === "glob") await predecessorGate.promise;
+    }, {
+      reconcileWorker: async ({ node }) => {
+        assert.equal(node.id, "glob");
+        return { disposition: "interrupted", reason: "predecessor transport was lost" };
+      },
+    });
+
+    const created = await service.create({
+      repository: "owner/repo",
+      items: graph.items,
+      serializationEdges: graph.edges,
+      maxParallel: 2,
+    });
+    assert.deepEqual(created.serializationEdges, graph.edges);
+    assert.deepEqual((await repository.loadOrchestration(created.orchestrationId))?.serializationEdges, graph.edges);
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [
+        {
+          ...created.nodes[0]!,
+          status: "suspended",
+          activeAttemptId: "attempt-old",
+          attempts: [{
+            attemptId: "attempt-old",
+            attempt: 1,
+            recovery: "initial",
+            status: "suspended",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:01:00.000Z",
+            completedAt: "2026-01-01T00:01:00.000Z",
+          }],
+        },
+        { ...created.nodes[1]!, status: "queued", attempts: [] },
+      ],
+    });
+
+    const resumed = service.resume(created.orchestrationId);
+    await waitUntil(() => launched.length === 1, "resumed glob predecessor did not dispatch");
+    assert.deepEqual(launched, ["glob"]);
+    predecessorGate.resolve();
+    const result = await resumed;
+    assert.deepEqual(result.schedule.startOrder, ["glob", "concrete"]);
+    assert.equal(result.record.nodes.every((node) => node.status === "completed"), true);
+    assert.deepEqual(result.record.serializationEdges, graph.edges);
+    assert.deepEqual((await repository.loadOrchestration(created.orchestrationId))?.serializationEdges, graph.edges);
   });
 
   it("resumes by attaching to a live worker without launching a duplicate", async () => {

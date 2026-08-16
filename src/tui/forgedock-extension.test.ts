@@ -12,6 +12,7 @@ import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
+import { materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
   bindOrchestrationInvocation,
@@ -658,13 +659,27 @@ test("visible DAG delegation dispatches a successor on its predecessor completio
   }) as typeof state.pi.events.emit;
   const delegator = witnessedDagDelegator(state.pi);
   const completed: number[] = [];
+  const discovered = [
+    { id: "issue-1", issue: 1, title: "One", summary: "One", priority: 1, dependencies: [], claims: ["src/**/*.ts"], labels: [], affectedFiles: ["src/**/*.ts"], memberIssues: [1] },
+    { id: "issue-2", issue: 2, title: "Two", summary: "Two", priority: 1, dependencies: [], claims: ["src/foo.ts"], labels: [], affectedFiles: ["src/foo.ts"], memberIssues: [2] },
+  ];
+  const derived = materializeClaimDependencies(discovered);
+  assert.deepEqual(derived.edges, [{
+    predecessor: "issue-1",
+    successor: "issue-2",
+    overlappingClaims: ["src/**/*.ts ↔ src/foo.ts"],
+  }]);
   const run = await delegator.start({
-    items: [
-      { id: "issue-1", issue: 1, title: "One", summary: "One", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] },
-      { id: "issue-2", issue: 2, title: "Two", summary: "Two", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [2] },
-    ],
+    items: derived.items.map((item) => ({
+      ...item,
+      title: item.title ?? `Issue ${item.issue}`,
+      summary: item.summary ?? "",
+      labels: [],
+      affectedFiles: item.affectedFiles ?? [],
+      memberIssues: item.memberIssues ?? [item.issue],
+    })),
     maxParallel: 2,
-    serializationEdges: [{ predecessor: "issue-1", successor: "issue-2", overlappingClaims: ["src/a.ts"] }],
+    serializationEdges: derived.edges,
     taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
     assertCompleted: async (item) => { completed.push(item.issue); },
     onComplete: () => undefined,
