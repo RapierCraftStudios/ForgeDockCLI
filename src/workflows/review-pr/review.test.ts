@@ -12,6 +12,7 @@ import { isTransientReviewerTransportFailure, materializeReviewFindings, renderR
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
+const deploymentPr: PullRequestSnapshot = { ...pr, headBranch: "staging", title: "Deploy: staging → main" };
 
 class FakeHost implements ForgeHost {
   snapshots: PullRequestSnapshot[] = [pr, pr];
@@ -85,6 +86,19 @@ function artifacts(run: RunState) {
   return { intent, investigation, packet, buildResult };
 }
 
+function deploymentContext(run: RunState, expectedPaths: readonly string[]) {
+  const base = artifacts(run);
+  return {
+    intent: base.intent,
+    investigation: base.investigation,
+    packet: {
+      ...base.packet,
+      payload: { ...base.packet.payload, expectedPaths: [...expectedPaths], risks: [] },
+    },
+    checks: base.buildResult.payload.checks,
+  };
+}
+
 const clean: ReviewerSubmission = { summary: "No blocking defects", findings: [] };
 const inScope = {
   scopeDisposition: "in_scope" as const,
@@ -106,6 +120,89 @@ const followUpAdjudication = (task: AgentTask<unknown>) => ({
 });
 
 describe("fresh-context PR review", () => {
+  it("normalizes deployment inventory paths before planning and scope construction", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const pathWithBackslash = `./src${String.fromCharCode(92)}worker.ts`;
+    const context = deploymentContext(run, ["src/worker.ts"]);
+    const host = new FakeHost();
+    host.snapshots = Array.from({ length: 4 }, () => deploymentPr);
+    host.getPullRequestDiff = async () => {
+      const diffPath = pathWithBackslash;
+      return `diff --git a/${diffPath} b/${diffPath}\n+await update()`;
+    };
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
+    const result = await reviewPullRequest({
+      run,
+      pullRequest: deploymentPr,
+      ...context,
+      deployment: {
+        headSha: sha,
+        headBranch: "staging",
+        baseBranch: "main",
+        changedPaths: [` ${pathWithBackslash} `],
+        checks: context.checks,
+      },
+      workspace: process.cwd(),
+      maxReviewSpecialists: 1,
+    }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs });
+
+    assert.equal(result.run.state, "merging");
+    assert.deepEqual(result.reviewPlan.executionGroups.flatMap(({ scope }) => scope), ["src/worker.ts"]);
+    const reviewerTask = runtime.tasks.find((task) => task.role === "reviewer");
+    assert.ok(reviewerTask);
+    assert.ok(reviewerTask.workspace.scope.readRoots.includes("src"));
+  });
+
+  it("rejects empty, unsafe, and malformed deployment evidence or diff before reviewer dispatch", async () => {
+    const cases: Array<{ name: string; evidence: unknown; diff: unknown; pattern: RegExp }> = [
+      { name: "empty evidence", evidence: [], diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()", pattern: /non-empty array/ },
+      { name: "unsafe evidence", evidence: ["../secret.ts"], diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()", pattern: /malformed or unsafe/ },
+      { name: "malformed evidence", evidence: [42], diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()", pattern: /malformed or unsafe/ },
+      { name: "empty diff", evidence: ["src/lock.ts"], diff: "", pattern: /non-empty array/ },
+      { name: "malformed diff", evidence: ["src/lock.ts"], diff: "not a unified diff", pattern: /non-empty array/ },
+      { name: "unsafe diff", evidence: ["src/lock.ts"], diff: "diff --git a/../secret.ts b/../secret.ts\n+secret()", pattern: /malformed or unsafe/ },
+    ];
+    for (const testCase of cases) {
+      const runs = new InMemoryRunRepository();
+      const run = await reviewingRun(runs);
+      const context = deploymentContext(run, ["src/lock.ts"]);
+      const host = new FakeHost();
+      host.snapshots = [deploymentPr];
+      host.getPullRequestDiff = async () => testCase.diff as string;
+      const runtime = new FakeAgentRuntime();
+      const artifactStore = new InMemoryArtifactRepository();
+
+      await assert.rejects(
+        reviewPullRequest({
+          run,
+          pullRequest: deploymentPr,
+          ...context,
+          deployment: {
+            headSha: sha,
+            headBranch: "staging",
+            baseBranch: "main",
+            changedPaths: testCase.evidence as readonly string[],
+            checks: context.checks,
+          },
+          workspace: process.cwd(),
+          maxReviewSpecialists: 1,
+        }, { runtime, host, artifacts: artifactStore, runs }),
+        (error: unknown) => error instanceof Error
+          && error.name === "WorkflowExecutionError"
+          && testCase.pattern.test(error.message),
+        testCase.name,
+      );
+
+      assert.equal(runtime.tasks.length, 0, testCase.name);
+      assert.equal(host.comments.length, 0, testCase.name);
+      assert.equal(host.findingIssues.length, 0, testCase.name);
+      assert.equal(host.reconciliations.length, 0, testCase.name);
+      assert.deepEqual(artifactStore.artifacts, [], testCase.name);
+      assert.equal((await runs.load(run.runId))?.state, "failed", testCase.name);
+    }
+  });
+
   it("routes risk specialists and approves only the frozen SHA", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);

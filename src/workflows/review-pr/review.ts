@@ -7,10 +7,10 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { AgentRunError } from "../../runtime/agent-runtime.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
+import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, parseDiffPaths, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -256,8 +256,8 @@ export async function reviewPullRequest(
       throw new Error("Review cannot combine Build Result and deployment review evidence");
     }
     const expectedHeadSha = input.buildResult?.payload.headSha ?? input.deployment?.headSha;
-    const changedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
-    if (!expectedHeadSha || !changedPaths) throw new Error("Review evidence is missing its head SHA or changed paths");
+    const evidenceChangedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
+    if (!expectedHeadSha || !evidenceChangedPaths) throw new Error("Review evidence is missing its head SHA or changed paths");
     const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
     if (!samePullRequestIdentity(input.pullRequest, frozen)) {
       throw new Error(
@@ -288,6 +288,18 @@ export async function reviewPullRequest(
     if (input.deployment && (input.deployment.headBranch !== frozen.headBranch || input.deployment.baseBranch !== frozen.baseBranch)) {
       throw new Error("Cannot start deployment review: PR branches changed before review");
     }
+    let diff = "";
+    let changedPaths: readonly string[];
+    if (input.deployment) {
+      // Deployment evidence has an independent caller-side diff read. Reconcile
+      // that metadata with this frozen-boundary read before any prior-plan or
+      // reviewer authority can consume it.
+      diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
+      changedPaths = reconcileDeploymentPathInventory(input.deployment.changedPaths, diff);
+    } else {
+      // Preserve the verified BuildResult path and its existing diff-read order.
+      changedPaths = evidenceChangedPaths;
+    }
     const planContext: Omit<ReviewPlanContext, "packetId" | "packetDigest"> = {
       runId: input.run.runId,
       repo: input.run.subject.repo,
@@ -305,7 +317,7 @@ export async function reviewPullRequest(
       deliveryRunId: expectedDeliveryRunId,
       host: dependencies.host,
     });
-    const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
+    if (!input.deployment) diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
     const priorReviewPlan = input.priorVerdict?.payload.reviewPlan;
     const reviewPlan = isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
       run: input.run, pullRequest: frozen, packet: input.packet, context: planContext,
@@ -442,7 +454,9 @@ export async function reviewPullRequest(
               cwd: input.workspace,
               mode: "read-only",
               scope: scopeManifestFor("build-packet", {
-                affectedFiles: [...input.packet.payload.expectedPaths, ...changedPaths],
+                affectedFiles: input.deployment
+                  ? [...changedPaths]
+                  : [...input.packet.payload.expectedPaths, ...changedPaths],
                 metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
               }),
             },
@@ -863,6 +877,51 @@ function assertPullRequestRouteStable(
 function samePullRequestIdentity(left: PullRequestSnapshot, right: PullRequestSnapshot): boolean {
   return left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase()
     && left.number === right.number;
+}
+
+function reconcileDeploymentPathInventory(evidence: unknown, diff: unknown): string[] {
+  const evidencePaths = canonicalDeploymentPathSet(evidence, "Deployment review evidence");
+  if (typeof diff !== "string") throw new Error("Deployment PR diff must be a string");
+  let diffPaths: string[];
+  try {
+    diffPaths = parseDiffPaths(diff);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Deployment PR diff is malformed: ${reason}`, { cause: error });
+  }
+  const parsedPaths = canonicalDeploymentPathSet(diffPaths, "Deployment PR diff");
+  const evidenceSet = new Set(evidencePaths);
+  const diffSet = new Set(parsedPaths);
+  const omitted = evidencePaths.filter((path) => !diffSet.has(path));
+  const added = parsedPaths.filter((path) => !evidenceSet.has(path));
+  if (omitted.length || added.length) {
+    throw new Error(
+      "Deployment changed-path inventory does not match the frozen PR diff"
+      + ` (omitted from diff: ${omitted.join(", ") || "none"}; added in diff: ${added.join(", ") || "none"})`,
+    );
+  }
+  return parsedPaths;
+}
+
+function canonicalDeploymentPathSet(value: unknown, source: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${source} changed paths must be a non-empty array of safe repository-relative paths`);
+  }
+  const entries = value.map((path, index) => {
+    if (typeof path !== "string") {
+      throw new Error(`${source} changed path at index ${index} is malformed or unsafe`);
+    }
+    const trimmed = path.trim();
+    if (!isConcreteScopePath(trimmed)) {
+      throw new Error(`${source} changed path at index ${index} is malformed or unsafe`);
+    }
+    return trimmed;
+  });
+  const paths = canonicalizeConcreteScopePaths(entries).sort();
+  if (!paths.length) {
+    throw new Error(`${source} changed paths must be a non-empty array of safe repository-relative paths`);
+  }
+  return paths;
 }
 
 async function adjudicateFindingScope(
