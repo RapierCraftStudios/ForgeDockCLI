@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
-import { buildSchedulePreview, claimsConflict, InMemoryLeaseRepository, LeaseContinuityError, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
+import { buildSchedulePreview, claimsConflict, ClaimPromotionConflictError, InMemoryLeaseRepository, LeaseContinuityError, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -94,7 +94,30 @@ describe("lean orchestration scheduler", () => {
     const result = await resultPromise;
     assert.equal(result.status.get("first"), "completed");
     assert.equal(result.status.get("second"), "failed");
+    assert.ok(result.errors.get("second") instanceof ClaimPromotionConflictError);
     assert.match(result.errors.get("second")?.message ?? "", /active work/);
+    assert.equal(promoted.some(([id]) => id === "second"), false);
+  });
+
+  it("rolls back a dynamic claim when its durable sink rejects publication", async () => {
+    const sinkError = new Error("claims sink rejected publication");
+    const published: string[] = [];
+    const result = await runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
+    ], 2, async (_item, scheduler) => {
+      scheduler.promoteClaims(["src/shared"]);
+    }, {
+      onClaimsPromoted: (itemId) => {
+        if (itemId === "first") throw sinkError;
+        published.push(itemId);
+      },
+    });
+
+    assert.equal(result.status.get("first"), "failed");
+    assert.equal(result.errors.get("first"), sinkError);
+    assert.equal(result.status.get("second"), "completed");
+    assert.deepEqual(published, ["second"]);
   });
 
   it("checks late claim promotion against workers that started afterward", async () => {

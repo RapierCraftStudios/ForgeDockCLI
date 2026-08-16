@@ -1507,7 +1507,9 @@ async function orchestrate(argv: string[]): Promise<void> {
           }
           if (error instanceof ClaimPromotionConflictError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
-            return { status: "suspended", error: error.message };
+            // Preserve the scheduler error object through the typed suspended
+            // result; the controller still serializes its message durably.
+            return { status: "suspended", error };
           }
           throw error;
         }

@@ -132,9 +132,12 @@ export async function prepareBuildPacket(
     });
     await dependencies.artifacts.append(packet);
     run = attachArtifact(run, "BuildPacket", packet.id);
+    const packetScopeManifest = scopeManifestForBuildPacket(expectedPaths);
     const advanced = transition(run, "BUILD_PACKET_READY", {
-      scopeManifest: scopeManifestForBuildPacket(expectedPaths),
+      scopeManifest: packetScopeManifest,
     });
+    // This compare-and-swap is the handoff barrier: callers adopt the
+    // returned version only after the packet and its frozen scope are durable.
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
