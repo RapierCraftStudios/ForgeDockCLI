@@ -291,6 +291,80 @@ describe("GitHub canonical marker admission", () => {
   });
 });
 
+describe("GitHub batch issue projection", () => {
+  const batchBody = [
+    "## Problem",
+    "Deliver the batch.",
+    "<!-- FORGEDOCK:BATCH_CONTRACT:v1 -->",
+    JSON.stringify({
+      members: [
+        { issue: 218, title: "First", acceptanceCriteria: ["First passes"], affectedFiles: ["src/a.ts"], claims: ["src/a.ts"], riskClass: "routine" },
+        { issue: 225, title: "Second", acceptanceCriteria: ["Second passes"], affectedFiles: ["src/a.ts"], claims: ["src/a.ts"], riskClass: "routine" },
+      ],
+    }),
+    "<!-- /FORGEDOCK:BATCH_CONTRACT:v1 -->",
+    "<!-- FORGEDOCK:BATCH 218-225 -->",
+  ].join("\n");
+
+  function batchProjectionHarness() {
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed" }> = [];
+    const client = new GitHubClient(".", admissions);
+    let creates = 0;
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view") {
+        const issue = issues.find((candidate) => candidate.number === Number(args[2]));
+        if (!issue) throw new Error(`Unknown issue ${args[2] ?? ""}`);
+        return JSON.stringify({
+          number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
+          state: issue.state.toUpperCase(), labels: [{ name: "batch" }], milestone: null,
+        });
+      }
+      if (args[0] === "issue" && args[1] === "create") {
+        creates += 1;
+        const number = 300 + creates;
+        issues.push({
+          number,
+          title: args[args.indexOf("--title") + 1] ?? "Batch",
+          body: body ?? "",
+          html_url: `https://github.test/a/b/issues/${number}`,
+          state: "open",
+        });
+        return `https://github.test/a/b/issues/${number}\n`;
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    return { admissions, client, issues, creates: () => creates };
+  }
+
+  it("invalidates a closed cached batch projection and safely creates a replacement", async () => {
+    const harness = batchProjectionHarness();
+    const input = { repo: "a/b", title: "Batch 218-225", body: batchBody, priorityLabel: "priority:P2" as const };
+    const first = await harness.client.materializeBatchIssue(input);
+    harness.issues[0]!.state = "closed";
+    const second = await harness.client.materializeBatchIssue(input);
+
+    assert.equal(first.number, 301);
+    assert.equal(second.number, 302);
+    assert.equal(harness.creates(), 2);
+    assert.equal(harness.admissions.records.size, 1);
+    assert.equal([...harness.admissions.records.values()][0]?.snapshot?.number, 302);
+  });
+
+  it("does not replace an open cached batch issue that lost its identity marker", async () => {
+    const harness = batchProjectionHarness();
+    const input = { repo: "a/b", title: "Batch 218-225", body: batchBody, priorityLabel: "priority:P2" as const };
+    await harness.client.materializeBatchIssue(input);
+    harness.issues[0]!.body = "marker removed";
+
+    await assert.rejects(harness.client.materializeBatchIssue(input), /lost its canonical root marker/);
+    assert.equal(harness.creates(), 1);
+  });
+});
+
 describe("GitHub review finding projection", () => {
   it("derives a stable deduplication marker from PR, location, and finding identity", () => {
     const finding = {

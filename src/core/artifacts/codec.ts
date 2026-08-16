@@ -146,6 +146,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
       const payload = artifact.payload as ReviewVerdictPayload;
       return [heading, meta, "", `**Disposition:** \`${payload.disposition}\` · **Reviewed SHA:** \`${payload.headSha}\``, "", `**Reviewer roles:** ${payload.reviewerRoles.map(code).join(", ")}`,
         payload.reviewPlan ? reviewPlanMarkdown(payload.reviewPlan) : "",
+        payload.findingProjection ? `### Finding projection\nPolicy: \`${payload.findingProjection.policy}\` Â· candidates: ${payload.findingProjection.candidateFindingIds.length} Â· materialized: ${payload.findingProjection.materializedFindingIds.length} Â· suppressed: ${payload.findingProjection.suppressed.length}` : "",
         payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
       ].filter(Boolean).join("\n\n");

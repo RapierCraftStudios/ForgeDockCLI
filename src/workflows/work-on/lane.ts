@@ -84,6 +84,11 @@ export function classifyIssueLane(
     throw new Error(`Configured feature promotion target ${featurePromotionTarget} is the protected production target; use a separate integration branch`);
   }
   const explicitEvidence = explicitBranchEvidence(issue);
+  if (productionTarget !== undefined && explicitEvidence.branch === productionTarget) {
+    throw new Error(
+      `Issue #${issue.number} explicitly targets protected production branch ${productionTarget}; ordinary work-on delivery must target an integration branch`,
+    );
+  }
   if (explicitEvidence.branch && explicitEvidence.kind === "source") {
     return { kind: "fast", targetBranch: explicitEvidence.branch, resolution: "explicit-source-branch" };
   }
@@ -317,13 +322,13 @@ function explicitBranchEvidence(
 ): { branch?: string; kind?: "source" | "target" } {
   const body = issue.body ?? "";
   const sourceValues = [
-    sourceBranchValue(/\*\*Code branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
-    sourceBranchValue(/\*\*Worktree base(?: branch)?\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
+    sourceBranchValue(/^\s{0,3}\*\*Code branch\*\*:\s*`?([^`\r\n]+?)`?\s*$/im.exec(body)?.[1]),
+    sourceBranchValue(/^\s{0,3}\*\*Worktree base(?: branch)?\*\*:\s*`?([^`\r\n]+?)`?\s*$/im.exec(body)?.[1]),
   ].filter((value): value is string => Boolean(value));
   const targetValues = [
-    sourceBranchValue(/\*\*Target branch\*\*:\s*`?([^`\r\n]+)`?/i.exec(body)?.[1]),
-    sourceBranchValue(/(?:pull request|delivery PR|PR)[^`\r\n]{0,160}\bonly against\s+`([^`]+)`/i.exec(body)?.[1]),
-    sourceBranchValue(/(?:pull request|PR)[^`\r\n]{0,160}\b(?:base|target) branch exactly\s+`([^`]+)`/i.exec(body)?.[1]),
+    sourceBranchValue(/^\s{0,3}\*\*Target branch\*\*:\s*`?([^`\r\n]+?)`?\s*$/im.exec(body)?.[1]),
+    sourceBranchValue(/^\s{0,3}(?:Open\s+(?:the\s+)?)?(?:pull request|delivery PR|PR)[^`\r\n]{0,160}\bonly against\s+`([^`]+)`[^\r\n]*$/im.exec(body)?.[1]),
+    sourceBranchValue(/^\s{0,3}(?:Open\s+(?:the\s+)?)?(?:pull request|PR)[^`\r\n]{0,160}\b(?:base|target) branch exactly\s+`([^`]+)`[^\r\n]*$/im.exec(body)?.[1]),
   ].filter((value): value is string => Boolean(value));
   const uniqueSources = [...new Set(sourceValues)];
   const uniqueTargets = [...new Set(targetValues)];

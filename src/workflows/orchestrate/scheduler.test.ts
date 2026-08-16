@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
-import { buildSchedulePreview, claimsConflict, InMemoryLeaseRepository, LeaseContinuityError, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
+import { buildSchedulePreview, ClaimPromotionConflictError, claimsConflict, InMemoryLeaseRepository, LeaseContinuityError, materializeClaimDependencies, runSchedule, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function deferredSignal(): { promise: Promise<void>; resolve(): void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((accept) => { resolve = accept; });
+  return { promise, resolve };
+}
 
 describe("lean orchestration scheduler", () => {
   it("honors dependencies, priority, concurrency and path claims", async () => {
@@ -85,11 +91,14 @@ describe("lean orchestration scheduler", () => {
       { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
       { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
     ], 2, async (item, scheduler) => {
-      scheduler.promoteClaims(["src/shared"]);
+      await scheduler.promoteClaims(["src/shared"]);
       if (item.id === "first") await new Promise<void>((resolve) => { releaseFirst = resolve; });
-    }, { onClaimsPromoted: (id, claims) => promoted.push([id, [...claims]]) });
+    }, { onClaimsPromoted: (id, claims) => { promoted.push([id, [...claims]]); } });
     await sleep(5);
-    assert.deepEqual(promoted, [["first", ["src/shared"]]]);
+    assert.deepEqual(promoted, [
+      ["first", ["src/shared"]],
+      ["second", ["src/shared"]],
+    ]);
     releaseFirst();
     const result = await resultPromise;
     assert.equal(result.status.get("first"), "completed");
@@ -112,13 +121,13 @@ describe("lean orchestration scheduler", () => {
       if (item.id === "first") {
         await secondPromoted;
         try {
-          scheduler.promoteClaims(["src/shared"]);
+          await scheduler.promoteClaims(["src/shared"]);
         } finally {
           signalFirstAttempted();
         }
         return;
       }
-      scheduler.promoteClaims(["src/shared"]);
+      await scheduler.promoteClaims(["src/shared"]);
       signalSecondPromoted();
       await keepSecondActive;
     });
@@ -129,6 +138,49 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("first"), "failed");
     assert.equal(result.status.get("second"), "completed");
     assert.match(result.errors.get("first")?.message ?? "", /active work/);
+  });
+
+  it("requeues a typed claim-conflict suspension until the active worker releases its promoted claim", async () => {
+    const firstPromoted = deferredSignal();
+    const secondSuspended = deferredSignal();
+    const releaseFirst = deferredSignal();
+    const attempts = new Map<string, number>();
+    const events: Array<{ type: string; itemId?: string }> = [];
+
+    const schedule = runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
+    ], 2, async (scheduled, scheduler) => {
+      attempts.set(scheduled.id, (attempts.get(scheduled.id) ?? 0) + 1);
+      if (scheduled.id === "first") {
+        await scheduler.promoteClaims(["src/shared"]);
+        firstPromoted.resolve();
+        await releaseFirst.promise;
+        return;
+      }
+      await firstPromoted.promise;
+      try {
+        await scheduler.promoteClaims(["src/shared/file.ts"]);
+      } catch (error) {
+        if (!(error instanceof ClaimPromotionConflictError)) throw error;
+        secondSuspended.resolve();
+        return { status: "suspended", error };
+      }
+    }, {
+      onEvent: (event) => events.push({ type: event.type, ...(event.itemId ? { itemId: event.itemId } : {}) }),
+    });
+
+    await secondSuspended.promise;
+    releaseFirst.resolve();
+    const result = await schedule;
+    assert.equal(result.status.get("first"), "completed");
+    assert.equal(result.status.get("second"), "completed");
+    assert.equal(result.errors.has("second"), false);
+    assert.equal(attempts.get("first"), 1);
+    assert.equal(attempts.get("second"), 2);
+    assert.deepEqual(result.startOrder, ["first", "second", "second"]);
+    assert.ok(events.some((event) => event.type === "suspended" && event.itemId === "second"));
+    assert.ok(events.some((event) => event.type === "resumed" && event.itemId === "second"));
   });
 
   it("streams a newly ready successor without waiting for an unrelated ready node", async () => {
@@ -204,6 +256,26 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("dependent"), "blocked");
     assert.match(result.errors.get("parent")?.message ?? "", /child scope/);
     assert.ok(events.includes("skipped"));
+  });
+
+  it("retains authoritative decomposition children for controller replanning", async () => {
+    const result = await runSchedule([
+      { id: "parent", issue: 1, priority: 1, dependencies: [], claims: [] },
+    ], 1, async () => ({
+      status: "skipped",
+      error: "authoritative child scope required",
+      childIssues: [11, 12],
+    }));
+    assert.deepEqual(result.decompositions && [...result.decompositions.entries()], [["parent", [11, 12]]]);
+    assert.deepEqual(result.waitReasons?.get("parent"), { kind: "decomposition-replan", children: [11, 12] });
+  });
+
+  it("fails closed on duplicate decomposition child references", async () => {
+    const result = await runSchedule([
+      { id: "parent", issue: 1, priority: 1, dependencies: [], claims: [] },
+    ], 1, async () => ({ status: "skipped", childIssues: [11, 11] }));
+    assert.equal(result.status.get("parent"), "failed");
+    assert.match(result.errors.get("parent")?.message ?? "", /duplicate child/);
   });
 
   it("keeps invalid investigations distinct and blocks their dependents", async () => {

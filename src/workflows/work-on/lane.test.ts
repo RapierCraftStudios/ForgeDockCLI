@@ -106,6 +106,35 @@ describe("issue lane classification", () => {
     });
   });
 
+  it("does not treat inline branch examples in issue evidence as routing authority", () => {
+    const finding = {
+      ...issueWithoutMilestone,
+      body: [
+        "## Problem",
+        "Explicit branch evidence bypasses the protected production-target guard",
+        "",
+        "## Evidence",
+        "With productionTarget=main and issue evidence such as **Code branch**: `main` or **Target branch**: `main`, the run incorrectly targets main.",
+      ].join("\n"),
+    };
+    assert.deepEqual(classifyIssueLane(finding, "main", [], "staging", "staging", "main"), {
+      kind: "fast", targetBranch: "staging", resolution: "configured-fast-lane",
+    });
+  });
+
+  it("rejects every explicit branch field that targets protected production", () => {
+    for (const body of [
+      "**Code branch**: `main`",
+      "**Worktree base**: `origin/main`",
+      "**Target branch**: `main`",
+    ]) {
+      assert.throws(
+        () => classifyIssueLane({ ...issueWithoutMilestone, body }, "main", [], "staging", "staging", "main"),
+        /protected production branch main/,
+      );
+    }
+  });
+
   it("rejects an explicit target that conflicts with a milestone lane", () => {
     assert.throws(() => classifyIssueLane({
       ...issue,

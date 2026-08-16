@@ -21,6 +21,12 @@ function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
     id: "review-current", severity: "high", confidence: "high", blocking: true,
     title: "Update is not atomic", causalRoot: "write escapes atomic lock", evidence: "The write escapes the lock", location: "src/a.ts:20",
     intentRelevance: "Breaks the guarded update", remediation: "Keep the write inside the lock",
+    impact: {
+      category: "correctness",
+      trigger: "Two concurrent updates reach the write after the lock is released.",
+      affectedInvariant: criterion,
+      consequence: "The persisted value can lose one accepted update.",
+    },
     reviewerRoles: ["correctness"], scopeDisposition: "in_scope", scopeRationale: "Direct criterion violation",
     matchedAcceptanceCriteria: [criterion], matchedPriorFindingIds: [], introducedByRemediation: false,
     ...overrides,
@@ -117,5 +123,25 @@ describe("review finding scope policy", () => {
       blocking: false, scopeDisposition: "follow_up", reviewerRoles: ["correctness", "security"],
     })), true);
     assert.equal(shouldMaterializeFinding(finding({ blocking: false, scopeDisposition: "rejected" })), false);
+  });
+
+  it("keeps the impact gate fail-closed for advisory and malformed evidence", () => {
+    assert.equal(shouldMaterializeFinding(finding(), "impact-gated"), true);
+    assert.equal(shouldMaterializeFinding(finding({
+      severity: "low", blocking: false, impact: {
+        category: "test-gap",
+        trigger: "A focused race interleaving is not covered.",
+        affectedInvariant: criterion,
+        consequence: "The regression could recur without a targeted test.",
+      },
+    }), "impact-gated"), false);
+    assert.equal(shouldMaterializeFinding(finding({
+      impact: { category: "advisory", trigger: "A reviewer prefers another shape.", affectedInvariant: "No frozen criterion", consequence: "No observable consequence." },
+    }), "impact-gated"), false);
+    const missingImpact = finding();
+    delete missingImpact.impact;
+    assert.equal(shouldMaterializeFinding(missingImpact, "impact-gated"), false);
+    assert.equal(shouldMaterializeFinding(finding({ confidence: "medium" }), "impact-gated"), false);
+    assert.equal(shouldMaterializeFinding(finding({ scopeDisposition: "follow_up", blocking: false }), "impact-gated"), false);
   });
 });

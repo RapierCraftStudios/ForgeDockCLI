@@ -9,6 +9,7 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
+import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
@@ -173,6 +174,34 @@ describe("complete work-on trajectory", () => {
     assert.equal(outcomes.at(-1)?.payload.issueClosure?.status, "completed");
   });
 
+  it("retains the frozen building checkpoint when parent claim arbitration suspends the worker", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_claim_conflict", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Conflicting scope", problem: "Needs shared file", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+
+    await assert.rejects(
+      () => workOn({
+        intent,
+        repoPath: process.cwd(),
+        lane: fastLane,
+        verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+        onClaimsPromoted: async () => { throw new ClaimPromotionConflictError("issue-8", ["issue-9"]); },
+      }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }),
+      ClaimPromotionConflictError,
+    );
+
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author"]);
+    assert.equal((await runs.load(intent.runId))?.state, "building");
+    assert.equal(git.removed, false);
+    assert.equal((await artifacts.list(intent.subject, "Outcome")).length, 0);
+  });
+
   it("resumes preparation from a durable Investigation without replaying the investigator", async () => {
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
@@ -199,8 +228,12 @@ describe("complete work-on trajectory", () => {
     await artifacts.append(intent);
     await artifacts.append(investigationArtifact);
     const runtime = new FakeAgentRuntime([packet, submission, { summary: "Approved", findings: [] }]);
+    let observeClaims!: (claims: readonly string[]) => void;
+    const claimsObserved = new Promise<readonly string[]>((resolve) => { observeClaims = resolve; });
+    let releaseClaims!: () => void;
+    const claimAdmission = new Promise<void>((resolve) => { releaseClaims = resolve; });
 
-    const resumed = await resumeEarlyWorkOn({
+    const resumedPromise = resumeEarlyWorkOn({
       checkpoint: "preparation",
       run,
       intent,
@@ -209,9 +242,17 @@ describe("complete work-on trajectory", () => {
       workspace,
       baseBranch: "main",
       autoMerge: true,
+      onClaimsPromoted: async (claims) => {
+        observeClaims(claims);
+        await claimAdmission;
+      },
       verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
+    assert.deepEqual(await claimsObserved, ["src/a.js"]);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
+    releaseClaims();
+    const resumed = await resumedPromise;
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author", "builder", "reviewer"]);
   });

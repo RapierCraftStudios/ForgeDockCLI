@@ -429,6 +429,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     if (this.#leaseFailure) throw new LeaseContinuityError(this.#leaseFailure);
     if (!this.#witness) this.#failLease("no retained checkpoint witness is configured");
     const snapshot = this.#witness.verify();
+    // Recover the historical bootstrap mismatch only for a demonstrably
+    // unused lease store. Old bootstraps seeded the witness at epoch 1 while
+    // SQLite began at 0, making the documented first acquire impossible.
+    // Never apply this bridge once either side has lease history.
+    if (snapshot.state === "verified"
+      && snapshot.epoch === 1
+      && this.#localMaximum() === 0
+      && Number((this.#database.prepare("SELECT COUNT(*) AS count FROM leases").get() as { count: number }).count) === 0) {
+      this.#acceptWitness(snapshot);
+    }
     if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
       this.#failLease(snapshot.reason ?? "local maximum diverges from the retained witness");
     }

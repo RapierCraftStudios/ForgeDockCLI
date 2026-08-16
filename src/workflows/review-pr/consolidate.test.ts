@@ -13,6 +13,12 @@ const base = {
   blocking: false,
   intentRelevance: "The authority contract must be interoperable.",
   remediation: "Freeze an exact schema and conformance vectors.",
+  impact: {
+    category: "correctness" as const,
+    trigger: "A consumer receives a payload outside the declared contract.",
+    affectedInvariant: "The authority contract is interoperable.",
+    consequence: "Independent consumers disagree or reject the payload.",
+  },
   scopeDisposition: "in_scope" as const,
   scopeRationale: "Directly violates the frozen interoperability criterion.",
   matchedAcceptanceCriteria: ["The authority contract is interoperable."],

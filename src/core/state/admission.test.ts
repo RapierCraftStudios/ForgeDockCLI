@@ -23,7 +23,7 @@ function intent(runId: string, createdAt: string): DurableArtifact {
   return { ...artifact, createdAt };
 }
 
-function outcome(runId: string, createdAt: string, status: "invalid" | "decomposed" | "blocked" | "failed"): DurableArtifact {
+function outcome(runId: string, createdAt: string, status: "invalid" | "decomposed" | "blocked" | "failed" | "abandoned"): DurableArtifact {
   const artifact = createArtifact({
     kind: "Outcome",
     runId,
@@ -133,6 +133,31 @@ describe("subject run admission", () => {
       runId: "run_old",
       state: "decomposed",
     });
+  });
+
+  it("starts a clean run after reset leaves an abandoned Outcome", () => {
+    const artifacts = [
+      intent("run_reset", "2026-01-01T00:00:00.000Z"),
+      outcome("run_reset", "2026-01-01T00:01:00.000Z", "abandoned"),
+    ];
+    assert.deepEqual(decideSubjectAdmission(artifacts), { action: "start" });
+  });
+
+  it("does not discard durable work published after an abandoned Outcome", () => {
+    const runId = "run_reset_race";
+    const investigation = createArtifact({
+      kind: "Investigation", runId, subject, producer: { role: "investigator" },
+      payload: {
+        outcome: "confirmed", confidence: "high", summary: "confirmed after reset",
+        evidence: [{ claim: "race", source: "src/a.ts", detail: "stale controller survived" }],
+        rootCause: "stale controller", affectedSurfaces: ["src/a.ts"], risks: [], recommendation: "recover explicitly",
+      },
+    });
+    assert.deepEqual(decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"),
+      outcome(runId, "2026-01-01T00:01:00.000Z", "abandoned"),
+      investigation,
+    ]), { action: "skip", runId, state: "cancelled" });
   });
 
   it("resumes an invalid run until GitHub issue closure is authoritatively proven", () => {

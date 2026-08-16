@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
+import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
@@ -38,7 +39,7 @@ import { persistControllerTaskTerminal } from "../runtime/controller-task-record
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
-import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
+import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
@@ -52,6 +53,8 @@ import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, p
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
+import { promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController } from "../workflows/orchestrate/controller.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
@@ -61,6 +64,7 @@ import { createForgeDockObserver, type ForgeDockObserver } from "../observabilit
 import type { RunState } from "../core/state/machine.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
+import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
@@ -95,6 +99,122 @@ function runStatePresentation(state: string): { glyph: RunDisplayGlyph; label: s
     case "merging": return { glyph: "active", label: "awaiting human merge" };
     default: return { glyph: "active", label: state };
   }
+}
+
+function decompositionChildIssuesFromArtifacts(
+  parentIssue: number,
+  artifacts: readonly DurableArtifact[],
+  runId: string | undefined,
+): number[] {
+  if (!runId) throw new Error(`Issue #${parentIssue} is decomposed but has no authoritative run id`);
+  let outcome: DurableArtifact<"Outcome"> | undefined;
+  for (let index = artifacts.length - 1; index >= 0; index--) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === "Outcome" && artifact.runId === runId) {
+      outcome = artifact;
+      break;
+    }
+  }
+  if (outcome?.payload.status !== "decomposed") {
+    throw new Error(`Issue #${parentIssue} is decomposed but has no authoritative decomposed Outcome`);
+  }
+  const seen = new Set<number>();
+  return outcome.payload.childIssues.map((reference) => {
+    const match = /^#(\d+)\b/.exec(reference.trim());
+    const child = Number(match?.[1]);
+    if (!Number.isSafeInteger(child) || child < 1) throw new Error(`Issue #${parentIssue} has malformed decomposition child reference '${reference}'`);
+    if (child === parentIssue) throw new Error(`Issue #${parentIssue} decomposition points back to itself`);
+    if (seen.has(child)) throw new Error(`Issue #${parentIssue} decomposition repeats child #${child}`);
+    seen.add(child);
+    return child;
+  });
+}
+
+async function materializeCliDecomposition(input: {
+  github: GitHubClient;
+  artifacts: Pick<ArtifactRepository, "list">;
+  repository: string;
+  defaultBranch: string;
+  effective: EffectiveOrchestrationConfig;
+  orchestration: Readonly<OrchestrationRecord>;
+  node: Readonly<OrchestrationNodeRecord>;
+  item: ScheduledWorkItem;
+  childIssues?: readonly number[];
+  routedIssues?: Map<number, { issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
+}): Promise<{
+  childIssues: readonly number[];
+  items: readonly ScheduledWorkItem[];
+  serializationEdges?: readonly { predecessor: string; successor: string; overlappingClaims: readonly string[] }[];
+} | undefined> {
+  let children = input.childIssues === undefined ? undefined : [...input.childIssues];
+  if (children === undefined) {
+    const artifacts = await input.artifacts.list({ repo: input.repository, issue: input.item.issue });
+    const reconciled = reconcileLatestRunArtifacts(artifacts);
+    if (reconciled.state !== "decomposed") return undefined;
+    children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
+  }
+  if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
+  const selected = new Set([...input.orchestration.issueNumbers, ...children]);
+  const snapshots = await Promise.all(children.map((issue) => input.github.getIssue(issue, input.repository)));
+  const childItems: ScheduledWorkItem[] = [];
+  for (const issue of snapshots) {
+    if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
+    const lane = await resolveIssueLane(
+      issue,
+      input.defaultBranch,
+      input.github,
+      input.effective.fastLaneTarget,
+      input.effective.featurePromotionTarget,
+      input.effective.productionTarget,
+    );
+    input.routedIssues?.set(issue.number, { issue, lane });
+    const affectedFiles = affectedFilesFromIssueBody(issue.body);
+    const labels = issue.labels ?? [];
+    const priority = labels.some((label) => /(?:^|:)P0$/i.test(label)) ? 0
+      : labels.some((label) => /(?:^|:)P1$/i.test(label)) ? 100
+        : labels.some((label) => /(?:^|:)P2$/i.test(label)) ? 200
+          : labels.some((label) => /(?:^|:)P3$/i.test(label)) ? 300 : 400;
+    const sourcePullRequest = /^\*\*Source:\*\*\s*PR\s+#(\d+)\b/im.exec(issue.body)?.[1];
+    const defectClass = /<!--\s*FORGE:CLASS:\s*([A-Za-z0-9_-]+)\s*-->/i.exec(issue.body)?.[1];
+    childItems.push({
+      id: `issue-${issue.number}`,
+      issue: issue.number,
+      priority,
+      dependencies: dependencyIssueNumbersFromBodyCli(issue.body, selected).map((dependency) => `issue-${dependency}`),
+      claims: affectedFiles.length ? [...affectedFiles] : [`component:${input.repository}`],
+      targetBranch: lane.targetBranch,
+      lane: lane.kind,
+      ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+      ...(input.orchestration.productionTarget ?? input.effective.productionTarget
+        ? { productionTarget: input.orchestration.productionTarget ?? input.effective.productionTarget } : {}),
+      affectedFiles,
+      memberIssues: [issue.number],
+      title: issue.title,
+      summary: issue.body.slice(0, 4_000),
+      ...(issue.milestone ? { milestone: issue.milestone } : {}),
+      ...(sourcePullRequest !== undefined ? { sourcePullRequest: Number(sourcePullRequest) } : {}),
+      ...(defectClass !== undefined ? { defectClass } : {}),
+    });
+  }
+  const existingItems: ScheduledWorkItem[] = input.orchestration.nodes.map((candidate) => ({
+    id: candidate.id,
+    issue: candidate.issue,
+    priority: candidate.priority,
+    dependencies: candidate.dependencies.filter((dependency) => dependency !== input.node.id),
+    claims: [...candidate.claims],
+  }));
+  const claimGraph = materializeClaimDependencies([...existingItems, ...childItems]);
+  const serializationEdges = claimGraph.edges.filter((edge) =>
+    childItems.some((child) => child.id === edge.predecessor || child.id === edge.successor));
+  return { childIssues: children, items: childItems, serializationEdges };
+}
+
+function dependencyIssueNumbersFromBodyCli(body: string, selectedIssues: ReadonlySet<number>): number[] {
+  const section = /(?:^|\n)#{2,6}\s+(?:dependencies|prerequisites|blocked by)\s*\n([\s\S]*?)(?=\n#{2,6}\s|$)/i.exec(body)?.[1];
+  if (!section) return [];
+  return [...new Set([...section.matchAll(/(?<![A-Za-z0-9])#(\d+)\b/g)]
+    .map((match) => Number(match[1]))
+    .filter((issue) => Number.isSafeInteger(issue) && issue > 0 && selectedIssues.has(issue)))].sort((a, b) => a - b);
 }
 
 async function main(argv: string[]): Promise<void> {
@@ -276,7 +396,15 @@ async function status(argv: string[]): Promise<void> {
   }
 }
 
-async function workOn(argv: string[]): Promise<void> {
+async function workOn(
+  argv: string[],
+  orchestration?: {
+    promoteClaims(claims: readonly string[]): Promise<void>;
+    recordRun?(runId: string): Promise<void>;
+    /** Abort this nested work-on when its parent orchestration loses liveness. */
+    signal?: AbortSignal;
+  },
+): Promise<void> {
   requirePiNodeVersion();
   const issueArg = parseWorkOnIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) {
@@ -406,6 +534,7 @@ async function workOn(argv: string[]): Promise<void> {
     ...(process.env.FORGEDOCK_ORCHESTRATION_NODE ? { nodeId: process.env.FORGEDOCK_ORCHESTRATION_NODE, workUnitId: process.env.FORGEDOCK_ORCHESTRATION_NODE } : {}),
     ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
   });
+  await orchestration?.recordRun?.(progressRunId);
   const intent = createArtifact({
     kind: "Intent", runId, subject,
     producer: { role: "controller", runtime: "forgedock" },
@@ -490,6 +619,13 @@ async function workOn(argv: string[]): Promise<void> {
   const leaseItem = `issue-${issue.number}`;
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
   const leaseController = new AbortController();
+  const forwardOrchestrationAbort = () => {
+    if (!leaseController.signal.aborted) {
+      leaseController.abort(orchestration?.signal?.reason ?? new Error("Parent orchestration worker aborted"));
+    }
+  };
+  orchestration?.signal?.addEventListener("abort", forwardOrchestrationAbort, { once: true });
+  if (orchestration?.signal?.aborted) forwardOrchestrationAbort();
   let leaseToken: string | undefined;
   let leaseGuard: import("../core/ports/lease.js").LeaseGuard | undefined;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
@@ -508,13 +644,13 @@ async function workOn(argv: string[]): Promise<void> {
     leaseHeartbeat = setInterval(() => {
       try {
         store.heartbeat(leaseItem, lease.token, 60_000);
-        void runs.recordProgress({
-          runId: progressRunId,
-          phase: "controller.heartbeat",
-          message: "Controller lease renewed",
-          occurredAt: new Date().toISOString(),
-        }).catch(() => undefined);
       } catch (error) { leaseController.abort(error); }
+      void runs.recordProgress({
+        runId: progressRunId,
+        phase: "controller.heartbeat",
+        message: "Controller lease renewed",
+        occurredAt: new Date().toISOString(),
+      }).catch(() => undefined);
     }, 20_000);
 
     if (resumeRunId) {
@@ -645,6 +781,11 @@ async function workOn(argv: string[]): Promise<void> {
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
           ...planning,
+          onClaimsPromoted: async (paths) => {
+            await promoteOrchestrationClaims(paths, {
+              ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
+            });
+          },
           signal: leaseController.signal,
         }, { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent });
         const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
@@ -756,6 +897,13 @@ async function workOn(argv: string[]): Promise<void> {
       } else {
         run = { ...run, ...frozenTarget, scopeManifest: recoveredScopeManifest };
       }
+
+      // A crash can leave a durable Build Packet immediately before its first
+      // parent-scheduler promotion. Re-arbitrate every retained packet before
+      // any resume path can edit, publish, remediate, or complete delivery.
+      await promoteOrchestrationClaims(packet.payload.expectedPaths, {
+        ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
+      });
 
       const git = new GitWorktreeManager(process.cwd());
       const verifier = new ProcessVerificationRunner();
@@ -952,6 +1100,11 @@ async function workOn(argv: string[]): Promise<void> {
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
       ...planning,
+      onClaimsPromoted: async (paths) => {
+        await promoteOrchestrationClaims(paths, {
+          ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
+        });
+      },
       signal: leaseController.signal,
     }, {
       runtime, artifacts, runs,
@@ -966,8 +1119,18 @@ async function workOn(argv: string[]): Promise<void> {
     const presentation = runStatePresentation(result.run.state);
     process.stdout.write(`${statusGlyph(result.awaitingHuman ? "active" : presentation.glyph, mode)} Run ${result.run.runId} · ${result.awaitingHuman ? "awaiting human merge" : presentation.label}${suffix}\n`);
     if (result.run.state !== "completed") process.exitCode = 2;
+  } catch (error) {
+    if (error instanceof ClaimPromotionConflictError) {
+      if (orchestration) resolveClaimPromotionConflictAtBoundary(error, "nested-work-on");
+      const resolution = resolveClaimPromotionConflictAtBoundary(error, "standalone-work-on");
+      process.stdout.write(`${statusGlyph("active", mode)} ${process.env.FORGEDOCK_ORCHESTRATION_NODE ?? `issue-${issueArg}`} suspended · Build Packet claims conflict with ${resolution.conflict.conflicts.join(", ")}; retained for explicit orchestration resume\n`);
+      process.exitCode = 2;
+      return;
+    }
+    throw error;
   } finally {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+    orchestration?.signal?.removeEventListener("abort", forwardOrchestrationAbort);
     if (leaseToken) { try { store.release(leaseItem, leaseToken); } catch { /* continuity failure deliberately retains the row */ } }
     await runtime.close();
     store.close();
@@ -1381,6 +1544,20 @@ async function orchestrate(argv: string[]): Promise<void> {
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
       transportCapacity: effective.maxParallel,
+      maxDecompositionChildren: effective.maxRemediationChildren,
+      maxDecompositionDepth: effective.maxRemediationDepth,
+      resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeCliDecomposition({
+        github,
+        artifacts,
+        repository: repository.repo,
+        defaultBranch: repository.defaultBranch,
+        effective,
+        orchestration: durable,
+        node,
+        item,
+        routedIssues,
+        ...(childIssues !== undefined ? { childIssues } : {}),
+      }),
       worker: async (item, controllerContext) => {
       const lease = store.acquire(item.id, owner, 60_000);
       if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
@@ -1388,20 +1565,29 @@ async function orchestrate(argv: string[]): Promise<void> {
       const heartbeat = setInterval(() => {
         try {
           store.heartbeat(item.id, lease.token, 60_000);
-          void controllerContext.heartbeat();
         } catch (error) {
           workerAbort.abort(error);
+          return;
         }
+        void controllerContext.heartbeat().catch((error: unknown) => {
+          if (!workerAbort.signal.aborted) workerAbort.abort(error);
+        });
       }, 20_000);
       try {
         const subject = { repo: repository.repo, issue: item.issue };
-        const admission = decideSubjectAdmission(await artifacts.list(subject), { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue).lane.targetBranch });
+        const issueArtifacts = await artifacts.list(subject);
+        const admission = decideSubjectAdmission(issueArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue).lane.targetBranch });
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
           outcomes.set(item.id, admission.state);
           process.stdout.write(`${statusGlyph(admission.state === "decomposed" ? "blocked" : "passed", mode)} ${item.id} skipped · existing run ${admission.runId} is ${admission.state}\n`);
           if (admission.state === "decomposed") {
-            return { status: "skipped", error: `${item.id} is decomposed; rerun orchestration to freeze its authoritative child scope` };
+            const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+            return {
+              status: "skipped",
+              error: `${item.id} is decomposed; replacement scope will be admitted to this DAG`,
+              childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+            };
           }
           return;
         }
@@ -1430,12 +1616,22 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (thinking !== undefined) resumeArgs.push("--thinking", thinking);
           if (planning.planningProvider !== undefined && planning.planningModel !== undefined) resumeArgs.push("--planning-model", `${planning.planningProvider}/${planning.planningModel}`);
           if (planning.planningThinking !== undefined) resumeArgs.push("--planning-thinking", planning.planningThinking);
-          await workOn(resumeArgs);
-          setAgentEventObservationIdentity({
-            repository: repository.repo,
-            orchestrationId,
-            ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
-          });
+          try {
+            await workOn(resumeArgs, {
+              promoteClaims: controllerContext.promoteClaims,
+              recordRun: (runId) => controllerContext.recordTask({ runId }),
+            });
+          } catch (error) {
+            const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; resume after the active node completes\n`);
+            return suspension.result;
+          } finally {
+            setAgentEventObservationIdentity({
+              repository: repository.repo,
+              orchestrationId,
+              ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+            });
+          }
           const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
           if (resumed.runId) await controllerContext.recordTask({ runId: resumed.runId });
           outcomes.set(item.id, resumed.state);
@@ -1485,8 +1681,9 @@ async function orchestrate(argv: string[]): Promise<void> {
               claims: item.claims,
               metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
             },
-            onClaimsPromoted: (paths) => {
-              controllerContext.promoteClaims(paths);
+            onClaimsPromoted: async (paths) => {
+              await promoteOrchestrationClaimsFromEnvironment(paths);
+              await controllerContext.promoteClaims(paths);
             },
             subjectEvidence: [...issueSubjectEvidence(issue), laneEvidence(lane)],
             ...(batchMembers.length ? { batchMembers } : {}),
@@ -1507,7 +1704,7 @@ async function orchestrate(argv: string[]): Promise<void> {
           }
           if (error instanceof ClaimPromotionConflictError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
-            return { status: "suspended", error: error.message };
+            return { status: "suspended", error };
           }
           throw error;
         }
@@ -1530,7 +1727,13 @@ async function orchestrate(argv: string[]): Promise<void> {
           }
         }
         if (result.run.state === "decomposed") {
-          return { status: "skipped", error: `${item.id} decomposed during orchestration; rerun orchestration to freeze its authoritative child scope` };
+          const issueArtifacts = await artifacts.list(subject);
+          const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+          return {
+            status: "skipped",
+            error: `${item.id} decomposed during orchestration; replacement scope will be admitted to this DAG`,
+            childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+          };
         }
         if (result.run.state !== "completed") {
           const reason = result.outcome?.payload.reason ?? result.run.blockedReason ?? result.run.failure ?? "durable recovery details are required";
@@ -1552,12 +1755,19 @@ async function orchestrate(argv: string[]): Promise<void> {
           return { disposition: "terminal", result: { status: "invalid", error: `#${item.issue} is authoritatively invalid` } };
         }
         if (reconciled.state === "decomposed") {
-          return { disposition: "terminal", result: { status: "skipped", error: `#${item.issue} decomposed into replacement scope` } };
+          return {
+            disposition: "terminal",
+            result: {
+              status: "skipped",
+              error: `#${item.issue} decomposed into replacement scope`,
+              childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+            },
+          };
         }
         if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
           return { disposition: "interrupted", reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
         }
-        const terminal = terminalCliOrchestrationResult(item.issue, issueArtifacts, reconciled);
+        const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
         if (terminal) return { disposition: "terminal", result: terminal };
         return { disposition: "interrupted", reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
       },
@@ -1657,6 +1867,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
     const maxRemediationCycles = orchestrationPlanPositiveInteger(record.plan, "maxRemediationCycles") ?? configuredOrchestration.maxRemediationCycles;
     const maxRemediationDepth = orchestrationPlanNonNegativeInteger(record.plan, "maxRemediationDepth") ?? configuredOrchestration.maxRemediationDepth;
     const maxRemediationChildren = orchestrationPlanPositiveInteger(record.plan, "maxRemediationChildren") ?? configuredOrchestration.maxRemediationChildren;
+    const orchestrationWorkerOwner = `orchestration-worker-${process.pid}-${crypto.randomUUID()}`;
     setAgentEventObservationIdentity({
       repository: record.repository,
       orchestrationId,
@@ -1669,11 +1880,18 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
       const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
       if (reconciled.state === "completed") return { disposition: "terminal" as const, result: { status: "completed" as const }, reason: "Durable Outcome is complete" };
       if (reconciled.state === "invalid") return { disposition: "terminal" as const, result: { status: "invalid" as const, error: `#${item.issue} is authoritatively invalid` } };
-      if (reconciled.state === "decomposed") return { disposition: "terminal" as const, result: { status: "skipped" as const, error: `#${item.issue} decomposed into replacement scope` } };
+      if (reconciled.state === "decomposed") return {
+        disposition: "terminal" as const,
+        result: {
+          status: "skipped" as const,
+          error: `#${item.issue} decomposed into replacement scope`,
+          childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+        },
+      };
       if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
         return { disposition: "interrupted" as const, reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
       }
-      const terminal = terminalCliOrchestrationResult(item.issue, issueArtifacts, reconciled);
+      const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
       if (terminal) return { disposition: "terminal" as const, result: terminal };
       return { disposition: "interrupted" as const, reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
     };
@@ -1682,16 +1900,56 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
       transportCapacity: record.maxParallel,
+      maxDecompositionChildren: maxRemediationChildren,
+      maxDecompositionDepth: maxRemediationDepth,
+      resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeCliDecomposition({
+        github,
+        artifacts,
+        repository: record.repository,
+        defaultBranch: checkout.defaultBranch,
+        effective: {
+          ...configuredOrchestration,
+          maxRemediationChildren,
+          maxRemediationDepth,
+        },
+        orchestration: durable,
+        node,
+        item,
+        ...(childIssues !== undefined ? { childIssues } : {}),
+      }),
+      revalidateRoute: async ({ item }) => {
+        const issue = await github.getIssue(item.issue, record.repository);
+        const lane = await resolveIssueLane(
+          issue,
+          checkout.defaultBranch,
+          github,
+          configuredOrchestration.fastLaneTarget,
+          configuredOrchestration.featurePromotionTarget,
+          configuredOrchestration.productionTarget,
+        );
+        return {
+          targetBranch: lane.targetBranch,
+          lane: lane.kind,
+          ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+          ...(configuredOrchestration.productionTarget !== undefined ? { productionTarget: configuredOrchestration.productionTarget } : {}),
+        };
+      },
       reconcileWorker: ({ item }) => reconcileWorker(item),
       worker: async (item, context) => {
         const subject = { repo: record.repository, issue: item.issue };
-        const current = decideSubjectAdmission(await artifacts.list(subject), {
+        const issueArtifacts = await artifacts.list(subject);
+        const current = decideSubjectAdmission(issueArtifacts, {
           ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}),
         });
         if (current.action === "skip") {
           if (current.state === "completed") return;
           if (current.state === "invalid") return { status: "invalid", error: `#${item.issue} is authoritatively invalid` };
-          return { status: "skipped", error: `#${item.issue} is decomposed; freeze its replacement scope in a new orchestration` };
+          const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+          return {
+            status: "skipped",
+            error: `#${item.issue} is decomposed; replacement scope will be admitted to this DAG`,
+            childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
+          };
         }
         if (current.action === "block") throw new Error(current.reason);
         const workerArgs = [String(item.issue), "--repo", record.repository];
@@ -1718,18 +1976,58 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         if (workerThinking) workerArgs.push("--thinking", workerThinking);
         if (planningProvider && planningModel) workerArgs.push("--planning-model", `${planningProvider}/${planningModel}`);
         if (planningThinking) workerArgs.push("--planning-thinking", planningThinking);
-        await workOn(workerArgs);
-        setAgentEventObservationIdentity({
-          repository: record.repository,
-          orchestrationId,
-          ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
-        });
+        const workerLeaseItem = `orchestration:${record.orchestrationId}:${item.id}`;
+        const workerLease = store.acquire(workerLeaseItem, orchestrationWorkerOwner, 60_000);
+        if (!workerLease) throw new Error(`${item.id} already has an active orchestration worker lease`);
+        const workerAbort = new AbortController();
+        const heartbeat = setInterval(() => {
+          try {
+            store.heartbeat(workerLeaseItem, workerLease.token, 60_000);
+          } catch (error) {
+            workerAbort.abort(error);
+            return;
+          }
+          void context.heartbeat().catch((error: unknown) => {
+            if (!workerAbort.signal.aborted) workerAbort.abort(error);
+          });
+        }, 20_000);
+        try {
+          await workOn(workerArgs, {
+            promoteClaims: context.promoteClaims,
+            recordRun: async (runId) => {
+              await context.recordTask({ runId });
+            },
+            signal: workerAbort.signal,
+          });
+        } catch (error) {
+          if (workerAbort.signal.aborted) {
+            return { status: "suspended", error: "Orchestration worker lost liveness; worker aborted and dependents remain queued" };
+          }
+          const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
+          process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; resume after the active node completes\n`);
+          return suspension.result;
+        } finally {
+          clearInterval(heartbeat);
+          try { store.release(workerLeaseItem, workerLease.token); } catch { /* retain evidence for reconciliation */ }
+          setAgentEventObservationIdentity({
+            repository: record.repository,
+            orchestrationId,
+            ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
+          });
+        }
         const recovered = reconcileLatestRunArtifacts(await artifacts.list(subject));
         if (recovered.runId) await context.recordTask({ runId: recovered.runId });
         if (recovered.state === "completed") return;
         if (recovered.state === "invalid") return { status: "invalid", error: `#${item.issue} is authoritatively invalid` };
-        if (recovered.state === "decomposed") return { status: "skipped", error: `#${item.issue} decomposed into replacement scope` };
-        const terminal = terminalCliOrchestrationResult(item.issue, await artifacts.list(subject), recovered);
+        if (recovered.state === "decomposed") {
+          const issueArtifacts = await artifacts.list(subject);
+          return {
+            status: "skipped",
+            error: `#${item.issue} decomposed into replacement scope`,
+            childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, recovered.runId),
+          };
+        }
+        const terminal = terminalOrchestrationResult(item.issue, await artifacts.list(subject), recovered);
         if (terminal) return terminal;
         throw new Error(`#${item.issue} resumed to ${recovered.state}: ${recovered.warnings.join("; ") || "durable recovery details are required"}`);
       },
@@ -1834,24 +2132,6 @@ function issueSubjectEvidence(issue: { number: number; body: string; labels: rea
     `GitHub issue #${issue.number} labels: ${issue.labels.length ? issue.labels.join(", ") : "none"}`,
     `GitHub issue #${issue.number} body: ${compactBody || "(empty)"}`,
   ];
-}
-
-function terminalCliOrchestrationResult(
-  issue: number,
-  artifacts: readonly DurableArtifact[],
-  reconciled: ReturnType<typeof reconcileLatestRunArtifacts>,
-): Exclude<ScheduleWorkerResult, void> | undefined {
-  const outcome = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
-  if (outcome?.payload.status === "failed" || outcome?.payload.status === "blocked") {
-    return { status: outcome.payload.status, error: `#${issue} reached ${outcome.payload.status}: ${outcome.payload.reason}` };
-  }
-  if (reconciled.state === "blocked" || reconciled.state === "failed") {
-    return {
-      status: reconciled.state,
-      error: `#${issue} reconciled as ${reconciled.state}${reconciled.warnings.length ? `: ${reconciled.warnings.join("; ")}` : ""}`,
-    };
-  }
-  return undefined;
 }
 
 async function collectBaselineChecks(input: {
@@ -2068,7 +2348,7 @@ function bootstrapLeaseWitness(argv: string[]): void {
     return;
   }
   process.stdout.write(`${renderHeader({ subtitle: "local lease witness" })}\n\n`);
-  process.stdout.write(`${statusGlyph("passed", mode)} Created a fail-closed Ed25519 lease witness for this canonical checkout.\n`);
+  process.stdout.write(`${statusGlyph("passed", mode)} ${result.recovered ? "Recovered" : "Created"} a fail-closed Ed25519 lease witness for this canonical checkout.\n`);
   process.stdout.write(`  checkout reference: ${result.configPath}\n`);
   process.stdout.write(`  retained checkpoint: ${result.checkpointPath}\n`);
   process.stdout.write(`  private key: ${result.privateKeyPath}\n\n`);

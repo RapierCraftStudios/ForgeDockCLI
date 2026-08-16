@@ -116,6 +116,10 @@ export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
   status: DurableOrchestrationNodeStatus;
   error?: string;
   childRunIds: string[];
+  /** Authoritative replacement issue numbers when this node was decomposed. */
+  decompositionChildren?: number[];
+  /** Bounded decomposition lineage depth (root nodes are depth zero). */
+  decompositionDepth?: number;
   /** Optional for records created before structured worker recovery existed. */
   attempts?: OrchestrationWorkerAttemptRecord[];
   activeAttemptId?: string;

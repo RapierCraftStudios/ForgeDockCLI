@@ -12,6 +12,28 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 describe("isolated Git worktrees", () => {
+  it("reclaims a repository metadata lock immediately when its owner is dead", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-dead-owner-"));
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "README.md"), "base\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-m", "base");
+
+    const lockPath = join(repo, ".forgedock", "git-metadata.lock");
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: 999_999, token: "dead", startedAt: Date.now() }));
+    utimesSync(lockPath, new Date(), new Date());
+
+    const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+    const workspace = await manager.recover({ runId: "run_dead_owner", issue: 91, baseRef: "HEAD" });
+
+    assert.equal(workspace.branch, "forgedock/issue-91-run_dead_owner");
+    assert.equal(existsSync(lockPath), false);
+  });
+
   it("creates, inspects, commits and removes a managed worktree", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-"));
     const repo = join(root, "repo");
@@ -187,12 +209,54 @@ describe("isolated Git worktrees", () => {
     const workspace = await manager.create({ runId: "run_fetch", issue: 13, baseRef: "origin/main" });
     assert.equal(workspace.baseSha, fetchedSha);
     assert.equal(
+      git(repo, "rev-parse", "refs/remotes/origin/main"),
+      baseSha,
+      "authoritative base discovery must not mutate the checkout's shared tracking ref",
+    );
+    const parallel = await Promise.all([14, 15, 16, 17].map((issue) => manager.create({
+      runId: `run_parallel_fetch_${issue}`,
+      issue,
+      baseRef: "origin/main",
+    })));
+    assert.deepEqual(parallel.map((candidate) => candidate.baseSha), [fetchedSha, fetchedSha, fetchedSha, fetchedSha]);
+    assert.equal(git(repo, "rev-parse", "refs/remotes/origin/main"), baseSha);
+    const managerEntry = fileURLToPath(new URL("./git-worktree.js", import.meta.url));
+    const createWorker = join(root, "create-worktree.mjs");
+    writeFileSync(createWorker, [
+      `import { GitWorktreeManager } from ${JSON.stringify(pathToFileURL(managerEntry).href)};`,
+      "const [repo, worktreeRoot, issue] = process.argv.slice(2);",
+      "const workspace = await new GitWorktreeManager(repo, worktreeRoot).create({ runId: `run_process_fetch_${issue}`, issue: Number(issue), baseRef: 'origin/main' });",
+      "process.stdout.write(JSON.stringify(workspace));",
+    ].join("\n"));
+    const createInChild = (issue: number) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [createWorker, repo, join(root, "worktrees"), String(issue)], {
+        cwd: repo,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+      child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    const processResults = await Promise.all([18, 19, 20, 21].map(createInChild));
+    const processWorkspaces = processResults.map((result) => {
+      assert.equal(result.status, 0, result.stderr);
+      return JSON.parse(result.stdout) as typeof workspace;
+    });
+    assert.deepEqual(processWorkspaces.map((candidate) => candidate.baseSha), [fetchedSha, fetchedSha, fetchedSha, fetchedSha]);
+    assert.equal(git(repo, "rev-parse", "refs/remotes/origin/main"), baseSha);
+    assert.equal(
       readFileSync(join(workspace.path, "README.md"), "utf8").replaceAll("\r\n", "\n"),
       "fetched\n",
     );
     assert.equal(await manager.isAncestor(workspace, baseSha, fetchedSha), true);
     assert.equal(await manager.isAncestor(workspace, fetchedSha, baseSha), false);
     await manager.push(workspace);
+    for (const candidate of processWorkspaces) await manager.remove(candidate);
+    for (const candidate of parallel) await manager.remove(candidate);
     await manager.remove(workspace);
   });
 

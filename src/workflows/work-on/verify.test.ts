@@ -305,6 +305,19 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(uncoveredVerificationCommands(["Run `git diff --check`.", "Run `npm test`."], [
       { id: "diff-check", command: "git", args: ["diff", "--check"] }, command,
     ]), []);
+    const windowsBuild = {
+      id: "build",
+      command: "C:\\Program Files\\nodejs\\node.exe",
+      args: ["C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js", "run", "build"],
+    };
+    assert.deepEqual(uncoveredVerificationCommands([
+      "`C:\\Program Files\\nodejs\\node.exe C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js run build`",
+    ], [windowsBuild]), []);
+    assert.deepEqual(uncoveredVerificationCommands([
+      "`C:\\Program Files\\nodejs\\node.exe C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js run build -- --watch`",
+    ], [windowsBuild]), [
+      "C:\\Program Files\\nodejs\\node.exe C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js run build -- --watch",
+    ]);
     assert.deepEqual(
       uncoveredVerificationCommands(["`node --test test/contract.test.js`"], [command]),
       ["node --test test/contract.test.js"],

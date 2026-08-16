@@ -75,6 +75,14 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
   const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
+  // A verified build published after a review verdict is a new review head.
+  // The older verdict must not make the run look terminally blocked while the
+  // publication/review path is still recoverable. Admission already uses this
+  // ordering rule; reconciliation must expose the same state to orchestration
+  // resume instead of terminalizing the node.
+  const verdictSupersededByBuild = verdict !== undefined
+    && build !== undefined
+    && buildIndex > lastArtifactIndex(ordered, "ReviewVerdict");
 
   let state: RunStateName = "queued";
   const checkpointIsLatest = remediationCheckpoint !== undefined
@@ -97,7 +105,7 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
       warnings.push("Merged Outcome has no approving Review Verdict");
       state = "blocked";
     }
-  } else if (!checkpointIsLatest && verdict) {
+  } else if (!checkpointIsLatest && verdict && !verdictSupersededByBuild) {
     state = verdict.payload.disposition === "approve" ? "merging"
       : verdict.payload.disposition === "request_changes" ? "remediating" : "blocked";
     if (!build || build.payload.headSha !== verdict.payload.headSha) {

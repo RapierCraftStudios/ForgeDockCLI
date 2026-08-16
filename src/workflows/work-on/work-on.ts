@@ -22,6 +22,7 @@ import {
   WorkflowExecutionError,
 } from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket } from "./prepare.js";
+import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
@@ -91,7 +92,7 @@ export async function workOn(
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
     /** Promote frozen Build Packet paths into the owning scheduler before edits begin. */
-    onClaimsPromoted?: (paths: readonly string[]) => void;
+    onClaimsPromoted?: (paths: readonly string[]) => void | Promise<void>;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -133,6 +134,7 @@ export async function workOn(
   };
   let workspace: GitWorkspace | undefined;
   let run: RunState | undefined;
+  let claimPromotionSuspended = false;
   try {
     assertLease(dependencies);
     const issue = input.intent.subject.issue;
@@ -205,8 +207,8 @@ export async function workOn(
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
-    input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     run = prepared.run;
+    await input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     const continued = await continueBuildDelivery({
       run, intent: input.intent, investigation: investigated.investigation, packet: prepared.packet, workspace,
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
@@ -231,6 +233,10 @@ export async function workOn(
     run = continued.run;
     return continued;
   } catch (error) {
+    if (error instanceof ClaimPromotionConflictError) {
+      claimPromotionSuspended = true;
+      throw error;
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
     if (run && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
@@ -241,7 +247,7 @@ export async function workOn(
     if (run?.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run?.state === "blocked" || run?.state === "failed" || run?.state === "cancelled";
+    const retainForRecovery = claimPromotionSuspended || run?.state === "blocked" || run?.state === "failed" || run?.state === "cancelled";
     if (workspace && !retainForRecovery) {
       try { await dependencies.git.remove(workspace); } catch { /* recovery reconciles stale worktrees */ }
     }
@@ -272,7 +278,7 @@ export interface EarlyWorkOnResumeInput extends ScopeExpansionOptions {
   subjectEvidence?: readonly string[];
   batchMembers?: readonly number[];
   batchMemberContracts?: readonly BatchMemberContract[];
-  onClaimsPromoted?: (paths: readonly string[]) => void;
+  onClaimsPromoted?: (paths: readonly string[]) => void | Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -290,6 +296,7 @@ export async function resumeEarlyWorkOn(
   let run = input.run;
   let investigation = input.investigation;
   const workspace = input.workspace;
+  let claimPromotionSuspended = false;
   const agentDependencies = {
     runtime: dependencies.runtime,
     artifacts: dependencies.artifacts,
@@ -366,8 +373,8 @@ export async function resumeEarlyWorkOn(
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
-    input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     run = prepared.run;
+    await input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     const continued = await continueBuildDelivery({
       run,
       intent: input.intent,
@@ -398,6 +405,10 @@ export async function resumeEarlyWorkOn(
     run = continued.run;
     return continued;
   } catch (error) {
+    if (error instanceof ClaimPromotionConflictError) {
+      claimPromotionSuspended = true;
+      throw error;
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
     if (run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
@@ -408,7 +419,7 @@ export async function resumeEarlyWorkOn(
     if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    const retainForRecovery = claimPromotionSuspended || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
     if (!retainForRecovery) {
       try { await dependencies.git.remove(workspace); } catch { /* recovery reconciles stale worktrees */ }
     }

@@ -268,6 +268,9 @@ export function uncoveredVerificationCommands(
       }];
     for (const { candidate, fenced: isFenced } of candidates) {
       if (!candidate) continue;
+      if (commands.some((command) => candidate === [command.command, ...command.args].join(" ").trim())) {
+        continue;
+      }
       if (/^git\s+diff\s+--check$/i.test(candidate)) {
         if (!commands.some(isConfiguredDiffCheck)) uncovered.add(candidate);
         continue;

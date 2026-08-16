@@ -8,7 +8,7 @@ import { createRun, transition, type RunState, type TransitionEvent } from "../.
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
-import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -93,6 +93,12 @@ const inScope = {
   matchedPriorFindingIds: [] as string[],
   introducedByRemediation: false,
   causalRoot: "lock releases before guarded write",
+  impact: {
+    category: "correctness" as const,
+    trigger: "A concurrent update enters after the lock is released.",
+    affectedInvariant: "Concurrent updates pass",
+    consequence: "One accepted update can overwrite another.",
+  },
 };
 const acceptAdjudication = (task: AgentTask<unknown>) => ({
   decisions: [...task.objective.matchAll(/"id": "(review-[a-f0-9]{16})"/g)].map((match) => ({
@@ -194,6 +200,86 @@ describe("fresh-context PR review", () => {
     const lastReviewerComment = Math.max(...events.map((event, index) => event.startsWith("comment:") ? index : -1));
     const issueProjection = events.findIndex((event) => event.startsWith("issue:"));
     assert.ok(issueProjection > lastReviewerComment, "issue projection must follow every reviewer comment");
+  });
+
+  it("uses impact-gated projection to keep low-value test gaps in the verdict only", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtimeDefect = {
+      ...inScope,
+      id: "runtime-defect", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Guarded write can escape the lock", evidence: "The write executes after the lock is released.",
+      location: "src/lock.ts:20", intentRelevance: "Allows concurrent updates to overwrite one another.",
+      remediation: "Keep the write inside the lock.",
+      impact: {
+        category: "correctness" as const,
+        trigger: "Two updates overlap at the unlocked write.",
+        affectedInvariant: "Concurrent updates pass",
+        consequence: "The persisted value can lose an accepted update.",
+      },
+    };
+    const lowTestGap = {
+      ...inScope,
+      id: "test-gap", severity: "low" as const, confidence: "high" as const, blocking: false,
+      causalRoot: "missing callback ordering assertion",
+      title: "Fresh success path lacks an ordering assertion", evidence: "The regression test does not assert callback ordering.",
+      location: "src/lock.ts:42", intentRelevance: "A future refactor could reorder the callback.",
+      remediation: "Add an ordering assertion.",
+      impact: {
+        category: "test-gap" as const,
+        trigger: "A future change reorders the callback without a focused assertion.",
+        affectedInvariant: "Concurrent updates pass",
+        consequence: "The test suite may miss a regression in callback ordering.",
+      },
+    };
+    const host = new FakeHost();
+    const result = await reviewPullRequest({
+      run, pullRequest: pr, ...context, workspace: process.cwd(), findingIssuePolicy: "impact-gated",
+    }, {
+      runtime: new FakeAgentRuntime([
+        { summary: "Runtime defect", findings: [runtimeDefect] },
+        { summary: "Test gap", findings: [lowTestGap] },
+        acceptAdjudication,
+      ]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(host.findingIssues.length, 1);
+    assert.equal(host.findingIssues[0]?.finding.id, result.verdict.payload.findingProjection?.materializedFindingIds[0]);
+    assert.equal(result.verdict.payload.findingProjection?.policy, "impact-gated");
+    assert.equal(result.verdict.payload.findingProjection?.suppressed.length, 1);
+    assert.match(result.verdict.payload.findingProjection?.suppressed[0]?.reason ?? "", /low-severity test-gap/);
+  });
+
+  it("shadow impact gating preserves legacy issue projection while recording suppression candidates", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const lowTestGap = {
+      ...inScope,
+      id: "shadow-test-gap", severity: "low" as const, confidence: "high" as const, blocking: false,
+      causalRoot: "missing callback ordering assertion",
+      title: "Ordering assertion is absent", evidence: "The focused test does not assert the callback order.",
+      location: "src/lock.ts:42", intentRelevance: "A future refactor could reorder the callback.",
+      remediation: "Add an ordering assertion.",
+      impact: {
+        category: "test-gap" as const,
+        trigger: "A future change reorders the callback without a focused assertion.",
+        affectedInvariant: "Concurrent updates pass",
+        consequence: "The test suite may miss a regression in callback ordering.",
+      },
+    };
+    const host = new FakeHost();
+    const result = await reviewPullRequest({
+      run, pullRequest: pr, ...context, workspace: process.cwd(), findingIssuePolicy: "shadow-impact-gated",
+    }, {
+      runtime: new FakeAgentRuntime([{ summary: "Advisory", findings: [lowTestGap] }, clean]),
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(host.findingIssues.length, 1, "shadow mode keeps the legacy projection unchanged");
+    assert.equal(result.verdict.payload.findingProjection?.policy, "shadow-impact-gated");
+    assert.equal(result.verdict.payload.findingProjection?.materializedFindingIds.length, 1);
+    assert.equal(result.verdict.payload.findingProjection?.suppressed.length, 1);
   });
 
   it("fails closed when the PR target branch changes during review", async () => {

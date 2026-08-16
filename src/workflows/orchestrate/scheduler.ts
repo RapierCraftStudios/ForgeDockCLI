@@ -31,6 +31,8 @@ export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "
 export type ScheduleWorkerResult = void | {
   status: "completed" | "skipped" | "blocked" | "suspended" | "failed" | "invalid";
   error?: Error | string;
+  /** Authoritative replacement issue numbers returned by a decomposition outcome. */
+  childIssues?: readonly number[];
 };
 export type WaitReason = OrchestrationWaitReason;
 
@@ -39,6 +41,8 @@ export interface ScheduleResult {
   errors: Map<string, Error>;
   startOrder: string[];
   waitReasons?: Map<string, WaitReason>;
+  /** Decomposition outcomes discovered during this scheduler pass. */
+  decompositions?: Map<string, number[]>;
 }
 export interface ScheduleEvent {
   type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed";
@@ -48,10 +52,10 @@ export interface ScheduleEvent {
   waitReasons?: ReadonlyMap<string, WaitReason>;
 }
 export type ScheduleEventSink = (event: ScheduleEvent) => void;
-export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => void;
+export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => void | Promise<void>;
 export interface ScheduleWorkerContext {
   /** Add concrete Build Packet paths before the worker mutates its checkout. */
-  promoteClaims(claims: readonly string[]): void;
+  promoteClaims(claims: readonly string[]): Promise<void>;
 }
 export interface RunScheduleOptions {
   onEvent?: ScheduleEventSink;
@@ -183,6 +187,7 @@ export async function runSchedule(
   const status = new Map(items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = new Map<string, Error>();
   const waitReasons = new Map<string, WaitReason>();
+  const decompositions = new Map<string, number[]>();
   let queuedCount = items.length;
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
@@ -268,7 +273,7 @@ export async function runSchedule(
       startOrder.push(item.id);
       emit("started", item.id);
       const context: ScheduleWorkerContext = {
-        promoteClaims: (claims) => {
+        promoteClaims: async (claims) => {
           const merged = [...new Set([...(currentClaims.get(item.id) ?? []), ...claims.map((claim) => claim.trim()).filter(Boolean)])];
           // Re-read the live set here. A worker can discover Build Packet
           // paths after later workers have started, so the dispatch-time
@@ -276,9 +281,17 @@ export async function runSchedule(
           const conflicts = [...running.keys()]
             .filter((activeId) => activeId !== item.id)
             .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
-          if (conflicts.length) throw new ClaimPromotionConflictError(item.id, conflicts);
+          if (conflicts.length) {
+            // The Build Packet paths remain authoritative even though this
+            // attempt cannot proceed. Retaining them makes the retry wait on
+            // the actual live claim instead of immediately redispatching with
+            // the node's older, incomplete scope.
+            currentClaims.set(item.id, merged);
+            await options.onClaimsPromoted?.(item.id, merged);
+            throw new ClaimPromotionConflictError(item.id, conflicts);
+          }
           currentClaims.set(item.id, merged);
-          options.onClaimsPromoted?.(item.id, merged);
+          await options.onClaimsPromoted?.(item.id, merged);
         },
       };
       const promise = worker(item, context)
@@ -298,6 +311,13 @@ export async function runSchedule(
           } else if (outcome.status === "skipped") {
             status.set(item.id, "skipped");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            if (outcome.childIssues !== undefined) {
+              const children = normalizeChildIssues(outcome.childIssues, item.issue);
+              if (children.length) {
+                decompositions.set(item.id, children);
+                waitReasons.set(item.id, { kind: "decomposition-replan", children: [...children] });
+              }
+            }
             emit("skipped", item.id);
           } else if (outcome.status === "blocked") {
             status.set(item.id, "blocked");
@@ -307,6 +327,25 @@ export async function runSchedule(
             status.set(item.id, "suspended");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             emit("suspended", item.id);
+            const claimConflict = claimPromotionConflict(outcome.error);
+            if (claimConflict) {
+              // A promoted-claim conflict is transient and owned entirely by
+              // this live scheduler. The controller has already persisted the
+              // suspended attempt, so return the node to the queue and create
+              // a fresh recovery attempt after the conflicting worker exits.
+              status.set(item.id, "queued");
+              errors.delete(item.id);
+              const predecessor = claimConflict.conflicts[0];
+              if (predecessor) {
+                waitReasons.set(item.id, {
+                  kind: "active-claim-conflict",
+                  node: predecessor,
+                  claims: overlappingClaims(currentClaims.get(item.id) ?? [], currentClaims.get(predecessor) ?? []),
+                });
+              }
+              queuedCount++;
+              emit("resumed", item.id);
+            }
           } else if (outcome.status === "invalid") {
             status.set(item.id, "invalid");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
@@ -341,7 +380,29 @@ export async function runSchedule(
     // supervisor can resume the same DAG after durable child work completes.
     break;
   }
-  return { status, errors, startOrder, ...(waitReasons.size ? { waitReasons } : {}) };
+  return {
+    status,
+    errors,
+    startOrder,
+    ...(waitReasons.size ? { waitReasons } : {}),
+    ...(decompositions.size ? { decompositions } : {}),
+  };
+}
+
+function normalizeChildIssues(values: readonly number[], parentIssue: number): number[] {
+  if (!Array.isArray(values)) throw new Error(`Decomposition children for #${parentIssue} must be an array`);
+  const seen = new Set<number>();
+  const children: number[] = [];
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`Decomposition child for #${parentIssue} is not a positive issue number: ${String(value)}`);
+    }
+    if (value === parentIssue) throw new Error(`Decomposition child for #${parentIssue} points back to its parent`);
+    if (seen.has(value)) throw new Error(`Decomposition for #${parentIssue} contains duplicate child #${value}`);
+    seen.add(value);
+    children.push(value);
+  }
+  return children;
 }
 
 function isError(value: unknown): value is Error {
@@ -355,6 +416,10 @@ function asError(value: unknown): Error {
 export function isLeaseContinuityFailure(value: unknown): value is LeaseContinuityError {
   return value instanceof LeaseContinuityError
     || (isError(value) && (value as Error & { code?: unknown }).code === "LEASE_CONTINUITY_UNVERIFIABLE");
+}
+
+function claimPromotionConflict(value: unknown): ClaimPromotionConflictError | undefined {
+  return value instanceof ClaimPromotionConflictError ? value : undefined;
 }
 
 export function claimsConflict(left: readonly string[], right: readonly string[]): boolean {

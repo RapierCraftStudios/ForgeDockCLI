@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
+import { SqliteRepositories } from "./sqlite-repositories.js";
 import {
   bootstrapLocalLeaseWitness,
   createConfiguredLeaseWitness,
@@ -56,6 +57,7 @@ describe("retained lease checkpoint witness", () => {
     mkdirSync(checkout);
     try {
       const result = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      assert.equal(result.recovered, false);
       const referenceText = readFileSync(result.configPath, "utf8");
       const reference = JSON.parse(referenceText) as Record<string, unknown>;
       assert.equal(reference.schema, "forgedock.lease-witness-local/v1");
@@ -65,6 +67,85 @@ describe("retained lease checkpoint witness", () => {
       assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().state, "verified");
       if (process.platform !== "win32") assert.equal(statSync(result.privateKeyPath).mode & 0o077, 0);
       assert.throws(() => bootstrapLocalLeaseWitness(checkout, { localDataRoot }), /already exists|refusing to overwrite/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("uses a freshly bootstrapped witness for the first SQLite lease", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-first-lease-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      assert.equal(witness.verify().epoch, 0);
+      const store = new SqliteRepositories(join(checkout, ".forgedock", "state.db"), { witness });
+      try {
+        const lease = store.acquire("first-use", "worker", 1_000, 1_000);
+        assert.equal(lease?.epoch, 1);
+        assert.equal(store.continuity().state, "verified");
+      } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("bridges the historical epoch-one bootstrap only into an unused lease store", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-old-bootstrap-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      assert.equal(witness.compareAndAdvance(0).epoch, 1);
+      const store = new SqliteRepositories(join(checkout, ".forgedock", "state.db"), { witness });
+      try {
+        const lease = store.acquire("first-use", "worker", 1_000, 1_000);
+        assert.equal(lease?.epoch, 2);
+        assert.equal(store.continuity().epoch, 2);
+      } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("recovers a complete orphaned witness without replacing key material", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-recover-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const created = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const privateKeyBefore = readFileSync(created.privateKeyPath, "utf8");
+      const publicKeyBefore = readFileSync(created.publicKeyPath, "utf8");
+      const checkpointBefore = readFileSync(created.checkpointPath, "utf8");
+      rmSync(created.configPath);
+
+      const recovered = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+
+      assert.equal(recovered.recovered, true);
+      assert.equal(readFileSync(recovered.privateKeyPath, "utf8"), privateKeyBefore);
+      assert.equal(readFileSync(recovered.publicKeyPath, "utf8"), publicKeyBefore);
+      assert.equal(readFileSync(recovered.checkpointPath, "utf8"), checkpointBefore);
+      assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().state, "verified");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("refuses to recover malformed or unexpected orphaned witness material", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-recover-invalid-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const created = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      rmSync(created.configPath);
+      writeFileSync(join(created.checkpointPath, "..", "unexpected.txt"), "unexpected");
+
+      assert.throws(
+        () => bootstrapLocalLeaseWitness(checkout, { localDataRoot }),
+        /cannot be safely recovered|expected files|continuity/i,
+      );
+      assert.equal(readFileSync(created.privateKeyPath, "utf8").includes("PRIVATE KEY"), true);
+      assert.equal(readFileSync(created.publicKeyPath, "utf8").includes("PUBLIC KEY"), true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

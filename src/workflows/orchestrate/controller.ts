@@ -77,6 +77,19 @@ export interface OrchestrationWorkerReconciliationInput {
   attempt?: Readonly<OrchestrationWorkerAttemptRecord>;
 }
 
+export interface OrchestrationRouteSnapshot {
+  targetBranch: string;
+  lane: "fast" | "feature";
+  promotionTarget?: string;
+  productionTarget?: string;
+}
+
+export type OrchestrationRouteRevalidator = (input: {
+  orchestration: Readonly<OrchestrationRecord>;
+  node: Readonly<OrchestrationNodeRecord>;
+  item: ScheduledWorkItem;
+}) => Promise<OrchestrationRouteSnapshot>;
+
 export type OrchestrationWorkerReconciliation =
   | {
       disposition: "live";
@@ -100,6 +113,23 @@ export type OrchestrationWorkerReconciler = (
   input: OrchestrationWorkerReconciliationInput,
 ) => Promise<OrchestrationWorkerReconciliation>;
 
+export interface OrchestrationDecompositionExpansion {
+  /** Authoritative replacement issue numbers reported by the worker/artifacts. */
+  childIssues: readonly number[];
+  /** Frozen scheduler nodes for the replacement scope. */
+  items: readonly ScheduledWorkItem[];
+  /** Optional claim-only ordering derived for the replacement nodes. */
+  serializationEdges?: readonly ClaimSerializationEdge[];
+}
+
+export type OrchestrationDecompositionResolver = (input: {
+  orchestration: Readonly<OrchestrationRecord>;
+  node: Readonly<OrchestrationNodeRecord>;
+  item: ScheduledWorkItem;
+  /** Omitted only when recovering a legacy skipped node from authoritative artifacts. */
+  childIssues?: readonly number[];
+}) => Promise<OrchestrationDecompositionExpansion | undefined>;
+
 export interface OrchestrationControllerDependencies {
   repository: OrchestrationRepository;
   worker: OrchestrationWorkOnWorker;
@@ -107,6 +137,14 @@ export interface OrchestrationControllerDependencies {
   executionAdmission: OrchestrationExecutionAdmission;
   /** Required to safely resume a record containing running/suspended nodes. */
   reconcileWorker?: OrchestrationWorkerReconciler;
+  /** Refresh queued delivery routes from authoritative issue/config evidence before resumed dispatch. */
+  revalidateRoute?: OrchestrationRouteRevalidator;
+  /** Resolve and materialize authoritative replacement nodes after decomposition. */
+  resolveDecomposition?: OrchestrationDecompositionResolver;
+  /** Maximum replacement children accepted from one decomposition outcome. */
+  maxDecompositionChildren?: number;
+  /** Maximum replacement lineage depth (root nodes are depth zero). */
+  maxDecompositionDepth?: number;
   /** Available worker slots in the caller's process/RPC/subagent transport. */
   transportCapacity: number | (() => number | Promise<number>);
   onEvent?: OrchestrationEventSink;
@@ -173,6 +211,7 @@ export class OrchestrationController {
           edges: input.serializationEdges.map(cloneSerializationEdge),
         };
     validateGraph(graph.items, graph.edges);
+    for (const item of graph.items) assertProtectedProductionRoute(item, input.productionTarget);
 
     const requestedIssueNumbers = uniqueIssueNumbers(
       input.requestedIssueNumbers
@@ -229,7 +268,23 @@ export class OrchestrationController {
     let claim: OrchestrationExecutionClaim | undefined;
     let state: PersistenceState | undefined;
     try {
-      claim = await this.dependencies.executionAdmission.acquire(orchestrationId);
+      try {
+        claim = await this.dependencies.executionAdmission.acquire(orchestrationId);
+      } catch (error) {
+        // A newly created DAG must not remain indistinguishably "running" when
+        // execution admission fails before the controller can own it.
+        const unstarted = await this.dependencies.repository.loadOrchestration(orchestrationId).catch(() => undefined);
+        if (unstarted
+          && unstarted.executionAttempt === 0
+          && unstarted.nodes.every((node) => node.status === "queued" && !(node.attempts?.length))) {
+          await this.dependencies.repository.saveOrchestration({
+            ...unstarted,
+            status: "failed",
+            updatedAt: this.now(),
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
       if (!claim) throw new Error(`Orchestration ${orchestrationId} is already active in another controller`);
       if (!claim.claimId.trim()) throw new Error(`Execution admission returned an empty claim id for ${orchestrationId}`);
       claim.assertValid();
@@ -275,28 +330,40 @@ export class OrchestrationController {
       }
 
       const executionState = state;
-      const schedule = await runSchedule(
-        prepared.items,
-        effectiveMaxParallel,
-        (item, schedulerContext) => this.executePreparedWorker(executionState, item, schedulerContext, prepared.actions.get(item.id)),
-        {
-          serializationEdges: prepared.serializationEdges,
-          resumedItemIds: prepared.resumedItemIds,
-          onClaimsPromoted: (itemId, claims) => {
-            this.updateNode(executionState, itemId, (node) => ({ ...node, claims: [...claims] }));
-            this.emitSnapshot(executionState.record, executionState);
+      const startOrder: string[] = [];
+      let schedule: ScheduleResult = scheduleResultFromRecord(state.record, []);
+      let pass = prepared;
+      while (pass.items.length) {
+        const current = await runSchedule(
+          pass.items,
+          effectiveMaxParallel,
+          (item, schedulerContext) => this.executePreparedWorker(executionState, item, schedulerContext, pass.actions.get(item.id)),
+          {
+            serializationEdges: pass.serializationEdges,
+            resumedItemIds: pass.resumedItemIds,
+            onClaimsPromoted: async (itemId, claims) => {
+              this.updateNode(executionState, itemId, (node) => ({ ...node, claims: [...claims] }));
+              this.emitSnapshot(executionState.record, executionState);
+              await this.flush(executionState);
+            },
+            onEvent: (event) => this.handleScheduleEvent(executionState, event, pass.actions),
           },
-          onEvent: (event) => this.handleScheduleEvent(executionState, event, prepared.actions),
-        },
-      );
-
-      this.applyScheduleResult(state, schedule);
+        );
+        startOrder.push(...current.startOrder);
+        this.applyScheduleResult(state, current);
+        schedule = current;
+        const expanded = await this.expandDecompositions(state, current);
+        if (!expanded) break;
+        await this.flush(state);
+        pass = this.prepareFollowup(state);
+        if (!pass.items.length) break;
+      }
       this.finalizeRecord(state);
       await this.flush(state);
       return {
         orchestrationId,
         effectiveMaxParallel,
-        schedule: mergeResultWithRecord(schedule, state.record),
+        schedule: mergeResultWithRecord({ ...schedule, startOrder }, state.record),
         record: structuredClone(state.record),
       };
     } catch (error) {
@@ -325,6 +392,7 @@ export class OrchestrationController {
     const items = record.nodes.map(itemFromNodeRecord);
     const serializationEdges = (record.serializationEdges ?? []).map(cloneSerializationEdge);
     validateGraph(items, serializationEdges);
+    for (const item of items) assertProtectedProductionRoute(item, record.productionTarget);
     return {
       items,
       serializationEdges,
@@ -337,8 +405,9 @@ export class OrchestrationController {
     const actions = new Map<string, PreparedAction>();
     const completed = new Set(state.record.nodes.filter((node) => node.status === "completed").map((node) => node.id));
 
-    for (const node of state.record.nodes) {
-      if (node.status === "completed") continue;
+    for (const storedNode of [...state.record.nodes]) {
+      if (storedNode.status === "completed") continue;
+      const node = await this.revalidateNodeRoute(state, storedNode);
       const item = itemFromNodeRecord(node);
       if (node.status === "running" || node.status === "suspended") {
         const attemptEvidence = referencedAttempt(node);
@@ -406,7 +475,21 @@ export class OrchestrationController {
         continue;
       }
 
-      if (node.status === "skipped" || node.status === "invalid") {
+      if (node.status === "skipped") {
+        if (node.decompositionChildren?.length) {
+          assertPersistedDecomposition(state.record, node);
+          continue;
+        }
+        const expansion = await this.resolveDecomposition(state, node, item);
+        if (expansion) continue;
+        actions.set(node.id, {
+          kind: "terminal",
+          result: { status: node.status, ...(node.error !== undefined ? { error: node.error } : {}) },
+        });
+        continue;
+      }
+
+      if (node.status === "invalid") {
         actions.set(node.id, {
           kind: "terminal",
           result: { status: node.status, ...(node.error !== undefined ? { error: node.error } : {}) },
@@ -421,13 +504,35 @@ export class OrchestrationController {
       actions.set(node.id, { kind: "launch", recovery });
     }
 
-    const remainingIds = new Set(state.record.nodes.filter((node) => !completed.has(node.id)).map((node) => node.id));
+    const remainingIds = new Set(state.record.nodes
+      .filter((node) => !completed.has(node.id)
+        && !(node.status === "skipped" && node.decompositionChildren?.length))
+      .map((node) => node.id));
     const items = state.record.nodes
       .filter((node) => remainingIds.has(node.id))
       .map((node) => ({
         ...itemFromNodeRecord(node),
         dependencies: node.dependencies.filter((dependency) => remainingIds.has(dependency)),
       }));
+    // A legacy skipped node may have been expanded during the loop above,
+    // adding queued children that were not present in the original snapshot.
+    // Give those durable nodes an explicit launch action before scheduling.
+    for (const item of items) {
+      if (actions.has(item.id)) continue;
+      const node = requiredNode(state.record, item.id);
+      if (node.status === "queued") {
+        actions.set(item.id, {
+          kind: "launch",
+          recovery: node.attempts?.length ? "resume" : "initial",
+        });
+      } else {
+        const status = node.status === "running" ? "suspended" : node.status;
+        actions.set(item.id, {
+          kind: "terminal",
+          result: { status, ...(node.error !== undefined ? { error: node.error } : {}) },
+        });
+      }
+    }
     const serializationEdges = (state.record.serializationEdges ?? [])
       .filter((edge) => remainingIds.has(edge.predecessor) && remainingIds.has(edge.successor))
       .map(cloneSerializationEdge);
@@ -438,6 +543,257 @@ export class OrchestrationController {
       actions,
       resumedItemIds: items.map((item) => item.id),
     };
+  }
+
+  /**
+   * Build the next scheduler pass after a live decomposition. Terminal nodes
+   * remain in the graph as blockers, while the replacement children and any
+   * dependency descendants reopened by the replacement are dispatched.
+   */
+  private prepareFollowup(state: PersistenceState): PreparedExecution {
+    const included = new Set(
+      state.record.nodes
+        .filter((node) => node.status !== "completed"
+          && !(node.status === "skipped" && node.decompositionChildren?.length))
+        .map((node) => node.id),
+    );
+    const items = state.record.nodes
+      .filter((node) => included.has(node.id))
+      .map((node) => ({
+        ...itemFromNodeRecord(node),
+        dependencies: node.dependencies.filter((dependency) => included.has(dependency)),
+      }));
+    const actions = new Map<string, PreparedAction>();
+    for (const node of state.record.nodes) {
+      if (!included.has(node.id)) continue;
+      if (node.status === "queued") {
+        actions.set(node.id, {
+          kind: "launch",
+          recovery: node.attempts?.length ? "resume" : "initial",
+        });
+      } else {
+        const status = node.status === "running" ? "suspended" : node.status;
+        actions.set(node.id, {
+          kind: "terminal",
+          result: {
+            status,
+            ...(node.error !== undefined ? { error: node.error } : {}),
+          },
+        });
+      }
+    }
+    const serializationEdges = (state.record.serializationEdges ?? [])
+      .filter((edge) => included.has(edge.predecessor) && included.has(edge.successor))
+      .map(cloneSerializationEdge);
+    validateGraph(items, serializationEdges);
+    return {
+      items,
+      serializationEdges,
+      actions,
+      resumedItemIds: items.map((item) => item.id),
+    };
+  }
+
+  private async expandDecompositions(state: PersistenceState, result: ScheduleResult): Promise<boolean> {
+    if (!result.decompositions?.size) return false;
+    for (const [nodeId, childIssues] of result.decompositions) {
+      const node = requiredNode(state.record, nodeId);
+      const item = itemFromNodeRecord(node);
+      const expansion = await this.resolveDecomposition(state, node, item, childIssues);
+      if (!expansion) {
+        throw new Error(`Decomposition of ${node.id} produced child issues but no resolver materialized them`);
+      }
+    }
+    return true;
+  }
+
+  private async resolveDecomposition(
+    state: PersistenceState,
+    node: OrchestrationNodeRecord,
+    item: ScheduledWorkItem,
+    childIssues?: readonly number[],
+  ): Promise<OrchestrationDecompositionExpansion | undefined> {
+    const resolver = this.dependencies.resolveDecomposition;
+    if (!resolver) {
+      if (childIssues?.length) {
+        throw new Error(`Decomposition of ${node.id} requires a durable child-scope resolver`);
+      }
+      return undefined;
+    }
+    state.claim.assertValid();
+    const expansion = await resolver({
+      orchestration: structuredClone(state.record),
+      node: structuredClone(node),
+      item: structuredClone(item),
+      ...(childIssues !== undefined ? { childIssues: [...childIssues] } : {}),
+    });
+    state.claim.assertValid();
+    if (!expansion) {
+      if (childIssues?.length) throw new Error(`Decomposition resolver returned no replacement scope for ${node.id}`);
+      return undefined;
+    }
+    this.applyDecompositionExpansion(state, node.id, expansion, childIssues);
+    return expansion;
+  }
+
+  private applyDecompositionExpansion(
+    state: PersistenceState,
+    nodeId: string,
+    expansion: OrchestrationDecompositionExpansion,
+    expectedChildIssues?: readonly number[],
+  ): void {
+    const parent = requiredNode(state.record, nodeId);
+    if (parent.status !== "skipped") throw new Error(`Cannot expand non-skipped orchestration node ${nodeId}`);
+    const children = normalizeChildIssues(expansion.childIssues, parent.issue);
+    if (expectedChildIssues !== undefined && !sameNumbers(children, normalizeChildIssues(expectedChildIssues, parent.issue))) {
+      throw new Error(`Decomposition resolver changed the authoritative child scope for ${nodeId}`);
+    }
+    if (parent.decompositionChildren?.length) {
+      if (!sameNumbers(parent.decompositionChildren, children)) {
+        throw new Error(`Orchestration node ${nodeId} already has a different durable child scope`);
+      }
+      assertPersistedDecomposition(state.record, parent);
+      return;
+    }
+    const maxChildren = this.dependencies.maxDecompositionChildren ?? 100;
+    const maxDepth = this.dependencies.maxDecompositionDepth ?? 4;
+    assertPositiveInteger(maxChildren, "maxDecompositionChildren");
+    if (!Number.isSafeInteger(maxDepth) || maxDepth < 0) throw new Error("maxDecompositionDepth must be a non-negative integer");
+    if (!children.length) throw new Error(`Decomposition of ${nodeId} produced no replacement children`);
+    if (children.length > maxChildren) throw new Error(`Decomposition of ${nodeId} exceeds the ${maxChildren}-child limit`);
+    const depth = (parent.decompositionDepth ?? 0) + 1;
+    if (depth > maxDepth) throw new Error(`Decomposition of ${nodeId} exceeds the ${maxDepth}-level depth limit`);
+
+    const childSet = new Set(children);
+    const existingByIssue = new Map(state.record.nodes.map((candidate) => [candidate.issue, candidate.id] as const));
+    const childItems = expansion.items.map(cloneScheduledItem);
+    if (childItems.length !== children.length) {
+      throw new Error(`Decomposition of ${nodeId} returned ${childItems.length} scheduler nodes for ${children.length} child issues`);
+    }
+    const childIds = new Set<string>();
+    const childIssuesSeen = new Set<number>();
+    for (const child of childItems) {
+      if (!childSet.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned unreported child issue #${child.issue}`);
+      if (childIds.has(child.id)) throw new Error(`Decomposition of ${nodeId} returned duplicate child node ${child.id}`);
+      if (childIssuesSeen.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned duplicate child issue #${child.issue}`);
+      if (existingByIssue.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned existing issue #${child.issue}`);
+      if (child.dependencies.includes(parent.id)) throw new Error(`Decomposition child ${child.id} depends on its skipped parent ${parent.id}`);
+      childIds.add(child.id);
+      childIssuesSeen.add(child.issue);
+    }
+    if (childIssuesSeen.size !== childSet.size) throw new Error(`Decomposition of ${nodeId} did not materialize every child issue`);
+    const originalDependencies = new Map(state.record.nodes.map((candidate) => [candidate.id, [...candidate.dependencies]] as const));
+    const descendants = new Set(state.record.nodes
+      .filter((candidate) => candidate.status === "blocked" && dependsOn(originalDependencies, candidate.id, parent.id))
+      .map((candidate) => candidate.id));
+    const replacementIds = [...childIds];
+    const replaceParentDependency = (dependencies: readonly string[]): string[] => [
+      ...new Set(dependencies.flatMap((dependency) => dependency === parent.id ? replacementIds : [dependency])),
+    ];
+    const expandedNodes = state.record.nodes.map((candidate) => {
+      if (candidate.id === parent.id) {
+        return {
+          ...candidate,
+          decompositionChildren: [...children],
+          decompositionDepth: depth - 1,
+          waitReason: { kind: "decomposition-replan" as const, children: [...children] },
+        };
+      }
+      const dependencies = replaceParentDependency(candidate.dependencies);
+      if (descendants.has(candidate.id)) {
+        const reopened = clearNodeForRetry(candidate);
+        return { ...reopened, dependencies };
+      }
+      return dependencies.length === candidate.dependencies.length
+        ? candidate
+        : { ...candidate, dependencies };
+    });
+    const childNodes = childItems.map((child) => ({
+      ...nodeRecordFromItem(child),
+      decompositionDepth: depth,
+    }));
+    const rewrittenEdges = rewriteDecompositionEdges(state.record.serializationEdges ?? [], parent.id, replacementIds);
+    const suppliedEdges = (expansion.serializationEdges ?? []).map(cloneSerializationEdge);
+    const serializationEdges = mergeSerializationEdges([...rewrittenEdges, ...suppliedEdges]);
+    const allItems = expandedNodes.concat(childNodes).map(itemFromNodeRecord);
+    validateGraph(allItems, serializationEdges);
+    this.replaceRecord(state, {
+      ...state.record,
+      issueNumbers: uniqueIssueNumbers([...state.record.issueNumbers, ...children]),
+      nodes: [...expandedNodes, ...childNodes],
+      serializationEdges: serializationEdges.map((edge) => ({
+        predecessor: edge.predecessor,
+        successor: edge.successor,
+        overlappingClaims: [...edge.overlappingClaims],
+      })),
+      updatedAt: this.now(),
+    });
+    this.emitSnapshot(state.record, state);
+  }
+
+  private async revalidateNodeRoute(
+    state: PersistenceState,
+    node: OrchestrationNodeRecord,
+  ): Promise<OrchestrationNodeRecord> {
+    const revalidate = this.dependencies.revalidateRoute;
+    if (!revalidate) {
+      assertProtectedProductionRoute(itemFromNodeRecord(node), state.record.productionTarget);
+      return node;
+    }
+    state.claim.assertValid();
+    const route = await revalidate({
+      orchestration: structuredClone(state.record),
+      node: structuredClone(node),
+      item: itemFromNodeRecord(node),
+    });
+    state.claim.assertValid();
+    const candidate: ScheduledWorkItem = {
+      ...itemFromNodeRecord(node),
+      targetBranch: route.targetBranch,
+      lane: route.lane,
+      ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
+      ...(route.productionTarget !== undefined ? { productionTarget: route.productionTarget } : {}),
+    };
+    assertProtectedProductionRoute(candidate, state.record.productionTarget);
+    if (route.productionTarget !== state.record.productionTarget) {
+      throw new Error(
+        `Authoritative route for ${node.id} reports production target ${route.productionTarget ?? "unset"}, but orchestration ${state.record.orchestrationId} is frozen to ${state.record.productionTarget ?? "unset"}`,
+      );
+    }
+    const changed = node.targetBranch !== route.targetBranch
+      || node.lane !== route.lane
+      || node.promotionTarget !== route.promotionTarget
+      || node.productionTarget !== route.productionTarget;
+    if (!changed) return node;
+    const active = node.activeAttemptId === undefined
+      ? undefined
+      : node.attempts?.find((attempt) => attempt.attemptId === node.activeAttemptId);
+    const hasSemanticExecution = node.childRunIds.length > 0
+      || (node.attempts ?? []).some((attempt) => attempt.runId !== undefined || attempt.agentTaskId !== undefined || attempt.sessionId !== undefined);
+    const hasActiveTransportIdentity = active !== undefined
+      && [active.taskId, active.controllerTaskId, active.agentTaskId, active.runId, active.sessionId].some((value) => value !== undefined);
+    if (hasSemanticExecution || hasActiveTransportIdentity) {
+      throw new Error(
+        `Durable route drift for ${node.id}: frozen ${node.lane ?? "unknown"}:${node.targetBranch ?? "unset"} now classifies to ${route.lane}:${route.targetBranch}; refusing to retarget started work`,
+      );
+    }
+    this.updateNode(state, node.id, (current) => {
+      const {
+        targetBranch: _targetBranch,
+        lane: _lane,
+        promotionTarget: _promotionTarget,
+        productionTarget: _productionTarget,
+        ...retained
+      } = current;
+      return {
+        ...retained,
+        targetBranch: route.targetBranch,
+        lane: route.lane,
+        ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
+        ...(route.productionTarget !== undefined ? { productionTarget: route.productionTarget } : {}),
+      };
+    });
+    return requiredNode(state.record, node.id);
   }
 
   private async executePreparedWorker(
@@ -465,8 +821,12 @@ export class OrchestrationController {
       return result;
     }
 
-    const attempt = await this.beginAttempt(state, item.id, action.recovery, action.recoveryOfAttemptId);
-    const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, action.recovery);
+    const existingAttempts = requiredNode(state.record, item.id).attempts ?? [];
+    const recovery = action.recovery === "initial" && existingAttempts.length > 0
+      ? "resume"
+      : action.recovery;
+    const attempt = await this.beginAttempt(state, item.id, recovery, action.recoveryOfAttemptId);
+    const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, recovery);
     let result: ScheduleWorkerResult;
     try {
       result = await this.dependencies.worker(item, context);
@@ -489,10 +849,10 @@ export class OrchestrationController {
       orchestrationId: state.record.orchestrationId,
       attemptId,
       recovery,
-      promoteClaims: (claims) => {
+      promoteClaims: async (claims) => {
         assertAttemptActive(state.record, item.id, attemptId);
         state.claim.assertValid();
-        schedulerContext.promoteClaims(claims);
+        await schedulerContext.promoteClaims(claims);
       },
       recordTask: async (identity) => {
         const identityValues = Object.values(identity);
@@ -787,7 +1147,14 @@ export class OrchestrationController {
         // completed but before the scheduler observes its callback return.
         // Never regress that atomic terminal transition to the event's stale
         // running/queued projection.
-        if ((scheduledStatus === "queued" || scheduledStatus === "running") && isDurablyTerminalNode(node)) return node;
+        const retryingPromotedClaimConflict = event.type === "resumed"
+          && event.itemId === node.id
+          && scheduledStatus === "queued"
+          && node.status === "suspended"
+          && event.waitReasons?.get(node.id)?.kind === "active-claim-conflict";
+        if ((scheduledStatus === "queued" || scheduledStatus === "running")
+          && isDurablyTerminalNode(node)
+          && !retryingPromotedClaimConflict) return node;
         const error = event.errors.get(node.id);
         const waitReason = event.waitReasons?.get(node.id);
         const { error: _error, waitReason: _waitReason, ...rest } = node;
@@ -1043,6 +1410,92 @@ function cloneSerializationEdge(edge: ClaimSerializationEdge): ClaimSerializatio
   };
 }
 
+function normalizeChildIssues(values: readonly number[], parentIssue: number): number[] {
+  if (!Array.isArray(values)) throw new Error(`Decomposition children for #${parentIssue} must be an array`);
+  const seen = new Set<number>();
+  const children: number[] = [];
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`Decomposition child for #${parentIssue} is not a positive issue number: ${String(value)}`);
+    }
+    if (value === parentIssue) throw new Error(`Decomposition child for #${parentIssue} points back to its parent`);
+    if (seen.has(value)) throw new Error(`Decomposition for #${parentIssue} contains duplicate child #${value}`);
+    seen.add(value);
+    children.push(value);
+  }
+  return children;
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
+  return [...left].sort((a, b) => a - b).join(",") === [...right].sort((a, b) => a - b).join(",");
+}
+
+function assertPersistedDecomposition(record: OrchestrationRecord, parent: OrchestrationNodeRecord): void {
+  const children = parent.decompositionChildren;
+  if (!children?.length) throw new Error(`Decomposed node ${parent.id} has no durable child issue references`);
+  const childSet = new Set(children);
+  if (childSet.size !== children.length) throw new Error(`Decomposed node ${parent.id} has duplicate durable child issue references`);
+  for (const childIssue of children) {
+    const child = record.nodes.find((candidate) => candidate.issue === childIssue);
+    if (!child) throw new Error(`Decomposed node ${parent.id} is missing durable child node #${childIssue}`);
+    if (child.id === parent.id) throw new Error(`Decomposed node ${parent.id} points to itself`);
+  }
+}
+
+function dependsOn(
+  dependencies: ReadonlyMap<string, readonly string[]>,
+  nodeId: string,
+  targetId: string,
+): boolean {
+  const pending = [...(dependencies.get(nodeId) ?? [])];
+  const visited = new Set<string>();
+  while (pending.length) {
+    const dependency = pending.pop()!;
+    if (dependency === targetId) return true;
+    if (visited.has(dependency)) continue;
+    visited.add(dependency);
+    pending.push(...(dependencies.get(dependency) ?? []));
+  }
+  return false;
+}
+
+function rewriteDecompositionEdges(
+  edges: readonly ClaimSerializationEdge[],
+  parentId: string,
+  replacementIds: readonly string[],
+): ClaimSerializationEdge[] {
+  const rewritten: ClaimSerializationEdge[] = [];
+  for (const edge of edges) {
+    const predecessors = edge.predecessor === parentId ? replacementIds : [edge.predecessor];
+    const successors = edge.successor === parentId ? replacementIds : [edge.successor];
+    for (const predecessor of predecessors) {
+      for (const successor of successors) {
+        if (predecessor === successor) continue;
+        rewritten.push({
+          predecessor,
+          successor,
+          overlappingClaims: [...edge.overlappingClaims],
+        });
+      }
+    }
+  }
+  return rewritten;
+}
+
+function mergeSerializationEdges(edges: readonly ClaimSerializationEdge[]): ClaimSerializationEdge[] {
+  const merged = new Map<string, ClaimSerializationEdge>();
+  for (const edge of edges) {
+    const key = `${edge.predecessor}\u0000${edge.successor}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, cloneSerializationEdge(edge));
+      continue;
+    }
+    existing.overlappingClaims = [...new Set([...existing.overlappingClaims, ...edge.overlappingClaims])];
+  }
+  return [...merged.values()];
+}
+
 function activeAttempt(node: OrchestrationNodeRecord): OrchestrationWorkerAttemptRecord | undefined {
   if (node.activeAttemptId) {
     const referenced = node.attempts?.find((attempt) => attempt.attemptId === node.activeAttemptId);
@@ -1228,6 +1681,20 @@ function uniqueIssueNumbers(values: readonly number[]): number[] {
     result.push(value);
   }
   return result;
+}
+
+function assertProtectedProductionRoute(item: ScheduledWorkItem, productionTarget?: string): void {
+  if (item.productionTarget !== undefined && item.productionTarget !== productionTarget) {
+    throw new Error(
+      `Scheduled route for ${item.id} reports production target ${item.productionTarget}, but the orchestration is frozen to ${productionTarget ?? "unset"}`,
+    );
+  }
+  const protectedTarget = productionTarget ?? item.productionTarget;
+  if (protectedTarget !== undefined && item.targetBranch === protectedTarget) {
+    throw new Error(
+      `Scheduled route for ${item.id} directly targets protected production branch ${protectedTarget}; ordinary orchestration delivery must target an integration branch`,
+    );
+  }
 }
 
 function assertPositiveInteger(value: number, name: string): void {

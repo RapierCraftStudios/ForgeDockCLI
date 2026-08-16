@@ -4,6 +4,9 @@ import type { DurableArtifact } from "../../core/artifacts/schema.js";
 
 export type ReviewFinding = DurableArtifact<"ReviewVerdict">["payload"]["findings"][number];
 
+/** Projection mode used by the native review controller. */
+export type FindingProjectionMode = "all" | "impact-gated";
+
 /**
  * Apply the controller-owned semantic scope gate after independent reviewers
  * report evidence. New reviewer submissions must name an exact frozen
@@ -85,9 +88,52 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
   });
 }
 
-/** Every controller-accepted finding becomes durable work; rejected candidates remain review evidence only. */
-export function shouldMaterializeFinding(finding: ReviewFinding): boolean {
-  return finding.scopeDisposition !== "rejected";
+/**
+ * Explain why a finding is excluded from the opt-in impact-gated issue lane.
+ * The default lane intentionally preserves the historical contract: every
+ * accepted (non-rejected) finding is materialized. The impact lane is stricter
+ * and only creates work when the reviewer supplied high-confidence, in-scope,
+ * anchored evidence of a concrete consequence. Missing or malformed impact
+ * evidence is advisory review data, never an automatic work item.
+ */
+export function findingMaterializationReason(
+  finding: ReviewFinding,
+  mode: FindingProjectionMode = "all",
+): string | undefined {
+  if (finding.scopeDisposition === "rejected") return "controller rejected the finding scope";
+  if (mode === "all") return undefined;
+  if (finding.scopeDisposition !== "in_scope") return "finding is not in the frozen Build Packet scope";
+  if (finding.confidence !== "high") return "impact lane requires high-confidence evidence";
+  if (!finding.causalRoot?.trim()) return "impact lane requires a causal root";
+  const hasAnchor = Boolean(finding.location?.trim() || finding.evidenceAnchor?.reference?.trim());
+  if (!hasAnchor) return "impact lane requires a repository or typed evidence anchor";
+  const impact = finding.impact;
+  if (!impact) return "reviewer did not provide structured impact evidence";
+  if (!impact.trigger.trim() || !impact.affectedInvariant.trim() || !impact.consequence.trim()) {
+    return "structured impact evidence is incomplete";
+  }
+  if (impact.category === "advisory") return "reviewer classified the concern as advisory";
+  // Low-severity test, performance, compatibility, and operational gaps stay
+  // in the verdict as advisory evidence unless the reviewer promotes them to
+  // a higher severity after proving a concrete delivery consequence. Low
+  // correctness/security/data/availability defects remain eligible because a
+  // small blast radius does not make a safety defect frivolous.
+  if (finding.severity === "low"
+    && (impact.category === "test-gap"
+      || impact.category === "performance"
+      || impact.category === "compatibility"
+      || impact.category === "operability")) {
+    return `low-severity ${impact.category} concern remains advisory`;
+  }
+  return undefined;
+}
+
+/** Every controller-accepted finding becomes durable work in the legacy lane. */
+export function shouldMaterializeFinding(
+  finding: ReviewFinding,
+  mode: FindingProjectionMode = "all",
+): boolean {
+  return findingMaterializationReason(finding, mode) === undefined;
 }
 
 const EXCLUDED_TOPICS: ReadonlyArray<{ name: string; pattern: RegExp }> = [

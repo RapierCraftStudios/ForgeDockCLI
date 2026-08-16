@@ -81,6 +81,7 @@ export default function forgedockExtension(
   let controlGateway: ForgeDockObservationControlGateway | undefined;
   let harnessMode: HarnessMode = "assistant";
   let activeWorkflow: Workflow | undefined;
+  let orchestrationPromptStarted = false;
   const ensureObserver = async (cwd: string): Promise<ForgeDockObserver> => {
     if (!observer) {
       observer = await createForgeDockObserver(cwd, { component: "forgedock-extension" });
@@ -120,6 +121,7 @@ export default function forgedockExtension(
     const planningStillActive = isDeepPlanActive();
     harnessMode = planningStillActive ? "forgedock-workflow" : "assistant";
     activeWorkflow = planningStillActive ? "deep-plan" : undefined;
+    orchestrationPromptStarted = false;
     clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
     activateOnly(pi, [
@@ -214,6 +216,10 @@ export default function forgedockExtension(
   });
 
   pi.on("message_start", (event) => {
+    if (event.message.role === "custom" && event.message.customType === FORGEDOCK_NATIVE_WORKFLOW_MESSAGE) {
+      const details = event.message.details as { command?: unknown } | undefined;
+      if (details?.command === "orchestrate") orchestrationPromptStarted = true;
+    }
     if (event.message.role !== "custom" || event.message.customType !== "subagent_supervisor_request") return;
     activateOnly(pi, [HUMAN_DECISION_TOOL, DEEP_PLAN_TOOL, "subagent_supervisor"]);
   });
@@ -227,6 +233,15 @@ export default function forgedockExtension(
   });
 
   pi.on("agent_settled", (_event, ctx) => {
+    // `/orchestrate` queues its real supervisor prompt as a follow-up. Pi can
+    // settle the slash-command dispatch turn before that custom message starts;
+    // clearing here would discard the invocation binding before the typed tool
+    // can consume it. Once the queued prompt has actually started, ordinary
+    // settlement owns cleanup again.
+    if (activeWorkflow === "orchestrate" && !orchestrationPromptStarted) {
+      if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", "◇ Preparing orchestration…");
+      return;
+    }
     restoreAssistantMode();
     if (ctx.mode === "tui") ctx.ui.setStatus("forgedock", FORGEDOCK_READY_STATUS);
   });
@@ -251,6 +266,7 @@ export default function forgedockExtension(
       () => {
         harnessMode = "forgedock-workflow";
         activeWorkflow = workflow;
+        if (workflow === "orchestrate") orchestrationPromptStarted = false;
       },
       restoreAssistantMode,
     );
@@ -406,7 +422,9 @@ function registerWorkflow(
       if (workflow !== "orchestrate" && workflow !== "deep-plan" && !await confirmWorkflow(workflow, normalized, ctx)) return;
       if (workflow === "deep-plan") requestDeepPlanMode();
       activateWorkflow();
-      if (workflow === "orchestrate") bindOrchestrationInvocation(pi, { rawArgs: normalized });
+      if (workflow === "orchestrate") {
+        bindOrchestrationInvocation(pi, { rawArgs: normalized });
+      }
       try {
         await queueNativeWorkflow(pi, workflow, normalized, ctx);
       } catch (error) {
@@ -436,7 +454,7 @@ async function queueNativeWorkflow(
       customType: FORGEDOCK_NATIVE_WORKFLOW_MESSAGE,
       content: prompt,
       display: true,
-      details: { command, invocationLabel: formatOrchestrationInvocationLabel(command, rawArgs) },
+      details: { command, rawArgs, invocationLabel: formatOrchestrationInvocationLabel(command, rawArgs) },
     }, { triggerTurn: true, deliverAs: "followUp" });
     return;
   }

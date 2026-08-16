@@ -174,6 +174,17 @@ export class ForgeDockBackgroundTasks {
       .map((record) => ({ ...record, args: [...record.args] }));
   }
 
+  /**
+   * Operational liveness is supervisor-owned, not inferred from a stale
+   * persisted `running`/`detached` label. Dead detached records remain audit
+   * evidence but must not consume controller transport capacity.
+   */
+  isOperationallyActive(id: string): boolean {
+    const live = this.#live.get(id);
+    if (!live || ["completed", "blocked", "failed", "cancelled"].includes(live.record.status)) return false;
+    return isProcessAlive(live.record.pid);
+  }
+
   async waitForTerminal(id: string, options: { warnAfterMs?: number } = {}): Promise<BackgroundTaskRecord> {
     const warnAfterMs = options.warnAfterMs ?? 120_000;
     let lastOutputSize = 0;

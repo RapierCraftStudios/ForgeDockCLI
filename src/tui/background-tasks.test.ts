@@ -111,6 +111,7 @@ test("non-cancelling shutdown leaves native controllers detached and adoptable",
   const adopter = new ForgeDockBackgroundTasks(first.pi);
   adopter.initialize(first.ctx);
   assert.equal(adopter.list().find((candidate) => candidate.id === record.id)?.status, "detached");
+  assert.equal(adopter.isOperationallyActive(record.id), true);
   assert.equal(adopter.cancel(record.id).status, "cancelled");
   await adopter.shutdown();
 });
@@ -203,6 +204,7 @@ test("a disappeared adopted PID remains operationally detached without inventing
   const tasks = new ForgeDockBackgroundTasks(pi);
   tasks.initialize(ctx);
   assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "detached");
+  assert.equal(tasks.isOperationallyActive(record.id), false);
   await assert.rejects(tasks.waitForTerminal(record.id), /without a locally observable controller result/);
   await tasks.shutdown();
 });

@@ -5,6 +5,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -99,6 +100,7 @@ interface LocalLeaseWitnessReference {
 }
 
 export interface LocalLeaseWitnessBootstrap {
+  recovered: boolean;
   checkoutDigest: string;
   configPath: string;
   checkpointPath: string;
@@ -169,7 +171,7 @@ export function bootstrapLocalLeaseWitness(
 ): LocalLeaseWitnessBootstrap {
   const paths = localWitnessPaths(cwd, options.localDataRoot);
   if (existsSync(paths.configPath)) throw new Error(`Lease witness bootstrap already exists at ${paths.configPath}`);
-  if (existsSync(paths.witnessDirectory)) throw new Error(`Lease witness key directory already exists at ${paths.witnessDirectory}; refusing to overwrite it`);
+  if (existsSync(paths.witnessDirectory)) return recoverLocalLeaseWitness(paths);
 
   mkdirSync(dirname(paths.witnessDirectory), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(paths.configPath), { recursive: true, mode: 0o700 });
@@ -191,29 +193,18 @@ export function bootstrapLocalLeaseWitness(
       privateKey,
       keyId: paths.keyId,
     });
-    witness.reEnroll(createSignedLeaseCheckpoint(1, privateKey, paths.keyId));
+    // An empty SQLite lease store starts at epoch 0. The first successful
+    // acquire advances both stores to epoch 1; bootstrap must not make the
+    // retained witness one epoch newer before the database has any history.
+    writeCheckpoint(temporaryCheckpoint, createSignedLeaseCheckpoint(0, privateKey, paths.keyId));
     if (witness.verify().state !== "verified") throw new LeaseContinuityError("newly seeded local witness could not be verified");
     renameSync(temporaryDirectory, paths.witnessDirectory);
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
 
-    const reference: LocalLeaseWitnessReference = {
-      schema: LOCAL_WITNESS_SCHEMA,
-      checkoutDigest: paths.checkoutDigest,
-      checkpointPath: paths.checkpointPath,
-      publicKeyPath: paths.publicKeyPath,
-      privateKeyPath: paths.privateKeyPath,
-      keyId: paths.keyId,
-    };
+    const reference = localWitnessReference(paths);
     writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    return {
-      checkoutDigest: paths.checkoutDigest,
-      configPath: paths.configPath,
-      checkpointPath: paths.checkpointPath,
-      publicKeyPath: paths.publicKeyPath,
-      privateKeyPath: paths.privateKeyPath,
-      keyId: paths.keyId,
-    };
+    return localWitnessBootstrapResult(paths, false);
   } catch (error) {
     if (existsSync(temporaryDirectory)) rmSync(temporaryDirectory, { recursive: true, force: true });
     if (installed && !existsSync(paths.configPath) && existsSync(paths.witnessDirectory)) {
@@ -221,6 +212,80 @@ export function bootstrapLocalLeaseWitness(
     }
     throw error;
   }
+}
+
+/**
+ * Complete the only recoverable bootstrap interruption: key material was
+ * atomically installed, but the checkout reference was not. Existing material
+ * is adopted only after the directory shape, key pair, and signed checkpoint
+ * all verify for this canonical checkout. Nothing in the witness directory is
+ * modified by recovery.
+ */
+function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): LocalLeaseWitnessBootstrap {
+  assertWitnessDirectory(paths);
+  const publicKey = readFileSync(paths.publicKeyPath, "utf8");
+  const privateKey = readFileSync(paths.privateKeyPath, "utf8");
+  verifiedWitness({
+    path: paths.checkpointPath,
+    publicKey,
+    privateKey,
+    keyId: paths.keyId,
+  });
+
+  const reference = localWitnessReference(paths);
+  writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  return localWitnessBootstrapResult(paths, true);
+}
+
+function assertWitnessDirectory(paths: ReturnType<typeof localWitnessPaths>): void {
+  try {
+    const directory = lstatSync(paths.witnessDirectory);
+    if (directory.isSymbolicLink() || !directory.isDirectory()) {
+      throw new Error("witness path must be a regular non-symlink directory");
+    }
+    if (!samePath(realpathSync.native(paths.witnessDirectory), paths.witnessDirectory)) {
+      throw new Error("witness directory resolved outside its expected path");
+    }
+    const actualEntries = readdirSync(paths.witnessDirectory).sort();
+    const expectedEntries = ["checkpoint.json", "private.pem", "public.pem"].sort();
+    if (actualEntries.join("\0") !== expectedEntries.join("\0")) {
+      throw new Error("witness directory does not contain exactly the expected files");
+    }
+    assertRegularFile(paths.checkpointPath, "retained checkpoint");
+    assertRegularFile(paths.publicKeyPath, "witness public key");
+    assertRegularFile(paths.privateKeyPath, "witness private key");
+    assertPrivateKeyPermissions(paths.privateKeyPath);
+  } catch (error) {
+    if (error instanceof LeaseContinuityError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new LeaseContinuityError(`existing local witness cannot be safely recovered: ${detail}`);
+  }
+}
+
+function localWitnessReference(paths: ReturnType<typeof localWitnessPaths>): LocalLeaseWitnessReference {
+  return {
+    schema: LOCAL_WITNESS_SCHEMA,
+    checkoutDigest: paths.checkoutDigest,
+    checkpointPath: paths.checkpointPath,
+    publicKeyPath: paths.publicKeyPath,
+    privateKeyPath: paths.privateKeyPath,
+    keyId: paths.keyId,
+  };
+}
+
+function localWitnessBootstrapResult(
+  paths: ReturnType<typeof localWitnessPaths>,
+  recovered: boolean,
+): LocalLeaseWitnessBootstrap {
+  return {
+    recovered,
+    checkoutDigest: paths.checkoutDigest,
+    configPath: paths.configPath,
+    checkpointPath: paths.checkpointPath,
+    publicKeyPath: paths.publicKeyPath,
+    privateKeyPath: paths.privateKeyPath,
+    keyId: paths.keyId,
+  };
 }
 
 function payload(epoch: number, keyId: string): Buffer {

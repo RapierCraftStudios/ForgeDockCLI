@@ -156,6 +156,33 @@ export const BuildResultPayloadSchema = Type.Object({
   residualRisks: Type.Array(Type.String()),
 });
 
+/**
+ * Controller-verifiable impact evidence for a review finding. This remains
+ * optional on durable findings so older verdicts can be decoded, but the
+ * current reviewer prompt asks every new finding to provide it. Impact-gated
+ * projection fails closed when the declaration is absent or incomplete.
+ */
+export const FindingImpactSchema = Type.Object({
+  category: Type.Union([
+    Type.Literal("correctness"),
+    Type.Literal("security"),
+    Type.Literal("data-integrity"),
+    Type.Literal("availability"),
+    Type.Literal("performance"),
+    Type.Literal("compatibility"),
+    Type.Literal("operability"),
+    Type.Literal("test-gap"),
+    Type.Literal("advisory"),
+  ]),
+  /** Concrete trigger or input sequence that exposes the concern. */
+  trigger: NonEmptyString,
+  /** Invariant, acceptance criterion, or boundary that the trigger violates. */
+  affectedInvariant: NonEmptyString,
+  /** Observable consequence if the trigger occurs. */
+  consequence: NonEmptyString,
+});
+export type FindingImpact = Static<typeof FindingImpactSchema>;
+
 export const FindingSchema = Type.Object({
   id: NonEmptyString,
   severity: Type.Union([
@@ -175,6 +202,8 @@ export const FindingSchema = Type.Object({
   location: Type.Optional(NonEmptyString),
   intentRelevance: NonEmptyString,
   remediation: NonEmptyString,
+  /** Structured impact declaration added by the current reviewer contract. */
+  impact: Type.Optional(FindingImpactSchema),
   /** Controller-verifiable anchor proposed by a reviewer; prose alone is never an anchor. */
   evidenceAnchor: Type.Optional(Type.Object({
     kind: Type.Union([
@@ -296,6 +325,26 @@ export const ReviewVerdictPayloadSchema = Type.Object({
       findingId: NonEmptyString,
       disposition: Type.Union([Type.Literal("accept"), Type.Literal("follow_up"), Type.Literal("reject")]),
       rationale: NonEmptyString,
+    })),
+  })),
+  /**
+   * Records the controller's projection decision separately from the review
+   * verdict. This makes shadow/canary comparisons durable without changing
+   * the independent reviewer evidence or legacy verdict shape.
+   */
+  findingProjection: Type.Optional(Type.Object({
+    policy: Type.Union([
+      Type.Literal("all"),
+      Type.Literal("approved-only"),
+      Type.Literal("none"),
+      Type.Literal("impact-gated"),
+      Type.Literal("shadow-impact-gated"),
+    ]),
+    candidateFindingIds: Type.Array(NonEmptyString),
+    materializedFindingIds: Type.Array(NonEmptyString),
+    suppressed: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      reason: NonEmptyString,
     })),
   })),
   supersedes: Type.Optional(NonEmptyString),

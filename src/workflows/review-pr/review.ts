@@ -11,7 +11,7 @@ import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentR
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
-import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
+import { applyFindingScopePolicy, findingMaterializationReason, shouldMaterializeFinding, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
   ...FindingSchema.properties,
@@ -41,7 +41,7 @@ const ScopeAdjudicationSchema = Type.Object({
 });
 type ScopeAdjudication = Static<typeof ScopeAdjudicationSchema>;
 export type { ReviewerRole } from "./planner.js";
-export type FindingIssuePolicy = "all" | "approved-only" | "none";
+export type FindingIssuePolicy = "all" | "approved-only" | "none" | "impact-gated" | "shadow-impact-gated";
 export type ReviewChecks = DurableArtifact<"BuildResult">["payload"]["checks"];
 
 export interface DeploymentReviewEvidence {
@@ -55,6 +55,25 @@ export interface DeploymentReviewEvidence {
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS = 15_000;
 const MIN_REVIEWER_ATTEMPT_DRAIN_MS = 100;
+
+const FINDING_ISSUE_POLICIES = new Set<FindingIssuePolicy>([
+  "all", "approved-only", "none", "impact-gated", "shadow-impact-gated",
+]);
+
+/**
+ * Resolve the reversible native projection flag. Existing callers pass
+ * `all`; an environment override lets the staging controller dogfood the new
+ * lane without changing every legacy call site. Explicit `none` remains a
+ * hard opt-out for issue-less review flows.
+ */
+export function resolveFindingIssuePolicy(explicit?: FindingIssuePolicy): FindingIssuePolicy {
+  const configured = process.env.FORGEDOCK_REVIEW_FINDING_POLICY?.trim();
+  if (configured !== undefined && configured !== "" && !FINDING_ISSUE_POLICIES.has(configured as FindingIssuePolicy)) {
+    throw new Error(`FORGEDOCK_REVIEW_FINDING_POLICY must be one of ${[...FINDING_ISSUE_POLICIES].join(", ")}`);
+  }
+  if (configured && explicit !== "none") return configured as FindingIssuePolicy;
+  return explicit ?? "all";
+}
 
 class ReviewWaveIncompleteError extends Error {
   constructor(message: string) {
@@ -418,6 +437,7 @@ export async function reviewPullRequest(
                 : "Start from fresh context. You do not have or need the builder conversation.",
               "Report only actionable findings caused or exposed by this change.",
               "Every finding needs concrete evidence, intent relevance, remediation, and a concise causalRoot failure-mode label.",
+              "Every finding must include a structured impact declaration: choose one category (correctness, security, data-integrity, availability, performance, compatibility, operability, test-gap, advisory) and state the concrete trigger, the affected invariant or acceptance criterion, and the observable consequence. Do not promote style, preference, speculative cleanup, or a test gap with no concrete consequence; report no finding or classify it advisory.",
               "Anchor a potentially blocking finding with a repository location or a typed evidenceAnchor. Delivery-authority/check anchors must quote an exact controller-observed reference; vague prose cannot block.",
               "Classify scopeDisposition=in_scope only when the minimal fix is wholly required by the frozen Build Packet and does not add a new guarantee, entity, protocol, or behavior excluded from it; otherwise use follow_up or rejected.",
               "For every in_scope finding, copy at least one Build Packet acceptance criterion verbatim into matchedAcceptanceCriteria. A broad consistency criterion does not authorize transitive redesign beyond the packet's explicit scope and exclusions.",
@@ -646,14 +666,39 @@ export async function reviewPullRequest(
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
     await input.beforeVerdictPublication?.();
-    const findingIssuePolicy = input.findingIssuePolicy ?? "all";
-    const projectionEnabled = findingIssuePolicy === "all" || (findingIssuePolicy === "approved-only" && disposition === "approve");
+    const findingIssuePolicy = resolveFindingIssuePolicy(input.findingIssuePolicy);
+    const projectionEnabled = findingIssuePolicy === "all"
+      || findingIssuePolicy === "impact-gated"
+      || findingIssuePolicy === "shadow-impact-gated"
+      || (findingIssuePolicy === "approved-only" && disposition === "approve");
+    const candidateProjectionFindings = terminalReviewFindings(findings);
+    const impactGatedFindings = terminalReviewFindings(findings, "impact-gated");
+    const projectionMode: FindingProjectionMode = findingIssuePolicy === "impact-gated" ? "impact-gated" : "all";
+    const activeProjectionFindings = projectionEnabled
+      ? findingIssuePolicy === "impact-gated" ? impactGatedFindings : candidateProjectionFindings
+      : [];
+    const materializedIds = new Set(activeProjectionFindings.map((finding) => finding.id));
+    const impactGatedIds = new Set(impactGatedFindings.map((finding) => finding.id));
+    const suppressedProjectionFindings = candidateProjectionFindings
+      .filter((finding) => findingIssuePolicy === "shadow-impact-gated"
+        ? !impactGatedIds.has(finding.id)
+        : !materializedIds.has(finding.id))
+      .map((finding) => ({
+        findingId: finding.id,
+        reason: !projectionEnabled
+          ? `finding issue projection disabled by ${findingIssuePolicy} policy`
+          : findingMaterializationReason(finding, "impact-gated") ?? "not selected by the active projection policy",
+      }));
+    if (findingIssuePolicy === "shadow-impact-gated" && suppressedProjectionFindings.length) {
+      await recordReviewProgress(
+        `impact-gated projection shadow: ${suppressedProjectionFindings.length} of ${candidateProjectionFindings.length} candidate finding(s) would remain advisory`,
+      );
+    }
     // The reviewer wave is fully settled above. Only this deterministic
     // post-wave path may project findings: scope filtering and consolidation
     // are complete before any GitHub issue lookup or creation occurs.
-    const activeProjectionFindings = projectionEnabled ? terminalReviewFindings(findings) : [];
     if (projectionEnabled) {
-      await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings }, dependencies.host);
+      await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings, policy: projectionMode }, dependencies.host);
     }
     if (projectionEnabled && dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
@@ -680,6 +725,12 @@ export async function reviewPullRequest(
         findings,
         checks: input.buildResult?.payload.checks ?? input.deployment?.checks ?? [],
         reviewPlan,
+        findingProjection: {
+          policy: findingIssuePolicy,
+          candidateFindingIds: candidateProjectionFindings.map((finding) => finding.id),
+          materializedFindingIds: activeProjectionFindings.map((finding) => finding.id),
+          suppressed: suppressedProjectionFindings,
+        },
         ...(adjudication ? {
           scopeAdjudication: { sessionRef: adjudication.sessionRef, decisions: adjudication.output.decisions },
         } : {}),
@@ -1370,10 +1421,11 @@ export async function materializeReviewFindings(
     pullRequest: PullRequestSnapshot;
     findings: ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]>;
     fallbackReviewerRoles?: readonly string[];
+    policy?: FindingProjectionMode;
   },
   host: ForgeHost,
 ): Promise<void> {
-  for (const finding of terminalReviewFindings(input.findings)) {
+  for (const finding of terminalReviewFindings(input.findings, input.policy ?? "all")) {
     await host.materializeReviewFinding({
       repo: input.pullRequest.repo,
       ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
@@ -1388,10 +1440,11 @@ export async function materializeReviewFindings(
 
 export function terminalReviewFindings(
   findings: ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]>,
+  mode: FindingProjectionMode = "all",
 ): ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]> {
   const severityOrder = { critical: 3, high: 2, medium: 1, low: 0 } as const;
   return findings
-    .filter(shouldMaterializeFinding)
+    .filter((finding) => shouldMaterializeFinding(finding, mode))
     .sort((left, right) => severityOrder[right.severity] - severityOrder[left.severity]
       || left.title.localeCompare(right.title)
       || left.id.localeCompare(right.id));

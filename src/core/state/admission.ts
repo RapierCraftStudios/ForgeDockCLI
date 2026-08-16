@@ -101,6 +101,20 @@ export function decideSubjectAdmission(
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
+  const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
+  const latestArtifact = latest.artifacts.at(-1);
+  // `reset` appends an abandoned Outcome as explicit authorization to leave
+  // the old run behind and start a clean attempt. Treating that checkpoint as
+  // an ordinary cancelled terminal run turns reset into a permanent subject
+  // lock: the next worker exits successfully without creating a new run, and
+  // its orchestration node can never produce a completed Outcome.
+  //
+  // Require the abandoned Outcome to be the final durable artifact. If a
+  // stale controller published newer work after reset, fail through the
+  // ordinary recovery policy instead of silently discarding that evidence.
+  if (latestArtifact?.kind === "Outcome" && latestArtifact.payload.status === "abandoned") {
+    return { action: "start" };
+  }
   const durableTargetBranch = options.durableTargetBranches?.get(latest.runId)
     ?? latestArtifactOfKind(latest.artifacts, "BuildResult")?.payload.targetBranch
     ?? latestArtifactOfKind(latest.artifacts, "Outcome")?.payload.failureEvidence?.targetBranch;
@@ -112,7 +126,6 @@ export function decideSubjectAdmission(
       reason: `Durable run ${latest.runId} targets ${durableTargetBranch}, but the current issue lane targets ${options.currentTargetBranch}; refusing cross-branch recovery. Use --rerun to start a fresh run on ${options.currentTargetBranch}.`,
     };
   }
-  const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
   const latestInvestigation = latestArtifactOfKind(latest.artifacts, "Investigation");
   const latestInvestigationIndex = lastArtifactIndex(latest.artifacts, "Investigation");
   const matchingTerminalOutcomeIndex = latestInvestigation?.payload.outcome === "invalid"

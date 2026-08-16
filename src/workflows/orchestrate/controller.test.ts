@@ -12,7 +12,7 @@ import {
   type OrchestrationWorkerContext,
   type OrchestrationWorkOnWorker,
 } from "./controller.js";
-import type { ScheduledWorkItem } from "./scheduler.js";
+import { ClaimPromotionConflictError, type ScheduledWorkItem } from "./scheduler.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -91,6 +91,121 @@ async function waitUntil(predicate: () => boolean, message: string): Promise<voi
 }
 
 describe("OrchestrationController", () => {
+  it("rejects a new DAG node that directly targets protected production", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const service = controller(repository, async () => undefined);
+    await assert.rejects(() => service.create({
+      repository: "owner/repo",
+      maxParallel: 1,
+      productionTarget: "main",
+      items: [{ ...item("issue-1", 1), targetBranch: "main", lane: "fast", productionTarget: "main" }],
+    }), /directly targets protected production branch main/);
+  });
+
+  it("refreshes a route when interrupted wrappers produced no semantic child run", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const launchedTargets: string[] = [];
+    const service = controller(repository, async (scheduled) => {
+      launchedTargets.push(scheduled.targetBranch ?? "unset");
+    }, {
+      revalidateRoute: async () => ({ targetBranch: "staging", lane: "fast", productionTarget: "main" }),
+      reconcileWorker: async () => ({ disposition: "interrupted", reason: "controller wrapper ended before child run creation" }),
+    });
+    const created = await service.create({
+      repository: "owner/repo",
+      maxParallel: 1,
+      productionTarget: "main",
+      items: [{ ...item("issue-1", 1), targetBranch: "staging", lane: "fast", productionTarget: "main" }],
+    });
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [{
+        ...created.nodes[0]!,
+        targetBranch: "main",
+        status: "running",
+        activeAttemptId: "attempt-launching",
+        attempts: [{
+          attemptId: "attempt-interrupted",
+          attempt: 1,
+          recovery: "initial",
+          status: "interrupted",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:01:00.000Z",
+          completedAt: "2026-01-01T00:01:00.000Z",
+          taskId: "dead-wrapper",
+        }, {
+          attemptId: "attempt-launching",
+          attempt: 2,
+          recovery: "relaunch",
+          status: "launching",
+          startedAt: "2026-01-01T00:02:00.000Z",
+          updatedAt: "2026-01-01T00:02:00.000Z",
+        }],
+      }],
+    });
+
+    const result = await service.resume(created.orchestrationId);
+    assert.deepEqual(launchedTargets, ["staging"]);
+    assert.equal(result.record.nodes[0]?.targetBranch, "staging");
+  });
+
+  it("fails closed instead of retargeting a node with durable attempt evidence", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const service = controller(repository, async () => undefined, {
+      revalidateRoute: async () => ({ targetBranch: "release", lane: "fast", productionTarget: "main" }),
+    });
+    const created = await service.create({
+      repository: "owner/repo",
+      maxParallel: 1,
+      productionTarget: "main",
+      items: [{ ...item("issue-1", 1), targetBranch: "staging", lane: "fast", productionTarget: "main" }],
+    });
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [{
+        ...created.nodes[0]!,
+        status: "failed",
+        attempts: [{
+          attemptId: "attempt-old",
+          attempt: 1,
+          recovery: "initial",
+          status: "failed",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:01:00.000Z",
+          completedAt: "2026-01-01T00:01:00.000Z",
+          runId: "run-old",
+        }],
+      }],
+    });
+
+    await assert.rejects(
+      () => service.resume(created.orchestrationId),
+      /Durable route drift.*refusing to retarget started work/,
+    );
+  });
+
+  it("marks a newly created DAG failed when execution admission throws", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const service = controller(repository, async () => undefined, {
+      executionAdmission: {
+        acquire: async () => { throw new Error("retained witness diverged"); },
+      },
+    });
+
+    await assert.rejects(() => service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 1,
+      items: [item("issue-1", 1)],
+    }), /retained witness diverged/);
+
+    const durable = await repository.loadOrchestration("dag-test");
+    assert.equal(durable?.status, "failed");
+    assert.equal(durable?.executionAttempt, 0);
+    assert.equal(durable?.nodes[0]?.status, "queued");
+  });
+
   it("creates and runs a fully frozen plan through the caller work-on worker", async () => {
     const repository = new RecordingOrchestrationRepository();
     const events: string[] = [];
@@ -159,6 +274,145 @@ describe("OrchestrationController", () => {
     assert.ok(events.includes("started"));
     assert.ok(events.includes("completed"));
     assert.deepEqual(await repository.loadOrchestration(result.orchestrationId), result.record);
+  });
+
+  it("expands a live decomposition into the same durable DAG and reroutes dependents", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const started: string[] = [];
+    const service = controller(repository, async (scheduled) => {
+      started.push(scheduled.id);
+      if (scheduled.id === "parent") return {
+        status: "skipped",
+        error: "authoritative child scope required",
+        childIssues: [11, 12],
+      };
+    }, {
+      resolveDecomposition: async ({ childIssues }) => {
+        assert.deepEqual(childIssues, [11, 12]);
+        return {
+          childIssues: childIssues ?? [],
+          items: [item("child-11", 11), item("child-12", 12)],
+        };
+      },
+    });
+
+    const result = await service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 2,
+      items: [item("parent", 1), item("dependent", 2, ["parent"])],
+    });
+
+    assert.deepEqual(started, ["parent", "child-11", "child-12", "dependent"]);
+    assert.equal(result.record.status, "completed");
+    assert.equal(result.record.nodes.find((node) => node.id === "parent")?.status, "skipped");
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "parent")?.decompositionChildren, [11, 12]);
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "dependent")?.dependencies, ["child-11", "child-12"]);
+    assert.equal(result.record.nodes.find((node) => node.id === "child-11")?.status, "completed");
+    assert.equal(result.record.nodes.find((node) => node.id === "child-12")?.status, "completed");
+    assert.deepEqual(result.record.issueNumbers, [1, 2, 11, 12]);
+    assert.deepEqual((await repository.loadOrchestration(result.orchestrationId))?.nodes, result.record.nodes);
+  });
+
+  it("recovers a legacy skipped decomposition from authoritative child discovery on resume", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const launched: string[] = [];
+    const service = controller(repository, async (scheduled) => { launched.push(scheduled.id); }, {
+      resolveDecomposition: async ({ node, childIssues }) => {
+        assert.equal(node.issue, 1);
+        assert.equal(childIssues, undefined);
+        return {
+          childIssues: [21, 22],
+          items: [item("child-21", 21), item("child-22", 22)],
+        };
+      },
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("legacy-parent", 1)], maxParallel: 2 });
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [{ ...created.nodes[0]!, status: "skipped", error: "decomposed before child expansion" }],
+    });
+
+    const result = await service.resume(created.orchestrationId);
+    assert.deepEqual(launched, ["child-21", "child-22"]);
+    assert.equal(result.record.status, "completed");
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "legacy-parent")?.decompositionChildren, [21, 22]);
+  });
+
+  it("rejects an over-limit decomposition before dispatching child work", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let resolverCalls = 0;
+    const service = controller(repository, async (scheduled) => scheduled.id === "parent"
+      ? { status: "skipped", childIssues: [31, 32] }
+      : undefined, {
+      maxDecompositionChildren: 1,
+      resolveDecomposition: async ({ childIssues }) => {
+        resolverCalls++;
+        return { childIssues: childIssues ?? [], items: [item("child-31", 31), item("child-32", 32)] };
+      },
+    });
+
+    await assert.rejects(
+      () => service.createAndRun({ repository: "owner/repo", items: [item("parent", 1)], maxParallel: 1 }),
+      /exceeds the 1-child limit/,
+    );
+    assert.equal(resolverCalls, 1);
+    assert.equal((await repository.loadOrchestration("dag-test"))?.status, "failed");
+  });
+
+  it("completes a transient promoted-claim conflict in one controller execution with a durable resume attempt", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const firstPromoted = deferred<void>();
+    const secondSuspended = deferred<void>();
+    const secondDurablyRequeued = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const recoveries = new Map<string, string[]>();
+    const service = controller(repository, async (scheduled, context) => {
+      const seen = recoveries.get(scheduled.id) ?? [];
+      seen.push(context.recovery);
+      recoveries.set(scheduled.id, seen);
+      if (scheduled.id === "first") {
+        await context.promoteClaims(["src/shared"]);
+        firstPromoted.resolve();
+        await releaseFirst.promise;
+        return;
+      }
+      await firstPromoted.promise;
+      try {
+        await context.promoteClaims(["src/shared/file.ts"]);
+      } catch (error) {
+        if (!(error instanceof ClaimPromotionConflictError)) throw error;
+        secondSuspended.resolve();
+        return { status: "suspended", error };
+      }
+    }, {
+      onEvent: (event) => {
+        if (event.name === "resumed" && event.itemId === "second") secondDurablyRequeued.resolve();
+      },
+    });
+
+    const execution = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 2,
+      items: [item("first", 1), item("second", 2)],
+    });
+    await secondSuspended.promise;
+    await secondDurablyRequeued.promise;
+    const waiting = await repository.loadOrchestration("dag-test");
+    const waitingSecond = waiting?.nodes.find((node) => node.id === "second");
+    assert.equal(waitingSecond?.status, "queued");
+    assert.equal(waitingSecond?.waitReason?.kind, "active-claim-conflict");
+    releaseFirst.resolve();
+    const result = await execution;
+
+    assert.equal(result.record.status, "completed");
+    assert.equal(result.record.nodes.every((node) => node.status === "completed"), true);
+    assert.deepEqual(recoveries.get("first"), ["initial"]);
+    assert.deepEqual(recoveries.get("second"), ["initial", "resume"]);
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "second")?.claims, ["src/shared/file.ts"]);
+    const attempts = result.record.nodes.find((node) => node.id === "second")?.attempts ?? [];
+    assert.deepEqual(attempts.map((attempt) => attempt.status), ["suspended", "completed"]);
+    assert.deepEqual(attempts.map((attempt) => attempt.recovery), ["initial", "resume"]);
   });
 
   it("resumes by attaching to a live worker without launching a duplicate", async () => {

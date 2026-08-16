@@ -11,8 +11,11 @@ import { verificationEnvironment } from "../../runtime/controller-environment.js
 
 const execFileAsync = promisify(execFile);
 const dependencyInstallLocks = new Map<string, Promise<void>>();
+const repositoryMetadataLocks = new Map<string, Promise<void>>();
 const DEPENDENCY_LOCK_STALE_MS = 2 * 60 * 60 * 1_000;
 const DEPENDENCY_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
+const REPOSITORY_LOCK_STALE_MS = 10 * 60 * 1_000;
+const REPOSITORY_LOCK_TIMEOUT_MS = 10 * 60 * 1_000;
 
 type DependencyStamp = {
   schema: "forgedock.dependencies/v1";
@@ -43,8 +46,10 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
     const baseSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
-    await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
-    await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+    await this.withRepositoryMetadataLock(async () => {
+      await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
+      await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+    });
     await this.installDependencies(path);
     return { path, branch, baseRef: input.baseRef, baseSha };
   }
@@ -55,34 +60,37 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const fetchedBase = input.baseRef.startsWith("origin/")
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
-    if (existsSync(path)) {
-      const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
-      const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
-      if (root !== path || observedBranch !== branch) {
-        throw new Error(`Retained workspace identity mismatch for ${path}: expected ${branch}, found ${observedBranch || "detached HEAD"}`);
+    const baseSha = await this.withRepositoryMetadataLock(async () => {
+      if (existsSync(path)) {
+        const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
+        const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
+        if (root !== path || observedBranch !== branch) {
+          throw new Error(`Retained workspace identity mismatch for ${path}: expected ${branch}, found ${observedBranch || "detached HEAD"}`);
+        }
+      } else {
+        await this.git(["worktree", "prune"], this.#repo);
+        const branchExists = await this.branchExists(branch);
+        await this.git(branchExists
+          ? ["worktree", "add", path, branch]
+          : ["worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
       }
-    } else {
-      await this.git(["worktree", "prune"], this.#repo);
-      const branchExists = await this.branchExists(branch);
-      await this.git(branchExists
-        ? ["worktree", "add", path, branch]
-        : ["worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
-    }
-    const configuredBaseSha = await this.configuredBaseSha(branch);
-    const baseSha = input.baseSha
-      ?? configuredBaseSha
-      ?? (await this.git(["merge-base", input.baseRef, "HEAD"], path)).trim();
-    try {
-      await this.git(["merge-base", "--is-ancestor", baseSha, input.baseRef], path);
-    } catch (error) {
-      throw new Error(`Frozen base ${baseSha} does not belong to target ref ${input.baseRef}`, { cause: error });
-    }
-    try {
-      await this.git(["merge-base", "--is-ancestor", baseSha, "HEAD"], path);
-    } catch (error) {
-      throw new Error(`Frozen base ${baseSha} is not an ancestor of retained workspace ${branch}`, { cause: error });
-    }
-    await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+      const configuredBaseSha = await this.configuredBaseSha(branch);
+      const frozenBaseSha = input.baseSha
+        ?? configuredBaseSha
+        ?? (await this.git(["merge-base", fetchedBase, "HEAD"], path)).trim();
+      try {
+        await this.git(["merge-base", "--is-ancestor", frozenBaseSha, fetchedBase], path);
+      } catch (error) {
+        throw new Error(`Frozen base ${frozenBaseSha} does not belong to target ref ${input.baseRef}`, { cause: error });
+      }
+      try {
+        await this.git(["merge-base", "--is-ancestor", frozenBaseSha, "HEAD"], path);
+      } catch (error) {
+        throw new Error(`Frozen base ${frozenBaseSha} is not an ancestor of retained workspace ${branch}`, { cause: error });
+      }
+      await this.git(["config", `branch.${branch}.forgedockBaseSha`, frozenBaseSha], this.#repo);
+      return frozenBaseSha;
+    });
     await this.installDependencies(path);
     return { path, branch, baseRef: input.baseRef, baseSha };
   }
@@ -92,10 +100,9 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const path = resolve(this.#root, `review-${input.pr}-${suffix}`);
     assertInside(this.#root, path);
     await mkdir(dirname(path), { recursive: true });
-    await this.git(["fetch", "origin", `pull/${input.pr}/head`], this.#repo);
-    const fetched = (await this.git(["rev-parse", "FETCH_HEAD"], this.#repo)).trim();
+    const fetched = await this.fetchRemoteCommit(`refs/pull/${input.pr}/head`, this.#repo);
     if (fetched !== input.headSha) throw new Error(`Fetched review SHA ${fetched} does not match PR head ${input.headSha}`);
-    await this.git(["worktree", "add", "--detach", path, fetched], this.#repo);
+    await this.withRepositoryMetadataLock(() => this.git(["worktree", "add", "--detach", path, fetched], this.#repo));
     await this.installDependencies(path);
     return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha, baseSha: input.headSha };
   }
@@ -129,8 +136,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   async syncToRemoteHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
     const dirty = await this.changedPaths(workspace);
     if (dirty.length) throw new Error(`Cannot synchronize dirty retained workspace: ${dirty.join(", ")}`);
-    await this.git(["fetch", "--no-tags", "origin", workspace.branch], workspace.path);
-    const fetched = (await this.git(["rev-parse", "FETCH_HEAD"], workspace.path)).trim();
+    const fetched = await this.fetchRemoteCommit(`refs/heads/${workspace.branch}`, workspace.path);
     if (fetched.toLowerCase() !== expectedHeadSha.toLowerCase()) {
       throw new Error(`Fetched parent branch head ${fetched} does not match authoritative PR head ${expectedHeadSha}`);
     }
@@ -232,7 +238,20 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       "push", "--no-verify", "--set-upstream", "origin", workspace.branch,
     ], workspace.path);
   }
-  async publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void> { if (!isSafeRepairBranch(input.branch) || ["main", "master"].includes(input.branch)) throw new Error(`CI repair refuses to publish to protected or unsafe branch '${input.branch}'`); if (!/^[0-9a-f]{40,64}$/i.test(input.expectedRemoteHeadSha)) throw new Error("CI repair requires an exact expected remote head SHA"); await this.git(["fetch", "--no-tags", "origin", `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`], workspace.path); const remote = (await this.git(["rev-parse", `refs/remotes/origin/${input.branch}`], workspace.path)).trim(); if (remote.toLowerCase() !== input.expectedRemoteHeadSha.toLowerCase()) throw new Error(`PR head changed before CI repair push: expected ${input.expectedRemoteHeadSha}, current ${remote}`); const local = await this.head(workspace); try { await this.git(["merge-base", "--is-ancestor", input.expectedRemoteHeadSha, local], workspace.path); } catch (error) { throw new Error(`CI repair commit ${local} is not a descendant of reviewed PR head ${input.expectedRemoteHeadSha}`, { cause: error }); } const disabledHooksPath = process.platform === "win32" ? "NUL" : "/dev/null"; await this.git(["-c", `core.hooksPath=${disabledHooksPath}`, "push", "--no-verify", "origin", `HEAD:refs/heads/${input.branch}`], workspace.path); }
+  async publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void> {
+    if (!isSafeRepairBranch(input.branch) || ["main", "master"].includes(input.branch)) throw new Error(`CI repair refuses to publish to protected or unsafe branch '${input.branch}'`);
+    if (!/^[0-9a-f]{40,64}$/i.test(input.expectedRemoteHeadSha)) throw new Error("CI repair requires an exact expected remote head SHA");
+    const remote = await this.fetchRemoteCommit(`refs/heads/${input.branch}`, workspace.path);
+    if (remote.toLowerCase() !== input.expectedRemoteHeadSha.toLowerCase()) throw new Error(`PR head changed before CI repair push: expected ${input.expectedRemoteHeadSha}, current ${remote}`);
+    const local = await this.head(workspace);
+    try {
+      await this.git(["merge-base", "--is-ancestor", input.expectedRemoteHeadSha, local], workspace.path);
+    } catch (error) {
+      throw new Error(`CI repair commit ${local} is not a descendant of reviewed PR head ${input.expectedRemoteHeadSha}`, { cause: error });
+    }
+    const disabledHooksPath = process.platform === "win32" ? "NUL" : "/dev/null";
+    await this.git(["-c", `core.hooksPath=${disabledHooksPath}`, "push", "--no-verify", "origin", `HEAD:refs/heads/${input.branch}`], workspace.path);
+  }
 
   async head(workspace: GitWorkspace): Promise<string> {
     return (await this.git(["rev-parse", "HEAD"], workspace.path)).trim();
@@ -240,10 +259,12 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
 
   async remove(workspace: GitWorkspace): Promise<void> {
     assertInside(this.#root, workspace.path);
-    await this.git(["worktree", "remove", "--force", workspace.path], this.#repo);
-    if (workspace.branch.startsWith("forgedock/")) {
-      try { await this.git(["branch", "-D", workspace.branch], this.#repo); } catch { /* branch may already be absent */ }
-    }
+    await this.withRepositoryMetadataLock(async () => {
+      await this.git(["worktree", "remove", "--force", workspace.path], this.#repo);
+      if (workspace.branch.startsWith("forgedock/")) {
+        try { await this.git(["branch", "-D", workspace.branch], this.#repo); } catch { /* branch may already be absent */ }
+      }
+    });
   }
 
   private workspaceIdentity(input: { runId: string; issue: number }): { branch: string; path: string } {
@@ -256,9 +277,91 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
 
   private async fetchOriginBase(baseRef: string): Promise<string> {
     const branch = baseRef.slice("origin/".length);
-    const remoteRef = `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
-    await this.git(["fetch", "origin", remoteRef], this.#repo);
-    return `origin/${branch}`;
+    return this.fetchRemoteCommit(`refs/heads/${branch}`, this.#repo);
+  }
+
+  /** Fetch an advertised commit without mutating shared tracking refs or FETCH_HEAD. */
+  private async fetchRemoteCommit(remoteRef: string, cwd: string): Promise<string> {
+    const advertised = await this.git(["ls-remote", "--exit-code", "origin", remoteRef], cwd);
+    const matches = advertised.split(/\r?\n/)
+      .map((line) => line.split(/\s+/, 2))
+      .filter((parts) => parts.length === 2 && parts[1] === remoteRef);
+    if (matches.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(matches[0]?.[0] ?? "")) {
+      throw new Error(`Remote ref ${remoteRef} did not resolve to exactly one commit`);
+    }
+    const sha = matches[0]![0]!;
+    await this.git(["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", remoteRef], cwd);
+    try {
+      await this.git(["cat-file", "-e", `${sha}^{commit}`], cwd);
+    } catch (error) {
+      throw new Error(`Remote ref ${remoteRef} changed while fetching advertised commit ${sha}`, { cause: error });
+    }
+    return sha;
+  }
+
+  private async withRepositoryMetadataLock<T>(operation: () => Promise<T>): Promise<T> {
+    const key = process.platform === "win32" ? this.#repo.toLowerCase() : this.#repo;
+    const previous = repositoryMetadataLocks.get(key) ?? Promise.resolve();
+    let result!: T;
+    const current = previous.catch(() => undefined).then(async () => {
+      const lease = await this.acquireRepositoryMetadataLock();
+      try {
+        result = await operation();
+      } finally {
+        await this.releaseDependencyInstallLock(lease);
+      }
+    });
+    repositoryMetadataLocks.set(key, current);
+    try {
+      await current;
+      return result;
+    } finally {
+      if (repositoryMetadataLocks.get(key) === current) repositoryMetadataLocks.delete(key);
+    }
+  }
+
+  private async acquireRepositoryMetadataLock(): Promise<DependencyLease> {
+    const lockPath = join(this.#repo, ".forgedock", "git-metadata.lock");
+    const ownerPath = join(lockPath, "owner.json");
+    await mkdir(dirname(lockPath), { recursive: true });
+    const startedAt = Date.now();
+    const token = randomUUID();
+    for (;;) {
+      try {
+        await mkdir(lockPath);
+        try {
+          await writeFile(ownerPath, JSON.stringify({ pid: process.pid, token, startedAt }), "utf8");
+        } catch (error) {
+          await rm(lockPath, { recursive: true, force: true });
+          throw error;
+        }
+        const heartbeat = setInterval(() => {
+          void utimes(lockPath, new Date(), new Date()).catch(() => undefined);
+        }, 30_000);
+        return { lockPath, ownerPath, token, heartbeat };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        try {
+          const age = Date.now() - (await stat(lockPath)).mtimeMs;
+          const ownerStatus = await dependencyOwnerStatus(ownerPath);
+          // A lock whose recorded owner has exited is safe to reclaim
+          // immediately. Waiting for the stale-age window after a controller
+          // interruption strands every resumed worker behind a dead lease.
+          // Unknown/malformed owner metadata still uses the conservative age
+          // threshold so a writer cannot be raced between mkdir and owner.json.
+          if (ownerStatus === "dead" || (age > REPOSITORY_LOCK_STALE_MS && ownerStatus !== "alive")) {
+            await rm(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch {
+          // A competing controller may have released or renewed the lock.
+        }
+        if (Date.now() - startedAt > REPOSITORY_LOCK_TIMEOUT_MS) {
+          throw new Error(`Timed out waiting for Git metadata lock in ${basename(this.#repo)}`);
+        }
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, 100));
+      }
+    }
   }
 
   private async branchExists(branch: string): Promise<boolean> {
@@ -536,15 +639,24 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   }
 }
 
-async function dependencyOwnerAlive(ownerPath: string): Promise<boolean> {
+type DependencyOwnerStatus = "alive" | "dead" | "unknown";
+
+async function dependencyOwnerStatus(ownerPath: string): Promise<DependencyOwnerStatus> {
   try {
     const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown };
-    if (typeof owner.pid !== "number") return false;
+    if (typeof owner.pid !== "number") return "unknown";
     process.kill(owner.pid, 0);
-    return true;
+    return "alive";
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return "alive";
+    if (code === "ESRCH") return "dead";
+    return "unknown";
   }
+}
+
+async function dependencyOwnerAlive(ownerPath: string): Promise<boolean> {
+  return (await dependencyOwnerStatus(ownerPath)) === "alive";
 }
 
 function isOperationalPath(path: string): boolean {

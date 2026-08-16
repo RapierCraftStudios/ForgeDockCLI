@@ -102,6 +102,28 @@ describe("GitHub artifact reconciliation", () => {
     }
   });
 
+  it("does not terminalize a newer build behind an older review verdict", () => {
+    const oldVerdict = createArtifact({
+      ...common,
+      kind: "ReviewVerdict",
+      payload: { headSha: sha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:02:00.000Z" });
+    const newerBuild = createArtifact({
+      ...common,
+      kind: "BuildResult",
+      payload: { ...build.payload, headSha: "b".repeat(40), summary: "repaired" },
+    }, { createdAt: "2026-01-01T00:03:00.000Z" });
+    const priorFailure = createArtifact({
+      ...common,
+      kind: "Outcome",
+      payload: { status: "blocked", reason: "verification repair dispatched", childIssues: [] },
+    }, { createdAt: "2026-01-01T00:01:00.000Z" });
+    assert.equal(
+      reconcileArtifacts([intent, investigation, packet, priorFailure, build, oldVerdict, newerBuild] as DurableArtifact[]).state,
+      "publishing",
+    );
+  });
+
   it("lets a later verified BuildResult supersede a ready remediation checkpoint", () => {
     const checkpoint = createArtifact({
       ...common,

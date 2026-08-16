@@ -1201,8 +1201,13 @@ export class GitHubClient implements ForgeHost {
     };
     if (claim.status === "materialized") {
       const authoritative = await this.authoritativeIssueSnapshot(claim.snapshot);
-      if (authoritative.state !== "OPEN" || !hasCanonicalMarker(authoritative.body, marker)) {
-        throw new Error(`Cached batch admission no longer matches an open authoritative GitHub issue for ${marker}`);
+      if (authoritative.state !== "OPEN") {
+        const invalidated = await this.remediationAdmissions.invalidateMaterialized(admissionKey, claim.snapshot.number);
+        if (!invalidated) throw new RemediationMaterializationPendingError(marker);
+        return this.materializeBatchIssue(input);
+      }
+      if (!hasCanonicalMarker(authoritative.body, marker)) {
+        throw new Error(`Cached batch issue #${authoritative.number} lost its canonical root marker`);
       }
       return validateExisting(authoritative);
     }
