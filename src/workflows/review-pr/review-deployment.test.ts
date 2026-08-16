@@ -121,6 +121,45 @@ describe("issue-less deployment PR review", () => {
     assertNoDeploymentGate(host.publications);
   });
 
+  it("blocks a pending legacy CodeQL context even when default setup passes", async () => {
+    const host = new DeploymentHost();
+    host.requiredChecks = [
+      { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
+      { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+    ];
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
+    const workspaces = new TestWorkspaces();
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number },
+        { runtime, host, workspaces, artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+      ),
+      /Deployment PR checks are not green: Analyze \(javascript-typescript\)=pending/,
+    );
+
+    assert.equal(runtime.tasks.length, 0);
+    assert.equal(workspaces.removed, false);
+    assertNoDeploymentGate(host.publications);
+  });
+
+  it("blocks cancelled, failed, and unavailable deployment checks", async () => {
+    for (const state of ["cancelled", "failed", "unavailable"] as const) {
+      const host = new DeploymentHost();
+      host.requiredChecks = [
+        { name: "CodeQL default setup", state: "passed" },
+        { name: "Analyze (javascript-typescript)", state },
+      ];
+      await assert.rejects(
+        reviewExistingPullRequest(
+          { repo: deploymentPr.repo, pr: deploymentPr.number },
+          { runtime: new FakeAgentRuntime(), host, workspaces: new TestWorkspaces(), artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+        ),
+        new RegExp(`Deployment PR checks are not green: Analyze \\(javascript-typescript\\)=${state}`),
+      );
+    }
+  });
+
   it("allows configured pending CI to overlap review, then asks for a green exact head", async () => {
     const host = new DeploymentHost();
     host.requiredChecks = [{ name: "CI", state: "pending", detailsUrl: "https://github.test/checks/ci" }];

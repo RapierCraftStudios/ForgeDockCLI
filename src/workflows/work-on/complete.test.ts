@@ -201,19 +201,88 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
-  it("blocks auto-merge while a required GitHub check is pending or failed", async () => {
-    for (const state of ["pending", "failed"] as const) {
+  it("blocks auto-merge and durably preserves every non-passing required state", async () => {
+    for (const state of ["pending", "cancelled", "failed", "unavailable"] as const) {
       const runs = new InMemoryRunRepository();
       const run = await mergingRun(runs);
       const host = new CompletionHost();
-      host.mergeGate.requiredChecks = [{ name: "Unit Tests", state }];
+      const observedAt = host.mergeGate.observedAt;
+      host.mergeGate.requiredChecks = [
+        { name: "Analyze (javascript-typescript)", state, detailsUrl: "https://github.test/actions/runs/legacy" },
+        { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+      ];
       const artifacts = new InMemoryArtifactRepository();
       const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+
       assert.equal(result.run.state, "blocked");
       assert.equal(result.outcome?.payload.status, "blocked");
-      assert.equal(result.outcome?.payload.mergeGate?.requiredChecks[0]?.state, state);
+      assert.deepEqual(result.outcome?.payload.mergeGate, {
+        pullRequest: 9,
+        headSha: sha,
+        baseBranch: "main",
+        mergeable: true,
+        observedAt,
+        requiredChecks: [
+          { name: "Analyze (javascript-typescript)", state, detailsUrl: "https://github.test/actions/runs/legacy" },
+          { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+        ],
+      });
       assert.equal(host.merges, 0);
     }
+  });
+
+  it("persists the exact pending legacy CodeQL gate beside a passing replacement", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    const observedAt = host.mergeGate.observedAt;
+    host.mergeGate.requiredChecks = [
+      { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
+      { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+    ];
+    const artifacts = new InMemoryArtifactRepository();
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+
+    assert.equal(result.run.state, "blocked");
+    assert.deepEqual(result.outcome?.payload.mergeGate, {
+      pullRequest: 9,
+      headSha: sha,
+      baseBranch: "main",
+      mergeable: true,
+      observedAt,
+      requiredChecks: [
+        { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
+        { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+      ],
+    });
+    assert.equal(host.merges, 0);
+  });
+
+  it("persists unavailable merge-gate authority without retrying into a merge", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    Object.defineProperty(host, "getPullRequestMergeGate", { value: async () => {
+      throw new Error("default setup authority unavailable");
+    } });
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+
+    assert.equal(result.run.state, "blocked");
+    assert.deepEqual(result.outcome?.payload.mergeGate, {
+      pullRequest: 9,
+      headSha: sha,
+      baseBranch: "main",
+      mergeable: false,
+      observedAt: result.outcome?.payload.mergeGate?.observedAt,
+      requiredChecks: [{
+        name: "merge-admission-query",
+        state: "unavailable",
+        detailsUrl: "default setup authority unavailable",
+      }],
+    });
+    assert.equal(host.merges, 0);
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {
