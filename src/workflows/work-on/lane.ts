@@ -84,6 +84,9 @@ export function classifyIssueLane(
     throw new Error(`Configured feature promotion target ${featurePromotionTarget} is the protected production target; use a separate integration branch`);
   }
   const explicitEvidence = explicitBranchEvidence(issue);
+  if (productionTarget !== undefined && explicitEvidence.branch === productionTarget) {
+    throw new Error(`Issue #${issue.number} explicit branch evidence selects protected production target ${productionTarget}; ordinary work-on delivery must use an integration branch`);
+  }
   if (explicitEvidence.branch && explicitEvidence.kind === "source") {
     return { kind: "fast", targetBranch: explicitEvidence.branch, resolution: "explicit-source-branch" };
   }
