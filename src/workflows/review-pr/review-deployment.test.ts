@@ -22,9 +22,13 @@ const deploymentPr: PullRequestSnapshot = {
   baseBranch: "main",
 };
 const clean: ReviewerSubmission = { summary: "No deployment defects", findings: [] };
+const deploymentWildcardPolicy = { ...DEFAULT_REVIEW_CI, deploymentChecks: ["Pipeline *"] };
 
 class DeploymentHost implements ForgeHost {
   readonly publications: Array<{ repo: string; pullRequest: number; marker: string; body: string }> = [];
+  materializedFindings = 0;
+  reconciledFindings = 0;
+  readonly mergeGateHeads: string[] = [];
   pullRequest = deploymentPr;
   pullRequestSnapshots: PullRequestSnapshot[] = [];
   requiredChecks: PullRequestMergeGate["requiredChecks"] = [{ name: "CI", state: "passed" }];
@@ -37,6 +41,7 @@ class DeploymentHost implements ForgeHost {
     return "diff --git a/src/release.ts b/src/release.ts\n+export const release = true;";
   }
   async getPullRequestMergeGate(_repo: string, number: number, headSha: string, baseBranch: string): Promise<PullRequestMergeGate> {
+    this.mergeGateHeads.push(headSha);
     return {
       repo: deploymentPr.repo,
       pullRequest: number,
@@ -53,6 +58,7 @@ class DeploymentHost implements ForgeHost {
     this.publications.push(input);
   }
   async materializeReviewFinding() {
+    this.materializedFindings += 1;
     return {
       repo: deploymentPr.repo,
       number: 100,
@@ -61,6 +67,10 @@ class DeploymentHost implements ForgeHost {
       url: "https://github.test/a/b/issues/100",
       state: "OPEN" as const,
     };
+  }
+  async reconcileReviewFindings(): Promise<readonly number[]> {
+    this.reconciledFindings += 1;
+    return [];
   }
   async mergePullRequest(): Promise<void> {}
   async closeIssue(): Promise<void> {}
@@ -100,6 +110,27 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["ReviewVerdict"]);
     assertNoDeploymentGate(host.publications);
     assert.equal(workspaces.removed, true);
+  });
+
+  it("blocks an unmatched deployment wildcard before reviewer setup", async () => {
+    const host = new DeploymentHost();
+    const runtime = new FakeAgentRuntime();
+    const workspaces = new TestWorkspaces();
+    const artifacts = new InMemoryArtifactRepository();
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: deploymentWildcardPolicy } },
+        { runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository() },
+      ),
+      /ForgeDock deployment PR checks are not green before independent review: Pipeline \*=unavailable/,
+    );
+
+    assert.equal(runtime.tasks.length, 0);
+    assert.equal(workspaces.removed, false);
+    assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }), []);
+    assert.deepEqual(host.mergeGateHeads, [sha]);
+    assertNoDeploymentGate(host.publications);
   });
 
   it("treats every non-green deployment check as authoritative", async () => {
@@ -201,6 +232,37 @@ describe("issue-less deployment PR review", () => {
     );
 
     assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }), []);
+    assertNoDeploymentGate(host.publications);
+  });
+
+  it("rejects an unmatched deployment wildcard before verdict publication", async () => {
+    const host = new DeploymentHost();
+    host.requiredChecks = [{ name: "Pipeline Linux", state: "passed" }];
+    const runtime = new FakeAgentRuntime([
+      () => {
+        host.requiredChecks = [{ name: "CI", state: "passed" }];
+        return clean;
+      },
+      ...Array.from({ length: 7 }, () => clean),
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const workspaces = new TestWorkspaces();
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: deploymentWildcardPolicy } },
+        { runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository() },
+      ),
+      /ForgeDock deployment PR checks are not green after independent review of the exact head: Pipeline \*=unavailable/,
+    );
+
+    assert.ok(runtime.tasks.length > 0);
+    assert.equal(workspaces.removed, true);
+    assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }), []);
+    assert.equal(host.materializedFindings, 0);
+    assert.equal(host.reconciledFindings, 0);
+    assert.ok(host.mergeGateHeads.length >= 2);
+    assert.equal(host.mergeGateHeads.every((head) => head === sha), true);
     assertNoDeploymentGate(host.publications);
   });
 
