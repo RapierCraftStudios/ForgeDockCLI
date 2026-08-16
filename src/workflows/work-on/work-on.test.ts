@@ -3,12 +3,16 @@ import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
+import { decideSubjectAdmission } from "../../core/state/admission.js";
+import { reconcileArtifacts } from "../../core/state/reconcile.js";
 import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
+import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
+import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
@@ -113,6 +117,76 @@ function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"Bui
 const submission: BuilderSubmission = {
   summary: "Added guard", changedPaths: ["src/a.js"], criterionCoverage: [{ criterion: "Guard runs", implementation: "guard() is called" }], decisions: [], residualRisks: [],
 };
+
+function createWorkOnIntent(runId: string) {
+  return createArtifact({
+    kind: "Intent", runId, subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+    payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+  });
+}
+
+async function createPreparationCheckpointFixture(runId: string) {
+  const artifacts = new InMemoryArtifactRepository();
+  const runs = new InMemoryRunRepository();
+  const git = new EndToEndGit();
+  const host = new EndToEndHost();
+  const intent = createWorkOnIntent(runId);
+  const investigationArtifact = createArtifact({
+    kind: "Investigation", runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation,
+  });
+  let run = attachArtifact(createRun({ workflow: "work-on", subject: intent.subject, runId, target: runTarget }), "Intent", intent.id);
+  await runs.create(run);
+  let advanced = transition(run, "START_INVESTIGATION");
+  await runs.commit(run.version, advanced.state, advanced.record);
+  run = advanced.state;
+  run = attachArtifact(run, "Investigation", investigationArtifact.id);
+  advanced = transition(run, "INVESTIGATION_CONFIRMED");
+  await runs.commit(run.version, advanced.state, advanced.record);
+  run = advanced.state;
+  await artifacts.append(intent);
+  await artifacts.append(investigationArtifact);
+  return { artifacts, runs, git, host, intent, investigationArtifact, run };
+}
+
+async function createBuildCheckpointFixture(runId: string) {
+  const fixture = await createPreparationCheckpointFixture(runId);
+  const packetArtifact = createArtifact({
+    kind: "BuildPacket", runId, subject: fixture.intent.subject, producer: { role: "packet-author" }, payload: packet,
+  });
+  await fixture.artifacts.append(packetArtifact);
+  const withPacket = attachArtifact(fixture.run, "BuildPacket", packetArtifact.id);
+  const advanced = transition(withPacket, "BUILD_PACKET_READY", {
+    scopeManifest: scopeManifestForBuildPacket(packetArtifact.payload.expectedPaths),
+  });
+  await fixture.runs.commit(withPacket.version, advanced.state, advanced.record);
+  return { ...fixture, packetArtifact, run: advanced.state };
+}
+
+async function assertRetainedBuildPacketCheckpoint(
+  artifacts: InMemoryArtifactRepository,
+  runs: InMemoryRunRepository,
+  git: EndToEndGit,
+  runId: string,
+): Promise<void> {
+  const persisted = await runs.load(runId);
+  if (!persisted) throw new Error(`Missing persisted run ${runId}`);
+  assert.equal(persisted.state, "building");
+  assert.equal(persisted.version, 3);
+  assert.deepEqual((await runs.history(runId)).map((record) => record.event), [
+    "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
+  ]);
+  const packetArtifact = artifacts.artifacts.find((artifact) => artifact.kind === "BuildPacket");
+  if (!packetArtifact || packetArtifact.kind !== "BuildPacket") throw new Error("Missing Build Packet artifact");
+  assert.deepEqual(persisted.artifactIds.BuildPacket, [packetArtifact.id]);
+  assert.deepEqual(persisted.scopeManifest, scopeManifestForBuildPacket(packetArtifact.payload.expectedPaths));
+  assert.equal(artifacts.artifacts.some((artifact) => artifact.kind === "Outcome"), false);
+  assert.equal(git.removed, false);
+  assert.equal(reconcileArtifacts(artifacts.artifacts).state, "building");
+  const admission = decideSubjectAdmission(artifacts.artifacts, { currentTargetBranch: "main" });
+  assert.equal(admission.action, "resume");
+  if (admission.action === "resume") assert.equal(admission.checkpoint, "build");
+}
+
 const acceptAdjudication = (task: AgentTask<unknown>) => ({
   decisions: [...task.objective.matchAll(/"id": "(review-[a-f0-9]{16})"/g)].map((match) => ({
     findingId: match[1]!, disposition: "accept", rationale: "Directly required by the frozen criterion.",
@@ -214,6 +288,203 @@ describe("complete work-on trajectory", () => {
 
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author", "builder", "reviewer"]);
+  });
+
+  it("retains the committed packet checkpoint and exact conflict for fresh claim promotion", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createWorkOnIntent("run_initial_claim_conflict");
+    const conflict = new ClaimPromotionConflictError("issue-8", ["issue-7"]);
+    let promotedPaths: readonly string[] | undefined;
+
+    await assert.rejects(workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, verification: [],
+      onClaimsPromoted: (paths) => {
+        promotedPaths = paths;
+        throw conflict;
+      },
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }), (error: unknown) => {
+      assert.equal(error, conflict);
+      return true;
+    });
+
+    assert.deepEqual(promotedPaths, packet.expectedPaths);
+    await assertRetainedBuildPacketCheckpoint(artifacts, runs, git, intent.runId);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author"]);
+  });
+
+  it("retains the committed packet checkpoint and exact conflict for preparation resume claim promotion", async () => {
+    const fixture = await createPreparationCheckpointFixture("run_preparation_claim_conflict");
+    const runtime = new FakeAgentRuntime([packet]);
+    const conflict = new ClaimPromotionConflictError("issue-8", ["issue-7"]);
+    let promotedPaths: readonly string[] | undefined;
+
+    await assert.rejects(resumeEarlyWorkOn({
+      checkpoint: "preparation",
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      priorArtifacts: [fixture.intent, fixture.investigationArtifact],
+      workspace,
+      baseBranch: "main",
+      verification: [],
+      onClaimsPromoted: (paths) => {
+        promotedPaths = paths;
+        throw conflict;
+      },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    }), (error: unknown) => {
+      assert.equal(error, conflict);
+      return true;
+    });
+
+    assert.deepEqual(promotedPaths, packet.expectedPaths);
+    await assertRetainedBuildPacketCheckpoint(fixture.artifacts, fixture.runs, fixture.git, fixture.intent.runId);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
+  });
+
+  it("re-promotes frozen packet paths before builder dispatch on build resume", async () => {
+    const fixture = await createBuildCheckpointFixture("run_build_claim_conflict");
+    const runtime = new FakeAgentRuntime([]);
+    const conflict = new ClaimPromotionConflictError("issue-8", ["issue-7"]);
+    let promotedPaths: readonly string[] | undefined;
+
+    await assert.rejects(resumeBuildWorkOn({
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      packet: fixture.packetArtifact,
+      workspace,
+      baseBranch: "main",
+      verification: [],
+      onClaimsPromoted: (paths) => {
+        promotedPaths = paths;
+        throw conflict;
+      },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    }), (error: unknown) => {
+      assert.equal(error, conflict);
+      return true;
+    });
+
+    assert.deepEqual(promotedPaths, fixture.packetArtifact.payload.expectedPaths);
+    const persisted = await fixture.runs.load(fixture.intent.runId);
+    if (!persisted) throw new Error("Missing persisted build-resume run");
+    assert.equal(persisted.state, "building");
+    assert.equal(persisted.version, 4);
+    assert.deepEqual((await fixture.runs.history(fixture.intent.runId)).map((record) => record.event), [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "RESUME_BUILD",
+    ]);
+    assert.deepEqual(persisted.artifactIds.BuildPacket, [fixture.packetArtifact.id]);
+    assert.deepEqual(persisted.scopeManifest, scopeManifestForBuildPacket(fixture.packetArtifact.payload.expectedPaths));
+    assert.equal(fixture.artifacts.artifacts.some((artifact) => artifact.kind === "Outcome"), false);
+    assert.equal(fixture.git.removed, false);
+    assert.deepEqual(runtime.tasks, []);
+  });
+
+  it("records a non-conflict callback failure from the adopted fresh packet checkpoint", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createWorkOnIntent("run_initial_callback_failure");
+    const callbackError = new Error("promotion sink failed");
+
+    await assert.rejects(workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, verification: [],
+      onClaimsPromoted: () => { throw callbackError; },
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }), (error: unknown) => {
+      assert.equal(error, callbackError);
+      assert.notEqual(error instanceof Error ? error.name : undefined, "ConcurrentRunUpdateError");
+      return true;
+    });
+
+    const persisted = await runs.load(intent.runId);
+    if (!persisted) throw new Error("Missing persisted callback-failure run");
+    assert.equal(persisted.state, "failed");
+    assert.equal(persisted.version, 4);
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "FAIL",
+    ]);
+    const outcomes = artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome");
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.status : undefined, "failed");
+    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.reason : undefined, callbackError.message);
+    assert.equal(git.removed, false);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author"]);
+  });
+
+  it("records a non-conflict callback failure from the adopted preparation checkpoint", async () => {
+    const fixture = await createPreparationCheckpointFixture("run_preparation_callback_failure");
+    const runtime = new FakeAgentRuntime([packet]);
+    const callbackError = new Error("preparation promotion sink failed");
+
+    await assert.rejects(resumeEarlyWorkOn({
+      checkpoint: "preparation",
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      priorArtifacts: [fixture.intent, fixture.investigationArtifact],
+      workspace,
+      baseBranch: "main",
+      verification: [],
+      onClaimsPromoted: () => { throw callbackError; },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    }), (error: unknown) => {
+      assert.equal(error, callbackError);
+      assert.notEqual(error instanceof Error ? error.name : undefined, "ConcurrentRunUpdateError");
+      return true;
+    });
+
+    const persisted = await fixture.runs.load(fixture.intent.runId);
+    if (!persisted) throw new Error("Missing persisted preparation callback-failure run");
+    assert.equal(persisted.state, "failed");
+    assert.equal(persisted.version, 4);
+    assert.deepEqual((await fixture.runs.history(fixture.intent.runId)).map((record) => record.event), [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "FAIL",
+    ]);
+    const outcomes = fixture.artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome");
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.reason : undefined, callbackError.message);
+    assert.equal(fixture.git.removed, false);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
+  });
+
+  it("dispatches the builder only after successful claim promotion from the preparation checkpoint", async () => {
+    const fixture = await createPreparationCheckpointFixture("run_preparation_claim_success");
+    const runtime = new FakeAgentRuntime([packet, submission, { summary: "Approved", findings: [] }]);
+    const promoted: string[][] = [];
+
+    const result = await resumeEarlyWorkOn({
+      checkpoint: "preparation",
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      priorArtifacts: [fixture.intent, fixture.investigationArtifact],
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      onClaimsPromoted: (paths) => promoted.push([...paths]),
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    });
+
+    assert.equal(result.run.state, "completed");
+    assert.deepEqual(promoted, [packet.expectedPaths]);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author", "builder", "reviewer"]);
+    assert.equal(fixture.git.removed, true);
   });
 
   it("distinguishes durable artifact fields from dotted and extensionless repository paths", () => {

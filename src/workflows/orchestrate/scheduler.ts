@@ -277,8 +277,17 @@ export async function runSchedule(
             .filter((activeId) => activeId !== item.id)
             .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
           if (conflicts.length) throw new ClaimPromotionConflictError(item.id, conflicts);
+          const previousClaims = currentClaims.get(item.id);
           currentClaims.set(item.id, merged);
-          options.onClaimsPromoted?.(item.id, merged);
+          try {
+            options.onClaimsPromoted?.(item.id, merged);
+          } catch (error) {
+            // A durable sink can reject after the in-memory publication. Do
+            // not leave a claim visible that the sink did not accept.
+            if (previousClaims === undefined) currentClaims.delete(item.id);
+            else currentClaims.set(item.id, previousClaims);
+            throw error;
+          }
         },
       };
       const promise = worker(item, context)

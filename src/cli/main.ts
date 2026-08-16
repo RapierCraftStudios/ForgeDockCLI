@@ -276,7 +276,10 @@ async function status(argv: string[]): Promise<void> {
   }
 }
 
-async function workOn(argv: string[]): Promise<void> {
+async function workOn(
+  argv: string[],
+  orchestration?: { onClaimsPromoted?: (paths: readonly string[]) => void },
+): Promise<void> {
   requirePiNodeVersion();
   const issueArg = parseWorkOnIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) {
@@ -645,6 +648,7 @@ async function workOn(argv: string[]): Promise<void> {
           ...(provider !== undefined ? { provider } : {}),
           ...(model !== undefined ? { model } : {}),
           ...planning,
+          ...(orchestration?.onClaimsPromoted !== undefined ? { onClaimsPromoted: orchestration.onClaimsPromoted } : {}),
           signal: leaseController.signal,
         }, { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent });
         const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
@@ -838,7 +842,10 @@ async function workOn(argv: string[]): Promise<void> {
           ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
         }, dependencies)
         : admission.checkpoint === "build"
-          ? await resumeBuildWorkOn(common, dependencies)
+          ? await resumeBuildWorkOn({
+            ...common,
+            ...(orchestration?.onClaimsPromoted !== undefined ? { onClaimsPromoted: orchestration.onClaimsPromoted } : {}),
+          }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({
               ...common,
@@ -952,6 +959,7 @@ async function workOn(argv: string[]): Promise<void> {
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
       ...planning,
+      ...(orchestration?.onClaimsPromoted !== undefined ? { onClaimsPromoted: orchestration.onClaimsPromoted } : {}),
       signal: leaseController.signal,
     }, {
       runtime, artifacts, runs,
@@ -1430,7 +1438,9 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (thinking !== undefined) resumeArgs.push("--thinking", thinking);
           if (planning.planningProvider !== undefined && planning.planningModel !== undefined) resumeArgs.push("--planning-model", `${planning.planningProvider}/${planning.planningModel}`);
           if (planning.planningThinking !== undefined) resumeArgs.push("--planning-thinking", planning.planningThinking);
-          await workOn(resumeArgs);
+          await workOn(resumeArgs, {
+            onClaimsPromoted: (paths) => controllerContext.promoteClaims(paths),
+          });
           setAgentEventObservationIdentity({
             repository: repository.repo,
             orchestrationId,
@@ -1507,7 +1517,9 @@ async function orchestrate(argv: string[]): Promise<void> {
           }
           if (error instanceof ClaimPromotionConflictError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
-            return { status: "suspended", error: error.message };
+            // Preserve the scheduler error object through the typed suspended
+            // result; the controller still serializes its message durably.
+            return { status: "suspended", error };
           }
           throw error;
         }
@@ -1718,7 +1730,18 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         if (workerThinking) workerArgs.push("--thinking", workerThinking);
         if (planningProvider && planningModel) workerArgs.push("--planning-model", `${planningProvider}/${planningModel}`);
         if (planningThinking) workerArgs.push("--planning-thinking", planningThinking);
-        await workOn(workerArgs);
+        try {
+          await workOn(workerArgs, {
+            onClaimsPromoted: (paths) => context.promoteClaims(paths),
+          });
+        } catch (error) {
+          if (error instanceof ClaimPromotionConflictError) {
+            // Preserve the scheduler conflict identity so orchestration resume
+            // records a suspension rather than a terminal worker failure.
+            return { status: "suspended", error };
+          }
+          throw error;
+        }
         setAgentEventObservationIdentity({
           repository: record.repository,
           orchestrationId,

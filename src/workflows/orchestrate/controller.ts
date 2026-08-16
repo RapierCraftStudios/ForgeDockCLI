@@ -283,6 +283,9 @@ export class OrchestrationController {
           serializationEdges: prepared.serializationEdges,
           resumedItemIds: prepared.resumedItemIds,
           onClaimsPromoted: (itemId, claims) => {
+            // Promotion is part of the same fenced worker handoff as the
+            // packet checkpoint; reject stale controllers before recording it.
+            executionState.claim.assertValid();
             this.updateNode(executionState, itemId, (node) => ({ ...node, claims: [...claims] }));
             this.emitSnapshot(executionState.record, executionState);
           },

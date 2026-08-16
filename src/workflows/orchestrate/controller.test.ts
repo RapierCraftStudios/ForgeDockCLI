@@ -12,7 +12,7 @@ import {
   type OrchestrationWorkerContext,
   type OrchestrationWorkOnWorker,
 } from "./controller.js";
-import type { ScheduledWorkItem } from "./scheduler.js";
+import { ClaimPromotionConflictError, type ScheduledWorkItem } from "./scheduler.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -647,6 +647,127 @@ describe("OrchestrationController", () => {
       (await repository.loadOrchestration(result.orchestrationId))?.nodes.find((node) => node.id === "child")?.waitReason,
       child?.waitReason,
     );
+  });
+
+  it("persists a caught claim conflict as a suspended attempt and resumes after release", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const conflict = new ClaimPromotionConflictError("parent", ["active-worker"]);
+    const launches: string[] = [];
+    let firstAttempt = true;
+    const service = controller(repository, async (scheduled, context) => {
+      launches.push(`${scheduled.id}:${context.recovery}`);
+      if (scheduled.id === "parent" && firstAttempt) {
+        firstAttempt = false;
+        try {
+          throw conflict;
+        } catch (error) {
+          assert.equal(error, conflict);
+          return { status: "suspended", error: conflict };
+        }
+      }
+    }, {
+      reconcileWorker: async ({ item: scheduled }) => {
+        assert.equal(scheduled.id, "parent");
+        return { disposition: "interrupted", reason: "active claim released" };
+      },
+    });
+
+    const created = await service.create({
+      repository: "owner/repo",
+      items: [item("parent", 30), item("child", 31, ["parent"])],
+      maxParallel: 2,
+    });
+    const suspended = await service.run(created.orchestrationId);
+    const suspendedParent = suspended.record.nodes.find((node) => node.id === "parent");
+    const queuedChild = suspended.record.nodes.find((node) => node.id === "child");
+    assert.equal(suspended.schedule.status.get("parent"), "suspended");
+    assert.equal(suspended.schedule.status.get("child"), "queued");
+    assert.equal(suspended.schedule.errors.get("parent"), conflict);
+    assert.equal(suspendedParent?.status, "suspended");
+    assert.equal(suspendedParent?.attempts?.[0]?.status, "suspended");
+    assert.equal(suspendedParent?.activeAttemptId, undefined);
+    assert.deepEqual(queuedChild?.waitReason, {
+      kind: "suspended-predecessor",
+      predecessor: "parent",
+      checkpoint: "durable-recovery",
+    });
+    assert.deepEqual(
+      (await repository.loadOrchestration(created.orchestrationId))?.nodes.find((node) => node.id === "child")?.waitReason,
+      queuedChild?.waitReason,
+    );
+
+    const resumed = await service.resume(created.orchestrationId);
+    const resumedParent = resumed.record.nodes.find((node) => node.id === "parent");
+    assert.equal(resumed.record.status, "completed");
+    assert.deepEqual(launches, ["parent:initial", "parent:relaunch", "child:initial"]);
+    assert.deepEqual(resumedParent?.attempts?.map((attempt) => [attempt.status, attempt.recovery]), [
+      ["interrupted", "initial"],
+      ["completed", "relaunch"],
+    ]);
+    assert.equal(resumed.record.nodes.find((node) => node.id === "child")?.status, "completed");
+  });
+
+  it("re-promotes packet-only claims on an explicit resume after the active claim releases", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const activeClaimed = deferred<void>();
+    const releaseActive = deferred<void>();
+    const launches: string[] = [];
+    let conflict: ClaimPromotionConflictError | undefined;
+    const service = controller(repository, async (scheduled, context) => {
+      launches.push(`${scheduled.id}:${context.recovery}`);
+      if (scheduled.id === "active") {
+        context.promoteClaims(["src/packet-only"]);
+        activeClaimed.resolve();
+        await releaseActive.promise;
+        return;
+      }
+      if (scheduled.id === "parent" && context.recovery === "initial") {
+        await activeClaimed.promise;
+        try {
+          context.promoteClaims(["src/packet-only"]);
+        } catch (error) {
+          if (!(error instanceof ClaimPromotionConflictError)) throw error;
+          conflict = error;
+          return { status: "suspended", error };
+        }
+        throw new Error("expected the packet-only claim to conflict with active work");
+      }
+      context.promoteClaims(["src/packet-only"]);
+    }, {
+      reconcileWorker: async ({ item: scheduled }) => {
+        assert.equal(scheduled.id, "parent");
+        return { disposition: "interrupted", reason: "active claim released" };
+      },
+    });
+
+    const created = await service.create({
+      repository: "owner/repo",
+      maxParallel: 2,
+      items: [
+        { id: "parent", issue: 30, priority: 0, dependencies: [], claims: [] },
+        { id: "active", issue: 31, priority: 1, dependencies: [], claims: [] },
+        { id: "child", issue: 32, priority: 2, dependencies: ["parent"], claims: [] },
+      ],
+    });
+    const firstExecution = service.run(created.orchestrationId);
+    await activeClaimed.promise;
+    await waitUntil(() => conflict !== undefined, "packet-only claim conflict was not observed");
+    releaseActive.resolve();
+
+    const suspended = await firstExecution;
+    assert.ok(conflict);
+    assert.equal(suspended.schedule.errors.get("parent"), conflict);
+    assert.equal(suspended.record.nodes.find((node) => node.id === "parent")?.status, "suspended");
+    assert.deepEqual(suspended.record.nodes.find((node) => node.id === "parent")?.claims, []);
+    assert.deepEqual(suspended.record.nodes.find((node) => node.id === "active")?.claims, ["src/packet-only"]);
+    assert.equal(suspended.record.nodes.find((node) => node.id === "child")?.status, "queued");
+
+    const resumed = await service.resume(created.orchestrationId);
+    assert.equal(resumed.record.status, "completed");
+    assert.deepEqual(launches, ["parent:initial", "active:initial", "parent:relaunch", "child:initial"]);
+    assert.deepEqual(resumed.record.nodes.find((node) => node.id === "parent")?.claims, ["src/packet-only"]);
+    assert.equal(resumed.record.nodes.find((node) => node.id === "parent")?.status, "completed");
+    assert.equal(resumed.record.nodes.find((node) => node.id === "child")?.status, "completed");
   });
 
   it("delivers events only after persistence and isolates observer failures", async () => {
