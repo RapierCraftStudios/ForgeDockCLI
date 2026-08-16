@@ -511,6 +511,8 @@ export async function resumeBuildWorkOn(
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
     parentRemediation?: ParentRemediationTarget;
+    /** Re-register the frozen packet paths with the owning scheduler before builder dispatch. */
+    onClaimsPromoted?: (paths: readonly string[]) => void;
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -519,6 +521,8 @@ export async function resumeBuildWorkOn(
   if (input.run.state !== "building") throw new Error(`Build resume requires building state, found ${input.run.state}`);
   assertRunTargetsBranch(input.run, input.baseBranch);
   let run = input.run;
+  let claimPromotionPending = false;
+  let retainWorkspaceForRecovery = false;
   try {
     let priorVerificationFailure = input.priorVerificationFailure;
     let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
@@ -549,6 +553,9 @@ export async function resumeBuildWorkOn(
     const resumed = transition(run, "RESUME_BUILD", { reason: `Resuming frozen Build Packet in retained workspace ${input.workspace.path}` });
     await dependencies.runs.commit(run.version, resumed.state, resumed.record);
     run = resumed.state;
+    claimPromotionPending = true;
+    input.onClaimsPromoted?.(input.packet.payload.expectedPaths);
+    claimPromotionPending = false;
     const result = await continueBuildDelivery({
       ...input,
       run,
@@ -558,6 +565,12 @@ export async function resumeBuildWorkOn(
     run = result.run;
     return result;
   } catch (error) {
+    if (claimPromotionPending && error instanceof ClaimPromotionConflictError) {
+      // The RESUME_BUILD checkpoint is already durable. Preserve it and the
+      // retained workspace while the scheduler waits for a later explicit retry.
+      retainWorkspaceForRecovery = true;
+      throw error;
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
     if (run.state !== "failed" && run.state !== "blocked") {
@@ -568,7 +581,7 @@ export async function resumeBuildWorkOn(
     if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    const retainForRecovery = retainWorkspaceForRecovery || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
     if (!retainForRecovery) {
       try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
     }

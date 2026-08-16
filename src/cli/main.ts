@@ -986,7 +986,10 @@ async function workOn(
           ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
         }, dependencies)
         : admission.checkpoint === "build"
-          ? await resumeBuildWorkOn(common, dependencies)
+          ? await resumeBuildWorkOn({
+            ...common,
+            ...(orchestration?.onClaimsPromoted !== undefined ? { onClaimsPromoted: orchestration.onClaimsPromoted } : {}),
+          }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({
               ...common,
