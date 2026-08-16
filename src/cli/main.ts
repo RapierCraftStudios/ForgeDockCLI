@@ -1263,6 +1263,7 @@ async function orchestrate(argv: string[]): Promise<void> {
       const observed = requiredIssueRoute(routedIssues, item.issue).issue;
       const lane = requiredIssueRoute(routedIssues, item.issue).lane;
       const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
+      const affectedFiles = affectedFilesFromIssueBody(observed.body);
       return {
         ...item,
         repository: repository.repo,
@@ -1274,7 +1275,8 @@ async function orchestrate(argv: string[]): Promise<void> {
         labels: observed.labels,
         title: observed.title,
         summary: observed.body.slice(0, 4_000),
-        affectedFiles: affectedFilesFromIssueBody(observed.body),
+        affectedFiles,
+        claims: [...new Set([...item.claims, ...affectedFiles])],
         riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
         ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
       };

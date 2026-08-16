@@ -5,6 +5,12 @@ import { buildSchedulePreview, claimsConflict, ClaimPromotionConflictError, InMe
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function deferredGate(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
 describe("lean orchestration scheduler", () => {
   it("honors dependencies, priority, concurrency and path claims", async () => {
     const items = [
@@ -78,6 +84,72 @@ describe("lean orchestration scheduler", () => {
     assert.equal(preview.criticalPath[0]?.id, "a");
   });
 
+  it("uses conservative glob scopes for accepted forms, uncertain segments, and boundaries", () => {
+    const typescript = materializeClaimDependencies([
+      { id: "glob", issue: 1, priority: 1, dependencies: [], claims: ["src/**/*.ts"] },
+      { id: "concrete", issue: 2, priority: 1, dependencies: [], claims: ["src/foo.ts"] },
+    ]);
+    assert.deepEqual(typescript.edges, [{
+      predecessor: "glob",
+      successor: "concrete",
+      overlappingClaims: ["src/**/*.ts ↔ src/foo.ts"],
+    }]);
+
+    const components = materializeClaimDependencies([
+      { id: "glob", issue: 3, priority: 1, dependencies: [], claims: ["src/components/*.tsx"] },
+      { id: "concrete", issue: 4, priority: 1, dependencies: [], claims: ["src/components/button.tsx"] },
+    ]);
+    assert.deepEqual(components.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["glob", "concrete"]]);
+    assert.equal(claimsConflict(["src/**/*.ts"], ["src/components/*.tsx"]), true);
+    assert.equal(claimsConflict(["src/components/*.tsx"], ["src/api/*.ts"]), false);
+    assert.equal(claimsConflict(["src/**/*.ts"], ["src2/foo.ts"]), false);
+    assert.equal(claimsConflict(["src/components/*.tsx"], ["src/components2/button.tsx"]), false);
+    assert.equal(claimsConflict(["src/foo*.ts"], ["src/foobar.ts"]), true);
+    assert.equal(claimsConflict(["src/[ab].ts"], ["src/a.ts"]), true);
+    assert.equal(claimsConflict(["src/{a,b}.ts"], ["src/b.ts"]), true);
+    assert.equal(claimsConflict(["src/foo*.ts"], ["docs/foobar.ts"]), false);
+    assert.equal(claimsConflict(["./SRC/components/"], ["src/components/button.tsx"]), true);
+    assert.equal(claimsConflict(["component:repository"], ["component:repository"]), true);
+    assert.equal(claimsConflict(["component:repository"], ["component:repository/subscope"]), false);
+    assert.equal(claimsConflict(["component:repository"], ["src/repository"]), false);
+    assert.equal(claimsConflict(["*.ts"], ["docs/readme.md"]), true);
+  });
+
+  it("serializes matching glob and concrete work while unrelated work uses available capacity", async () => {
+    const globGate = deferredGate();
+    const unrelatedGate = deferredGate();
+    const items = [
+      { id: "glob", issue: 1, priority: 1, dependencies: [], claims: ["src/**/*.ts"] },
+      { id: "unrelated", issue: 2, priority: 1, dependencies: [], claims: ["docs"] },
+      { id: "concrete", issue: 3, priority: 1, dependencies: [], claims: ["src/foo.ts"] },
+    ];
+    const byId = new Map(items.map((item) => [item.id, item]));
+    const active = new Set<string>();
+    const started: string[] = [];
+    let maximumActive = 0;
+    let conflictObserved = false;
+    const schedule = runSchedule(items, 2, async (item) => {
+      if ([...active].some((id) => claimsConflict(item.claims, byId.get(id)?.claims ?? []))) conflictObserved = true;
+      active.add(item.id);
+      started.push(item.id);
+      maximumActive = Math.max(maximumActive, active.size);
+      if (item.id === "glob") await globGate.promise;
+      if (item.id === "unrelated") await unrelatedGate.promise;
+      active.delete(item.id);
+    });
+
+    await sleep(5);
+    assert.deepEqual(started, ["glob", "unrelated"]);
+    assert.equal(maximumActive, 2);
+    unrelatedGate.release();
+    await sleep(5);
+    assert.deepEqual(started, ["glob", "unrelated"]);
+    globGate.release();
+    await schedule;
+    assert.deepEqual(started, ["glob", "unrelated", "concrete"]);
+    assert.equal(conflictObserved, false);
+  });
+
   it("promotes Build Packet paths and rejects a newly discovered active claim conflict", async () => {
     let releaseFirst!: () => void;
     const promoted: Array<[string, string[]]> = [];
@@ -85,11 +157,11 @@ describe("lean orchestration scheduler", () => {
       { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
       { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
     ], 2, async (item, scheduler) => {
-      scheduler.promoteClaims(["src/shared"]);
+      scheduler.promoteClaims([item.id === "first" ? "src/**/*.ts" : "src/foo.ts"]);
       if (item.id === "first") await new Promise<void>((resolve) => { releaseFirst = resolve; });
     }, { onClaimsPromoted: (id, claims) => promoted.push([id, [...claims]]) });
     await sleep(5);
-    assert.deepEqual(promoted, [["first", ["src/shared"]]]);
+    assert.deepEqual(promoted, [["first", ["src/**/*.ts"]]]);
     releaseFirst();
     const result = await resultPromise;
     assert.equal(result.status.get("first"), "completed");
@@ -135,13 +207,13 @@ describe("lean orchestration scheduler", () => {
       if (item.id === "first") {
         await secondPromoted;
         try {
-          scheduler.promoteClaims(["src/shared"]);
+          scheduler.promoteClaims(["src/**/*.ts"]);
         } finally {
           signalFirstAttempted();
         }
         return;
       }
-      scheduler.promoteClaims(["src/shared"]);
+      scheduler.promoteClaims(["src/foo.ts"]);
       signalSecondPromoted();
       await keepSecondActive;
     });
