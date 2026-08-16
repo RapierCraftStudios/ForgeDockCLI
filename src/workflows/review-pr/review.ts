@@ -10,7 +10,7 @@ import { AgentRunError } from "../../runtime/agent-runtime.js";
 import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, parseDiffPaths, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -319,9 +319,13 @@ export async function reviewPullRequest(
     });
     if (!input.deployment) diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
     const priorReviewPlan = input.priorVerdict?.payload.reviewPlan;
-    const reviewPlan = isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
+    // Deployment reconciliation establishes a new path authority at this
+    // frozen boundary. Do not let a structurally valid prior plan retain a
+    // narrower execution scope than the reconciled deployment diff.
+    const reusablePriorReviewPlan = !input.deployment && isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
       run: input.run, pullRequest: frozen, packet: input.packet, context: planContext,
-    })
+    });
+    const reviewPlan = reusablePriorReviewPlan
       ? freezeReviewPlan(priorReviewPlan)
       : planReviewPanel({
         changedPaths,
@@ -884,7 +888,7 @@ function reconcileDeploymentPathInventory(evidence: unknown, diff: unknown): str
   if (typeof diff !== "string") throw new Error("Deployment PR diff must be a string");
   let diffPaths: string[];
   try {
-    diffPaths = parseDiffPaths(diff);
+    diffPaths = parseStrictDeploymentDiffPaths(diff);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Deployment PR diff is malformed: ${reason}`, { cause: error });
@@ -901,6 +905,29 @@ function reconcileDeploymentPathInventory(evidence: unknown, diff: unknown): str
     );
   }
   return parsedPaths;
+}
+
+function parseStrictDeploymentDiffPaths(diff: string): string[] {
+  const paths: string[] = [];
+  const lines = diff.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
+    // A real diff header is unprefixed. Treat every line beginning with the
+    // header marker as authoritative input rather than allowing the planner's
+    // permissive section extractor to silently discard it.
+    if (!line.startsWith("diff --git")) continue;
+    const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (!match) {
+      throw new Error(`diff header at line ${index + 1} is malformed`);
+    }
+    const sourcePath = match[1]!.trim();
+    const targetPath = match[2]!.trim();
+    if (!isConcreteScopePath(sourcePath) || !isConcreteScopePath(targetPath)) {
+      throw new Error(`diff header at line ${index + 1} contains malformed or unsafe paths`);
+    }
+    paths.push(targetPath);
+  }
+  if (!paths.length) throw new Error("diff must contain a non-empty array of parsed headers");
+  return paths;
 }
 
 function canonicalDeploymentPathSet(value: unknown, source: string): string[] {

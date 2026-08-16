@@ -154,6 +154,71 @@ describe("fresh-context PR review", () => {
     assert.ok(reviewerTask.workspace.scope.readRoots.includes("src"));
   });
 
+  it("replans deployment review when a valid prior plan omits a reconciled diff path", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = deploymentContext(run, ["src/lock.ts"]);
+    const deploymentPlanContext: Omit<ReviewPlanContext, "packetId" | "packetDigest"> = {
+      ...reviewPlanContext(run),
+      buildResultBranch: "staging",
+    };
+    const priorPlan = planReviewPanel({
+      changedPaths: ["src/lock.ts"],
+      diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()",
+      packet: context.packet,
+      context: deploymentPlanContext,
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict",
+      runId: run.runId,
+      subject: { ...run.subject, pr: deploymentPr.number },
+      producer: { role: "controller" },
+      payload: {
+        headSha: sha,
+        headBranch: "staging",
+        baseBranch: "main",
+        disposition: "request_changes",
+        reviewerRoles: ["correctness"],
+        findings: [],
+        checks: [],
+        reviewPlan: priorPlan,
+      },
+    });
+    const host = new FakeHost();
+    host.snapshots = Array.from({ length: 4 }, () => deploymentPr);
+    host.getPullRequestDiff = async () => "diff --git a/src/lock.ts b/src/lock.ts\n+lock()\n"
+      + "diff --git a/config/release.yml b/config/release.yml\n+release: true";
+    const runtime = new FakeAgentRuntime([clean, clean]);
+    const result = await reviewPullRequest({
+      run,
+      pullRequest: deploymentPr,
+      ...context,
+      deployment: {
+        headSha: sha,
+        headBranch: "staging",
+        baseBranch: "main",
+        changedPaths: ["src/lock.ts", "config/release.yml"],
+        checks: context.checks,
+      },
+      priorVerdict,
+      workspace: process.cwd(),
+      maxReviewSpecialists: 1,
+    }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs });
+
+    assert.notEqual(result.reviewPlan.planId, priorPlan.planId);
+    assert.deepEqual(
+      [...new Set(result.reviewPlan.executionGroups.flatMap(({ scope }) => scope))].sort(),
+      ["config/release.yml", "src/lock.ts"],
+    );
+    const reviewerTask = runtime.tasks.find((task) => task.role === "reviewer");
+    assert.ok(reviewerTask);
+    assert.match(reviewerTask.objective, /config\/release\.yml/);
+    assert.deepEqual(
+      [...new Set(result.verdict.payload.reviewPlan?.executionGroups?.flatMap(({ scope }) => scope) ?? [])].sort(),
+      ["config/release.yml", "src/lock.ts"],
+    );
+  });
+
   it("rejects empty, unsafe, and malformed deployment evidence or diff before reviewer dispatch", async () => {
     const cases: Array<{ name: string; evidence: unknown; diff: unknown; pattern: RegExp }> = [
       { name: "empty evidence", evidence: [], diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()", pattern: /non-empty array/ },
@@ -161,6 +226,12 @@ describe("fresh-context PR review", () => {
       { name: "malformed evidence", evidence: [42], diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()", pattern: /malformed or unsafe/ },
       { name: "empty diff", evidence: ["src/lock.ts"], diff: "", pattern: /non-empty array/ },
       { name: "malformed diff", evidence: ["src/lock.ts"], diff: "not a unified diff", pattern: /non-empty array/ },
+      {
+        name: "malformed diff header after a valid section",
+        evidence: ["src/lock.ts"],
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()\ndiff --git a/../secret.ts b/",
+        pattern: /malformed/,
+      },
       { name: "unsafe diff", evidence: ["src/lock.ts"], diff: "diff --git a/../secret.ts b/../secret.ts\n+secret()", pattern: /malformed or unsafe/ },
     ];
     for (const testCase of cases) {
