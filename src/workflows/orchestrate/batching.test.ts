@@ -84,14 +84,56 @@ describe("orchestration work-unit batching", () => {
       "## Affected Files", "1. `src/core/a.ts` — change", "2. `src/core/b.ts` — test",
       "## Related", "See `src/not-this-either.ts`.",
     ].join("\n");
-    assert.deepEqual(affectedFilesFromIssueBody(body), ["src/core/a.ts", "src/core/b.ts"]);
+    const affectedFiles = affectedFilesFromIssueBody(body);
+    assert.deepEqual(affectedFiles, ["src/core/a.ts", "src/core/b.ts"]);
+    const graph = materializeClaimDependencies([
+      { id: "planned", issue: 1, priority: 1, dependencies: [], claims: [affectedFiles[0]!] },
+      { id: "concrete", issue: 2, priority: 1, dependencies: [], claims: ["src/core/a.ts"] },
+    ]);
+    assert.deepEqual(graph.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["planned", "concrete"]]);
   });
 
   it("accepts bounded glob paths and ignores unsafe or unbounded paths", () => {
     const body = [
-      "## Affected Files", "- `src/**/*.ts`", "- `src/components/*.tsx`", "- `**/*.md`", "- `../outside.ts`", "- `/etc/passwd`",
+      "## Affected Files", "- `src/**/*.ts`", "- `src/components/*.tsx`", "- `**/*.md`", "- `../outside.ts`", "- `src/../../outside.ts`", "- `/etc/passwd`", "- `C:/etc/passwd`",
     ].join("\n");
-    assert.deepEqual(affectedFilesFromIssueBody(body), ["src/**/*.ts", "src/components/*.tsx"]);
+    const affectedFiles = affectedFilesFromIssueBody(body);
+    assert.deepEqual(affectedFiles, ["src/**/*.ts", "src/components/*.tsx"]);
+    for (const [glob, concrete] of [["src/**/*.ts", "src/foo.ts"], ["src/components/*.tsx", "src/components/button.tsx"]] as const) {
+      const graph = materializeClaimDependencies([
+        { id: "glob", issue: 1, priority: 1, dependencies: [], claims: [glob] },
+        { id: "concrete", issue: 2, priority: 1, dependencies: [], claims: [concrete] },
+      ]);
+      assert.deepEqual(graph.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["glob", "concrete"]]);
+    }
+  });
+
+  it("preserves bounded glob claims through contraction and re-materializes concrete conflicts", () => {
+    const glob = "src/**/*.ts";
+    const members = [
+      item(11, { affectedFiles: [glob], claims: [glob] }),
+      item(12, { affectedFiles: [glob], claims: [glob] }),
+    ];
+    const concrete = item(13, { affectedFiles: ["src/foo.ts"], claims: ["src/foo.ts"] });
+    const contracted = contractBatchGroups([...members, concrete], [{
+      id: "batch:same-file:src-glob:11-12",
+      kind: "same-file",
+      key: glob,
+      riskClass: "routine",
+      members,
+    }], [{
+      groupId: "batch:same-file:src-glob:11-12",
+      issue: 20,
+      title: "Batch findings",
+      summary: "Deliver bounded glob findings",
+    }]);
+    const batch = contracted.find((candidate) => candidate.issue === 20);
+    assert.ok(batch);
+    assert.deepEqual(batch.affectedFiles, [glob]);
+    assert.deepEqual(batch.claims, [glob]);
+    const graph = materializeClaimDependencies(contracted);
+    assert.deepEqual(graph.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["issue-13", "issue-20"]]);
+    assert.deepEqual(graph.edges[0]?.overlappingClaims, ["src/foo.ts ↔ src/**/*.ts"]);
   });
 
   it("renders and parses durable batch membership", () => {

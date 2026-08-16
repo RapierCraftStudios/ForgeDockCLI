@@ -434,15 +434,52 @@ export function claimsConflict(left: readonly string[], right: readonly string[]
   return left.some((a) => right.some((b) => claimOverlaps(a, b)));
 }
 
+/**
+ * Compare claims as repository scopes rather than as glob strings. A glob is
+ * intentionally reduced to the nearest complete literal directory segment;
+ * this is conservative for partial segments and uncertain bracket/brace
+ * expressions, but it cannot let a wildcard escape its slash boundary.
+ */
 function claimOverlaps(left: string, right: string): boolean {
-  const a = normalizeClaim(left);
-  const b = normalizeClaim(right);
-  if (a.startsWith("component:") || b.startsWith("component:")) return a === b;
-  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  const a = canonicalClaimScope(left);
+  const b = canonicalClaimScope(right);
+  if (a.kind === "component" || b.kind === "component") return a.value === b.value;
+  return scopesOverlap(a.value, b.value);
 }
 
 function normalizeClaim(claim: string): string {
-  return claim.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "").toLowerCase();
+  return claim
+    .trim()
+    .replaceAll("\\", "/")
+    .replace(/\/+/g, "/")
+    .replace(/^(?:\.\/)+/, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+function canonicalClaimScope(claim: string): { kind: "component" | "path"; value: string } {
+  const normalized = normalizeClaim(claim);
+  if (normalized.startsWith("component:")) return { kind: "component", value: normalized };
+  const firstGlob = normalized.search(/[*?[{]/);
+  if (firstGlob < 0) return { kind: "path", value: normalized };
+  // Keep only complete literal segments before the first uncertain segment.
+  // Thus `src/foo*.ts` is conservatively scoped to `src`, while
+  // `src/components/*.tsx` is scoped to `src/components`.
+  const literalPrefix = normalized.slice(0, firstGlob);
+  const segmentBoundary = literalPrefix.lastIndexOf("/");
+  return {
+    kind: "path",
+    value: segmentBoundary < 0 ? "" : literalPrefix.slice(0, segmentBoundary),
+  };
+}
+
+function scopesOverlap(left: string, right: string): boolean {
+  // An absent literal prefix represents the repository-wide scope.
+  return left === ""
+    || right === ""
+    || left === right
+    || left.startsWith(`${right}/`)
+    || right.startsWith(`${left}/`);
 }
 
 function overlappingClaims(left: readonly string[], right: readonly string[]): string[] {

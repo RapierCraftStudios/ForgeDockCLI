@@ -97,11 +97,16 @@ describe("SQLite operational repositories", () => {
       status: "running",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
+      serializationEdges: [{
+        predecessor: "issue-9",
+        successor: "issue-10",
+        overlappingClaims: ["src/**/*.ts ↔ src/foo.ts"],
+      }],
       nodes: [{
-        id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: ["src"],
+        id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: ["src/**/*.ts"],
         status: "running", childRunIds: ["run_9"],
       }, {
-        id: "issue-10", issue: 10, priority: 2, dependencies: ["issue-9"], claims: ["docs"],
+        id: "issue-10", issue: 10, priority: 2, dependencies: [], claims: ["src/foo.ts"],
         status: "queued", childRunIds: [],
       }],
     };
