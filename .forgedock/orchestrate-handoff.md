@@ -68,3 +68,27 @@ Persistent evidence files were updated with HP-19 (operator stop/resume checkpoi
 5. Preserve untracked scratch files (`-`, `.forgedock.state.db`, `.forgedock/issue-207-artifacts.json`, `.tables`, `x`) unless the user explicitly authorizes cleanup. They were intentionally not staged or deleted.
 
 Your job is to continue from this evidence, not to restart the investigation from repository-wide history or infer behavior solely from code.
+
+## Live continuation — 2026-08-16/17 UTC
+
+The supported native recovery was executed with:
+
+`npm run next -- orchestrate --resume dag_50ad2a24-44f7-4a1e-96a2-6766f7119f58`
+
+The active controller is the native CLI (`node bin/forgedock-next.mjs`), using the frozen plan `openai-codex/gpt-5.6-luna` with `max` thinking and transport capacity 4. It is not the Codex Forge adapter and it is not a second orchestration engine. The current live process family is recorded in `.forgedock/native-next-resume-2026-08-16T22-40-22-090Z.watch.ndjson`; stdout/stderr are in the matching `.out.log`/`.err.log` files.
+
+Observed durable projection at approximately `2026-08-16T23:16:36Z`:
+
+- #189 completed.
+- #194 blocked at merge admission because GitHub did not report PR #281's reviewed SHA mergeable on `staging`.
+- #202, #209, and #210 were marked failed by the controller with `Issue #... is decomposed but has no authoritative decomposed Outcome`. This was a native CLI resume-branch classification defect: any skipped terminal state other than completed/invalid was incorrectly routed through decomposition expansion. It did not indicate actual decomposition.
+- #211 is running the same semantic run `run_0bd33d87-4d3d-4c71-8da3-19dea51986e7`, currently in review after BuildResult, with #212 queued behind the frozen broad component claim.
+
+Run-scoped telemetry for #211 at that observation: 4 tasks (3 with usage), 413,670 input tokens, 66,022 output tokens, 2,952,704 cache-read tokens, 3,432,396 total tokens, estimated cost `$0.22101448`, 1,962,993 active milliseconds, zero retries. Build and verification completed; the worker entered review cycle 1 with correctness and concurrency reviewers. Controller heartbeats continued every 20 seconds.
+
+Two native CLI fixes were committed locally as `366e5920` (`fix: preserve orchestration terminal states and scoped claims`):
+
+1. Resume now expands children only for an actual `decomposed` terminal state; failed/blocked/cancelled runs retain their own terminal result and reason.
+2. Explicit CLI orchestration no longer pre-seeds every issue with `component:<repo>` before affected-file evidence is read. Bounded affected paths now form the initial claims; the repository-wide fallback is used only when no path evidence exists. The frozen active DAG is intentionally unchanged so its observed serialization remains valid.
+
+Validation after the patch: `npm run build` passed; focused orchestration controller/scheduler/terminal-result tests passed `52/52`. The active #211 worker independently reached the project full-test gate and then review; do not stop it while semantic progress/heartbeats continue.

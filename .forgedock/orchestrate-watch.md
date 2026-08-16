@@ -1812,3 +1812,41 @@ entry as the current checkpoint.
 - This is a code/test integration checkpoint, not an end-to-end closure claim:
   the saved seven-issue run still has one completed issue and queued/resumable
   work awaiting a deliberate operator resume.
+
+#### HP-21 native resume and scoped-claim correction (2026-08-16/17 UTC)
+
+- The saved DAG was resumed through the native CLI with
+  `npm run next -- orchestrate --resume
+  dag_50ad2a24-44f7-4a1e-96a2-6766f7119f58`. The active controller is the
+  same typed ForgeDock Next engine used by the interactive terminal; the
+  adapter boundary is CLI versus TUI, not a competing workflow
+  implementation. The frozen worker policy is `openai-codex/gpt-5.6-luna`
+  with `max` thinking and transport capacity 4.
+- At approximately `2026-08-16T23:16:36Z`, #189 was completed; #194 was
+  blocked at merge admission because GitHub did not report PR #281's reviewed
+  SHA mergeable on `staging`; #202/#209/#210 were failed with the misleading
+  `decomposed but has no authoritative decomposed Outcome` message; #211 was
+  running after BuildResult in review cycle 1; #212 was queued behind the
+  frozen broad component claim. The latter three failures were traced to the
+  native CLI resume worker branch treating every terminal state other than
+  completed/invalid as decomposition. No decomposition was evidenced.
+- #211's run `run_0bd33d87-4d3d-4c71-8da3-19dea51986e7` showed active
+  controller heartbeats every 20 seconds, completed build/verification, and
+  review children for correctness and concurrency. At the checkpoint its
+  telemetry was: 4 tasks (3 with usage), 413,670 input tokens, 66,022 output,
+  2,952,704 cache-read, 3,432,396 total, estimated `$0.22101448`,
+  1,962,993 active milliseconds, and zero retries. The worker ran the full
+  project `npm test` gate in its isolated issue worktree before entering
+  review; it was not stopped because the process family remained live and
+  semantic progress was observable.
+- Local commit `366e5920` fixes the two observed native CLI defects: terminal
+  resume preserves failed/blocked/cancelled results and only actual
+  decomposed runs expand children; explicit CLI orchestration derives claims
+  from authoritative affected paths instead of pre-seeding every issue with
+  `component:<repo>`, using the repository-wide fallback only when no path
+  evidence exists. The frozen active DAG was not rewritten, preserving its
+  telemetry and claim-serialization evidence.
+- Verification after the fix: `npm run build` passed and focused
+  orchestration controller/scheduler/terminal-result tests passed `52/52`.
+  The full native suite remains the active worker's own validation gate; do
+  not count this code checkpoint as a new issue closure.
