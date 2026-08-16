@@ -182,12 +182,13 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         continue;
       }
       const parsed = /^(\d+)\s+(\S+)\s+([0-9a-f]+)\t/.exec(entry);
-      if (!parsed || parsed[2] !== "blob") throw new Error(`Committed delivery path is not a blob: ${path}`);
+      if (!parsed) throw new Error(`Committed delivery path is not a blob: ${path}`);
       const mode = parsed[1]!;
+      if (mode === "120000") return false;
+      if (parsed[2] !== "blob") throw new Error(`Committed delivery path is not a blob: ${path}`);
       const blob = await this.gitBuffer(["cat-file", "blob", parsed[3]!], workspace.path);
       hash.update(mode === "100755" ? "1" : "0").update("\0");
-      if (mode === "120000") hash.update("symlink\0").update(blob).update("\0");
-      else hash.update("file\0").update(blob).update("\0");
+      hash.update("file\0").update(blob).update("\0");
     }
     if (hash.digest("hex") === expectedDigest) return true;
 

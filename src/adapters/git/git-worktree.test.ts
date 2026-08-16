@@ -178,6 +178,37 @@ describe("isolated Git worktrees", () => {
     await manager.remove(workspace);
   });
 
+  it("rejects mode-120000 committed delivery entries before the hash-object fallback", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-symlink-proof-"));
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "README.md"), "base\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-m", "base");
+    const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+    const workspace = await manager.create({ runId: "run_symlink_proof", issue: 16, baseRef: "HEAD" });
+    const path = "escape";
+    try {
+      // The index entry deliberately carries an escaping link target. Keeping
+      // matching bytes in the worktree makes the old hash-object fallback
+      // return true even for a deliberately mismatching expected digest.
+      writeFileSync(join(workspace.path, path), "../../outside/secret\n");
+      const blob = git(workspace.path, "hash-object", "-w", "--", path);
+      git(workspace.path, "update-index", "--add", "--cacheinfo", `120000,${blob},${path}`);
+      git(workspace.path, "commit", "-m", "add escaping link entry");
+      const revision = git(workspace.path, "rev-parse", "HEAD");
+      assert.equal(
+        await manager.committedContentMatches(workspace, [path], "0".repeat(64), revision),
+        false,
+      );
+    } finally {
+      await manager.remove(workspace);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses the fetched origin tip instead of a stale remote-tracking ref", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-fetch-"));
     const repo = join(root, "repo");

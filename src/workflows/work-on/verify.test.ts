@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -21,6 +21,7 @@ const submission: BuilderSubmission = {
 class FakeGit implements GitWorkspaceManager {
   committed = false;
   dependenciesPrepared = false;
+  pushed = false;
   constructor(
     readonly paths: string[],
     readonly revisionPaths: string[] = [],
@@ -36,7 +37,7 @@ class FakeGit implements GitWorkspaceManager {
   async prepareWorkspaceDependencies(): Promise<void> { this.dependenciesPrepared = true; }
   async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { this.committed = true; return "a".repeat(40); }
-  async push(): Promise<void> {}
+  async push(): Promise<void> { this.pushed = true; }
   async head(): Promise<string> { return "a".repeat(40); }
   async remove(): Promise<void> {}
 }
@@ -74,6 +75,10 @@ function packet(run: RunState) {
 const command = { id: "test", command: "npm", args: ["test"], cwd: "/tmp/worktree", timeoutMs: 1000, required: true } as const;
 const passed: CheckResult = { command: "npm test", status: "passed", exitCode: 0, durationMs: 10, outputDigest: "b".repeat(64) };
 
+function linkDirectory(target: string, path: string): void {
+  symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
+}
+
 describe("verification and commit barrier", () => {
   it("commits only after required executable evidence passes", async () => {
     const runs = new InMemoryRunRepository();
@@ -95,6 +100,157 @@ describe("verification and commit barrier", () => {
     assert.equal(result.buildResult?.payload.baseSha, workspace.baseSha);
     assert.equal(result.buildResult?.payload.checks[0]?.status, "passed");
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
+  });
+
+  it("keeps a real regular-file delivery on the publishing path", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-regular-"));
+    mkdirSync(join(directory, "src"), { recursive: true });
+    writeFileSync(join(directory, "src", "a.ts"), "export const value = 1;\n");
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: { ...workspace, path: directory }, commands: [command],
+      }, { verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
+      assert.equal(result.run.state, "publishing");
+      assert.ok(result.buildResult);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks an escaping link created by verification before commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-verify-escape-"));
+    const directory = join(root, "worktree");
+    const outside = join(root, "outside");
+    const file = join(directory, "src", "a.ts");
+    mkdirSync(join(directory, "src"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(file, "export const value = 1;\n");
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      let verifierRuns = 0;
+      const verifier: VerificationRunner = {
+        async run() {
+          verifierRuns++;
+          rmSync(file, { force: true });
+          linkDirectory(outside, file);
+          return [passed];
+        },
+      };
+      const git = new FakeGit(["src/a.ts"]);
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: { ...workspace, path: directory }, commands: [command],
+      }, { verifier, git, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.match(result.outcome?.payload.reason ?? "", /symbolic link/);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.changedPaths, ["src/a.ts"]);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, [passed]);
+      assert.equal(result.buildResult, undefined);
+      assert.equal(verifierRuns, 1);
+      assert.equal(git.committed, false);
+      assert.equal(git.pushed, false);
+      assert.equal(artifacts.artifacts.some((artifact) => artifact.kind === "BuildResult"), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a broken delivery link before running verification", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-verify-broken-"));
+    const directory = join(root, "worktree");
+    const file = join(directory, "src", "a.ts");
+    const target = join(root, "missing-target");
+    mkdirSync(join(directory, "src"), { recursive: true });
+    mkdirSync(target);
+    linkDirectory(target, file);
+    rmSync(target, { recursive: true, force: true });
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      let verifierRuns = 0;
+      const verifier: VerificationRunner = { async run() { verifierRuns++; throw new Error("verification must not execute"); } };
+      const git = new FakeGit(["src/a.ts"]);
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: { ...workspace, path: directory }, commands: [command],
+      }, { verifier, git, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.match(result.outcome?.payload.reason ?? "", /symbolic link/);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.changedPaths, ["src/a.ts"]);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
+      assert.equal(result.buildResult, undefined);
+      assert.equal(verifierRuns, 0);
+      assert.equal(git.committed, false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks an in-workspace delivery link at the pre-verification seal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-verify-in-workspace-"));
+    const directory = join(root, "worktree");
+    const file = join(directory, "src", "a.ts");
+    const target = join(directory, "src", "target");
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "value.txt"), "inside\n");
+    linkDirectory(target, file);
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      const verifier: VerificationRunner = { async run() { throw new Error("verification must not execute"); } };
+      const git = new FakeGit(["src/a.ts"]);
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: { ...workspace, path: directory }, commands: [command],
+      }, { verifier, git, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.match(result.outcome?.payload.reason ?? "", /symbolic link/);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.changedPaths, ["src/a.ts"]);
+      assert.equal(result.buildResult, undefined);
+      assert.equal(git.committed, false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a link inserted between the post-verification seal and commit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-verify-race-"));
+    const directory = join(root, "worktree");
+    const outside = join(root, "outside");
+    const file = join(directory, "src", "a.ts");
+    mkdirSync(join(directory, "src"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(file, "export const value = 1;\n");
+    try {
+      const runs = new InMemoryRunRepository();
+      const artifacts = new InMemoryArtifactRepository();
+      const run = await verifyingRun(runs);
+      class RacingGit extends FakeGit {
+        override async commit(): Promise<string> {
+          rmSync(file, { force: true });
+          linkDirectory(outside, file);
+          return super.commit();
+        }
+      }
+      const git = new RacingGit(["src/a.ts"]);
+      const result = await verifyAndCommit({
+        run, packet: packet(run), submission, workspace: { ...workspace, path: directory }, commands: [command],
+      }, { verifier: new FakeVerifier([passed]), git, artifacts, runs });
+      assert.equal(result.run.state, "blocked");
+      assert.match(result.outcome?.payload.reason ?? "", /symbolic link/);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.changedPaths, ["src/a.ts"]);
+      assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, [passed]);
+      assert.equal(result.buildResult, undefined);
+      assert.equal(git.committed, true);
+      assert.equal(git.pushed, false);
+      assert.equal(artifacts.artifacts.some((artifact) => artifact.kind === "BuildResult"), false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("resolves criterion coverage by stable packet IDs rather than model wording", async () => {

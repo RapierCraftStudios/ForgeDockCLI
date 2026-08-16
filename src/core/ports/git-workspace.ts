@@ -26,7 +26,7 @@ export interface GitWorkspaceManager {
   isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean>;
   /** Install lockfile dependencies without executing repository lifecycle scripts. */
   prepareWorkspaceDependencies(workspace: GitWorkspace): Promise<void>;
-  /** Compare raw committed blobs with the exact content verified in the worktree. */
+  /** Compare committed regular-file blobs with the exact content verified in the worktree; Git mode 120000 entries must fail the proof. */
   committedContentMatches(
     workspace: GitWorkspace,
     paths: readonly string[],
