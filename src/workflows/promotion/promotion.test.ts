@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryPromotionRepository, type PromotionRecord } from "../../core/ports/promotion.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -20,6 +20,7 @@ class PromotionHost implements ForgeHost {
   protected = true;
   merged = false;
   stagingIsSource = false;
+  requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
   pullRequest: PullRequestSnapshot | undefined;
   async getBranchHead(_repo: string, branch: string): Promise<string> {
     return branch === "milestone/feature" || (branch === "staging" && this.stagingIsSource) ? this.sourceSha : this.targetSha;
@@ -43,7 +44,15 @@ class PromotionHost implements ForgeHost {
     return { ...this.pullRequest, state: this.merged ? "MERGED" : "OPEN" };
   }
   async getPullRequestMergeGate() {
-    return { repo: "a/b", pullRequest: this.pullRequest?.number ?? 7, headSha: this.sourceSha, baseBranch: "staging", mergeable: true, requiredChecks: [], observedAt: new Date().toISOString() };
+    return {
+      repo: "a/b",
+      pullRequest: this.pullRequest?.number ?? 7,
+      headSha: this.sourceSha,
+      baseBranch: this.pullRequest?.baseBranch ?? "staging",
+      mergeable: true,
+      requiredChecks: [...this.requiredChecks],
+      observedAt: new Date().toISOString(),
+    };
   }
   async mergePullRequest(): Promise<void> { this.merged = true; }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.ts b/src/a.ts\n+change"; }
@@ -205,6 +214,31 @@ describe("explicit branch promotion", () => {
       verification: [command], promotionId: published.promotionId, authorizeMerge: true,
     }, deps), /not protected/i);
     assert.equal(host.merged, false);
+  });
+
+  it("blocks production promotion when legacy CodeQL is pending beside a passing replacement", async () => {
+    for (const state of ["pending", "cancelled", "failed", "unavailable"] as const) {
+      const host = new PromotionHost();
+      host.stagingIsSource = true;
+      host.requiredChecks = [
+        { name: "Analyze (javascript-typescript)", state, detailsUrl: "https://github.test/actions/runs/legacy" },
+        { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+      ];
+      const deps = dependencies(host);
+      const published = await promoteBranch({
+        repository: "a/b", mode: "production", sourceBranch: "staging", targetBranch: "main",
+        configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+        verification: [command], authorizeCreation: true,
+      }, deps);
+      assert.equal(published.phase, "awaiting-merge");
+
+      await assert.rejects(() => promoteBranch({
+        repository: "a/b", mode: "production", sourceBranch: published.sourceBranch, targetBranch: published.targetBranch,
+        configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
+        verification: [command], promotionId: published.promotionId, authorizeMerge: true,
+      }, deps), new RegExp(`Promotion merge admission is blocked.*Analyze \\(javascript-typescript\\)=${state}`));
+      assert.equal(host.merged, false);
+    }
   });
 
   it("refuses to record an externally merged unprotected production PR as completed", async () => {
