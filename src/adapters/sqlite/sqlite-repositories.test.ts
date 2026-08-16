@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -236,6 +237,61 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("denies a legacy epoch-zero lease store until authenticated recovery", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-legacy-zero-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let store: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    mkdirSync(join(checkout, ".forgedock"));
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const legacy = new DatabaseSync(databasePath);
+      legacy.exec(`
+        CREATE TABLE leases (
+          item_id TEXT PRIMARY KEY,
+          owner TEXT NOT NULL,
+          token TEXT NOT NULL,
+          acquired_at INTEGER NOT NULL,
+          heartbeat_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE lease_state (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          max_epoch INTEGER NOT NULL
+        );
+        INSERT INTO lease_state (singleton, max_epoch) VALUES (1, 0);
+        INSERT INTO leases (item_id, owner, token, acquired_at, heartbeat_at, expires_at)
+        VALUES ('legacy-zero', 'old-worker', 'legacy-token', 900, 900, 2_000);
+      `);
+      legacy.close();
+
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      store = new SqliteRepositories(databasePath, { witness });
+      const migrated = store;
+      const staleGuard = migrated.guard("legacy-zero", "legacy-token");
+      assert.throws(() => migrated.acquire("legacy-zero", "new-worker", 100, 1_000), /history|epoch zero|re-enrollment|continuity/i);
+      assert.throws(() => migrated.heartbeat("legacy-zero", "legacy-token", 100, 1_001), /history|epoch zero|re-enrollment|continuity/i);
+      assert.throws(() => migrated.release("legacy-zero", "legacy-token"), /history|epoch zero|re-enrollment|continuity/i);
+      assert.throws(() => staleGuard.assertValid(), /history|epoch zero|re-enrollment|continuity/i);
+
+      const privateKey = readFileSync(bootstrap.privateKeyPath, "utf8");
+      migrated.reEnroll(createSignedLeaseCheckpoint(10, privateKey, bootstrap.keyId));
+      assert.throws(() => migrated.heartbeat("legacy-zero", "legacy-token", 100, 1_010), /re-enrollment|predates/i);
+      assert.throws(() => migrated.release("legacy-zero", "legacy-token"), /re-enrollment|predates/i);
+      assert.throws(() => staleGuard.assertValid(), /re-enrollment|predates/i);
+      const recovered = migrated.acquire("legacy-zero", "new-worker", 100, 1_010);
+      assert.ok(recovered);
+      assert.equal(recovered.epoch, 11);
+      assert.notEqual(recovered.token, "legacy-token");
+    } finally {
+      store?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
   it("does not adopt a rolled-back file checkpoint after lease history exists", () => {
     const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-rollback-"));
     const checkout = join(root, "checkout");
@@ -397,6 +453,64 @@ describe("SQLite operational repositories", () => {
       assert.equal(recovered?.epoch, 11);
       assert.equal(recovered?.token === first.token, false);
     } finally { store.close(); }
+  });
+
+  it("persists the re-enrollment fence across repository instances and restart", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-recovery-fence-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const databasePath = join(checkout, ".forgedock", "state.db");
+    let firstStore: SqliteRepositories | undefined;
+    let secondStore: SqliteRepositories | undefined;
+    let reopened: SqliteRepositories | undefined;
+    mkdirSync(checkout);
+    try {
+      const bootstrap = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      const firstWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      const secondWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(firstWitness);
+      assert.ok(secondWitness);
+      firstStore = new SqliteRepositories(databasePath, { witness: firstWitness });
+      secondStore = new SqliteRepositories(databasePath, { witness: secondWitness });
+      const primary = firstStore;
+      const secondary = secondStore;
+      const first = primary.acquire("issue-recovery-a", "worker-a", 10_000, 1_000);
+      const second = primary.acquire("issue-recovery-b", "worker-a", 10_000, 1_001);
+      assert.ok(first);
+      assert.ok(second);
+      const staleGuard = primary.guard("issue-recovery-a", first.token);
+      const privateKey = readFileSync(bootstrap.privateKeyPath, "utf8");
+
+      primary.reEnroll(createSignedLeaseCheckpoint(10, privateKey, bootstrap.keyId));
+      assert.throws(() => secondary.heartbeat("issue-recovery-a", first.token, 100, 1_010), /re-enrollment|predates/i);
+      assert.throws(() => secondary.release("issue-recovery-b", second.token), /re-enrollment|predates/i);
+      assert.throws(() => staleGuard.assertValid(), /re-enrollment|predates/i);
+
+      const replacement = secondary.acquire("issue-recovery-c", "worker-c", 10_000, 1_011);
+      assert.ok(replacement);
+      assert.equal(replacement.epoch, 11);
+      assert.throws(() => primary.heartbeat("issue-recovery-a", first.token, 100, 1_012), /re-enrollment|predates/i);
+      assert.throws(() => primary.release("issue-recovery-b", second.token), /re-enrollment|predates/i);
+      assert.throws(() => primary.guard("issue-recovery-b", second.token).assertValid(), /re-enrollment|predates/i);
+
+      firstStore.close();
+      firstStore = undefined;
+      secondStore.close();
+      secondStore = undefined;
+      const restartedWitness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(restartedWitness);
+      const restarted = new SqliteRepositories(databasePath, { witness: restartedWitness });
+      reopened = restarted;
+      assert.equal(restarted.continuity().epoch, 11);
+      assert.throws(() => restarted.heartbeat("issue-recovery-a", first.token, 100, 1_013), /re-enrollment|predates/i);
+      assert.throws(() => restarted.release("issue-recovery-b", second.token), /re-enrollment|predates/i);
+      assert.throws(() => restarted.guard("issue-recovery-a", first.token).assertValid(), /re-enrollment|predates/i);
+    } finally {
+      firstStore?.close();
+      secondStore?.close();
+      reopened?.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
   });
 
   it("retains fencing epochs across a repository restart and expiry recovery", () => {

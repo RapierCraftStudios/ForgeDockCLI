@@ -17,16 +17,23 @@ const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
 const EMPTY_LEASE_EPOCH = 0;
 
+type DurableLeaseState = {
+  maxEpoch: number;
+  hasHistory: boolean;
+  recoveryEpoch: number | undefined;
+};
+
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
   readonly #witness: LeaseWitness | undefined;
-  #recoveryEpoch: number | undefined;
   #leaseFailure: string | undefined;
 
   constructor(path: string, options: { witness?: LeaseWitness } = {}) {
     this.#witness = options.witness;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
+    const hadLeasesTable = this.#database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leases'").get() !== undefined;
+    const hadLeaseStateTable = this.#database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lease_state'").get() !== undefined;
     // WAL permits concurrent readers, but SQLite still has one writer. Wait for
     // short cross-process controller transactions instead of turning contention
     // into a terminal workflow failure. Set it before WAL initialization so a
@@ -76,9 +83,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE TABLE IF NOT EXISTS lease_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        max_epoch INTEGER NOT NULL
+        max_epoch INTEGER NOT NULL,
+        lease_history INTEGER NOT NULL DEFAULT 0,
+        recovery_epoch INTEGER
       );
-      INSERT INTO lease_state (singleton, max_epoch) VALUES (1, ${EMPTY_LEASE_EPOCH}) ON CONFLICT(singleton) DO NOTHING;
       CREATE TABLE IF NOT EXISTS run_telemetry (
         telemetry_key TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -117,8 +125,32 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       CREATE INDEX IF NOT EXISTS promotions_updated ON promotion_records(updated_at);
     `);
     // Existing operational stores predate fencing. They are retained for
-    // inspection, but lease use remains fail-closed until a witness is bound.
+    // inspection, but their lease history is never reclassified as an empty
+    // epoch-zero store during migration.
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
+    let migratedLegacyLeaseState = false;
+    try {
+      this.#database.exec("ALTER TABLE lease_state ADD COLUMN lease_history INTEGER NOT NULL DEFAULT 0");
+      migratedLegacyLeaseState = true;
+    } catch { /* already migrated */ }
+    try { this.#database.exec("ALTER TABLE lease_state ADD COLUMN recovery_epoch INTEGER"); } catch { /* already migrated */ }
+    this.#database.exec(`
+      INSERT INTO lease_state (singleton, max_epoch, lease_history, recovery_epoch)
+      VALUES (1, ${EMPTY_LEASE_EPOCH}, 0, NULL) ON CONFLICT(singleton) DO NOTHING;
+    `);
+    // A pre-marker lease_state is not provably fresh, even when its current
+    // rows have already expired or were deleted. A row or nonzero maximum is
+    // also durable evidence of prior lease activity in a marker-aware store.
+    if (migratedLegacyLeaseState || (hadLeasesTable && !hadLeaseStateTable)) {
+      this.#database.exec("UPDATE lease_state SET lease_history = 1 WHERE singleton = 1");
+    }
+    this.#database.exec(`
+      UPDATE lease_state SET lease_history = 1
+      WHERE singleton = 1 AND (
+        max_epoch > ${EMPTY_LEASE_EPOCH}
+        OR EXISTS (SELECT 1 FROM leases)
+      );
+    `);
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
@@ -337,13 +369,14 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
     this.#assertLeaseContinuity();
     return this.inTransaction(() => {
+      const state = this.#readLeaseState();
       const current = this.#database.prepare("SELECT epoch, expires_at FROM leases WHERE item_id = ?").get(itemId) as { epoch: number; expires_at: number } | undefined;
-      if (current && current.epoch > this.#localMaximum()) this.#failLease("local lease epoch is ahead of the retained witness");
-      const recoveredRow = current && this.#recoveryEpoch !== undefined && current.epoch < this.#recoveryEpoch;
+      if (current && current.epoch > state.maxEpoch) this.#failLease("local lease epoch is ahead of the retained witness");
+      const recoveredRow = current !== undefined && state.recoveryEpoch !== undefined && current.epoch < state.recoveryEpoch;
       if (current && current.expires_at > now && !recoveredRow) return undefined;
       // Advancing the retained witness happens before assigning the row. A
       // failed SQLite commit therefore consumes an epoch and can never reuse it.
-      const advanced = this.#witness!.compareAndAdvance(this.#localMaximum());
+      const advanced = this.#witness!.compareAndAdvance(state.maxEpoch);
       this.#acceptWitness(advanced);
       if (recoveredRow) this.#database.prepare("DELETE FROM leases WHERE item_id = ?").run(itemId);
       else this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
@@ -353,7 +386,6 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
       `).run(itemId, owner, token, advanced.epoch, now, now, now + ttlMs);
       if (result.changes !== 1) return undefined;
-      this.#recoveryEpoch = undefined;
       return { itemId, owner, token, epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" as const };
     });
   }
@@ -361,10 +393,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {
     this.#assertLeaseContinuity();
     const rowBefore = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
-    if (rowBefore && rowBefore.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
-    if (rowBefore && this.#recoveryEpoch !== undefined && rowBefore.epoch < this.#recoveryEpoch) {
-      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-    }
+    if (rowBefore) this.#assertLeaseRowUsable(rowBefore.epoch);
     const result = this.#database.prepare(`
       UPDATE leases SET heartbeat_at = ?, expires_at = ?
       WHERE item_id = ? AND token = ? AND expires_at > ?
@@ -376,10 +405,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   release(itemId: string, token: string): boolean {
     this.#assertLeaseContinuity();
     const row = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
-    if (row && row.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
-    if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
-      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-    }
+    if (row) this.#assertLeaseRowUsable(row.epoch);
     return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
   }
 
@@ -387,18 +413,21 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return { assertValid: () => {
       this.#assertLeaseContinuity();
       const row = this.#database.prepare("SELECT token, epoch FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number } | undefined;
-      if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
-        throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-      }
+      if (row) this.#assertLeaseRowUsable(row.epoch);
       if (!row || row.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
     }, check: () => { this.guard(itemId, token).assertValid(); } };
   }
 
   continuity(): LeaseWitnessSnapshot {
     if (this.#leaseFailure) return { state: "unverifiable", epoch: this.#localMaximum(), reason: this.#leaseFailure };
-    if (!this.#witness) return { state: "unverifiable", epoch: this.#localMaximum(), reason: "no retained checkpoint witness is configured" };
+    const state = this.#readLeaseState();
+    if (!this.#witness) return { state: "unverifiable", epoch: state.maxEpoch, reason: "no retained checkpoint witness is configured" };
     const snapshot = this.#witness.verify();
-    if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
+    if ((state.maxEpoch === EMPTY_LEASE_EPOCH && state.hasHistory && state.recoveryEpoch === undefined)
+      || this.#hasUnrecoveredEpochZeroLease(state)) {
+      return { ...snapshot, state: "unverifiable", epoch: state.maxEpoch, reason: "lease history exists at epoch zero; explicit higher authenticated re-enrollment is required" };
+    }
+    if (snapshot.state !== "verified" || snapshot.epoch !== state.maxEpoch) {
       return { ...snapshot, state: "unverifiable", reason: snapshot.reason ?? "local maximum diverges from the retained witness" };
     }
     return snapshot;
@@ -406,21 +435,50 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
 
   reEnroll(checkpoint: AuthenticatedLeaseCheckpoint): void {
     if (!this.#witness) throw new LeaseContinuityError("no retained checkpoint witness is configured");
-    if (!Number.isSafeInteger(checkpoint.epoch) || checkpoint.epoch <= this.#localMaximum()) {
+    const localMaximum = this.#localMaximum();
+    if (!Number.isSafeInteger(checkpoint.epoch) || checkpoint.epoch <= localMaximum) {
       throw new LeaseContinuityError("re-enrollment checkpoint is not higher than the local maximum");
     }
     const snapshot = this.#witness.reEnroll(checkpoint);
     this.#acceptWitness(snapshot);
-    this.#recoveryEpoch = snapshot.epoch;
+    const result = this.#database.prepare(`
+      UPDATE lease_state
+      SET recovery_epoch = CASE
+        WHEN recovery_epoch IS NULL OR recovery_epoch < ? THEN ?
+        ELSE recovery_epoch
+      END,
+      lease_history = 1
+      WHERE singleton = 1 AND max_epoch >= ?
+    `).run(snapshot.epoch, snapshot.epoch, snapshot.epoch);
+    if (result.changes !== 1) this.#failLease("local lease recovery state changed while recording re-enrollment");
     this.#leaseFailure = undefined;
   }
 
-  #localMaximum(): number {
-    const row = this.#database.prepare("SELECT max_epoch FROM lease_state WHERE singleton = 1").get() as { max_epoch: number } | undefined;
+  #readLeaseState(): DurableLeaseState {
+    const row = this.#database.prepare("SELECT max_epoch, lease_history, recovery_epoch FROM lease_state WHERE singleton = 1").get() as {
+      max_epoch: number;
+      lease_history: number;
+      recovery_epoch: number | null;
+    } | undefined;
     if (!row) this.#failLease("local lease epoch state is missing");
-    const epoch = Number(row.max_epoch);
-    if (!Number.isSafeInteger(epoch) || epoch < EMPTY_LEASE_EPOCH) this.#failLease("local lease epoch state is invalid");
-    return epoch;
+    const maxEpoch = Number(row.max_epoch);
+    if (!Number.isSafeInteger(maxEpoch) || maxEpoch < EMPTY_LEASE_EPOCH) this.#failLease("local lease epoch state is invalid");
+    const historyValue = Number(row.lease_history);
+    if (historyValue !== 0 && historyValue !== 1) this.#failLease("local lease history marker is invalid");
+    const recoveryEpoch = row.recovery_epoch === null || row.recovery_epoch === undefined ? undefined : Number(row.recovery_epoch);
+    if (recoveryEpoch !== undefined && (!Number.isSafeInteger(recoveryEpoch) || recoveryEpoch <= EMPTY_LEASE_EPOCH || recoveryEpoch > maxEpoch)) {
+      this.#failLease("local lease recovery marker is invalid");
+    }
+    let hasHistory = historyValue === 1;
+    if (!hasHistory && (maxEpoch > EMPTY_LEASE_EPOCH || this.#database.prepare("SELECT 1 FROM leases LIMIT 1").get() !== undefined)) {
+      this.#database.prepare("UPDATE lease_state SET lease_history = 1 WHERE singleton = 1 AND lease_history = 0").run();
+      hasHistory = true;
+    }
+    return { maxEpoch, hasHistory, recoveryEpoch };
+  }
+
+  #localMaximum(): number {
+    return this.#readLeaseState().maxEpoch;
   }
   #acceptWitness(snapshot: LeaseWitnessSnapshot): void {
     const localMaximum = this.#localMaximum();
@@ -430,10 +488,27 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     // A continuity read can race another repository's committed advancement.
     // Never let that stale read overwrite a newer durable fencing epoch.
     const result = this.#database.prepare(`
-      UPDATE lease_state SET max_epoch = ?
+      UPDATE lease_state SET
+        max_epoch = ?,
+        lease_history = CASE WHEN lease_history = 1 OR ? > ${EMPTY_LEASE_EPOCH} THEN 1 ELSE 0 END
       WHERE singleton = 1 AND max_epoch <= ?
-    `).run(snapshot.epoch, snapshot.epoch);
+    `).run(snapshot.epoch, snapshot.epoch, snapshot.epoch);
     if (result.changes !== 1) this.#failLease("local lease epoch changed while accepting the retained witness");
+  }
+  #assertLeaseRowUsable(epoch: number): void {
+    const state = this.#readLeaseState();
+    if (epoch > state.maxEpoch) this.#failLease("lease row is divergent from the retained witness");
+    if ((state.maxEpoch === EMPTY_LEASE_EPOCH && state.hasHistory && state.recoveryEpoch === undefined)
+      || this.#hasUnrecoveredEpochZeroLease(state)) {
+      throw new LeaseContinuityError("lease history exists at epoch zero; explicit higher authenticated re-enrollment is required");
+    }
+    if (state.recoveryEpoch !== undefined && epoch < state.recoveryEpoch) {
+      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+    }
+  }
+  #hasUnrecoveredEpochZeroLease(state: DurableLeaseState): boolean {
+    return state.hasHistory && state.recoveryEpoch === undefined
+      && this.#database.prepare(`SELECT 1 FROM leases WHERE epoch = ${EMPTY_LEASE_EPOCH} LIMIT 1`).get() !== undefined;
   }
   #failLease(reason: string): never {
     this.#leaseFailure = reason;
@@ -442,8 +517,13 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   #assertLeaseContinuity(): void {
     if (this.#leaseFailure) throw new LeaseContinuityError(this.#leaseFailure);
     if (!this.#witness) this.#failLease("no retained checkpoint witness is configured");
+    const state = this.#readLeaseState();
+    if ((state.maxEpoch === EMPTY_LEASE_EPOCH && state.hasHistory && state.recoveryEpoch === undefined)
+      || this.#hasUnrecoveredEpochZeroLease(state)) {
+      this.#failLease("lease history exists at epoch zero; explicit higher authenticated re-enrollment is required");
+    }
     const snapshot = this.#witness.verify();
-    if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
+    if (snapshot.state !== "verified" || snapshot.epoch !== state.maxEpoch) {
       this.#failLease(snapshot.reason ?? "local maximum diverges from the retained witness");
     }
     this.#acceptWitness(snapshot);
