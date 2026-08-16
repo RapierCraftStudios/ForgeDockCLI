@@ -40,9 +40,61 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
   });
 
+  it("does not merge when legacy CodeQL remains pending beside a passing default-setup replacement", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
+        return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([
+        { name: "Analyze (javascript-typescript)", state: "PENDING", link: "https://github.test/actions/runs/legacy" },
+        { name: "CodeQL default setup", state: "SUCCESS", link: "https://github.test/actions/runs/default" },
+      ]);
+      if (args[0] === "pr" && args[1] === "merge") return "";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.deepEqual(gate.requiredChecks, [
+      { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
+      { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
+    ]);
+    await assert.rejects(
+      () => client.mergePullRequest("a/b", 8, sha, "main"),
+      /Required GitHub checks are not all passing.*Analyze \(javascript-typescript\)=pending/,
+    );
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
+  });
+
+  it("normalizes failed, cancelled, pending, stale, and unavailable check observations", async () => {
+    const cases = [
+      ["FAILURE", "failed"],
+      ["CANCELLED", "cancelled"],
+      ["IN_PROGRESS", "pending"],
+      ["STALE", "failed"],
+      ["UNKNOWN_STATE", "unavailable"],
+    ] as const;
+    for (const [reported, expected] of cases) {
+      const client = new GitHubClient();
+      Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+        if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE" });
+        if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+        if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "CodeQL default setup", state: reported }]);
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+      const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+      assert.equal(gate.requiredChecks[0]?.state, expected, reported);
+    }
+  });
+
   it("preserves contradictory same-name check runs so a newer success cannot mask a failure", async () => {
     const client = new GitHubClient();
+    const calls: string[][] = [];
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
       if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
         return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
       }
@@ -51,6 +103,7 @@ describe("GitHub promotion transport", () => {
         { name: "Unit tests (node --test)", state: "FAILURE", link: "https://github.test/old", completedAt: "2026-08-14T12:28:55Z" },
         { name: "Unit tests (node --test)", state: "SUCCESS", link: "https://github.test/new", completedAt: "2026-08-14T12:29:13Z" },
       ]);
+      if (args[0] === "pr" && args[1] === "merge") return "";
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
@@ -58,6 +111,11 @@ describe("GitHub promotion transport", () => {
       { name: "Unit tests (node --test)", state: "failed", detailsUrl: "https://github.test/old" },
       { name: "Unit tests (node --test)", state: "passed", detailsUrl: "https://github.test/new" },
     ]);
+    await assert.rejects(
+      () => client.mergePullRequest("a/b", 8, sha, "main"),
+      /Required GitHub checks are not all passing.*Unit tests \(node --test\)=failed/,
+    );
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
   });
 
   it("preserves both completed and in-progress same-name observations", async () => {
@@ -131,5 +189,61 @@ describe("GitHub promotion transport", () => {
     assert.ok(calls.at(-1)?.includes("--match-head-commit") && calls.at(-1)?.includes(sha));
     current = { ...current, baseBranch: "staging" };
     await assert.rejects(() => client.mergePullRequest("a/b", 8, sha, "main"), /target changed/);
+  });
+
+  it("rejects a head race after checks are collected without issuing a merge", async () => {
+    const client = new GitHubClient();
+    const advancedSha = "b".repeat(40);
+    let basicViews = 0;
+    let headAdvanced = false;
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "view") {
+        basicViews++;
+        const headSha = headAdvanced && basicViews >= 3 ? advancedSha : sha;
+        return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: headSha, headRefName: "staging", baseRefName: "main" });
+      }
+      if (args[0] === "pr" && args[1] === "checks") {
+        headAdvanced = true;
+        return JSON.stringify([{ name: "CodeQL default setup", state: "SUCCESS" }]);
+      }
+      if (args[0] === "pr" && args[1] === "merge") return "";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    await assert.rejects(
+      () => client.mergePullRequest("a/b", 8, sha, "main"),
+      /head changed while reading required checks/,
+    );
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
+  });
+
+  it("rejects an open-state race after checks are collected without issuing a merge", async () => {
+    const client = new GitHubClient();
+    let basicViews = 0;
+    let closed = false;
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "view") {
+        basicViews++;
+        return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: closed && basicViews >= 3 ? "CLOSED" : "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      }
+      if (args[0] === "pr" && args[1] === "checks") {
+        closed = true;
+        return JSON.stringify([{ name: "CodeQL default setup", state: "SUCCESS" }]);
+      }
+      if (args[0] === "pr" && args[1] === "merge") return "";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    await assert.rejects(
+      () => client.mergePullRequest("a/b", 8, sha, "main"),
+      /changed state while reading required checks: CLOSED/,
+    );
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
   });
 });
