@@ -516,6 +516,151 @@ export function parseDiffPaths(diff: string): string[] {
   return parseDiffSections(diff).map((section) => section.path);
 }
 
+/**
+ * Parse the deployment inventory without the permissive filtering used by
+ * legacy diff consumers. Every diff --git header is an authority-bearing
+ * record: both sides must be concrete repository-relative paths, while the
+ * destination side supplies the changed-path inventory.
+ */
+export function parseDeploymentDiffPaths(diff: unknown): string[] {
+  if (typeof diff !== "string" || diff.length === 0) {
+    throw new Error("Deployment diff inventory is empty or malformed");
+  }
+  const headers = diff.split(/\r\n|\n|\r/)
+    .filter((line) => /^diff --git(?:[ \t]|$)/.test(line));
+  if (!headers.length) throw new Error("Deployment diff inventory is missing diff --git headers");
+
+  const destinations: string[] = [];
+  headers.forEach((header, index) => {
+    const parsed = parseDeploymentDiffHeader(header);
+    if (!parsed) throw new Error(`Deployment diff inventory contains a malformed diff --git header at line ${index + 1}`);
+    normalizeDeploymentPath(stripGitPathPrefix(parsed[0]), `Deployment diff header ${index + 1} source path`);
+    destinations.push(normalizeDeploymentPath(stripGitPathPrefix(parsed[1]), `Deployment diff header ${index + 1} destination path`));
+  });
+  return canonicalizeDeploymentPaths(destinations, "diff-header destinations");
+}
+
+/** Canonicalize deployment evidence while rejecting lossy normalization. */
+export function canonicalizeDeploymentPaths(paths: readonly unknown[], label = "deployment inventory"): string[] {
+  if (!Array.isArray(paths)) throw new Error(`Deployment ${label} must be an array of paths`);
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  paths.forEach((value, index) => {
+    if (typeof value !== "string") {
+      throw new Error(`Deployment ${label} contains a non-string path at index ${index}`);
+    }
+    const path = normalizeDeploymentPath(value, `Deployment ${label} path ${index + 1}`);
+    if (seen.has(path)) throw new Error(`Deployment ${label} contains a duplicate canonical path: ${path}`);
+    seen.add(path);
+    normalized.push(path);
+  });
+  if (!normalized.length) throw new Error(`Deployment ${label} is empty`);
+  return normalized.sort();
+}
+
+function parseDeploymentDiffHeader(header: string): readonly [string, string] | undefined {
+  const marker = "diff --git";
+  if (!header.startsWith(marker)) return undefined;
+  let rest = header.slice(marker.length);
+  if (!/^[ \t]/.test(rest)) return undefined;
+  rest = rest.replace(/^[ \t]+/, "");
+  if (!rest) return undefined;
+
+  // Git normally leaves ordinary paths unquoted. Locate the separator by
+  // requiring the destination prefix; this retains spaces in either path and
+  // fails closed if the header is ambiguous rather than guessing.
+  if (!rest.startsWith('"')) {
+    const candidates: Array<readonly [string, string]> = [];
+    for (let index = 1; index < rest.length; index++) {
+      if (!isHeaderWhitespace(rest[index]) || isHeaderWhitespace(rest[index - 1])) continue;
+      let destinationStart = index;
+      while (destinationStart < rest.length && isHeaderWhitespace(rest[destinationStart])) destinationStart++;
+      const source = rest.slice(0, index).trimEnd();
+      const destination = rest.slice(destinationStart);
+      if (hasGitPathPrefix(source, "a") && hasGitPathPrefix(destination, "b")) {
+        candidates.push([source, destination]);
+      }
+    }
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) return undefined;
+  }
+
+  const source = readGitHeaderToken(rest, 0);
+  if (!source) return undefined;
+  let secondStart = source.end;
+  while (secondStart < rest.length && isHeaderWhitespace(rest[secondStart])) secondStart++;
+  const destination = readGitHeaderToken(rest, secondStart);
+  if (!destination || rest.slice(destination.end).trim().length > 0
+    || !hasGitPathPrefix(source.value, "a") || !hasGitPathPrefix(destination.value, "b")) {
+    return undefined;
+  }
+  return [source.value, destination.value];
+}
+
+function readGitHeaderToken(value: string, start: number): { value: string; end: number } | undefined {
+  if (start >= value.length) return undefined;
+  if (value[start] !== '"') {
+    let end = start;
+    while (end < value.length && !isHeaderWhitespace(value[end])) end++;
+    return end > start ? { value: value.slice(start, end), end } : undefined;
+  }
+
+  let decoded = "";
+  for (let index = start + 1; index < value.length; index++) {
+    const character = value[index];
+    if (character === '"') return { value: decoded, end: index + 1 };
+    if (character !== "\\") {
+      decoded += character;
+      continue;
+    }
+    const escaped = value[++index];
+    if (escaped === undefined) return undefined;
+    if (/[0-7]/.test(escaped)) {
+      let octal = escaped;
+      for (let count = 1; count < 3 && /[0-7]/.test(value[index + 1] ?? ""); count++) octal += value[++index];
+      decoded += String.fromCharCode(Number.parseInt(octal, 8));
+    } else {
+      const escapedControls: Record<string, string> = {
+        b: String.fromCharCode(8), f: String.fromCharCode(12), n: String.fromCharCode(10),
+        r: String.fromCharCode(13), t: String.fromCharCode(9), v: String.fromCharCode(11),
+      };
+      decoded += escapedControls[escaped] ?? escaped;
+    }
+  }
+  return undefined;
+}
+
+function hasGitPathPrefix(value: string, prefix: "a" | "b"): boolean {
+  return value.startsWith(`${prefix}/`) || value.startsWith(`${prefix}\\`);
+}
+
+function stripGitPathPrefix(value: string): string {
+  return value.slice(2);
+}
+
+function isHeaderWhitespace(value: string | undefined): boolean {
+  return value === " " || value === "\t";
+}
+
+function normalizeDeploymentPath(value: string, label: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "");
+  if (!normalized || !normalized.trim()) throw new Error(`${label} is empty`);
+  if (normalized !== normalized.trim()) throw new Error(`${label} contains surrounding whitespace`);
+  if ([...normalized].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+  })) throw new Error(`${label} contains a control character`);
+  if (normalized.startsWith("/")) throw new Error(`${label} is absolute`);
+  if (/^[A-Za-z]:/.test(normalized)) throw new Error(`${label} is drive-qualified`);
+  if (normalized.includes(":")) throw new Error(`${label} contains a colon`);
+  if (/[*?\[\]{}]/.test(normalized)) throw new Error(`${label} contains a glob character`);
+  const segments = normalized.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new Error(`${label} contains an unsafe traversal or empty path segment`);
+  }
+  return normalized;
+}
+
 function parseDiffSections(diff: string): DiffSection[] {
   const starts = [...diff.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)];
   return starts.map((match, index) => {

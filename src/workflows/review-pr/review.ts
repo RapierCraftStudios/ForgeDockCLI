@@ -10,7 +10,7 @@ import { AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, canonicalizeDeploymentPaths, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, parseDeploymentDiffPaths, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, shouldMaterializeFinding } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -50,6 +50,8 @@ export interface DeploymentReviewEvidence {
   baseBranch: string;
   changedPaths: readonly string[];
   checks: ReviewChecks;
+  /** One host-observed diff snapshot shared by all deployment review stages. */
+  diff?: string;
 }
 
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
@@ -256,8 +258,8 @@ export async function reviewPullRequest(
       throw new Error("Review cannot combine Build Result and deployment review evidence");
     }
     const expectedHeadSha = input.buildResult?.payload.headSha ?? input.deployment?.headSha;
-    const changedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
-    if (!expectedHeadSha || !changedPaths) throw new Error("Review evidence is missing its head SHA or changed paths");
+    const suppliedChangedPaths = input.buildResult?.payload.changedPaths ?? input.deployment?.changedPaths;
+    if (!expectedHeadSha || suppliedChangedPaths === undefined) throw new Error("Review evidence is missing its head SHA or changed paths");
     const frozen = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
     if (!samePullRequestIdentity(input.pullRequest, frozen)) {
       throw new Error(
@@ -288,6 +290,23 @@ export async function reviewPullRequest(
     if (input.deployment && (input.deployment.headBranch !== frozen.headBranch || input.deployment.baseBranch !== frozen.baseBranch)) {
       throw new Error("Cannot start deployment review: PR branches changed before review");
     }
+
+    // Deployment reviews receive the host-observed diff from the caller. It is
+    // the one frozen content snapshot used for both reconciliation and every
+    // downstream review surface; never perform a second diff read here.
+    let diff: string;
+    let changedPaths: readonly string[];
+    if (input.deployment) {
+      if (typeof input.deployment.diff !== "string") {
+        throw new Error("Deployment review requires a frozen PR diff snapshot");
+      }
+      diff = input.deployment.diff;
+      changedPaths = reconcileDeploymentInventory(diff, input.deployment.changedPaths, input.packet.payload.expectedPaths);
+    } else {
+      diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
+      changedPaths = suppliedChangedPaths;
+    }
+
     const planContext: Omit<ReviewPlanContext, "packetId" | "packetDigest"> = {
       runId: input.run.runId,
       repo: input.run.subject.repo,
@@ -305,10 +324,13 @@ export async function reviewPullRequest(
       deliveryRunId: expectedDeliveryRunId,
       host: dependencies.host,
     });
-    const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
     const priorReviewPlan = input.priorVerdict?.payload.reviewPlan;
     const reviewPlan = isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
-      run: input.run, pullRequest: frozen, packet: input.packet, context: planContext,
+      run: input.run,
+      pullRequest: frozen,
+      packet: input.packet,
+      context: planContext,
+      ...(input.deployment ? { expectedPaths: changedPaths } : {}),
     })
       ? freezeReviewPlan(priorReviewPlan)
       : planReviewPanel({
@@ -347,7 +369,13 @@ export async function reviewPullRequest(
       const roleDiff = scopedReviewDiff(reviewPlan, selection, diff, input.deployment
         ? { maxInitialDiffChars: DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS }
         : undefined);
-      const authorityBrief = reviewerAuthorityBrief(input, selection, expectedHeadSha, buildTargetBranch);
+      const authorityBrief = reviewerAuthorityBrief(
+        input,
+        selection,
+        expectedHeadSha,
+        buildTargetBranch,
+        input.deployment ? changedPaths : undefined,
+      );
       const explorationBudget = reviewerToolCallBudget(selection, reviewPlan);
       let priorFailure: string | undefined;
       let resumeSessionRef: string | undefined;
@@ -442,7 +470,9 @@ export async function reviewPullRequest(
               cwd: input.workspace,
               mode: "read-only",
               scope: scopeManifestFor("build-packet", {
-                affectedFiles: [...input.packet.payload.expectedPaths, ...changedPaths],
+                affectedFiles: input.deployment
+                  ? [...changedPaths]
+                  : [...input.packet.payload.expectedPaths, ...changedPaths],
                 metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
               }),
             },
@@ -606,7 +636,7 @@ export async function reviewPullRequest(
       scope: reviewPlan.executionGroups.find(({ id }) => id === result.executionGroupId)?.scope ?? [],
     })), blocking, {
       reviewedPaths: changedPaths,
-      expectedPaths: input.packet.payload.expectedPaths,
+      expectedPaths: input.deployment ? changedPaths : input.packet.payload.expectedPaths,
       verifiedAuthorityReferences,
       verifiedCheckReferences,
     });
@@ -700,6 +730,30 @@ export async function reviewPullRequest(
   }
 }
 
+function reconcileDeploymentInventory(
+  diff: string,
+  changedPaths: readonly unknown[],
+  expectedPaths: readonly unknown[],
+): string[] {
+  const diffInventory = parseDeploymentDiffPaths(diff);
+  const evidenceInventory = canonicalizeDeploymentPaths(changedPaths, "changed-path evidence");
+  const packetInventory = canonicalizeDeploymentPaths(expectedPaths, "packet expectedPaths");
+  assertDeploymentInventoryMatch("deployment.changedPaths", diffInventory, evidenceInventory);
+  assertDeploymentInventoryMatch("packet.payload.expectedPaths", diffInventory, packetInventory);
+  return diffInventory;
+}
+
+function assertDeploymentInventoryMatch(
+  label: string,
+  diffInventory: readonly string[],
+  observedInventory: readonly string[],
+): void {
+  if (diffInventory.length !== observedInventory.length
+    || diffInventory.some((path, index) => path !== observedInventory[index])) {
+    throw new Error(`Deployment diff inventory does not exactly match ${label}; omissions, additions, or aliases are not repaired`);
+  }
+}
+
 async function assertPriorVerdictAuthority(
   verdict: DurableArtifact<"ReviewVerdict"> | undefined,
   expected: {
@@ -772,6 +826,7 @@ function isReusableFrozenReviewPlan(
     pullRequest: PullRequestSnapshot;
     packet: DurableArtifact<"BuildPacket">;
     context: Omit<ReviewPlanContext, "packetId" | "packetDigest">;
+    expectedPaths?: readonly string[];
   },
 ): value is ReviewPlan {
   if (!verdict || !value || typeof value !== "object") return false;
@@ -789,10 +844,23 @@ function isReusableFrozenReviewPlan(
       && verdict.subject.pr === expected.pullRequest.number
       && verdict.payload.headBranch === expected.pullRequest.headBranch
       && verdict.payload.baseBranch === expected.pullRequest.baseBranch
-      && canonicalReviewDigest(plan.context) === canonicalReviewDigest(expectedContext);
+      && canonicalReviewDigest(plan.context) === canonicalReviewDigest(expectedContext)
+      && (expected.expectedPaths === undefined || executionGroupPathsCover(plan, expected.expectedPaths));
   } catch {
     return false;
   }
+}
+
+function executionGroupPathsCover(plan: ReviewPlan, expectedPaths: readonly string[]): boolean {
+  const expected = new Set(expectedPaths.map(normalizeReviewInventoryPath));
+  const observedPaths = plan.executionGroups.flatMap(({ scope }) => scope);
+  if (observedPaths.some((path) => path !== normalizeReviewInventoryPath(path))) return false;
+  const observed = new Set(observedPaths);
+  return expected.size > 0 && observed.size === expected.size && [...expected].every((path) => observed.has(path));
+}
+
+function normalizeReviewInventoryPath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").trim();
 }
 
 function changedDeliveryAuthorityFacts(
@@ -1062,6 +1130,7 @@ function reviewerAuthorityBrief(
   selection: ReviewPlan["executionGroups"][number],
   headSha: string,
   targetBranch: string,
+  reviewedPaths?: readonly string[],
 ): string {
   const boundedList = (values: readonly string[] | undefined, maximum = 100): string[] =>
     (values ?? []).slice(0, maximum).map((value) => safeText(value, 2_000));
@@ -1076,7 +1145,7 @@ function reviewerAuthorityBrief(
       executionGroupRole: selection.role,
       executionGroupCapabilities: selection.capabilities,
       executionGroupPaths: selection.scope,
-      totalExpectedPaths: packet.expectedPaths.length,
+      totalExpectedPaths: reviewedPaths?.length ?? packet.expectedPaths.length,
     },
     intent: {
       id: input.intent.id,

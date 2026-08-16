@@ -130,6 +130,163 @@ describe("fresh-context PR review", () => {
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
   });
 
+  it("reconciles a deployment snapshot to one canonical inventory before runtime setup", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const { buildResult: _buildResult, ...deploymentContext } = context;
+    const host = new FakeHost();
+    const runtime = new FakeAgentRuntime([clean, clean]);
+    const result = await reviewPullRequest({
+      run,
+      pullRequest: pr,
+      ...deploymentContext,
+      deployment: {
+        headSha: sha,
+        headBranch: "fix",
+        baseBranch: "main",
+        changedPaths: ["./src\\lock.ts"],
+        checks: [],
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)",
+      },
+      workspace: process.cwd(),
+    }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs });
+    assert.equal(result.verdict.payload.disposition, "approve");
+    assert.deepEqual(result.reviewPlan.executionGroups.flatMap(({ scope }) => scope).filter((path, index, all) => all.indexOf(path) === index), ["src/lock.ts"]);
+    assert.ok(runtime.tasks.every((task) => task.workspace.scope.readRoots.includes("src")));
+  });
+
+  it("rejects deployment packet/evidence disagreement before reviewer or verdict side effects", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const { buildResult: _buildResult, ...deploymentContext } = context;
+    const runtime = new FakeAgentRuntime([clean]);
+    const host = new FakeHost();
+    const artifactStore = new InMemoryArtifactRepository();
+    await assert.rejects(
+      reviewPullRequest({
+        run,
+        pullRequest: pr,
+        ...deploymentContext,
+        deployment: {
+          headSha: sha,
+          headBranch: "fix",
+          baseBranch: "main",
+          changedPaths: ["src/other.ts"],
+          checks: [],
+          diff: "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)",
+        },
+        workspace: process.cwd(),
+      }, { runtime, host, artifacts: artifactStore, runs }),
+      /does not exactly match deployment\.changedPaths/,
+    );
+    assert.equal(runtime.tasks.length, 0);
+    assert.equal(host.comments.length, 0);
+    assert.equal(artifactStore.artifacts.length, 0);
+    assert.equal((await runs.load(run.runId))?.state, "failed");
+  });
+
+  it("rejects deployment omissions, additions, and packet disagreement before side effects", async () => {
+    const cases = [
+      {
+        name: "omission",
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()\ndiff --git a/src/other.ts b/src/other.ts\n+other()",
+        changedPaths: ["src/lock.ts"],
+        expectedPaths: ["src/lock.ts", "src/other.ts"],
+      },
+      {
+        name: "addition",
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()",
+        changedPaths: ["src/lock.ts", "src/other.ts"],
+        expectedPaths: ["src/lock.ts", "src/other.ts"],
+      },
+      {
+        name: "packet disagreement",
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+lock()",
+        changedPaths: ["src/lock.ts"],
+        expectedPaths: ["src/other.ts"],
+      },
+    ];
+    for (const candidate of cases) {
+      const runs = new InMemoryRunRepository();
+      const run = await reviewingRun(runs);
+      const context = artifacts(run);
+      const { buildResult: _buildResult, ...deploymentContext } = context;
+      const packet = { ...context.packet, payload: { ...context.packet.payload, expectedPaths: candidate.expectedPaths } };
+      const host = new FakeHost();
+      const artifactStore = new InMemoryArtifactRepository();
+      await assert.rejects(
+        reviewPullRequest({
+          run,
+          pullRequest: pr,
+          ...deploymentContext,
+          packet,
+          deployment: {
+            headSha: sha,
+            headBranch: "fix",
+            baseBranch: "main",
+            changedPaths: candidate.changedPaths,
+            checks: [],
+            diff: candidate.diff,
+          },
+          workspace: process.cwd(),
+        }, { runtime: new FakeAgentRuntime([clean]), host, artifacts: artifactStore, runs }),
+        /does not exactly match/,
+        candidate.name,
+      );
+      assert.equal(host.comments.length, 0, candidate.name);
+      assert.equal(artifactStore.artifacts.length, 0, candidate.name);
+      assert.equal((await runs.load(run.runId))?.state, "failed", candidate.name);
+    }
+  });
+
+  it("replans a reusable prior topology when its execution-group paths are stale", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const { buildResult: _buildResult, ...deploymentContext } = context;
+    const priorPlan = planReviewPanel({
+      changedPaths: ["src/stale.ts"],
+      diff: "diff --git a/src/stale.ts b/src/stale.ts\n+stale()",
+      packet: context.packet,
+      context: reviewPlanContext(run),
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict",
+      runId: run.runId,
+      subject: { ...run.subject, pr: pr.number },
+      producer: { role: "controller" },
+      payload: {
+        headSha: sha,
+        headBranch: "fix",
+        baseBranch: "main",
+        disposition: "request_changes",
+        reviewerRoles: ["correctness"],
+        findings: [],
+        checks: [],
+        reviewPlan: priorPlan,
+      },
+    });
+    const result = await reviewPullRequest({
+      run,
+      pullRequest: pr,
+      ...deploymentContext,
+      priorVerdict,
+      deployment: {
+        headSha: sha,
+        headBranch: "fix",
+        baseBranch: "main",
+        changedPaths: ["src/lock.ts"],
+        checks: [],
+        diff: "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)",
+      },
+      workspace: process.cwd(),
+    }, { runtime: new FakeAgentRuntime([clean, clean]), host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
+    assert.notEqual(result.reviewPlan.planId, priorPlan.planId);
+    assert.deepEqual(result.reviewPlan.executionGroups.flatMap(({ scope }) => scope).filter((path, index, all) => all.indexOf(path) === index), ["src/lock.ts"]);
+  });
+
   it("executes a large review as compact bounded shards with one folded durable report", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);

@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { assertReviewPlan, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
+import { assertReviewPlan, canonicalizeDeploymentPaths, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, parseDeploymentDiffPaths, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
   return createArtifact({
@@ -240,6 +240,41 @@ describe("evidence-backed review planning", () => {
       () => assertReviewPlan({ ...malformed, planId: computeReviewPlanId(malformed) }),
       /exactly and uniquely cover/,
     );
+  });
+
+  it("strictly parses complete deployment diff-header destination inventories", () => {
+    const diff = [
+      "diff --git a/src/old-release.ts b/src/release.ts",
+      "similarity index 98%",
+      "rename from src/old-release.ts",
+      "rename to src/release.ts",
+      "diff --git a/./src\\legacy.ts b/./src\\legacy-new.ts",
+    ].join("\n");
+    assert.deepEqual(parseDeploymentDiffPaths(diff), ["src/legacy-new.ts", "src/release.ts"]);
+    assert.deepEqual(canonicalizeDeploymentPaths(["./src\\release.ts", "src/legacy-new.ts"]), ["src/legacy-new.ts", "src/release.ts"]);
+
+    const invalidHeaders: Array<[string, string]> = [
+      ["missing headers", "not a patch"],
+      ["malformed header", "diff --git a/src/file.ts"],
+      ["empty path", "diff --git a/ b/"],
+      ["absolute path", "diff --git a//etc/passwd b//etc/passwd"],
+      ["drive-qualified path", "diff --git a/C:/repo/file.ts b/C:/repo/file.ts"],
+      ["traversal path", "diff --git a/src/../file.ts b/src/file.ts"],
+      ["glob path", "diff --git a/src/*.ts b/src/file.ts"],
+      ["colon path", "diff --git a/src/file:ts b/src/file.ts"],
+      ["control path", `diff --git a/src/file.ts b/src/file${String.fromCharCode(0)}.ts`],
+    ];
+    for (const [label, invalid] of invalidHeaders) assert.throws(() => parseDeploymentDiffPaths(invalid), /Deployment/, label);
+    assert.throws(
+      () => parseDeploymentDiffPaths([
+        "diff --git a/src/file.ts b/src/file.ts",
+        "diff --git a/./src/file.ts b/./src/file.ts",
+      ].join("\n")),
+      /duplicate canonical path/,
+    );
+    assert.throws(() => canonicalizeDeploymentPaths([]), /empty/);
+    assert.throws(() => canonicalizeDeploymentPaths(["src/file.ts", "./src\\file.ts"]), /duplicate/);
+    assert.throws(() => canonicalizeDeploymentPaths(["src/file.ts", 42]), /non-string/);
   });
 
   it("keeps oversized deployment shards component-coherent without manufacturing extra sessions", () => {

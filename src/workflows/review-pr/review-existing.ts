@@ -5,10 +5,11 @@ import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config
 import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
-import { attachArtifact, createRun } from "../../core/state/machine.js";
+import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
-import { parseDiffPaths } from "./planner.js";
+import { parseDeploymentDiffPaths } from "./planner.js";
 import { reviewPullRequest, type ReviewChecks } from "./review.js";
+import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { assessPullRequestCi, assertPullRequestCiReady, type PullRequestCiAssessment } from "./ci-policy.js";
 interface StandaloneReviewCiInput { policy: EffectiveReviewCiConfig; featurePromotionTarget?: string; productionTarget?: string; }
 
@@ -96,23 +97,34 @@ async function reviewDeploymentPullRequest(
   if (frozen.state !== "OPEN") {
     throw new Error(`Cannot start deployment review: PR #${frozen.number} must be OPEN at freeze, found ${frozen.state}`);
   }
+  // Read the deployment diff exactly once and carry that frozen snapshot
+  // through artifact construction and the core review boundary.
   const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
-  const changedPaths = parseDiffPaths(diff);
-  if (!changedPaths.length) throw new Error("Deployment PR diff does not contain any changed paths");
   const mergeGate = await readDeploymentMergeGate(frozen, dependencies.host);
   if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
   const checks = toReviewChecks(mergeGate);
   let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
   run = { ...run, headSha: frozen.headSha };
-  const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
-  // Deployment reviews have no single delivery issue, so their Intent,
-  // Investigation, and Build Packet are deterministic reviewer context rather
-  // than workflow artifacts. Keep them in the isolated reviewer input; do not
-  // project work-on lifecycle comments onto the deployment pull request.
+  // Create the run and workspace before strict parsing so an inventory failure
+  // has durable failure state and the caller's allocated workspace is cleaned.
   await dependencies.runs.create(run);
   const workspace = await dependencies.workspaces.createReview({ runId: run.runId, pr: frozen.number, headSha: frozen.headSha });
   const result = await (async () => {
     try {
+      let changedPaths: readonly string[];
+      try {
+        changedPaths = parseDeploymentDiffPaths(diff);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const failed = transition(run, "FAIL", { reason });
+        await dependencies.runs.commit(run.version, failed.state, failed.record);
+        throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+      }
+      const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
+      // Deployment reviews have no single delivery issue, so their Intent,
+      // Investigation, and Build Packet are deterministic reviewer context rather
+      // than workflow artifacts. Keep them in the isolated reviewer input; do not
+      // project work-on lifecycle comments onto the deployment pull request.
       return await reviewPullRequest({
         run,
         pullRequest: frozen,
@@ -123,6 +135,7 @@ async function reviewDeploymentPullRequest(
           baseBranch: frozen.baseBranch,
           changedPaths,
           checks,
+          diff,
         },
         workspace: workspace.path,
         ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),

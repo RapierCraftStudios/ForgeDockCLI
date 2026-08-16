@@ -27,6 +27,8 @@ class DeploymentHost implements ForgeHost {
   readonly publications: Array<{ repo: string; pullRequest: number; marker: string; body: string }> = [];
   pullRequest = deploymentPr;
   pullRequestSnapshots: PullRequestSnapshot[] = [];
+  diffResponses: string[] = [];
+  diffReads = 0;
   requiredChecks: PullRequestMergeGate["requiredChecks"] = [{ name: "CI", state: "passed" }];
   mergeGateIdentity: Partial<Pick<PullRequestMergeGate, "repo" | "pullRequest" | "headSha" | "baseBranch">> = {};
 
@@ -34,7 +36,8 @@ class DeploymentHost implements ForgeHost {
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.pullRequest; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return this.pullRequestSnapshots.shift() ?? this.pullRequest; }
   async getPullRequestDiff(): Promise<string> {
-    return "diff --git a/src/release.ts b/src/release.ts\n+export const release = true;";
+    this.diffReads++;
+    return this.diffResponses.shift() ?? "diff --git a/src/release.ts b/src/release.ts\n+export const release = true;";
   }
   async getPullRequestMergeGate(_repo: string, number: number, headSha: string, baseBranch: string): Promise<PullRequestMergeGate> {
     return {
@@ -84,6 +87,10 @@ function assertNoDeploymentGate(publications: DeploymentHost["publications"]): v
 describe("issue-less deployment PR review", () => {
   it("reviews staging-to-main without lifecycle gate comments", async () => {
     const host = new DeploymentHost();
+    host.diffResponses = [
+      "diff --git a/src/release.ts b/src/release.ts\n+export const release = true;",
+      "diff --git a/src/alternate.ts b/src/alternate.ts\n+export const alternate = true;",
+    ];
     const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
     const workspaces = new TestWorkspaces();
     const artifacts = new InMemoryArtifactRepository();
@@ -93,6 +100,7 @@ describe("issue-less deployment PR review", () => {
     );
 
     assert.equal(result.run.state, "merging");
+    assert.equal(host.diffReads, 1);
     assert.deepEqual(result.verdict.subject, { repo: deploymentPr.repo, pr: deploymentPr.number });
     assert.deepEqual(result.verdict.payload.checks, [{ command: "GitHub required check: CI", status: "passed", durationMs: 0 }]);
     assert.ok(runtime.tasks.length > 0);
@@ -100,6 +108,21 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["ReviewVerdict"]);
     assertNoDeploymentGate(host.publications);
     assert.equal(workspaces.removed, true);
+  });
+
+  it("propagates the complete canonical deployment set through shards and reviewer scopes", async () => {
+    const host = new DeploymentHost();
+    const paths = ["src/alpha.ts", "src/release.ts"];
+    host.diffResponses = [paths.map((path) => `diff --git a/${path} b/${path}\n+export const changed = true;`).join("\n")];
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
+    const result = await reviewExistingPullRequest(
+      { repo: deploymentPr.repo, pr: deploymentPr.number },
+      { runtime, host, workspaces: new TestWorkspaces(), artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+    );
+    assert.equal(host.diffReads, 1);
+    assert.deepEqual([...new Set(result.reviewPlan.executionGroups.flatMap(({ scope }) => scope))].sort(), paths);
+    assert.ok(runtime.tasks.every((task) => task.objective.includes('"totalExpectedPaths": 2')));
+    assert.ok(runtime.tasks.every((task) => paths.every((path) => task.objective.includes(path))));
   });
 
   it("treats every non-green deployment check as authoritative", async () => {
@@ -216,6 +239,43 @@ describe("issue-less deployment PR review", () => {
       /PR delivery route changed during reviewer execution/,
     );
     assertNoDeploymentGate(host.publications);
+  });
+
+  it("fails closed for every invalid deployment inventory before reviewer execution", async () => {
+    const invalidDiffs: Array<[string, string]> = [
+      ["empty", ""],
+      ["missing header", "--- a/src/release.ts\n+++ b/src/release.ts"],
+      ["malformed header", "diff --git a/src/release.ts"],
+      ["unsafe traversal", "diff --git a/src/../release.ts b/src/../release.ts"],
+      ["absolute", "diff --git a//etc/release.ts b//etc/release.ts"],
+      ["drive-qualified", "diff --git a/C:/release.ts b/C:/release.ts"],
+      ["glob", "diff --git a/src/*.ts b/src/*.ts"],
+      ["colon", "diff --git a/src/release:ts b/src/release:ts"],
+      ["control", `diff --git a/src/release.ts b/src/release${String.fromCharCode(0)}.ts`],
+      ["duplicate", "diff --git a/src/release.ts b/src/release.ts\ndiff --git a/./src/release.ts b/./src/release.ts"],
+    ];
+    for (const [label, diff] of invalidDiffs) {
+      const host = new DeploymentHost();
+      host.diffResponses = [diff];
+      const runtime = new FakeAgentRuntime([clean]);
+      const workspaces = new TestWorkspaces();
+      const artifactStore = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      await assert.rejects(
+        reviewExistingPullRequest(
+          { repo: deploymentPr.repo, pr: deploymentPr.number },
+          { runtime, host, workspaces, artifacts: artifactStore, runs },
+        ),
+        /Deployment/,
+        label,
+      );
+      assert.equal(host.diffReads, 1, label);
+      assert.equal(runtime.tasks.length, 0, label);
+      assert.equal(host.publications.length, 0, label);
+      assert.equal(artifactStore.artifacts.some(({ kind }) => kind === "ReviewVerdict"), false, label);
+      assert.equal([...runs.runs.values()][0]?.state, "failed", label);
+      assert.equal(workspaces.removed, true, label);
+    }
   });
 
   it("does not start a deployment review from a closed frozen snapshot", async () => {
