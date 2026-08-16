@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { lstat, readFile, readlink } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { createArtifact, type ControllerVerificationGate, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
@@ -17,6 +17,13 @@ export interface VerificationResult {
   checks: CheckResult[];
   buildResult?: DurableArtifact<"BuildResult">;
   outcome?: DurableArtifact<"Outcome">;
+}
+
+class DeliveryContentLinkError extends Error {
+  constructor(path: string) {
+    super(`Delivery path is a symbolic link and cannot be verified: ${path}`);
+    this.name = "DeliveryContentLinkError";
+  }
 }
 
 export async function verifyAndCommit(
@@ -145,15 +152,31 @@ export async function verifyAndCommit(
           : !input.commands.some((command) => command.required)
             ? "No required verification commands were configured"
             : changeReportFailure ?? coverageFailure;
-    const contentDigestBefore = preflightFailure
-      ? undefined
-      : await deliveryContentDigest(input.workspace.path, deliveryChangedPaths);
+    let contentDigestBefore: string | undefined;
+    if (!preflightFailure) {
+      try {
+        contentDigestBefore = await deliveryContentDigest(input.workspace.path, deliveryChangedPaths);
+      } catch (error) {
+        if (error instanceof DeliveryContentLinkError) {
+          return blockVerification(error.message, [], deliveryChangedPaths);
+        }
+        throw error;
+      }
+    }
     if (!preflightFailure) await dependencies.git.prepareWorkspaceDependencies(input.workspace);
     const observedChecks = preflightFailure ? [] : await dependencies.verifier.run(input.commands, input.signal);
-    const contentDigestAfter = contentDigestBefore === undefined
-      ? undefined
-      : await deliveryContentDigest(input.workspace.path, deliveryChangedPaths);
     const checks = observedChecks.map((check, index) => compareWithBaseline(check, input.baselineChecks?.[index]));
+    let contentDigestAfter: string | undefined;
+    if (contentDigestBefore !== undefined) {
+      try {
+        contentDigestAfter = await deliveryContentDigest(input.workspace.path, deliveryChangedPaths);
+      } catch (error) {
+        if (error instanceof DeliveryContentLinkError) {
+          return blockVerification(error.message, checks, deliveryChangedPaths);
+        }
+        throw error;
+      }
+    }
     const requiredFailure = input.commands.some((command, index) => command.required && checks[index]?.status !== "passed");
     const verificationMutation = contentDigestBefore !== undefined && contentDigestAfter !== contentDigestBefore
       ? "Verification commands changed controller-approved delivery content; refusing to commit untested results"
@@ -176,7 +199,15 @@ export async function verifyAndCommit(
     const committedPathSet = new Set(revisionChangedPaths);
     const committedOmittedFromReport = revisionChangedPaths.filter((path) => !reportedPathSet.has(path));
     const committedNotObserved = reportedPaths.filter((path) => !committedPathSet.has(path));
-    const committedWorktreeDigest = await deliveryContentDigest(input.workspace.path, revisionChangedPaths);
+    let committedWorktreeDigest: string;
+    try {
+      committedWorktreeDigest = await deliveryContentDigest(input.workspace.path, revisionChangedPaths);
+    } catch (error) {
+      if (error instanceof DeliveryContentLinkError) {
+        return blockVerification(error.message, checks, revisionChangedPaths);
+      }
+      throw error;
+    }
     const committedBlobsMatch = contentDigestAfter === undefined
       ? false
       : await dependencies.git.committedContentMatches(
@@ -349,10 +380,9 @@ async function deliveryContentDigest(workspacePath: string, paths: readonly stri
     hash.update(path).update("\0");
     try {
       const stat = await lstat(absolute);
+      if (stat.isSymbolicLink()) throw new DeliveryContentLinkError(path);
       hash.update(stat.mode & 0o111 ? "1" : "0").update("\0");
-      if (stat.isSymbolicLink()) {
-        hash.update("symlink\0").update(await readlink(absolute)).update("\0");
-      } else if (stat.isFile()) {
+      if (stat.isFile()) {
         hash.update("file\0").update(await readFile(absolute)).update("\0");
       } else {
         throw new Error(`Delivery path is not a file or symbolic link: ${path}`);
