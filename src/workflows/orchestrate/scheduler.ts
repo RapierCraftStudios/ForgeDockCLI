@@ -281,17 +281,25 @@ export async function runSchedule(
           const conflicts = [...running.keys()]
             .filter((activeId) => activeId !== item.id)
             .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
+          const previousClaims = currentClaims.get(item.id);
+          currentClaims.set(item.id, merged);
+          try {
+            // Publish the discovered Build Packet scope before exposing the
+            // worker's conflict or completion to the scheduler. If the
+            // durable sink rejects, roll back the in-memory claim projection.
+            await options.onClaimsPromoted?.(item.id, merged);
+          } catch (error) {
+            if (previousClaims === undefined) currentClaims.delete(item.id);
+            else currentClaims.set(item.id, previousClaims);
+            throw error;
+          }
           if (conflicts.length) {
             // The Build Packet paths remain authoritative even though this
             // attempt cannot proceed. Retaining them makes the retry wait on
             // the actual live claim instead of immediately redispatching with
             // the node's older, incomplete scope.
-            currentClaims.set(item.id, merged);
-            await options.onClaimsPromoted?.(item.id, merged);
             throw new ClaimPromotionConflictError(item.id, conflicts);
           }
-          currentClaims.set(item.id, merged);
-          await options.onClaimsPromoted?.(item.id, merged);
         },
       };
       const promise = worker(item, context)
