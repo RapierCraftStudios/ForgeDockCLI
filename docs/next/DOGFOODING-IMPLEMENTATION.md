@@ -58,7 +58,11 @@ legacy ForgeDock system.
 ## Release
 
 - [x] Update the native implementation checklist and changelog.
-- [ ] Commit the complete staging change set.
-- [ ] Push `staging` and open a `staging` → `main` pull request.
-- [ ] Pass CI and review the exact merge candidate.
-- [ ] Merge to `main` and verify the resulting remote state.
+- [x] Commit the complete staging change set (`ec8abbcc`).
+- [x] Push `staging` and open staging -> main PR #320.
+- [x] Pass CI and review the exact merge candidate (hosted checks all passed).
+- [x] Merge to `main` and verify the resulting remote state (`69bf65e1`).
+
+The live canary section remains intentionally open: local and hosted regression
+gates prove the implementation, but they do not substitute for three to five
+fresh native staging runs against a controlled small DAG.
