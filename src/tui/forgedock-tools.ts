@@ -26,8 +26,9 @@ import type {
 import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type EffectiveOrchestrationConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
+import { resolveCheckoutContext } from "../adapters/git/repository-context.js";
 import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
-import { createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
+import { createConfiguredLeaseWitness, leaseWitnessRequirementMessage } from "../adapters/sqlite/lease-witness.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
 import { buildPlanningPacket, PlanningSessionStore } from "../core/planning/frontier.js";
@@ -180,7 +181,7 @@ export interface OrchestrationScopeIssue {
 }
 
 export interface OrchestrationScopeResolverHost {
-  getRepository(): Promise<{ repo: string; defaultBranch: string }>;
+  getRepository(repo?: string): Promise<{ repo: string; defaultBranch: string }>;
   getMilestone(number: number, repo?: string): Promise<{ number: number; title: string; state: "open" | "closed" }>;
   getIssue(number: number, repo?: string): Promise<OrchestrationScopeIssue>;
   listOpenIssueNumbersForMilestone(title: string, repo?: string): Promise<number[]>;
@@ -421,7 +422,7 @@ export async function resolveRoutedOrchestrationScope(
   host: OrchestrationScopeResolverHost,
 ): Promise<OrchestrationInvocationScope> {
   if (!routing.rationale.trim()) throw new Error("Orchestration routing must include a concise selection rationale");
-  const repository = await host.getRepository();
+  const repository = await host.getRepository(routing.repository?.trim() || undefined);
   // Route validation needs the same immutable issue projection in several
   // checks (eligibility, selected-set validation, and final scope shaping).
   // Cache only within this read-only resolution call; execution planning does
@@ -1590,8 +1591,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
-      orchestrationCwd = ctx.cwd;
-      orchestrationContext = ctx;
+      const launchCwd = ctx.cwd;
       const livePreview = getOrchestrationPreview(pi);
       const previewCheckpoint = params.previewToken
         ? loadOrchestrationPreview(pi, params.previewToken)
@@ -1606,9 +1606,29 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const pending: PendingOrchestrationInvocation | undefined = pendingOrchestrationScopes.get(pi) ?? previewCheckpoint?.scope;
       if (!pending) throw new Error("forgedock_orchestrate requires an invocation bound by the interactive /orchestrate command or an active preview confirmation");
       const invocationLabel = formatOrchestrationInvocationLabel("orchestrate", pending.rawArgs);
-      if (ctx.mode === "tui") orchestrationBoard.attach(ctx);
       const replay = previewCheckpoint?.replay;
       const routing = params.routing ?? replay?.routing;
+      const targetRepository = isBoundOrchestrationScope(pending)
+        ? pending.repository
+        : routing?.repository?.trim() || undefined;
+      // A Pi session may start in a workspace parent while the orchestration
+      // target is one of its checkouts. Resolve that checkout before reading
+      // forge.yaml, opening SQLite, or starting a worker so every
+      // checkout-scoped operation shares one canonical root. The permissive
+      // fallback preserves read-only/test seams; dispatch performs the strict
+      // resolution below before any mutation is admitted.
+      const checkout = resolveCheckoutContext(launchCwd, targetRepository, {
+        allowAmbiguous: true,
+        allowUnresolvedTarget: true,
+      });
+      ctx = { ...ctx, cwd: checkout.checkoutRoot };
+      orchestrationCwd = ctx.cwd;
+      orchestrationContext = ctx;
+      // The session may have initialized task recovery from the launch
+      // directory before the target was known. Re-scan the canonical checkout
+      // so target-local controller records are visible to this orchestration.
+      backgroundTasks.initialize(ctx);
+      if (ctx.mode === "tui") orchestrationBoard.attach(ctx);
       let executionPlan = params.executionPlan ?? replay?.executionPlan as typeof params.executionPlan;
       let issueBriefs = params.issueBriefs ?? replay?.issueBriefs as typeof params.issueBriefs;
       let decomposedReplacements: readonly OrchestrationDecompositionReplacement[] = [];
@@ -1654,8 +1674,14 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       // dispatch. Establish it before GitHub discovery or batch materialization
       // so a missing/invalid witness cannot leave orphan batch issues behind.
       if (dispatchRequiresWitness && !orchestrationRepository && !options.orchestrationRepository) {
+        const dispatchCheckout = resolveCheckoutContext(launchCwd, targetRepository);
+        if (dispatchCheckout.checkoutRoot !== ctx.cwd) {
+          ctx = { ...ctx, cwd: dispatchCheckout.checkoutRoot };
+          orchestrationCwd = ctx.cwd;
+          orchestrationContext = ctx;
+        }
         const witness = createConfiguredLeaseWitness(ctx.cwd);
-        if (!witness) throw new Error("Authenticated lease witness is required before orchestration planning can authorize dispatch; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
+        if (!witness) throw new Error(leaseWitnessRequirementMessage("before orchestration planning can authorize dispatch", ctx.cwd));
         orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
       }
       if (dispatchRequiresWitness && orchestrationRepository) {

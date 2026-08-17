@@ -116,6 +116,19 @@ interface LocalLeaseWitnessOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
+export function leaseWitnessRequirementMessage(phase: string, checkoutRoot: string): string {
+  return [
+    `Authenticated lease witness is required ${phase}.`,
+    "ForgeDock checkout lease-witness preflight (not GitHub authentication) resolved this checkout:",
+    `  ${checkoutRoot}`,
+    "",
+    "No valid lease witness is configured for this checkout.",
+    "Bootstrap one from the resolved checkout with:",
+    "  forgedock-next lease-witness-bootstrap",
+    "or configure all FORGEDOCK_LEASE_WITNESS_* variables.",
+  ].join("\n");
+}
+
 /**
  * Resolve an explicitly configured witness first, then the per-checkout local
  * bootstrap reference. Partial environment configuration and any corrupt local

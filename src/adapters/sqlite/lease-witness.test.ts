@@ -12,6 +12,7 @@ import {
   bootstrapLocalLeaseWitness,
   createConfiguredLeaseWitness,
   createSignedLeaseCheckpoint,
+  leaseWitnessRequirementMessage,
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
 
@@ -203,5 +204,15 @@ describe("retained lease checkpoint witness", () => {
         /must be configured together|continuity/i,
       );
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("distinguishes checkout preflight from GitHub authentication and names the resolved root", () => {
+    const message = leaseWitnessRequirementMessage(
+      "before orchestration planning can authorize dispatch",
+      "/home/dev/Projects/ForgeDockCLI",
+    );
+    assert.match(message, /not GitHub authentication/);
+    assert.match(message, /\/home\/dev\/Projects\/ForgeDockCLI/);
+    assert.match(message, /forgedock-next lease-witness-bootstrap/);
   });
 });
