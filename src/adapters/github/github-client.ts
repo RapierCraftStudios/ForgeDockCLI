@@ -67,8 +67,8 @@ const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
-const MAX_READ_ATTEMPTS = 3;
-const READ_RETRY_DELAY_MS = 25;
+const MAX_READ_ATTEMPTS = 6;
+const READ_RETRY_DELAY_MS = 50;
 
 function isReadOnlyGhInvocation(args: readonly string[]): boolean {
   const [command, subcommand] = args;

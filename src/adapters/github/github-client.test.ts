@@ -47,7 +47,7 @@ describe("GitHub read retry boundary", () => {
     } });
 
     await assert.rejects(client.getRepository("a/b"), /HTTP 503: unavailable/);
-    assert.equal(attempts, 3);
+    assert.equal(attempts, 6);
   });
 
   it("does not replay a GitHub write after a transient failure", async () => {
