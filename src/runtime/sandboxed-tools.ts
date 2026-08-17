@@ -2,8 +2,9 @@
 
 import { createHash, createPrivateKey, createPublicKey, sign as cryptoSign } from "node:crypto";
 import { constants } from "node:fs";
-import { access, glob as fsGlob, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, posix, relative, resolve, sep } from "node:path";
+import { access, glob as fsGlob, lstat, mkdir, open, readFile, readdir, realpath, stat } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
   createEditTool,
   createFindTool,
@@ -23,9 +24,22 @@ import { isConcreteScopePath, type ScopeManifest, type ToolGrant } from "./agent
  * is checked lexically and through real paths to reject absolute/path-traversal
  * and symlink escapes.
  */
-export async function createSandboxedTools(cwd: string, grants: readonly ToolGrant[], scope?: ScopeManifest): Promise<ToolDefinition[]> {
-  const guard = await WorkspaceGuard.create(cwd, scope);
+/** Test-only synchronization; it supplies no filesystem operation or authorization decision. */
+type SandboxMutationTestAdapter = {
+  beforeMutation?: (kind: "file" | "directory", candidate: string) => void | Promise<void>;
+};
+
+export async function createSandboxedTools(
+  cwd: string,
+  grants: readonly ToolGrant[],
+  scope?: ScopeManifest,
+  testAdapter?: SandboxMutationTestAdapter,
+): Promise<ToolDefinition[]> {
+  const guard = await WorkspaceGuard.create(cwd, scope, testAdapter);
   if (grants.includes("bash")) throw new Error("The Pi adapter does not expose unrestricted bash to workflow roles");
+  if ((grants.includes("edit") || grants.includes("write")) && !safeMutationSupportAvailable()) {
+    throw new Error("Sandbox write tools are unavailable: this platform lacks descriptor-relative no-follow filesystem primitives");
+  }
   const tools: ToolDefinition[] = [];
   if (grants.includes("read")) {
     tools.push(createReadTool(cwd, { operations: {
@@ -80,14 +94,14 @@ export async function createSandboxedTools(cwd: string, grants: readonly ToolGra
   if (grants.includes("edit")) {
     tools.push(createEditTool(cwd, { operations: {
       readFile: async (path) => readFile(await guard.existing(path)),
-      writeFile: async (path, content) => writeFile(await guard.writable(path), content, "utf8"),
+      writeFile: async (path, content) => guard.writeFile(path, content),
       access: async (path) => { await access(await guard.existing(path), constants.R_OK | constants.W_OK); },
     } }) as unknown as ToolDefinition);
   }
   if (grants.includes("write")) {
     tools.push(createWriteTool(cwd, { operations: {
-      writeFile: async (path, content) => writeFile(await guard.writable(path), content, "utf8"),
-      mkdir: async (path) => mkdir(await guard.writableDirectory(path), { recursive: true }).then(() => undefined),
+      writeFile: async (path, content) => guard.writeFile(path, content),
+      mkdir: async (path) => guard.makeDirectory(path),
     } }) as unknown as ToolDefinition);
   }
   return tools;
@@ -362,15 +376,16 @@ export class WorkspaceGuard {
     private readonly readRoots: readonly string[],
     private readonly writeRoots: readonly string[],
     private readonly writePaths: readonly string[],
+    private readonly testAdapter?: SandboxMutationTestAdapter,
   ) {}
 
-  static async create(cwd: string, scope?: ScopeManifest): Promise<WorkspaceGuard> {
+  static async create(cwd: string, scope?: ScopeManifest, testAdapter?: SandboxMutationTestAdapter): Promise<WorkspaceGuard> {
     const root = await realpath(resolve(cwd));
     const readRoots = await resolveScopeRoots(root, scope?.readRoots ?? ["."], false);
     const writeRoots = await resolveScopeRoots(root, scope ? scope.writeRoots : ["."], true);
     const writePaths = await resolveScopePaths(root, scope?.writePaths ?? []);
     if (!readRoots.length) throw new Error("Scope manifest contains no existing read roots");
-    return new WorkspaceGuard(root, readRoots, writeRoots, writePaths);
+    return new WorkspaceGuard(root, readRoots, writeRoots, writePaths, testAdapter);
   }
 
   async existing(path: string): Promise<string> {
@@ -381,44 +396,136 @@ export class WorkspaceGuard {
     return resolved;
   }
 
-  async writable(path: string): Promise<string> {
+  /**
+   * Validate and open the file itself. Callers must close the returned handle;
+   * the handle, rather than the lexical name, is the authority used for the write.
+   */
+  async writable(path: string): Promise<FileHandle> {
     const candidate = this.lexical(path);
-    if (this.writePaths.length) this.assertExactlyAllowed(candidate);
-    let parent = dirname(candidate);
-    while (parent !== dirname(parent)) {
-      try {
-        const resolvedParent = await realpath(parent);
-        this.assertInside(resolvedParent);
-        if (!this.writePaths.length) this.assertAllowed(resolvedParent, this.writeRoots, "write");
-        try {
-          const resolvedCandidate = await realpath(candidate);
-          this.assertInside(resolvedCandidate);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        if (!this.writePaths.length) this.assertAllowed(candidate, this.writeRoots, "write");
-        return candidate;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        parent = dirname(parent);
-      }
-    }
-    throw new Error(`Workspace path has no parent inside the worktree: ${path}`);
+    if (candidate === this.root) throw new Error(`Workspace path has no writable file parent: ${path}`);
+    await this.assertWritableCandidate(candidate);
+    assertSafeMutationSupport();
+    await this.beforeMutation("file", candidate);
+    return this.openWritableFile(candidate);
   }
 
-  async writableDirectory(path: string): Promise<string> {
-    if (!this.writePaths.length) return this.writable(path);
+  /**
+   * Validate, open, and if necessary create a directory one component at a
+   * time. The returned handle is bound to the final directory and must be
+   * closed by the caller.
+   */
+  async writableDirectory(path: string): Promise<FileHandle> {
     const candidate = this.lexical(path);
-    if (!this.writePaths.some((writePath) => samePathOrUnder(candidate, writePath))) {
-      throw new Error(`Tool write directory is outside the assigned scope: ${candidate}`);
+    if (this.writePaths.length) {
+      if (!this.writePaths.some((writePath) => samePathOrUnder(candidate, writePath))) {
+        throw new Error(`Tool write directory is outside the assigned scope: ${candidate}`);
+      }
+      const nearest = await existingOrNearest(candidate);
+      this.assertInside(nearest);
+    } else {
+      await this.assertWritableCandidate(candidate);
     }
-    const nearest = await existingOrNearest(candidate);
-    this.assertInside(nearest);
-    return candidate;
+    assertSafeMutationSupport();
+    await this.beforeMutation("directory", candidate);
+    const directory = await this.openDirectory(candidate, true);
+    return directory.handle;
+  }
+
+  async writeFile(path: string, content: string): Promise<void> {
+    const handle = await this.writable(path);
+    try {
+      await handle.truncate(0);
+      await handle.writeFile(content, "utf8");
+    } finally {
+      await closeFileHandle(handle);
+    }
+  }
+
+  async makeDirectory(path: string): Promise<void> {
+    const handle = await this.writableDirectory(path);
+    await closeFileHandle(handle);
   }
 
   async searchRoot(path: string | undefined): Promise<string> {
     return this.existing(path ?? ".");
+  }
+
+  private async beforeMutation(kind: "file" | "directory", candidate: string): Promise<void> {
+    await this.testAdapter?.beforeMutation?.(kind, candidate);
+  }
+
+  private async assertWritableCandidate(candidate: string): Promise<void> {
+    if (this.writePaths.length) this.assertExactlyAllowed(candidate);
+    const nearest = await existingOrNearest(candidate);
+    this.assertInside(nearest);
+    if (!this.writePaths.length) {
+      this.assertAllowed(nearest, this.writeRoots, "write");
+      this.assertAllowed(candidate, this.writeRoots, "write");
+    }
+  }
+
+  private async openWritableFile(candidate: string): Promise<FileHandle> {
+    const parent = await this.openDirectory(dirname(candidate), false);
+    let handle: FileHandle | undefined;
+    try {
+      const target = join(parent.operationPath, basename(candidate));
+      await rejectSymbolicLink(target);
+      handle = await open(target, writableFileFlags(), 0o666);
+      const targetStats = await handle.stat();
+      if (!targetStats.isFile()) throw new Error(`Tool write target is not a regular file: ${candidate}`);
+      return handle;
+    } catch (error) {
+      if (handle) await closeFileHandle(handle);
+      throw error;
+    } finally {
+      await closeFileHandle(parent.handle);
+    }
+  }
+
+  private async openDirectory(candidate: string, createMissing: boolean): Promise<SafeDirectory> {
+    assertSafeMutationSupport();
+    const segments = relative(this.root, candidate) ? relative(this.root, candidate).split(sep) : [];
+    let current: SafeDirectory = {
+      handle: await openDirectoryHandle(this.root),
+      operationPath: "",
+    };
+    let currentLexical = this.root;
+    try {
+      current.operationPath = directoryHandlePath(current.handle);
+      for (const segment of segments) {
+        const lexicalChild = resolve(currentLexical, segment);
+        const operationChild = join(current.operationPath, segment);
+        let next: FileHandle | undefined;
+        try {
+          try {
+            next = await openDirectoryHandle(operationChild);
+          } catch (error) {
+            if (!createMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            try {
+              await mkdir(operationChild, { recursive: false });
+            } catch (mkdirError) {
+              if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+            }
+            next = await openDirectoryHandle(operationChild);
+          }
+          const nextOperationPath = directoryHandlePath(next);
+          await closeFileHandle(current.handle);
+          current = {
+            handle: next,
+            operationPath: nextOperationPath,
+          };
+          next = undefined;
+          currentLexical = lexicalChild;
+        } catch (error) {
+          if (next) await closeFileHandle(next);
+          throw error;
+        }
+      }
+      return current;
+    } catch (error) {
+      await closeFileHandle(current.handle);
+      throw error;
+    }
   }
 
   private lexical(path: string): string {
@@ -442,6 +549,96 @@ export class WorkspaceGuard {
     if (rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return;
     throw new Error(`Tool path escapes the assigned workspace: ${candidate}`);
   }
+}
+
+type SafeDirectory = {
+  handle: FileHandle;
+  operationPath: string;
+};
+
+function writableFileFlags(): number {
+  const noFollow = requiredNoFollowFlag();
+  return constants.O_WRONLY
+    | constants.O_CREAT
+    | noFollow
+    | (constants.O_NONBLOCK ?? 0);
+}
+
+function directoryFlags(): number {
+  const directory = requiredDirectoryFlag();
+  const noFollow = requiredNoFollowFlag();
+  return constants.O_RDONLY
+    | directory
+    | noFollow;
+}
+
+async function openDirectoryHandle(path: string): Promise<FileHandle> {
+  await rejectSymbolicLink(path);
+  const handle = await open(path, directoryFlags());
+  try {
+    if (!(await handle.stat()).isDirectory()) throw new Error(`Tool write path is not a directory: ${path}`);
+    return handle;
+  } catch (error) {
+    await closeFileHandle(handle);
+    throw error;
+  }
+}
+
+async function rejectSymbolicLink(path: string): Promise<void> {
+  try {
+    if ((await lstat(path)).isSymbolicLink()) {
+      throw new Error(`Tool path escapes the assigned workspace through a symbolic link: ${path}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function descriptorPathPrefix(): string | undefined {
+  if (process.platform === "linux") return "/proc/self/fd";
+  if (["aix", "darwin", "freebsd", "openbsd"].includes(process.platform)) return "/dev/fd";
+  return undefined;
+}
+
+export function safeMutationSupportAvailable(): boolean {
+  return descriptorPathPrefix() !== undefined
+    && typeof constants.O_NOFOLLOW === "number" && constants.O_NOFOLLOW !== 0
+    && typeof constants.O_DIRECTORY === "number" && constants.O_DIRECTORY !== 0;
+}
+
+function assertSafeMutationSupport(): void {
+  if (!safeMutationSupportAvailable()) {
+    throw new Error("Sandbox write operations require descriptor-relative no-follow filesystem primitives");
+  }
+}
+
+function requiredNoFollowFlag(): number {
+  const flag = constants.O_NOFOLLOW;
+  if (typeof flag !== "number" || flag === 0) {
+    throw new Error("Sandbox write operations require O_NOFOLLOW");
+  }
+  return flag;
+}
+
+function requiredDirectoryFlag(): number {
+  const flag = constants.O_DIRECTORY;
+  if (typeof flag !== "number" || flag === 0) {
+    throw new Error("Sandbox directory operations require O_DIRECTORY");
+  }
+  return flag;
+}
+
+function directoryHandlePath(handle: FileHandle): string {
+  const prefix = descriptorPathPrefix();
+  if (!prefix) {
+    throw new Error("Sandbox write operations require descriptor-relative directory handles");
+  }
+  return `${prefix}/${handle.fd}`;
+}
+
+async function closeFileHandle(handle: FileHandle): Promise<void> {
+  try { await handle.close(); }
+  catch { /* Preserve the operation's result; the handle is no longer usable. */ }
 }
 
 async function resolveScopeRoots(root: string, roots: readonly string[], allowMissing: boolean): Promise<string[]> {

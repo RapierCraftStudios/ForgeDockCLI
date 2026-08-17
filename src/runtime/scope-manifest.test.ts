@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import { createSandboxedTools, WorkspaceGuard } from "./sandboxed-tools.js";
+import { createSandboxedTools, safeMutationSupportAvailable, WorkspaceGuard } from "./sandboxed-tools.js";
 import { scopeManifestFor, scopeManifestForBuildPacket } from "./agent-runtime.js";
 
 describe("scope manifests", () => {
@@ -21,8 +21,13 @@ describe("scope manifests", () => {
     await assert.rejects(guard.existing("secrets/secret.txt"), /outside the assigned scope/);
     await assert.rejects(guard.writable("secrets/new.txt"), /outside the assigned scope/);
     const packetGuard = await WorkspaceGuard.create(root, { readRoots: ["src"], writeRoots: [], writePaths: ["src/a.ts"], source: "build-packet" });
-    await packetGuard.writable("src/a.ts");
-    await assert.rejects(packetGuard.writable("src/b.ts"), /outside the assigned scope/);
+    if (!safeMutationSupportAvailable()) {
+      await assert.rejects(packetGuard.writable("src/a.ts"), /descriptor-relative no-follow filesystem primitives/);
+    } else {
+      const packetFile = await packetGuard.writable("src/a.ts");
+      await packetFile.close();
+      await assert.rejects(packetGuard.writable("src/b.ts"), /outside the assigned scope/);
+    }
     const tools = await createSandboxedTools(root, ["read"], { readRoots: ["src"], writeRoots: [], source: "build-packet" });
     assert.ok(tools.some((tool) => tool.name === "read"));
     const link = join(root, "src", "outside");
