@@ -21,7 +21,8 @@ describe("scope manifests", () => {
     await assert.rejects(guard.existing("secrets/secret.txt"), /outside the assigned scope/);
     await assert.rejects(guard.writable("secrets/new.txt"), /outside the assigned scope/);
     const packetGuard = await WorkspaceGuard.create(root, { readRoots: ["src"], writeRoots: [], writePaths: ["src/a.ts"], source: "build-packet" });
-    await packetGuard.writable("src/a.ts");
+    const packetFile = await packetGuard.writable("src/a.ts");
+    await packetFile.close();
     await assert.rejects(packetGuard.writable("src/b.ts"), /outside the assigned scope/);
     const tools = await createSandboxedTools(root, ["read"], { readRoots: ["src"], writeRoots: [], source: "build-packet" });
     assert.ok(tools.some((tool) => tool.name === "read"));

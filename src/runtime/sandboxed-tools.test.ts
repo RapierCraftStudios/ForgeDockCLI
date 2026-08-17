@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -86,6 +86,124 @@ describe("runtime workspace confinement", () => {
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses guarded public edit and write operations for existing files, new files, and nested directories", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-public-writes-"));
+    try {
+      writeFileSync(join(root, "existing.txt"), "before\n");
+      const tools = await createSandboxedTools(root, ["edit", "write"]);
+      const edit = tools.find((tool) => tool.name === "edit");
+      const write = tools.find((tool) => tool.name === "write");
+      assert.ok(edit); assert.ok(write);
+      await edit.execute("edit-existing", {
+        path: "existing.txt", edits: [{ oldText: "before", newText: "after" }],
+      }, undefined, undefined, {} as never);
+      assert.equal(readFileSync(join(root, "existing.txt"), "utf8"), "after\n");
+      await write.execute("write-existing", {
+        path: "existing.txt", content: "written\n",
+      }, undefined, undefined, {} as never);
+      assert.equal(readFileSync(join(root, "existing.txt"), "utf8"), "written\n");
+      await write.execute("write-nested", {
+        path: "generated/contracts/host.ts", content: "export const host = true;\n",
+      }, undefined, undefined, {} as never);
+      assert.equal(readFileSync(join(root, "generated", "contracts", "host.ts"), "utf8"), "export const host = true;\n");
+      writeFileSync(join(root, "not-a-directory"), "regular-file\n");
+      await assert.rejects(
+        write.execute("write-wrong-directory", {
+          path: "not-a-directory/nested.txt", content: "must-fail\n",
+        }, undefined, undefined, {} as never),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a static symlink through the public write tool", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "forgedock-public-symlink-"));
+    const root = join(parent, "worktree");
+    const outside = join(parent, "outside.txt");
+    mkdirSync(root);
+    writeFileSync(outside, "outside\n");
+    try {
+      symlinkSync(outside, join(root, "link.txt"), "file");
+      const write = (await createSandboxedTools(root, ["write"])).find((tool) => tool.name === "write");
+      assert.ok(write);
+      await assert.rejects(
+        write.execute("write-static-link", { path: "link.txt", content: "changed\n" }, undefined, undefined, {} as never),
+        /symbolic link|outside the assigned scope|escapes the assigned workspace/,
+      );
+      assert.equal(readFileSync(outside, "utf8"), "outside\n");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for deterministic target, parent, and intermediate-directory swaps", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "forgedock-toctou-"));
+    const root = join(parent, "worktree");
+    const outside = join(parent, "outside");
+    mkdirSync(root); mkdirSync(outside);
+    const writeTool = async (
+      path: string,
+      content: string,
+      beforeMutation: (kind: "file" | "directory", candidate: string) => void,
+    ) => {
+      const write = (await createSandboxedTools(root, ["write"], undefined, { beforeMutation })).find((tool) => tool.name === "write");
+      assert.ok(write);
+      await assert.rejects(
+        write.execute(`race-${path}`, { path, content }, undefined, undefined, {} as never),
+      );
+    };
+    try {
+      const target = join(root, "target.txt");
+      const targetBackup = join(root, "target.original.txt");
+      const outsideTarget = join(outside, "target.txt");
+      writeFileSync(target, "inside\n"); writeFileSync(outsideTarget, "outside-target\n");
+      let targetSwapped = false;
+      await writeTool("target.txt", "attacker-write\n", (kind, candidate) => {
+        if (kind !== "file" || targetSwapped || candidate !== target) return;
+        targetSwapped = true;
+        renameSync(target, targetBackup);
+        symlinkSync(outsideTarget, target, "file");
+      });
+      assert.equal(targetSwapped, true);
+      assert.equal(readFileSync(outsideTarget, "utf8"), "outside-target\n");
+
+      const allowedParent = join(root, "parent");
+      const parentBackup = join(root, "parent.original");
+      const outsideParent = join(outside, "parent");
+      const outsideNew = join(outsideParent, "new.txt");
+      mkdirSync(allowedParent); mkdirSync(outsideParent); writeFileSync(outsideNew, "outside-new\n");
+      let parentSwapped = false;
+      await writeTool("parent/new.txt", "attacker-parent\n", (kind, candidate) => {
+        if (kind !== "file" || parentSwapped || candidate !== join(root, "parent", "new.txt")) return;
+        parentSwapped = true;
+        renameSync(allowedParent, parentBackup);
+        symlinkSync(outsideParent, allowedParent, process.platform === "win32" ? "junction" : "dir");
+      });
+      assert.equal(parentSwapped, true);
+      assert.equal(readFileSync(outsideNew, "utf8"), "outside-new\n");
+
+      const allowedIntermediate = join(root, "intermediate");
+      const intermediateBackup = join(root, "intermediate.original");
+      const outsideIntermediate = join(outside, "intermediate");
+      mkdirSync(allowedIntermediate); mkdirSync(outsideIntermediate);
+      writeFileSync(join(outsideIntermediate, "sentinel.txt"), "outside-directory\n");
+      let intermediateSwapped = false;
+      await writeTool("intermediate/nested/file.txt", "attacker-directory\n", (kind, candidate) => {
+        if (kind !== "directory" || intermediateSwapped || candidate !== join(root, "intermediate", "nested")) return;
+        intermediateSwapped = true;
+        renameSync(allowedIntermediate, intermediateBackup);
+        symlinkSync(outsideIntermediate, allowedIntermediate, process.platform === "win32" ? "junction" : "dir");
+      });
+      assert.equal(intermediateSwapped, true);
+      assert.equal(readFileSync(join(outsideIntermediate, "sentinel.txt"), "utf8"), "outside-directory\n");
+      assert.equal(existsSync(join(outsideIntermediate, "nested", "file.txt")), false);
+      assert.equal(readFileSync(outsideNew, "utf8"), "outside-new\n");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
