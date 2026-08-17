@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { join } from "node:path";
-import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
+import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, observationStreamKey, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
 import { ObservationProjector, type ObservationProjectionSnapshot } from "./projections.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
@@ -34,6 +34,7 @@ export class ForgeDockObserver implements ObservationSink {
   #droppedEvents = 0;
   #droppedInput: ObservationDraft | undefined;
   #dropScheduled = false;
+  #quarantinedStreams = new Set<string>();
   #dropWaiters: Array<{ resolve: (event: ObservationEnvelopeV1) => void; reject: (error: unknown) => void }> = [];
   #closed = false;
 
@@ -52,16 +53,25 @@ export class ForgeDockObserver implements ObservationSink {
 
   emit(input: ObservationDraft): Promise<ObservationEnvelopeV1> {
     if (this.#closed) return Promise.reject(new Error("ForgeDock observer is closed"));
+    const streamKey = input.output ? observationStreamKey(input.identity ?? {}, input.output.channel) : undefined;
     if (this.#pending >= this.#maxQueueDepth) {
       this.#droppedEvents += 1;
-      this.#droppedInput ??= input;
+      if (streamKey) this.#quarantinedStreams.add(streamKey);
+      if (!this.#droppedInput) {
+        const { output: _output, ...withoutOutput } = input;
+        this.#droppedInput = {
+          ...withoutOutput,
+          payload: { reason: "Output payload omitted after observer backpressure" },
+        };
+      }
       const dropped = new Promise<ObservationEnvelopeV1>((resolve, reject) => this.#dropWaiters.push({ resolve, reject }));
       this.scheduleDropMarker();
       return dropped;
     }
     this.#pending += 1;
+    const quarantined = streamKey !== undefined && this.#quarantinedStreams.has(streamKey);
     const draft = normalizeObservationDraft({
-      ...input,
+      ...quarantined ? quarantinedDraft(input) : input,
       producer: input.producer ?? this.#producer,
     }, this.#redaction);
     const result = this.#queue.then(async () => this.appendAndProject(draft)).finally(() => {
@@ -119,6 +129,10 @@ export class ForgeDockObserver implements ObservationSink {
   private appendAndProject(draft: ObservationDraft): Promise<ObservationEnvelopeV1> {
     return this.#store.append(draft).then((event) => {
       this.#projector.apply(event);
+      if (isObservationStreamReset(event.kind)) {
+        this.#quarantinedStreams.delete(observationStreamKey(event.identity, "stdout"));
+        this.#quarantinedStreams.delete(observationStreamKey(event.identity, "stderr"));
+      }
       for (const listener of this.#listeners) {
         try { listener(event); } catch { /* observers cannot break the producer */ }
       }
@@ -158,6 +172,24 @@ export class ForgeDockObserver implements ObservationSink {
       return undefined;
     });
   }
+}
+
+function quarantinedDraft(input: ObservationDraft): ObservationDraft {
+  const text = "[output quarantined after backpressure drop]";
+  const payload = input.payload && typeof input.payload === "object" && !Array.isArray(input.payload)
+    ? { ...(input.payload as Record<string, unknown>), text }
+    : { text };
+  return {
+    ...input,
+    payload,
+    ...(input.output ? { output: { ...input.output, text } } : {}),
+    delivery: { ...(input.delivery ?? {}), truncated: true },
+    security: { ...(input.security ?? {}), redacted: true },
+  };
+}
+
+function isObservationStreamReset(kind: string): boolean {
+  return /(?:session\.(?:completed|failed|cancelled)|process\.(?:exited|failed)|controller\.(?:completed|failed))$/i.test(kind);
 }
 
 function isObservationLayoutStore(store: ObservationStore): store is ObservationStore & ObservationLayoutStore {

@@ -1,42 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AgentEvent, AgentEventSink } from "../runtime/agent-runtime.js";
-import { createObservationProducer, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity, type StreamingObservationText } from "./contracts.js";
 
 export interface ObservationAdapterContext {
   identity?: ObservationIdentity;
+  /** Mutable identity holder so refreshes do not recreate stream state. */
+  identityRef?: { current: ObservationIdentity };
   producer?: ReturnType<typeof createObservationProducer>;
 }
 
 export function createAgentEventObservationSink(observer: ObservationSink, context: ObservationAdapterContext = {}): AgentEventSink {
   let outputSequence = 0;
   const producer = context.producer ?? createObservationProducer("agent-runtime");
+  const streams = new Map<string, StreamingObservationText>();
+  const identityFor = (event: AgentEvent): ObservationIdentity => ({
+    ...(context.identityRef?.current ?? context.identity ?? {}),
+    agentTaskId: event.taskId,
+    ...(event.observability?.activeChild ? { parentAgentId: event.observability.activeChild } : {}),
+  });
+  const streamKey = (event: AgentEvent): string => `${event.taskId}:stdout`;
+  const emitOutput = (event: AgentEvent, text: string): void => {
+    if (!text) return;
+    outputSequence += 1;
+    const identity = identityFor(event);
+    void observer.emit({
+      producer,
+      identity,
+      source: "agent",
+      channel: "activity",
+      kind: "output.delta",
+      payload: { summary: "Assistant output", text },
+      output: { channel: "stdout", text, chunkSequence: outputSequence },
+    });
+  };
+  const flush = (event: AgentEvent): void => {
+    const key = streamKey(event);
+    const stream = streams.get(key);
+    if (!stream) return;
+    emitOutput(event, stream.finish());
+    streams.delete(key);
+  };
   return (event: AgentEvent) => {
-    const identity: ObservationIdentity = {
-      ...(context.identity ?? {}),
-      agentTaskId: event.taskId,
-      ...(event.observability?.activeChild ? { parentAgentId: event.observability.activeChild } : {}),
-    };
+    const identity = identityFor(event);
     const base = {
       producer,
       identity,
       source: "agent" as const,
     };
     if (event.type === "thinking.delta") {
+      flush(event);
       void observer.emit({ ...base, channel: "activity", kind: "activity.changed", severity: "debug", payload: { activity: "thinking", summary: "Model activity" } });
       return;
     }
     if (event.type === "text.delta") {
-      outputSequence += 1;
-      void observer.emit({
-        ...base,
-        channel: "activity",
-        kind: "output.delta",
-        payload: { summary: "Assistant output", text: event.text },
-        output: { channel: "stdout", text: event.text, chunkSequence: outputSequence },
-      });
+      const key = streamKey(event);
+      const stream = streams.get(key) ?? createStreamingObservationText();
+      streams.set(key, stream);
+      emitOutput(event, stream.push(event.text));
       return;
     }
+    flush(event);
     if (event.type === "session.started") {
       void observer.emit({ ...base, identity: { ...identity, piSessionRef: event.sessionRef }, channel: "lifecycle", kind: "agent.session.started", payload: { provider: event.provider, model: event.model, ...observabilityPayload(event) } });
       return;

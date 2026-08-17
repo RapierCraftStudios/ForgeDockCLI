@@ -306,6 +306,69 @@ export const ReviewPlanSchema = Type.Object({
   })),
 });
 
+const ReviewFindingProjectionEntrySchema = Type.Object({
+  findingId: NonEmptyString,
+  status: Type.Union([
+    Type.Literal("pending"),
+    Type.Literal("materialized"),
+    Type.Literal("adopted"),
+    Type.Literal("projection-drift"),
+    Type.Literal("suppressed"),
+  ]),
+  marker: Type.Optional(NonEmptyString),
+  issueNumber: Type.Optional(Type.Integer({ minimum: 1 })),
+  issueUrl: Type.Optional(Type.String()),
+  mismatches: Type.Optional(Type.Array(NonEmptyString)),
+});
+
+/**
+ * Durable checkpoint for the non-atomic review-finding -> GitHub projection.
+ * The plan contains the complete consolidated findings so a restart can
+ * reconcile GitHub without invoking another reviewer/model wave.
+ */
+export const ReviewFindingProjectionPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("review-finding-publication"),
+  status: Type.Union([Type.Literal("planned"), Type.Literal("completed")]),
+  pullRequest: Type.Integer({ minimum: 1 }),
+  headSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  disposition: Type.Union([
+    Type.Literal("approve"),
+    Type.Literal("request_changes"),
+    Type.Literal("blocked"),
+  ]),
+  reviewerRoles: Type.Array(NonEmptyString, { minItems: 1 }),
+  findings: Type.Array(FindingSchema),
+  checks: Type.Array(CheckResultSchema),
+  reviewPlan: Type.Optional(ReviewPlanSchema),
+  scopeAdjudication: Type.Optional(Type.Object({
+    sessionRef: NonEmptyString,
+    decisions: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      disposition: Type.Union([Type.Literal("accept"), Type.Literal("follow_up"), Type.Literal("reject")]),
+      rationale: NonEmptyString,
+    })),
+  })),
+  findingProjection: Type.Object({
+    policy: Type.Union([
+      Type.Literal("all"),
+      Type.Literal("approved-only"),
+      Type.Literal("none"),
+      Type.Literal("impact-gated"),
+      Type.Literal("shadow-impact-gated"),
+    ]),
+    candidateFindingIds: Type.Array(NonEmptyString),
+    materializedFindingIds: Type.Array(NonEmptyString),
+    suppressed: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      reason: NonEmptyString,
+    })),
+  }),
+  projections: Type.Array(ReviewFindingProjectionEntrySchema),
+  supersedes: Type.Optional(NonEmptyString),
+});
+
 export const ReviewVerdictPayloadSchema = Type.Object({
   headSha: Sha,
   headBranch: Type.Optional(NonEmptyString),
@@ -346,6 +409,7 @@ export const ReviewVerdictPayloadSchema = Type.Object({
       findingId: NonEmptyString,
       reason: NonEmptyString,
     })),
+    projections: Type.Optional(Type.Array(ReviewFindingProjectionEntrySchema)),
   })),
   supersedes: Type.Optional(NonEmptyString),
 });
@@ -460,6 +524,7 @@ export const ArtifactPayloadSchemas = {
   BuildPacket: BuildPacketPayloadSchema,
   BuildResult: BuildResultPayloadSchema,
   ReviewVerdict: ReviewVerdictPayloadSchema,
+  ReviewFindingProjection: ReviewFindingProjectionPayloadSchema,
   Outcome: OutcomePayloadSchema,
   VerificationAdjudication: VerificationAdjudicationPayloadSchema,
   RemediationBlocked: RemediationBlockedPayloadSchema,
@@ -476,6 +541,7 @@ export type ControllerVerificationGate = Static<typeof ControllerVerificationGat
 export type VerificationRequirement = Static<typeof VerificationRequirementSchema>;
 export type BuildResultPayload = Static<typeof BuildResultPayloadSchema>;
 export type ReviewVerdictPayload = Static<typeof ReviewVerdictPayloadSchema>;
+export type ReviewFindingProjectionPayload = Static<typeof ReviewFindingProjectionPayloadSchema>;
 export type OutcomePayload = Static<typeof OutcomePayloadSchema>;
 export type VerificationAdjudicationPayload = Static<typeof VerificationAdjudicationPayloadSchema>;
 export type RemediationBlockedPayload = Static<typeof RemediationBlockedPayloadSchema>;
@@ -486,6 +552,7 @@ export interface ArtifactPayloadByKind {
   BuildPacket: BuildPacketPayload;
   BuildResult: BuildResultPayload;
   ReviewVerdict: ReviewVerdictPayload;
+  ReviewFindingProjection: ReviewFindingProjectionPayload;
   Outcome: OutcomePayload;
   VerificationAdjudication: VerificationAdjudicationPayload;
   RemediationBlocked: RemediationBlockedPayload;

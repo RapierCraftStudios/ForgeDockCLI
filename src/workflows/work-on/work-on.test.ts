@@ -1380,7 +1380,7 @@ describe("complete work-on trajectory", () => {
     assert.equal(host.issueClosed, true);
     assert.equal(git.removed, true);
     assert.deepEqual(artifacts.artifacts.map((artifact) => artifact.kind), [
-      "Intent", "Investigation", "BuildPacket", "BuildResult", "ReviewVerdict", "Outcome",
+      "Intent", "Investigation", "BuildPacket", "BuildResult", "ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict", "Outcome",
     ]);
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "reviewer"]);
     assert.equal(new Set(runtime.tasks.map((task) => task.id)).size, 4);

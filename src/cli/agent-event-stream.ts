@@ -2,7 +2,7 @@
 
 import type { AgentEvent } from "../runtime/agent-runtime.js";
 import { createAgentEventObservationSink } from "../observability/adapters.js";
-import { sanitizeTerminalText, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
+import { createStreamingObservationText, sanitizeTerminalText, type ObservationIdentity, type ObservationSink, type StreamingObservationText } from "../observability/contracts.js";
 import { statusGlyph, type ColorMode } from "../tui/brand.js";
 
 const TOOL_ARG_KEYS = ["path", "file_path", "pattern", "query", "glob", "command", "offset", "limit"] as const;
@@ -13,18 +13,20 @@ export type AgentEventWrite = (text: string) => void;
 let agentObservationSink: ((event: AgentEvent) => void) | undefined;
 let agentObservationObserver: ObservationSink | undefined;
 let agentObservationIdentity: ObservationIdentity = {};
+let agentObservationIdentityRef: { current: ObservationIdentity } | undefined;
 
 export function setAgentEventObservationSink(observer: ObservationSink | undefined, identity: ObservationIdentity = {}): void {
   agentObservationObserver = observer;
   agentObservationIdentity = { ...identity };
-  agentObservationSink = observer ? createAgentEventObservationSink(observer, { identity: agentObservationIdentity }) : undefined;
+  agentObservationIdentityRef = observer ? { current: agentObservationIdentity } : undefined;
+  agentObservationSink = observer && agentObservationIdentityRef
+    ? createAgentEventObservationSink(observer, { identityRef: agentObservationIdentityRef })
+    : undefined;
 }
 
 export function setAgentEventObservationIdentity(identity: ObservationIdentity): void {
   agentObservationIdentity = { ...identity };
-  agentObservationSink = agentObservationObserver
-    ? createAgentEventObservationSink(agentObservationObserver, { identity: agentObservationIdentity })
-    : undefined;
+  if (agentObservationIdentityRef) agentObservationIdentityRef.current = agentObservationIdentity;
 }
 
 export function observeAgentEvent(event: AgentEvent): void {
@@ -40,7 +42,7 @@ export function observeAgentEvent(event: AgentEvent): void {
 export class AgentEventStreamWriter {
   readonly #write: AgentEventWrite;
   readonly #mode: ColorMode;
-  #stream: { task: string; kind: "assistant"; lineOpen: boolean } | undefined;
+  #stream: { task: string; kind: "assistant"; lineOpen: boolean; sanitizer: StreamingObservationText } | undefined;
 
   constructor(write: AgentEventWrite, mode: ColorMode) {
     this.#write = write;
@@ -92,10 +94,15 @@ export class AgentEventStreamWriter {
     if (!this.#stream || this.#stream.task !== task || this.#stream.kind !== kind) {
       this.finishDelta();
       this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${kind}\n`);
-      this.#stream = { task, kind, lineOpen: false };
+      this.#stream = { task, kind, lineOpen: false, sanitizer: createStreamingObservationText() };
     }
 
-    const text = sanitizeTerminalText(rawText).replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const text = this.#stream.sanitizer.push(rawText).replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    this.renderText(text);
+  }
+
+  private renderText(text: string): void {
+    if (!this.#stream) return;
     for (const part of text.split(/(\n)/)) {
       if (!part) continue;
       if (part === "\n") {
@@ -113,7 +120,10 @@ export class AgentEventStreamWriter {
   }
 
   private finishDelta(): void {
-    if (this.#stream?.lineOpen) this.#write("\n");
+    const stream = this.#stream;
+    if (!stream) return;
+    this.renderText(stream.sanitizer.finish());
+    if (stream.lineOpen) this.#write("\n");
     this.#stream = undefined;
   }
 }
