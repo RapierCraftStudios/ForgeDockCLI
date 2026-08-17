@@ -182,7 +182,10 @@ jobs:
             local error
             local -a npm_args
 
-            npm_args=(show "$package_spec" version --silent "--registry=$registry")
+            # Keep npm's explicit 404 diagnostic available. With --silent, npm
+            # suppresses the only response that lets this gate distinguish an
+            # unclaimed new package from an auth, network, or registry failure.
+            npm_args=(show "$package_spec" version "--registry=$registry")
             if [ -n "$userconfig" ]; then
               npm_args+=(--userconfig "$userconfig")
             fi
