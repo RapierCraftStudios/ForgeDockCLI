@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
+import { FORGEDOCK_VERIFICATION_PATH, sealVerificationEnvironment } from "../../runtime/controller-environment.js";
 import { ProcessVerificationRunner, windowsTaskkillSucceeded } from "./process-verifier.js";
 
 describe("deterministic process verification", () => {
@@ -25,6 +26,32 @@ describe("deterministic process verification", () => {
     assert.equal(result?.exitCode, 0);
     assert.match(result?.outputDigest ?? "", /^[0-9a-f]{64}$/);
     assert.match(result?.summary ?? "", /verified/);
+  });
+
+  it("resolves a bare command from the sealed PATH after a sparse descendant boundary", async () => {
+    if (process.platform === "win32") return;
+    const source: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: dirname(process.execPath),
+    };
+    for (const name of Object.keys(source)) {
+      if (name.toLowerCase() === FORGEDOCK_VERIFICATION_PATH.toLowerCase()) delete source[name];
+    }
+    const parent = sealVerificationEnvironment(source);
+    const sealedPath = parent[FORGEDOCK_VERIFICATION_PATH];
+    assert.ok(sealedPath);
+    const descendant: NodeJS.ProcessEnv = {
+      ...parent,
+      PATH: join(tmpdir(), `forgedock-runner-sparse-${process.pid}-${randomUUID()}`),
+    };
+    assert.equal(descendant[FORGEDOCK_VERIFICATION_PATH], sealedPath);
+    const [result] = await isolatedRunner(descendant).run([{
+      id: "sealed-bare-node", command: basename(process.execPath),
+      args: ["-e", "console.log('sealed runner')"],
+      cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.equal(result?.status, "passed");
+    assert.match(result?.summary ?? "", /sealed runner/);
   });
 
   it("executes every required command even when coverage metadata is present", async () => {

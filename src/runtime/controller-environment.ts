@@ -44,14 +44,20 @@ export function verificationEnvironment(environment: NodeJS.ProcessEnv = process
   for (const name of Object.keys(clean)) {
     if (isSensitiveVerificationVariable(name, clean[name])) delete clean[name];
   }
-  if (process.platform !== "win32") return isolateVerificationHome(clean);
+  const sealedEntries = pathEntries(environmentValue(clean, FORGEDOCK_VERIFICATION_PATH));
+  if (process.platform !== "win32") {
+    if (sealedEntries.length) {
+      const inheritedEntries = pathEntries(environmentValue(clean, "PATH"));
+      setEnvironmentValue(clean, "PATH", uniquePathEntries([...sealedEntries, ...inheritedEntries]).join(delimiter));
+    }
+    return isolateVerificationHome(clean);
+  }
 
   const gitRoot = discoverGitForWindowsRoot(clean);
   const userHome = environmentValue(clean, "USERPROFILE") ?? homedir();
   const programFiles = environmentValue(clean, "ProgramFiles");
   const programData = environmentValue(clean, "ProgramData") ?? environmentValue(clean, "ALLUSERSPROFILE");
   const localAppData = environmentValue(clean, "LOCALAPPDATA");
-  const sealedEntries = pathEntries(environmentValue(clean, FORGEDOCK_VERIFICATION_PATH));
   const discoveredCandidates = [
     gitRoot && join(gitRoot, "usr", "bin"),
     gitRoot && join(gitRoot, "mingw64", "bin"),

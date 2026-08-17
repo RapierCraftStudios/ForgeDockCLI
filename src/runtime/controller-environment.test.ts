@@ -3,8 +3,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { controllerEnvironment, FORGEDOCK_VERIFICATION_PATH, isAgentTransportVariable, sealVerificationEnvironment, verificationEnvironment } from "./controller-environment.js";
 
@@ -98,6 +98,64 @@ describe("controller environment boundary", () => {
     assert.equal(environment.FORGEDOCK_GIT_BASH, join(entries[0] ?? "", "bash.exe"));
     assert.equal(environment.MSYSTEM, "MINGW64", "cmd/PowerShell launches receive the Git-for-Windows identity marker");
     if (existsSync(join(homedir(), "bin"))) assert.ok(entries.includes(join(homedir(), "bin")));
+  });
+
+  it("reconstructs one sealed toolchain across a sparse-PATH Unix descendant", () => {
+    if (process.platform === "win32") return;
+    const sealedEntry = dirname(process.execPath);
+    const inheritedEntry = join(tmpdir(), `forgedock-inherited-path-${process.pid}`);
+    const source: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: [sealedEntry, inheritedEntry].join(delimiter),
+    };
+    for (const name of Object.keys(source)) {
+      if (name.toLowerCase() === FORGEDOCK_VERIFICATION_PATH.toLowerCase()) delete source[name];
+    }
+    const parent = sealVerificationEnvironment(source);
+    let repeated = parent;
+    for (let boundary = 0; boundary < 8; boundary++) repeated = sealVerificationEnvironment(repeated);
+    assert.equal(repeated.PATH, parent.PATH, "sealing must be idempotent across process boundaries");
+    assert.equal(repeated[FORGEDOCK_VERIFICATION_PATH], parent[FORGEDOCK_VERIFICATION_PATH]);
+    const sealedPath = parent[FORGEDOCK_VERIFICATION_PATH];
+    assert.ok(sealedPath);
+    assert.equal(parent.PATH, sealedPath);
+    const parentEntries = (parent.PATH ?? "").split(delimiter);
+    assert.deepEqual(parentEntries, [sealedEntry, inheritedEntry]);
+    assert.equal(new Set(parentEntries).size, parentEntries.length);
+
+    const sparseEntry = join(tmpdir(), `forgedock-sparse-path-${process.pid}`);
+    const sparsePath = [sparseEntry, sparseEntry].join(delimiter);
+    const descendant = verificationEnvironment({ ...parent, PATH: sparsePath });
+    const descendantEntries = (descendant.PATH ?? "").split(delimiter);
+    assert.equal(descendant[FORGEDOCK_VERIFICATION_PATH], sealedPath);
+    assert.deepEqual(descendantEntries.slice(0, parentEntries.length), parentEntries);
+    assert.deepEqual(descendantEntries.slice(parentEntries.length), [sparseEntry]);
+    assert.equal(new Set(descendantEntries).size, descendantEntries.length);
+    assert.equal(descendant.PATH, [...parentEntries, sparseEntry].join(delimiter));
+
+    const resealed = sealVerificationEnvironment({ ...parent, PATH: sparsePath });
+    assert.equal(resealed.PATH, parent.PATH, "re-sealing must retain the valid sealed PATH");
+    assert.equal(resealed[FORGEDOCK_VERIFICATION_PATH], sealedPath);
+
+    const probe = spawnSync(basename(process.execPath), ["-e", "process.stdout.write('sealed-node')"], {
+      env: descendant, encoding: "utf8", windowsHide: true,
+    });
+    assert.equal(probe.status, 0, probe.stderr || probe.error?.message);
+    assert.equal(probe.stdout, "sealed-node");
+  });
+
+  it("preserves a supplied PATH when no Unix sealed manifest exists", () => {
+    if (process.platform === "win32") return;
+    const suppliedPath = [
+      join(tmpdir(), `forgedock-no-manifest-a-${process.pid}`),
+      join(tmpdir(), `forgedock-no-manifest-b-${process.pid}`),
+    ].join(delimiter);
+    const source: NodeJS.ProcessEnv = { ...process.env, PATH: suppliedPath };
+    for (const name of Object.keys(source)) {
+      if (name.toLowerCase() === FORGEDOCK_VERIFICATION_PATH.toLowerCase()) delete source[name];
+    }
+    const environment = verificationEnvironment(source);
+    assert.equal(environment.PATH, suppliedPath);
   });
 
   it("reconstructs one sealed toolchain across a sparse-PATH verification descendant", () => {
