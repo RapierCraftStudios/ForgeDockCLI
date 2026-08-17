@@ -331,7 +331,23 @@ jobs:
           # irreversible at this point, so failure must be explicit and a later
           # run's independent registry reconciliation must retry only a missing
           # publication before finalizing the same version.
+          reset_generated_worktree() {
+            # npm test/build hydrate and patch the checked-out Pi submodule.
+            # Those changes are disposable CI outputs, but a dirty submodule
+            # prevents git rebase from reconciling the metadata commit after
+            # publication. Clean before every rebase attempt, including retries
+            # after a raced push.
+            git reset --hard HEAD
+            git submodule foreach --recursive 'git reset --hard && git clean -fdx'
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "Generated release worktree is still dirty; refusing to publish metadata" >&2
+              git status --short >&2
+              return 1
+            fi
+          }
+
           for attempt in 1 2 3; do
+            reset_generated_worktree
             git fetch origin main
             if ! git rebase origin/main; then
               git rebase --abort || true
