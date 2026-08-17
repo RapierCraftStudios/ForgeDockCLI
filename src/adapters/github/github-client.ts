@@ -373,6 +373,7 @@ export class GitHubClient implements ForgeHost {
   async materializeReviewFinding(input: ReviewFindingMaterializationInput): Promise<IssueSnapshot> {
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
+    const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
     const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
     const admissionKey: RemediationAdmissionKey = {
       repo: input.repo,
@@ -383,7 +384,7 @@ export class GitHubClient implements ForgeHost {
     };
     const claim = await this.remediationAdmissions.claim(admissionKey);
     const isAuthoritativeProjection = (issue: IssueSnapshot): boolean => issue.state === "OPEN"
-      && hasCanonicalMarker(issue.body, marker);
+      && (hasCanonicalMarker(issue.body, marker) || hasCanonicalMarker(issue.body, semanticMarker));
     if (claim.status === "materialized") {
       const authoritative = await this.authoritativeIssueSnapshot(claim.snapshot);
       if (authoritative.state !== "OPEN") {
@@ -391,26 +392,28 @@ export class GitHubClient implements ForgeHost {
         if (!invalidated) throw new RemediationMaterializationPendingError(marker);
         return this.materializeReviewFinding(input);
       }
-      if (!hasCanonicalMarker(authoritative.body, marker)) {
-        throw new Error(`Cached review-finding issue #${authoritative.number} lost its canonical root marker`);
+      if (!isAuthoritativeProjection(authoritative)) {
+        throw new Error(`Cached review-finding issue #${authoritative.number} lost its canonical identity markers`);
       }
-      return this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+      await this.remediationAdmissions.complete(admissionKey, refreshed);
+      return refreshed;
     }
     const existingIssues = await this.listAllIssues(input.repo);
     const existing = existingIssues.find((issue) => isAuthoritativeProjection(issue));
     if (existing) {
       const authoritative = await this.authoritativeIssueSnapshot(existing);
       if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${existing.number} changed during adoption`);
-      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, "adopted");
       await this.remediationAdmissions.complete(admissionKey, refreshed);
       return refreshed;
     }
     if (claim.status !== "claimed") {
-      const visible = await this.reconcileReviewFindingMarker(input.repo, [marker]);
+      const visible = await this.reconcileReviewFindingMarker(input.repo, [marker, semanticMarker]);
       if (visible) {
         const authoritative = await this.authoritativeIssueSnapshot(visible);
         if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${visible.number} changed during reconciliation`);
-        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
+        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, "adopted");
         await this.remediationAdmissions.complete(admissionKey, refreshed);
         return refreshed;
       }
@@ -434,12 +437,18 @@ export class GitHubClient implements ForgeHost {
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
     const authoritative = await this.authoritativeIssueSnapshot({ repo: input.repo, number, title, body, url, state: "OPEN" });
-    const projectionMismatches = reviewFindingProjectionMismatches(authoritative, { title, body, marker, priority, milestoneTitle });
-    if (projectionMismatches.length) {
-      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation: ${projectionMismatches.join(", ")}`);
+    const projectionMismatches = reviewFindingProjectionMismatches(authoritative, { title, body, marker, semanticMarker, priority, milestoneTitle });
+    const semanticMismatches = semanticReviewFindingProjectionMismatches(projectionMismatches);
+    if (semanticMismatches.length) {
+      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation: ${semanticMismatches.join(", ")}`);
     }
-    await this.remediationAdmissions.complete(admissionKey, authoritative);
-    return authoritative;
+    const result = withReviewFindingProjection(authoritative, {
+      status: projectionMismatches.length ? "projection-drift" : "materialized",
+      marker,
+      ...(projectionMismatches.length ? { mismatches: projectionMismatches } : {}),
+    });
+    await this.remediationAdmissions.complete(admissionKey, result);
+    return result;
   }
 
   private async refreshReviewFindingProjection(
@@ -447,13 +456,15 @@ export class GitHubClient implements ForgeHost {
     issue: IssueSnapshot,
     marker: string,
     laneMarker: string,
+    adoptionStatus: "materialized" | "adopted" = "materialized",
   ): Promise<IssueSnapshot> {
     await this.publishReviewFindingRecurrence(input, issue, marker);
     const priority = reviewFindingPriority(input.finding.severity);
     const milestoneTitle = await this.resolveReviewFindingMilestone(input);
+    const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
     const { title, body } = renderReviewFindingIssue(input, marker, laneMarker, priority);
     const currentPriorityLabels = (issue.labels ?? []).filter((label) => /^priority:P[0-3]$/.test(label));
-    const expected = { title, body, marker, priority, milestoneTitle };
+    const expected = { title, body, marker, semanticMarker, priority, milestoneTitle };
 
     let authoritative = issue;
     if (!isCurrentReviewFindingProjection(issue, expected)) {
@@ -470,10 +481,15 @@ export class GitHubClient implements ForgeHost {
     }
 
     const projectionMismatches = reviewFindingProjectionMismatches(authoritative, expected);
-    if (projectionMismatches.length) {
-      throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh: ${projectionMismatches.join(", ")}`);
+    const semanticMismatches = semanticReviewFindingProjectionMismatches(projectionMismatches);
+    if (semanticMismatches.length) {
+      throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh: ${semanticMismatches.join(", ")}`);
     }
-    return authoritative;
+    return withReviewFindingProjection(authoritative, {
+      status: projectionMismatches.length ? "projection-drift" : adoptionStatus,
+      marker,
+      ...(projectionMismatches.length ? { mismatches: projectionMismatches } : {}),
+    });
   }
 
   private async publishReviewFindingRecurrence(
@@ -1373,10 +1389,11 @@ export function reviewFindingReconciliationCandidates(
   const activeMarkerOwners = new Map<string, string>();
   for (const finding of input.activeFindings) {
     activeMarkerOwners.set(reviewFindingMarker(input.repo, input.pullRequest.number, finding), finding.id);
+    activeMarkerOwners.set(reviewFindingSemanticMarker(input.repo, input.pullRequest.number, finding), finding.id);
   }
   const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
   const sourceMarker = `**Source:** PR #${input.pullRequest.number} `;
-  const markerPattern = /<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->/;
+  const markerPattern = /<!-- FORGEDOCK:REVIEW-FINDING(?:-IDENTITY v1)? [a-f0-9]{64} -->/;
   const laneIssues = issues
     .filter((issue) => issue.state === "OPEN" && hasCanonicalLinePrefix(issue.body, sourceMarker)
       && hasCanonicalMarker(issue.body, laneMarker) && findCanonicalMarker(issue.body, markerPattern) !== undefined)
@@ -1398,6 +1415,12 @@ export function reviewFindingLaneMarker(repo: string, pullRequest: number): stri
 
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
   return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${reviewFindingIdentity(repo, pullRequest, finding)}\n${finding.id.trim()}`).digest("hex")} -->`;
+}
+
+export function reviewFindingSemanticMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  const root = finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || [finding.location ?? "", finding.title].join("\n");
+  const identity = [repo.trim().toLowerCase(), String(pullRequest), root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n");
+  return `<!-- FORGEDOCK:REVIEW-FINDING-IDENTITY v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
 }
 
 function reviewFindingIdentity(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
@@ -1472,6 +1495,7 @@ function renderReviewFindingIssue(
     ...(priority === "priority:P3" && !sensitive ? ["", "<!-- FORGE:BATCHABLE -->"] : []),
     "",
     marker,
+    reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding),
     laneMarker,
   ].join("\n");
   return { title, body };
@@ -1483,6 +1507,7 @@ function isCurrentReviewFindingProjection(
     title: string;
     body: string;
     marker: string;
+    semanticMarker: string;
     priority: "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3";
     milestoneTitle: string | undefined;
   },
@@ -1496,6 +1521,7 @@ function reviewFindingProjectionMismatches(
     title: string;
     body: string;
     marker: string;
+    semanticMarker: string;
     priority: "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3";
     milestoneTitle: string | undefined;
   },
@@ -1512,6 +1538,7 @@ function reviewFindingProjectionMismatches(
     mismatches.push(`body-diff-at:${firstDifferenceIndex(authoritativeBody, expectedBody)}`);
   }
   if (!hasCanonicalMarker(issue.body, expected.marker)) mismatches.push("root-marker");
+  if (!hasCanonicalMarker(issue.body, expected.semanticMarker)) mismatches.push("semantic-marker");
   if (reviewedShaFromFindingBody(issue.body) === undefined) mismatches.push("reviewed-sha");
   const missingLabels = ["review-finding", "needs-validation", expected.priority].filter((label) => !labels.includes(label));
   if (missingLabels.length) mismatches.push(`missing-labels:${missingLabels.join("|")}`);
@@ -1524,6 +1551,17 @@ function reviewFindingProjectionMismatches(
     mismatches.push("unexpected-milestone");
   }
   return mismatches;
+}
+
+function semanticReviewFindingProjectionMismatches(mismatches: readonly string[]): string[] {
+  return mismatches.filter((mismatch) => mismatch !== "title" && !mismatch.startsWith("body-"));
+}
+
+function withReviewFindingProjection(
+  issue: IssueSnapshot,
+  projection: NonNullable<IssueSnapshot["projection"]>,
+): IssueSnapshot {
+  return { ...issue, projection };
 }
 
 /** GitHub stores issue bodies with normalized LF line endings. Preserve strict

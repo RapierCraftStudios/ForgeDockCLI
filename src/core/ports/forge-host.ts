@@ -14,6 +14,12 @@ export interface IssueSnapshot {
   state: "OPEN" | "CLOSED";
   labels?: readonly string[];
   milestone?: IssueMilestone;
+  /** Controller-only receipt metadata; never required in GitHub snapshots. */
+  projection?: {
+    status: "materialized" | "adopted" | "projection-drift";
+    marker?: string;
+    mismatches?: readonly string[];
+  };
 }
 
 export interface BranchSnapshot {

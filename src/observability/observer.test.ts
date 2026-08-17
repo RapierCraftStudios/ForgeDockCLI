@@ -5,9 +5,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, sanitizeTerminalText } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, sanitizeTerminalText } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -127,6 +128,23 @@ test("agent adapter preserves failed and cancelled terminal semantics", async ()
   observer.close();
 });
 
+test("agent identity refresh does not reset streaming redaction state", async () => {
+  const observer = observerWithStore();
+  setAgentEventObservationSink(observer, { forgeRunId: "run-refresh" });
+  observeAgentEvent({ type: "text.delta", taskId: "agent-refresh", text: "Bearer split" });
+  setAgentEventObservationIdentity({ forgeRunId: "run-refresh", workUnitId: "unit-refresh" });
+  observeAgentEvent({ type: "text.delta", taskId: "agent-refresh", text: "-secret-value" });
+  observeAgentEvent({ type: "session.completed", taskId: "agent-refresh", sessionRef: "pi-refresh" });
+  await observer.flush();
+  const events = await observer.query({ forgeRunId: "run-refresh" });
+  const output = events.find((event) => event.kind === "output.delta");
+  assert.ok(output);
+  assert.equal(output.identity.workUnitId, "unit-refresh");
+  assert.doesNotMatch(JSON.stringify(output), /split-secret-value/);
+  setAgentEventObservationSink(undefined);
+  observer.close();
+});
+
 test("workspace layouts survive observer restart in the operational journal", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-layout-test-"));
   const path = join(root, "observations.db");
@@ -144,6 +162,78 @@ test("workspace layouts survive observer restart in the operational journal", as
 test("terminal sanitization removes executable control sequences while preserving text", () => {
   const value = sanitizeTerminalText("\u001b]8;;https://example.test\u0007visible\u001b]8;;\u0007\u001b[31m warning");
   assert.equal(value, "visible warning");
+});
+
+test("streaming sanitizer carries split terminal and credential state across chunks", () => {
+  const stream = createStreamingObservationText();
+  const output = [
+    stream.push("before \u001b]8;;https://example.test"),
+    stream.push("\u0007visible bearer supe"),
+    stream.push("r-secret-value\u001b[31m after"),
+    stream.finish(),
+  ].join("");
+  assert.match(output, /before visible/);
+  assert.match(output, /\[REDACTED\]/);
+  assert.match(output, /after/);
+  assert.doesNotMatch(output, /super-secret-value/);
+  assert.doesNotMatch(output, /https:\/\/example\.test/);
+});
+
+test("streaming sanitizer retains a long split token until its delimiter", () => {
+  const stream = createStreamingObservationText();
+  const output = [
+    stream.push("Bearer abcdefgh"),
+    stream.push("ijklmnopqrstuvwxyz"),
+    stream.push(" after"),
+    stream.finish(),
+  ].join("");
+  assert.match(output, /\[REDACTED\] after/);
+  assert.doesNotMatch(output, /abcdefgh|ijklmnopqrstuvwxyz/);
+});
+
+test("streaming sanitizer retains a split private-key body until the closing delimiter", () => {
+  const stream = createStreamingObservationText();
+  const output = [
+    stream.push("-----BEGIN RSA PRIVATE KEY-----\\nMIIE"),
+    stream.push("private-body-fragment"),
+    stream.push("\\n-----END RSA PRIVATE KEY----- after"),
+    stream.finish(),
+  ].join("");
+  assert.match(output, /\[REDACTED\] after/);
+  assert.doesNotMatch(output, /private-body-fragment|MIIE/);
+});
+
+test("streaming sanitizer quarantines an unbounded secret candidate", () => {
+  const stream = createStreamingObservationText();
+  assert.equal(stream.push(`Bearer ${"a".repeat(8)}`), "");
+  assert.equal(stream.push("b".repeat(16 * 1024)), "");
+  assert.equal(stream.quarantined, true);
+  assert.equal(stream.push("tail-must-not-escape"), "");
+  assert.equal(stream.finish(), "");
+});
+
+test("streaming sanitizer fails closed after a dropped chunk until reset", () => {
+  const stream = createStreamingObservationText();
+  stream.push("safe output");
+  stream.markDropped();
+  assert.equal(stream.push("credential=should-not-escape"), "");
+  assert.equal(stream.finish(), "");
+  stream.reset();
+  assert.match(`${stream.push("visible")}${stream.finish()}`, /visible/);
+});
+
+test("observer never retains raw dropped output and quarantines the next chunk", async () => {
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 });
+  const first = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "first" }, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "drop-secret-value" }, output: { channel: "stdout", text: "drop-secret-value" } });
+  await Promise.all([first, dropped]);
+  const next = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "next-secret-value" }, output: { channel: "stdout", text: "next-secret-value" } });
+  await next;
+  const events = await observer.query({ forgeRunId: "run-quarantine" });
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /drop-secret-value|next-secret-value/);
+  assert.match(serialized, /quarantined after backpressure drop/);
+  observer.close();
 });
 
 test("control gateway records rejection without mutating state when no adapter exists", async () => {

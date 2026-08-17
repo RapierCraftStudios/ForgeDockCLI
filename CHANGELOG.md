@@ -7,6 +7,9 @@
 
 ### Fixed
 
+- Native review-finding publication now persists a durable projection plan and receipt, separates semantic identity from GitHub Markdown transport drift, records canonical issue numbers, and resumes unfinished publication without replaying reviewer sessions.
+- Native agent and observer output now carries terminal/parser and credential-masking state across chunks, quarantines streams after backpressure drops, preserves state across identity refreshes, and omits raw dropped payloads.
+- Streaming observation masking now retains long split credentials and private-key bodies until a safe delimiter or bounded fail-closed quarantine; review findings can also be adopted by semantic identity when a legacy root marker was lost.
 - Completed reviews now materialize every controller-accepted root cause as its own qualitative, labeled GitHub issue across standalone, work-on, and promotion paths; exact-head per-root admission prevents cross-finding collapse, authoritatively validates and refreshes projections on new-head recurrence, elevates closed-root regressions, inherits delivery milestones, and reconciles stale aggregate or duplicate projections without hiding active findings.
 - Review execution now keeps path-adjacent files in coherent shards and applies a scope-derived read/search evidence budget with an early synthesis warning; typed reviewers can still submit a valid report after browsing is blocked, while a truly exhausted shard fails once without an automatic token-burning retry.
 - Internal typed review shards now remain fleet-visible without emitting generic completion or inactivity prompts into the parent terminal; they no longer inherit Pi's hidden foreground timeout, and failed attempts retry with a fresh schema-bound delegation instead of an incompatible generic acceptance-report resume.

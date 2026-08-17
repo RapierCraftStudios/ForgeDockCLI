@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Check } from "typebox/value";
-import { createArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
-import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, resumeReviewFindingProjection, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -1038,6 +1038,41 @@ describe("fresh-context PR review", () => {
     assert.equal(events.filter((event) => event.startsWith("comment:")).length, 1);
     assert.ok(issueIndex > Math.max(...events.map((event, index) => event.startsWith("comment:") ? index : -1)));
     assert.ok(verdictIndex > issueIndex);
+  });
+
+  it("persists a finding publication checkpoint and resumes without another reviewer wave", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const finding = {
+      ...inScope,
+      id: "projection-resume",
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: false,
+      title: "Projection can be resumed",
+      evidence: "A durable checkpoint is required",
+      location: "src/projection.ts:1",
+      intentRelevance: "Preserves review authority",
+      remediation: "Resume the GitHub projection",
+    };
+    const backing = new InMemoryArtifactRepository();
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      runtime: new FakeAgentRuntime([{ summary: "Projection finding", findings: [finding] }, clean, acceptAdjudication]),
+      host: new FakeHost(), artifacts: backing, runs,
+    });
+    const plan = backing.artifacts.find((artifact): artifact is DurableArtifact<"ReviewFindingProjection"> => artifact.kind === "ReviewFindingProjection" && artifact.payload.status === "planned");
+    assert.ok(plan);
+    const resumeArtifacts = new InMemoryArtifactRepository();
+    await resumeArtifacts.append(plan);
+    const resumeRuns = new InMemoryRunRepository();
+    await resumeRuns.create(run);
+    const resumed = await resumeReviewFindingProjection({ run, pullRequest: pr, projection: plan }, {
+      host: new FakeHost(), artifacts: resumeArtifacts, runs: resumeRuns,
+    });
+    assert.equal(resumed.run.state, "merging");
+    assert.equal(resumed.verdict.payload.findingProjection?.projections?.length, 1);
+    assert.equal((await resumeArtifacts.list({ repo: "a/b", issue: 2, pr: 4 }, "ReviewVerdict")).length, 1);
   });
 
   it("materializes each controller-accepted root cause as independently actionable work", async () => {

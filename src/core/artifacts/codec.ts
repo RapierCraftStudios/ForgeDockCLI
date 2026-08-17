@@ -10,6 +10,7 @@ import {
   type InvestigationPayload,
   type OutcomePayload,
   type RemediationBlockedPayload,
+  type ReviewFindingProjectionPayload,
   type VerificationAdjudicationPayload,
   type ReviewVerdictPayload,
 } from "./schema.js";
@@ -149,6 +150,17 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         payload.findingProjection ? `### Finding projection\nPolicy: \`${payload.findingProjection.policy}\` Â· candidates: ${payload.findingProjection.candidateFindingIds.length} Â· materialized: ${payload.findingProjection.materializedFindingIds.length} Â· suppressed: ${payload.findingProjection.suppressed.length}` : "",
         payload.findings.length ? `### Findings\n${payload.findings.map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}**${finding.blocking ? " · **BLOCKING**" : ""}${finding.reviewerRoles?.length ? ` · reviewers: ${finding.reviewerRoles.map(code).join(", ")}` : ""}\n  ${finding.evidence}${finding.location ? `\n  Location: \`${finding.location}\`` : ""}${finding.sourceFindingIds?.length ? `\n  Sources: ${finding.sourceFindingIds.map(code).join(", ")}` : ""}${finding.sourceSessionRefs?.length ? `\n  Sessions: ${finding.sourceSessionRefs.map(code).join(", ")}` : ""}\n  Remediation: ${finding.remediation}`).join("\n")}` : "### Findings\nNo findings.",
         checkTable(payload.checks),
+      ].filter(Boolean).join("\n\n");
+    }
+    case "ReviewFindingProjection": {
+      const payload = artifact.payload as ReviewFindingProjectionPayload;
+      return [heading, meta, "",
+        `**Checkpoint:** \`${payload.checkpoint}\` Â· **Status:** \`${payload.status}\` Â· **PR:** #${payload.pullRequest} Â· **Reviewed SHA:** \`${payload.headSha}\``,
+        `**Disposition:** \`${payload.disposition}\` Â· **Policy:** \`${payload.findingProjection.policy}\``,
+        `**Projection entries:** ${payload.projections.length}/${payload.findingProjection.materializedFindingIds.length}`,
+        payload.projections.length
+          ? `### Projection receipt\n${payload.projections.map((projection) => `- **${projection.findingId}** Â· ${projection.status}${projection.issueNumber ? ` Â· issue #${projection.issueNumber}` : ""}${projection.mismatches?.length ? ` Â· ${projection.mismatches.join(", ")}` : ""}`).join("\n")}`
+          : "",
       ].filter(Boolean).join("\n\n");
     }
     case "VerificationAdjudication": {

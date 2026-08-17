@@ -107,7 +107,7 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual(result.verdict.payload.checks, [{ command: "GitHub required check: CI", status: "passed", durationMs: 0 }]);
     assert.ok(runtime.tasks.length > 0);
     assert.ok(runtime.tasks.every((task) => !task.context.some((artifact) => artifact.kind === "BuildResult")));
-    assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["ReviewVerdict"]);
+    assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict"]);
     assertNoDeploymentGate(host.publications);
     assert.equal(workspaces.removed, true);
   });

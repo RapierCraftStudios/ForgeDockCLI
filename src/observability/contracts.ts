@@ -185,6 +185,146 @@ export interface RedactedValue {
 
 const SENSITIVE_KEY = /(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)/i;
 const SENSITIVE_VALUE = /(?:bearer\s+|gh[pousr]_\w+|sk-[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]+ PRIVATE KEY-----)/i;
+const STREAM_SECRET_PATTERNS = [
+  /bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+  /authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]{8,}/gi,
+  /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/gi,
+  /\bsk-[A-Za-z0-9_-]{12,}\b/gi,
+  /-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----/g,
+] as const;
+const STREAM_HOLDBACK_LIMIT_BYTES = 16 * 1024;
+const STREAM_SECRET_PREFIXES = ["bearer", "authorization", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-", "-----BEGIN "];
+
+type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
+
+/** Stateful, fail-closed sanitizer for output that arrives in arbitrary chunks. */
+export class StreamingObservationText {
+  #state: TerminalParserState = "ground";
+  #holdback = "";
+  #quarantined = false;
+
+  push(value: string): string {
+    if (!value || this.#quarantined) return "";
+    const visible = this.consumeTerminal(value);
+    if (!visible) return "";
+    return this.flushSafe(visible);
+  }
+
+  /** Backpressure may discard an incomplete control/secret sequence. */
+  markDropped(): void {
+    this.#quarantined = true;
+    this.#state = "ground";
+    this.#holdback = "";
+  }
+
+  reset(): void {
+    this.#state = "ground";
+    this.#holdback = "";
+    this.#quarantined = false;
+  }
+
+  finish(): string {
+    if (this.#quarantined) {
+      this.reset();
+      return "";
+    }
+    const tail = streamingSecretSuffixStart(this.#holdback) === undefined
+      ? redactStreamingSecrets(this.#holdback)
+      : "[REDACTED]";
+    this.#holdback = "";
+    this.#state = "ground";
+    return tail;
+  }
+
+  get quarantined(): boolean { return this.#quarantined; }
+
+  private flushSafe(value: string): string {
+    const candidate = this.#holdback + value;
+    const secretStart = streamingSecretSuffixStart(candidate);
+    if (secretStart !== undefined) {
+      const holdback = candidate.slice(secretStart);
+      if (Buffer.byteLength(holdback, "utf8") > STREAM_HOLDBACK_LIMIT_BYTES) {
+        this.markDropped();
+        return "";
+      }
+      this.#holdback = holdback;
+      return redactStreamingSecrets(candidate.slice(0, secretStart));
+    }
+    this.#holdback = "";
+    return redactStreamingSecrets(candidate);
+  }
+
+  private consumeTerminal(value: string): string {
+    let output = "";
+    for (const character of value) {
+      const code = character.charCodeAt(0);
+      if (this.#state === "ground") {
+        if (code === 0x1b) this.#state = "escape";
+        else if (code === 0x0a || code === 0x0d || code === 0x09 || code >= 0x20) output += character;
+        continue;
+      }
+      if (this.#state === "escape") {
+        if (character === "[") this.#state = "csi";
+        else if (character === "]") this.#state = "osc";
+        else if (character === "O") this.#state = "ss3";
+        else this.#state = "ground";
+        continue;
+      }
+      if (this.#state === "csi" || this.#state === "ss3") {
+        if (code >= 0x40 && code <= 0x7e) this.#state = "ground";
+        else if (code === 0x1b) this.#state = "escape";
+        continue;
+      }
+      if (this.#state === "osc") {
+        if (code === 0x07) this.#state = "ground";
+        else if (code === 0x1b) this.#state = "osc-escape";
+        continue;
+      }
+      if (code === 0x5c) this.#state = "ground";
+      else if (code === 0x1b) this.#state = "osc-escape";
+      else this.#state = "osc";
+    }
+    return output;
+  }
+}
+
+export function createStreamingObservationText(): StreamingObservationText {
+  return new StreamingObservationText();
+}
+
+export function redactStreamingSecrets(value: string): string {
+  let result = value;
+  for (const pattern of STREAM_SECRET_PATTERNS) result = result.replace(pattern, "[REDACTED]");
+  return result;
+}
+
+function streamingSecretSuffixStart(value: string): number | undefined {
+  const candidates: number[] = [];
+  const suffixPatterns = [
+    /(?:^|[^A-Za-z0-9_])(bearer\s+[A-Za-z0-9._~+/=-]*)$/i,
+    /(?:^|[^A-Za-z0-9_])(authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]*)$/i,
+    /(?:^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]*)$/i,
+    /(?:^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]*)$/i,
+  ];
+  for (const pattern of suffixPatterns) {
+    const match = pattern.exec(value);
+    if (match?.[1] !== undefined) candidates.push(match.index + match[0].length - match[1].length);
+  }
+  const privateKeyHeader = /-----BEGIN [A-Z ]+ PRIVATE KEY-----/i.exec(value);
+  if (privateKeyHeader && !/-----END [A-Z ]+ PRIVATE KEY-----/i.test(value.slice(privateKeyHeader.index))) {
+    candidates.push(privateKeyHeader.index);
+  }
+  for (const prefix of STREAM_SECRET_PREFIXES) {
+    for (let length = prefix.length; length >= 1; length -= 1) {
+      const start = value.length - length;
+      if (start < 0 || !prefix.toLowerCase().startsWith(value.slice(start).toLowerCase())) continue;
+      if (start > 0 && /[A-Za-z0-9_]/.test(value[start - 1] ?? "")) continue;
+      candidates.push(start);
+      break;
+    }
+  }
+  return candidates.length ? Math.min(...candidates) : undefined;
+}
 
 export function observationScopeKey(identity: ObservationIdentity): string {
   return identity.forgeRunId
@@ -194,6 +334,18 @@ export function observationScopeKey(identity: ObservationIdentity): string {
     ?? identity.piAsyncId
     ?? identity.agentTaskId
     ?? "global";
+}
+
+export function observationStreamKey(identity: ObservationIdentity, channel: "stdout" | "stderr"): string {
+  return [
+    identity.forgeRunId ?? "",
+    identity.orchestrationId ?? "",
+    identity.workUnitId ?? "",
+    identity.agentTaskId ?? "",
+    identity.controllerTaskId ?? "",
+    identity.piAsyncId ?? "",
+    channel,
+  ].join("|");
 }
 
 export function observationEntityId(identity: ObservationIdentity, producer: ObservationProducer): string {
@@ -227,7 +379,8 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
 
   if (typeof value === "string") {
     const sanitized = sanitizeTerminalText(value);
-    if (SENSITIVE_VALUE.test(sanitized)) {
+    const masked = redactStreamingSecrets(sanitized);
+    if (masked !== sanitized || SENSITIVE_VALUE.test(sanitized)) {
       return { value: "[REDACTED]", redacted: true, originalBytes, outputBytes: 11, truncated: false };
     }
     const terminalSequencesRemoved = sanitized !== value;

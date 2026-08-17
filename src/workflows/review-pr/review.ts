@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { Type, type Static } from "typebox";
-import { createArtifact, FindingSchema, type DurableArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -254,6 +254,7 @@ export async function reviewPullRequest(
 ): Promise<{ run: RunState; verdict: DurableArtifact<"ReviewVerdict">; sessionRefs: string[]; reviewPlan: ReviewPlan }> {
   if (input.run.state !== "reviewing") throw new Error(`Review requires reviewing state, found ${input.run.state}`);
   let run = input.run;
+  let projectionCheckpointStarted = false;
   try {
     const reviewerAttemptTimeoutMs = resolveReviewerAttemptTimeoutMs(input.reviewerAttemptTimeoutMs);
     const recordReviewProgress = async (message: string): Promise<void> => {
@@ -694,11 +695,51 @@ export async function reviewPullRequest(
         `impact-gated projection shadow: ${suppressedProjectionFindings.length} of ${candidateProjectionFindings.length} candidate finding(s) would remain advisory`,
       );
     }
+    const subject = { repo: run.subject.repo, ...(run.subject.issue ? { issue: run.subject.issue } : {}), pr: frozen.number };
+    let projectionEntries: ReviewFindingProjectionPayload["projections"] = [];
+    let projectionPlan: DurableArtifact<"ReviewFindingProjection"> | undefined;
+    const projectionPayloadBase = {
+      checkpoint: "review-finding-publication" as const,
+      pullRequest: frozen.number,
+      headSha: frozen.headSha,
+      headBranch: frozen.headBranch,
+      baseBranch: frozen.baseBranch,
+      disposition,
+      reviewerRoles: roles,
+      findings,
+      checks: input.buildResult?.payload.checks ?? input.deployment?.checks ?? [],
+      reviewPlan,
+      findingProjection: {
+        policy: findingIssuePolicy,
+        candidateFindingIds: candidateProjectionFindings.map((finding) => finding.id),
+        materializedFindingIds: activeProjectionFindings.map((finding) => finding.id),
+        suppressed: suppressedProjectionFindings,
+      },
+      ...(adjudication ? {
+        scopeAdjudication: { sessionRef: adjudication.sessionRef, decisions: adjudication.output.decisions },
+      } : {}),
+      ...(input.priorVerdict !== undefined ? { supersedes: input.priorVerdict.id } : {}),
+    };
+    if (projectionEnabled) {
+      projectionCheckpointStarted = true;
+      projectionPlan = createArtifact({
+        kind: "ReviewFindingProjection",
+        runId: run.runId,
+        subject,
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: {
+          ...projectionPayloadBase,
+          status: "planned",
+          projections: activeProjectionFindings.map((finding) => ({ findingId: finding.id, status: "pending" as const })),
+        },
+      }, { id: reviewFindingProjectionPlanId(run.runId, frozen.headSha) });
+      await dependencies.artifacts.append(projectionPlan);
+    }
     // The reviewer wave is fully settled above. Only this deterministic
     // post-wave path may project findings: scope filtering and consolidation
     // are complete before any GitHub issue lookup or creation occurs.
     if (projectionEnabled) {
-      await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings, policy: projectionMode }, dependencies.host);
+      projectionEntries = await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings, policy: projectionMode }, dependencies.host);
     }
     if (projectionEnabled && dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
@@ -708,9 +749,24 @@ export async function reviewPullRequest(
         activeFindings: activeProjectionFindings,
       });
     }
+    if (projectionPlan) {
+      const projectionReceipt = createArtifact({
+        kind: "ReviewFindingProjection",
+        runId: run.runId,
+        subject,
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: {
+          ...projectionPayloadBase,
+          status: "completed",
+          projections: projectionEntries,
+        },
+      }, { id: reviewFindingProjectionReceiptId(projectionPlan.id) });
+      await dependencies.artifacts.append(projectionReceipt);
+      run = attachArtifact(run, "ReviewFindingProjection", projectionPlan.id);
+      run = attachArtifact(run, "ReviewFindingProjection", projectionReceipt.id);
+    }
     const publicationSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, publicationSnapshot, "immediately before verdict publication");
-    const subject = { repo: run.subject.repo, ...(run.subject.issue ? { issue: run.subject.issue } : {}), pr: frozen.number };
     const verdict = createArtifact({
       kind: "ReviewVerdict",
       runId: run.runId,
@@ -730,6 +786,7 @@ export async function reviewPullRequest(
           candidateFindingIds: candidateProjectionFindings.map((finding) => finding.id),
           materializedFindingIds: activeProjectionFindings.map((finding) => finding.id),
           suppressed: suppressedProjectionFindings,
+          projections: projectionEntries,
         },
         ...(adjudication ? {
           scopeAdjudication: { sessionRef: adjudication.sessionRef, decisions: adjudication.output.decisions },
@@ -743,7 +800,8 @@ export async function reviewPullRequest(
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, verdict, sessionRefs, reviewPlan };
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
+    const rawReason = error instanceof Error ? error.message : String(error);
+    const reason = projectionCheckpointStarted ? `review-finding publication failed: ${rawReason}` : rawReason;
     const event = error instanceof ReviewWaveIncompleteError ? "REVIEW_BLOCKED" as const : "FAIL" as const;
     const failed = transition(run, event, { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
@@ -1424,9 +1482,10 @@ export async function materializeReviewFindings(
     policy?: FindingProjectionMode;
   },
   host: ForgeHost,
-): Promise<void> {
+): Promise<ReviewFindingProjectionPayload["projections"]> {
+  const projections: ReviewFindingProjectionPayload["projections"] = [];
   for (const finding of terminalReviewFindings(input.findings, input.policy ?? "all")) {
-    await host.materializeReviewFinding({
+    const issue = await host.materializeReviewFinding({
       repo: input.pullRequest.repo,
       ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
       pullRequest: input.pullRequest,
@@ -1435,7 +1494,113 @@ export async function materializeReviewFindings(
       reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
       finding,
     });
+    projections.push({
+      findingId: finding.id,
+      status: issue.projection?.status ?? "materialized",
+      ...(issue.projection?.marker ? { marker: issue.projection.marker } : {}),
+      issueNumber: issue.number,
+      issueUrl: issue.url,
+      ...(issue.projection?.mismatches?.length ? { mismatches: [...issue.projection.mismatches] } : {}),
+    });
   }
+  return projections;
+}
+
+export function reviewFindingProjectionPlanId(runId: string, headSha: string): string {
+  return `review-projection-${runId}-${headSha.toLowerCase()}`;
+}
+
+export function reviewFindingProjectionReceiptId(planId: string): string {
+  return `${planId}:completed`;
+}
+
+/**
+ * Completes a previously persisted finding-publication checkpoint. This path
+ * deliberately has no runtime dependency: it can reconcile GitHub and emit a
+ * final verdict after a controller restart without replaying reviewer work.
+ */
+export async function resumeReviewFindingProjection(
+  input: {
+    run: RunState;
+    pullRequest: PullRequestSnapshot;
+    projection: DurableArtifact<"ReviewFindingProjection">;
+  },
+  dependencies: { host: ForgeHost; artifacts: ArtifactRepository; runs: RunRepository },
+): Promise<{ run: RunState; verdict: DurableArtifact<"ReviewVerdict">; reviewPlan: ReviewPlan }> {
+  if (input.run.state !== "reviewing") throw new Error(`Finding-publication resume requires reviewing state, found ${input.run.state}`);
+  const payload = input.projection.payload;
+  if (payload.pullRequest !== input.pullRequest.number
+    || payload.headSha.toLowerCase() !== input.pullRequest.headSha.toLowerCase()
+    || payload.headBranch !== input.pullRequest.headBranch
+    || payload.baseBranch !== input.pullRequest.baseBranch) {
+    throw new Error("Finding-publication checkpoint does not match the authoritative pull request route or head");
+  }
+  const planId = input.projection.id.endsWith(":completed")
+    ? input.projection.id.slice(0, -":completed".length)
+    : input.projection.id;
+  const completedProjectionId = reviewFindingProjectionReceiptId(planId);
+  let projections = payload.projections;
+  let projectionReceiptId: string | undefined;
+  if (payload.status === "planned") {
+    const activeIds = new Set(payload.findingProjection.materializedFindingIds);
+    const activeFindings = payload.findings.filter((finding) => activeIds.has(finding.id));
+    projections = await materializeReviewFindings({
+      run: input.run,
+      pullRequest: input.pullRequest,
+      findings: activeFindings,
+      fallbackReviewerRoles: payload.reviewerRoles,
+      policy: "all",
+    }, dependencies.host);
+    if (dependencies.host.reconcileReviewFindings) {
+      await dependencies.host.reconcileReviewFindings({
+        repo: input.pullRequest.repo,
+        pullRequest: input.pullRequest,
+        runId: input.run.runId,
+        activeFindings,
+      });
+    }
+    const projectionReceipt = createArtifact({
+      kind: "ReviewFindingProjection",
+      runId: input.run.runId,
+      subject: input.projection.subject,
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: { ...payload, status: "completed", projections },
+    }, { id: completedProjectionId });
+    await dependencies.artifacts.append(projectionReceipt);
+    projectionReceiptId = projectionReceipt.id;
+  }
+  const subject = { repo: input.projection.subject.repo, ...(input.projection.subject.issue ? { issue: input.projection.subject.issue } : {}), pr: input.pullRequest.number };
+  const reviewPlan = payload.reviewPlan as unknown as ReviewPlan | undefined;
+  if (!reviewPlan) throw new Error("Finding-publication checkpoint is missing the frozen review plan");
+  assertReviewPlan(reviewPlan);
+  const verdict = createArtifact({
+    kind: "ReviewVerdict",
+    runId: input.run.runId,
+    subject,
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      headSha: payload.headSha,
+      headBranch: payload.headBranch,
+      baseBranch: payload.baseBranch,
+      disposition: payload.disposition,
+      reviewerRoles: payload.reviewerRoles,
+      findings: payload.findings,
+      checks: payload.checks,
+      reviewPlan,
+      ...(payload.scopeAdjudication ? { scopeAdjudication: payload.scopeAdjudication } : {}),
+      findingProjection: { ...payload.findingProjection, projections },
+      ...(payload.supersedes ? { supersedes: payload.supersedes } : {}),
+    },
+  }, { id: `review-verdict-${planId}` });
+  await dependencies.artifacts.append(verdict);
+  let run = attachArtifact(input.run, "ReviewFindingProjection", planId);
+  if (projectionReceiptId || payload.status === "completed") {
+    run = attachArtifact(run, "ReviewFindingProjection", projectionReceiptId ?? completedProjectionId);
+  }
+  run = attachArtifact(run, "ReviewVerdict", verdict.id);
+  const advanced = transition(run, payload.disposition === "approve" ? "REVIEW_APPROVED" : "REVIEW_CHANGES_REQUESTED", { headSha: payload.headSha });
+  await dependencies.runs.commit(run.version, advanced.state, advanced.record);
+  return { run: advanced.state, verdict, reviewPlan };
 }
 
 export function terminalReviewFindings(

@@ -27,7 +27,7 @@ import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
 import { verifyAndCommit, type VerificationResult } from "./verify.js";
-import { materializeReviewFindings, reviewPullRequest } from "../review-pr/review.js";
+import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
@@ -1393,9 +1393,10 @@ export async function resumePublicationWorkOn(
   if (recoveringRevision) {
     const expectedHead = /^Published remediation head [0-9a-f]{7,64} does not match verified build ([0-9a-f]{7,64})$/i
       .exec(input.run.failure ?? "")?.[1];
-    if (!input.priorVerdict
+    const findingProjectionFailure = /review[- ]finding|projection|authoritative identity/i.test(input.run.failure ?? "");
+    if ((!input.priorVerdict
       || input.priorVerdict.payload.headSha === input.buildResult.payload.headSha
-      || expectedHead?.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()) {
+      || expectedHead?.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()) && !findingProjectionFailure) {
       throw new Error("Failed run does not carry proof of a newer verified remediation head after a stale PR projection");
     }
   }
@@ -1422,25 +1423,51 @@ export async function resumePublicationWorkOn(
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
     run = published.run;
     let pullRequest = published.pullRequest;
-    let verdict: DurableArtifact<"ReviewVerdict">;
+    let verdict!: DurableArtifact<"ReviewVerdict">;
     let priorVerdict = input.priorVerdict;
     let cycle = input.priorRemediationCycles ?? 0;
-    while (true) {
-      const reviewed = await reviewPullRequest({
-        run, pullRequest, intent: input.intent, investigation: input.investigation,
-        packet: input.packet, buildResult, workspace: input.workspace.path,
-        findingIssuePolicy: "all",
-        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
-        ...(priorVerdict !== undefined ? { priorVerdict } : {}),
-        reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
-        ...runtimeOptions,
-      }, {
-        runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
-        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+    let resumedProjectionReview: Awaited<ReturnType<typeof resumeReviewFindingProjection>> | undefined;
+    const projectionArtifacts = await dependencies.artifacts.list({
+      repo: pullRequest.repo,
+      ...(run.subject.issue ? { issue: run.subject.issue } : {}),
+      pr: pullRequest.number,
+    }, "ReviewFindingProjection");
+    const projectionCheckpoint = projectionArtifacts
+      .filter((artifact): artifact is DurableArtifact<"ReviewFindingProjection"> => artifact.kind === "ReviewFindingProjection"
+        && artifact.runId === run.runId
+        && artifact.payload.headSha.toLowerCase() === pullRequest.headSha.toLowerCase()
+        && (artifact.payload.status === "planned" || artifact.payload.status === "completed"))
+      .at(-1);
+    if (projectionCheckpoint && priorVerdict?.payload.headSha.toLowerCase() !== pullRequest.headSha.toLowerCase()) {
+      resumedProjectionReview = await resumeReviewFindingProjection({ run, pullRequest, projection: projectionCheckpoint }, {
+        host: dependencies.host,
+        artifacts: dependencies.artifacts,
+        runs: dependencies.runs,
       });
-      run = reviewed.run;
-      verdict = reviewed.verdict;
+      run = resumedProjectionReview.run;
+      verdict = resumedProjectionReview.verdict;
       priorVerdict = verdict;
+    }
+    while (true) {
+      if (resumedProjectionReview) {
+        resumedProjectionReview = undefined;
+      } else {
+        const reviewed = await reviewPullRequest({
+          run, pullRequest, intent: input.intent, investigation: input.investigation,
+          packet: input.packet, buildResult, workspace: input.workspace.path,
+          findingIssuePolicy: "all",
+          ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+          ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+          reviewCycle: { current: cycle + 1, total: (input.maxRemediationCycles ?? 2) + 1 },
+          ...runtimeOptions,
+        }, {
+          runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+          ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+        });
+        run = reviewed.run;
+        verdict = reviewed.verdict;
+        priorVerdict = verdict;
+      }
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );

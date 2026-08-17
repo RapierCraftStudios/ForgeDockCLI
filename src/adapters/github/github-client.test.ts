@@ -6,7 +6,7 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
-import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -376,6 +376,11 @@ describe("GitHub review finding projection", () => {
     const second = reviewFindingMarker("a/b", 57, { ...finding, evidence: "Expanded evidence" });
     assert.equal(first, second);
     assert.match(first, /^<!-- FORGEDOCK:REVIEW-FINDING [a-f0-9]{64} -->$/);
+    const rooted = { ...finding, normalizedRoot: "authorization nonce is reusable" };
+    assert.equal(
+      reviewFindingSemanticMarker("a/b", 57, rooted),
+      reviewFindingSemanticMarker("a/b", 57, { ...rooted, title: "Updated wording", location: "src/auth.ts:99" }),
+    );
     assert.equal(reviewFindingLaneMarker("A/B", 57), reviewFindingLaneMarker("a/b", 57));
     assert.match(reviewFindingLaneMarker("a/b", 57), /^<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 [a-f0-9]{64} -->$/);
   });
@@ -462,6 +467,55 @@ describe("GitHub review finding projection", () => {
     assert.equal(adopted.number, 88);
     assert.equal(created, false);
   });
+
+  it("adopts a semantic-identity issue when the legacy root marker was lost", async () => {
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Retained finding", evidence: "The semantic identity is durable.", location: "src/schema.ts:20",
+      normalizedRoot: "schema contract is incomplete", intentRelevance: "Keeps the review root durable", remediation: "Apply the recorded fix.",
+    };
+    const issue = {
+      number: 88,
+      title: "old projection",
+      body: `**Source:** PR #57 - Fix\n**Reviewed SHA:** \`${pullRequest.headSha}\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingSemanticMarker("a/b", 57, finding)}`,
+      html_url: "https://github.test/a/b/issues/88", state: "open" as const,
+      labels: ["review-finding", "needs-validation", "priority:P1"],
+    };
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    let created = false;
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([[issue]]);
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "88") return JSON.stringify({
+        number: issue.number, title: issue.title, body: issue.body, url: issue.html_url,
+        state: "OPEN", labels: issue.labels.map((name) => ({ name })), milestone: null,
+      });
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "2") return JSON.stringify({ milestone: null });
+      if (args[0] === "issue" && args[1] === "edit" && args[2] === "88") {
+        issue.title = args[args.indexOf("--title") + 1] ?? issue.title;
+        issue.body = body ?? issue.body;
+        issue.labels = [...new Set([...issue.labels, ...(args[args.indexOf("--add-label") + 1]?.split(",") ?? [])])];
+        return "";
+      }
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "issue" && args[1] === "create") { created = true; return "https://github.test/a/b/issues/99\n"; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const adopted = await client.materializeReviewFinding({
+      repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-new", reviewedHeadSha: pullRequest.headSha,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(adopted.number, 88);
+    assert.equal(adopted.projection?.status, "adopted");
+    assert.match(issue.body, /FORGEDOCK:REVIEW-FINDING [a-f0-9]{64}/);
+    assert.equal(created, false);
+  });
+
   it("creates distinct root issues and reconciles a stale aggregate plus duplicate root", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
@@ -791,10 +845,13 @@ describe("GitHub review finding projection", () => {
     assert.equal(issue.number, 101);
     assert.match(createdBody, /First line\r\nSecond line/);
     contentChanged = true;
-    await assert.rejects(client.materializeReviewFinding({
+    const drifted = await client.materializeReviewFinding({
       repo: "a/b", pullRequest, runId: "run-line-endings", reviewedHeadSha: head,
       reviewerRoles: ["correctness"], finding,
-    }), /body-diff-at/);
+    });
+    assert.equal(drifted.number, 101);
+    assert.equal(drifted.projection?.status, "projection-drift");
+    assert.ok(drifted.projection?.mismatches?.some((mismatch) => mismatch.startsWith("body-diff-at:")));
   });
 
   it("accepts GitHub caret normalization of escaped C1 controls", async () => {
