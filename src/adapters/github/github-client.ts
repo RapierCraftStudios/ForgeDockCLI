@@ -67,6 +67,31 @@ const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
+const MAX_READ_ATTEMPTS = 3;
+const READ_RETRY_DELAY_MS = 25;
+
+function isReadOnlyGhInvocation(args: readonly string[]): boolean {
+  const [command, subcommand] = args;
+  if (command === "api") {
+    const methodIndex = args.findIndex((arg) => arg === "--method");
+    return methodIndex < 0 || args[methodIndex + 1]?.toUpperCase() === "GET";
+  }
+  if (command === "repo") return subcommand === "view";
+  if (command === "issue") return subcommand === "list" || subcommand === "view";
+  if (command === "pr") return subcommand === "list" || subcommand === "view" || subcommand === "checks" || subcommand === "diff";
+  if (command === "label") return subcommand === "list";
+  return false;
+}
+
+function isTransientGitHubReadFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /HTTP (?:429|5\d{2})\b/i.test(message)
+    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|temporarily unavailable|no server is currently available)/i.test(message);
+}
+
+function waitForReadRetry(attempt: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, READ_RETRY_DELAY_MS * 2 ** (attempt - 1)));
+}
 const MAX_FALLBACK_PATCH_CHARS_PER_FILE = 16_384;
 
 const REVIEW_FINDING_LABELS = [
@@ -1338,15 +1363,24 @@ export class GitHubClient implements ForgeHost {
   }
 
   private async gh(args: string[], input?: string): Promise<string> {
-    try {
-      return await this.runGh(args, input);
-    } catch (error) {
-      if (this.authRefreshAttempted || !isGitHubAuthenticationFailure(error)) throw error;
-      this.authRefreshAttempted = true;
-      const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.cwd)))();
-      if (!refreshed) throw error;
-      return this.runGh(args, input);
+    const readOnly = isReadOnlyGhInvocation(args);
+    let attempts = 0;
+    while (attempts < MAX_READ_ATTEMPTS) {
+      attempts += 1;
+      try {
+        return await this.runGh(args, input);
+      } catch (error) {
+        if (!this.authRefreshAttempted && isGitHubAuthenticationFailure(error)) {
+          this.authRefreshAttempted = true;
+          const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.cwd)))();
+          if (!refreshed) throw error;
+          continue;
+        }
+        if (!readOnly || !isTransientGitHubReadFailure(error) || attempts >= MAX_READ_ATTEMPTS) throw error;
+        await waitForReadRetry(attempts);
+      }
     }
+    throw new Error("GitHub read attempts exhausted");
   }
 
   private runGh(args: string[], input?: string): Promise<string> {

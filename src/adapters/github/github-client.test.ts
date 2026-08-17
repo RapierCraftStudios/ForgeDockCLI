@@ -24,6 +24,45 @@ class CommentClient {
 }
 function key(subject: Subject) { return `${subject.repo}#${subject.pr ? `pr${subject.pr}` : `i${subject.issue}`}`; }
 
+describe("GitHub read retry boundary", () => {
+  it("retries a transient read failure and returns the eventual result", async () => {
+    let attempts = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("gh repo failed (1): HTTP 503: No server is currently available to service your request");
+      return JSON.stringify({ nameWithOwner: "a/b", defaultBranchRef: { name: "main" } });
+    } });
+
+    assert.deepEqual(await client.getRepository("a/b"), { repo: "a/b", defaultBranch: "main" });
+    assert.equal(attempts, 2);
+  });
+
+  it("bounds retries for a persistently unavailable read", async () => {
+    let attempts = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      throw new Error("gh repo failed (1): HTTP 503: unavailable");
+    } });
+
+    await assert.rejects(client.getRepository("a/b"), /HTTP 503: unavailable/);
+    assert.equal(attempts, 3);
+  });
+
+  it("does not replay a GitHub write after a transient failure", async () => {
+    let attempts = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      throw new Error("gh api failed (1): HTTP 503: unavailable");
+    } });
+
+    await assert.rejects(client.postIssueComment({ repo: "a/b", issue: 7 }, "body"), /HTTP 503: unavailable/);
+    assert.equal(attempts, 1);
+  });
+});
+
 describe("GitHub repository resolution", () => {
   it("extracts the target repository from origin URLs without selecting upstream", () => {
     assert.equal(repositoryFromRemote("https://github.com/RapierCraftStudios/ForgeDockCLI"), "RapierCraftStudios/ForgeDockCLI");
