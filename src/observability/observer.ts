@@ -139,7 +139,14 @@ export class ForgeDockObserver implements ObservationSink {
   private resetOutputStream(input: ObservationDraft, discard = false): void {
     const key = observationOutputStreamKey(input);
     if (key) {
-      const sanitizer = this.#outputSanitizers.get(key);
+      let sanitizer = this.#outputSanitizers.get(key);
+      if (!sanitizer && discard) {
+        // A dropped first chunk still establishes the stream's quarantine.
+        // Consume it before any later accepted chunk can create text-state
+        // parser state and expose the dropped sequence's continuation.
+        sanitizer = createTerminalTextSanitizer();
+        this.#outputSanitizers.set(key, sanitizer);
+      }
       if (sanitizer) {
         finishOutputSanitizer(sanitizer, discard, discard ? input.output?.text : undefined);
         if (!discard) this.#outputSanitizers.delete(key);

@@ -109,6 +109,51 @@ test("repeated backpressure drops keep output streams fail-closed until their te
   observer.close();
 });
 
+test("the first dropped output chunk initializes fail-closed parser state", async () => {
+  const observer = new ForgeDockObserver({
+    store: new SqliteObservationStore(":memory:"),
+    producer,
+    maxQueueDepth: 1,
+  });
+  const identity = { forgeRunId: "run-pressure-first-drop", controllerTaskId: "task-1" };
+  const occupyingEvent = observer.emit({
+    producer,
+    identity,
+    source: "process",
+    channel: "lifecycle",
+    kind: "process.started",
+    payload: { command: "test" },
+  });
+  const droppedFirstChunk = observer.emit({
+    producer,
+    identity,
+    source: "process",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "\u009d52;c;", chunkSequence: 1 },
+  });
+
+  await Promise.all([occupyingEvent, droppedFirstChunk]);
+  await observer.emit({
+    producer,
+    identity,
+    source: "process",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "clipboard-secret\u009cvisible", chunkSequence: 2 },
+  });
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-pressure-first-drop" });
+  const output = events.flatMap((event) => event.output ? [event.output.text] : []);
+  assert.equal(output.some((text) => text.includes("clipboard-secret")), false);
+  assert.ok(output.includes("visible"));
+  assert.equal(JSON.stringify(events).includes("clipboard-secret"), false);
+  observer.close();
+});
+
 test("journal hydrates projections after observer restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-observer-test-"));
   const path = join(root, "observations.db");
