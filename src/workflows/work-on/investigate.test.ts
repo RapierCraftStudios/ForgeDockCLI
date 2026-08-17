@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { DecompositionChild, IssueSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
+import { createRun, transition, type RunState } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { investigateWorkItem, WorkflowExecutionError } from "./investigate.js";
+import {
+  investigateWorkItem,
+  latestPriorLearningArtifacts,
+  resumeInvestigationWorkItem,
+  WorkflowExecutionError,
+} from "./investigate.js";
 
 function intent(runId = "run_investigate") {
   return createArtifact({
@@ -54,23 +60,61 @@ function dependencies(runtime: FakeAgentRuntime) {
   };
 }
 
+async function investigatingRun(
+  intentArtifact: ReturnType<typeof intent>,
+  runs: InMemoryRunRepository,
+): Promise<RunState> {
+  const queued = createRun({
+    workflow: "work-on",
+    subject: intentArtifact.subject,
+    runId: intentArtifact.runId,
+    target: { lane: "fast", targetBranch: "main" },
+  });
+  await runs.create(queued);
+  const started = transition(queued, "START_INVESTIGATION");
+  await runs.commit(queued.version, started.state, started.record);
+  return started.state;
+}
+
 describe("work-on investigation", () => {
+  it("projects only the latest durable learning artifact for each phase", () => {
+    const artifact = (kind: DurableArtifact["kind"], index: number) => ({ kind, id: `${kind}-${index}` } as unknown as DurableArtifact);
+    const projected = latestPriorLearningArtifacts([
+      artifact("ReviewVerdict", 1), artifact("Outcome", 1), artifact("ReviewVerdict", 2), artifact("BuildResult", 1), artifact("Outcome", 2),
+    ]);
+    assert.deepEqual(projected.map(({ kind, id }) => `${kind}:${id}`), ["ReviewVerdict:ReviewVerdict-2", "BuildResult:BuildResult-1", "Outcome:Outcome-2"]);
+  });
+
   it("commits confirmed evidence and stops at the Build Packet boundary", async () => {
     const runtime = new FakeAgentRuntime([confirmed()]);
     const deps = dependencies(runtime);
-    const result = await investigateWorkItem({ intent: intent(), cwd: process.cwd() }, deps);
+    const result = await investigateWorkItem({
+      intent: intent(),
+      cwd: process.cwd(),
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    }, deps);
 
     assert.equal(result.run.state, "preparing");
     assert.equal(result.investigation.payload.outcome, "confirmed");
     assert.equal(deps.artifacts.artifacts.map((artifact) => artifact.kind).join(","), "Intent,Investigation");
     assert.deepEqual(runtime.tasks[0]?.tools, ["read", "grep", "find", "ls"]);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /missing implementation.*confirmed, not invalid/);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /integration boundaries/);
+    assert.match(runtime.tasks[0]?.instructions ?? "", /repeated mechanical or integration failure patterns/);
     assert.equal(runtime.tasks[0]?.workspace.mode, "read-only");
+    assert.deepEqual(runtime.tasks[0]?.modelPolicy, {
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    });
     assert.deepEqual((await deps.runs.history(result.run.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED",
     ]);
   });
 
-  it("makes invalid evidence terminal and records an Outcome", async () => {
+  it("records invalid evidence with a provisional closure checkpoint", async () => {
     const runtime = new FakeAgentRuntime([{
       ...confirmed(),
       outcome: "invalid",
@@ -82,6 +126,7 @@ describe("work-on investigation", () => {
     const result = await investigateWorkItem({ intent: intent("run_invalid"), cwd: process.cwd() }, deps);
     assert.equal(result.run.state, "invalid");
     assert.equal(result.outcome?.payload.status, "invalid");
+    assert.deepEqual(result.outcome?.payload.issueClosure, { status: "pending", repo: "acme/widget", issue: 17 });
     assert.deepEqual(deps.artifacts.artifacts.map((artifact) => artifact.kind), ["Intent", "Investigation", "Outcome"]);
   });
 
@@ -120,5 +165,83 @@ describe("work-on investigation", () => {
       investigateWorkItem({ intent: intent("run_provider_failure"), cwd: process.cwd() }, deps),
       (error: unknown) => error instanceof WorkflowExecutionError && error.run.failure === "provider unavailable",
     );
+  });
+
+  it("recovers an Intent-only crash by dispatching exactly one investigator", async () => {
+    const intentArtifact = intent("run_intent_recovery");
+    const runtime = new FakeAgentRuntime([confirmed()]);
+    const deps = dependencies(runtime);
+    await deps.artifacts.append(intentArtifact);
+    const run = await investigatingRun(intentArtifact, deps.runs);
+
+    const result = await resumeInvestigationWorkItem({
+      run,
+      intent: intentArtifact,
+      cwd: process.cwd(),
+    }, deps);
+
+    assert.equal(result.run.state, "preparing");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator"]);
+    assert.equal(deps.artifacts.artifacts.filter((artifact) => artifact.kind === "Intent").length, 1);
+  });
+
+  it("adopts a durable Investigation after fault injection without replaying any agent outcome", async () => {
+    for (const outcome of ["confirmed", "invalid", "decompose"] as const) {
+      const { rootCause: _rootCause, ...classified } = confirmed();
+      const payload: InvestigationPayload = outcome === "confirmed"
+        ? confirmed()
+        : {
+          ...classified,
+          outcome,
+          ...(outcome === "decompose" ? {
+            decomposition: [
+              { title: "Add locking", outcome: "Serialize updates", dependsOn: [] },
+              { title: "Add regression coverage", outcome: "Prove safety", dependsOn: ["Add locking"] },
+            ],
+          } : {}),
+        };
+      const intentArtifact = intent(`run_fault_${outcome}`);
+      const runtime = new FakeAgentRuntime([payload]);
+      const deps = dependencies(runtime);
+      const artifacts = deps.artifacts;
+      let injected = false;
+      const originalAppend = artifacts.append.bind(artifacts);
+      artifacts.append = async (artifact) => {
+        await originalAppend(artifact);
+        if (!injected && artifact.kind === "Investigation") {
+          injected = true;
+          throw new Error("fault after durable Investigation append");
+        }
+      };
+
+      await assert.rejects(
+        investigateWorkItem({ intent: intentArtifact, cwd: process.cwd() }, deps),
+        /fault after durable Investigation append/,
+      );
+      const durableInvestigation = artifacts.artifacts.find(
+        (artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation",
+      );
+      assert.ok(durableInvestigation);
+
+      const recover = async () => {
+        const recoveredRuns = new InMemoryRunRepository();
+        const recoveredRun = await investigatingRun(intentArtifact, recoveredRuns);
+        return resumeInvestigationWorkItem({
+          run: recoveredRun,
+          intent: intentArtifact,
+          investigation: durableInvestigation,
+          cwd: process.cwd(),
+        }, { ...deps, runs: recoveredRuns });
+      };
+      const recovered = await recover();
+      assert.equal(recovered.run.state, outcome === "confirmed" ? "preparing" : outcome === "invalid" ? "invalid" : "decomposed");
+      assert.equal(runtime.tasks.length, 1, `${outcome} recovery must not replay the investigator`);
+
+      if (outcome !== "confirmed") {
+        const retried = await recover();
+        assert.equal(retried.outcome?.id, recovered.outcome?.id);
+        assert.equal(artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome").length, 1);
+      }
+    }
   });
 });

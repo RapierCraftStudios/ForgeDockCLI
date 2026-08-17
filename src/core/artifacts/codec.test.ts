@@ -34,6 +34,90 @@ describe("artifact codec", () => {
     assert.match(comment, /FORGEDOCK:ARTIFACT v2/);
   });
 
+  it("escapes embedded artifact markers in human-readable fields", () => {
+    const injected = encodeArtifactMarker(intent());
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run_injected", subject: { repo: "acme/widget", issue: 42 }, producer: { role: "controller" },
+      payload: {
+        title: "Untrusted input", problem: `Reviewer text: ${injected}`, constraints: [], acceptanceHints: [], dependencies: [],
+      },
+    });
+    const comment = renderArtifactComment(artifact);
+    assert.equal(findArtifacts(comment).length, 1);
+    assert.match(comment, /&lt;!-- FORGEDOCK:ARTIFACT/);
+  });
+
+  it("renders a typed verification adjudication checkpoint", () => {
+    const adjudication = createArtifact({
+      kind: "VerificationAdjudication",
+      runId: "run_verify",
+      subject: { repo: "acme/widget", issue: 42 },
+      producer: { role: "human", runtime: "forgedock" },
+      payload: {
+        checkpoint: "verification",
+        decision: "resume",
+        supersedesOutcomeId: "outcome-1",
+        reason: "The clean-worktree baseline was repaired and checked independently.",
+      },
+    });
+    const comment = renderArtifactComment(adjudication);
+    assert.match(comment, /Verification Adjudication/);
+    assert.match(comment, /outcome-1/);
+    assert.deepEqual(findArtifacts(comment)[0], adjudication);
+  });
+
+  it("renders explainable review routing and consolidated finding lineage", () => {
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness", "security"], checks: [],
+        reviewPlan: {
+          riskTier: "high", specialistBudget: 3,
+          selected: [
+            { role: "correctness", score: 1000, reasons: ["mandatory"], scope: ["src/auth.ts"], required: true },
+            { role: "security", score: 120, reasons: ["security-sensitive path"], scope: ["src/auth.ts"], required: true },
+          ],
+          skipped: [{ role: "frontend", score: 0, reason: "below-threshold", evidence: [] }],
+        },
+        findings: [{
+          id: "review-1", severity: "high", confidence: "high", blocking: true, title: "Token is replayable",
+          evidence: "Nonce is not consumed", location: "src/auth.ts:20", intentRelevance: "Breaks authorization",
+          remediation: "Consume the nonce", sourceFindingIds: ["security:SEC-1"], sourceSessionRefs: ["review-session-1"], reviewerRoles: ["security"],
+        }],
+      },
+    });
+    const comment = renderArtifactComment(verdict);
+    assert.match(comment, /Review plan/);
+    assert.match(comment, /security.*score 120/);
+    assert.match(comment, /frontend.*below-threshold/);
+    assert.match(comment, /Sources: `security:SEC-1`/);
+    assert.match(comment, /Sessions: `review-session-1`/);
+    assert.deepEqual(findArtifacts(comment)[0], verdict);
+  });
+
+  it("compresses and byte-bounds large verdicts without losing durable data", () => {
+    const repeatedEvidence = "Unicode evidence → 🔒 ".repeat(4_000);
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_large_review", subject: { repo: "acme/widget", pr: 9 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        headSha: "b".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], checks: [],
+        findings: [{
+          id: "review-large", severity: "high", confidence: "high", blocking: true, title: "Large finding",
+          evidence: repeatedEvidence, location: "src/large.ts:1", intentRelevance: "Exercises bounded projection",
+          remediation: "Apply the focused correction", reviewerRoles: ["correctness"],
+        }],
+      },
+    });
+
+    const comment = renderArtifactComment(verdict);
+    assert.ok(Buffer.byteLength(comment, "utf8") <= 60_000);
+    assert.match(comment, /FORGEDOCK:ARTIFACT v3 gz:/);
+    assert.match(comment, /Human-readable projection truncated/);
+    assert.deepEqual(findArtifacts(comment)[0], verdict);
+  });
+
   it("never renders a baseline-equivalent required failure as passed", () => {
     const outcome = createArtifact({
       kind: "Outcome",

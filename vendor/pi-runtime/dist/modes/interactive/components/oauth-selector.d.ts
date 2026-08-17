@@ -24,7 +24,7 @@ export declare class OAuthSelectorComponent extends Container implements Focusab
     private onSelectCallback;
     private onCancelCallback;
     private showAuthTypeLabels;
-    constructor(mode: "login" | "logout", providers: AuthSelectorProvider[], onSelect: (providerId: string, authType: AuthSelectorProvider["authType"]) => void, onCancel: () => void, initialSearchInput?: string);
+    constructor(mode: "login" | "logout", providers: AuthSelectorProvider[], onSelect: (providerId: string, authType: AuthSelectorProvider["authType"]) => void, onCancel: () => void, initialSearchInput?: string, titleOverride?: string);
     private filterProviders;
     private updateList;
     private formatStatusIndicator;

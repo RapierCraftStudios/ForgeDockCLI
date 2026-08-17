@@ -12,6 +12,10 @@ export interface VerificationCommand {
   cwd: string;
   timeoutMs: number;
   required: boolean;
+  /** Stable verification-plan identity shared by baseline and changed runs. */
+  planId?: string;
+  /** Commands covered transitively by another selected script; do not execute twice. */
+  coveredBy?: readonly string[];
 }
 
 export interface VerificationRunner {

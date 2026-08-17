@@ -20,6 +20,17 @@ export const ProducerSchema = Type.Object({
   model: Type.Optional(NonEmptyString),
 });
 
+export const BatchMemberContractPayloadSchema = Type.Object({
+  issue: Type.Integer({ minimum: 1 }),
+  repository: Type.Optional(NonEmptyString),
+  title: NonEmptyString,
+  acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
+  affectedFiles: Type.Array(NonEmptyString, { minItems: 1 }),
+  claims: Type.Array(NonEmptyString, { minItems: 1 }),
+  riskClass: Type.Union([Type.Literal("routine"), Type.Literal("security"), Type.Literal("auth"), Type.Literal("billing")]),
+  sourceIssueUrl: Type.Optional(Type.String()),
+});
+
 export const IntentPayloadSchema = Type.Object({
   title: NonEmptyString,
   problem: NonEmptyString,
@@ -27,6 +38,7 @@ export const IntentPayloadSchema = Type.Object({
   constraints: Type.Array(Type.String()),
   acceptanceHints: Type.Array(Type.String()),
   dependencies: Type.Array(Type.String()),
+  batchMemberContracts: Type.Optional(Type.Array(BatchMemberContractPayloadSchema)),
   sourceUrl: Type.Optional(Type.String()),
   conversation: Type.Optional(Type.Array(Type.Object({
     author: NonEmptyString,
@@ -64,6 +76,26 @@ export const InvestigationPayloadSchema = Type.Object({
   }), { minItems: 2 })),
 });
 
+export const ControllerVerificationGateIdSchema = Type.Union([
+  Type.Literal("staging-review"),
+  Type.Literal("workflow-lifecycle"),
+  Type.Literal("review-aggregation"),
+  Type.Literal("publication"),
+  Type.Literal("merge-closure"),
+]);
+
+export const ControllerVerificationGateSchema = Type.Object({
+  id: ControllerVerificationGateIdSchema,
+  description: NonEmptyString,
+});
+
+export const VerificationRequirementSchema = Type.Object({
+  kind: Type.Union([Type.Literal("command"), Type.Literal("controller-gate")]),
+  id: NonEmptyString,
+  criterionIds: Type.Array(Type.String({ pattern: "^criterion-[1-9][0-9]*$" }), { minItems: 1 }),
+  rationale: NonEmptyString,
+});
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -74,6 +106,10 @@ export const BuildPacketPayloadSchema = Type.Object({
   implementationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
   expectedPaths: Type.Array(NonEmptyString),
   verificationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
+  /** Typed controller-owned gates; legacy prose remains readable for old packets. */
+  controllerGates: Type.Optional(Type.Array(ControllerVerificationGateSchema)),
+  /** Additive typed verification references for new packets. */
+  verificationRequirements: Type.Optional(Type.Array(VerificationRequirementSchema, { minItems: 1 })),
   risks: Type.Array(Type.Object({
     risk: NonEmptyString,
     mitigation: NonEmptyString,
@@ -83,12 +119,19 @@ export const BuildPacketPayloadSchema = Type.Object({
 
 export const CheckResultSchema = Type.Object({
   command: NonEmptyString,
+  planId: Type.Optional(NonEmptyString),
+  coveredBy: Type.Optional(Type.Array(NonEmptyString)),
   status: Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("skipped")]),
   exitCode: Type.Optional(Type.Integer()),
   durationMs: Type.Integer({ minimum: 0 }),
   outputDigest: Type.Optional(Type.String()),
   summary: Type.Optional(Type.String()),
   failureSignatures: Type.Optional(Type.Array(NonEmptyString)),
+  failureClass: Type.Optional(Type.Union([
+    Type.Literal("command"),
+    Type.Literal("infrastructure"),
+    Type.Literal("timeout"),
+  ])),
   baselineStatus: Type.Optional(Type.Union([Type.Literal("passed"), Type.Literal("failed"), Type.Literal("skipped")])),
   baselineFailureSignatures: Type.Optional(Type.Array(NonEmptyString)),
   regression: Type.Optional(Type.Boolean()),
@@ -96,7 +139,11 @@ export const CheckResultSchema = Type.Object({
 
 export const BuildResultPayloadSchema = Type.Object({
   branch: NonEmptyString,
+  targetBranch: Type.Optional(NonEmptyString),
+  promotionTarget: Type.Optional(NonEmptyString),
+  productionTarget: Type.Optional(NonEmptyString),
   headSha: Sha,
+  baseSha: Type.Optional(Sha),
   changedPaths: Type.Array(NonEmptyString),
   summary: NonEmptyString,
   acceptanceEvidence: Type.Array(Type.Object({
@@ -109,6 +156,33 @@ export const BuildResultPayloadSchema = Type.Object({
   residualRisks: Type.Array(Type.String()),
 });
 
+/**
+ * Controller-verifiable impact evidence for a review finding. This remains
+ * optional on durable findings so older verdicts can be decoded, but the
+ * current reviewer prompt asks every new finding to provide it. Impact-gated
+ * projection fails closed when the declaration is absent or incomplete.
+ */
+export const FindingImpactSchema = Type.Object({
+  category: Type.Union([
+    Type.Literal("correctness"),
+    Type.Literal("security"),
+    Type.Literal("data-integrity"),
+    Type.Literal("availability"),
+    Type.Literal("performance"),
+    Type.Literal("compatibility"),
+    Type.Literal("operability"),
+    Type.Literal("test-gap"),
+    Type.Literal("advisory"),
+  ]),
+  /** Concrete trigger or input sequence that exposes the concern. */
+  trigger: NonEmptyString,
+  /** Invariant, acceptance criterion, or boundary that the trigger violates. */
+  affectedInvariant: NonEmptyString,
+  /** Observable consequence if the trigger occurs. */
+  consequence: NonEmptyString,
+});
+export type FindingImpact = Static<typeof FindingImpactSchema>;
+
 export const FindingSchema = Type.Object({
   id: NonEmptyString,
   severity: Type.Union([
@@ -120,14 +194,122 @@ export const FindingSchema = Type.Object({
   confidence: Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
   blocking: Type.Boolean(),
   title: NonEmptyString,
+  /** Stable reviewer-proposed failure-mode label used only after controller normalization. */
+  causalRoot: Type.Optional(NonEmptyString),
+  /** Stable controller-normalized root identity used for projection adoption. */
+  normalizedRoot: Type.Optional(NonEmptyString),
   evidence: NonEmptyString,
   location: Type.Optional(NonEmptyString),
   intentRelevance: NonEmptyString,
   remediation: NonEmptyString,
+  /** Structured impact declaration added by the current reviewer contract. */
+  impact: Type.Optional(FindingImpactSchema),
+  /** Controller-verifiable anchor proposed by a reviewer; prose alone is never an anchor. */
+  evidenceAnchor: Type.Optional(Type.Object({
+    kind: Type.Union([
+      Type.Literal("repository-location"),
+      Type.Literal("delivery-authority"),
+      Type.Literal("deterministic-check"),
+    ]),
+    reference: NonEmptyString,
+  })),
+  sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  /** Reviewer-declared semantic relationship to the frozen Build Packet. */
+  scopeDisposition: Type.Optional(Type.Union([
+    Type.Literal("in_scope"), Type.Literal("follow_up"), Type.Literal("rejected"),
+  ])),
+  scopeRationale: Type.Optional(NonEmptyString),
+  matchedAcceptanceCriteria: Type.Optional(Type.Array(NonEmptyString)),
+  matchedPriorFindingIds: Type.Optional(Type.Array(NonEmptyString)),
+  introducedByRemediation: Type.Optional(Type.Boolean()),
+});
+
+const ReviewerRoleSchema = Type.Union([
+  Type.Literal("correctness"), Type.Literal("security"), Type.Literal("data"),
+  Type.Literal("api-compatibility"), Type.Literal("frontend"), Type.Literal("infrastructure"), Type.Literal("concurrency"),
+]);
+const SpecialistReviewerRoleSchema = Type.Union([
+  Type.Literal("security"), Type.Literal("data"), Type.Literal("api-compatibility"),
+  Type.Literal("frontend"), Type.Literal("infrastructure"), Type.Literal("concurrency"),
+]);
+
+const ReviewCapabilityIdSchema = Type.Union([
+  Type.Literal("acceptance-correctness"), Type.Literal("security"), Type.Literal("data-integrity"),
+  Type.Literal("api-compatibility"), Type.Literal("frontend"), Type.Literal("release"), Type.Literal("concurrency"),
+]);
+const ReviewCapabilitySchema = Type.Object({
+  id: ReviewCapabilityIdSchema,
+  score: Type.Integer({ minimum: 0 }),
+  reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+  scope: Type.Array(NonEmptyString),
+  required: Type.Boolean(),
+});
+
+export const ReviewPlanSchema = Type.Object({
+  /** Current identity fields remain optional so legacy durable verdicts decode. */
+  planId: Type.Optional(NonEmptyString),
+  schemaVersion: Type.Optional(Type.Union([Type.Literal(2), Type.Literal(3)])),
+  context: Type.Optional(Type.Object({
+    runId: NonEmptyString,
+    repo: NonEmptyString,
+    issue: Type.Optional(Type.Integer({ minimum: 1 })),
+    pullRequest: Type.Integer({ minimum: 0 }),
+    packetId: NonEmptyString,
+    packetDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+    deliveryRunId: NonEmptyString,
+    buildResultBranch: NonEmptyString,
+    targetBranch: NonEmptyString,
+    baseSha: Type.Optional(Sha),
+  })),
+  generation: Type.Optional(Type.Integer({ minimum: 1 })),
+  frozen: Type.Optional(Type.Literal(true)),
+  riskTier: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]),
+  budget: Type.Optional(Type.Object({
+    maxSpecialistExecutionGroups: Type.Integer({ minimum: 1, maximum: 6 }),
+    maxLogicalReviewerSessions: Type.Integer({ minimum: 1, maximum: 64 }),
+    maxParallelSessions: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+    maxTurnsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 24 })),
+    maxToolCallsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+    maxAttemptsPerExecutionGroup: Type.Literal(2),
+    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 128 }),
+    maxScopeAdjudicationAttempts: Type.Integer({ minimum: 1, maximum: 2 }),
+    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 130 })),
+  })),
+  capabilities: Type.Optional(Type.Array(ReviewCapabilitySchema, { minItems: 1 })),
+  executionGroups: Type.Optional(Type.Array(Type.Object({
+    id: NonEmptyString,
+    role: ReviewerRoleSchema,
+    capabilities: Type.Array(ReviewCapabilityIdSchema, { minItems: 1 }),
+    score: Type.Integer({ minimum: 0 }),
+    reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+    scope: Type.Array(NonEmptyString),
+    required: Type.Boolean(),
+  }), { minItems: 1 })),
+  specialistBudget: Type.Integer({ minimum: 1, maximum: 6 }),
+  selected: Type.Array(Type.Object({
+    role: ReviewerRoleSchema,
+    score: Type.Integer({ minimum: 0 }),
+    reasons: Type.Array(NonEmptyString, { minItems: 1 }),
+    scope: Type.Array(NonEmptyString),
+    required: Type.Boolean(),
+  }), { minItems: 1 }),
+  skipped: Type.Array(Type.Object({
+    role: SpecialistReviewerRoleSchema,
+    score: Type.Integer({ minimum: 0 }),
+    reason: Type.Union([
+      Type.Literal("below-threshold"), Type.Literal("panel-budget"),
+      Type.Literal("overlapping-coverage"), Type.Literal("grouped-coverage"),
+    ]),
+    evidence: Type.Array(NonEmptyString),
+  })),
 });
 
 export const ReviewVerdictPayloadSchema = Type.Object({
   headSha: Sha,
+  headBranch: Type.Optional(NonEmptyString),
+  baseBranch: Type.Optional(NonEmptyString),
   disposition: Type.Union([
     Type.Literal("approve"),
     Type.Literal("request_changes"),
@@ -136,6 +318,35 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   reviewerRoles: Type.Array(NonEmptyString, { minItems: 1 }),
   findings: Type.Array(FindingSchema),
   checks: Type.Array(CheckResultSchema),
+  reviewPlan: Type.Optional(ReviewPlanSchema),
+  scopeAdjudication: Type.Optional(Type.Object({
+    sessionRef: NonEmptyString,
+    decisions: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      disposition: Type.Union([Type.Literal("accept"), Type.Literal("follow_up"), Type.Literal("reject")]),
+      rationale: NonEmptyString,
+    })),
+  })),
+  /**
+   * Records the controller's projection decision separately from the review
+   * verdict. This makes shadow/canary comparisons durable without changing
+   * the independent reviewer evidence or legacy verdict shape.
+   */
+  findingProjection: Type.Optional(Type.Object({
+    policy: Type.Union([
+      Type.Literal("all"),
+      Type.Literal("approved-only"),
+      Type.Literal("none"),
+      Type.Literal("impact-gated"),
+      Type.Literal("shadow-impact-gated"),
+    ]),
+    candidateFindingIds: Type.Array(NonEmptyString),
+    materializedFindingIds: Type.Array(NonEmptyString),
+    suppressed: Type.Array(Type.Object({
+      findingId: NonEmptyString,
+      reason: NonEmptyString,
+    })),
+  })),
   supersedes: Type.Optional(NonEmptyString),
 });
 
@@ -149,17 +360,98 @@ export const OutcomePayloadSchema = Type.Object({
     Type.Literal("abandoned"),
   ]),
   reason: NonEmptyString,
+  targetBranch: Type.Optional(NonEmptyString),
+  promotionTarget: Type.Optional(NonEmptyString),
+  productionTarget: Type.Optional(NonEmptyString),
+  /** Invalid outcomes are provisional until the controller proves issue closure. */
+  issueClosure: Type.Optional(Type.Object({
+    status: Type.Union([Type.Literal("pending"), Type.Literal("completed")]),
+    repo: NonEmptyString,
+    issue: Type.Integer({ minimum: 1 }),
+    verifiedAt: Type.Optional(IsoDateTime),
+  })),
   finalSha: Type.Optional(Sha),
+  /** Recoverable merge-admission evidence retained when GitHub checks are not ready. */
+  mergeGate: Type.Optional(Type.Object({
+    pullRequest: Type.Integer({ minimum: 1 }),
+    headSha: Sha,
+    baseBranch: NonEmptyString,
+    mergeable: Type.Boolean(),
+    observedAt: IsoDateTime,
+    requiredChecks: Type.Array(Type.Object({
+      name: NonEmptyString,
+      state: Type.Union([
+        Type.Literal("pending"), Type.Literal("passed"), Type.Literal("failed"),
+        Type.Literal("cancelled"), Type.Literal("unavailable"),
+      ]),
+      detailsUrl: Type.Optional(Type.String()),
+    })),
+  })),
   prUrl: Type.Optional(Type.String()),
   childIssues: Type.Array(Type.String()),
   batchParent: Type.Optional(Type.Integer({ minimum: 1 })),
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,
     workspacePath: NonEmptyString,
+    baseRef: Type.Optional(NonEmptyString),
+    targetBranch: Type.Optional(NonEmptyString),
+    promotionTarget: Type.Optional(NonEmptyString),
+    productionTarget: Type.Optional(NonEmptyString),
+    baseSha: Type.Optional(Sha),
     builderSummary: NonEmptyString,
     changedPaths: Type.Array(NonEmptyString),
+    criterionCoverage: Type.Optional(Type.Array(Type.Object({
+      criterionId: Type.Optional(Type.String({ pattern: "^criterion-[1-9][0-9]*$" })),
+      criterion: NonEmptyString,
+      implementation: NonEmptyString,
+    }))),
+    decisions: Type.Optional(Type.Array(Type.String())),
+    residualRisks: Type.Optional(Type.Array(Type.String())),
+    repairAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
     checks: Type.Array(CheckResultSchema),
   })),
+});
+
+export const VerificationAdjudicationPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("verification"),
+  decision: Type.Literal("resume"),
+  supersedesOutcomeId: NonEmptyString,
+  reason: NonEmptyString,
+});
+
+export const RemediationBlockedPayloadSchema = Type.Object({
+  checkpointKey: NonEmptyString,
+  checkpointSequence: Type.Integer({ minimum: 1 }),
+  status: Type.Union([
+    Type.Literal("awaiting-dispatch"), Type.Literal("children-running"),
+    Type.Literal("ready-to-resume"), Type.Literal("terminal"),
+  ]),
+  parentRunId: NonEmptyString,
+  parentIssue: Type.Integer({ minimum: 1 }),
+  pullRequest: Type.Integer({ minimum: 1 }),
+  headSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  packetArtifactId: NonEmptyString,
+  verdictArtifactId: NonEmptyString,
+  reason: Type.Union([Type.Literal("scope-violation"), Type.Literal("remediation-budget")]),
+  findings: Type.Array(Type.Object({
+    id: NonEmptyString,
+    severity: Type.Union([Type.Literal("critical"), Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
+    title: NonEmptyString,
+    evidence: NonEmptyString,
+    location: Type.Optional(NonEmptyString),
+    remediation: NonEmptyString,
+    acceptanceCriterion: Type.Optional(NonEmptyString),
+  })),
+  childIssues: Type.Array(Type.Integer({ minimum: 1 })),
+  childRunIds: Type.Array(NonEmptyString),
+  approvedPaths: Type.Array(NonEmptyString),
+  childOutcomeIds: Type.Array(NonEmptyString),
+  childFinalShas: Type.Optional(Type.Array(Sha)),
+  remediationDepth: Type.Integer({ minimum: 0 }),
+  maxRemediationDepth: Type.Integer({ minimum: 0 }),
+  maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 
 export const ArtifactPayloadSchemas = {
@@ -169,17 +461,24 @@ export const ArtifactPayloadSchemas = {
   BuildResult: BuildResultPayloadSchema,
   ReviewVerdict: ReviewVerdictPayloadSchema,
   Outcome: OutcomePayloadSchema,
+  VerificationAdjudication: VerificationAdjudicationPayloadSchema,
+  RemediationBlocked: RemediationBlockedPayloadSchema,
 } as const satisfies Record<string, TSchema>;
 
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
 export type Subject = Static<typeof SubjectSchema>;
 export type Producer = Static<typeof ProducerSchema>;
+export type BatchMemberContractPayload = Static<typeof BatchMemberContractPayloadSchema>;
 export type IntentPayload = Static<typeof IntentPayloadSchema>;
 export type InvestigationPayload = Static<typeof InvestigationPayloadSchema>;
 export type BuildPacketPayload = Static<typeof BuildPacketPayloadSchema>;
+export type ControllerVerificationGate = Static<typeof ControllerVerificationGateSchema>;
+export type VerificationRequirement = Static<typeof VerificationRequirementSchema>;
 export type BuildResultPayload = Static<typeof BuildResultPayloadSchema>;
 export type ReviewVerdictPayload = Static<typeof ReviewVerdictPayloadSchema>;
 export type OutcomePayload = Static<typeof OutcomePayloadSchema>;
+export type VerificationAdjudicationPayload = Static<typeof VerificationAdjudicationPayloadSchema>;
+export type RemediationBlockedPayload = Static<typeof RemediationBlockedPayloadSchema>;
 
 export interface ArtifactPayloadByKind {
   Intent: IntentPayload;
@@ -188,6 +487,8 @@ export interface ArtifactPayloadByKind {
   BuildResult: BuildResultPayload;
   ReviewVerdict: ReviewVerdictPayload;
   Outcome: OutcomePayload;
+  VerificationAdjudication: VerificationAdjudicationPayload;
+  RemediationBlocked: RemediationBlockedPayload;
 }
 
 export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends ArtifactKind ? {

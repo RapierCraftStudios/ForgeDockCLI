@@ -1,6 +1,6 @@
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
-import { existsSync } from "fs";
-import { join } from "path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, getAgentDir, getSettingsPath, PACKAGE_NAME } from "../config.js";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.js";
 import { KeybindingsManager } from "../core/keybindings.js";
@@ -85,9 +85,22 @@ async function clearStartupTui(ui) {
  * rather than settings.json because theme settings are persisted before
  * provider authentication and model selection finish.
  */
-export function shouldRunFirstTimeSetup(settingsPath = getSettingsPath(), onboardingPath = join(getAgentDir(), "onboarding.json")) {
+function hasStoredCredentials(authPath = join(getAgentDir(), "auth.json")) {
+    try {
+        const parsed = JSON.parse(readFileSync(authPath, "utf8"));
+        return (typeof parsed === "object" &&
+            parsed !== null &&
+            Object.values(parsed).some((value) => typeof value === "object" && value !== null && "type" in value && typeof value.type === "string"));
+    }
+    catch {
+        return false;
+    }
+}
+export function shouldRunFirstTimeSetup(settingsPath = getSettingsPath(), onboardingPath = join(getAgentDir(), "onboarding.json"), authPath = join(getAgentDir(), "auth.json")) {
     if (APP_NAME === "forgedock") {
-        return !existsSync(onboardingPath);
+        // A stored credential is enough to resume normally after an interrupted
+        // onboarding flow; never force OAuth again just because the receipt is absent.
+        return !existsSync(onboardingPath) && !hasStoredCredentials(authPath);
     }
     if (!isOfficialDistribution({
         packageName: PACKAGE_NAME,
@@ -128,11 +141,13 @@ export async function showFirstTimeSetup(settingsManager) {
     const ui = await createStartupTui(settingsManager);
     return new Promise((resolve) => {
         let settled = false;
+        let component;
         const finish = async (result) => {
             if (settled) {
                 return;
             }
             settled = true;
+            component?.dispose();
             if (result) {
                 settingsManager.setTheme(result.theme);
                 settingsManager.setEnableAnalytics(result.shareAnalytics);
@@ -146,12 +161,13 @@ export async function showFirstTimeSetup(settingsManager) {
             ui.start();
             const detectedTheme = await detectTerminalThemeForAuto({ ui, timeoutMs: 100 });
             setTheme(detectedTheme);
-            const component = new FirstTimeSetupComponent({
+            component = new FirstTimeSetupComponent({
                 detectedTheme,
                 onThemePreview: (themeName) => {
                     setTheme(themeName);
                     ui.requestRender();
                 },
+                onRender: () => ui.requestRender(),
                 onSubmit: (result) => void finish(result),
                 onCancel: () => void finish(undefined),
             });

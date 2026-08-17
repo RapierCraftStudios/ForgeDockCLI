@@ -1,18 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { BatchMemberContractPayload } from "../../core/artifacts/schema.js";
 import type { ScheduledWorkItem } from "./scheduler.js";
 
-export type BatchRiskClass = "routine" | "security" | "auth" | "billing";
+export type BatchRiskClass = BatchMemberContractPayload["riskClass"];
+export type BatchMemberContract = BatchMemberContractPayload;
 
 export interface BatchableWorkItem extends ScheduledWorkItem {
   title: string;
   summary: string;
   labels: readonly string[];
   affectedFiles: readonly string[];
+  acceptanceCriteria?: readonly string[];
+  repository?: string;
+  /** Alias accepted at the boundary when an issue plan calls it `repo`. */
+  repo?: string;
+  targetBranch?: string;
+  lane?: "fast" | "feature";
+  promotionTarget?: string;
+  productionTarget?: string;
+  urgencyTier?: "urgent" | "normal";
+  milestone?: string | { number?: number; title: string };
   sourcePullRequest?: number;
+  sourceIssueUrl?: string;
   defectClass?: string;
   riskClass?: BatchRiskClass;
   memberIssues?: readonly number[];
+  memberContract?: BatchMemberContract;
 }
 
 export interface IssueBatchGroup {
@@ -86,11 +100,11 @@ export function planIssueBatches(items: readonly BatchableWorkItem[]): IssueBatc
   return { groups, ungrouped: [...remaining.values()], excluded };
 }
 
-export function batchExclusionReason(item: BatchableWorkItem): string | undefined {
+export function batchExclusionReason(item: BatchableWorkItem, options: { allowOrdinary?: boolean } = {}): string | undefined {
   if (item.memberIssues?.length && item.memberIssues.length > 1) return "already-batched";
-  if (!item.labels.includes("review-finding")) return "not-review-finding";
   const priority = priorityFromLabels(item.labels);
-  if (priority !== "P2" && priority !== "P3") return "urgency";
+  if (!options.allowOrdinary && !item.labels.includes("review-finding")) return "not-review-finding";
+  if (!options.allowOrdinary && priority !== "P2" && priority !== "P3") return "urgency";
   if (item.labels.some((label) => ["needs-human", "blocked", "operator-only", "batch"].includes(label))) return "human-or-batch-state";
   if (!item.affectedFiles.length) return "no-affected-file";
   const risk = item.riskClass ?? "routine";
@@ -124,12 +138,18 @@ export function contractBatchGroups(
       issue: issue.issue,
       title: issue.title,
       summary: issue.summary,
+      ...(group.members[0]?.repository !== undefined ? { repository: group.members[0].repository } : group.members[0]?.repo !== undefined ? { repo: group.members[0].repo } : {}),
       priority: Math.min(...group.members.map((member) => member.priority)),
       dependencies,
       claims,
       labels,
       affectedFiles,
       riskClass: group.riskClass,
+      ...(group.members[0]?.targetBranch !== undefined ? { targetBranch: group.members[0].targetBranch } : {}),
+      ...(group.members[0]?.lane !== undefined ? { lane: group.members[0].lane } : {}),
+      ...(group.members[0]?.promotionTarget !== undefined ? { promotionTarget: group.members[0].promotionTarget } : {}),
+      ...(group.members[0]?.productionTarget !== undefined ? { productionTarget: group.members[0].productionTarget } : {}),
+      ...(group.members[0]?.milestone !== undefined ? { milestone: group.members[0].milestone } : {}),
       memberIssues: uniqueNumbers(memberIssues),
     });
   }
@@ -148,10 +168,12 @@ export function contractBatchGroups(
 
 export function renderBatchIssueBody(group: IssueBatchGroup): string {
   const members = group.members.flatMap((member) => member.memberIssues?.length ? [...member.memberIssues] : [member.issue]);
+  const contracts = group.members.map(memberContract).map((contract) => JSON.stringify(contract));
+  const contractJson = JSON.stringify({ members: contracts.map((value) => JSON.parse(value)) });
   return [
     "## Problem",
     "",
-    `Deliver ${members.length} compatible P2/P3 review findings as one verified work unit to reduce repeated investigation, build, verification, and review overhead.`,
+    `Deliver ${members.length} compatible work items as one verified work unit to reduce repeated investigation, build, verification, and review overhead.`,
     "",
     "## Member Findings",
     "",
@@ -162,6 +184,10 @@ export function renderBatchIssueBody(group: IssueBatchGroup): string {
       `  - Affected files: ${member.affectedFiles.map((file) => `\`${escapeCode(file)}\``).join(", ") || "not declared"}`,
     ]),
     "<!-- /FORGE:BATCH_MEMBERS -->",
+    "",
+    "<!-- FORGEDOCK:BATCH_CONTRACT:v1 -->",
+    contractJson,
+    "<!-- /FORGEDOCK:BATCH_CONTRACT:v1 -->",
     "",
     "## Affected Surface",
     "",
@@ -179,10 +205,69 @@ export function renderBatchIssueBody(group: IssueBatchGroup): string {
   ].join("\n");
 }
 
+export function parseBatchContract(body: string): BatchMemberContract[] {
+  const matches = [...body.matchAll(/<!-- FORGEDOCK:BATCH_CONTRACT:v1 -->([\s\S]*?)<!-- \/FORGEDOCK:BATCH_CONTRACT:v1 -->/g)];
+  if (matches.length !== 1) throw new Error("Batch body must contain exactly one FORGEDOCK:BATCH_CONTRACT:v1 block");
+  let parsed: unknown;
+  try { parsed = JSON.parse(matches[0]?.[1]?.trim() ?? ""); }
+  catch (error) { throw new Error("Batch contract contains invalid JSON", { cause: error }); }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { members?: unknown }).members)) {
+    throw new Error("Batch contract must contain a members array");
+  }
+  const members: BatchMemberContract[] = [];
+  const seen = new Set<number>();
+  for (const value of (parsed as { members: unknown[] }).members) {
+    if (!value || typeof value !== "object") throw new Error("Batch contract member must be an object");
+    const member = value as Record<string, unknown>;
+    const issue = member.issue;
+    if (typeof issue !== "number" || !Number.isSafeInteger(issue) || issue < 1 || seen.has(issue)) {
+      throw new Error(`Batch contract contains a duplicated or invalid issue: ${String(issue)}`);
+    }
+    const arrays = ["acceptanceCriteria", "affectedFiles", "claims"] as const;
+    for (const key of arrays) {
+      if (!Array.isArray(member[key]) || member[key].some((item) => typeof item !== "string" || !item.trim())) {
+        throw new Error(`Batch contract member #${issue} has invalid ${key}`);
+      }
+    }
+    if (typeof member.title !== "string" || !member.title.trim()) throw new Error(`Batch contract member #${issue} has no title`);
+    if (!["routine", "security", "auth", "billing"].includes(String(member.riskClass))) throw new Error(`Batch contract member #${issue} has invalid riskClass`);
+    const allowed = new Set(["issue", "repository", "title", "acceptanceCriteria", "affectedFiles", "claims", "riskClass", "sourceIssueUrl"]);
+    if (Object.keys(member).some((key) => !allowed.has(key))) throw new Error(`Batch contract member #${issue} contains unsupported fields`);
+    seen.add(issue);
+    members.push({
+      issue,
+      ...(typeof member.repository === "string" ? { repository: member.repository } : {}),
+      title: member.title,
+      acceptanceCriteria: member.acceptanceCriteria as string[],
+      affectedFiles: member.affectedFiles as string[],
+      claims: member.claims as string[],
+      riskClass: member.riskClass as BatchRiskClass,
+      ...(typeof member.sourceIssueUrl === "string" ? { sourceIssueUrl: member.sourceIssueUrl } : {}),
+    });
+  }
+  if (members.length < 2) throw new Error("Batch contract must contain at least two unique members");
+  if (body.includes("<!-- FORGE:BATCH_MEMBERS -->")) {
+    const declared = parseBatchMemberIssues(body);
+    const contracted = members.map((member) => member.issue).sort((left, right) => left - right);
+    if (declared.join(",") !== contracted.join(",")) throw new Error("Batch member checklist and machine contract disagree");
+  }
+  return members;
+}
+
 export function affectedFilesFromIssueBody(body: string): string[] {
   const section = /^#{2,3}\s+(?:Affected Files|Deliverables|Files to change)\s*$([\s\S]*?)(?=^#{1,3}\s+|(?![\s\S]))/im.exec(body)?.[1] ?? "";
   const backticked = [...section.matchAll(/`([^`\r\n]+)`/g)].map((match) => match[1]!.trim());
-  return unique(backticked.filter((path) => /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.@+-]+)+$/.test(path)));
+  return unique(backticked.map(normalizeAffectedPath).filter((path): path is string => path !== undefined));
+}
+
+function normalizeAffectedPath(value: string): string | undefined {
+  const path = value.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/:\d+(?::\d+)?$/, "").replace(/\/$/, "").trim();
+  if (!path || path === "." || path.startsWith("/") || /^[A-Za-z]:\//.test(path) || path.includes(":")) return undefined;
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined;
+  const globIndex = path.search(/[*?[{]/);
+  if (globIndex >= 0 && !path.slice(0, globIndex).replace(/\/$/, "")) return undefined;
+  return path;
 }
 
 export function inferBatchRiskClass(title: string, body: string, labels: readonly string[]): BatchRiskClass {
@@ -194,14 +279,34 @@ export function inferBatchRiskClass(title: string, body: string, labels: readonl
 }
 
 export function parseBatchMemberIssues(body: string): number[] {
-  const section = /<!-- FORGE:BATCH_MEMBERS -->([\s\S]*?)<!-- \/FORGE:BATCH_MEMBERS -->/.exec(body)?.[1] ?? "";
-  return uniqueNumbers([...section.matchAll(/^\s*- \[[ xX]\] #(\d+)\b/gm)].map((match) => Number(match[1])))
-    .filter((number) => Number.isSafeInteger(number) && number > 0)
-    .slice(0, MAX_ROUTINE_MEMBERS);
+  const matches = [...body.matchAll(/<!-- FORGE:BATCH_MEMBERS -->([\s\S]*?)<!-- \/FORGE:BATCH_MEMBERS -->/g)];
+  if (!matches.length) return [];
+  if (matches.length !== 1) throw new Error("Batch body must contain exactly one FORGE:BATCH_MEMBERS block");
+  const section = matches[0]?.[1] ?? "";
+  const values = [...section.matchAll(/^\s*- \[[ xX]\] #(\d+)\b/gm)].map((match) => Number(match[1]));
+  if (!values.length) throw new Error("Batch member block contains no issue numbers");
+  if (values.some((number) => !Number.isSafeInteger(number) || number < 1)) throw new Error("Batch member block contains an invalid issue number");
+  const unique = uniqueNumbers(values);
+  if (unique.length !== values.length) throw new Error("Batch member block contains duplicate issue numbers");
+  if (unique.length > MAX_ROUTINE_MEMBERS) throw new Error(`Batch member block exceeds ${MAX_ROUTINE_MEMBERS} members`);
+  return unique;
 }
 
 export function batchMarker(members: readonly number[]): string {
   return uniqueNumbers(members).sort((left, right) => left - right).join("-");
+}
+
+function memberContract(member: BatchableWorkItem): BatchMemberContract {
+  return {
+    issue: member.issue,
+    ...(member.repository ?? member.repo ? { repository: member.repository ?? member.repo } : {}),
+    title: escapeText(member.title, 500),
+    acceptanceCriteria: [...(member.acceptanceCriteria ?? [member.summary])].map((value) => escapeText(value, 1_000)).slice(0, 12),
+    affectedFiles: [...member.affectedFiles].map((value) => escapeCode(value)).slice(0, 50),
+    claims: [...member.claims].map((value) => escapeText(value, 300)).slice(0, 50),
+    riskClass: member.riskClass ?? "routine",
+    ...(member.sourceIssueUrl ? { sourceIssueUrl: member.sourceIssueUrl.slice(0, 500) } : {}),
+  };
 }
 
 function priorityFromLabels(labels: readonly string[]): string | undefined {

@@ -27,7 +27,6 @@ export class ProcessVerificationRunner implements VerificationRunner {
         if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted");
         const result = await runOne(command, this.#environment, signal);
         results.push(result);
-        if (command.required && result.status === "failed") break;
       }
       return results;
     } finally {
@@ -97,8 +96,9 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CheckResult> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const started = performance.now();
+    let settled = false;
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
       env: verificationEnvironment(environment),
@@ -124,22 +124,42 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
     }, spec.timeoutMs);
     const abort = terminate;
     signal?.addEventListener("abort", abort, { once: true });
-    child.on("error", (error) => {
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      reject(error);
+      const durationMs = Math.max(0, Math.round(performance.now() - started));
+      const errorCode = error.code ?? error.name ?? "spawn-error";
+      const summary = `Failed to start verification command (${errorCode})`;
+      resolve({
+        command: [spec.command, ...spec.args].join(" "),
+        ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
+        status: "failed",
+        failureClass: "infrastructure",
+        durationMs,
+        outputDigest: createHash("sha256").update(summary).digest("hex"),
+        summary,
+        failureSignatures: [summary],
+      });
     });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      const output = Buffer.concat(chunks).toString("utf8");
+      const output = redactVerificationOutput(Buffer.concat(chunks).toString("utf8"));
       const durationMs = Math.max(0, Math.round(performance.now() - started));
       const status = code === 0 && !timedOut ? "passed" as const : "failed" as const;
       const summary = summarize(output, timedOut, status);
       const failureSignatures = status === "failed" ? extractFailureSignatures(output, timedOut) : [];
       resolve({
         command: [spec.command, ...spec.args].join(" "),
+        ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
         status,
+        ...(status === "failed" ? {
+          failureClass: timedOut ? ("timeout" as const) : ("command" as const),
+        } : {}),
         ...(typeof code === "number" ? { exitCode: code } : {}),
         durationMs,
         outputDigest: createHash("sha256").update(output).digest("hex"),
@@ -162,7 +182,7 @@ function terminateProcessTree(child: ChildProcess): void {
       shell: false,
       windowsHide: true,
     });
-    if (result.error) child.kill();
+    if (!windowsTaskkillSucceeded(result)) child.kill();
     return;
   }
   try {
@@ -174,6 +194,23 @@ function terminateProcessTree(child: ChildProcess): void {
     try { process.kill(-pid, "SIGKILL"); } catch { /* process group already exited */ }
   }, 2_000);
   force.unref();
+}
+
+/** A launched taskkill process can fail without populating `error`; its exit status is authoritative. */
+export function windowsTaskkillSucceeded(result: { error?: Error; status: number | null }): boolean {
+  return result.error === undefined && result.status === 0;
+}
+
+function redactVerificationOutput(output: string): string {
+  return output
+    .replace(/(?:\x1b\[|\u009b)[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/(?:\x1b\]|\u009d)[\s\S]*?(?:\x07|\x1b\\|\u009c)/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "")
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,})\b/gi, "[REDACTED_TOKEN]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_JWT]")
+    .replace(/\b([A-Za-z0-9_]*(?:token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)[A-Za-z0-9_]*)\s*[:=]\s*[^\s|]+/gi, "$1=[REDACTED]");
 }
 
 function summarize(output: string, timedOut: boolean, status: "passed" | "failed"): string {

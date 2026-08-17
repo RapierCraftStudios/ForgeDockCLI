@@ -26,19 +26,21 @@ export class OAuthSelectorComponent extends Container {
     onSelectCallback;
     onCancelCallback;
     showAuthTypeLabels;
-    constructor(mode, providers, onSelect, onCancel, initialSearchInput) {
+    constructor(mode, providers, onSelect, onCancel, initialSearchInput, titleOverride) {
         super();
         this.mode = mode;
         this.allProviders = providers;
         this.filteredProviders = providers;
-        this.showAuthTypeLabels = new Set(providers.map((provider) => provider.authType)).size > 1;
+        // Keep the auth method visible even when a provider only supports one
+        // method; onboarding must never make API-key vs account ambiguous.
+        this.showAuthTypeLabels = true;
         this.onSelectCallback = onSelect;
         this.onCancelCallback = onCancel;
         // Add top border
         this.addChild(new DynamicBorder());
         this.addChild(new Spacer(1));
         // Add title
-        const title = mode === "login" ? "Select provider to configure:" : "Select provider to logout:";
+        const title = titleOverride ?? (mode === "login" ? "Select provider to configure:" : "Select provider to logout:");
         this.addChild(new TruncatedText(theme.fg("accent", theme.bold(title)), 1, 0));
         this.addChild(new Spacer(1));
         this.searchInput = new Input();

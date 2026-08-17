@@ -26,10 +26,18 @@ CLAUDE.md
 # ForgeDock local operational cache (GitHub artifacts remain authoritative)
 .forgedock/state.db
 .forgedock/state.db-*
+.forgedock/lease-witness.json
 .forgedock/worktrees/
 .forgedock/tasks/
 .forgedock/*.jsonl
 .forgedock/*.stderr
+.forgedock/*.ndjson
+.forgedock/*.log
+.forgedock/*.stdout.log
+.forgedock/*.stderr.log
+.forgedock/*.stop
+.forgedock/*.db
+.forgedock/*.db-*
 .forgedock/observations/
 .pi-subagents/
 

@@ -17,6 +17,34 @@ test("run-state projection follows every committed typed transition without owni
   assert.equal((await inner.load(queued.runId))?.state, "investigating");
 });
 
+test("run progress is durable and separate from state-machine versions", async () => {
+  const runs = new InMemoryRunRepository();
+  const queued = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 10 } });
+  await runs.create(queued);
+  await runs.recordProgress({ runId: queued.runId, phase: "session.started", message: "Agent session started", occurredAt: "2026-01-01T00:00:00.000Z" });
+  await runs.recordProgress({ runId: queued.runId, phase: "controller.heartbeat", message: "Lease renewed", occurredAt: "2026-01-01T00:00:01.000Z" });
+  assert.equal((await runs.load(queued.runId))?.version, queued.version);
+  assert.deepEqual(await runs.listProgress(queued.runId), [
+    { runId: queued.runId, phase: "session.started", message: "Agent session started", occurredAt: "2026-01-01T00:00:00.000Z" },
+    { runId: queued.runId, phase: "controller.heartbeat", message: "Lease renewed", occurredAt: "2026-01-01T00:00:01.000Z" },
+  ]);
+});
+
+test("projection retries transient external-view failures before reporting them", async () => {
+  const inner = new InMemoryRunRepository();
+  let attempts = 0;
+  const projected: string[] = [];
+  const runs = new ProjectedRunRepository(inner, async (state) => {
+    attempts += 1;
+    if (attempts < 3) throw new Error("GitHub temporarily unavailable");
+    projected.push(state.state);
+  });
+  const queued = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 9 } });
+  await runs.create(queued);
+  assert.equal(attempts, 3);
+  assert.deepEqual(projected, ["queued"]);
+});
+
 test("projection failure does not roll back authoritative run state", async () => {
   const inner = new InMemoryRunRepository();
   const failures: string[] = [];

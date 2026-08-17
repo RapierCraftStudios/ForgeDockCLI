@@ -11,6 +11,13 @@ export function getProviderLoginHelp() {
 export function formatNoModelsAvailableMessage() {
     return `No models available. ${getProviderLoginHelp()}`;
 }
+/**
+ * Interactive ForgeDock onboarding authenticates the provider after session
+ * creation, so a pre-auth no-model fallback would be stale and misleading.
+ */
+export function modelFallbackMessageForInteractiveStartup(message, forgeDockOnboarding) {
+    return forgeDockOnboarding ? undefined : message;
+}
 export function formatNoModelSelectedMessage() {
     return `No model selected.\n\n${getProviderLoginHelp()}\n\nThen use /model to select a model.`;
 }

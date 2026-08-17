@@ -337,24 +337,26 @@ forgedock models</pre>
     <section id="review">
       <div class="eyebrow">Workflow 2</div>
       <h2><code>review-pr</code>: independent and commit-specific</h2>
-      <p class="section-intro">The current many-agent review machinery should become a small review protocol with risk-based specialist routing.</p>
+      <p class="section-intro">Review is a frozen, budgeted protocol. Controller-observed evidence selects capabilities before execution; reviewer prose can propose findings but cannot create new reviewer nodes.</p>
       <div class="grid three">
-        <div class="card"><span class="num">INPUT</span><h3>Clean review packet</h3><p>Original issue intent, investigation, Build Packet, PR diff, verification evidence, repository policy, and current head SHA.</p></div>
-        <div class="card"><span class="num">PROCESS</span><h3>Fresh role sessions</h3><p>One baseline reviewer is mandatory. Security, data, API, frontend, infrastructure, or other specialists are selected from changed surfaces and risk.</p></div>
-        <div class="card"><span class="num">OUTPUT</span><h3>One typed verdict</h3><p>Every finding includes severity, confidence, evidence, location, intent relevance, remediation, and blocking status.</p></div>
+        <div class="card"><span class="num">INPUT</span><h3>Clean review packet</h3><p>Original issue intent, investigation, Build Packet, PR diff, verification evidence, repository policy, route facts, and current head SHA.</p></div>
+        <div class="card"><span class="num">PLAN</span><h3>Capabilities, then resources</h3><p>Acceptance/correctness is mandatory. Security, data, API, concurrency, frontend, and release capabilities are packed into at most three specialist execution groups by default; overlap may share execution but never removes a required capability. The canonical plan identity binds topology, authority context, and enforced parallel/session/model-call budgets.</p></div>
+        <div class="card"><span class="num">OUTPUT</span><h3>One typed verdict</h3><p>Current findings require severity, confidence, causal root, typed blocker anchor, exact scope lineage, and remediation. The controller derives blocking only from qualifying source attestations; rejected or weak duplicates cannot elevate or corroborate another source.</p></div>
       </div>
       <h3 style="margin-top:24px">Deterministic policy, not reviewer vibes</h3>
       <div class="table-wrap"><table>
         <thead><tr><th>Condition</th><th>Controller response</th></tr></thead>
         <tbody>
           <tr><td>No blocking findings; required checks pass; SHA unchanged</td><td>Approve. Merge only if repository policy permits auto-merge.</td></tr>
-          <tr><td>Actionable in-scope blocking finding</td><td>Enter remediation with only accepted findings; re-run verification; review the new SHA in fresh context.</td></tr>
-          <tr><td>Head SHA changed during review</td><td>Invalidate all outstanding verdicts and restart review at the new head.</td></tr>
-          <tr><td>Finding is speculative, out of scope, or lacks evidence</td><td>Record as non-blocking or reject it; do not expand the build silently.</td></tr>
-          <tr><td>Retry/remediation budget exhausted</td><td>Stop as <code>blocked</code> with a human-readable handoff. Never merge optimistically.</td></tr>
+          <tr><td>High/critical, high-confidence finding with a reviewed-path or verified delivery-authority anchor</td><td>Block when exact acceptance and scope gates also pass. Reviewer blocking booleans are ignored.</td></tr>
+          <tr><td>Medium, high-confidence anchored finding</td><td>Block only with two independent roles or deterministic/reproducible controller evidence.</td></tr>
+          <tr><td>Low confidence, low severity, vague/locationless prose, duplicate root, or obvious out-of-path claim</td><td>Keep non-blocking or reject before any model scope adjudication.</td></tr>
+          <tr><td>Actionable in-scope blocking root</td><td>Enter remediation with the normalized roots in the verdict; re-run verification and review the new SHA in fresh context using the same validated frozen topology. A newly introduced blocker requires an exact prior-SHA delta path or an explicit authority value changed from the prior verdict.</td></tr>
+          <tr><td>Head SHA changed during review</td><td>Invalidate the verdict. Never approve a partial or mixed-SHA wave.</td></tr>
+          <tr><td>A logical reviewer fails after two attempts</td><td>Let siblings settle and preserve valid reports, then stop in a resumable fail-closed state with no partial approval.</td></tr>
         </tbody>
       </table></div>
-      <details><summary>Recommended review roles</summary><div><p><strong>Always:</strong> baseline correctness/intent reviewer plus deterministic repository checks.</p><p><strong>Conditional:</strong> security/auth, persistence/migrations, API compatibility, concurrency, frontend/accessibility, infrastructure/CI, or domain-specific review. Selection is code/config, based on changed paths, diff semantics, Build Packet risks, and repository policy.</p><p><strong>Removed:</strong> a fixed fan-out to every specialist and a large prose orchestrator that asks a model to decide what review means.</p></div></details>
+      <details><summary>Frozen review topology</summary><div><p><strong>Always:</strong> acceptance/correctness plus deterministic repository and delivery-route checks.</p><p><strong>Conditional capabilities:</strong> security/auth, persistence/data, API compatibility, concurrency, frontend/accessibility, and release/infrastructure. Selection uses only changed paths/diff, Build Packet risk, repository policy, and controller route/artifact facts.</p><p><strong>Identity:</strong> the plan hashes every authority-bearing field and records run, repository, PR, Build Packet, and delivery context. Foreign, legacy, or mutated plans are deterministically replanned rather than reused.</p><p><strong>Execution:</strong> capabilities are packed into a hard-bounded set of independent groups. An unexpected domain becomes a finding or verification need—not another reviewer. Retries remain attempts under the same logical group, and total attempts, parallel sessions, model calls, and adjudication attempts are controller-enforced.</p><p><strong>Removed:</strong> fixed fleet fan-out and finding-triggered adaptive reviewer escalation.</p></div></details>
       <details><summary>Independence boundary</summary><div>The reviewer may use the same model family if that is the configured option, but receives a new Pi session, no builder transcript, no builder scratchpad, and no uncommitted workspace state. For high-risk changes, policy may require a different provider/model class as an additional independence measure.</div></details>
     </section>
 
@@ -390,7 +392,7 @@ while (capacity.available && ready.length) {
         <div class="card"><span class="num">02</span><h3>Investigation</h3><p>Outcome, confidence, evidence, root cause, affected surfaces, risk, and decomposition proposal.</p></div>
         <div class="card"><span class="num">03</span><h3>Build Packet</h3><p>Frozen scope, criteria, context/history, implementation plan, verification plan, risks, and out-of-scope items.</p></div>
         <div class="card"><span class="num">04</span><h3>Build Result</h3><p>Branch/SHA, changes, criteria evidence, commands and results, artifacts, decisions, and residual risks.</p></div>
-        <div class="card"><span class="num">05</span><h3>Review Verdict</h3><p>Reviewed SHA, reviewer roles, checks, structured findings, disposition, and freshness metadata.</p></div>
+        <div class="card"><span class="num">05</span><h3>Review Verdict</h3><p>Reviewed SHA, frozen Review Plan identity/generation, required capabilities, bounded execution groups/budget, checks, normalized findings, disposition, and freshness metadata.</p></div>
         <div class="card"><span class="num">06</span><h3>Outcome</h3><p>Merged, invalid, decomposed, blocked, or abandoned; final references, reason, and completion timestamp.</p></div>
       </div>
       <pre aria-label="Legacy v2 example; not protected evidence">{
@@ -400,10 +402,11 @@ while (capacity.available && ready.length) {
   "runId": "run_...",
   "subject": { "repo": "owner/repo", "pr": 167 },
   "createdAt": "ISO-8601",
-  "producer": { "role": "reviewer", "runtime": "pi", "model": "optional-audit-data" },
+  "producer": { "role": "controller", "runtime": "forgedock" },
   "payload": {
     "headSha": "full-sha",
     "disposition": "approve | request_changes | blocked",
+    "reviewPlan": { "planId": "review-plan-...", "generation": 1, "frozen": true, "capabilities": [], "executionGroups": [], "budget": {} },
     "findings": [],
     "checks": [],
     "supersedes": "optional-artifact-id"

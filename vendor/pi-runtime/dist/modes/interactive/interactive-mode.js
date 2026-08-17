@@ -2,7 +2,6 @@
  * Interactive mode for the coding agent.
  * Handles TUI rendering and user interaction, delegating business logic to AgentSession.
  */
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -27,8 +26,9 @@ import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core
 import { getUsageCostBreakdown } from "../../core/usage-totals.js";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard, readClipboardText } from "../../utils/clipboard.js";
-import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
+import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { processImage } from "../../utils/image-process.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { getPiUserAgent } from "../../utils/pi-user-agent.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
@@ -50,10 +50,11 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent, formatTokens } from "./components/footer.js";
-import { renderForgeDockBrand } from "./components/forgedock-header.js";
+import { forgeDockBrandShinePosition, renderForgeDockBrand, shouldAnimateForgeDockBrand, } from "./components/forgedock-header.js";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import { ModelSelectorComponent } from "./components/model-selector.js";
+import { PendingImageAttachments } from "./pending-image-attachments.js";
 import { formatAuthSelectorProviderType, OAuthSelectorComponent, } from "./components/oauth-selector.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
@@ -75,13 +76,19 @@ function isExpandable(obj) {
 class ExpandableText extends Text {
     getCollapsedText;
     getExpandedText;
+    expanded;
     constructor(getCollapsedText, getExpandedText, expanded = false, paddingX = 0, paddingY = 0) {
         super(expanded ? getExpandedText() : getCollapsedText(), paddingX, paddingY);
         this.getCollapsedText = getCollapsedText;
         this.getExpandedText = getExpandedText;
+        this.expanded = expanded;
     }
     setExpanded(expanded) {
-        this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
+        this.expanded = expanded;
+        this.refresh();
+    }
+    refresh() {
+        this.setText(this.expanded ? this.getExpandedText() : this.getCollapsedText());
     }
 }
 function isCustomSessionEntry(item) {
@@ -184,6 +191,10 @@ export class InteractiveMode {
     isInitialized = false;
     onInputCallback;
     pendingUserInputs = [];
+    pendingUserInputImages = [];
+    nextUserInputImages;
+    pendingImageAttachments = new PendingImageAttachments();
+    clipboardPastePending = false;
     activeStatusIndicator = undefined;
     idleStatus = new IdleStatus();
     workingMessage = undefined;
@@ -501,8 +512,9 @@ export class InteractiveMode {
         await this.themeController.applyFromSettings();
         // Add header with keybindings from config (unless silenced)
         if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-            const logo = APP_NAME === "forgedock"
-                ? renderForgeDockBrand(this.version)
+            const animateForgeDockBrand = APP_NAME === "forgedock" && shouldAnimateForgeDockBrand();
+            let logo = APP_NAME === "forgedock"
+                ? renderForgeDockBrand(this.version, animateForgeDockBrand ? forgeDockBrandShinePosition(0) : undefined)
                 : theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
             // Build startup instructions using keybinding hint helpers
             const hint = (keybinding, description) => keyHint(keybinding, description);
@@ -535,14 +547,28 @@ export class InteractiveMode {
                 hint("app.tools.expand", "more"),
             ].join(theme.fg("muted", " · "));
             const compactOnboarding = theme.fg("dim", `Press ${keyText("app.tools.expand")} to show full startup help and loaded resources.`);
-            const onboarding = theme.fg("dim", APP_NAME === "forgedock"
-                ? "GitHub artifacts are durable memory; ForgeDock's typed controller remains authoritative."
-                : "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.");
-            this.builtInHeader = new ExpandableText(() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`, () => `${logo}\n${expandedInstructions}\n\n${onboarding}`, this.getStartupExpansionState(), 1, 0);
+            const onboarding = APP_NAME === "forgedock"
+                ? ""
+                : theme.fg("dim", "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.");
+            const onboardingSuffix = onboarding ? `\n\n${onboarding}` : "";
+            this.builtInHeader = new ExpandableText(() => `${logo}\n${compactInstructions}\n${compactOnboarding}${onboardingSuffix}`, () => `${logo}\n${expandedInstructions}${onboardingSuffix}`, this.getStartupExpansionState(), 1, 0);
             // Setup UI layout
             this.headerContainer.addChild(new Spacer(1));
             this.headerContainer.addChild(this.builtInHeader);
             this.headerContainer.addChild(new Spacer(1));
+            if (animateForgeDockBrand) {
+                const frames = 14;
+                let frame = 0;
+                const shimmerTimer = setInterval(() => {
+                    frame += 1;
+                    logo = renderForgeDockBrand(this.version, frame <= frames ? forgeDockBrandShinePosition(frame, frames) : undefined);
+                    this.builtInHeader instanceof ExpandableText && this.builtInHeader.refresh();
+                    this.ui.requestRender();
+                    if (frame > frames)
+                        clearInterval(shimmerTimer);
+                }, 55);
+                shimmerTimer.unref();
+            }
         }
         else {
             // Minimal header when silenced
@@ -661,8 +687,10 @@ export class InteractiveMode {
         // Main interactive loop
         while (true) {
             const userInput = await this.getUserInput();
+            const images = this.nextUserInputImages;
+            this.nextUserInputImages = undefined;
             try {
-                await this.session.prompt(userInput);
+                await this.session.prompt(userInput, images ? { images } : undefined);
             }
             catch (error) {
                 const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -2091,15 +2119,34 @@ export class InteractiveMode {
         };
     }
     async handleClipboardPaste() {
+        if (this.clipboardPastePending)
+            return;
+        this.clipboardPastePending = true;
         try {
             const image = await readClipboardImage();
             if (image) {
-                const tmpDir = os.tmpdir();
-                const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-                const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
-                const filePath = path.join(tmpDir, fileName);
-                fs.writeFileSync(filePath, Buffer.from(image.bytes));
-                this.editor.insertTextAtCursor?.(filePath);
+                if (this.settingsManager.getBlockImages()) {
+                    this.showWarning("Image attachments are disabled in settings.");
+                    return;
+                }
+                if (image.bytes.length > 20 * 1024 * 1024) {
+                    this.showWarning(`Clipboard image is too large (${(image.bytes.length / 1024 / 1024).toFixed(1)}MB; maximum 20MB).`);
+                    return;
+                }
+                const processed = await processImage(image.bytes, image.mimeType, {
+                    autoResizeImages: this.settingsManager.getImageAutoResize(),
+                });
+                if (!processed.ok) {
+                    this.showWarning(processed.message);
+                    return;
+                }
+                const attachment = this.pendingImageAttachments.add({
+                    type: "image",
+                    data: processed.data,
+                    mimeType: processed.mimeType,
+                });
+                this.editor.insertTextAtCursor?.(`${attachment.marker} `);
+                this.showStatus(`Attached ${attachment.marker}${processed.hints.length ? ` · ${processed.hints.join(" ")}` : ""}`);
                 this.ui.requestRender();
                 return;
             }
@@ -2109,8 +2156,11 @@ export class InteractiveMode {
                 this.ui.requestRender();
             }
         }
-        catch {
-            // Silently ignore clipboard errors (may not have permission, etc.)
+        catch (error) {
+            this.showWarning(`Clipboard paste failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        finally {
+            this.clipboardPastePending = false;
         }
     }
     setupEditorSubmitHandler() {
@@ -2272,16 +2322,20 @@ export class InteractiveMode {
                     await this.session.prompt(text);
                 }
                 else {
-                    this.queueCompactionMessage(text, "steer");
+                    this.queueCompactionMessage(this.pendingImageAttachments.consume(text), "steer");
                 }
                 return;
             }
             // If streaming, use prompt() with steer behavior
             // This handles extension commands (execute immediately), prompt template expansion, and queueing
             if (this.session.isStreaming) {
+                const submitted = this.pendingImageAttachments.consume(text);
                 this.editor.addToHistory?.(text);
                 this.editor.setText("");
-                await this.session.prompt(text, { streamingBehavior: "steer" });
+                await this.session.prompt(submitted.text, {
+                    streamingBehavior: "steer",
+                    ...(submitted.images ? { images: submitted.images } : {}),
+                });
                 this.updatePendingMessagesDisplay();
                 this.ui.requestRender();
                 return;
@@ -2289,11 +2343,14 @@ export class InteractiveMode {
             // Normal message submission
             // First, move any pending bash components to chat
             this.flushPendingBashComponents();
+            const submitted = this.pendingImageAttachments?.consume(text) ?? { text };
             if (this.onInputCallback) {
-                this.onInputCallback(text);
+                this.nextUserInputImages = submitted.images;
+                this.onInputCallback(submitted.text);
             }
             else {
-                this.pendingUserInputs.push(text);
+                this.pendingUserInputs.push(submitted.text);
+                (this.pendingUserInputImages ??= []).push(submitted.images);
             }
             this.editor.addToHistory?.(text);
         };
@@ -2588,6 +2645,11 @@ export class InteractiveMode {
             : message.content.filter((c) => c.type === "text");
         return textBlocks.map((c) => c.text).join("");
     }
+    getUserMessageImages(message) {
+        if (message.role !== "user" || typeof message.content === "string")
+            return [];
+        return message.content.filter((content) => content.type === "image");
+    }
     /**
      * Show a status message in the chat.
      *
@@ -2666,7 +2728,8 @@ export class InteractiveMode {
             }
             case "user": {
                 const textContent = this.getUserMessageText(message);
-                if (textContent) {
+                const imageContent = this.getUserMessageImages(message);
+                if (textContent || imageContent.length) {
                     if (this.chatContainer.children.length > 0) {
                         this.chatContainer.addChild(new Spacer(1));
                     }
@@ -2679,12 +2742,12 @@ export class InteractiveMode {
                         // Render user message separately if present
                         if (skillBlock.userMessage) {
                             this.chatContainer.addChild(new Spacer(1));
-                            const userComponent = new UserMessageComponent(skillBlock.userMessage, this.getMarkdownThemeWithSettings(), this.outputPad);
+                            const userComponent = new UserMessageComponent(skillBlock.userMessage, this.getMarkdownThemeWithSettings(), this.outputPad, imageContent, this.settingsManager.getShowImages(), this.settingsManager.getImageWidthCells());
                             this.chatContainer.addChild(userComponent);
                         }
                     }
                     else {
-                        const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), this.outputPad);
+                        const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings(), this.outputPad, imageContent, this.settingsManager.getShowImages(), this.settingsManager.getImageWidthCells());
                         this.chatContainer.addChild(userComponent);
                     }
                     if (options?.populateHistory) {
@@ -2851,6 +2914,7 @@ export class InteractiveMode {
     async getUserInput() {
         const queuedInput = this.pendingUserInputs.shift();
         if (queuedInput !== undefined) {
+            this.nextUserInputImages = this.pendingUserInputImages?.shift();
             return queuedInput;
         }
         return new Promise((resolve) => {
@@ -3056,16 +3120,20 @@ export class InteractiveMode {
                 await this.session.prompt(text);
             }
             else {
-                this.queueCompactionMessage(text, "followUp");
+                this.queueCompactionMessage(this.pendingImageAttachments.consume(text), "followUp");
             }
             return;
         }
         // Alt+Enter queues a follow-up message (waits until agent finishes)
         // This handles extension commands (execute immediately), prompt template expansion, and queueing
         if (this.session.isStreaming) {
+            const submitted = this.pendingImageAttachments.consume(text);
             this.editor.addToHistory?.(text);
             this.editor.setText("");
-            await this.session.prompt(text, { streamingBehavior: "followUp" });
+            await this.session.prompt(submitted.text, {
+                streamingBehavior: "followUp",
+                ...(submitted.images ? { images: submitted.images } : {}),
+            });
             this.updatePendingMessagesDisplay();
             this.ui.requestRender();
         }
@@ -3296,9 +3364,9 @@ export class InteractiveMode {
         }
         return allQueued.length;
     }
-    queueCompactionMessage(text, mode) {
-        this.compactionQueuedMessages.push({ text, mode });
-        this.editor.addToHistory?.(text);
+    queueCompactionMessage(input, mode) {
+        this.compactionQueuedMessages.push({ ...input, mode });
+        this.editor.addToHistory?.(input.text);
         this.editor.setText("");
         this.updatePendingMessagesDisplay();
         this.showStatus("Queued message for after compaction");
@@ -3332,10 +3400,10 @@ export class InteractiveMode {
                         await this.session.prompt(message.text);
                     }
                     else if (message.mode === "followUp") {
-                        await this.session.followUp(message.text);
+                        await this.session.followUp(message.text, message.images);
                     }
                     else {
-                        await this.session.steer(message.text);
+                        await this.session.steer(message.text, message.images);
                     }
                 }
                 this.updatePendingMessagesDisplay();
@@ -3359,7 +3427,10 @@ export class InteractiveMode {
             }
             // Start a prompt when idle, or queue it into a run still finishing compaction.
             const promptPromise = this.session
-                .prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+                .prompt(firstPrompt.text, {
+                streamingBehavior: firstPrompt.mode,
+                ...(firstPrompt.images ? { images: firstPrompt.images } : {}),
+            })
                 .catch((error) => {
                 restoreQueue(error);
             });
@@ -3369,10 +3440,10 @@ export class InteractiveMode {
                     await this.session.prompt(message.text);
                 }
                 else if (message.mode === "followUp") {
-                    await this.session.followUp(message.text);
+                    await this.session.followUp(message.text, message.images);
                 }
                 else {
-                    await this.session.steer(message.text);
+                    await this.session.steer(message.text, message.images);
                 }
             }
             this.updatePendingMessagesDisplay();
@@ -4034,33 +4105,46 @@ export class InteractiveMode {
         }
     }
     async runForgeDockOnboarding() {
-        this.showStatus("ForgeDock setup · detecting provider credentials");
+        this.showStatus("ForgeDock setup · checking provider authentication");
         let availableModels = [];
         try {
-            await this.session.modelRuntime.refresh();
+            // Startup onboarding must not wait forever on the optional remote catalog.
+            await this.session.modelRuntime.refresh({ signal: AbortSignal.timeout(15_000) });
             availableModels = [...(await this.session.modelRuntime.getAvailable())];
         }
         catch {
             availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
         }
-        let connectProvider = true;
-        if (availableModels.length > 0) {
+        // A model catalog can exist before credentials do. Reuse any stored
+        // credential even when the catalog refresh is temporarily unavailable;
+        // rebuilding or relaunching the terminal must never force OAuth again.
+        const storedCredentials = await this.session.modelRuntime.listCredentials();
+        const detectedModel = availableModels.find((model) => this.session.modelRuntime.hasConfiguredAuth(model.provider));
+        let connectProvider = detectedModel === undefined && storedCredentials.length === 0;
+        if (detectedModel) {
             const choice = await this.selectForgeDockSetupChoice(availableModels.length);
             if (choice === undefined)
                 return;
             connectProvider = choice === "connect";
         }
+        else if (storedCredentials.length > 0) {
+            this.showStatus("ForgeDock setup · reusing saved provider authentication");
+        }
         if (connectProvider) {
-            const provider = await this.selectForgeDockOnboardingProvider();
+            const authType = await this.selectForgeDockOnboardingAuthType();
+            if (!authType)
+                return;
+            const provider = await this.selectForgeDockOnboardingProvider(authType);
             if (!provider)
                 return;
-            await this.startProviderLogin(provider);
-            try {
-                await this.session.modelRuntime.refresh();
+            const loginCompleted = await this.startProviderLogin(provider);
+            if (!loginCompleted) {
+                this.showWarning("Provider connection was not completed. Restart ForgeDock to try onboarding again.");
+                return;
             }
-            catch {
-                // Model selection below reports an empty authenticated catalog clearly.
-            }
+            // ModelRuntime.login already performs a bounded catalog refresh. The
+            // model selector performs its own bounded background refresh, so avoid
+            // issuing a second unbounded network refresh while onboarding is paused.
         }
         const model = await this.selectForgeDockOnboardingModel();
         if (!model) {
@@ -4078,7 +4162,7 @@ export class InteractiveMode {
         return new Promise((resolve) => {
             this.showSelector((done) => {
                 const detected = `Use detected credentials · ${modelCount} model${modelCount === 1 ? "" : "s"} available`;
-                const connect = "Connect or replace a provider account";
+                const connect = "Connect or replace a provider account or API key";
                 const selector = new ExtensionSelectorComponent("Provider setup · step 2 of 3", [detected, connect], (option) => {
                     done();
                     resolve(option === detected ? "detected" : "connect");
@@ -4090,21 +4174,46 @@ export class InteractiveMode {
             });
         });
     }
-    selectForgeDockOnboardingProvider() {
-        const providers = this.getLoginProviderOptions().filter((provider) => provider.authType === "oauth" || provider.method?.login !== undefined);
-        if (providers.length === 0) {
+    getForgeDockOnboardingProviderOptions(authType) {
+        return this.getLoginProviderOptions(authType).filter((provider) => provider.authType === "oauth" || provider.method?.login !== undefined);
+    }
+    selectForgeDockOnboardingAuthType() {
+        const providers = this.getForgeDockOnboardingProviderOptions();
+        const authTypes = new Set(providers.map((provider) => provider.authType));
+        const options = [
+            ...(authTypes.has("oauth")
+                ? [{ label: "Sign in with a provider account (subscription)", authType: "oauth" }]
+                : []),
+            ...(authTypes.has("api_key") ? [{ label: "Use an API key", authType: "api_key" }] : []),
+        ];
+        if (options.length === 0) {
             this.showError("No interactive provider login methods are available. Configure a provider key and restart ForgeDock.");
             return Promise.resolve(undefined);
         }
         return new Promise((resolve) => {
             this.showSelector((done) => {
-                const selector = new OAuthSelectorComponent("login", providers, (providerId, authType) => {
+                const selector = new ExtensionSelectorComponent("Connect a model provider · step 2 of 3", options.map((option) => option.label), (label) => {
                     done();
-                    resolve(providers.find((provider) => provider.id === providerId && provider.authType === authType));
+                    resolve(options.find((option) => option.label === label)?.authType);
                 }, () => {
                     done();
                     resolve(undefined);
                 });
+                return { component: selector, focus: selector };
+            });
+        });
+    }
+    selectForgeDockOnboardingProvider(authType) {
+        const providers = this.getForgeDockOnboardingProviderOptions(authType);
+        return new Promise((resolve) => {
+            this.showSelector((done) => {
+                const selector = new OAuthSelectorComponent("login", providers, (providerId, selectedAuthType) => {
+                    done();
+                    resolve(providers.find((provider) => provider.id === providerId && provider.authType === selectedAuthType));
+                }, () => {
+                    done();
+                    resolve(undefined);
+                }, undefined, "Choose the provider to connect · step 2 of 3");
                 return { component: selector, focus: selector };
             });
         });
@@ -4217,14 +4326,13 @@ export class InteractiveMode {
     }
     async startProviderLogin(providerOption) {
         if (providerOption.authType === "oauth") {
-            await this.showLoginDialog(providerOption.id, providerOption.name);
+            return this.showLoginDialog(providerOption.id, providerOption.name);
         }
-        else if (providerOption.method?.login) {
-            await this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
+        if (providerOption.method?.login) {
+            return this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
         }
-        else {
-            this.showAmbientAuthDialog(providerOption);
-        }
+        this.showAmbientAuthDialog(providerOption);
+        return false;
     }
     showLoginAuthTypeSelector(providerOptions) {
         const oauthProvider = providerOptions?.find((provider) => provider.authType === "oauth");
@@ -4430,6 +4538,7 @@ export class InteractiveMode {
             await this.loginProvider(dialog, providerId, "api_key");
             restoreEditor();
             await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
+            return true;
         }
         catch (error) {
             restoreEditor();
@@ -4437,6 +4546,7 @@ export class InteractiveMode {
             if (errorMsg !== "Login cancelled") {
                 this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
             }
+            return false;
         }
     }
     showAuthSelect(dialog, prompt) {
@@ -4533,6 +4643,7 @@ export class InteractiveMode {
             await this.loginProvider(dialog, providerId, "oauth");
             restoreEditor();
             await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
+            return true;
         }
         catch (error) {
             restoreEditor();
@@ -4540,6 +4651,7 @@ export class InteractiveMode {
             if (errorMsg !== "Login cancelled") {
                 this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
             }
+            return false;
         }
     }
     // =========================================================================

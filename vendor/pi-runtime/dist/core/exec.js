@@ -13,6 +13,7 @@ export async function execCommand(command, args, cwd, options) {
             cwd,
             shell: false,
             stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
         });
         let stdout = "";
         let stderr = "";

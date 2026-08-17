@@ -31,17 +31,156 @@ describe("Build Packet preparation", () => {
       kind: "Intent", runId: "run_packet", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
       payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
+    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({
+      intent, cwd: process.cwd(), scopeHints,
+      planningProvider: "anthropic", planningModel: "claude-sonnet", planningThinking: "high",
+    }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
+      planningProvider: "anthropic", planningModel: "claude-sonnet", planningThinking: "high",
+    }, { runtime, artifacts, runs });
+
+    assert.equal(prepared.run.state, "building");
+    assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
+    assert.equal(prepared.run.scopeManifest?.source, "build-packet");
+    assert.deepEqual(prepared.run.scopeManifest?.writeRoots, []);
+    assert.deepEqual(prepared.run.scopeManifest?.writePaths, ["src/a.ts", "test/a.test.ts"]);
+    assert.ok(prepared.run.scopeManifest?.readRoots.includes("src"));
+    assert.ok(prepared.run.scopeManifest?.readRoots.includes("test"));
+    assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /implementationPlan name the relevant symbols\/files/);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /Map verificationPlan to the acceptance criteria/);
+    assert.match(runtime.tasks[1]?.instructions ?? "", /latest prior review, verification/);
+    assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
+    assert.deepEqual(runtime.tasks[1]?.modelPolicy, {
+      planningProvider: "anthropic",
+      planningModel: "claude-sonnet",
+      planningThinking: "high",
+    });
+    assert.ok(runtime.tasks[0]?.workspace.scope.readRoots.includes("src"));
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
+    ]);
+  });
+
+  it("canonicalizes typed verification requirements against the controller catalog", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      {
+        ...packet,
+        verificationPlan: ["free-form lifecycle prose"],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+        verificationRequirements: [{ kind: "controller-gate", id: "staging-review", criterionIds: ["criterion-1"], rationale: "The controller owns staging validation." }],
+      },
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_typed_valid", subject: { repo: "a/b", issue: 5 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
+      verificationCatalog: {
+        commands: [{ id: "test", command: "npm", args: ["test"] }],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    }, { runtime, artifacts, runs });
+    assert.deepEqual(prepared.packet.payload.verificationPlan, ["controller-gate:staging-review"]);
+    assert.deepEqual(prepared.packet.payload.verificationRequirements?.map((requirement) => requirement.id), ["staging-review"]);
+  });
+
+  it("rejects controller-owned verification prose before the builder can start", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      {
+        ...packet,
+        verificationPlan: ["Confirm no targeted test bypasses the durable admission by checking that the tests still pass"],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_typed", subject: { repo: "a/b", issue: 4 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    await assert.rejects(() => prepareBuildPacket({
+      run: investigated.run,
+      intent,
+      investigation: investigated.investigation,
+      cwd: process.cwd(),
+      verificationCatalog: {
+        commands: [{ id: "test", command: "npm", args: ["test"] }],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
+    }, { runtime, artifacts, runs }), /unsupported or unfenced controller prose/);
+    assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+  });
+
+  it("retries one packet-author session that ended before submit_artifact", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      new Error("Agent run_packet_recovery:build-packet:1 ended without calling submit_artifact"),
+      packet,
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_recovery", subject: { repo: "a/b", issue: 3 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({
       run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
     }, { runtime, artifacts, runs });
 
     assert.equal(prepared.run.state, "building");
+    assert.equal(runtime.tasks.length, 3);
+    assert.equal(runtime.tasks[2]?.id, "run_packet_recovery:build-packet:1:submit-retry");
+    assert.match(runtime.tasks[2]?.instructions ?? "", /one bounded recovery attempt/);
+  });
+
+  it("grants bounded source discovery when the issue has no concrete affected-file hints", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_discovery", subject: { repo: "a/b", issue: 130 }, producer: { role: "controller" },
+      payload: { title: "Discover shared contract", problem: "Affected files to be confirmed by investigation", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const scopeHints = { affectedFiles: [], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
+    }, { runtime, artifacts, runs });
+    for (const task of runtime.tasks) {
+      assert.ok(task.workspace.scope.readRoots.includes("src"));
+      assert.ok(task.workspace.scope.readRoots.includes("bin"));
+      assert.deepEqual(task.workspace.scope.writeRoots, []);
+    }
+  });
+
+  it("canonicalizes packet paths and retains every concrete issue-declared path", async () => {
+    const runtime = new FakeAgentRuntime([investigation, { ...packet, expectedPaths: ["src\\a.ts"] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_packet_paths", subject: { repo: "a/b", issue: 2 }, producer: { role: "controller" },
+      payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const scopeHints = { affectedFiles: ["src/a.ts", "test/a.test.ts"], metadataRoots: ["package.json"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
+    }, { runtime, artifacts, runs });
+
     assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
-    assert.deepEqual(runtime.tasks[1]?.context.map((item) => item.kind), ["Intent", "Investigation"]);
-    assert.equal(runtime.tasks[1]?.workspace.mode, "read-only");
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
-      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
-    ]);
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
+    assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("test"));
   });
 });

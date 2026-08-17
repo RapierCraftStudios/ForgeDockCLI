@@ -181,6 +181,27 @@ gh project field-list <project_number> --owner <owner> --format json \
 
 ---
 
+## ForgeDock Next agent models (OPTIONAL)
+
+ForgeDock Next stores its provider/model overrides in the marker-bounded managed section of `forge.yaml`:
+
+```yaml
+# FORGEDOCK:NEXT-CONFIG:START
+next:
+  agents:
+    planning_model: "provider/model"
+    planning_thinking: "high"
+    worker_model: "provider/model"
+    worker_thinking: "high"
+    reviewer_model: "provider/model"
+    reviewer_thinking: "high"
+# FORGEDOCK:NEXT-CONFIG:END
+```
+
+`planning_model` applies only to the read-only issue investigator and Build Packet author. `worker_model` applies to issue workers, and `reviewer_model` applies to nested/independent reviewers. Thinking settings follow the same role boundaries. Invocation flags override the managed config; `/forgedock-config` resolves friendly names against the authenticated live model catalog. The native `/orchestrate` supervisor plans its issue DAG with the active terminal model rather than this setting.
+
+For the Next CLI, use `--planning-model provider/model` and `--planning-thinking high` on `work-on` or `orchestrate`. The managed values are also transported to controller processes launched from the terminal.
+
 ## `review` (OPTIONAL)
 
 Context injected into review agent prompts. Helps agents make project-aware decisions.

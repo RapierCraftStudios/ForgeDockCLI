@@ -38,6 +38,51 @@ describe("controller environment boundary", () => {
     assert.equal(environment.PI_INTERCOM_SESSION_ID, undefined);
   });
 
+  it("removes controller credentials and isolates verification config homes", () => {
+    const controllerHome = "C:/controller/home";
+    const environment = verificationEnvironment({
+      PATH: process.env.PATH,
+      HOME: controllerHome,
+      USERPROFILE: controllerHome,
+      AUDIT_SECRET: "fd-secret-proof",
+      GH_TOKEN: "github-token",
+      GITHUB_PAT: "github-pat",
+      PIP_INDEX_URL: "https://user:password@example.test/simple",
+      DOCKER_AUTH_CONFIG: '{"auths":{"registry.example":{"auth":"proof"}}}',
+      DOCKER_CONFIG: "C:/controller/docker",
+      GIT_ASKPASS: "C:/controller/askpass.exe",
+      NPM_CONFIG_GLOBALCONFIG: "C:/controller/npmrc",
+      NODE_OPTIONS: "--require=C:/controller/loader.js",
+      BASH_ENV: "C:/controller/bash-env.sh",
+      OPENAI_API_KEY: "provider-key",
+      FORGEDOCK_NESTED_AGENT_TOKEN: "nested-token",
+      SAFE_FLAG: "visible",
+    });
+    assert.equal(environment.AUDIT_SECRET, undefined);
+    assert.equal(environment.GH_TOKEN, undefined);
+    assert.equal(environment.GITHUB_PAT, undefined);
+    assert.equal(environment.PIP_INDEX_URL, undefined);
+    assert.equal(environment.DOCKER_AUTH_CONFIG, undefined);
+    assert.notEqual(environment.DOCKER_CONFIG, "C:/controller/docker");
+    assert.ok(environment.DOCKER_CONFIG?.startsWith(environment.HOME ?? ""));
+    assert.equal(environment.GIT_ASKPASS, undefined);
+    assert.equal(environment.NPM_CONFIG_GLOBALCONFIG, undefined);
+    assert.equal(environment.NODE_OPTIONS, undefined);
+    assert.equal(environment.BASH_ENV, undefined);
+    assert.equal(environment.OPENAI_API_KEY, undefined);
+    assert.equal(environment.FORGEDOCK_NESTED_AGENT_TOKEN, undefined);
+    assert.equal(environment.SAFE_FLAG, "visible");
+    assert.notEqual(environment.HOME, controllerHome);
+    assert.equal(environment.HOME, environment.USERPROFILE);
+    assert.ok(environment.NPM_CONFIG_USERCONFIG?.startsWith(environment.HOME ?? ""));
+    assert.ok(environment.GIT_CONFIG_GLOBAL?.startsWith(environment.HOME ?? ""));
+    const identity = spawnSync("git", ["config", "--global", "--get", "user.email"], {
+      env: environment, encoding: "utf8", windowsHide: true,
+    });
+    assert.equal(identity.status, 0, identity.stderr || identity.error?.message);
+    assert.equal(identity.stdout.trim(), "verification@forgedock.invalid");
+  });
+
   it("puts discovered Git Bash and user tools ahead of ambiguous Windows launchers", () => {
     if (process.platform !== "win32") return;
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
@@ -51,6 +96,7 @@ describe("controller environment boundary", () => {
     const entries = (environment.PATH ?? "").split(delimiter);
     assert.ok(existsSync(join(entries[0] ?? "", "bash.exe")), `Git Bash was not discovered: ${environment.PATH}`);
     assert.equal(environment.FORGEDOCK_GIT_BASH, join(entries[0] ?? "", "bash.exe"));
+    assert.equal(environment.MSYSTEM, "MINGW64", "cmd/PowerShell launches receive the Git-for-Windows identity marker");
     if (existsSync(join(homedir(), "bin"))) assert.ok(entries.includes(join(homedir(), "bin")));
   });
 
@@ -78,7 +124,25 @@ describe("controller environment boundary", () => {
   it("classifies worker transport without stripping ordinary Pi model settings", () => {
     assert.equal(isAgentTransportVariable("PI_SUBAGENT_CHILD_AGENT"), true);
     assert.equal(isAgentTransportVariable("PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT"), true);
+    assert.equal(isAgentTransportVariable("pi_subagent_child_agent"), true);
+    assert.equal(isAgentTransportVariable("Pi_Subagents_Worktree_Dir"), true);
+    assert.equal(isAgentTransportVariable("pi_intercom_session_id"), true);
     assert.equal(isAgentTransportVariable("PI_PROVIDER"), false);
     assert.equal(isAgentTransportVariable("PI_MODEL"), false);
+  });
+
+  it("removes case-varied transport keys while retaining ordinary Pi settings", () => {
+    const environment = controllerEnvironment({
+      pi_subagent_child_agent: "forgedock-reviewer",
+      Pi_Subagents_Worktree_Dir: "C:/worker",
+      pi_intercom_session_id: "intercom",
+      PI_PROVIDER: "openai-codex",
+      PI_MODEL: "gpt-test",
+    });
+    assert.equal(environment.pi_subagent_child_agent, undefined);
+    assert.equal(environment.Pi_Subagents_Worktree_Dir, undefined);
+    assert.equal(environment.pi_intercom_session_id, undefined);
+    assert.equal(environment.PI_PROVIDER, "openai-codex");
+    assert.equal(environment.PI_MODEL, "gpt-test");
   });
 });

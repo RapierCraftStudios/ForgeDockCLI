@@ -49,6 +49,10 @@ export declare class InteractiveMode {
     private isInitialized;
     private onInputCallback?;
     private pendingUserInputs;
+    private pendingUserInputImages;
+    private nextUserInputImages;
+    private pendingImageAttachments;
+    private clipboardPastePending;
     private activeStatusIndicator;
     private readonly idleStatus;
     private workingMessage;
@@ -244,6 +248,7 @@ export declare class InteractiveMode {
     private handleEvent;
     /** Extract text content from a user message */
     private getUserMessageText;
+    private getUserMessageImages;
     /**
      * Show a status message in the chat.
      *
@@ -352,6 +357,8 @@ export declare class InteractiveMode {
     private handleResumeSession;
     private runForgeDockOnboarding;
     private selectForgeDockSetupChoice;
+    private getForgeDockOnboardingProviderOptions;
+    private selectForgeDockOnboardingAuthType;
     private selectForgeDockOnboardingProvider;
     private selectForgeDockOnboardingModel;
     private showForgeDockOnboardingReceipt;
