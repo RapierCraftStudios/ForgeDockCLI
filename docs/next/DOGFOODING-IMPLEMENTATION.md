@@ -62,7 +62,7 @@ legacy ForgeDock system.
 - [x] Push `staging` and open staging -> main PR #320.
 - [x] Pass CI and review the exact merge candidate (hosted checks all passed).
 - [x] Merge to `main` and verify the resulting remote state (`69bf65e1`).
-- [x] Publish the merged release to npm as `forgedockcli@1.8.1` and verify the registry tarball (GitHub Actions OIDC run `32041554350`; `latest` and tarball verified).
+- [x] Publish the merged release to npm as `forgedockcli@1.8.1` and verify the registry tarball (GitHub Actions OIDC run `32041554350`; `latest` and `https://registry.npmjs.org/forgedockcli/-/forgedockcli-1.8.1.tgz` verified).
 
 The live canary section remains intentionally open: local and hosted regression
 gates prove the implementation, but they do not substitute for three to five
