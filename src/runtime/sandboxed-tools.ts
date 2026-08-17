@@ -37,6 +37,9 @@ export async function createSandboxedTools(
 ): Promise<ToolDefinition[]> {
   const guard = await WorkspaceGuard.create(cwd, scope, testAdapter);
   if (grants.includes("bash")) throw new Error("The Pi adapter does not expose unrestricted bash to workflow roles");
+  if ((grants.includes("edit") || grants.includes("write")) && !safeMutationSupportAvailable()) {
+    throw new Error("Sandbox write tools are unavailable: this platform lacks descriptor-relative no-follow filesystem primitives");
+  }
   const tools: ToolDefinition[] = [];
   if (grants.includes("read")) {
     tools.push(createReadTool(cwd, { operations: {
@@ -401,6 +404,7 @@ export class WorkspaceGuard {
     const candidate = this.lexical(path);
     if (candidate === this.root) throw new Error(`Workspace path has no writable file parent: ${path}`);
     await this.assertWritableCandidate(candidate);
+    assertSafeMutationSupport();
     await this.beforeMutation("file", candidate);
     return this.openWritableFile(candidate);
   }
@@ -421,6 +425,7 @@ export class WorkspaceGuard {
     } else {
       await this.assertWritableCandidate(candidate);
     }
+    assertSafeMutationSupport();
     await this.beforeMutation("directory", candidate);
     const directory = await this.openDirectory(candidate, true);
     return directory.handle;
@@ -478,35 +483,43 @@ export class WorkspaceGuard {
   }
 
   private async openDirectory(candidate: string, createMissing: boolean): Promise<SafeDirectory> {
+    assertSafeMutationSupport();
     const segments = relative(this.root, candidate) ? relative(this.root, candidate).split(sep) : [];
     let current: SafeDirectory = {
       handle: await openDirectoryHandle(this.root),
-      operationPath: this.root,
+      operationPath: "",
     };
-    current.operationPath = directoryHandlePath(current.handle, current.operationPath);
     let currentLexical = this.root;
     try {
+      current.operationPath = directoryHandlePath(current.handle);
       for (const segment of segments) {
         const lexicalChild = resolve(currentLexical, segment);
         const operationChild = join(current.operationPath, segment);
-        let next: FileHandle;
+        let next: FileHandle | undefined;
         try {
-          next = await openDirectoryHandle(operationChild);
-        } catch (error) {
-          if (!createMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           try {
-            await mkdir(operationChild, { recursive: false });
-          } catch (mkdirError) {
-            if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+            next = await openDirectoryHandle(operationChild);
+          } catch (error) {
+            if (!createMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            try {
+              await mkdir(operationChild, { recursive: false });
+            } catch (mkdirError) {
+              if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+            }
+            next = await openDirectoryHandle(operationChild);
           }
-          next = await openDirectoryHandle(operationChild);
+          const nextOperationPath = directoryHandlePath(next);
+          await closeFileHandle(current.handle);
+          current = {
+            handle: next,
+            operationPath: nextOperationPath,
+          };
+          next = undefined;
+          currentLexical = lexicalChild;
+        } catch (error) {
+          if (next) await closeFileHandle(next);
+          throw error;
         }
-        await closeFileHandle(current.handle);
-        current = {
-          handle: next,
-          operationPath: directoryHandlePath(next, lexicalChild),
-        };
-        currentLexical = lexicalChild;
       }
       return current;
     } catch (error) {
@@ -544,16 +557,19 @@ type SafeDirectory = {
 };
 
 function writableFileFlags(): number {
+  const noFollow = requiredNoFollowFlag();
   return constants.O_WRONLY
     | constants.O_CREAT
-    | (constants.O_NOFOLLOW ?? 0)
+    | noFollow
     | (constants.O_NONBLOCK ?? 0);
 }
 
 function directoryFlags(): number {
+  const directory = requiredDirectoryFlag();
+  const noFollow = requiredNoFollowFlag();
   return constants.O_RDONLY
-    | (constants.O_DIRECTORY ?? 0)
-    | (constants.O_NOFOLLOW ?? 0);
+    | directory
+    | noFollow;
 }
 
 async function openDirectoryHandle(path: string): Promise<FileHandle> {
@@ -578,11 +594,46 @@ async function rejectSymbolicLink(path: string): Promise<void> {
   }
 }
 
-function directoryHandlePath(handle: FileHandle, fallback: string): string {
-  const prefix = process.platform === "linux" ? "/proc/self/fd"
-    : ["aix", "darwin", "freebsd", "openbsd"].includes(process.platform) ? "/dev/fd"
-      : undefined;
-  return prefix ? `${prefix}/${handle.fd}` : fallback;
+function descriptorPathPrefix(): string | undefined {
+  if (process.platform === "linux") return "/proc/self/fd";
+  if (["aix", "darwin", "freebsd", "openbsd"].includes(process.platform)) return "/dev/fd";
+  return undefined;
+}
+
+export function safeMutationSupportAvailable(): boolean {
+  return descriptorPathPrefix() !== undefined
+    && typeof constants.O_NOFOLLOW === "number" && constants.O_NOFOLLOW !== 0
+    && typeof constants.O_DIRECTORY === "number" && constants.O_DIRECTORY !== 0;
+}
+
+function assertSafeMutationSupport(): void {
+  if (!safeMutationSupportAvailable()) {
+    throw new Error("Sandbox write operations require descriptor-relative no-follow filesystem primitives");
+  }
+}
+
+function requiredNoFollowFlag(): number {
+  const flag = constants.O_NOFOLLOW;
+  if (typeof flag !== "number" || flag === 0) {
+    throw new Error("Sandbox write operations require O_NOFOLLOW");
+  }
+  return flag;
+}
+
+function requiredDirectoryFlag(): number {
+  const flag = constants.O_DIRECTORY;
+  if (typeof flag !== "number" || flag === 0) {
+    throw new Error("Sandbox directory operations require O_DIRECTORY");
+  }
+  return flag;
+}
+
+function directoryHandlePath(handle: FileHandle): string {
+  const prefix = descriptorPathPrefix();
+  if (!prefix) {
+    throw new Error("Sandbox write operations require descriptor-relative directory handles");
+  }
+  return `${prefix}/${handle.fd}`;
 }
 
 async function closeFileHandle(handle: FileHandle): Promise<void> {

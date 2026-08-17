@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { WorkspaceGuard, createSandboxedTools } from "./sandboxed-tools.js";
+import { WorkspaceGuard, createSandboxedTools, safeMutationSupportAvailable } from "./sandboxed-tools.js";
 
 describe("runtime workspace confinement", () => {
   it("rejects lexical reads and writes outside the assigned worktree", async () => {
@@ -63,6 +63,13 @@ describe("runtime workspace confinement", () => {
         writePaths: ["generated/contracts/host.ts"],
         source: "build-packet" as const,
       };
+      if (!safeMutationSupportAvailable()) {
+        await assert.rejects(
+          createSandboxedTools(root, ["write"], scope),
+          /descriptor-relative no-follow filesystem primitives/,
+        );
+        return;
+      }
       const write = (await createSandboxedTools(root, ["write"], scope)).find((tool) => tool.name === "write");
       assert.ok(write);
       await write.execute("write-new", {
@@ -92,6 +99,13 @@ describe("runtime workspace confinement", () => {
   it("uses guarded public edit and write operations for existing files, new files, and nested directories", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-public-writes-"));
     try {
+      if (!safeMutationSupportAvailable()) {
+        await assert.rejects(
+          createSandboxedTools(root, ["edit", "write"]),
+          /descriptor-relative no-follow filesystem primitives/,
+        );
+        return;
+      }
       writeFileSync(join(root, "existing.txt"), "before\n");
       const tools = await createSandboxedTools(root, ["edit", "write"]);
       const edit = tools.find((tool) => tool.name === "edit");
@@ -128,6 +142,13 @@ describe("runtime workspace confinement", () => {
     writeFileSync(outside, "outside\n");
     try {
       symlinkSync(outside, join(root, "link.txt"), "file");
+      if (!safeMutationSupportAvailable()) {
+        await assert.rejects(
+          createSandboxedTools(root, ["write"]),
+          /descriptor-relative no-follow filesystem primitives/,
+        );
+        return;
+      }
       const write = (await createSandboxedTools(root, ["write"])).find((tool) => tool.name === "write");
       assert.ok(write);
       await assert.rejects(
@@ -157,6 +178,13 @@ describe("runtime workspace confinement", () => {
       );
     };
     try {
+      if (!safeMutationSupportAvailable()) {
+        await assert.rejects(
+          createSandboxedTools(root, ["write"]),
+          /descriptor-relative no-follow filesystem primitives/,
+        );
+        return;
+      }
       const target = join(root, "target.txt");
       const targetBackup = join(root, "target.original.txt");
       const outsideTarget = join(outside, "target.txt");
