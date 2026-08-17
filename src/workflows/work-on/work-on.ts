@@ -248,14 +248,16 @@ export async function workOn(
       }
       throw error;
     }
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
+    if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
-    if (run && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
+    if (!recoverable && run && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run?.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run?.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
     const retainForRecovery = claimPromotionSuspended || retainWorkspaceForRecovery
@@ -432,14 +434,16 @@ export async function resumeEarlyWorkOn(
       }
       throw error;
     }
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
+    if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
-    if (run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
+    if (!recoverable && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
     const retainForRecovery = claimPromotionSuspended || retainWorkspaceForRecovery
@@ -570,14 +574,16 @@ export async function resumeBuildWorkOn(
       retainWorkspaceForRecovery = true;
       throw error;
     }
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
+    if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
-    if (run.state !== "failed" && run.state !== "blocked") {
+    if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
     const retainForRecovery = retainWorkspaceForRecovery || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
@@ -872,10 +878,11 @@ export async function resumeWorkOn(
     throw new Error("Legacy verification evidence lacks builder criterion coverage and must resume through a bounded builder repair");
   }
   assertRunTargetsBranch(input.run, input.baseBranch);
-  if (evidence.workspacePath !== input.workspace.path || evidence.branch !== input.workspace.branch) {
+  if (!workspacePathsEquivalent(evidence.workspacePath, input.workspace.path) || evidence.branch !== input.workspace.branch) {
     throw new Error("Recovery workspace does not match the durable failure evidence");
   }
   let run = input.run;
+  let retainWorkspaceForRecovery = false;
   const resumed = transition(run, "RESUME_VERIFICATION", { reason: `Resuming retained workspace ${input.workspace.path}` });
   await dependencies.runs.commit(run.version, resumed.state, resumed.record);
   run = resumed.state;
@@ -988,16 +995,18 @@ export async function resumeWorkOn(
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
-    if (run.state !== "failed" && run.state !== "blocked") {
+    if (recoverable) retainWorkspaceForRecovery = true;
+    if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    const retainForRecovery = retainWorkspaceForRecovery || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
     if (!retainForRecovery) {
       try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
     }
@@ -1050,6 +1059,7 @@ export async function resumeReviewWorkOn(
     throw new Error("Review resume requires one matching request-changes verdict, verified Build Result, and open PR head");
   }
   let run = input.run;
+  let retainWorkspaceForRecovery = false;
   const resumed = transition(run, budgetBlocked ? "RESUME_REVIEW" : "RESUME_REMEDIATION", {
     reason: budgetBlocked
       ? `Reassessing exhausted findings at ${input.buildResult.payload.headSha} against the frozen scope before authorizing any further remediation`
@@ -1218,16 +1228,18 @@ export async function resumeReviewWorkOn(
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
-    if (run.state !== "failed" && run.state !== "blocked") {
+    if (recoverable) retainWorkspaceForRecovery = true;
+    if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    const retainForRecovery = retainWorkspaceForRecovery || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
     if (!retainForRecovery) {
       try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
     }
@@ -1388,6 +1400,7 @@ export async function resumePublicationWorkOn(
     }
   }
   let run = input.run;
+  let retainWorkspaceForRecovery = false;
   const resumed = transition(run, recoveringRevision ? "RECOVER_REVISION_PUBLICATION" : "RESUME_PUBLICATION", {
     reason: recoveringRevision
       ? `Recovering verified remediation head ${input.buildResult.payload.headSha} after its PR projection lagged the pushed branch`
@@ -1482,16 +1495,18 @@ export async function resumePublicationWorkOn(
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
     if (error instanceof WorkflowExecutionError) run = error.run;
-    if (run.state !== "failed" && run.state !== "blocked") {
+    if (recoverable) retainWorkspaceForRecovery = true;
+    if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
       run = failed.state;
     }
-    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    if (!recoverable && run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    const retainForRecovery = run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
+    const retainForRecovery = retainWorkspaceForRecovery || run.state === "blocked" || run.state === "failed" || run.state === "cancelled";
     if (!retainForRecovery) {
       try { await dependencies.git.remove(input.workspace); } catch { /* recovery reconciles stale worktrees */ }
     }
@@ -1585,6 +1600,25 @@ export function shouldAppendFailureOutcome(existing: readonly DurableArtifact[],
     .filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.runId === runId && artifact.kind === "Outcome" && artifact.payload.status === "failed")
     .at(-1);
   return latestFailure?.payload.reason !== reason;
+}
+
+/**
+ * Durable verification evidence can outlive the OS/runtime that wrote it.
+ * Treat Windows drive paths and their WSL `/mnt/<drive>/` spelling as the
+ * same workspace identity while preserving exact comparison for ordinary
+ * POSIX paths.
+ */
+export function workspacePathsEquivalent(left: string, right: string): boolean {
+  return canonicalWorkspacePath(left) === canonicalWorkspacePath(right);
+}
+
+function canonicalWorkspacePath(path: string): string {
+  const normalized = path.replaceAll("\\", "/").replace(/\/+/g, "/");
+  const wslPath = normalized.match(/^\/mnt\/([a-zA-Z])\/(.*)$/);
+  if (wslPath) return `${wslPath[1]!.toUpperCase()}:/${wslPath[2]!}`.toLowerCase();
+  const windowsPath = normalized.match(/^([a-zA-Z]):\/(.*)$/);
+  if (windowsPath) return `${windowsPath[1]!.toUpperCase()}:/${windowsPath[2]!}`.toLowerCase();
+  return normalized;
 }
 
 function assertLease(dependencies: Pick<WorkOnDependencies, "leaseGuard">): void {

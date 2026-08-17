@@ -652,6 +652,7 @@ describe("GitHub review finding projection", () => {
       intentRelevance: "Confuses billing", remediation: "Render the total.",
     };
     let createdBody = "";
+    let createdTitle = "";
     let createdArgs: string[] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
@@ -744,6 +745,156 @@ describe("GitHub review finding projection", () => {
       repo: "a/b", pullRequest, runId: "run-bad-readback", reviewedHeadSha: head,
       reviewerRoles: ["correctness"], finding,
     }), /failed authoritative identity validation/);
+  });
+
+  it("accepts GitHub line-ending normalization but rejects body content changes", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Finding", evidence: "First line\r\nSecond line", location: "src/a.ts:1",
+      intentRelevance: "Relevant", remediation: "Fix it",
+    };
+    let createdBody = "";
+    let createdTitle = "";
+    let contentChanged = false;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") {
+        createdBody = body ?? "";
+        createdTitle = args[args.indexOf("--title") + 1] ?? "";
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "edit") return "";
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({
+        number: 101,
+        title: createdTitle,
+        body: (contentChanged ? createdBody.replace("Second line", "Changed line") : createdBody).replace(/\r\n?/g, "\n"),
+        url: "https://github.test/a/b/issues/101",
+        state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P1" }],
+        milestone: null,
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const issue = await client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-line-endings", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(issue.number, 101);
+    assert.match(createdBody, /First line\r\nSecond line/);
+    contentChanged = true;
+    await assert.rejects(client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-line-endings", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    }), /body-diff-at/);
+  });
+
+  it("accepts GitHub caret normalization of escaped C1 controls", async () => {
+    const head = "a".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Finding", evidence: "First `\\u009d52;c;` then `\\u009cvisible`, plus `\\u009b` and `\\u0007`", location: "src/a.ts:1",
+      intentRelevance: "Relevant", remediation: "Fix it",
+    };
+    let createdBody = "";
+    let createdTitle = "";
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") {
+        createdBody = body ?? "";
+        createdTitle = args[args.indexOf("--title") + 1] ?? "";
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({
+        number: 101,
+        title: createdTitle,
+        body: createdBody
+          .replaceAll("\\u0007", "\\^G")
+          .replaceAll("\\u009b", "\\^[")
+          .replaceAll("\\u009d", "\\^]")
+          .replaceAll("\\u009c", "\\^\\"),
+        url: "https://github.test/a/b/issues/101",
+        state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P1" }],
+        milestone: null,
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const issue = await client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-c1-normalization", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(issue.number, 101);
+    assert.match(createdBody, /\\u0007/);
+    assert.match(createdBody, /\\u009b/);
+    assert.match(createdBody, /\\u009d/);
+    assert.match(createdBody, /\\u009c/);
+  });
+
+  it("accepts GitHub caret normalization regardless of escaped-control hex case", async () => {
+    const head = "b".repeat(40);
+    const pullRequest = {
+      repo: "a/b", number: 58, title: "Fix", body: "", url: "https://github.test/a/b/pull/58",
+      state: "OPEN" as const, headSha: head, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-2222222222222222", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Finding", evidence: "Upper `\\u009D52;c;` and mixed `\\u009cvisible`, plus `\\u009B` and `\\u0007`", location: "src/a.ts:2",
+      intentRelevance: "Relevant", remediation: "Fix it",
+    };
+    let createdBody = "";
+    let createdTitle = "";
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/58") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") {
+        createdBody = body ?? "";
+        createdTitle = args[args.indexOf("--title") + 1] ?? "";
+        return "https://github.test/a/b/issues/102\n";
+      }
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({
+        number: 102,
+        title: createdTitle,
+        body: createdBody
+          .replace(/\\u0007/gi, "\\^G")
+          .replace(/\\u009b/gi, "\\^[")
+          .replace(/\\u009d/gi, "\\^]")
+          .replace(/\\u009c/gi, "\\^\\"),
+        url: "https://github.test/a/b/issues/102",
+        state: "OPEN",
+        labels: [{ name: "review-finding" }, { name: "needs-validation" }, { name: "priority:P1" }],
+        milestone: null,
+      });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const issue = await client.materializeReviewFinding({
+      repo: "a/b", pullRequest, runId: "run-c1-case-normalization", reviewedHeadSha: head,
+      reviewerRoles: ["correctness"], finding,
+    });
+    assert.equal(issue.number, 102);
+    assert.match(createdBody, /\\u009B/);
+    assert.match(createdBody, /\\u009D/);
+    assert.match(createdBody, /\\u009c/);
+    assert.match(createdBody, /\\u0007/);
   });
 });
 

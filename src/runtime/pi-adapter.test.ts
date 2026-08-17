@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, resolvePiModelPolicy } from "./pi-adapter.js";
+import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -52,6 +52,16 @@ test("planning model resolution is role-specific and invocation policy wins", ()
   assert.deepEqual(resolvePiModelPolicy(taskForRole("packet-author"), {}, environment), { provider: "env", model: "planner", thinking: "high" });
   assert.deepEqual(resolvePiModelPolicy(taskForRole("builder", { provider: "worker", model: "builder" }), {}, environment), { provider: "worker", model: "builder", thinking: undefined });
   assert.deepEqual(resolvePiModelPolicy(taskForRole("reviewer", { provider: "task", model: "task" }), {}, environment), { provider: "env", model: "reviewer", thinking: undefined });
+});
+
+test("tool-call budget reserves parallel beforeToolCall slots without overshoot", () => {
+  const state = { toolCalls: 0 };
+  for (let index = 0; index < 20; index += 1) {
+    assert.equal(reserveToolCallBudget(state, 20), undefined);
+  }
+  assert.equal(state.toolCalls, 20);
+  assert.deepEqual(reserveToolCallBudget(state, 20), { limit: "maxToolCalls", value: 20, maximum: 20 });
+  assert.equal(state.toolCalls, 20);
 });
 
 test("nested reviewer transport does not depend on fetch or an implicit wall-clock timeout", async () => {

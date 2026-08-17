@@ -17,10 +17,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import { splitConfiguredModel, type ThinkingLevel } from "../core/config/forgedock-config.js";
-import { runIdFromTaskId, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
+import { runIdFromTaskId, type AgentExecutionUsage, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
 import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
-import { AgentRunError, createScopeManifestReceipt, scopeManifestForReviewer } from "./agent-runtime.js";
+import { AgentExecutionBudgetExceededError, AgentRunError, createScopeManifestReceipt, scopeManifestForReviewer } from "./agent-runtime.js";
 import type { RuntimePreflightOptions } from "./agent-runtime.js";
 import type {
   AgentEventSink,
@@ -54,6 +54,13 @@ interface ActiveExecution {
   controller: AbortController;
   done: Promise<void>;
   complete(): void;
+}
+
+interface LocalExecutionBudgetState {
+  turns: number;
+  toolCalls: number;
+  blockedToolCalls: number;
+  exhausted?: "maxTurns" | "maxToolCalls";
 }
 
 export class PiAgentRuntime implements AgentRuntime {
@@ -218,11 +225,36 @@ export class PiAgentRuntime implements AgentRuntime {
 
     const sessionRef = session.sessionId;
     this.#activeSessions.add(session);
+    const budgetState: LocalExecutionBudgetState = { turns: 0, toolCalls: 0, blockedToolCalls: 0 };
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "agent_end") usageMessages.push(...event.messages);
       if (event.type === "auto_retry_start") retryCount += 1;
+      if (event.type === "turn_start") budgetState.turns += 1;
       mapEvent(task.id, event, emit, task.observability);
     });
+    const previousBeforeToolCall = session.agent.beforeToolCall;
+    session.agent.beforeToolCall = async (context, signal) => {
+      if (context.toolCall.name !== "submit_artifact") {
+        const maxTurns = task.executionBudget?.maxTurns;
+        const maxToolCalls = task.executionBudget?.maxToolCalls;
+        const exhausted = maxTurns !== undefined && budgetState.turns > maxTurns
+          ? { limit: "maxTurns" as const, value: budgetState.turns, maximum: maxTurns }
+          : reserveToolCallBudget(budgetState, maxToolCalls);
+        if (exhausted) {
+          budgetState.exhausted ??= exhausted.limit;
+          budgetState.blockedToolCalls += 1;
+          // Give the model a short, explicit submit window. If it ignores the
+          // checkpoint, stop the session rather than allowing an unbounded
+          // stream of identical blocked tool calls.
+          if (budgetState.blockedToolCalls >= 4) void session.abort();
+          return {
+            block: true,
+            reason: `Execution budget exhausted (${exhausted.limit}=${exhausted.value}/${exhausted.maximum}). Stop exploring or editing and call submit_artifact with the complete result now.`,
+          };
+        }
+      }
+      return previousBeforeToolCall?.(context, signal);
+    };
     const abort = () => void session.abort().catch(() => undefined);
     execution.controller.signal.addEventListener("abort", abort, { once: true });
     if (execution.controller.signal.aborted) abort();
@@ -242,24 +274,42 @@ export class PiAgentRuntime implements AgentRuntime {
         ].join("\n"));
       }
       if (submitted === undefined) {
+        if (budgetState.exhausted !== undefined) {
+          throw new AgentExecutionBudgetExceededError(
+            budgetState.exhausted,
+            budgetState.exhausted === "maxTurns" ? budgetState.turns : budgetState.toolCalls,
+            budgetState.exhausted === "maxTurns" ? task.executionBudget?.maxTurns ?? budgetState.turns : task.executionBudget?.maxToolCalls ?? budgetState.toolCalls,
+            { sessionRef, execution: localExecutionUsage(task, budgetState) },
+          );
+        }
         throw new Error(`Agent ${task.id} ended without calling submit_artifact`);
       }
       emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
       const result = { output: submitted, sessionRef, provider, model: modelId };
-      return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageFromMessages(usageMessages), retryCount) };
+      return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageFromMessages(usageMessages), retryCount, undefined, localExecutionUsage(task, budgetState)) };
     } catch (error) {
       const cancelled = execution.controller.signal.aborted;
+      const effectiveError = budgetState.exhausted !== undefined && submitted === undefined && !(error instanceof AgentExecutionBudgetExceededError)
+        ? new AgentExecutionBudgetExceededError(
+          budgetState.exhausted,
+          budgetState.exhausted === "maxTurns" ? budgetState.turns : budgetState.toolCalls,
+          budgetState.exhausted === "maxTurns" ? task.executionBudget?.maxTurns ?? budgetState.turns : task.executionBudget?.maxToolCalls ?? budgetState.toolCalls,
+          { sessionRef, execution: localExecutionUsage(task, budgetState), cause: error },
+        )
+        : error;
       emit({
         type: cancelled ? "session.cancelled" : "session.failed",
         taskId: task.id,
         sessionRef,
-        errorSummary: terminalErrorSummary(error, cancelled),
+        errorSummary: terminalErrorSummary(effectiveError, cancelled),
         ...(task.observability ? { observability: task.observability } : {}),
       });
-      if (error instanceof AgentRunError && error.sessionRef) throw error;
-      const detail = error instanceof Error ? error : new Error(String(error));
-      throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: error });
+      if (effectiveError instanceof AgentRunError && effectiveError.sessionRef) throw effectiveError;
+      const detail = effectiveError instanceof Error ? effectiveError : new Error(String(effectiveError));
+      throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: effectiveError, execution: localExecutionUsage(task, budgetState) });
     } finally {
+      if (previousBeforeToolCall) session.agent.beforeToolCall = previousBeforeToolCall;
+      else delete session.agent.beforeToolCall;
       execution.controller.signal.removeEventListener("abort", abort);
       unsubscribe();
       this.#activeSessions.delete(session);
@@ -329,6 +379,26 @@ export class PiAgentRuntime implements AgentRuntime {
     this.#activeExecutions.add(execution);
     return execution;
   }
+}
+
+/**
+ * Reserve a tool-call slot before Pi starts the call. Pi may invoke several
+ * beforeToolCall hooks concurrently for one model response, so counting only
+ * tool_execution_start events lets a parallel wave overshoot its ceiling.
+ */
+export function reserveToolCallBudget(
+  state: Pick<LocalExecutionBudgetState, "toolCalls">,
+  maximum: number | undefined,
+): { limit: "maxToolCalls"; value: number; maximum: number } | undefined {
+  if (maximum === undefined) {
+    state.toolCalls += 1;
+    return undefined;
+  }
+  if (state.toolCalls >= maximum) {
+    return { limit: "maxToolCalls", value: state.toolCalls, maximum };
+  }
+  state.toolCalls += 1;
+  return undefined;
 }
 
 export interface ResolvedPiModelPolicy {
@@ -492,6 +562,7 @@ function createAgentReceipt<T>(
   usage: AgentUsageReceipt,
   retryCount = 0,
   resumedFrom?: string,
+  execution?: AgentExecutionUsage,
 ): AgentRunReceipt {
   const completedAt = Date.now();
   return {
@@ -514,6 +585,16 @@ function createAgentReceipt<T>(
       ...(resumedFrom !== undefined ? { resumedFrom } : {}),
     },
     usage,
+    ...(execution !== undefined ? { execution } : {}),
+  };
+}
+
+function localExecutionUsage<T>(task: AgentTask<T>, state: LocalExecutionBudgetState): AgentExecutionUsage {
+  return {
+    turns: state.turns,
+    toolCalls: state.toolCalls,
+    ...(task.executionBudget ? { budget: { ...task.executionBudget } } : {}),
+    ...(state.exhausted ? { exhausted: state.exhausted } : {}),
   };
 }
 
@@ -767,6 +848,7 @@ function terminalErrorSummary(error: unknown, cancelled: boolean): string {
   if (/ended without calling submit_artifact/i.test(message)) return "Agent session ended without submitting the required artifact";
   if (/invalid structured result/i.test(message)) return "Agent session returned an invalid structured result";
   if (/scope manifest|scope receipt/i.test(message)) return "Agent session scope validation failed";
+  if (/execution (maxTurns|maxToolCalls) budget exhausted/i.test(message)) return "Agent execution budget exhausted before artifact submission";
   return "Agent session failed";
 }
 

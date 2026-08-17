@@ -68,12 +68,13 @@ describe("orchestrate runtime helper paths", () => {
     assert.match(opencodeDocs, /customized commands are\s+preserved/);
   });
 
-  it("keeps README OpenCode install guidance aligned with migration ownership", () => {
+  it("keeps README npm install guidance aligned with ForgeDock Next", () => {
     assert.match(
       readme,
-      /without changing your provider\s+or user-owned settings\.\s+When migrating an older ForgeDock adapter, it removes\s+only exact ForgeDock-managed legacy entries from `opencode\.json`:/,
+      /ForgeDock Next is distributed as the `forgedockcli` npm package\.[\s\S]*npm install -g forgedockcli[\s\S]*forgedockcli/,
     );
-    assert.doesNotMatch(readme, /without changing your provider\s+or `opencode\.json`/);
+    assert.match(readme, /legacy command\/spec trees are intentionally excluded from the npm tarball/);
+    assert.doesNotMatch(readme, /npx forgedock opencode install/);
   });
 
   it("documents event-driven OpenCode DAG dispatch", () => {

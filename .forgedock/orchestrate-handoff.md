@@ -1,5 +1,96 @@
 # ForgeDock `/orchestrate` audit — handoff prompt
 
+## Mission resume checkpoint - 2026-08-17 UTC
+
+This is the active checkpoint. The mission is to use the native ForgeDockCLI
+engine in the staging worktree to drive the open/in-flight no-milestone issues
+through authoritative closure, while recording performance and fixing defects
+exposed by real runs. Do not substitute a Codex Forge adapter or declare
+dogfood readiness from a preview.
+
+- Worktree: `C:\Users\ItsMr\Documents\Coding Projects\.forgedock-worktrees\forgedockcli\staging`.
+- Native command boundary: `node bin/forgedock-next.mjs`, `npm run next`, and
+  `npm run terminal` share the same typed engine. Use one native mutating
+  controller at a time; sidecars are read-only.
+- Primary stateless ledger: `.forgedock/orchestrate-watch.md`. Preserve it and
+  append exact issue/run IDs, GitHub timestamps, transitions, receipts,
+  retries, token/cost/tool telemetry, stop reasons, and next actions.
+- Current run: `run_f42976d5-d62e-40bb-8202-61811545fa33` for issue #256 is
+  durably `failed`, attempt 2, version 18, after sequence 18. BuildResult
+  `art_047acb61-132d-48e3-8913-3b85125c1df0`, PR #299, and reviewed head
+  `edf8db88224f675184744c84c6ccd32506c771df` are authoritative and retained.
+- The latest native run completed verification, publication, four reviewer
+  sessions, and scope adjudication. It failed only while projecting real issue
+  #302 because GitHub normalized nine CRLF characters: readback body length
+  3,711 versus pre-write 3,720. #302 is valid/open and must be adopted, not
+  deleted or duplicated.
+- Staging now canonicalizes only CRLF/CR to LF for review-finding body
+  identity, preserves strict semantic content/markers/labels/milestone checks,
+  and reports a safe first-difference index. `npm run build` and the GitHub
+  client suite pass 45/45, including line-ending acceptance and content-change
+  rejection.
+- Next action is the native Windows resume, with the lease-witness environment
+  configured and logs under `.forgedock/`:
+
+  `node bin/forgedock-next.mjs work-on 256 --repo RapierCraftStudios/ForgeDockCLI --resume --auto-merge --provider openai-codex --model gpt-5.6-luna --thinking max`
+
+  Watch `state.db`, `observations.db`, native stdout/stderr, GitHub PR #299,
+  and issues #300/#302. Require ReviewVerdict, remediation, verification,
+  merge, and authoritative issue closure. Then proceed one in-flight candidate
+  at a time; do not claim dogfood readiness until engine-error/stale blockers
+  have been resolved or explicitly evidenced as external and the end-to-end
+  telemetry is complete.
+
+## Historical checkpoint (superseded) - 2026-08-17 UTC
+
+Resume from this checkpoint; do not treat the older historical sections below
+as the current live state.
+
+- Worktree: `C:\Users\ItsMr\Documents\Coding Projects\.forgedock-worktrees\forgedockcli\staging`.
+- Use the native ForgeDockCLI Next engine (`npm run next`, `npm run terminal`,
+  or `node bin/forgedock-next.mjs`) only. Interactive terminal and CLI are
+  integration surfaces over the same typed engine. Do not use Codex Forge
+  adapter skills or create a competing workflow implementation.
+- Spawn Luna max subagents before resuming: one read-only process/telemetry
+  watcher, one GitHub issue/PR and workflow-state fact finder, and one
+  code/CI/security fact finder. They must report observations only; only one
+  native mutating controller may own a worktree at a time.
+- Read `AGENTS.md`, the tail of `.forgedock/orchestrate-watch.md`,
+  `.forgedock/orchestrate-hyperperformance-plan.md`, and
+  `.forgedock/orchestrate-watch.md` before acting. Preserve all scratch files
+  and historical ledger entries.
+- The prior live controller has been stopped. There is no active
+  `work-on 256` process. Its durable run is intentionally resumable but still
+  says `building`:
+  `run_f42976d5-d62e-40bb-8202-61811545fa33`, attempt 2, version 4, with
+  `updatedAt=2026-08-17T06:16:30.217Z`.
+- #256 is open with `workflow:building`; GitHub's last update is
+  `2026-08-17T05:55:48Z`. Local observations continued until about `07:03Z`
+  with 1,031 heartbeat/progress records, repeated reads/edits, and no durable
+  state transition, BuildResult, commit, PR, or GitHub checkpoint. This was
+  classified and recorded as a semantic-progress stall in HP-23, not as a
+  successful build.
+- Do not blindly resume #256. First inspect the retained issue-worktree diff,
+  verify whether the edits are coherent and scoped, reconcile the durable
+  Build Packet/task receipt state, and choose a bounded recovery that requires
+  semantic progress/checkpoint evidence. If resuming, use the exact native
+  `work-on 256 --resume` path with provider `openai-codex`, model
+  `gpt-5.6-luna`, and `--thinking max`; repair WSL Git pointers before launch
+  and restore Windows pointers after the process family exits.
+- #291 / issue #210 remains blocked by the required failing Unit tests check
+  on PR #291. #254 and #255 are stale `ready-to-build`; #278 is stale
+  `investigating`; #199 is stale `building`; #208 is durably `decomposed` and
+  must be reconciled from its authoritative child evidence rather than
+  treated as a fresh build. Work one recovery at a time.
+- Treat GitHub artifacts as semantic truth and SQLite/observations/process
+  activity as operational evidence. A heartbeat or model-thinking event is
+  not semantic progress. Record issue/PR timestamps, transitions, task
+  receipts, active/wall-clock gaps, token/cost data, retries, and exact
+  process outcomes in the watch ledger.
+- Keep the controller's semantic work intact when stopping it: interrupt only
+  the exact validated process family, retain the durable checkpoint, do not
+  delete issues, branches, worktrees, artifacts, databases, or user scratch.
+
 You are taking over a behavior-first audit and improvement task for the native ForgeDockCLI `/orchestrate` implementation. Work in:
 
 `C:\Users\ItsMr\Documents\Coding Projects\.forgedock-worktrees\forgedockcli\staging`

@@ -15,7 +15,7 @@ name: Publish to npm
 #      the revert is prepared, use `npm dist-tag` to move `latest` back to the
 #      last-known-good version (this does not remove the bad version, it only
 #      stops it from being the default resolution target):
-#       npm dist-tag add forgedock@<last-good-version> latest
+#       npm dist-tag add forgedockcli@<last-good-version> latest
 #
 # The `concurrency` group below serializes publish runs so two qualifying
 # pushes landing close together (e.g. a merge immediately followed by this
@@ -216,12 +216,12 @@ jobs:
           }
 
           NPM_ALREADY_PUBLISHED=$(query_registry_version \
-            "forgedock@$NEXT_VERSION" \
+            "forgedockcli@$NEXT_VERSION" \
             "https://registry.npmjs.org" \
             "" \
             "npmjs")
           GITHUB_PACKAGES_ALREADY_PUBLISHED=$(query_registry_version \
-            "@rapiercraftstudios/forgedock@$NEXT_VERSION" \
+            "@rapiercraftstudios/forgedockcli@$NEXT_VERSION" \
             "https://npm.pkg.github.com" \
             "$GITHUB_PACKAGES_NPMRC" \
             "github-packages")
@@ -274,7 +274,7 @@ jobs:
             "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" \
             "@rapiercraftstudios:registry=https://npm.pkg.github.com" \
             > "$NPMRC"
-          npm pkg set name="@rapiercraftstudios/forgedock"
+          npm pkg set name="@rapiercraftstudios/forgedockcli"
           npm publish --access public --userconfig "$NPMRC"
           echo "GITHUB_PACKAGES_ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
         env:
@@ -298,8 +298,8 @@ jobs:
             exit 1
           fi
           PACKAGE_NAME=$(node -p "require('./package.json').name")
-          if [ "$PACKAGE_NAME" != "forgedock" ]; then
-            echo "package.json name was not restored to forgedock; refusing to finalize" >&2
+          if [ "$PACKAGE_NAME" != "forgedockcli" ]; then
+            echo "package.json name was not restored to forgedockcli; refusing to finalize" >&2
             exit 1
           fi
           echo "REGISTRIES_RECONCILED=true" >> "$GITHUB_ENV"

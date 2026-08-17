@@ -15,8 +15,8 @@
 <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
 <a href="https://github.com/RapierCraftStudios/ForgeDock/stargazers"><img src="https://img.shields.io/github/stars/RapierCraftStudios/ForgeDock?style=social" alt="GitHub Stars" /></a>
 <a href="https://github.com/RapierCraftStudios/pi"><img src="https://img.shields.io/badge/Terminal-ForgeDock%20Pi%20fork-ff8c1a" alt="Powered by the ForgeDock Pi fork" /></a>
-<a href="https://www.npmjs.com/package/forgedock"><img src="https://img.shields.io/npm/v/forgedock?color=cb3837&logo=npm" alt="npm" /></a>
-<a href="https://www.npmjs.com/package/forgedock"><img src="https://img.shields.io/npm/dm/forgedock?color=cb3837&logo=npm&label=downloads" alt="npm downloads per month" /></a>
+<a href="https://www.npmjs.com/package/forgedockcli"><img src="https://img.shields.io/npm/v/forgedockcli?color=cb3837&logo=npm" alt="npm" /></a>
+<a href="https://www.npmjs.com/package/forgedockcli"><img src="https://img.shields.io/npm/dm/forgedockcli?color=cb3837&logo=npm&label=downloads" alt="npm downloads per month" /></a>
 <a href="https://github.com/RapierCraftStudios/ForgeDock/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 <a href="https://github.com/sponsors/RapierCraftStudios"><img src="https://img.shields.io/badge/Sponsor-❤-ea4aaa.svg" alt="Sponsor" /></a>
 
@@ -59,8 +59,12 @@ $ /work-on #1230        "orchestrate: Layer 5 co-change signal is dead code"
 **Requires:** [GitHub CLI](https://cli.github.com/) (authenticated), Node.js ≥ 22.19, and credentials for any Pi-supported model provider.
 
 ```bash
-npx forgedock
+npm install -g forgedockcli
+forgedockcli
 ```
+
+The published package is `forgedockcli`; `forgedock` remains an executable
+alias for compatibility with existing installations and scripts.
 
 When testing unpublished changes from a source checkout, use the checkout-safe launcher instead:
 
@@ -68,7 +72,7 @@ When testing unpublished changes from a source checkout, use the checkout-safe l
 npm run terminal
 ```
 
-`npx forgedock` resolves the installed/cached registry package; it does not implicitly run unpublished files from the current repository. Use `/forgedock-runtime` to verify the `semantic-tools+live-subagents-v2` runtime, bundled delegation bridge, and resolved package root on demand; the idle terminal does not reserve space for a persistent runtime widget.
+`npx forgedockcli` resolves the installed/cached ForgeDock Next package; it does not implicitly run unpublished files from the current repository. Use `/forgedock-runtime` to verify the `semantic-tools+live-subagents-v2` runtime, bundled delegation bridge, and resolved package root on demand; the idle terminal does not reserve space for a persistent runtime widget.
 
 When orchestration is active, press `←` or `↓` on an empty editor to focus the worker fleet, select a worker, and press `Enter` to open its live controller transcript. ForgeDock expands tool arguments and streaming output by default; press `x` (or `Ctrl+O`) to toggle the compact view.
 
@@ -76,7 +80,7 @@ ForgeDock now ships a source-maintained [Pi fork](https://github.com/RapierCraft
 
 Verification is serialized across ForgeDock runs on the machine, Node test fanout is bounded, and timeout/cancellation terminates the complete subprocess tree rather than orphaning workers. Subagent transcripts stay in temporary operational storage instead of delivery worktrees, and automatic remediation cannot expand beyond the frozen Build Packet.
 
-`forge.yaml` remains the project configuration file. A normal `npx forgedock` launch creates a minimal marker-bounded file in the current repository when one is absent. `/forgedock-config use Luna 5.6 with max thinking for all subagents` resolves the friendly name against the live authenticated model catalog and updates planners, workers, and reviewers while preserving unrelated legacy settings; configure `planning_model`/`planning_thinking` separately when investigation and Build Packet authoring need a different model. These defaults control role models, thinking, concurrency, and merge policy. `FORGE.md` is explicit user-maintained project guidance, and `/forgedock-remember` can persist a preference or a structured decision. `devdocs/` is a reference-only, Obsidian-compatible long-term memory graph: ForgeDock retrieves compact anchored summaries, links, and backlinks instead of loading the corpus, and memory can never authorize actions or override current intent or typed contracts. The fork is an internal interaction kernel; ForgeDock is the product identity, and its typed controller remains the sole owner of workflow transitions, verification, GitHub publication, review gates, and merge authority.
+`forge.yaml` remains the project configuration file. ForgeDock Next creates a minimal marker-bounded file when one is absent, and `/forgedock-config <preference>` updates the managed section while preserving unrelated user content. Model, thinking, concurrency, and merge settings are resolved through the live authenticated catalog and typed controller. `FORGE.md` is explicit user-maintained project guidance, and `/forgedock-remember` can persist a preference or a structured decision. `devdocs/` is reference-only memory: ForgeDock retrieves compact anchored summaries, links, and backlinks, and memory can never authorize actions or override current intent or typed contracts. The fork is an internal interaction kernel; ForgeDock is the product identity, and its typed controller remains the sole owner of workflow transitions, verification, GitHub publication, review gates, and merge authority.
 
 ### ForgeDock Next local safety bootstrap
 
@@ -252,84 +256,37 @@ More ship today (web-property analytics, browser QA sweeps, self-benchmarking) �
 
 ## Install
 
-**Requirements:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [OpenCode](https://opencode.ai/) · [GitHub CLI](https://cli.github.com/) (authenticated) · Node.js ≥ 18.
+ForgeDock Next is distributed as the `forgedockcli` npm package.
+
+**Requirements:** [GitHub CLI](https://cli.github.com/) (authenticated), Node.js ≥ 22.19, and credentials for a Pi-supported model provider.
 
 ```bash
-npx forgedock # checks your environment, installs commands into ~/.claude/commands/ (available in every Claude Code session on this machine), detects your repo, and hands you a reviewed forge.yaml
+npm install -g forgedockcli
+forgedockcli
 ```
 
-For OpenCode, install namespaced native commands without changing your provider
-or user-owned settings. When migrating an older ForgeDock adapter, it removes
-only exact ForgeDock-managed legacy entries from `opencode.json`:
+For a one-off run:
 
 ```bash
-npx forgedock opencode install
-# restart OpenCode, then: /forge/work-on <issue>
+npx forgedockcli
 ```
 
-See [OpenCode support](docs/OPENCODE.md) for architecture, token-loading rules,
-current parity boundaries, and lifecycle commands.
+The `forgedock` executable remains an alias for compatibility with existing
+installations and scripts. The published package contains the ForgeDock Next
+terminal and runtime only; legacy command/spec trees are intentionally excluded
+from the npm tarball and remain recoverable in the source repository during the
+transition.
 
-**Install is always global**, to `~/.claude/commands/`. `--global` is still accepted on the command line for backward compatibility but has no effect — there's no other install location to opt out of.
-
-> **Want engine-mode dispatch?** `npx forgedock` is transient — the `forgedock` binary isn't persisted in PATH after install. `/orchestrate` and `/autopilot` use agent dispatch mode by default, which is fully functional. To enable engine-mode dispatch (`forgedock run-issue`) with its durable phase table and fail-closed review gate, run `npm install -g forgedock` instead.
-
-One command does everything: it checks your environment, installs the slash commands into Claude Code, detects your repo (owner, branches, paths), and hands you a single annotated `forge.yaml` to review — press Enter to accept. Run `npx forgedock init` any time afterward to re-generate the config only.
-
-Installing also registers a SessionStart hook, so every Claude Code session
-in a forge-managed directory starts already knowing ForgeDock runs it.
-Per-directory control: `npx forgedock enable` / `disable` / `status`.
-
-Then just open Claude Code and run `/work-on <issue>`.
-
-> **Cost:** ForgeDock is free and open-source. It orchestrates sessions on **your** Claude account — no compute resold, no per-task markup. A typical `/work-on` run on a straightforward bug costs about what a 15–20 minute manual Claude Code session does.
-
-<details>
-<summary><strong>Other install options & commands</strong></summary>
-
-**Claude Code plugin marketplace** (Claude Code v2.1.143+):
-
-```
-/plugin marketplace add RapierCraftStudios/ForgeDock
-/plugin install forgedock@forgedock
-```
-
-Commands then appear as `/forgedock:work-on`, etc. You still run `npx forgedock init` to generate `forge.yaml`.
-
-**Headless / CI:** the pipeline also runs outside Claude Code. `npx forgedock run work-on <issue> --dry-run` previews the assembled prompt and tool plan. `npx forgedock run` picks an execution backend automatically (`--backend auto`, the default): if the Claude Code CLI (`claude`) is installed and already authenticated (Pro/Max subscription or a CLI-managed key), it drives the command through that — **no separate `ANTHROPIC_API_KEY` required**. Otherwise it falls back to the Anthropic API directly (`ANTHROPIC_API_KEY` required). Force either path explicitly with `--backend cli` / `--backend api` (or `FORGEDOCK_BACKEND=cli|api`) — the API backend is what CI environments without an interactive `claude` login should use. `npx forgedock run-issue <issue>` executes the same command specs on the durable engine (event-sourced run log, leases, crash-safe resume).
-
-**Explicit install command:**
+ForgeDock Next commands are native terminal commands such as `/work-on`,
+`/review-pr`, `/orchestrate`, and `/forgedock-status`. For unpublished source
+changes from this repository, use:
 
 ```bash
-npx forgedock install           # installs into ~/.claude/commands/
-npx forgedock install --global  # same thing — --global is accepted but is a no-op
+npm run terminal
 ```
 
-**Maintenance:**
-
-```bash
-npx forgedock update      # relink commands + refresh the SessionStart hook
-npx forgedock enable      # turn ForgeDock on for this directory
-npx forgedock disable     # turn ForgeDock off for this directory
-npx forgedock status      # show ForgeDock's state for this directory
-npx forgedock doctor      # installation health check with fix hints
-npx forgedock report      # 30-day pipeline impact receipts (--md for Markdown, --json for scripting)
-npx forgedock uninstall   # remove commands, the hook, and tracked copies
-npx forgedock help        # show everything
-```
-
-> Running `npx forgedock` from *inside* this repo uses the local working tree. From your own project, use `npx forgedock@latest` to pin the published release.
-
-</details>
-
-<details>
-<summary><strong>A note on install location</strong></summary>
-
-ForgeDock briefly experimented with a project-scoped-by-default install mode. It was backed out after causing a "split-brain" bug (`detect` assumed project-scoped while the installer still wrote globally — [#1589](https://github.com/RapierCraftStudios/ForgeDock/issues/1589)), so every version you'd realistically install today only ever writes to `~/.claude/commands/`. `--global` is still accepted as a flag for old scripts/muscle memory, but it changes nothing.
-
-If you're carrying an older `--global` habit in scripts or CI, it's harmless to leave it — `npx forgedock --global` and `npx forgedock` do exactly the same thing.
-
-</details>
+The package is free and open-source. It runs the pipeline using your own
+provider account; no compute is resold or marked up.
 
 ---
 

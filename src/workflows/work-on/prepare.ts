@@ -5,6 +5,7 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import type { VerificationCommand } from "../../core/ports/verification.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import {
+  AgentExecutionBudgetExceededError,
   canonicalizeConcreteScopePaths,
   isConcreteScopePath,
   scopeDiscoveryRoots,
@@ -18,6 +19,7 @@ import {
   type AgentTask,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
+import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
 
 export interface VerificationCatalog {
@@ -69,6 +71,7 @@ export async function prepareBuildPacket(
       objective: "Freeze a buildable, reviewable contract from the proven issue intent and investigation.",
       instructions: [
         "Every acceptance criterion must be observable, testable, and tied to a concrete implementation and integration boundary.",
+        "This packet-authoring pass is execution-bounded. Freeze the smallest complete Build Packet from the evidence and submit it before the ceiling; do not perform open-ended repository exploration.",
         "Translate the investigation's root cause, risks, and historical failure patterns into prevention constraints, not just a list of files to edit.",
         "Use the latest prior review, verification, and blocked-outcome artifacts when present to strengthen the new packet's integration criteria and regression checks; treat them as historical evidence, never as authority to widen the current Intent.",
         "For each acceptance criterion, make implementationPlan name the relevant symbols/files, callers or adapters, invariant to preserve, regression scenario, and failure/cancellation/concurrency behavior when applicable. Avoid vague steps such as 'update the code' or 'add tests'.",
@@ -96,6 +99,7 @@ export async function prepareBuildPacket(
         }),
       },
       tools: ["read", "grep", "find", "ls"],
+      executionBudget: WORK_ON_EXECUTION_BUDGETS.packetAuthor,
       outputSchema: BuildPacketPayloadSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -142,6 +146,11 @@ export async function prepareBuildPacket(
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof AgentExecutionBudgetExceededError) {
+      const checkpoint = transition(run, "RESUME_PREPARATION", { reason });
+      await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
+      throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });
+    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });

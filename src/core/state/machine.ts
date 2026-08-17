@@ -23,10 +23,12 @@ export type RunStateName =
 
 export type TransitionEvent =
   | "START_INVESTIGATION"
+  | "RESUME_INVESTIGATION"
   | "INVESTIGATION_CONFIRMED"
   | "INVESTIGATION_INVALID"
   | "INVESTIGATION_DECOMPOSED"
   | "BUILD_PACKET_READY"
+  | "RESUME_PREPARATION"
   | "BUILD_COMPLETED"
   | "RESUME_BUILD"
   | "VERIFICATION_PASSED"
@@ -103,6 +105,7 @@ export interface TransitionRecord {
 const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent, RunStateName>>>> = {
   queued: { START_INVESTIGATION: "investigating", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   investigating: {
+    RESUME_INVESTIGATION: "investigating",
     INVESTIGATION_CONFIRMED: "preparing",
     INVESTIGATION_INVALID: "invalid",
     INVESTIGATION_DECOMPOSED: "decomposed",
@@ -110,7 +113,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     FAIL: "failed",
     CANCEL: "cancelled",
   },
-  preparing: { BUILD_PACKET_READY: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  preparing: { RESUME_PREPARATION: "preparing", BUILD_PACKET_READY: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   building: { BUILD_COMPLETED: "verifying", RESUME_BUILD: "building", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   verifying: {
     VERIFICATION_PASSED: "publishing",
@@ -209,7 +212,7 @@ export function transition(
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
-  if (event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
+  if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

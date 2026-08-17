@@ -434,8 +434,9 @@ export class GitHubClient implements ForgeHost {
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
     const authoritative = await this.authoritativeIssueSnapshot({ repo: input.repo, number, title, body, url, state: "OPEN" });
-    if (!isCurrentReviewFindingProjection(authoritative, { title, body, marker, priority, milestoneTitle })) {
-      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation`);
+    const projectionMismatches = reviewFindingProjectionMismatches(authoritative, { title, body, marker, priority, milestoneTitle });
+    if (projectionMismatches.length) {
+      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation: ${projectionMismatches.join(", ")}`);
     }
     await this.remediationAdmissions.complete(admissionKey, authoritative);
     return authoritative;
@@ -468,8 +469,9 @@ export class GitHubClient implements ForgeHost {
       authoritative = await this.authoritativeIssueSnapshot(issue);
     }
 
-    if (!isCurrentReviewFindingProjection(authoritative, expected)) {
-      throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh`);
+    const projectionMismatches = reviewFindingProjectionMismatches(authoritative, expected);
+    if (projectionMismatches.length) {
+      throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh: ${projectionMismatches.join(", ")}`);
     }
     return authoritative;
   }
@@ -1485,19 +1487,65 @@ function isCurrentReviewFindingProjection(
     milestoneTitle: string | undefined;
   },
 ): boolean {
+  return reviewFindingProjectionMismatches(issue, expected).length === 0;
+}
+
+function reviewFindingProjectionMismatches(
+  issue: IssueSnapshot,
+  expected: {
+    title: string;
+    body: string;
+    marker: string;
+    priority: "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3";
+    milestoneTitle: string | undefined;
+  },
+): string[] {
+  const mismatches: string[] = [];
   const labels = issue.labels ?? [];
   const priorityLabels = labels.filter((label) => /^priority:P[0-3]$/.test(label));
-  return issue.state === "OPEN"
-    && issue.title === expected.title
-    && issue.body === expected.body
-    && hasCanonicalMarker(issue.body, expected.marker)
-    && reviewedShaFromFindingBody(issue.body) !== undefined
-    && ["review-finding", "needs-validation", expected.priority].every((label) => labels.includes(label))
-    && priorityLabels.length === 1
-    && priorityLabels[0] === expected.priority
-    && (expected.milestoneTitle !== undefined
-      ? issue.milestone?.title === expected.milestoneTitle
-      : issue.milestone === undefined);
+  if (issue.state !== "OPEN") mismatches.push(`state:${issue.state}`);
+  if (issue.title !== expected.title) mismatches.push("title");
+  const authoritativeBody = canonicalGitHubBody(issue.body);
+  const expectedBody = canonicalGitHubBody(expected.body);
+  if (authoritativeBody !== expectedBody) {
+    mismatches.push(`body-length:${issue.body.length}/${expected.body.length}`);
+    mismatches.push(`body-diff-at:${firstDifferenceIndex(authoritativeBody, expectedBody)}`);
+  }
+  if (!hasCanonicalMarker(issue.body, expected.marker)) mismatches.push("root-marker");
+  if (reviewedShaFromFindingBody(issue.body) === undefined) mismatches.push("reviewed-sha");
+  const missingLabels = ["review-finding", "needs-validation", expected.priority].filter((label) => !labels.includes(label));
+  if (missingLabels.length) mismatches.push(`missing-labels:${missingLabels.join("|")}`);
+  if (priorityLabels.length !== 1 || priorityLabels[0] !== expected.priority) {
+    mismatches.push(`priority-labels:${priorityLabels.join("|") || "none"}`);
+  }
+  if (expected.milestoneTitle !== undefined) {
+    if (issue.milestone?.title !== expected.milestoneTitle) mismatches.push("milestone");
+  } else if (issue.milestone !== undefined) {
+    mismatches.push("unexpected-milestone");
+  }
+  return mismatches;
+}
+
+/** GitHub stores issue bodies with normalized LF line endings. Preserve strict
+ * content identity while ignoring only that transport-level normalization. */
+function canonicalGitHubBody(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    // GitHub's issue transport rewrites literal escaped C1 controls in
+    // Markdown text to caret notation. Preserve strict content identity
+    // while treating only those known wire-level spellings as equivalent.
+    .replace(/\\u0007/gi, "\\^G")
+    .replace(/\\u009b/gi, "\\^[")
+    .replace(/\\u009d/gi, "\\^]")
+    .replace(/\\u009c/gi, "\\^\\");
+}
+
+function firstDifferenceIndex(left: string, right: string): number {
+  const limit = Math.min(left.length, right.length);
+  for (let index = 0; index < limit; index += 1) {
+    if (left[index] !== right[index]) return index;
+  }
+  return limit;
 }
 
 function reviewedShaFromFindingBody(body: string): string | undefined {

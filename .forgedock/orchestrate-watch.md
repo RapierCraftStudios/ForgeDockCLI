@@ -1850,3 +1850,265 @@ entry as the current checkpoint.
   orchestration controller/scheduler/terminal-result tests passed `52/52`.
   The full native suite remains the active worker's own validation gate; do
   not count this code checkpoint as a new issue closure.
+
+#### HP-22 native post-reboot recovery and telemetry checkpoint (2026-08-17 UTC)
+
+- All live work in this checkpoint used the native ForgeDock Next CLI
+  (`node bin/forgedock-next.mjs`), not a Codex Forge adapter or competing
+  workflow implementation. Windows native `/review-pr` correctly failed
+  closed because this host lacks the descriptor-relative no-follow mutation
+  primitives required by the sandbox. Native WSL execution was used only as
+  the verified Linux host path, with the existing provider auth bridged into
+  a temporary agent directory and the retained lease witness supplied through
+  the documented environment boundary.
+- The reboot exposed Windows/WSL Git pointer incompatibilities. The staging
+  pointer and each recovered issue worktree pointer were repaired explicitly
+  before WSL execution and restored to Windows form after each controller
+  family exited. No issue worktree, branch, artifact, database, or user
+  scratch file was deleted. A WSL GitHub CLI older than the workflow's
+  `--paginate --slurp` requirement was also detected; the persistent WSL
+  `gh` was upgraded to 2.74.2 for subsequent native runs.
+- #278 resumed from durable run
+  `run_ff988b84-6b17-4480-a792-3738e9126daa` after its worktree pointer was
+  repaired. The investigator repeatedly replayed stale retained paths and
+  hit scope/path rejection before correcting to the assigned worktree. It
+  continued reads/greps but produced no new semantic artifact or state
+  transition for roughly twenty minutes, so only the exact native Node
+  process was interrupted. The durable run remains `investigating` and is
+  resumable; the path replay and missing bounded investigation completion are
+  confirmed resume-context defects, not evidence to discard the checkpoint.
+- #256 resumed from durable run
+  `run_f42976d5-d62e-40bb-8202-61811545fa33`. The native observation journal
+  recorded investigation session start at `05:18:54Z`, Investigation artifact
+  `art_905207b1-ed30-4761-b5be-911b79964dcd`, and a valid
+  `investigating -> preparing` transition at `05:35:03Z`. The Build Packet
+  session then produced artifact
+  `art_f00050f7-3c4d-4341-9090-e43141965a96` and a durable
+  `preparing -> building` transition at `05:55:46Z`. The two completed
+  semantic tasks consumed 2,189,327 active milliseconds, 254,652 input
+  tokens, 50,434 output tokens, 1,835,520 cache-read tokens, 2,140,606
+  total tokens, zero queue milliseconds, zero retries, and an estimated
+  `$0.740808`.
+- The #256 build agent traced observability, output-budget, redaction, and
+  TUI background-task paths. Its last completed read was at `06:04:49Z`
+  followed only by model-thinking events through `06:05:13Z`; no tool,
+  progress, or activity event arrived for more than five minutes while the
+  provider remained in `p9_client_rpc`. The exact native process was then
+  interrupted. The durable run remains `building` at version 3 with the
+  Build Packet and checkpoint retained, so this is a measured provider/build
+  stall, not a fabricated failure.
+- The #291 review repair remained blocked on required `Unit tests (node --test)`
+  for PR #291. A Windows native repair failed closed at the sandbox capability
+  boundary; a WSL native repair reached the provider but produced no tool
+  calls for roughly ten minutes and was interrupted after its heartbeat
+  evidence was captured. PR #291 remains open at head
+  `2c3a155926255c78b5f935131f11f7ee095f2b3c`; DCO passed and the unit check
+  remains the actual blocker.
+- This checkpoint confirms a recurring performance pattern: Luna max agents
+  make large read batches, then spend approximately 3--5 minutes in provider
+  thinking before resuming. It also confirms that a true stall is
+  distinguishable from that pattern through the observation journal's tool
+  and activity timestamps. Future recovery must preserve this evidence,
+  resume #256 from its `building` checkpoint, and then recover #254/#255/#199
+  one at a time after pointer preflight. Do not impose the old soft issue-time
+  aspiration as an automatic termination policy.
+
+#### HP-23 #256 semantic checkpoint stall confirmed (2026-08-17 UTC)
+
+- GitHub remains the semantic authority: the live no-milestone issue query
+  reports #256 `OPEN`, `workflow:building`, with `updatedAt` at
+  `2026-08-17T05:55:48Z`—the Build Packet transition. There was no GitHub
+  comment, label transition, commit, or PR update during the resumed build.
+- The native resumed controller nevertheless remained alive until the exact
+  process was interrupted at approximately `07:03Z`. Its durable run
+  `run_f42976d5-d62e-40bb-8202-61811545fa33` was still `building`, attempt 2,
+  version 4, with `updatedAt` frozen at `06:16:30Z`. The observation journal
+  reached 1,031 progress/heartbeat records, but no durable state transition;
+  the latest events were repeated reads/edits in the observability files and
+  controller heartbeats.
+- The run's durable receipts still contained only the two completed semantic
+  tasks: 254,652 input tokens, 50,434 output tokens, 1,835,520 cache-read
+  tokens, and 2,140,606 total tokens. The resumed build had not emitted a
+  completed task receipt, BuildResult, commit, review handoff, or GitHub
+  checkpoint. This is semantic-progress stalling and unbounded token exposure
+  even though low-level activity/heartbeats continued.
+- The exact native Node process was interrupted to cap waste. The durable
+  `building` checkpoint and retained issue worktree were preserved for a
+  targeted recovery; no issue, branch, artifact, database, or scratch file
+  was deleted. Staging and issue-256 Git pointers were restored to Windows
+  form after the controller exited. Do not resume this run blindly: first
+  inspect the retained diff and the build/review checkpoint, then apply a
+  bounded recovery strategy that requires semantic progress or an explicit
+  durable checkpoint within the watchdog window.
+
+#### HP-24 active native dogfood recovery mandate (2026-08-17 UTC)
+
+- Operator clarified the immediate objective: do the actual native ForgeDockCLI
+  orchestration for all in-flight/open no-milestone work, drive issues toward
+  authoritative closure, fix pipeline defects exposed by those runs, and only
+  then report dogfood readiness. Do not answer with a user-run instruction or
+  substitute a Codex adapter.
+- Stateless continuity rule: this Markdown ledger is the primary handoff log.
+  After compaction or restart, reread its tail plus the hyperperformance plan
+  before any controller action. Record exact issue/run IDs, process families,
+  GitHub timestamps, durable transitions, telemetry, stop reasons, and the next
+  action here; do not rely on conversational memory.
+- Current inventory: open workflow/in-flight issues include #194, #197, #199,
+  #201, #208, #210, #254, #255, #256, and #278. Additional open review
+  findings remain in the no-milestone query and must be selected from current
+  GitHub evidence, not from this list alone. #211 and #212 are already closed.
+- Durable blockers/intermediate runs: #199 `building`, #254/#255
+  `preparing`, #256 `building` attempt 2 after the exact controller stop,
+  #278 `investigating`; #194/#197/#201/#210 have prior failed/blocked runs,
+  and #208 is authoritatively `decomposed`. #256's retained issue worktree
+  contains an uncommitted native builder diff for its two member findings
+  (#188/#203); it must be audited and recovered, not discarded.
+- Root-cause work queued before broad dispatch: builder sessions currently have
+  no execution turn/tool ceiling, controller timing counts wall-clock gaps as
+  active, and GitHub projection does not expose the last semantic transition
+  separately from tool/heartbeat activity. Implement evidence-backed bounded
+  progress/telemetry behavior without turning the soft 5--8 minute aspiration
+  into a blind issue timeout. Verify with focused tests and native runs.
+- No native controller is live at this checkpoint. Staging is on branch
+  `staging` at `0ef7404122b7f9579c0c55d8cc5ad8e78e7c71ce`; the Windows Git
+  pointers are restored. Preserve the existing tracked review-CI changes,
+  handoff/ledger edits, and all untracked scratch files.
+
+#### HP-25 bounded recovery fixes verified; #256 ready for native resume (2026-08-17 UTC)
+
+- Staging pipeline safeguards are implemented and verified: local Pi sessions
+  now enforce role budgets (investigator 16 turns/48 tools, packet author 12/40,
+  builder 32/96, remediator and CI repair 24/64), permit the final
+  `submit_artifact`, and convert exhaustion into recoverable `RESUME_*`
+  checkpoints with execution counters instead of an unbounded semantic loop.
+- Timing telemetry now reports open nonterminal phases as `unknown` unless a
+  semantic transition proves completion; live progress is separately recorded
+  as `fresh`, `stale`, or `unknown` with `lastProgressAt` and age. Run rebuild
+  preserves transitions/progress/telemetry and adopts the transition high-water
+  version before the caller resumes, preventing stale CAS/sequence collisions.
+- Staging build plus targeted SQLite/runtime/trajectory tests pass (19 tests).
+  The retained #256 observability diff was repaired for idempotent redaction of
+  `[REDACTED]` placeholders and corrected to preserve valid CSI semantics and
+  per-chunk channel telemetry. Its full Next corpus passes: 649 tests across
+  195 suites, including all 21 focused CLI/observability/TUI tests.
+- Retained #256 worktree remains intact and now passes `git diff --check`; no
+  commit or worktree cleanup has been performed. The next action is one native
+  ForgeDockCLI `work-on 256 --resume` through the actual Luna runtime, with the
+  direct observation journal and durable run state watched for bounded semantic
+  progress, execution-budget receipts, BuildResult, commit, PR, review, and
+  authoritative GitHub closure.
+
+#### HP-26 native #256 verification repair active (2026-08-17 UTC)
+
+- The native controller is live as WSL Node 22 PID 1004, launched with
+  `node bin/forgedock-next.mjs work-on 256 --repo RapierCraftStudios/ForgeDockCLI
+  --resume --provider openai-codex --model gpt-5.6-luna --thinking max`.
+  Git pointers were temporarily converted to WSL form for this process and must
+  be restored to Windows form after it exits; do not edit the live issue
+  worktree or pointers while PID 1004 owns them.
+- Build attempt 3 produced a BuildResult and entered verification after about
+  32m 06s active time: 53 tool calls, 34 observed turns, 3,489,495 total
+  tokens, estimated provider cost `$1.1826064`, with the configured
+  `maxTurns:32` budget reported as exhausted. The final artifact was durable,
+  but the receipt exceeding the nominal turn ceiling is itself a follow-up
+  budget-enforcement defect to test after the live run is safe.
+- Verification failed durably at sequence 7 with two findings: `npm run
+  docs:build` exited 1, and `npm test` failed the lease-witness bootstrap test
+  because WSL `/mnt/c` permission metadata does not satisfy the Linux
+  `mode & 0o077 === 0` security check. The controller recorded sequence 8
+  `VERIFICATION_REPAIR_REQUESTED`, state `building`, attempt 4, repair `1 of 2`.
+- Build attempt 4 is currently diagnosing the retained change set. The
+  controller heartbeat remains fresh (approximately every 20s), observation
+  events show repeated `activity.changed: thinking`, and tool reads/greps are
+  still completing; this is active model work, not yet a semantic stall. No
+  second receipt, edit, commit, or transition has appeared at this checkpoint.
+- Sidecar fact-finding is limited to read-only monitoring and next-candidate
+  selection. After this repair reaches a verified/blocked checkpoint, continue
+  the native mission through the remaining in-flight runs; do not declare
+  dogfood readiness from #256 alone.
+- The watcher observed one durable `run_progress` projection gap of 4m17s
+  between non-heartbeat records (over the 90s alert threshold), while
+  `observations.db` still recorded model/tool activity and heartbeats. Treat
+  this as a telemetry projection-gap finding, not a confirmed semantic stall;
+  the next non-heartbeat progress recovered at `08:41:18Z`. One expected
+  `forge.yaml` read also failed because the file is absent; the native repair
+  continued with subsequent edits.
+
+#### HP-27 native #256 bounded stop after final repair stall (2026-08-17 UTC)
+
+- Repair attempt 1/2 (`build:4`) completed a real artifact and advanced through
+  verification, but verification reproduced both blockers: `docs:build` exit 1
+  and the WSL `/mnt/c` lease-witness permission failure. Its receipt was 20
+  turns, 48 tool calls, 998,341ms active, 1,768,802 total tokens, estimated
+  cost `$0.9222958`; no execution budget was exhausted.
+- The controller correctly entered repair attempt 2/2 (`build:5`) at sequence
+  11. It produced only the initial repeated reads/greps for roughly 8.5
+  minutes, with no edit, artifact, or semantic checkpoint after the last
+  tool completion; heartbeats alone continued. The exact native PID 1004 was
+  terminated under the watchdog to prevent another unbounded token stall.
+- Durable state was intentionally preserved rather than rewritten: run
+  `run_f42976d5-d62e-40bb-8202-61811545fa33` remains `building`, attempt 5,
+  version 11, with the prior artifacts and retained #256 worktree. There is no
+  `build:5` receipt, commit, PR, or closure. The issue worktree still passes
+  `git diff --check`; its native diff remains uncommitted and its untracked
+  `.forgedock/` artifacts were preserved.
+- All four temporary WSL Git pointer conversions were restored to Windows form
+  after PID 1004 exited. Next action is to fix the verification harness on
+  staging: preserve fail-closed private-key security, make docs-build failure
+  observable, and run verification from an OS/filesystem context whose
+  permission semantics match the security test before resuming #256 natively.
+
+#### HP-28 native #256 projection recovery prepared (2026-08-17 UTC)
+
+- The second bounded native resume completed verification, publication, four
+  reviewer sessions, and scope adjudication, then failed closed at sequence 18
+  while projecting the real review-finding issue #302. GitHub issue #302 is
+  open, correctly labeled `review-finding`, `needs-validation`, `priority:P1`,
+  has no milestone, and carries the expected root and lane markers; it must be
+  adopted, not deleted or duplicated.
+- The authoritative readback body is 3,711 characters while the controller's
+  pre-write body was 3,720. The visible content matches and the nine-character
+  delta is transport-level CRLF-to-LF normalization. The projection validator
+  now canonicalizes only `CRLF`/`CR` to `LF`, keeps strict title/content,
+  marker, reviewed-SHA, label, state, and milestone checks, and reports a
+  safe first-difference index for real content mismatches.
+- Staging verification for this fix is green: `npm run build` and the GitHub
+  client corpus pass 45/45 tests, including acceptance of line-ending
+  normalization and rejection of a changed body. No native mutating
+  controller is live; the failed durable run remains resumable at version 18
+  with BuildResult `art_047acb61-132d-48e3-8913-3b85125c1df0`, PR #299, and
+  head `edf8db88224f675184744c84c6ccd32506c771df`.
+- Next action: launch exactly one native Windows
+  `node bin/forgedock-next.mjs work-on 256 --repo RapierCraftStudios/ForgeDockCLI
+  --resume --auto-merge --provider openai-codex --model gpt-5.6-luna
+  --thinking max`, watch durable transitions and receipts, and require the
+  review verdict/remediation/merge/issue-closure chain before selecting the
+  next in-flight issue. Do not claim dogfood readiness from this checkpoint.
+
+#### HP-29 native #256 projection canonicalization and user-requested stop (2026-08-17 UTC)
+
+- The native Windows resume adopted the durable publication checkpoint without
+  replaying build or verification: `RESUME_PUBLICATION` sequence 34 followed by
+  `PR_PUBLISHED` sequence 35. The verified head remained
+  `6515e1075887119dbe430dd86f473ea24fe72612`.
+- The previous projection failure for finding #318 was corroborated as a
+  GitHub wire-normalization mismatch: four literal escaped C1 spellings had a
+  12-character length delta (`3514/3526`, first diff `1955`). The shared
+  `canonicalGitHubBody()` mapping now accepts the known `\\u00xx` spellings
+  case-insensitively. Build passed; the GitHub client corpus passed 47/47,
+  including a mixed/uppercase regression. This repairs projection identity,
+  not the underlying #318 code finding.
+- The resumed review pass produced a fresh concurrency receipt within budget:
+  9 turns, 18 tool calls against a cap of 20. Security's `submit_artifact`
+  initially failed once at `12:01:47Z` and then completed at `12:02:30Z`; the
+  controller continued with lease heartbeats and did not transition to
+  failure.
+- At the user's explicit request, the single native controller PID 32404 was
+  stopped after the security artifact completed. No `forgedock-next` process
+  remains. Durable state and logs were preserved at version 35, state
+  `reviewing`; no ReviewVerdict, remediation, merge, or issue closure was
+  recorded after the stop.
+- Dogfood and staging-to-main promotion remain blocked. Resume only after an
+  explicit instruction, then continue #318 remediation and the remaining
+  #256 review/merge/closure gates. Do not delete or rewrite this run's state,
+  issue worktrees, or telemetry databases.

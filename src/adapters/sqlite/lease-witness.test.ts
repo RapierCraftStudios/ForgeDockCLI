@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
@@ -16,7 +17,7 @@ import {
 
 describe("retained lease checkpoint witness", () => {
   it("authenticates compare-and-advance and rejects invalid signatures", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-"));
     const path = join(root, "checkpoint.json");
     const keys = generateKeyPairSync("ed25519");
     const privateKey = keys.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
@@ -38,7 +39,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("rejects lower checkpoints during explicit re-enrollment", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-"));
     const path = join(root, "checkpoint.json");
     const keys = generateKeyPairSync("ed25519");
     const privateKey = keys.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
@@ -51,7 +52,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("bootstraps a verified per-checkout witness without storing secrets in the checkout", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-bootstrap-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-bootstrap-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -71,7 +72,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("uses a freshly bootstrapped witness for the first SQLite lease", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-first-lease-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-first-lease-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -90,7 +91,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("bridges the historical epoch-one bootstrap only into an unused lease store", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-old-bootstrap-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-old-bootstrap-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -109,7 +110,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("recovers a complete orphaned witness without replacing key material", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-recover-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-recover-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -131,7 +132,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("refuses to recover malformed or unexpected orphaned witness material", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-recover-invalid-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-recover-invalid-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -150,7 +151,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("fails closed when the checkout binding or local key material is corrupted", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-corrupt-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-corrupt-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     mkdirSync(checkout);
@@ -174,7 +175,7 @@ describe("retained lease checkpoint witness", () => {
   });
 
   it("prefers a complete explicit environment witness and rejects partial overrides", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-witness-env-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-env-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
     const explicitPath = join(root, "explicit-checkpoint.json");

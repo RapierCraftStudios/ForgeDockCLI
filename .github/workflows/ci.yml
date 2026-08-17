@@ -1,11 +1,11 @@
 name: CI
 
-# Runs the repo's unit-test suite (`npm test` = `node --test "bin/tests/**/*.test.mjs"`)
+# Runs the ForgeDock Next unit-test suite (`npm test` = compiled `src/**/*.test.ts`)
 # on every PR and on push to staging.
 #
 # Closes the visibility gap identified in forge#1581: before this workflow,
-# no CI job ran the suite at all, so failing tests (including CLI-breaking
-# regressions) were invisible on PRs and could reach a deploy candidate
+# no CI job ran the Next suite at all, so failing tests (including
+# CLI-breaking regressions) were invisible on PRs and could reach a deploy candidate
 # without ever failing a check.
 #
 # Push to `main` is intentionally excluded here — `publish.yml` already runs

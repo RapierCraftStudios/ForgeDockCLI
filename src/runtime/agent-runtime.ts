@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { TSchema } from "typebox";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import type { VerificationCommand, VerificationRunner } from "../core/ports/verification.js";
-import { runIdFromTaskId, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
+import { runIdFromTaskId, type AgentExecutionUsage, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
 
 export type AgentRole = "investigator" | "packet-author" | "builder" | "reviewer" | "adjudicator" | "remediator";
 export type ToolGrant = "read" | "grep" | "find" | "ls" | "compute" | "verify" | "bash" | "edit" | "write";
@@ -303,12 +303,32 @@ export interface AgentRunResult<T> {
 export class AgentRunError extends Error {
   readonly sessionRef: string | undefined;
   readonly resumable: boolean;
+  readonly execution: AgentExecutionUsage | undefined;
 
-  constructor(message: string, options: { sessionRef?: string; resumable?: boolean; cause?: unknown } = {}) {
+  constructor(message: string, options: { sessionRef?: string; resumable?: boolean; cause?: unknown; execution?: AgentExecutionUsage } = {}) {
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "AgentRunError";
     this.sessionRef = options.sessionRef;
     this.resumable = options.resumable === true && options.sessionRef !== undefined;
+    this.execution = options.execution;
+  }
+}
+
+/** A bounded provider session stopped before producing its typed artifact. */
+export class AgentExecutionBudgetExceededError extends AgentRunError {
+  constructor(
+    readonly limit: "maxTurns" | "maxToolCalls",
+    readonly value: number,
+    readonly maximum: number,
+    options: { sessionRef: string; execution: AgentExecutionUsage; cause?: unknown },
+  ) {
+    super(`Agent execution ${limit} budget exhausted: ${value} >= ${maximum}`, {
+      sessionRef: options.sessionRef,
+      resumable: false,
+      cause: options.cause,
+      execution: options.execution,
+    });
+    this.name = "AgentExecutionBudgetExceededError";
   }
 }
 
@@ -557,6 +577,7 @@ function failureReceipt<T>(task: AgentTask<T>, startedAt: number, error: unknown
       ...(resumedFrom !== undefined ? { resumedFrom } : {}),
     },
     usage: { source: "unavailable" } satisfies AgentUsageReceipt,
+    ...(error instanceof AgentRunError && error.execution !== undefined ? { execution: error.execution } : {}),
     error: { name: detail.name, message: detail.message.slice(0, 500) },
   };
 }

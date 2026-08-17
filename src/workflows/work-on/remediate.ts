@@ -5,12 +5,14 @@ import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import {
+  AgentExecutionBudgetExceededError,
   scopeDiscoveryRoots,
   scopeManifestFor,
   STANDARD_SCOPE_METADATA_ROOTS,
   type AgentEventSink,
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
+import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { BuilderSubmissionSchema, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
@@ -83,6 +85,7 @@ export async function remediateReview(
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
       outputSchema: BuilderSubmissionSchema,
+      executionBudget: WORK_ON_EXECUTION_BUDGETS.remediator,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
@@ -96,6 +99,11 @@ export async function remediateReview(
     return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof AgentExecutionBudgetExceededError) {
+      const checkpoint = transition(run, "RESUME_REMEDIATION", { reason });
+      await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
+      throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });
+    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });

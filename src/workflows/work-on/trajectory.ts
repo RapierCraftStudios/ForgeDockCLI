@@ -112,6 +112,9 @@ export function validateReceipt(value: unknown): asserts value is TrajectoryRece
     if (!timing || typeof timing !== "object" || !Number.isSafeInteger(timing.activeMs) || timing.activeMs < 0
       || !Number.isSafeInteger(timing.queuedMs) || timing.queuedMs < 0
       || !Number.isSafeInteger(timing.humanHeldMs) || timing.humanHeldMs < 0
+      || (timing.unknownMs !== undefined && (!Number.isSafeInteger(timing.unknownMs) || timing.unknownMs < 0))
+      || (timing.activityAgeMs !== undefined && (!Number.isSafeInteger(timing.activityAgeMs) || timing.activityAgeMs < 0))
+      || (timing.activityStatus !== undefined && !["fresh", "stale", "unknown"].includes(timing.activityStatus))
       || !Array.isArray(timing.phases) || timing.phases.length > 100) {
       throw new Error("Trajectory controller timing is invalid");
     }

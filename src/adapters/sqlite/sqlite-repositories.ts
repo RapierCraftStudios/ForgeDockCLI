@@ -285,12 +285,17 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
 
   async rebuildRun(state: RunState): Promise<void> {
     await withSqliteBusyRetry(() => this.inTransaction(() => {
-      this.#database.prepare("DELETE FROM transitions WHERE run_id = ?").run(state.runId);
-      this.#database.prepare("DELETE FROM run_progress WHERE run_id = ?").run(state.runId);
+      // Rebuild only the rebuildable current-state row. Transition history,
+      // progress, and telemetry are operational evidence and must survive a
+      // cache/state repair; deleting them made stalls look like fresh runs.
+      const highWater = this.#database.prepare("SELECT MAX(sequence) AS sequence FROM transitions WHERE run_id = ?")
+        .get(state.runId) as { sequence?: number } | undefined;
+      const version = Math.max(state.version, highWater?.sequence ?? state.version);
+      const persisted = version === state.version ? state : { ...state, version };
       this.#database.prepare(`
         INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET version = excluded.version, state_json = excluded.state_json
-      `).run(state.runId, state.version, JSON.stringify(state));
+      `).run(state.runId, version, JSON.stringify(persisted));
     }));
   }
 

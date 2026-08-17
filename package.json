@@ -1,5 +1,5 @@
 {
-  "name": "forgedock",
+  "name": "forgedockcli",
   "version": "1.8.0",
   "description": "Provider-neutral software delivery workflows with GitHub as durable institutional memory.",
   "pi": {
@@ -9,9 +9,9 @@
   },
   "type": "module",
   "bin": {
+    "forgedockcli": "bin/forgedock-terminal.mjs",
     "forgedock": "bin/forgedock-terminal.mjs",
-    "forgedock-next": "bin/forgedock-next.mjs",
-    "forgedock-legacy": "bin/forgedock.mjs"
+    "forgedock-next": "bin/forgedock-next.mjs"
   },
   "keywords": [
     "ai-agents",
@@ -33,25 +33,21 @@
   "license": "AGPL-3.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RapierCraftStudios/ForgeDock.git"
+    "url": "git+https://github.com/RapierCraftStudios/ForgeDockCLI.git"
   },
-  "homepage": "https://rapiercraftstudios.github.io/ForgeDock/",
+  "homepage": "https://github.com/RapierCraftStudios/ForgeDockCLI",
   "bugs": {
-    "url": "https://github.com/RapierCraftStudios/ForgeDock/issues"
+    "url": "https://github.com/RapierCraftStudios/ForgeDockCLI/issues"
   },
   "files": [
-    "bin/",
-    "!bin/tests/",
+    "bin/forgedock-terminal.mjs",
+    "bin/forgedock-next.mjs",
     "dist/",
     "agents/",
-    "commands/",
-    "docs/",
-    "!docs/site/.vitepress/",
-    "examples/",
-    "packages/protocol/src/",
-    "scripts/",
-    "!scripts/refresh-bot-token.sh",
-    "templates/",
+    "scripts/patch-pi-subagents-visibility.mjs",
+    "scripts/refresh-bot-token.mjs",
+    "vendor/pi-runtime/",
+    "assets/",
     "LICENSE",
     "README.md"
   ],
@@ -65,7 +61,7 @@
     "pretest": "npm run patch:pi-subagents",
     "pretest:next": "npm run patch:pi-subagents",
     "pretest:legacy": "npm run patch:pi-subagents",
-    "test": "npm run build && npm run test:next && npm run test:legacy",
+    "test": "npm run build && npm run test:next",
     "test:next": "node --test --test-concurrency=4 \"dist/**/*.test.js\"",
     "test:legacy": "node --test --test-concurrency=4 \"bin/tests/**/*.test.mjs\" \"bin/engine/**/*.test.mjs\" \"packages/protocol/test/**/*.test.mjs\"",
     "next": "npm run build --silent && node bin/forgedock-next.mjs",

@@ -31,7 +31,17 @@ test("controller timing separates queued, active, and human-held intervals", () 
   assert.equal(timing.queuedMs, 1_000);
   assert.equal(timing.activeMs, 2_000);
   assert.equal(timing.humanHeldMs, 5_000);
+  assert.equal(timing.unknownMs, 0);
   assert.deepEqual(timing.phases.map((phase) => phase.status), ["queued", "active", "human-held"]);
+});
+
+test("controller timing does not call an open phase active without a semantic transition", () => {
+  const timing = summarizeControllerTiming("2026-01-01T00:00:00.000Z", [
+    { runId: "run", sequence: 1, event: "START_INVESTIGATION", from: "queued", to: "investigating", occurredAt: "2026-01-01T00:00:01.000Z" },
+  ], Date.parse("2026-01-01T00:00:08.000Z"));
+  assert.equal(timing.activeMs, 0);
+  assert.equal(timing.unknownMs, 7_000);
+  assert.equal(timing.phases.at(-1)?.status, "unknown");
 });
 
 test("telemetry runtime records successful agent usage exactly once", async () => {

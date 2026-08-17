@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { TransitionRecord } from "../state/machine.js";
+import type { RunProgressRecord } from "./repositories.js";
 
 export type TelemetryUsageSource = "provider" | "unavailable";
 
@@ -36,12 +37,21 @@ export interface AgentRunReceipt {
   model: string;
   timing: AgentTimingReceipt;
   usage: AgentUsageReceipt;
+  /** Low-level execution counters used to detect semantic stalls and budget waste. */
+  execution?: AgentExecutionUsage;
   error?: { name: string; message: string };
+}
+
+export interface AgentExecutionUsage {
+  turns: number;
+  toolCalls: number;
+  budget?: { maxTurns?: number; maxToolCalls?: number };
+  exhausted?: "maxTurns" | "maxToolCalls";
 }
 
 export interface ControllerPhaseTiming {
   phase: string;
-  status: "queued" | "active" | "human-held" | "terminal";
+  status: "queued" | "active" | "human-held" | "terminal" | "unknown";
   startedAt: string;
   completedAt?: string;
   elapsedMs: number;
@@ -51,6 +61,11 @@ export interface ControllerTimingSummary {
   queuedMs: number;
   activeMs: number;
   humanHeldMs: number;
+  /** Time in the current non-terminal phase that transitions cannot prove was active work. */
+  unknownMs: number;
+  activityStatus: "fresh" | "stale" | "unknown";
+  lastProgressAt?: string;
+  activityAgeMs?: number;
   phases: ControllerPhaseTiming[];
 }
 
@@ -78,6 +93,7 @@ export function summarizeControllerTiming(
   createdAt: string,
   records: readonly TransitionRecord[],
   now = Date.now(),
+  progress: readonly RunProgressRecord[] = [],
 ): ControllerTimingSummary {
   const ordered = [...records].sort((left, right) => left.sequence - right.sequence);
   const phases: ControllerPhaseTiming[] = [];
@@ -101,15 +117,27 @@ export function summarizeControllerTiming(
     const completedMs = Math.max(startedMs, now);
     phases.push({
       phase,
-      status: phase === "queued" ? "queued" : phase === "blocked" ? "human-held" : "active",
+      // A transition ledger proves when a phase changed, not that a provider
+      // or controller was making semantic progress during the open interval.
+      // Keep that time visible as unknown so a heartbeat/tool stream cannot be
+      // mistaken for completed work.
+      status: phase === "queued" ? "queued" : phase === "blocked" ? "human-held" : "unknown",
       startedAt: new Date(startedMs).toISOString(),
       elapsedMs: completedMs - startedMs,
     });
   }
+  const latestProgressMs = progress
+    .map((item) => Date.parse(item.occurredAt))
+    .filter(Number.isFinite)
+    .reduce<number | undefined>((latest, value) => latest === undefined || value > latest ? value : latest, undefined);
+  const activityAgeMs = latestProgressMs === undefined ? undefined : Math.max(0, now - latestProgressMs);
   return {
     queuedMs: phases.filter((item) => item.status === "queued").reduce((total, item) => total + item.elapsedMs, 0),
     activeMs: phases.filter((item) => item.status === "active").reduce((total, item) => total + item.elapsedMs, 0),
     humanHeldMs: phases.filter((item) => item.status === "human-held").reduce((total, item) => total + item.elapsedMs, 0),
+    unknownMs: phases.filter((item) => item.status === "unknown").reduce((total, item) => total + item.elapsedMs, 0),
+    activityStatus: latestProgressMs === undefined ? "unknown" : (activityAgeMs ?? 0) <= 60_000 ? "fresh" : "stale",
+    ...(latestProgressMs !== undefined && activityAgeMs !== undefined ? { lastProgressAt: new Date(latestProgressMs).toISOString(), activityAgeMs } : {}),
     phases,
   };
 }

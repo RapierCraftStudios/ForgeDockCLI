@@ -56,7 +56,8 @@ describe("ForgeDock Pi terminal launcher", () => {
     const launcher = readFileSync(entry, "utf8");
     const packageManifest = JSON.parse(readFileSync("package.json", "utf8")) as { files?: string[] };
     assert.equal(existsSync("scripts/refresh-bot-token.mjs"), true);
-    assert.ok(packageManifest.files?.includes("scripts/"));
+    assert.ok(packageManifest.files?.includes("scripts/refresh-bot-token.mjs"));
+    assert.equal(packageManifest.files?.includes("scripts/"), false);
     assert.equal(packageManifest.files?.includes("!scripts/refresh-bot-token.mjs"), false);
     assert.match(launcher, /refresh-bot-token\.mjs/);
     assert.match(launcher, /spawnSync\(process\.execPath, \[refreshScript/);

@@ -12,6 +12,7 @@ import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
 import {
+  AgentExecutionBudgetExceededError,
   scopeDiscoveryRoots,
   scopeManifestFor,
   STANDARD_SCOPE_DISCOVERY_ROOTS,
@@ -20,6 +21,7 @@ import {
   type AgentRuntime,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
+import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export interface InvestigateDependencies {
   runtime: AgentRuntime;
@@ -172,6 +174,7 @@ async function continueInvestigation(
         objective: "Determine whether the issue is confirmed, invalid, or must be decomposed. Prove the result from repository evidence before any code is changed.",
         instructions: [
           "Inspect the relevant implementation, integration boundaries, and tests before deciding.",
+          "This investigation is execution-bounded. Gather the minimum complete repository evidence, classify the issue, and submit the typed result before the ceiling; do not loop over broad discovery.",
           "Trace the reported behavior through its callers, implementations, adapters, persistence/serialization, error and cancellation paths, and existing regression tests; do not stop at the first matching function.",
           "Every evidence item must identify a concrete repository source such as a path, symbol, test, or command result.",
           "State the observable contract, the failure mode that violates it, and the smallest repository surfaces that must change to restore it.",
@@ -189,6 +192,7 @@ async function continueInvestigation(
           scope: scopeManifest,
         },
         tools: ["read", "grep", "find", "ls"],
+        executionBudget: WORK_ON_EXECUTION_BUDGETS.investigator,
         outputSchema: InvestigationPayloadSchema,
         modelPolicy,
       }, {
@@ -221,6 +225,10 @@ async function continueInvestigation(
     );
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof AgentExecutionBudgetExceededError) {
+      const checkpoint = await applyTransition(dependencies.runs, run, "RESUME_INVESTIGATION", reason);
+      throw new WorkflowExecutionError(reason, checkpoint, { cause: error, recoverable: true });
+    }
     run = await applyTransition(dependencies.runs, run, "FAIL", reason);
     throw new WorkflowExecutionError(reason, run, { cause: error });
   }
@@ -335,8 +343,11 @@ function enforceInvestigationSemantics(payload: InvestigationPayload): void {
 }
 
 export class WorkflowExecutionError extends Error {
-  constructor(message: string, readonly run: RunState, options?: ErrorOptions) {
+  readonly recoverable: boolean;
+
+  constructor(message: string, readonly run: RunState, options: ErrorOptions & { recoverable?: boolean } = {}) {
     super(message, options);
     this.name = "WorkflowExecutionError";
+    this.recoverable = options.recoverable === true;
   }
 }

@@ -15,12 +15,26 @@ import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
-import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workOn } from "./work-on.js";
+import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
 const runTarget = { lane: "fast", targetBranch: "main" } as const;
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main" };
+
+describe("durable workspace identity", () => {
+  it("treats Windows and WSL spellings as the same retained workspace", () => {
+    assert.equal(
+      workspacePathsEquivalent(
+        "/mnt/c/Users/ItsMr/Documents/Coding Projects/.forgedock-worktrees/forgedockcli/.forgedock-worktrees/staging/issue-256-e-40bb-8202-61811545fa33",
+        "C:\\Users\\ItsMr\\Documents\\Coding Projects\\.forgedock-worktrees\\forgedockcli\\.forgedock-worktrees\\staging\\issue-256-e-40bb-8202-61811545fa33",
+      ),
+      true,
+    );
+    assert.equal(workspacePathsEquivalent("/tmp/work", "/tmp/WORK"), false);
+  });
+});
+
 class EndToEndGit implements GitWorkspaceManager {
   removed = false;
   createdFrom?: string;

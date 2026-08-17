@@ -5,8 +5,9 @@ import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
+import { AgentExecutionBudgetExceededError, scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
+import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export const BuilderSubmissionSchema = Type.Object({
   summary: Type.String({ minLength: 1 }),
@@ -50,6 +51,7 @@ export async function buildWorkItem(
         : "Implement exactly the accepted Build Packet in the assigned worktree.",
       instructions: [
         "Read the Build Packet, investigation evidence, affected code, integration boundaries, and existing tests before editing.",
+        "This execution is bounded. Prioritize the frozen criteria, stop broad exploration early, and submit the complete typed result before the execution ceiling; a retained checkpoint will be resumed if the ceiling is reached.",
         "Turn the Build Packet into a criterion-by-criterion implementation checklist before making changes. For every criterion, identify the invariant, all relevant callers/implementations/adapters, and the regression scenario that must remain true.",
         ...(input.priorVerificationFailure ? [
           "This is a bounded repair of the retained implementation. Use the controller-recorded failed checks as evidence and change only frozen Build Packet paths.",
@@ -84,6 +86,7 @@ export async function buildWorkItem(
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
       outputSchema: BuilderSubmissionSchema,
+      executionBudget: WORK_ON_EXECUTION_BUDGETS.builder,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
@@ -97,6 +100,11 @@ export async function buildWorkItem(
     return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof AgentExecutionBudgetExceededError) {
+      const checkpoint = transition(run, "RESUME_BUILD", { reason });
+      await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
+      throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });
+    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });

@@ -471,6 +471,7 @@ export class WorkspaceGuard {
       const target = join(parent.operationPath, basename(candidate));
       await rejectSymbolicLink(target);
       handle = await open(target, writableFileFlags(), 0o666);
+      await this.assertWindowsHandlePath(handle, candidate, "file");
       const targetStats = await handle.stat();
       if (!targetStats.isFile()) throw new Error(`Tool write target is not a regular file: ${candidate}`);
       return handle;
@@ -485,13 +486,14 @@ export class WorkspaceGuard {
   private async openDirectory(candidate: string, createMissing: boolean): Promise<SafeDirectory> {
     assertSafeMutationSupport();
     const segments = relative(this.root, candidate) ? relative(this.root, candidate).split(sep) : [];
+    let currentLexical = this.root;
+    const initialHandle = await openDirectoryHandle(this.root);
     let current: SafeDirectory = {
-      handle: await openDirectoryHandle(this.root),
+      handle: initialHandle,
       operationPath: "",
     };
-    let currentLexical = this.root;
     try {
-      current.operationPath = directoryHandlePath(current.handle);
+      current.operationPath = directoryHandlePath(current.handle, currentLexical);
       for (const segment of segments) {
         const lexicalChild = resolve(currentLexical, segment);
         const operationChild = join(current.operationPath, segment);
@@ -508,7 +510,8 @@ export class WorkspaceGuard {
             }
             next = await openDirectoryHandle(operationChild);
           }
-          const nextOperationPath = directoryHandlePath(next);
+          await this.assertWindowsHandlePath(next, lexicalChild, "directory");
+          const nextOperationPath = directoryHandlePath(next, lexicalChild);
           await closeFileHandle(current.handle);
           current = {
             handle: next,
@@ -526,6 +529,35 @@ export class WorkspaceGuard {
       await closeFileHandle(current.handle);
       throw error;
     }
+  }
+
+  /**
+   * Windows does not expose the POSIX descriptor-relative openat primitives
+   * used by the Unix implementation. Keep the mutation path fail-closed by
+   * validating the opened handle against the lexical path immediately after
+   * opening it. The handle is then the authority for the actual file write;
+   * a later path replacement cannot redirect that already-open handle.
+   */
+  private async assertWindowsHandlePath(handle: FileHandle, candidate: string, kind: "file" | "directory"): Promise<void> {
+    if (process.platform !== "win32") return;
+    const resolved = await realpath(candidate);
+    this.assertInside(resolved);
+    this.assertWritableResolved(resolved, kind);
+    await rejectSymbolicLinkPath(this.root, candidate);
+    const pathStats = await stat(candidate);
+    const handleStats = await handle.stat();
+    if (pathStats.dev !== handleStats.dev || pathStats.ino !== handleStats.ino) {
+      throw new Error(`Tool ${kind} changed during guarded open: ${candidate}`);
+    }
+  }
+
+  private assertWritableResolved(candidate: string, kind: "file" | "directory"): void {
+    if (this.writePaths.length) {
+      if (kind === "directory" && this.writePaths.some((writePath) => samePathOrUnder(candidate, writePath))) return;
+      this.assertExactlyAllowed(candidate);
+      return;
+    }
+    this.assertAllowed(candidate, this.writeRoots, "write");
   }
 
   private lexical(path: string): string {
@@ -557,6 +589,7 @@ type SafeDirectory = {
 };
 
 function writableFileFlags(): number {
+  if (process.platform === "win32") return constants.O_WRONLY | constants.O_CREAT;
   const noFollow = requiredNoFollowFlag();
   return constants.O_WRONLY
     | constants.O_CREAT
@@ -565,6 +598,7 @@ function writableFileFlags(): number {
 }
 
 function directoryFlags(): number {
+  if (process.platform === "win32") return constants.O_RDONLY;
   const directory = requiredDirectoryFlag();
   const noFollow = requiredNoFollowFlag();
   return constants.O_RDONLY
@@ -601,6 +635,7 @@ function descriptorPathPrefix(): string | undefined {
 }
 
 export function safeMutationSupportAvailable(): boolean {
+  if (process.platform === "win32") return true;
   return descriptorPathPrefix() !== undefined
     && typeof constants.O_NOFOLLOW === "number" && constants.O_NOFOLLOW !== 0
     && typeof constants.O_DIRECTORY === "number" && constants.O_DIRECTORY !== 0;
@@ -628,12 +663,24 @@ function requiredDirectoryFlag(): number {
   return flag;
 }
 
-function directoryHandlePath(handle: FileHandle): string {
+function directoryHandlePath(handle: FileHandle, windowsFallbackPath?: string): string {
   const prefix = descriptorPathPrefix();
   if (!prefix) {
+    if (process.platform === "win32" && windowsFallbackPath !== undefined) return windowsFallbackPath;
     throw new Error("Sandbox write operations require descriptor-relative directory handles");
   }
   return `${prefix}/${handle.fd}`;
+}
+
+async function rejectSymbolicLinkPath(root: string, candidate: string): Promise<void> {
+  if (process.platform !== "win32") return;
+  const rel = relative(root, candidate);
+  const segments = rel ? rel.split(sep) : [];
+  let current = root;
+  for (const segment of segments) {
+    current = resolve(current, segment);
+    await rejectSymbolicLink(current);
+  }
 }
 
 async function closeFileHandle(handle: FileHandle): Promise<void> {

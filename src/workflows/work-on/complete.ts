@@ -217,7 +217,12 @@ export async function completeWorkItem(
     const contracts = new Map((input.memberContracts ?? []).map((contract) => [contract.issue, contract]));
     const trajectoryArtifacts = [...parentArtifacts, outcome, input.verdict];
     const telemetry = dependencies.telemetry ? summarizeTelemetry(dependencies.telemetry.listTelemetry(run.runId)) : undefined;
-    const controllerTiming = summarizeControllerTiming(run.createdAt, await dependencies.runs.history(run.runId), Date.parse(run.updatedAt));
+    const controllerTiming = summarizeControllerTiming(
+      run.createdAt,
+      await dependencies.runs.history(run.runId),
+      Date.parse(run.updatedAt),
+      await dependencies.runs.listProgress(run.runId),
+    );
     for (const child of childOutcomes) {
       const contract = contracts.get(child.issue);
       const receipt = trajectoryReceiptFromArtifacts({

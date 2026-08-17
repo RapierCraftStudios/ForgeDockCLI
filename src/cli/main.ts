@@ -41,7 +41,7 @@ import type { CheckResult, VerificationCommand } from "../core/ports/verificatio
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
-import { investigateWorkItem } from "../workflows/work-on/investigate.js";
+import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
@@ -336,7 +336,7 @@ async function status(argv: string[]): Promise<void> {
       const progress = localRun ? await store.listProgress(localRun.runId) : [];
       const latestProgress = progress.at(-1);
       const controllerTiming = localRun
-        ? summarizeControllerTiming(localRun.createdAt, await store.history(localRun.runId))
+        ? summarizeControllerTiming(localRun.createdAt, await store.history(localRun.runId), Date.now(), progress)
         : undefined;
       const result = {
         subject: `${issue.repo}#${issue.number}`,
@@ -366,12 +366,15 @@ async function status(argv: string[]): Promise<void> {
     const configured = readForgeDockConfig(process.cwd());
     const policy = resolveOrchestrationConfig(configured);
     const policySources = orchestrationConfigSources(configured);
-    const runsWithTelemetry = await Promise.all(runs.map(async (run) => ({
-      ...run,
-      telemetry: summarizeTelemetry(store.listTelemetry(run.runId)),
-      controllerTiming: summarizeControllerTiming(run.createdAt, await store.history(run.runId)),
-      controllerProgress: (await store.listProgress(run.runId)).at(-1),
-    })));
+    const runsWithTelemetry = await Promise.all(runs.map(async (run) => {
+      const progress = await store.listProgress(run.runId);
+      return {
+        ...run,
+        telemetry: summarizeTelemetry(store.listTelemetry(run.runId)),
+        controllerTiming: summarizeControllerTiming(run.createdAt, await store.history(run.runId), Date.now(), progress),
+        controllerProgress: progress.at(-1),
+      };
+    }));
     if (argv.includes("--json")) {
       process.stdout.write(`${JSON.stringify({ policy, policySources, runs: runsWithTelemetry }, null, 2)}\n`);
       return;
@@ -891,7 +894,7 @@ async function workOn(
         || JSON.stringify(run.scopeManifest ?? null) !== JSON.stringify(recoveredScopeManifest)) {
         process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} state or scope (${run.state}) from durable GitHub authority (${admission.state})\n`);
         await store.rebuildRun(recoveredRun);
-        run = recoveredRun;
+        run = await store.load(resumeRunId) ?? recoveredRun;
       } else if (run.targetBranch) {
         assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
       } else {
@@ -929,13 +932,24 @@ async function workOn(
         if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
           throw new Error(`Run ${resumeRunId} does not contain complete retained verification evidence`);
         }
-        workspace = {
-          path: outcome.payload.failureEvidence.workspacePath,
-          branch: outcome.payload.failureEvidence.branch,
+        // Failure evidence contains a human-readable path, but that path may
+        // have been recorded by a different OS/runtime (for example WSL
+        // `/mnt/c/...` before a Windows restart). Re-derive the retained
+        // workspace from the durable run identity so recovery is portable and
+        // the Git manager can also verify branch/base identity.
+        const failureEvidence = outcome.payload.failureEvidence;
+        const recoveredWorkspace = await git.recover({
+          runId: resumeRunId,
+          issue: issue.number,
           baseRef: recoveryBaseRef,
-          ...(outcome.payload.failureEvidence.baseSha ? { baseSha: outcome.payload.failureEvidence.baseSha } : {}),
-        };
-        if (!existsSync(workspace.path)) throw new Error(`Recovery workspace is unavailable: ${workspace.path}`);
+          ...(failureEvidence.baseSha ? { baseSha: failureEvidence.baseSha } : {}),
+        });
+        if (failureEvidence.branch !== recoveredWorkspace.branch) {
+          throw new Error(
+            `Retained verification branch ${failureEvidence.branch} conflicts with derived recovery branch ${recoveredWorkspace.branch}`,
+          );
+        }
+        workspace = recoveredWorkspace;
       }
       const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), recoveryBaseRef);
       const baselineChecks = admission.checkpoint === "publication" || admission.checkpoint === "completion"
@@ -1131,6 +1145,11 @@ async function workOn(
       if (orchestration) resolveClaimPromotionConflictAtBoundary(error, "nested-work-on");
       const resolution = resolveClaimPromotionConflictAtBoundary(error, "standalone-work-on");
       process.stdout.write(`${statusGlyph("active", mode)} ${process.env.FORGEDOCK_ORCHESTRATION_NODE ?? `issue-${issueArg}`} suspended · Build Packet claims conflict with ${resolution.conflict.conflicts.join(", ")}; retained for explicit orchestration resume\n`);
+      process.exitCode = 2;
+      return;
+    }
+    if (error instanceof WorkflowExecutionError && error.recoverable) {
+      process.stdout.write(`${statusGlyph("active", mode)} ${process.env.FORGEDOCK_ORCHESTRATION_NODE ?? `issue-${issueArg}`} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
       process.exitCode = 2;
       return;
     }
@@ -1712,6 +1731,10 @@ async function orchestrate(argv: string[]): Promise<void> {
             workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
           }
+          if (error instanceof WorkflowExecutionError && error.recoverable) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
+            return { status: "suspended", error: error.message };
+          }
           if (error instanceof ClaimPromotionConflictError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
             // Preserve the scheduler error object through the typed suspended
@@ -2023,6 +2046,10 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
           if (workerAbort.signal.aborted) {
             return { status: "suspended", error: "Orchestration worker lost liveness; worker aborted and dependents remain queued" };
           }
+          if (error instanceof WorkflowExecutionError && error.recoverable) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
+            return { status: "suspended", error: error.message };
+          }
           const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
           process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; resume after the active node completes\n`);
           return suspension.result;
@@ -2319,7 +2346,7 @@ function renderTelemetryLine(summary: ReturnType<typeof summarizeTelemetry>, pre
 }
 
 function renderControllerTimingLine(summary: ReturnType<typeof summarizeControllerTiming>, prefix = ""): void {
-  process.stdout.write(`${prefix}controller timing: active=${summary.activeMs}ms queued=${summary.queuedMs}ms human-held=${summary.humanHeldMs}ms phases=${summary.phases.length}\n`);
+    process.stdout.write(`${prefix}controller timing: active=${summary.activeMs}ms unknown=${summary.unknownMs}ms queued=${summary.queuedMs}ms human-held=${summary.humanHeldMs}ms activity=${summary.activityStatus}${summary.activityAgeMs !== undefined ? ` age=${summary.activityAgeMs}ms` : ""} phases=${summary.phases.length}\n`);
 }
 
 function commandAutoMerge(argv: string[]): boolean {
