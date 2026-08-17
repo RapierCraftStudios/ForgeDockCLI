@@ -16,7 +16,7 @@ test("controller adapter preserves stdout and stderr as separate observation cha
   const channels: string[] = [];
   const result = await executeController(
     process.execPath,
-    ["-e", "process.stdout.write('out'); process.stderr.write('err')"],
+    ["-e", "process.stdout.write('api_key=controller-secret\\u009d52;c;'); process.stdout.write('clipboard\\u009ccontroller-out'); process.stderr.write('password=controller-error-secret')"],
     process.cwd(),
     undefined,
     () => undefined,
@@ -32,6 +32,14 @@ test("controller adapter preserves stdout and stderr as separate observation cha
   assert.equal(result.code, 0);
   assert.ok(channels.some((value) => value.startsWith("stdout:")));
   assert.ok(channels.some((value) => value.startsWith("stderr:")));
-  assert.deepEqual(events.filter((event) => event.output).map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
+  assert.deepEqual([...new Set(events.filter((event) => event.output).map((event) => event.output?.channel))].sort(), ["stderr", "stdout"]);
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /controller-secret|controller-error-secret|clipboard|52;c/);
+  assert.ok(events.some((event) => event.output?.text.includes("controller-out")));
+  assert.equal(events.filter((event) => event.output).every((event) => event.output!.bytes === Buffer.byteLength(event.output!.text, "utf8")), true);
+  assert.equal(events.filter((event) => event.output).every((event) => {
+    const payload = event.payload as { bytes?: unknown };
+    return typeof payload.bytes !== "number" || payload.bytes === event.output!.bytes;
+  }), true);
   observer.close();
 });

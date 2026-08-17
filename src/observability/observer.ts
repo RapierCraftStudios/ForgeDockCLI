@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { join } from "node:path";
-import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
+import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, createTerminalTextSanitizer, normalizeObservationDraft, observationOutputStreamKey, observationOutputStreamPrefix, sanitizeObservationOutput, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
 import { ObservationProjector, type ObservationProjectionSnapshot } from "./projections.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
@@ -35,6 +35,7 @@ export class ForgeDockObserver implements ObservationSink {
   #droppedInput: ObservationDraft | undefined;
   #dropScheduled = false;
   #dropWaiters: Array<{ resolve: (event: ObservationEnvelopeV1) => void; reject: (error: unknown) => void }> = [];
+  readonly #outputSanitizers = new Map<string, ReturnType<typeof createTerminalTextSanitizer>>();
   #closed = false;
 
   constructor(options: ForgeDockObserverOptions = {}) {
@@ -53,6 +54,8 @@ export class ForgeDockObserver implements ObservationSink {
   emit(input: ObservationDraft): Promise<ObservationEnvelopeV1> {
     if (this.#closed) return Promise.reject(new Error("ForgeDock observer is closed"));
     if (this.#pending >= this.#maxQueueDepth) {
+      // A dropped chunk is a stream gap; never let parser state bridge it.
+      this.resetOutputStream(input, true);
       this.#droppedEvents += 1;
       this.#droppedInput ??= input;
       const dropped = new Promise<ObservationEnvelopeV1>((resolve, reject) => this.#dropWaiters.push({ resolve, reject }));
@@ -60,10 +63,11 @@ export class ForgeDockObserver implements ObservationSink {
       return dropped;
     }
     this.#pending += 1;
-    const draft = normalizeObservationDraft({
+    const preparedInput = this.prepareInput({
       ...input,
       producer: input.producer ?? this.#producer,
-    }, this.#redaction);
+    });
+    const draft = normalizeObservationDraft(preparedInput, this.#redaction);
     const result = this.#queue.then(async () => this.appendAndProject(draft)).finally(() => {
       this.#pending -= 1;
     });
@@ -104,11 +108,51 @@ export class ForgeDockObserver implements ObservationSink {
   close(): void {
     this.#closed = true;
     this.#listeners.clear();
+    for (const sanitizer of this.#outputSanitizers.values()) sanitizer.finish();
+    this.#outputSanitizers.clear();
     this.#store.close();
   }
 
   get producer(): ReturnType<typeof createObservationProducer> {
     return this.#producer;
+  }
+
+  private prepareInput(input: ObservationDraft): ObservationDraft {
+    const key = observationOutputStreamKey(input);
+    if (!key) {
+      this.resetOutputStream(input);
+      return input;
+    }
+    let sanitizer = this.#outputSanitizers.get(key);
+    if (!sanitizer) {
+      sanitizer = createTerminalTextSanitizer();
+      this.#outputSanitizers.set(key, sanitizer);
+    }
+    const prepared = sanitizeObservationOutput(input, sanitizer);
+    if (isTerminalObservationKind(input.kind)) {
+      sanitizer.finish();
+      this.#outputSanitizers.delete(key);
+    }
+    return prepared;
+  }
+
+  private resetOutputStream(input: ObservationDraft, discard = false): void {
+    const key = observationOutputStreamKey(input);
+    if (key) {
+      const sanitizer = this.#outputSanitizers.get(key);
+      if (sanitizer) {
+        finishOutputSanitizer(sanitizer, discard, discard ? input.output?.text : undefined);
+        if (!discard) this.#outputSanitizers.delete(key);
+      }
+      return;
+    }
+    const prefix = observationOutputStreamPrefix(input);
+    for (const [streamKey, sanitizer] of this.#outputSanitizers) {
+      if (streamKey.startsWith(prefix)) {
+        finishOutputSanitizer(sanitizer, discard);
+        if (!discard) this.#outputSanitizers.delete(streamKey);
+      }
+    }
   }
 
   private layoutStore(): ObservationLayoutStore {
@@ -158,6 +202,15 @@ export class ForgeDockObserver implements ObservationSink {
       return undefined;
     });
   }
+}
+
+function finishOutputSanitizer(sanitizer: ReturnType<typeof createTerminalTextSanitizer>, discard: boolean, droppedText?: string): void {
+  if (discard && sanitizer.discard) sanitizer.discard(droppedText);
+  else sanitizer.finish();
+}
+
+function isTerminalObservationKind(kind: string): boolean {
+  return /(?:^|\.)(?:completed|failed|cancelled|canceled|exited|finished)$/.test(kind);
 }
 
 function isObservationLayoutStore(store: ObservationStore): store is ObservationStore & ObservationLayoutStore {

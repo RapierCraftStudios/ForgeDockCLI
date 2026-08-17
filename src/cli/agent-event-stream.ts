@@ -2,7 +2,7 @@
 
 import type { AgentEvent } from "../runtime/agent-runtime.js";
 import { createAgentEventObservationSink } from "../observability/adapters.js";
-import { sanitizeTerminalText, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
+import { createTerminalTextSanitizer, redactObservationValue, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import { statusGlyph, type ColorMode } from "../tui/brand.js";
 
 const TOOL_ARG_KEYS = ["path", "file_path", "pattern", "query", "glob", "command", "offset", "limit"] as const;
@@ -37,10 +37,18 @@ export function observeAgentEvent(event: AgentEvent): void {
  * so SDK-owned inner sessions remain observable without weakening controller
  * authority or exposing complete tool payloads.
  */
+type AgentTextStream = {
+  task: string;
+  kind: "assistant";
+  lineOpen: boolean;
+  sanitizer: ReturnType<typeof createTerminalTextSanitizer>;
+};
+
 export class AgentEventStreamWriter {
   readonly #write: AgentEventWrite;
   readonly #mode: ColorMode;
-  #stream: { task: string; kind: "assistant"; lineOpen: boolean } | undefined;
+  readonly #sanitizers = new Map<string, ReturnType<typeof createTerminalTextSanitizer>>();
+  #stream: AgentTextStream | undefined;
 
   constructor(write: AgentEventWrite, mode: ColorMode) {
     this.#write = write;
@@ -60,8 +68,9 @@ export class AgentEventStreamWriter {
     }
 
     this.finishDelta();
-    const milestone = observabilityPreview(event.observability);
+    const milestone = safePreviewText(observabilityPreview(event.observability));
     if (event.type === "session.started") {
+      this.#sanitizers.delete(this.streamKey(task, "assistant"));
       this.#write(`  ${statusGlyph("active", this.#mode)} ${task} · ${event.provider}/${event.model}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "tool.started") {
       const args = toolArgPreview(event.tool, event.args);
@@ -70,32 +79,43 @@ export class AgentEventStreamWriter {
     } else if (event.type === "tool.completed") {
       const status = event.isError ? "failed" : "passed";
       const call = toolCallPreview(event.toolCallId);
-      const error = event.isError && event.errorSummary ? ` · ${sanitizeTerminalText(event.errorSummary)}` : "";
+      const error = event.isError && event.errorSummary ? ` · ${safePreviewText(event.errorSummary)}` : "";
       this.#write(`    ${statusGlyph(status, this.#mode)} ${task} · ${event.tool}[${call}] ${event.isError ? "failed" : "complete"}${error}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "artifact.submitted") {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · artifact submitted${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "session.completed") {
       this.#write(`  ${statusGlyph("passed", this.#mode)} ${task} · session complete${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "session.failed") {
-      this.#write(`  ${statusGlyph("failed", this.#mode)} ${task} · session failed · ${sanitizeTerminalText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
+      this.#write(`  ${statusGlyph("failed", this.#mode)} ${task} · session failed · ${safePreviewText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
     } else if (event.type === "session.cancelled") {
-      this.#write(`  ${statusGlyph("blocked", this.#mode)} ${task} · session cancelled · ${sanitizeTerminalText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
+      this.#write(`  ${statusGlyph("blocked", this.#mode)} ${task} · session cancelled · ${safePreviewText(event.errorSummary)}${milestone ? ` · ${milestone}` : ""}\n`);
+    }
+    if (event.type === "session.completed" || event.type === "session.failed" || event.type === "session.cancelled") {
+      this.#sanitizers.delete(this.streamKey(task, "assistant"));
     }
   }
 
   finish(): void {
     this.finishDelta();
+    for (const sanitizer of this.#sanitizers.values()) sanitizer.finish();
+    this.#sanitizers.clear();
   }
 
   private writeDelta(task: string, kind: "assistant", rawText: string): void {
     if (!rawText) return;
+    const streamKey = this.streamKey(task, kind);
     if (!this.#stream || this.#stream.task !== task || this.#stream.kind !== kind) {
       this.finishDelta();
       this.#write(`    ${statusGlyph("active", this.#mode)} ${task} · ${kind}\n`);
-      this.#stream = { task, kind, lineOpen: false };
+      let sanitizer = this.#sanitizers.get(streamKey);
+      if (!sanitizer) {
+        sanitizer = createTerminalTextSanitizer();
+        this.#sanitizers.set(streamKey, sanitizer);
+      }
+      this.#stream = { task, kind, lineOpen: false, sanitizer };
     }
 
-    const text = sanitizeTerminalText(rawText).replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const text = safePreviewText(this.#stream.sanitizer.write(rawText)).replaceAll("\r\n", "\n").replaceAll("\r", "\n");
     for (const part of text.split(/(\n)/)) {
       if (!part) continue;
       if (part === "\n") {
@@ -115,6 +135,10 @@ export class AgentEventStreamWriter {
   private finishDelta(): void {
     if (this.#stream?.lineOpen) this.#write("\n");
     this.#stream = undefined;
+  }
+
+  private streamKey(task: string, kind: "assistant"): string {
+    return `${task}:${kind}`;
   }
 }
 
@@ -148,7 +172,12 @@ function toolArgPreview(tool: string, args: unknown): string | undefined {
 }
 
 function scalar(value: unknown): string | undefined {
-  if (typeof value === "string" && value.trim()) return JSON.stringify(sanitizeTerminalText(value));
+  if (typeof value === "string" && value.trim()) return JSON.stringify(safePreviewText(value));
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return undefined;
+}
+
+function safePreviewText(value: string): string {
+  const redacted = redactObservationValue(value).value;
+  return typeof redacted === "string" ? redacted : String(redacted);
 }

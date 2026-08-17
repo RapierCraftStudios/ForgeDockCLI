@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AgentEvent, AgentEventSink } from "../runtime/agent-runtime.js";
-import { createObservationProducer, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity } from "./contracts.js";
+import { createObservationProducer, createTerminalTextSanitizer, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity } from "./contracts.js";
 
 export interface ObservationAdapterContext {
   identity?: ObservationIdentity;
@@ -11,6 +11,13 @@ export interface ObservationAdapterContext {
 export function createAgentEventObservationSink(observer: ObservationSink, context: ObservationAdapterContext = {}): AgentEventSink {
   let outputSequence = 0;
   const producer = context.producer ?? createObservationProducer("agent-runtime");
+  const sanitizers = new Map<string, ReturnType<typeof createTerminalTextSanitizer>>();
+
+  const resetStream = (taskId: string): void => {
+    sanitizers.get(taskId)?.finish();
+    sanitizers.delete(taskId);
+  };
+
   return (event: AgentEvent) => {
     const identity: ObservationIdentity = {
       ...(context.identity ?? {}),
@@ -23,34 +30,44 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       source: "agent" as const,
     };
     if (event.type === "thinking.delta") {
-      void observer.emit({ ...base, channel: "activity", kind: "activity.changed", severity: "debug", payload: { activity: "thinking", summary: "Model activity" } });
+      // Thinking is omitted from the journal, but it does not end the visible
+      // text stream; keep its parser state isolated to this task.
+      emitObservation(observer, { ...base, channel: "activity", kind: "activity.changed", severity: "debug", payload: { activity: "thinking", summary: "Model activity" } });
       return;
     }
     if (event.type === "text.delta") {
+      let sanitizer = sanitizers.get(event.taskId);
+      if (!sanitizer) {
+        sanitizer = createTerminalTextSanitizer();
+        sanitizers.set(event.taskId, sanitizer);
+      }
+      const text = sanitizer.write(event.text);
       outputSequence += 1;
-      void observer.emit({
+      emitObservation(observer, {
         ...base,
         channel: "activity",
         kind: "output.delta",
-        payload: { summary: "Assistant output", text: event.text },
-        output: { channel: "stdout", text: event.text, chunkSequence: outputSequence },
+        payload: { summary: "Assistant output", text },
+        ...(text !== event.text ? { security: { redacted: true } } : {}),
+        output: { channel: "stdout", text, chunkSequence: outputSequence },
       });
       return;
     }
     if (event.type === "session.started") {
-      void observer.emit({ ...base, identity: { ...identity, piSessionRef: event.sessionRef }, channel: "lifecycle", kind: "agent.session.started", payload: { provider: event.provider, model: event.model, ...observabilityPayload(event) } });
+      resetStream(event.taskId);
+      emitObservation(observer, { ...base, identity: { ...identity, piSessionRef: event.sessionRef }, channel: "lifecycle", kind: "agent.session.started", payload: { provider: event.provider, model: event.model, ...observabilityPayload(event) } });
       return;
     }
     if (event.type === "tool.started") {
-      void observer.emit({ ...base, channel: "tool", kind: "tool.started", payload: { tool: event.tool, toolCallId: event.toolCallId, args: safeToolArgs(event.args), ...observabilityPayload(event) } });
+      emitObservation(observer, { ...base, channel: "tool", kind: "tool.started", payload: { tool: event.tool, toolCallId: event.toolCallId, args: safeToolArgs(event.args), ...observabilityPayload(event) } });
       return;
     }
     if (event.type === "tool.completed") {
-      void observer.emit({ ...base, channel: "tool", kind: "tool.completed", severity: event.isError ? "error" : "info", payload: { tool: event.tool, toolCallId: event.toolCallId, isError: event.isError, ...(event.errorSummary ? { summary: event.errorSummary } : {}), ...observabilityPayload(event) } });
+      emitObservation(observer, { ...base, channel: "tool", kind: "tool.completed", severity: event.isError ? "error" : "info", payload: { tool: event.tool, toolCallId: event.toolCallId, isError: event.isError, ...(event.errorSummary ? { summary: event.errorSummary } : {}), ...observabilityPayload(event) } });
       return;
     }
     if (event.type === "artifact.submitted") {
-      void observer.emit({ ...base, channel: "artifact", kind: "artifact.submitted", payload: { ...observabilityPayload(event) } });
+      emitObservation(observer, { ...base, channel: "artifact", kind: "artifact.submitted", payload: { ...observabilityPayload(event) } });
       return;
     }
     const terminal = event.type === "session.completed"
@@ -58,7 +75,8 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       : event.type === "session.failed"
         ? { kind: "agent.session.failed", severity: "error" as const, payload: { summary: event.errorSummary, ...observabilityPayload(event) } }
         : { kind: "agent.session.cancelled", severity: "warning" as const, payload: { summary: event.errorSummary, ...observabilityPayload(event) } };
-    void observer.emit({
+    resetStream(event.taskId);
+    emitObservation(observer, {
       ...base,
       identity: { ...identity, piSessionRef: event.sessionRef },
       channel: "lifecycle",
@@ -72,6 +90,7 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
 export class ControllerObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #context: ObservationAdapterContext;
+  readonly #outputSanitizers = new Map<"stdout" | "stderr", ReturnType<typeof createTerminalTextSanitizer>>();
   #outputSequence = 0;
 
   constructor(observer: ObservationSink, context: ObservationAdapterContext = {}) {
@@ -80,29 +99,43 @@ export class ControllerObservationAdapter {
   }
 
   started(command: string, args: readonly string[]): void {
+    this.resetOutputSanitizers();
     this.emit("lifecycle", "controller.started", { command, args: safeArgs(args) });
   }
 
   output(channel: "stdout" | "stderr", text: string): void {
+    let sanitizer = this.#outputSanitizers.get(channel);
+    if (!sanitizer) {
+      sanitizer = createTerminalTextSanitizer();
+      this.#outputSanitizers.set(channel, sanitizer);
+    }
+    const safeText = sanitizer.write(text);
     this.#outputSequence += 1;
-    this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(text, "utf8") }, "info", {
+    this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(safeText, "utf8") }, "info", {
       channel,
-      text,
+      text: safeText,
       chunkSequence: this.#outputSequence,
-    });
+    }, undefined, safeText !== text ? { redacted: true } : undefined);
   }
 
   completed(code: number, truncated = false): void {
+    this.resetOutputSanitizers();
     if (truncated) this.emit("diagnostic", "output.truncated", { summary: "Controller output was bounded to the retained tail" }, "warning", undefined, { truncated: true });
     this.emit("lifecycle", "controller.completed", { code }, code === 0 ? "info" : "error", undefined, truncated ? { truncated: true } : undefined);
   }
 
   failed(error: unknown): void {
+    this.resetOutputSanitizers();
     this.emit("lifecycle", "controller.failed", { summary: error instanceof Error ? error.message : String(error) }, "error");
   }
 
-  private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"]): void {
-    void this.#observer.emit({
+  private resetOutputSanitizers(): void {
+    for (const sanitizer of this.#outputSanitizers.values()) sanitizer.finish();
+    this.#outputSanitizers.clear();
+  }
+
+  private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"], security?: ObservationDraft["security"]): void {
+    emitObservation(this.#observer, {
       producer: this.#context.producer ?? createObservationProducer("forgedock-controller"),
       ...(this.#context.identity ? { identity: this.#context.identity } : {}),
       source: "controller",
@@ -112,6 +145,7 @@ export class ControllerObservationAdapter {
       payload,
       ...(output ? { output } : {}),
       ...(delivery ? { delivery } : {}),
+      ...(security ? { security } : {}),
     });
   }
 }
@@ -119,6 +153,7 @@ export class ControllerObservationAdapter {
 export class BackgroundTaskObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #producer: ReturnType<typeof createObservationProducer>;
+  readonly #outputSanitizers = new Map<string, ReturnType<typeof createTerminalTextSanitizer>>();
 
   constructor(observer: ObservationSink, producer = createObservationProducer("forgedock-background-task")) {
     this.#observer = observer;
@@ -126,6 +161,7 @@ export class BackgroundTaskObservationAdapter {
   }
 
   started(task: { id: string; command: string; args: readonly string[]; cwd: string; pid: number }): void {
+    this.resetTask(task.id);
     this.emit(task.id, "process.started", "info", { command: task.command, args: safeArgs(task.args), cwd: task.cwd, pid: task.pid });
   }
 
@@ -134,23 +170,41 @@ export class BackgroundTaskObservationAdapter {
   }
 
   output(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): void {
-    void this.#observer.emit({
+    const key = `${taskId}:${channel}`;
+    let sanitizer = this.#outputSanitizers.get(key);
+    if (!sanitizer) {
+      sanitizer = createTerminalTextSanitizer();
+      this.#outputSanitizers.set(key, sanitizer);
+    }
+    const safeText = sanitizer.write(text);
+    emitObservation(this.#observer, {
       producer: this.#producer,
       identity: { controllerTaskId: taskId },
       source: "process",
       channel,
       kind: channel === "stdout" ? "output.stdout" : "output.stderr",
-      payload: { bytes: Buffer.byteLength(text, "utf8") },
-      output: { channel, text, chunkSequence },
+      payload: { bytes: Buffer.byteLength(safeText, "utf8") },
+      ...(safeText !== text ? { security: { redacted: true } } : {}),
+      output: { channel, text: safeText, chunkSequence },
     });
   }
 
   finished(taskId: string, status: string, exitCode?: number): void {
+    this.resetTask(taskId);
     this.emit(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
   }
 
+  private resetTask(taskId: string): void {
+    for (const [key, sanitizer] of this.#outputSanitizers) {
+      if (key.startsWith(`${taskId}:`)) {
+        sanitizer.finish();
+        this.#outputSanitizers.delete(key);
+      }
+    }
+  }
+
   private emit(taskId: string, kind: string, severity: ObservationSeverity, payload: unknown): void {
-    void this.#observer.emit({ producer: this.#producer, identity: { controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
+    emitObservation(this.#observer, { producer: this.#producer, identity: { controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
   }
 }
 
@@ -198,7 +252,7 @@ export class PiAsyncObservationAdapter {
       ...(status.parentStepIndex !== undefined ? { childIndex: status.parentStepIndex } : {}),
       ...(status.depth !== undefined ? { depth: status.depth } : {}),
     };
-    void this.#observer.emit({
+    emitObservation(this.#observer, {
       producer: this.#producer,
       identity,
       source: "pi-subagents",
@@ -232,12 +286,12 @@ export class NestedReviewerObservationAdapter {
   failed(identity: ObservationIdentity, error: unknown): void { this.emit(identity, "review.failed", "error", { summary: error instanceof Error ? error.message : String(error) }); }
 
   private emit(identity: ObservationIdentity, kind: string, severity: ObservationSeverity, payload: unknown): void {
-    void this.#observer.emit({ producer: this.#producer, identity: { ...identity, agentRole: "reviewer" }, source: "reviewer", channel: "review", kind, severity, payload });
+    emitObservation(this.#observer, { producer: this.#producer, identity: { ...identity, agentRole: "reviewer" }, source: "reviewer", channel: "review", kind, severity, payload });
   }
 }
 
 export function createArtifactObservation(observer: ObservationSink, identity: ObservationIdentity, artifactId: string, kind: string): void {
-  void observer.emit({
+  emitObservation(observer, {
     producer: createObservationProducer("forgedock-artifact"),
     identity: { ...identity, artifactId },
     source: "artifact",
@@ -245,6 +299,14 @@ export function createArtifactObservation(observer: ObservationSink, identity: O
     kind: "artifact.submitted",
     payload: { artifactId, kind },
   });
+}
+
+function emitObservation(observer: ObservationSink, draft: ObservationDraft): void {
+  try {
+    void observer.emit(draft).catch(() => undefined);
+  } catch {
+    // Adapter callbacks are fire-and-forget; a closed observer must not break the producer.
+  }
 }
 
 function observabilityPayload(event: AgentEvent): Record<string, unknown> {

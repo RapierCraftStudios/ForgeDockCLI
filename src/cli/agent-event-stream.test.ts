@@ -37,6 +37,41 @@ test("removes terminal control sequences from untrusted streamed text", () => {
   assert.equal(stream.output().includes(escape), false);
 });
 
+test("removes split C1 terminal payloads from the live stream", () => {
+  const stream = capture();
+  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "prefix\u009d52;c;" });
+  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "clipboard-secret\u009cvisible" });
+  stream.writer.finish();
+
+  assert.match(stream.output(), /prefix/);
+  assert.match(stream.output(), /visible/);
+  assert.doesNotMatch(stream.output(), /clipboard-secret|52;c/);
+  assert.equal(stream.output().includes("\u009d"), false);
+});
+
+test("masks credential-shaped live deltas and terminal summaries", () => {
+  const stream = capture();
+  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "api_key=live-secret https://user:pass@example.test" });
+  stream.writer.write({ type: "session.failed", taskId: "build:1", sessionRef: "pi-failed", errorSummary: "password=failed-secret" });
+
+  assert.doesNotMatch(stream.output(), /live-secret|user:pass|failed-secret/);
+  assert.match(stream.output(), /api_key=\[REDACTED\]/);
+  assert.match(stream.output(), /session failed · password=\[REDACTED\]/);
+});
+
+test("keeps terminal parser state isolated for interleaved live task streams", () => {
+  const stream = capture();
+  stream.writer.write({ type: "text.delta", taskId: "task-a", text: "\u009d52;c;" });
+  stream.writer.write({ type: "text.delta", taskId: "task-b", text: "\u009b31" });
+  stream.writer.write({ type: "text.delta", taskId: "task-a", text: "clipboard-a\u009cvisible-a" });
+  stream.writer.write({ type: "text.delta", taskId: "task-b", text: "mvisible-b" });
+  stream.writer.finish();
+
+  assert.doesNotMatch(stream.output(), /clipboard-a|31m/);
+  assert.match(stream.output(), /visible-a/);
+  assert.match(stream.output(), /visible-b/);
+});
+
 test("shows typed review milestones and artifact timestamps in the live stream", () => {
   const stream = capture();
   stream.writer.write({

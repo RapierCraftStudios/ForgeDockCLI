@@ -6,6 +6,11 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   OBSERVATION_SCHEMA_VERSION,
+  createTerminalTextSanitizer,
+  normalizeObservationDraft,
+  observationOutputStreamKey,
+  observationOutputStreamPrefix,
+  sanitizeObservationOutput,
   type ObservationDraft,
   type ObservationEnvelopeV1,
   type ObservationLayoutStore,
@@ -13,7 +18,6 @@ import {
   type ObservationRetentionPolicy,
   type ObservationRetentionResult,
   type ObservationStore,
-  normalizeObservationDraft,
   observationScopeKey,
 } from "./contracts.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
@@ -25,6 +29,7 @@ const MAX_QUERY_LIMIT = 5_000;
 /** Operational journal for observations. It is rebuildable and never owns workflow state. */
 export class SqliteObservationStore implements ObservationStore, ObservationLayoutStore {
   readonly #database: DatabaseSync;
+  readonly #outputSanitizers = new Map<string, ReturnType<typeof createTerminalTextSanitizer>>();
 
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -100,7 +105,7 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
   }
 
   async append(input: ObservationDraft): Promise<ObservationEnvelopeV1> {
-    const draft = normalizeObservationDraft(input);
+    const draft = normalizeObservationDraft(this.prepareInput(input));
     const scopeKey = observationScopeKey(draft.identity ?? {});
     const eventId = randomUUID();
     const occurredAt = draft.occurredAt ?? new Date().toISOString();
@@ -285,7 +290,45 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
   }
 
   close(): void {
+    for (const sanitizer of this.#outputSanitizers.values()) sanitizer.finish();
+    this.#outputSanitizers.clear();
     this.#database.close();
+  }
+
+  private prepareInput(input: ObservationDraft): ObservationDraft {
+    const key = observationOutputStreamKey(input);
+    if (!key) {
+      this.resetOutputStream(input);
+      return input;
+    }
+    let sanitizer = this.#outputSanitizers.get(key);
+    if (!sanitizer) {
+      sanitizer = createTerminalTextSanitizer();
+      this.#outputSanitizers.set(key, sanitizer);
+    }
+    const prepared = sanitizeObservationOutput(input, sanitizer);
+    if (isTerminalObservationKind(input.kind)) {
+      sanitizer.finish();
+      this.#outputSanitizers.delete(key);
+    }
+    return prepared;
+  }
+
+  private resetOutputStream(input: ObservationDraft): void {
+    const key = observationOutputStreamKey(input);
+    if (key) {
+      const sanitizer = this.#outputSanitizers.get(key);
+      sanitizer?.finish();
+      this.#outputSanitizers.delete(key);
+      return;
+    }
+    const prefix = observationOutputStreamPrefix(input);
+    for (const [streamKey, sanitizer] of this.#outputSanitizers) {
+      if (streamKey.startsWith(prefix)) {
+        sanitizer.finish();
+        this.#outputSanitizers.delete(streamKey);
+      }
+    }
   }
 
   private updateAttention(envelope: ObservationEnvelopeV1, scopeKey: string): void {
@@ -335,6 +378,10 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
       throw error;
     }
   }
+}
+
+function isTerminalObservationKind(kind: string): boolean {
+  return /(?:^|\.)(?:completed|failed|cancelled|canceled|exited|finished)$/.test(kind);
 }
 
 function decodeEnvelope(row: Record<string, unknown>): ObservationEnvelopeV1 {
