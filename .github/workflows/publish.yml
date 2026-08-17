@@ -160,44 +160,128 @@ jobs:
               \`\${maj}.\${min}.\${pat+1}\`;
             }
           ")
-          # Re-run guard: check if NEXT_VERSION (not the current committed version) was
-          # already published. This correctly identifies the re-run case where a partial
-          # failure left the bumped version on npm without committing it back to the repo.
-          # Checking CURRENT_VERSION would always be true (the committed version is always
-          # the last published version), which would permanently disable publishing.
-          if npm show forgedock@"$NEXT_VERSION" version --silent 2>/dev/null | grep -qx "$NEXT_VERSION"; then
-            echo "Next version $NEXT_VERSION is already published — reconciling repository metadata"
+
+          # A rerun reconciles each registry independently. Only an exact successful
+          # response means present, and only npm's explicit 404 means absent; every
+          # auth, network, malformed, or ambiguous response fails closed.
+          GITHUB_PACKAGES_NPMRC="$RUNNER_TEMP/forgedock-github-packages.npmrc"
+          printf '%s\n' \
+            "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" \
+            "@rapiercraftstudios:registry=https://npm.pkg.github.com" \
+            > "$GITHUB_PACKAGES_NPMRC"
+
+          query_registry_version() {
+            local package_spec="$1"
+            local registry="$2"
+            local userconfig="$3"
+            local label="$4"
+            local output_file="$RUNNER_TEMP/forgedock-${label}.stdout"
+            local error_file="$RUNNER_TEMP/forgedock-${label}.stderr"
+            local status
+            local output
+            local error
+            local -a npm_args
+
+            npm_args=(show "$package_spec" version --silent "--registry=$registry")
+            if [ -n "$userconfig" ]; then
+              npm_args+=(--userconfig "$userconfig")
+            fi
+
+            set +e
+            npm "${npm_args[@]}" >"$output_file" 2>"$error_file"
+            status=$?
+            set -e
+            output=$(cat "$output_file")
+            error=$(cat "$error_file")
+            output=${output//$'\r'/}
+
+            if [ "$status" -eq 0 ]; then
+              if [ "$output" = "$NEXT_VERSION" ]; then
+                printf 'true'
+                return 0
+              fi
+              echo "Ambiguous $label registry response; refusing to publish or finalize" >&2
+              return 1
+            fi
+            if [ -n "$output" ]; then
+              echo "Unexpected $label registry output on failed lookup; refusing to publish or finalize" >&2
+              return 1
+            fi
+            if printf '%s\n' "$error" | grep -Eiq 'E404|404[[:space:]]+Not Found|is not in this registry'; then
+              printf 'false'
+              return 0
+            fi
+            echo "$label registry lookup failed without an explicit not-found response; refusing to publish or finalize" >&2
+            return 1
+          }
+
+          NPM_ALREADY_PUBLISHED=$(query_registry_version \
+            "forgedock@$NEXT_VERSION" \
+            "https://registry.npmjs.org" \
+            "" \
+            "npmjs")
+          GITHUB_PACKAGES_ALREADY_PUBLISHED=$(query_registry_version \
+            "@rapiercraftstudios/forgedock@$NEXT_VERSION" \
+            "https://npm.pkg.github.com" \
+            "$GITHUB_PACKAGES_NPMRC" \
+            "github-packages")
+          case "$NPM_ALREADY_PUBLISHED" in
+            true|false) ;;
+            *) echo "Invalid npm registry state; refusing to publish or finalize" >&2; exit 1 ;;
+          esac
+          case "$GITHUB_PACKAGES_ALREADY_PUBLISHED" in
+            true|false) ;;
+            *) echo "Invalid GitHub Packages registry state; refusing to publish or finalize" >&2; exit 1 ;;
+          esac
+          echo "NPM_ALREADY_PUBLISHED=$NPM_ALREADY_PUBLISHED" >> "$GITHUB_ENV"
+          echo "GITHUB_PACKAGES_ALREADY_PUBLISHED=$GITHUB_PACKAGES_ALREADY_PUBLISHED" >> "$GITHUB_ENV"
+
+          # npm and GitHub Packages are independent publication boundaries:
+          # neither present publishes both, npm-present/GitHub-absent retries only
+          # GitHub Packages, npm-absent/GitHub-present publishes only npm, and both
+          # present skips both. NEXT_VERSION is retained for an npm-present rerun.
+          if [ "$NPM_ALREADY_PUBLISHED" = "true" ]; then
+            echo "Next npm version $NEXT_VERSION is already published — reconciling repository metadata"
             npm version "$NEXT_VERSION" --no-git-tag-version --allow-same-version
-            echo "VERSION=$NEXT_VERSION" >> $GITHUB_ENV
-            echo "REGISTRY_ALREADY_PUBLISHED=true" >> $GITHUB_ENV
+            echo "VERSION=$NEXT_VERSION" >> "$GITHUB_ENV"
           else
             npm version "$BUMP_TYPE" --no-git-tag-version
             NEW_VERSION=$(node -p "require('./package.json').version")
-            echo "VERSION=$NEW_VERSION" >> $GITHUB_ENV
-            echo "REGISTRY_ALREADY_PUBLISHED=false" >> $GITHUB_ENV
+            echo "VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
           fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish to npm (OIDC trusted publishing)
-        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
-        run: npm publish --provenance --access public
+        if: env.SKIP_PUBLISH != 'true' && env.NPM_ALREADY_PUBLISHED != 'true'
+        run: |
+          npm publish --provenance --access public
+          echo "NPM_ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
 
       - name: Save package.json before name mutation
-        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
-        run: cp package.json package.json.orig
+        if: env.SKIP_PUBLISH != 'true' && env.GITHUB_PACKAGES_ALREADY_PUBLISHED != 'true'
+        run: |
+          # This marker is set before any scoped-package mutation so cleanup also
+          # runs when the publish command is cancelled or fails halfway through.
+          echo "GITHUB_PACKAGES_ATTEMPTED=true" >> "$GITHUB_ENV"
+          cp package.json package.json.orig
 
       - name: Publish to GitHub Packages
-        if: env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.GITHUB_PACKAGES_ALREADY_PUBLISHED != 'true'
         run: |
-          NPMRC="$RUNNER_TEMP/.npmrc"
-          echo "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" > "$NPMRC"
-          echo "@rapiercraftstudios:registry=https://npm.pkg.github.com" >> "$NPMRC"
+          NPMRC="$RUNNER_TEMP/forgedock-github-packages.npmrc"
+          printf '%s\n' \
+            "//npm.pkg.github.com/:_authToken=${GH_TOKEN}" \
+            "@rapiercraftstudios:registry=https://npm.pkg.github.com" \
+            > "$NPMRC"
           npm pkg set name="@rapiercraftstudios/forgedock"
           npm publish --access public --userconfig "$NPMRC"
+          echo "GITHUB_PACKAGES_ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore package.json name
-        if: always() && env.SKIP_PUBLISH != 'true' && env.REGISTRY_ALREADY_PUBLISHED != 'true'
+        if: always() && env.SKIP_PUBLISH != 'true' && env.GITHUB_PACKAGES_ATTEMPTED == 'true'
         run: |
           if [ -f package.json.orig ]; then
             mv package.json.orig package.json
@@ -205,8 +289,23 @@ jobs:
             echo "package.json was not renamed; nothing to restore"
           fi
 
-      - name: Sync plugin.json version
+      - name: Verify registry reconciliation
         if: env.SKIP_PUBLISH != 'true'
+        run: |
+          if [ "${NPM_ALREADY_PUBLISHED:-false}" != "true" ] || \
+             [ "${GITHUB_PACKAGES_ALREADY_PUBLISHED:-false}" != "true" ]; then
+            echo "Both registries must be reconciled before finalization" >&2
+            exit 1
+          fi
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          if [ "$PACKAGE_NAME" != "forgedock" ]; then
+            echo "package.json name was not restored to forgedock; refusing to finalize" >&2
+            exit 1
+          fi
+          echo "REGISTRIES_RECONCILED=true" >> "$GITHUB_ENV"
+
+      - name: Sync plugin.json version
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRIES_RECONCILED == 'true'
         run: |
           node -e "
             const fs = require('fs');
@@ -218,7 +317,7 @@ jobs:
           "
 
       - name: Push version bump
-        if: env.SKIP_PUBLISH != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRIES_RECONCILED == 'true'
         run: |
           git add package.json package-lock.json .claude-plugin/plugin.json
           git commit -m "chore: bump version to ${{ env.VERSION }} [skip ci]"
@@ -227,7 +326,8 @@ jobs:
           # pushes to main. Rebase the generated metadata commit onto the latest
           # main and retry a raced non-fast-forward update. npm may already be
           # irreversible at this point, so failure must be explicit and a later
-          # run's REGISTRY_ALREADY_PUBLISHED path must reconcile the same version.
+          # run's independent registry reconciliation must retry only a missing
+          # publication before finalizing the same version.
           for attempt in 1 2 3; do
             git fetch origin main
             if ! git rebase origin/main; then
@@ -246,7 +346,7 @@ jobs:
           exit 1
 
       - name: Create GitHub Release
-        if: env.SKIP_PUBLISH != 'true'
+        if: env.SKIP_PUBLISH != 'true' && env.REGISTRIES_RECONCILED == 'true'
         run: |
           # Idempotent: if the release already exists (e.g. on a re-run), skip gracefully.
           gh release create "v${{ env.VERSION }}" \
