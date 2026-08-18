@@ -184,9 +184,9 @@ export interface RedactedValue {
 }
 
 const SENSITIVE_KEY = /(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)/i;
-const SENSITIVE_VALUE = /(?:bearer\s+|gh[pousr]_\w+|sk-[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]+ PRIVATE KEY-----)/i;
+const SENSITIVE_VALUE = /(?:bearer\s+[A-Za-z0-9._~+/=-]+|gh[pousr]_\w+|sk-[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]+ PRIVATE KEY-----)/i;
 const STREAM_SECRET_PATTERNS = [
-  /bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+  /bearer\s+[A-Za-z0-9._~+/=-]+/gi,
   /authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]{8,}/gi,
   /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/gi,
   /\bsk-[A-Za-z0-9_-]{12,}\b/gi,
@@ -325,11 +325,14 @@ function streamingSecretSuffixStart(value: string): number | undefined {
     /(?:^|[^A-Za-z0-9_])(authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]*)$/i,
     /(?:^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]*)$/i,
     /(?:^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]*)$/i,
-    /(?:^|[\\s,{?&;])["']?((?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret))["']?[\\s]*[:=][\\s]*[^\\s,}&;]*$/i,
+    /(?:^|[\s,{?&;])["']?((?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret))["']?[\s]*[:=][\s]*[^\s,}&;]*$/i,
   ];
   for (const pattern of suffixPatterns) {
     const match = pattern.exec(value);
-    if (match?.[1] !== undefined) candidates.push(match.index + match[0].length - match[1].length);
+    if (match?.[1] !== undefined) {
+      // Include the complete assignment in the holdback; match[1] is only the key.
+      candidates.push(match.index + match[0].indexOf(match[1]));
+    }
   }
   const privateKeyHeader = /-----BEGIN [A-Z ]+ PRIVATE KEY-----/i.exec(value);
   if (privateKeyHeader && !/-----END [A-Z ]+ PRIVATE KEY-----/i.test(value.slice(privateKeyHeader.index))) {
@@ -409,11 +412,15 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
     const sanitized = sanitizeTerminalText(value);
     const streamed = redactStreamingSecrets(sanitized);
     const masked = maskCredentialAssignments(streamed);
+    const sensitive = SENSITIVE_VALUE.test(sanitized);
     const changed = masked !== value;
-    if (changed || SENSITIVE_VALUE.test(sanitized)) {
-      const bytes = Buffer.byteLength(masked, "utf8");
-      if (bytes <= maxStringBytes) return { value: masked, redacted: true, originalBytes, outputBytes: bytes, truncated: false };
-      const clipped = clipUtf8(masked, maxStringBytes);
+    if (changed || sensitive) {
+      // Keep the detector and replacement boundaries aligned: a positive
+      // detector result must never report redaction while returning the input.
+      const safeMasked = sensitive && masked === sanitized ? "[REDACTED]" : masked;
+      const bytes = Buffer.byteLength(safeMasked, "utf8");
+      if (bytes <= maxStringBytes) return { value: safeMasked, redacted: true, originalBytes, outputBytes: bytes, truncated: false };
+      const clipped = clipUtf8(safeMasked, maxStringBytes);
       return { value: `${clipped}… [truncated]`, redacted: true, originalBytes, outputBytes: Buffer.byteLength(clipped, "utf8") + 14, truncated: true };
     }
     const terminalSequencesRemoved = sanitized !== value;
@@ -505,7 +512,7 @@ export function sanitizeTerminalText(value: string): string {
 
 function maskCredentialAssignments(value: string): string {
   let result = value;
-  const assignment = /(?:^|[\\s,{?&;])["']?(?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)["']?\\s*[:=]\\s*/gi;
+  const assignment = /(?:^|[\s,{?&;])["']?(?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)["']?\s*[:=]\s*/gi;
   let searchFrom = 0;
   while (searchFrom < result.length) {
     assignment.lastIndex = searchFrom;

@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, sanitizeTerminalText } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, redactObservationValue, sanitizeTerminalText } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -189,6 +189,42 @@ test("streaming sanitizer retains a long split token until its delimiter", () =>
   ].join("");
   assert.match(output, /\[REDACTED\] after/);
   assert.doesNotMatch(output, /abcdefgh|ijklmnopqrstuvwxyz/);
+});
+
+test("streaming assignment holdback never emits a credential fragment", () => {
+  const stream = createStreamingObservationText();
+  const chunks = [stream.push("prefix token="), stream.push("secret"), stream.finish()];
+  assert.equal(chunks[0], "prefix ");
+  assert.equal(chunks[1], "");
+  assert.equal(chunks[2], "[REDACTED]");
+  assert.doesNotMatch(chunks.join(""), /token|secret/);
+});
+
+test("redaction masks spaced assignments and short bearer values", () => {
+  for (const value of ["{ \"api_key\": \"secret\" }", "api_key = secret", "Bearer x"]) {
+    const result = redactObservationValue(value);
+    assert.equal(result.redacted, true);
+    assert.doesNotMatch(String(result.value), /secret|Bearer x/);
+  }
+});
+
+test("observer and SQLite persistence retain assignment redaction", async () => {
+  const observer = observerWithStore();
+  await observer.emit({
+    producer,
+    identity: { forgeRunId: "run-redaction" },
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: { command: "{ \"api_key\": \"persist-secret\" }" },
+    output: { channel: "stdout", text: "Bearer x", chunkSequence: 1 },
+  });
+  await observer.flush();
+  const events = await observer.query({ forgeRunId: "run-redaction" });
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /persist-secret|Bearer x/);
+  assert.equal(events[0]?.security.redacted, true);
+  observer.close();
 });
 
 test("streaming sanitizer retains a split private-key body until the closing delimiter", () => {

@@ -96,6 +96,7 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
 export class ControllerObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #context: ObservationAdapterContext;
+  readonly #streams = new Map<"stdout" | "stderr", StreamingObservationText>();
   #outputSequence = 0;
 
   constructor(observer: ObservationSink, context: ObservationAdapterContext = {}) {
@@ -108,27 +109,47 @@ export class ControllerObservationAdapter {
   }
 
   output(channel: "stdout" | "stderr", text: string): void {
+    const stream = this.#streams.get(channel) ?? createStreamingObservationText();
+    this.#streams.set(channel, stream);
+    const safeText = stream.push(text);
+    if (!safeText) return;
     this.#outputSequence += 1;
-    this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(text, "utf8") }, "info", {
+    this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(safeText, "utf8") }, "info", {
       channel,
-      text,
+      text: safeText,
       chunkSequence: this.#outputSequence,
     });
   }
 
   completed(code: number, truncated = false): void {
+    this.finishOutputStreams();
     if (truncated) this.emit("diagnostic", "output.truncated", { summary: "Controller output was bounded to the retained tail" }, "warning", undefined, { truncated: true });
     this.emit("lifecycle", "controller.completed", { code }, code === 0 ? "info" : "error", undefined, truncated ? { truncated: true } : undefined);
   }
 
   failed(error: unknown): void {
+    this.finishOutputStreams();
     this.emit("lifecycle", "controller.failed", { summary: error instanceof Error ? error.message : String(error) }, "error");
+  }
+
+  private finishOutputStreams(): void {
+    for (const [channel, stream] of this.#streams) {
+      const safeText = stream.finish();
+      this.#streams.delete(channel);
+      if (!safeText) continue;
+      this.#outputSequence += 1;
+      this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(safeText, "utf8") }, "info", {
+        channel,
+        text: safeText,
+        chunkSequence: this.#outputSequence,
+      });
+    }
   }
 
   private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"]): void {
     void this.#observer.emit({
       producer: this.#context.producer ?? createObservationProducer("forgedock-controller"),
-      ...(this.#context.identity ? { identity: this.#context.identity } : {}),
+      ...(this.#context.identityRef?.current ? { identity: this.#context.identityRef.current } : this.#context.identity ? { identity: this.#context.identity } : {}),
       source: "controller",
       channel,
       kind,
@@ -143,6 +164,7 @@ export class ControllerObservationAdapter {
 export class BackgroundTaskObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #producer: ReturnType<typeof createObservationProducer>;
+  readonly #streams = new Map<string, StreamingObservationText>();
 
   constructor(observer: ObservationSink, producer = createObservationProducer("forgedock-background-task")) {
     this.#observer = observer;
@@ -158,6 +180,27 @@ export class BackgroundTaskObservationAdapter {
   }
 
   output(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): void {
+    const key = `${taskId}:${channel}`;
+    const stream = this.#streams.get(key) ?? createStreamingObservationText();
+    this.#streams.set(key, stream);
+    const safeText = stream.push(text);
+    if (!safeText) return;
+    this.emitOutput(taskId, channel, safeText, chunkSequence);
+  }
+
+  finished(taskId: string, status: string, exitCode?: number): void {
+    for (const channel of ["stdout", "stderr"] as const) {
+      const key = `${taskId}:${channel}`;
+      const stream = this.#streams.get(key);
+      if (!stream) continue;
+      const safeText = stream.finish();
+      this.#streams.delete(key);
+      if (safeText) this.emitOutput(taskId, channel, safeText, 0);
+    }
+    this.emit(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
+  }
+
+  private emitOutput(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): void {
     void this.#observer.emit({
       producer: this.#producer,
       identity: { controllerTaskId: taskId },
@@ -165,12 +208,8 @@ export class BackgroundTaskObservationAdapter {
       channel,
       kind: channel === "stdout" ? "output.stdout" : "output.stderr",
       payload: { bytes: Buffer.byteLength(text, "utf8") },
-      output: { channel, text, chunkSequence },
+      output: { channel, text, ...(chunkSequence > 0 ? { chunkSequence } : {}) },
     });
-  }
-
-  finished(taskId: string, status: string, exitCode?: number): void {
-    this.emit(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
   }
 
   private emit(taskId: string, kind: string, severity: ObservationSeverity, payload: unknown): void {
