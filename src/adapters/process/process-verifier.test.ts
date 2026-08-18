@@ -116,6 +116,27 @@ describe("deterministic process verification", () => {
     assert.match(result?.summary ?? "", /not ok 15 - windows path import/);
   });
 
+  it("retains Node test failure names and locations in bounded diagnostics", async () => {
+    const runner = isolatedRunner();
+    const output = [
+      "✖ parent suite (600ms)",
+      "✖ failing tests:",
+      "test at dist/tui/forgedock-extension.test.js:576:1",
+      "✖ orchestration preview exposes a single-use continuation checkpoint (523.05ms)",
+      "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: 0 !== 1",
+    ];
+    const [result] = await runner.run([{
+      id: "node-test-fail", command: process.execPath,
+      args: ["-e", `console.log(${JSON.stringify(output.join("\n"))}); process.exit(1)`],
+      cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.deepEqual(result?.failureSignatures, [
+      "node test - orchestration preview exposes a single-use continuation checkpoint",
+    ]);
+    assert.match(result?.summary ?? "", /forgedock-extension\.test\.js:576:1/);
+    assert.match(result?.summary ?? "", /0 !== 1/);
+  });
+
   it("serializes verification across runner instances that share machine-global fixtures", async () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-lock-"));
     const lockPath = join(directory, "verification.lock");
