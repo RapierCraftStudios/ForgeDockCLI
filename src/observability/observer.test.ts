@@ -64,6 +64,62 @@ test("marker boundaries keep safe delimiters and do not skip following assignmen
   assert.equal(safe.redacted, false);
 });
 
+test("controller credential continuations isolate delimiter-containing identities", () => {
+  const collisionProducer = createObservationProducer("controller-collision-test", 1);
+  const identityA = { forgeRunId: "a|b" };
+  const identityB = { forgeRunId: "a", orchestrationId: "b" };
+  const first = normalizeObservationDraft({
+    producer: collisionProducer,
+    identity: identityA,
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "password=", chunkSequence: 1 },
+  });
+  assert.equal(first.output?.text, "");
+  const beforeTerminal = normalizeObservationDraft({
+    producer: collisionProducer,
+    identity: identityA,
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "secret", chunkSequence: 2 },
+  });
+  assert.equal(beforeTerminal.output?.text, "password=[REDACTED]");
+  normalizeObservationDraft({
+    producer: collisionProducer,
+    identity: identityA,
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "password=", chunkSequence: 3 },
+  });
+
+  normalizeObservationDraft({
+    producer: collisionProducer,
+    identity: identityB,
+    source: "controller",
+    channel: "lifecycle",
+    kind: "controller.completed",
+    payload: {},
+  });
+
+  const continuation = normalizeObservationDraft({
+    producer: collisionProducer,
+    identity: identityA,
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: {},
+    output: { channel: "stdout", text: "secret", chunkSequence: 4 },
+  });
+  assert.equal(continuation.output?.text, "password=[REDACTED]");
+  assert.doesNotMatch(JSON.stringify(continuation), /secret/);
+});
+
 test("controller adapter output uses the central assignment redaction boundary", async () => {
   const observer = observerWithStore();
   const adapter = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller-marker" }, producer });

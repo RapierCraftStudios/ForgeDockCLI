@@ -419,9 +419,31 @@ interface ControllerCredentialStreamState {
 
 const controllerCredentialStreams = new Map<string, ControllerCredentialStreamState>();
 
+/**
+ * Encode controller stream identity without delimiter ambiguity. The
+ * credential continuation map is process-global, so every identity component
+ * and the producer instance must remain distinguishable from the others.
+ */
+function controllerCredentialKey(
+  identity: ObservationIdentity,
+  channel: "stdout" | "stderr",
+  processInstanceId: string,
+): string {
+  return JSON.stringify([
+    identity.forgeRunId ?? null,
+    identity.orchestrationId ?? null,
+    identity.workUnitId ?? null,
+    identity.agentTaskId ?? null,
+    identity.controllerTaskId ?? null,
+    identity.piAsyncId ?? null,
+    channel,
+    processInstanceId,
+  ]);
+}
+
 function controllerCredentialStreamKey(draft: ObservationDraft): string | undefined {
   if (draft.source !== "controller" || !draft.output || draft.output.chunkSequence === undefined) return undefined;
-  return `${observationStreamKey(draft.identity ?? {}, draft.output.channel)}|${draft.producer.processInstanceId}`;
+  return controllerCredentialKey(draft.identity ?? {}, draft.output.channel, draft.producer.processInstanceId);
 }
 
 function isObservationStreamTerminal(kind: string): boolean {
@@ -526,7 +548,7 @@ export function normalizeObservationDraft(draft: ObservationDraft, policy: Obser
   let output = outputValue;
   if (isObservationStreamTerminal(draft.kind) && draft.source === "controller") {
     for (const channel of ["stdout", "stderr"] as const) {
-      controllerCredentialStreams.delete(`${observationStreamKey(identity, channel)}|${draft.producer.processInstanceId}`);
+      controllerCredentialStreams.delete(controllerCredentialKey(identity, channel, draft.producer.processInstanceId));
     }
   }
   if (outputValue && controllerStreamKey && !outputValue.redacted && draft.security?.redacted !== true) {
