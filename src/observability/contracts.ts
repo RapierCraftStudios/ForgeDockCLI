@@ -194,6 +194,8 @@ const STREAM_SECRET_PATTERNS = [
 ] as const;
 const STREAM_HOLDBACK_LIMIT_BYTES = 16 * 1024;
 const STREAM_SECRET_PREFIXES = ["bearer", "authorization", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-", "-----BEGIN "];
+const CREDENTIAL_ASSIGNMENT_KEY = /(?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)/i;
+const REDACTION_MARKER = /^\[REDACTED(?:[-_:][A-Za-z0-9_-]*)?\]$/i;
 
 type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
 
@@ -208,6 +210,12 @@ export class StreamingObservationText {
     const visible = this.consumeTerminal(value);
     if (!visible) return "";
     return this.flushSafe(visible);
+  }
+
+  /** Consume an input chunk without returning any text, then quarantine the stream. */
+  discard(value: string): void {
+    if (!this.#quarantined) this.#state = consumeTerminalText(value, this.#state).state;
+    this.markDropped();
   }
 
   /** Backpressure may discard an incomplete control/secret sequence. */
@@ -255,37 +263,49 @@ export class StreamingObservationText {
   }
 
   private consumeTerminal(value: string): string {
-    let output = "";
-    for (const character of value) {
-      const code = character.charCodeAt(0);
-      if (this.#state === "ground") {
-        if (code === 0x1b) this.#state = "escape";
-        else if (code === 0x0a || code === 0x0d || code === 0x09 || code >= 0x20) output += character;
-        continue;
-      }
-      if (this.#state === "escape") {
-        if (character === "[") this.#state = "csi";
-        else if (character === "]") this.#state = "osc";
-        else if (character === "O") this.#state = "ss3";
-        else this.#state = "ground";
-        continue;
-      }
-      if (this.#state === "csi" || this.#state === "ss3") {
-        if (code >= 0x40 && code <= 0x7e) this.#state = "ground";
-        else if (code === 0x1b) this.#state = "escape";
-        continue;
-      }
-      if (this.#state === "osc") {
-        if (code === 0x07) this.#state = "ground";
-        else if (code === 0x1b) this.#state = "osc-escape";
-        continue;
-      }
-      if (code === 0x5c) this.#state = "ground";
-      else if (code === 0x1b) this.#state = "osc-escape";
-      else this.#state = "osc";
-    }
-    return output;
+    const result = consumeTerminalText(value, this.#state);
+    this.#state = result.state;
+    return result.text;
   }
+}
+
+function consumeTerminalText(value: string, initialState: TerminalParserState): { text: string; state: TerminalParserState } {
+  let output = "";
+  let state = initialState;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (state === "ground") {
+      if (code === 0x1b) state = "escape";
+      else if (code === 0x9b) state = "csi";
+      else if (code === 0x9d) state = "osc";
+      else if (code === 0x8f) state = "ss3";
+      else if (code === 0x9c) continue;
+      else if (code === 0x0a || code === 0x0d || code === 0x09 || (code >= 0x20 && !(code >= 0x80 && code <= 0x9f))) output += character;
+      continue;
+    }
+    if (state === "escape") {
+      if (character === "[") state = "csi";
+      else if (character === "]") state = "osc";
+      else if (character === "O") state = "ss3";
+      else state = "ground";
+      continue;
+    }
+    if (state === "csi" || state === "ss3") {
+      if (code === 0x9c) state = "ground";
+      else if (code >= 0x40 && code <= 0x7e) state = "ground";
+      else if (code === 0x1b) state = "escape";
+      continue;
+    }
+    if (state === "osc") {
+      if (code === 0x07 || code === 0x9c) state = "ground";
+      else if (code === 0x1b) state = "osc-escape";
+      continue;
+    }
+    if (code === 0x5c || code === 0x9c) state = "ground";
+    else if (code === 0x1b) state = "osc-escape";
+    else state = "osc";
+  }
+  return { text: output, state };
 }
 
 export function createStreamingObservationText(): StreamingObservationText {
@@ -305,6 +325,7 @@ function streamingSecretSuffixStart(value: string): number | undefined {
     /(?:^|[^A-Za-z0-9_])(authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]*)$/i,
     /(?:^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]*)$/i,
     /(?:^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]*)$/i,
+    /(?:^|[\\s,{?&;])["']?((?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret))["']?[\\s]*[:=][\\s]*[^\\s,}&;]*$/i,
   ];
   for (const pattern of suffixPatterns) {
     const match = pattern.exec(value);
@@ -337,15 +358,22 @@ export function observationScopeKey(identity: ObservationIdentity): string {
 }
 
 export function observationStreamKey(identity: ObservationIdentity, channel: "stdout" | "stderr"): string {
-  return [
-    identity.forgeRunId ?? "",
-    identity.orchestrationId ?? "",
-    identity.workUnitId ?? "",
-    identity.agentTaskId ?? "",
-    identity.controllerTaskId ?? "",
-    identity.piAsyncId ?? "",
-    channel,
-  ].join("|");
+  // Task/channel identity is stable across enrichment and prevents a refreshed
+  // run/work-unit identity from escaping an existing quarantine.
+  const logical = identity.agentTaskId
+    ? `agent:${identity.agentTaskId}`
+    : identity.controllerTaskId
+      ? `controller:${identity.controllerTaskId}`
+      : identity.piAsyncId
+        ? `pi:${identity.piAsyncId}`
+        : identity.workUnitId
+          ? `work:${identity.workUnitId}`
+          : identity.orchestrationId
+            ? `orchestration:${identity.orchestrationId}`
+            : identity.forgeRunId
+              ? `run:${identity.forgeRunId}`
+              : "global";
+  return `${logical}|${channel}`;
 }
 
 export function observationEntityId(identity: ObservationIdentity, producer: ObservationProducer): string {
@@ -379,9 +407,14 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
 
   if (typeof value === "string") {
     const sanitized = sanitizeTerminalText(value);
-    const masked = redactStreamingSecrets(sanitized);
-    if (masked !== sanitized || SENSITIVE_VALUE.test(sanitized)) {
-      return { value: "[REDACTED]", redacted: true, originalBytes, outputBytes: 11, truncated: false };
+    const streamed = redactStreamingSecrets(sanitized);
+    const masked = maskCredentialAssignments(streamed);
+    const changed = masked !== value;
+    if (changed || SENSITIVE_VALUE.test(sanitized)) {
+      const bytes = Buffer.byteLength(masked, "utf8");
+      if (bytes <= maxStringBytes) return { value: masked, redacted: true, originalBytes, outputBytes: bytes, truncated: false };
+      const clipped = clipUtf8(masked, maxStringBytes);
+      return { value: `${clipped}… [truncated]`, redacted: true, originalBytes, outputBytes: Buffer.byteLength(clipped, "utf8") + 14, truncated: true };
     }
     const terminalSequencesRemoved = sanitized !== value;
     const bytes = Buffer.byteLength(sanitized, "utf8");
@@ -465,13 +498,41 @@ export function normalizeObservationDraft(draft: ObservationDraft, policy: Obser
 }
 
 export function sanitizeTerminalText(value: string): string {
-  return value
-    // OSC hyperlinks, titles, and clipboard sequences can execute in some terminal emulators.
-    .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, "")
-    // CSI/SS3 and other ANSI control sequences are not part of the observation payload.
-    .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])/g, "")
-    // Preserve newline, carriage return, and tab while removing other C0 controls.
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+  // Use the same fail-closed transition model as chunked adapters. An incomplete
+  // sequence is discarded rather than becoming visible at this boundary.
+  return consumeTerminalText(value, "ground").text;
+}
+
+function maskCredentialAssignments(value: string): string {
+  let result = value;
+  const assignment = /(?:^|[\\s,{?&;])["']?(?:--?(?:api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)|api[-_]?key|token|password|authorization|credential|cookie|jwt|private[-_]?key|secret)["']?\\s*[:=]\\s*/gi;
+  let searchFrom = 0;
+  while (searchFrom < result.length) {
+    assignment.lastIndex = searchFrom;
+    const match = assignment.exec(result);
+    if (!match) break;
+    const valueStart = match.index + match[0].length;
+    const quote = result[valueStart];
+    const quoted = quote === '"' || quote === "'";
+    const contentStart = valueStart + (quoted ? 1 : 0);
+    let end = contentStart;
+    if (quoted) {
+      while (end < result.length) {
+        if (result[end] === quote && result[end - 1] !== "\\") break;
+        end += 1;
+      }
+    } else {
+      while (end < result.length && !/[\s,}&;]/.test(result[end] ?? "")) end += 1;
+    }
+    const raw = result.slice(contentStart, end);
+    if (raw && !REDACTION_MARKER.test(raw)) {
+      result = `${result.slice(0, contentStart)}[REDACTED]${result.slice(end)}`;
+      searchFrom = contentStart + "[REDACTED]".length;
+    } else {
+      searchFrom = Math.max(end + 1, valueStart + 1);
+    }
+  }
+  return result.replace(/([a-z][a-z0-9+.-]*:\/\/)([^\s/@:]+):([^\s/@]+)@/gi, "$1$2:[REDACTED]@");
 }
 
 function enforcePayloadLimit(value: RedactedValue, maxBytes: number): RedactedValue {
