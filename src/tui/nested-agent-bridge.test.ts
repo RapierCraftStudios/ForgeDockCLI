@@ -111,6 +111,72 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
   }
 });
 
+test("nested delegation relays V2 updates as JSON-safe streamed progress", async () => {
+  const events = new FakeEvents();
+  events.autoRespond = false;
+  const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
+  try {
+    const pending = fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        ownerRunId: "run-progress",
+        id: "run-progress:review:abc:correctness",
+        role: "reviewer",
+        objective: "Review frozen SHA abc",
+        instructions: "Read only",
+        context: [],
+        cwd: process.cwd(),
+        ...REVIEWER_SCOPE,
+        tools: ["read"],
+        outputSchema: { type: "object" },
+        provider: "openai-codex",
+        model: "gpt-test",
+      }),
+    });
+    for (let attempt = 0; attempt < 100 && events.requests.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const request = events.requests[0];
+    assert.ok(request);
+    events.emit("prompt-template:subagent:update", {
+      version: 2,
+      requestId: request.requestId,
+      ownerRunId: request.ownerRunId,
+      nodeId: request.nodeId,
+      runId: "nested-progress-run",
+      currentTool: "read",
+      toolCount: 1,
+    });
+    events.emit("prompt-template:subagent:response", {
+      version: 2,
+      requestId: request.requestId,
+      ownerRunId: request.ownerRunId,
+      nodeId: request.nodeId,
+      status: "completed",
+      runId: "nested-progress-run",
+      result: { kind: "structured", value: { summary: "clean", findings: [] } },
+    });
+    const response = await pending;
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.match(body, /^\s+\{/);
+    assert.deepEqual(JSON.parse(body), {
+      output: { summary: "clean", findings: [] },
+      sessionRef: "nested-progress-run",
+      provider: "openai-codex",
+      model: "gpt-test",
+      scopeVersion: REVIEWER_SCOPE.scopeVersion,
+      scopeDigest: REVIEWER_SCOPE.scopeDigest,
+    });
+  } finally {
+    await bridge.close();
+  }
+});
+
 test("nested reviewer scope receipts fail closed on omission, tampering, or narrowed/write authority", async () => {
   const events = new FakeEvents();
   const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);

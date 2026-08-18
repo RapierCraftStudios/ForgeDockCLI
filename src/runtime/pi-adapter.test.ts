@@ -209,6 +209,44 @@ test("nested reviewer transport exposes the persisted child identity before term
   }
 });
 
+test("nested reviewer streamed progress reaches the controller event sink", async () => {
+  const endpoint = await listen((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    request.once("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      response.writeHead(200, {
+        "content-type": "application/json",
+        "x-forgedock-nested-session-ref": "nested-progress-session",
+      });
+      response.flushHeaders();
+      response.write(" ");
+      setTimeout(() => response.end(JSON.stringify({
+        output: { summary: "complete" },
+        sessionRef: "nested-progress-session",
+        provider: body.provider,
+        model: body.model,
+        scopeVersion: body.scopeVersion,
+        scopeDigest: body.scopeDigest,
+      })), 10);
+    });
+  });
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  process.env.FORGEDOCK_NESTED_AGENT_URL = endpoint.url;
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = "test-token";
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  const events: AgentEvent[] = [];
+  try {
+    await runtime.run(taskForRole("reviewer") as any, { onEvent: (event) => events.push(event) });
+    assert.ok(events.some((event) => event.type === "session.progress" && event.sessionRef === "nested-progress-session"));
+  } finally {
+    await runtime.close();
+    restoreNestedEnvironment(previousUrl, previousToken);
+    await endpoint.close();
+  }
+});
+
 test("nested reviewer transport rejects non-loopback bridge destinations", async () => {
   await assert.rejects(
     postNestedAgentRequest({ url: "http://attacker.example/v1/run", token: "test-token", body: {} }),

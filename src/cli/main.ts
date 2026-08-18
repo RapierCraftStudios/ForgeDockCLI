@@ -712,7 +712,7 @@ async function workOn(
   }, store);
   const onAgentEvent = (event: AgentEvent) => {
     writeAgentEvent(event);
-    if (event.type === "thinking.delta" || event.type === "text.delta") return;
+    if (event.type === "thinking.delta" || event.type === "text.delta" || event.type === "session.progress") return;
     const observability = event.observability;
     const activity = event.type === "tool.started"
       ? `last tool ${event.tool} started`

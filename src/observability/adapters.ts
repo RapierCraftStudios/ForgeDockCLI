@@ -65,6 +65,10 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       void observer.emit({ ...base, identity: { ...identity, piSessionRef: event.sessionRef }, channel: "lifecycle", kind: "agent.session.started", payload: { provider: event.provider, model: event.model, ...observabilityPayload(event) } });
       return;
     }
+    if (event.type === "session.progress") {
+      void observer.emit({ ...base, identity: { ...identity, piSessionRef: event.sessionRef }, channel: "activity", kind: "agent.session.progress", severity: "debug", payload: observabilityPayload(event) });
+      return;
+    }
     if (event.type === "tool.started") {
       void observer.emit({ ...base, channel: "tool", kind: "tool.started", payload: { tool: event.tool, toolCallId: event.toolCallId, args: safeToolArgs(event.args), ...observabilityPayload(event) } });
       return;

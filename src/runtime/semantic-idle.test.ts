@@ -88,6 +88,20 @@ test("semantic idle resets on useful progress and has no total-run deadline", ()
   watchdog.stop();
 });
 
+test("relayed nested-session progress resets semantic idle", () => {
+  const clock = new FakeClock();
+  let idleAt: number | undefined;
+  const watchdog = new SemanticIdleWatchdog({ idleMs: 10, clock, onIdle: (lastProgressAt) => { idleAt = lastProgressAt; } });
+
+  clock.advance(9);
+  watchdog.markProgress({ type: "session.progress", taskId: task.id, sessionRef: "nested", });
+  clock.advance(9);
+  assert.equal(idleAt, undefined);
+  clock.advance(1);
+  assert.equal(idleAt, 9);
+  watchdog.stop();
+});
+
 test("frozen provider is interrupted, cleaned up, and retried exactly once", async () => {
   const clock = new FakeClock();
   let runCalls = 0;

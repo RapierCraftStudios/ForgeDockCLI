@@ -30,7 +30,8 @@ const systemClock: SemanticIdleClock = {
 
 /** Events which prove that the provider is still doing useful semantic work. */
 export function isSemanticProgressEvent(event: AgentEvent): boolean {
-  return event.type === "thinking.delta"
+  return event.type === "session.progress"
+    || event.type === "thinking.delta"
     || event.type === "text.delta"
     || event.type === "tool.started"
     || event.type === "tool.completed"

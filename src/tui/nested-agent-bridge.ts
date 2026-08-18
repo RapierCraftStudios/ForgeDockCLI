@@ -113,9 +113,21 @@ async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingM
       });
       response.flushHeaders();
     };
+    const relayProgress = (): void => {
+      if (!response.headersSent || response.writableEnded || response.destroyed) return;
+      try {
+        // Whitespace is valid JSON and keeps the existing response contract
+        // compatible with fetch().json() callers while making V2 updates
+        // observable to the controller before the terminal body arrives.
+        response.write(" ");
+      } catch {
+        // The request/response close handlers own cancellation; a failed
+        // heartbeat write must not mask the nested operation's result.
+      }
+    };
     const result = payload.resumeSessionRef
       ? await resumeDelegation(pi, payload, signal, announceSession)
-      : await delegate(pi, payload, signal, announceSession);
+      : await delegate(pi, payload, signal, announceSession, relayProgress);
     send(response, 200, result);
   } catch (error) {
     send(response, 500, {
@@ -131,6 +143,7 @@ function delegate(
   input: NestedAgentRequest,
   signal: AbortSignal,
   onSessionRef?: (sessionRef: string) => void,
+  onProgress?: () => void,
 ): Promise<NestedAgentResponse> {
   const requestId = crypto.randomUUID();
   const request: SubagentDelegationV2Request = {
@@ -163,9 +176,12 @@ function delegate(
     };
     const unsubscribeUpdate = pi.events.on(SUBAGENT_DELEGATION_UPDATE_EVENT, (raw) => {
       const value = raw as SubagentDelegationV2Update;
-      if (value.version === 2 && value.requestId === requestId && value.ownerRunId === input.ownerRunId && value.nodeId === input.id && value.runId) {
-        observedRunId = value.runId;
-        onSessionRef?.(value.runId);
+      if (value.version === 2 && value.requestId === requestId && value.ownerRunId === input.ownerRunId && value.nodeId === input.id) {
+        if (value.runId) {
+          observedRunId = value.runId;
+          onSessionRef?.(value.runId);
+        }
+        onProgress?.();
       }
     });
     const unsubscribeResponse = pi.events.on(SUBAGENT_DELEGATION_RESPONSE_EVENT, (raw) => {

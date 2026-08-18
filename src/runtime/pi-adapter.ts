@@ -651,6 +651,14 @@ async function runNestedReviewer<T>(
           ...(task.observability ? { observability: task.observability } : {}),
         });
       },
+      onProgress: () => {
+        input.emit({
+          type: "session.progress",
+          taskId: task.id,
+          sessionRef: observedSessionRef ?? provisionalSessionRef,
+          ...(task.observability ? { observability: task.observability } : {}),
+        });
+      },
     });
   } catch (error) {
     const cancelled = input.signal?.aborted === true;
@@ -790,6 +798,8 @@ export function postNestedAgentRequest<T>(input: {
   body: unknown;
   signal?: AbortSignal;
   onSessionRef?: (sessionRef: string) => void;
+  /** Called for each streamed progress heartbeat before the terminal JSON body. */
+  onProgress?: () => void;
 }): Promise<{ status: number; payload: T }> {
   let target: URL;
   try {
@@ -833,6 +843,7 @@ export function postNestedAgentRequest<T>(input: {
           fail(new Error(`Nested reviewer response exceeded ${MAX_NESTED_AGENT_RESPONSE_BYTES} bytes`));
           return;
         }
+        input.onProgress?.();
         chunks.push(buffer);
       });
       response.once("error", (error) => fail(new Error(`Nested reviewer response failed: ${error.message}`, { cause: error })));

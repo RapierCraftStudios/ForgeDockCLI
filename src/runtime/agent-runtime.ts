@@ -280,6 +280,8 @@ export interface AgentObservability {
 
 export type AgentEvent =
   | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string; observability?: AgentObservability }
+  /** A semantic progress snapshot relayed from an owned nested session. */
+  | { type: "session.progress"; taskId: string; sessionRef: string; observability?: AgentObservability }
   | { type: "thinking.delta"; taskId: string; text: string; observability?: AgentObservability }
   | { type: "text.delta"; taskId: string; text: string; observability?: AgentObservability }
   | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown; observability?: AgentObservability }
