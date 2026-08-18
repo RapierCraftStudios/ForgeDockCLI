@@ -7,7 +7,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "completion" | "invalid-closure"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -217,6 +217,47 @@ export function decideSubjectAdmission(
 
   if (reconciled.state === "building" && deliveryContext) {
     return { action: "resume", runId: latest.runId, state: "building", checkpoint: "build", artifacts: latest.artifacts };
+  }
+
+  // A confirmed target conflict after an approving verdict is a typed,
+  // opt-in recovery checkpoint. Keep it ahead of generic verification
+  // failure handling so an ordinary `--resume` cannot silently reuse the old
+  // approval or treat the conflict as an unrelated builder failure.
+  const mergeGate = latestOutcome?.payload.mergeGate;
+  const durableGateBaseBranch = build?.payload.targetBranch
+    ?? latestOutcome?.payload.targetBranch
+    ?? latestOutcome?.payload.failureEvidence?.targetBranch;
+  const retainedPullRequest = verdict?.subject.pr
+    ?? latestOutcome?.subject.pr
+    ?? latest.artifacts.find((artifact) => artifact.subject.pr !== undefined)?.subject.pr;
+  const mergeGateIdentityMatches = mergeGate !== undefined
+    && retainedPullRequest !== undefined
+    && mergeGate.pullRequest === retainedPullRequest
+    && (mergeGate.repo === undefined
+      || mergeGate.repo.toLowerCase() === (latest.artifacts.find((artifact) => artifact.kind === "Intent")?.subject.repo
+        ?? latest.artifacts[0]?.subject.repo
+        ?? "").toLowerCase())
+    && (durableGateBaseBranch === undefined || mergeGate.baseBranch === durableGateBaseBranch)
+    && (verdict?.payload.baseBranch === undefined || mergeGate.baseBranch === verdict.payload.baseBranch);
+  const conflictRecoveryPending = deliveryContext
+    && reconciled.state === "blocked"
+    && latestOutcome?.payload.status === "blocked"
+    && mergeGate?.mergeability === "conflicting"
+    && mergeGateIdentityMatches
+    && build !== undefined
+    && verdict !== undefined
+    && verdict.payload.disposition === "approve"
+    && verdict.payload.headSha === build.payload.headSha
+    && mergeGate.headSha === build.payload.headSha
+    && latestOutcomeIndex > Math.max(latestBuildIndex, latestVerdictIndex);
+  if (conflictRecoveryPending) {
+    return {
+      action: "resume",
+      runId: latest.runId,
+      state: "blocked",
+      checkpoint: "conflict-recovery",
+      artifacts: latest.artifacts,
+    };
   }
 
   // Repository order is durable publication order. Use it rather than worker

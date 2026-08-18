@@ -2,13 +2,71 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { GitWorktreeManager } from "./git-worktree.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function gitWithInput(cwd: string, input: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+
+function restoreMergeHead(cwd: string, sha: string): void {
+  const mergeHeadPath = resolve(cwd, git(cwd, "rev-parse", "--git-path", "MERGE_HEAD"));
+  writeFileSync(mergeHeadPath, `${sha}\n`);
+}
+
+async function remoteBaseIntegrationFixture(conflicting: boolean): Promise<{
+  root: string;
+  manager: GitWorktreeManager;
+  workspace: Awaited<ReturnType<GitWorktreeManager["create"]>>;
+  headSha: string;
+  baseSha: string;
+  updatedBaseSha: string;
+}> {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-git-integrate-base-"));
+  const repo = join(root, "repo");
+  const remote = join(root, "remote.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "ForgeDock Test");
+  git(repo, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(repo, "README.md"), "base\n");
+  git(repo, "add", "README.md");
+  git(repo, "commit", "-m", "base");
+  git(repo, "branch", "-M", "main");
+  git(repo, "remote", "add", "origin", remote);
+  git(repo, "push", "-u", "origin", "main");
+  const baseSha = git(repo, "rev-parse", "HEAD");
+
+  const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+  const workspace = await manager.create({ runId: "run_integrate_base", issue: 22, baseRef: "origin/main" });
+  if (conflicting) writeFileSync(join(workspace.path, "README.md"), "delivery\n");
+  else writeFileSync(join(workspace.path, "feature.txt"), "delivery\n");
+  git(workspace.path, "add", "--all");
+  git(workspace.path, "commit", "-m", "delivery");
+  const headSha = git(workspace.path, "rev-parse", "HEAD");
+  git(workspace.path, "push", "-u", "origin", workspace.branch);
+
+  if (conflicting) writeFileSync(join(repo, "README.md"), "base update\n");
+  else writeFileSync(join(repo, "base.txt"), "base update\n");
+  git(repo, "add", "--all");
+  git(repo, "commit", "-m", "advance base");
+  git(repo, "push", "origin", "main");
+  const updatedBaseSha = git(repo, "rev-parse", "HEAD");
+  return { root, manager, workspace, headSha, baseSha, updatedBaseSha };
+}
+
+async function removeRemoteBaseIntegrationFixture(fixture: Awaited<ReturnType<typeof remoteBaseIntegrationFixture>>): Promise<void> {
+  try {
+    await fixture.manager.remove(fixture.workspace);
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
 }
 
 describe("isolated Git worktrees", () => {
@@ -369,5 +427,255 @@ describe("isolated Git worktrees", () => {
       /does not belong to target ref milestone\/old-lane/,
     );
     await manager.remove(workspace);
+  });
+
+  it("integrates an exact remote base into a clean delivery workspace", async () => {
+    const fixture = await remoteBaseIntegrationFixture(false);
+    try {
+      const result = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+
+      assert.deepEqual(result.conflictPaths, []);
+      assert.equal(result.mergeCommitExists, false);
+      assert.equal(result.workspace.baseSha, fixture.updatedBaseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+      assert.equal(readFileSync(join(fixture.workspace.path, "base.txt"), "utf8"), "base update\n");
+      assert.equal(readFileSync(join(fixture.workspace.path, "feature.txt"), "utf8"), "delivery\n");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("leaves exact conflict paths and the merge checkpoint for bounded resolution", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      const result = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+
+      assert.deepEqual(result.conflictPaths, ["README.md"]);
+      assert.equal(result.mergeCommitExists, false);
+      assert.equal(result.workspace.baseSha, fixture.updatedBaseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+      assert.match(git(fixture.workspace.path, "status", "--porcelain"), /UU README\.md/);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("rejects stale delivery and remote-base evidence without mutating the workspace", async () => {
+    const staleHead = await remoteBaseIntegrationFixture(false);
+    try {
+      await assert.rejects(
+        staleHead.manager.integrateRemoteBase(staleHead.workspace, {
+          expectedHeadSha: staleHead.baseSha,
+          expectedBaseSha: staleHead.updatedBaseSha,
+        }),
+        /does not match expected delivery head/,
+      );
+      assert.equal(git(staleHead.workspace.path, "rev-parse", "HEAD"), staleHead.headSha);
+      assert.equal(git(staleHead.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(staleHead);
+    }
+
+    const staleBase = await remoteBaseIntegrationFixture(false);
+    try {
+      await assert.rejects(
+        staleBase.manager.integrateRemoteBase(staleBase.workspace, {
+          expectedHeadSha: staleBase.headSha,
+          expectedBaseSha: staleBase.baseSha,
+        }),
+        /resolved to .*expected/,
+      );
+      assert.equal(git(staleBase.workspace.path, "rev-parse", "HEAD"), staleBase.headSha);
+      assert.equal(git(staleBase.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(staleBase);
+    }
+  });
+
+  it("re-enters an exact in-progress merge without repeating or losing conflicts", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      const first = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      const second = await fixture.manager.integrateRemoteBase(first.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+
+      assert.deepEqual(second.conflictPaths, ["README.md"]);
+      assert.equal(second.mergeCommitExists, false);
+      assert.equal(second.workspace.baseSha, fixture.updatedBaseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("rejects an advanced HEAD even when the exact MERGE_HEAD remains", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      const tree = git(fixture.workspace.path, "rev-parse", "HEAD^{tree}");
+      const advancedHead = gitWithInput(
+        fixture.workspace.path,
+        "unexpected advanced delivery\n",
+        "commit-tree",
+        tree,
+        "-p",
+        fixture.headSha,
+      );
+      git(fixture.workspace.path, "reset", "--hard", advancedHead);
+      restoreMergeHead(fixture.workspace.path, fixture.updatedBaseSha);
+
+      await assert.rejects(
+        fixture.manager.integrateRemoteBase(fixture.workspace, {
+          expectedHeadSha: fixture.headSha,
+          expectedBaseSha: fixture.updatedBaseSha,
+        }),
+        /does not match expected delivery head .* while merge .* is in progress/,
+      );
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), advancedHead);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+      assert.equal(git(fixture.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("rejects a reset HEAD even when the exact MERGE_HEAD remains", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      git(fixture.workspace.path, "reset", "--hard", fixture.baseSha);
+      restoreMergeHead(fixture.workspace.path, fixture.updatedBaseSha);
+
+      await assert.rejects(
+        fixture.manager.integrateRemoteBase(fixture.workspace, {
+          expectedHeadSha: fixture.headSha,
+          expectedBaseSha: fixture.updatedBaseSha,
+        }),
+        /does not match expected delivery head .* while merge .* is in progress/,
+      );
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.baseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+      assert.equal(git(fixture.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("recognizes an exact completed merge commit after crash re-entry", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      const integrated = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      assert.equal(integrated.mergeCommitExists, false);
+      writeFileSync(join(fixture.workspace.path, "README.md"), "resolved delivery\n");
+      git(fixture.workspace.path, "add", "README.md");
+      const mergeSha = await fixture.manager.commit(integrated.workspace, "resolve target synchronization");
+      assert.deepEqual(git(fixture.workspace.path, "rev-list", "--parents", "-n", "1", mergeSha).split(/\s+/u), [
+        mergeSha,
+        fixture.headSha,
+        fixture.updatedBaseSha,
+      ]);
+
+      // A fresh adapter instance models the controller process restarting
+      // after the merge commit was durably created but before its checkpoint
+      // advanced.
+      const restartedManager = new GitWorktreeManager(
+        join(fixture.root, "repo"),
+        join(fixture.root, "worktrees"),
+      );
+      const recovered = await restartedManager.recover({
+        runId: "run_integrate_base",
+        issue: 22,
+        baseRef: "origin/main",
+        baseSha: fixture.updatedBaseSha,
+      });
+      const reentered = await restartedManager.integrateRemoteBase(recovered, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+
+      assert.equal(reentered.mergeCommitExists, true);
+      assert.deepEqual(reentered.conflictPaths, []);
+      assert.equal(reentered.workspace.baseSha, fixture.updatedBaseSha);
+      assert.equal(await restartedManager.head(reentered.workspace), mergeSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("fails closed for unrelated and parent-swapped merge commits", async () => {
+    const unrelated = await remoteBaseIntegrationFixture(false);
+    try {
+      const tree = git(unrelated.workspace.path, "rev-parse", "HEAD^{tree}");
+      const unrelatedMerge = gitWithInput(
+        unrelated.workspace.path,
+        "unrelated merge\n",
+        "commit-tree",
+        tree,
+        "-p",
+        unrelated.headSha,
+        "-p",
+        unrelated.baseSha,
+      );
+      git(unrelated.workspace.path, "reset", "--hard", unrelatedMerge);
+      await assert.rejects(
+        unrelated.manager.integrateRemoteBase(unrelated.workspace, {
+          expectedHeadSha: unrelated.headSha,
+          expectedBaseSha: unrelated.updatedBaseSha,
+        }),
+        /does not match expected delivery head/,
+      );
+      assert.equal(git(unrelated.workspace.path, "rev-parse", "HEAD"), unrelatedMerge);
+      assert.equal(git(unrelated.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(unrelated);
+    }
+
+    const parentSwapped = await remoteBaseIntegrationFixture(false);
+    try {
+      const tree = git(parentSwapped.workspace.path, "rev-parse", "HEAD^{tree}");
+      const swappedMerge = gitWithInput(
+        parentSwapped.workspace.path,
+        "parent swapped merge\n",
+        "commit-tree",
+        tree,
+        "-p",
+        parentSwapped.updatedBaseSha,
+        "-p",
+        parentSwapped.headSha,
+      );
+      git(parentSwapped.workspace.path, "reset", "--hard", swappedMerge);
+      await assert.rejects(
+        parentSwapped.manager.integrateRemoteBase(parentSwapped.workspace, {
+          expectedHeadSha: parentSwapped.headSha,
+          expectedBaseSha: parentSwapped.updatedBaseSha,
+        }),
+        /does not match expected delivery head/,
+      );
+      assert.equal(git(parentSwapped.workspace.path, "rev-parse", "HEAD"), swappedMerge);
+      assert.equal(git(parentSwapped.workspace.path, "status", "--porcelain"), "");
+    } finally {
+      await removeRemoteBaseIntegrationFixture(parentSwapped);
+    }
   });
 });

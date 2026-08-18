@@ -155,6 +155,79 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
+  async integrateRemoteBase(
+    workspace: GitWorkspace,
+    input: { expectedHeadSha: string; expectedBaseSha: string },
+  ): Promise<{ workspace: GitWorkspace; conflictPaths: string[]; mergeCommitExists: boolean }> {
+    assertSha(input.expectedHeadSha, "expected delivery head SHA");
+    assertSha(input.expectedBaseSha, "expected remote base SHA");
+    if (!workspace.baseSha) throw new Error("Remote base integration requires a frozen prior workspace base SHA");
+    assertSha(workspace.baseSha, "frozen workspace base SHA");
+
+    const expectedHeadSha = input.expectedHeadSha.toLowerCase();
+    const expectedBaseSha = input.expectedBaseSha.toLowerCase();
+    const existingMergeHead = await this.readMergeHead(workspace);
+    if (existingMergeHead && existingMergeHead.toLowerCase() !== expectedBaseSha) {
+      throw new Error(`Retained workspace has an unrelated merge in progress at ${existingMergeHead}; refusing remote base integration`);
+    }
+
+    const localHead = await this.head(workspace);
+    if (existingMergeHead && localHead.toLowerCase() !== expectedHeadSha) {
+      throw new Error(`Retained workspace head ${localHead} does not match expected delivery head ${input.expectedHeadSha} while merge ${existingMergeHead} is in progress`);
+    }
+    const fetchedBase = await this.fetchRemoteCommit(this.remoteBaseRef(workspace.baseRef), workspace.path);
+    if (fetchedBase.toLowerCase() !== expectedBaseSha) {
+      throw new Error(`Remote base ${workspace.baseRef} resolved to ${fetchedBase}, expected ${input.expectedBaseSha}`);
+    }
+    if (!await this.isAncestor(workspace, workspace.baseSha, input.expectedBaseSha)) {
+      throw new Error(`Frozen workspace base ${workspace.baseSha} is not an ancestor of remote base ${input.expectedBaseSha}`);
+    }
+
+    const integratedWorkspace = { ...workspace, baseSha: input.expectedBaseSha };
+    if (existingMergeHead) {
+      return { workspace: integratedWorkspace, conflictPaths: await this.unmergedPaths(workspace), mergeCommitExists: false };
+    }
+
+    const completedMerge = await this.isCompletedRemoteBaseMerge(workspace, expectedHeadSha, expectedBaseSha);
+    if (completedMerge) {
+      const dirty = await this.changedPaths(workspace);
+      if (dirty.length) throw new Error(`Cannot re-enter completed remote base merge with dirty workspace: ${dirty.join(", ")}`);
+      return { workspace: integratedWorkspace, conflictPaths: [], mergeCommitExists: true };
+    }
+
+    if (localHead.toLowerCase() !== expectedHeadSha) {
+      throw new Error(`Retained workspace head ${localHead} does not match expected delivery head ${input.expectedHeadSha}`);
+    }
+
+    const dirty = await this.changedPaths(workspace);
+    if (dirty.length) throw new Error(`Cannot integrate remote base into dirty workspace: ${dirty.join(", ")}`);
+
+    try {
+      await this.git(["merge", "--no-commit", "--no-ff", input.expectedBaseSha], workspace.path);
+    } catch (error) {
+      const mergeHead = await this.readMergeHead(workspace);
+      if (!mergeHead || mergeHead.toLowerCase() !== expectedBaseSha) throw error;
+      const conflictPaths = await this.unmergedPaths(workspace);
+      if (conflictPaths.length) return { workspace: integratedWorkspace, conflictPaths, mergeCommitExists: false };
+      try {
+        await this.git(["merge", "--abort"], workspace.path);
+      } catch (abortError) {
+        throw new Error("Remote base integration failed without a recoverable conflict and could not be aborted", { cause: abortError });
+      }
+      throw new Error("Remote base integration failed without a recoverable conflict; merge was aborted", { cause: error });
+    }
+
+    const mergeHead = await this.readMergeHead(workspace);
+    if (mergeHead && mergeHead.toLowerCase() !== expectedBaseSha) {
+      throw new Error(`Remote base integration created an unexpected merge state at ${mergeHead}`);
+    }
+    return {
+      workspace: integratedWorkspace,
+      conflictPaths: mergeHead ? await this.unmergedPaths(workspace) : [],
+      mergeCommitExists: false,
+    };
+  }
+
   async isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean> {
     try {
       await this.git(["merge-base", "--is-ancestor", ancestorSha, descendantSha], workspace.path);
@@ -279,6 +352,55 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   private async fetchOriginBase(baseRef: string): Promise<string> {
     const branch = baseRef.slice("origin/".length);
     return this.fetchRemoteCommit(`refs/heads/${branch}`, this.#repo);
+  }
+
+  private remoteBaseRef(baseRef: string): string {
+    if (baseRef.startsWith("origin/") && baseRef.length > "origin/".length) {
+      return `refs/heads/${baseRef.slice("origin/".length)}`;
+    }
+    if (baseRef.startsWith("refs/heads/") && baseRef.length > "refs/heads/".length) return baseRef;
+    throw new Error(`Remote base integration requires a remote branch baseRef, found ${baseRef || "blank"}`);
+  }
+
+  private async readMergeHead(workspace: GitWorkspace): Promise<string | undefined> {
+    const mergeHeadPath = resolve(workspace.path, (await this.git(["rev-parse", "--git-path", "MERGE_HEAD"], workspace.path)).trim());
+    try {
+      const contents = (await readFile(mergeHeadPath, "utf8")).trim();
+      if (!contents) return undefined;
+      const values = contents.split(/\s+/u);
+      if (values.length !== 1 || !isSha(values[0] ?? "")) {
+        throw new Error(`Retained workspace has an invalid MERGE_HEAD at ${mergeHeadPath}`);
+      }
+      return values[0];
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  private async unmergedPaths(workspace: GitWorkspace): Promise<string[]> {
+    const output = await this.git(["diff", "--name-only", "--diff-filter=U", "-z", "--"], workspace.path);
+    return [...new Set(output.split("\0").filter(Boolean))].sort();
+  }
+
+  private async isCompletedRemoteBaseMerge(
+    workspace: GitWorkspace,
+    expectedHeadSha: string,
+    expectedBaseSha: string,
+  ): Promise<boolean> {
+    const parents = await this.commitParents(workspace);
+    return parents.length === 2
+      && parents[0]!.toLowerCase() === expectedHeadSha
+      && parents[1]!.toLowerCase() === expectedBaseSha;
+  }
+
+  private async commitParents(workspace: GitWorkspace): Promise<string[]> {
+    const output = (await this.git(["rev-list", "--parents", "-n", "1", "HEAD"], workspace.path)).trim();
+    const values = output.split(/\s+/u).filter(Boolean);
+    if (!values[0] || !isSha(values[0]) || values.slice(1).some((value) => !isSha(value))) {
+      throw new Error(`Retained workspace HEAD has invalid commit parent evidence: ${output || "blank"}`);
+    }
+    return values.slice(1);
   }
 
   /** Fetch an advertised commit without mutating shared tracking refs or FETCH_HEAD. */
@@ -727,6 +849,12 @@ function isOperationalPath(path: string): boolean {
     || normalized.startsWith("node_modules/");
 }
 function isSafeRepairBranch(value: string): boolean { return Boolean(value) && value.length <= 240 && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") && !/[\s~^:?*\[\\]/.test(value) && value.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== ".."); }
+
+function isSha(value: string): boolean { return /^[0-9a-f]{40,64}$/i.test(value); }
+
+function assertSha(value: string, label: string): void {
+  if (!isSha(value)) throw new Error(`${label} must be a full Git commit SHA`);
+}
 
 function assertInside(root: string, candidate: string): void {
   const path = relative(root, resolve(candidate));

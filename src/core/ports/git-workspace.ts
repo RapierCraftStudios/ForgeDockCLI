@@ -22,6 +22,18 @@ export interface GitWorkspaceManager {
   revisionChangedPaths(workspace: GitWorkspace): Promise<string[]>;
   /** Fast-forward a clean retained workspace to one authoritative remote branch SHA. */
   syncToRemoteHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void>;
+  /**
+   * Integrate one exact remote base revision into a clean retained delivery
+   * workspace. A conflict leaves the controller-owned merge in progress so a
+   * bounded resolver can inspect only the returned unmerged paths; callers may
+   * safely repeat the operation after a restart with the same MERGE_HEAD.
+   * `mergeCommitExists` is true only when the current HEAD is the exact
+   * two-parent merge `(expectedHeadSha, expectedBaseSha)`.
+   */
+  integrateRemoteBase?(
+    workspace: GitWorkspace,
+    input: { expectedHeadSha: string; expectedBaseSha: string },
+  ): Promise<{ workspace: GitWorkspace; conflictPaths: string[]; mergeCommitExists: boolean }>;
   /** Prove one fetched commit is contained in a descendant revision. */
   isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean>;
   /** Install lockfile dependencies without executing repository lifecycle scripts. */

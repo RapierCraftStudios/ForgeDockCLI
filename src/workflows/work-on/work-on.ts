@@ -27,6 +27,7 @@ import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
 import { verifyAndCommit, type VerificationResult } from "./verify.js";
+import { recoverConflictingRevision } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
@@ -769,7 +770,7 @@ async function continueBuildDelivery(
   const published = await publishPullRequest({
     run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
     ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
-  }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
+  }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
   run = published.run;
   let pullRequest = published.pullRequest;
   let verdict: DurableArtifact<"ReviewVerdict">;
@@ -836,7 +837,7 @@ async function continueBuildDelivery(
     if (!remediationVerification.buildResult) return { run, pullRequest };
     buildResult = remediationVerification.buildResult;
     const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
-      git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+      git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
     pullRequest = revision.pullRequest;
@@ -929,7 +930,7 @@ export async function resumeWorkOn(
     const published = await publishPullRequest({
       run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
       ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
-    }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
+    }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     run = published.run;
     let pullRequest = published.pullRequest;
     let verdict: DurableArtifact<"ReviewVerdict">;
@@ -991,7 +992,7 @@ export async function resumeWorkOn(
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
       const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
-        git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+        git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
       pullRequest = revision.pullRequest;
@@ -1163,7 +1164,7 @@ export async function resumeReviewWorkOn(
     if (!verified.buildResult) return { run, pullRequest };
     buildResult = verified.buildResult;
     let revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
-      git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+      git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
     pullRequest = revision.pullRequest;
@@ -1223,7 +1224,7 @@ export async function resumeReviewWorkOn(
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
       revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
-        git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+        git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
       pullRequest = revision.pullRequest;
@@ -1430,7 +1431,7 @@ export async function resumePublicationWorkOn(
     const published = await publishPullRequest({
       run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
       ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
-    }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs });
+    }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     run = published.run;
     let pullRequest = published.pullRequest;
     let verdict!: DurableArtifact<"ReviewVerdict">;
@@ -1518,7 +1519,7 @@ export async function resumePublicationWorkOn(
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
       const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
-        git: dependencies.git, host: dependencies.host, runs: dependencies.runs,
+        git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
       pullRequest = revision.pullRequest;
@@ -1599,6 +1600,213 @@ export async function resumeCompletionWorkOn(
   } finally {
     if (input.workspace && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
       try { await dependencies.git.remove(input.workspace); } catch { /* stale worktree reconciliation is operational */ }
+    }
+  }
+}
+
+/**
+ * Explicitly recover a confirmed target conflict. This path synchronizes and
+ * verifies a new descendant revision, then deliberately starts review with no
+ * prior verdict so an approval for the old SHA cannot authorize the new one.
+ */
+export async function resumeConflictRecoveryWorkOn(
+  input: {
+    run: RunState;
+    intent: DurableArtifact<"Intent">;
+    investigation: DurableArtifact<"Investigation">;
+    packet: DurableArtifact<"BuildPacket">;
+    buildResult: DurableArtifact<"BuildResult">;
+    verdict: DurableArtifact<"ReviewVerdict">;
+    pullRequest: PullRequestSnapshot;
+    workspace: GitWorkspace;
+    baseBranch: string;
+    verification: readonly Omit<VerificationCommand, "cwd">[];
+    mergeGate: NonNullable<DurableArtifact<"Outcome">["payload"]["mergeGate"]>;
+    provider?: string;
+    model?: string;
+    autoMerge?: boolean;
+    maxRemediationCycles?: number;
+    maxRemediationDepth?: number;
+    maxRemediationChildren?: number;
+    remediationDepth?: number;
+    scopeExpansion?: "scope-locked" | "recursive";
+    maxReviewSpecialists?: number;
+    subjectEvidence?: readonly string[];
+    batchMembers?: readonly number[];
+    batchMemberContracts?: readonly BatchMemberContract[];
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult> {
+  dependencies = guardMutationBoundaries(dependencies);
+  if (input.run.state !== "blocked") throw new Error(`Conflict recovery requires blocked state, found ${input.run.state}`);
+  if (input.verdict.payload.disposition !== "approve") throw new Error("Conflict recovery requires an approving verdict");
+  if (input.mergeGate.mergeability !== "conflicting") throw new Error("Conflict recovery requires confirmed conflicting mergeability");
+  assertRunTargetsBranch(input.run, input.baseBranch);
+  if (input.pullRequest.baseBranch !== input.baseBranch
+    || input.pullRequest.headSha !== input.buildResult.payload.headSha
+    || input.verdict.payload.headSha !== input.buildResult.payload.headSha
+    || input.mergeGate.pullRequest !== input.pullRequest.number
+    || input.mergeGate.baseBranch !== input.baseBranch
+    || (input.mergeGate.repo !== undefined && input.mergeGate.repo.toLowerCase() !== input.pullRequest.repo.toLowerCase())
+    || input.run.subject.repo.toLowerCase() !== input.pullRequest.repo.toLowerCase()
+    || (input.verdict.subject.pr !== undefined && input.verdict.subject.pr !== input.pullRequest.number)
+    || (input.verdict.payload.baseBranch !== undefined && input.verdict.payload.baseBranch !== input.baseBranch)) {
+    throw new Error("Conflict recovery requires one matching approved PR, Build Result, and Review Verdict head");
+  }
+  let run = input.run;
+  let retainWorkspaceForRecovery = true;
+  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  try {
+    const synchronized = await recoverConflictingRevision({
+      run,
+      intent: input.intent,
+      investigation: input.investigation,
+      packet: input.packet,
+      buildResult: input.buildResult,
+      verdict: input.verdict,
+      pullRequest: input.pullRequest,
+      workspace: input.workspace,
+      commands,
+      mergeGate: input.mergeGate,
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, {
+      runtime: dependencies.runtime,
+      artifacts: dependencies.artifacts,
+      runs: dependencies.runs,
+      git: dependencies.git,
+      verifier: dependencies.verifier,
+      host: dependencies.host,
+      ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+    });
+    run = synchronized.run;
+    if (!synchronized.buildResult || !synchronized.pullRequest || run.state !== "reviewing") {
+      return { run, ...(synchronized.pullRequest ? { pullRequest: synchronized.pullRequest } : {}) };
+    }
+
+    // A new head has a new authority chain. Never pass input.verdict as
+    // priorVerdict to the first review after synchronization.
+    let buildResult = synchronized.buildResult;
+    let pullRequest = synchronized.pullRequest;
+    let verdict: DurableArtifact<"ReviewVerdict">;
+    let priorVerdict: DurableArtifact<"ReviewVerdict"> | undefined;
+    let cycle = 0;
+    const remediationLimit = input.maxRemediationCycles ?? 2;
+    const runtimeOptions = {
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    };
+    while (true) {
+      const reviewed = await reviewPullRequest({
+        run,
+        pullRequest,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        buildResult,
+        workspace: input.workspace.path,
+        findingIssuePolicy: "all",
+        ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
+        ...(priorVerdict !== undefined ? { priorVerdict } : {}),
+        reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
+        ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime,
+        host: dependencies.host,
+        artifacts: dependencies.artifacts,
+        runs: dependencies.runs,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = reviewed.run;
+      verdict = reviewed.verdict;
+      priorVerdict = verdict;
+      const scopeViolation = blockingFindingOutsidePacket(
+        verdict,
+        input.packet,
+        undefined,
+        input.scopeExpansion === "recursive",
+      );
+      if (scopeViolation) {
+        run = await blockForScopeViolation(run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies);
+        return { run, pullRequest };
+      }
+      if (run.state === "merging") break;
+      cycle += 1;
+      if (cycle > remediationLimit) {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, `Remediation budget exhausted after ${cycle - 1} cycle(s)`);
+        return { run, pullRequest };
+      }
+      const remediated = await remediateReview({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        buildResult,
+        verdict,
+        reviewCycle: { current: cycle, total: remediationLimit + 1 },
+        worktree: input.workspace.path,
+        verification: commands,
+        verificationRunner: dependencies.verifier,
+        ...runtimeOptions,
+      }, {
+        runtime: dependencies.runtime,
+        runs: dependencies.runs,
+        verifier: dependencies.verifier,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      });
+      run = remediated.run;
+      const verified = await verifyWithBuilderRepairs({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        submission: remediated.submission,
+        repairContext: [buildResult, verdict],
+        workspace: input.workspace,
+        commands,
+        ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+        ...runtimeOptions,
+      }, dependencies);
+      run = verified.run;
+      if (!verified.buildResult) return { run, pullRequest };
+      buildResult = verified.buildResult;
+      const published = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+        git: dependencies.git,
+        host: dependencies.host,
+        runs: dependencies.runs,
+        artifacts: dependencies.artifacts,
+      });
+      run = published.run;
+      pullRequest = published.pullRequest;
+    }
+    const completed = await completeWorkItem({
+      run,
+      pullRequest,
+      verdict,
+      autoMerge: input.autoMerge ?? false,
+      ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+      ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+    }, dependencies);
+    run = completed.run;
+    retainWorkspaceForRecovery = false;
+    return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorkflowExecutionError) run = error.run;
+    if (run.state !== "failed" && run.state !== "blocked") {
+      const failed = transition(run, "FAIL", { reason });
+      await dependencies.runs.commit(run.version, failed.state, failed.record);
+      run = failed.state;
+    }
+    if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
+    throw error;
+  } finally {
+    if (!retainWorkspaceForRecovery && run.state !== "blocked" && run.state !== "failed" && run.state !== "cancelled") {
+      try { await dependencies.git.remove(input.workspace); } catch { /* retained recovery reconciles stale worktrees */ }
     }
   }
 }
@@ -1707,7 +1915,7 @@ function guardMutationBoundaries(dependencies: WorkOnDependencies): WorkOnDepend
     ...dependencies,
     artifacts: guarded(dependencies.artifacts, ["append"]),
     runs: guarded(dependencies.runs, ["create", "commit", "recordProgress"]),
-    git: guarded(dependencies.git, ["create", "syncToRemoteHead", "prepareWorkspaceDependencies", "commit", "push"]),
+    git: guarded(dependencies.git, ["create", "syncToRemoteHead", "integrateRemoteBase", "prepareWorkspaceDependencies", "commit", "push"]),
     host: guarded(dependencies.host, [
       "materializeBatchIssue", "publishIssueComment", "materializeRemediationChildren",
       "materializeDecomposition", "createPullRequest", "publishPullRequestComment",

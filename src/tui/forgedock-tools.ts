@@ -1065,9 +1065,9 @@ interface VisibleDagInput {
     items: readonly VisibleOrchestrationItem[];
     serializationEdges?: readonly ClaimSerializationEdge[];
   } | undefined>;
-  taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => { agent: string; task: string; cwd: string; model?: string };
+  taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => { agent: string; task: string; cwd: string; model?: string };
   /** Optional direct typed-controller transport used by the live TUI. */
-  controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => ControllerTaskSpec;
+  controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => ControllerTaskSpec;
   startControllerTask?: (spec: ControllerTaskSpec) => Promise<string>;
   waitControllerTask?: (taskId: string) => Promise<BackgroundTaskRecord | void>;
   stopControllerTask?: (taskId: string) => void;
@@ -1159,6 +1159,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         issue: Type.Integer({ minimum: 1 }),
         reason: Type.String({ minLength: 1, description: "Human rationale confirming the repaired verification baseline" }),
       }), { description: "Exhausted verification checkpoints authorized for typed resume after human baseline repair; never a fresh rerun" })),
+      resolveConflictIssueNumbers: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { description: "Issues explicitly authorized for confirmed target-conflict recovery; each is synchronized, fully reverified, and freshly reviewed" })),
     }),
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1172,6 +1173,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         }
       }
       const rerunIssueNumbers = [...new Set(params.rerunIssueNumbers ?? [])];
+      const resolveConflictIssueNumbers = [...new Set(params.resolveConflictIssueNumbers ?? [])];
       const adjudicationEntries = params.adjudicateVerification ?? [];
       const adjudications = new Map<number, string>();
       for (const entry of adjudicationEntries) {
@@ -1180,9 +1182,11 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       }
       const overlap = adjudicationEntries.filter((entry) => rerunIssueNumbers.includes(entry.issue)).map((entry) => `#${entry.issue}`);
       if (overlap.length) throw new Error(`A verification adjudication cannot be combined with fresh rerun authorization: ${overlap.join(", ")}`);
-      const resumed = await dagDelegator.resume(params.orchestrationId, { rerunIssueNumbers, adjudications });
+      const conflictOverlap = resolveConflictIssueNumbers.filter((issue) => rerunIssueNumbers.includes(issue) || adjudications.has(issue));
+      if (conflictOverlap.length) throw new Error(`Conflict recovery authorization cannot be combined with rerun or verification adjudication: ${conflictOverlap.map((issue) => `#${issue}`).join(", ")}`);
+      const resumed = await dagDelegator.resume(params.orchestrationId, { rerunIssueNumbers, adjudications, resolveConflictIssueNumbers });
       return {
-        content: [{ type: "text", text: `Resumed ForgeDock DAG ${resumed.id}. Completed nodes were preserved; ${resumed.childRunIds.length} total worker run(s) are now associated with this DAG.${rerunIssueNumbers.length ? ` Fresh rerun authorized for ${rerunIssueNumbers.map((issue) => `#${issue}`).join(", ")}.` : ""}${adjudications.size ? ` Typed verification resume authorized for ${[...adjudications.keys()].map((issue) => `#${issue}`).join(", ")}.` : ""}` }],
+        content: [{ type: "text", text: `Resumed ForgeDock DAG ${resumed.id}. Completed nodes were preserved; ${resumed.childRunIds.length} total worker run(s) are now associated with this DAG.${rerunIssueNumbers.length ? ` Fresh rerun authorized for ${rerunIssueNumbers.map((issue) => `#${issue}`).join(", ")}.` : ""}${adjudications.size ? ` Typed verification resume authorized for ${[...adjudications.keys()].map((issue) => `#${issue}`).join(", ")}.` : ""}${resolveConflictIssueNumbers.length ? ` Confirmed target-conflict recovery authorized for ${resolveConflictIssueNumbers.map((issue) => `#${issue}`).join(", ")}; each requires fresh verification and review.` : ""}` }],
         details: { command: "orchestrate", args: [], state: "delegated", delegation: { orchestrationId: resumed.id, childRunIds: resumed.childRunIds } } satisfies ToolDetails,
       };
     },
@@ -1205,12 +1209,15 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       resume: Type.Optional(Type.Boolean({ description: "Explicitly resume a controller-supported durable checkpoint instead of creating a new run" })),
+      resolveConflict: Type.Optional(Type.Boolean({ description: "Explicitly authorize synchronized target-conflict recovery; requires resume=true and always forces fresh verification/review" })),
       adjudicateVerification: Type.Optional(Type.String({ minLength: 1, description: "Human rationale authorizing resume after repairing/adjudicating an exhausted verification baseline; requires resume=true" })),
       background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children. Foreground background=false runs are owned by this terminal and cannot be recovered after a TUI restart; use background=true for restart-safe task handling." })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
       if (params.rerun && params.resume) throw new Error("ForgeDock work-on rerun and resume policies are mutually exclusive");
+      if (params.resolveConflict && !params.resume) throw new Error("resolveConflict requires resume=true");
+      if (params.resolveConflict && params.rerun) throw new Error("resolveConflict cannot be combined with rerun");
       const args = [String(params.issue)];
       if (params.dependencies?.length) args.push("--depends-on", [...new Set(params.dependencies)].join(","));
       const issueWorker = process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker";
@@ -1233,6 +1240,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.maxRemediationChildren !== undefined) args.push("--max-remediation-children", String(params.maxRemediationChildren));
       if (params.rerun) args.push("--rerun");
       if (params.resume) args.push("--resume");
+      if (params.resolveConflict) args.push("--resolve-conflict");
       if (params.adjudicateVerification) {
         if (!params.resume) throw new Error("adjudicateVerification requires resume=true");
         args.push("--adjudicate-verification", params.adjudicateVerification);
@@ -2042,7 +2050,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           item,
           ...(childIssues !== undefined ? { childIssues } : {}),
         }),
-        taskFor: (item, recovery, adjudicationReason) => {
+        taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
           return {
             agent: "forgedock-issue-worker",
@@ -2057,6 +2065,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 maxRemediationDepth: effective.maxRemediationDepth,
                 maxRemediationChildren: effective.maxRemediationChildren,
                 ...policy,
+                resolveConflict: resolveConflict === true,
                 ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
                 dependencies: item.dependencies.map(issueNumberFromId),
               },
@@ -2067,7 +2076,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           };
         },
         ...(controllerEntryAvailable() ? {
-          controllerTaskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string) => {
+          controllerTaskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => {
             const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
             return {
               args: buildIssueWorkerControllerArgs(item.issue, {
@@ -2078,6 +2087,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 maxRemediationDepth: effective.maxRemediationDepth,
                 maxRemediationChildren: effective.maxRemediationChildren,
                 ...policy,
+                resolveConflict: resolveConflict === true,
                 ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
                 dependencies: item.dependencies.map(issueNumberFromId),
                 ...nativeWorker,
@@ -2854,7 +2864,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
       ...(childIssues !== undefined ? { childIssues } : {}),
     }),
     ...(controllerEntryAvailable() ? {
-      controllerTaskFor: (item, recovery, adjudicationReason) => {
+      controllerTaskFor: (item, recovery, adjudicationReason, resolveConflict) => {
         const policy = resolveIssueWorkerRecovery([], false, recovery);
         return {
           args: buildIssueWorkerControllerArgs(item.issue, {
@@ -2865,6 +2875,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
             maxRemediationDepth: effective.maxRemediationDepth,
             maxRemediationChildren: effective.maxRemediationChildren,
             ...policy,
+            resolveConflict: resolveConflict === true,
             ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
             dependencies: item.dependencies.map(issueNumberFromId),
             ...frozenWorker,
@@ -2877,7 +2888,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
         };
       },
     } : {}),
-    taskFor: (item, recovery, adjudicationReason) => {
+    taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
       const policy = resolveIssueWorkerRecovery([], false, recovery);
       return {
         agent: "forgedock-issue-worker",
@@ -2890,6 +2901,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
           maxRemediationDepth: effective.maxRemediationDepth,
           maxRemediationChildren: effective.maxRemediationChildren,
           ...policy,
+          resolveConflict: resolveConflict === true,
           ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
           dependencies: item.dependencies.map(issueNumberFromId),
         }, { issue: item.issue, title: item.title ?? `Issue #${item.issue}`, summary: item.summary ?? "Resumed from durable orchestration state" }),
@@ -2930,6 +2942,7 @@ function buildIssueWorkerControllerArgs(
     maxRemediationChildren: number;
     rerun: boolean;
     resume: boolean;
+    resolveConflict?: boolean;
     adjudicateVerification?: string;
     dependencies: number[];
     provider?: string;
@@ -2944,6 +2957,7 @@ function buildIssueWorkerControllerArgs(
   if (options.dependencies.length) args.push("--depends-on", options.dependencies.join(","));
   if (options.rerun) args.push("--rerun");
   if (options.resume) args.push("--resume");
+  if (options.resolveConflict) args.push("--resolve-conflict");
   if (options.adjudicateVerification) args.push("--adjudicate-verification", options.adjudicateVerification);
   if (options.provider) args.push("--provider", options.provider);
   if (options.model) args.push("--model", options.model);
@@ -3021,6 +3035,7 @@ function buildIssueWorkerTask(
     maxRemediationChildren: number;
     rerun: boolean;
     resume: boolean;
+    resolveConflict?: boolean;
     adjudicateVerification?: string;
     dependencies: number[];
   },
@@ -3031,7 +3046,7 @@ function buildIssueWorkerTask(
     brief ? `Issue brief — ${brief.title}: ${brief.summary}` : "No issue brief was supplied; escalate rather than guessing if the controller request is ambiguous.",
     "If scope, product intent, or a risky decision is genuinely ambiguous, call contact_supervisor with need_decision or interview_request and wait for the reply.",
     `Resolved controller policy (workers cannot override): batching=${options.batching}; scopeExpansion=${options.scopeExpansion}; maxRemediationCycles=${options.maxRemediationCycles}; maxRemediationDepth=${options.maxRemediationDepth}; maxRemediationChildren=${options.maxRemediationChildren}.`,
-    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume, ...(options.adjudicateVerification ? { adjudicateVerification: options.adjudicateVerification } : {}) })}`,
+    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume, ...(options.resolveConflict ? { resolveConflict: true } : {}), ...(options.adjudicateVerification ? { adjudicateVerification: options.adjudicateVerification } : {}) })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
 }
@@ -3342,7 +3357,7 @@ export class VisibleDagDelegator {
 
   async resume(
     orchestrationId: string,
-    options: { rerunIssueNumbers?: readonly number[]; adjudications?: ReadonlyMap<number, string> } = {},
+    options: { rerunIssueNumbers?: readonly number[]; adjudications?: ReadonlyMap<number, string>; resolveConflictIssueNumbers?: readonly number[] } = {},
   ): Promise<VisibleDagRun> {
     let stored = this.runs.get(orchestrationId);
     if (!stored) {
@@ -3381,6 +3396,7 @@ export class VisibleDagDelegator {
 
     const remaining = stored.durableRecord.nodes.filter((node) => node.status !== "completed");
     const rerunIssueNumbers = new Set(options.rerunIssueNumbers ?? []);
+    const resolveConflictIssueNumbers = new Set(options.resolveConflictIssueNumbers ?? []);
     const unknownReruns = [...rerunIssueNumbers].filter((issue) =>
       !remaining.some((item) => item.issue === issue || (item.memberIssues ?? []).includes(issue)));
     if (unknownReruns.length) {
@@ -3396,10 +3412,19 @@ export class VisibleDagDelegator {
     if (overlapping.length) {
       throw new Error("Verification adjudication cannot be combined with fresh rerun authorization: " + overlapping.map((issue) => "#" + issue).join(", "));
     }
+    const conflictOverlap = [...resolveConflictIssueNumbers].filter((issue) => rerunIssueNumbers.has(issue) || adjudications.has(issue));
+    if (conflictOverlap.length) {
+      throw new Error("Conflict recovery authorization cannot be combined with fresh rerun or verification adjudication: " + conflictOverlap.map((issue) => "#" + issue).join(", "));
+    }
+    const unknownConflictRecoveries = [...resolveConflictIssueNumbers].filter((issue) =>
+      !remaining.some((item) => item.issue === issue || (item.memberIssues ?? []).includes(issue)));
+    if (unknownConflictRecoveries.length) {
+      throw new Error("Conflict recovery authorization does not match a failed or blocked DAG issue: " + unknownConflictRecoveries.map((issue) => "#" + issue).join(", "));
+    }
     const dispatch = deferredSignal();
     stored.firstDispatch = dispatch.promise;
     stored.notifyFirstDispatch = dispatch.resolve;
-    const controller = this.buildController(stored.input, () => stored, { rerunIssueNumbers, adjudications });
+    const controller = this.buildController(stored.input, () => stored, { rerunIssueNumbers, adjudications, resolveConflictIssueNumbers });
     return this.launch(stored, controller, true);
   }
 
@@ -3436,6 +3461,7 @@ export class VisibleDagDelegator {
     overrides: {
       rerunIssueNumbers?: ReadonlySet<number>;
       adjudications?: ReadonlyMap<number, string>;
+      resolveConflictIssueNumbers?: ReadonlySet<number>;
     } = {},
   ): OrchestrationController {
     return new OrchestrationController({
@@ -3470,6 +3496,8 @@ export class VisibleDagDelegator {
         let claimPromotionConflict: ClaimPromotionConflictError | undefined;
         const explicitlyRerun = overrides.rerunIssueNumbers?.has(item.issue)
           || item.memberIssues.some((issue) => overrides.rerunIssueNumbers?.has(issue));
+        const explicitlyResolveConflict = overrides.resolveConflictIssueNumbers?.has(item.issue)
+          || item.memberIssues.some((issue) => overrides.resolveConflictIssueNumbers?.has(issue));
         const adjudication = overrides.adjudications?.get(item.issue)
           ?? item.memberIssues.map((issue) => overrides.adjudications?.get(issue)).find((reason): reason is string => reason !== undefined);
         const recovery: DagRecoveryMode = explicitlyRerun
@@ -3478,7 +3506,7 @@ export class VisibleDagDelegator {
         const startControllerTask = input.startControllerTask ?? this.directControllerTransport?.start;
         const waitControllerTask = input.waitControllerTask ?? this.directControllerTransport?.wait;
         if (input.controllerTaskFor && startControllerTask && waitControllerTask) {
-          const spec = input.controllerTaskFor(item, recovery, adjudication);
+          const spec = input.controllerTaskFor(item, recovery, adjudication, explicitlyResolveConflict);
           const taskId = await startControllerTask({
             ...spec,
             env: { ...(spec.env ?? {}), FORGEDOCK_ORCHESTRATION_ID: stored.id },
@@ -3527,7 +3555,7 @@ export class VisibleDagDelegator {
         }
 
         const response = await callSubagentRpc(this.pi, "spawn", {
-          ...input.taskFor(item, recovery, adjudication),
+          ...input.taskFor(item, recovery, adjudication, explicitlyResolveConflict),
           async: true,
           context: "fresh",
           artifacts: true,

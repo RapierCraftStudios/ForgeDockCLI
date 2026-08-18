@@ -132,6 +132,18 @@ describe("workflow state machine", () => {
     assert.equal(resumed.blockedReason, undefined);
   });
 
+  it("uses a distinct typed transition for explicitly authorized conflict recovery", () => {
+    const queued = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 11 }, target: { lane: "fast", targetBranch: "main" } });
+    const blocked = transition(queued, "BLOCK", { reason: "confirmed target conflict" }).state;
+    const resumed = transition(blocked, "RESUME_CONFLICT_RECOVERY", {
+      reason: "operator authorized target synchronization",
+      headSha: "a".repeat(40),
+    }).state;
+    assert.equal(resumed.state, "verifying");
+    assert.equal(resumed.attempt, blocked.attempt + 1);
+    assert.equal(resumed.blockedReason, undefined);
+  });
+
   it("records typed interruption recovery within remediation and completion", () => {
     let remediation = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 9 } });
     for (const event of [

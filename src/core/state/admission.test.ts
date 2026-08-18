@@ -805,7 +805,9 @@ describe("subject run admission", () => {
         },
       },
     }, { createdAt: "2026-01-01T00:05:00.000Z" });
-    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked]);
+    const intentArtifact = intent(runId, "2026-01-01T00:00:00.000Z");
+    const artifacts = [intentArtifact, ...delivery, verdict, blocked];
+    const decision = decideSubjectAdmission(artifacts);
     assert.equal(decision.action, "resume");
     if (decision.action === "resume") {
       assert.equal(decision.state, "building");
@@ -831,5 +833,112 @@ describe("subject run admission", () => {
       assert.equal(decision.checkpoint, "verification");
     }
     assert.deepEqual(decideSubjectAdmission([intent("run_recover", "2026-01-01T00:00:00.000Z"), blocked], { rerun: true }), { action: "start" });
+  });
+
+  it("requires explicit conflict recovery after an approval becomes conflicting", () => {
+    const runId = "run_conflict_recovery";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact,
+      createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const headSha = "d".repeat(40);
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 77 }, producer: { role: "reviewer" },
+      payload: { headSha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const blocked = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "blocked",
+        reason: "Merge admission is blocked: confirmed conflict",
+        childIssues: [],
+        mergeGate: {
+          pullRequest: 77,
+          headSha,
+          baseBranch: "staging",
+          mergeable: false,
+          mergeability: "conflicting",
+          observedAt: "2026-01-01T00:05:00.000Z",
+          requiredChecks: [],
+        },
+      },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const intentArtifact = intent(runId, "2026-01-01T00:00:00.000Z");
+    const artifacts = [intentArtifact, ...delivery, verdict, blocked];
+    const decision = decideSubjectAdmission(artifacts);
+    assert.deepEqual(decision, {
+      action: "resume",
+      runId,
+      state: "blocked",
+      checkpoint: "conflict-recovery",
+      artifacts,
+    });
+  });
+
+  it("does not admit a conflicting checkpoint whose PR, base, or repository identity drifted", () => {
+    const runId = "run_conflict_identity";
+    const headSha = "d".repeat(40);
+    const delivery = publicationArtifacts(runId).map((artifact) => artifact.kind === "BuildResult"
+      ? { ...artifact, payload: { ...artifact.payload, targetBranch: "staging" } }
+      : artifact);
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 77 }, producer: { role: "reviewer" },
+      payload: {
+        headSha, baseBranch: "staging", disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [],
+      },
+    });
+    const gate = {
+      repo: "a/b",
+      pullRequest: 77,
+      headSha,
+      baseBranch: "staging",
+      mergeable: false,
+      mergeability: "conflicting" as const,
+      observedAt: "2026-01-01T00:05:00.000Z",
+      requiredChecks: [],
+    };
+    for (const [label, drift] of [
+      ["pull request", { pullRequest: 78 }],
+      ["base branch", { baseBranch: "main" }],
+      ["repository", { repo: "other/repo" }],
+    ] as const) {
+      const blocked = createArtifact({
+        kind: "Outcome", runId, subject, producer: { role: "controller" },
+        payload: {
+          status: "blocked", reason: `identity drift: ${label}`, childIssues: [],
+          mergeGate: { ...gate, ...drift },
+        },
+      });
+      const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked]);
+      assert.notEqual(
+        decision.action === "resume" ? decision.checkpoint : undefined,
+        "conflict-recovery",
+        `identity drift in ${label} must not authorize conflict recovery`,
+      );
+    }
+  });
+
+  it("does not promote transient or unavailable mergeability into conflict recovery", () => {
+    const runId = "run_transient_mergeability";
+    const delivery = publicationArtifacts(runId);
+    const headSha = "d".repeat(40);
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 78 }, producer: { role: "reviewer" },
+      payload: { headSha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    for (const mergeability of ["unknown", "unavailable"] as const) {
+      const blocked = createArtifact({
+        kind: "Outcome", runId, subject, producer: { role: "controller" },
+        payload: {
+          status: "blocked", reason: "Merge admission is not ready", childIssues: [],
+          mergeGate: {
+            pullRequest: 78, headSha, baseBranch: "staging", mergeable: false, mergeability,
+            observedAt: "2026-01-01T00:05:00.000Z", requiredChecks: [],
+          },
+        },
+      });
+      const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocked]);
+      assert.notEqual(decision.action === "resume" ? decision.checkpoint : undefined, "conflict-recovery");
+    }
   });
 });

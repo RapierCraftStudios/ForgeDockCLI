@@ -256,6 +256,7 @@ describe("merge and close authority", () => {
       assert.equal(result.run.state, "blocked");
       assert.equal(result.outcome?.payload.status, "blocked");
       assert.deepEqual(result.outcome?.payload.mergeGate, {
+        repo: "a/b",
         pullRequest: 9,
         headSha: sha,
         baseBranch: "main",
@@ -284,6 +285,7 @@ describe("merge and close authority", () => {
 
     assert.equal(result.run.state, "blocked");
     assert.deepEqual(result.outcome?.payload.mergeGate, {
+      repo: "a/b",
       pullRequest: 9,
       headSha: sha,
       baseBranch: "main",
@@ -310,6 +312,7 @@ describe("merge and close authority", () => {
 
     assert.equal(result.run.state, "blocked");
     assert.deepEqual(result.outcome?.payload.mergeGate, {
+      repo: "a/b",
       pullRequest: 9,
       headSha: sha,
       baseBranch: "main",

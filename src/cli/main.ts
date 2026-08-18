@@ -43,7 +43,7 @@ import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
@@ -412,13 +412,16 @@ async function workOn(
   requirePiNodeVersion();
   const issueArg = parseWorkOnIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--resolve-conflict] [--adjudicate-verification REASON] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
   const dryRun = argv.includes("--dry-run");
   if (dryRun && through !== "investigate") throw new Error("--dry-run must be paired with --through investigate; full work-on creates a branch and PR");
   if (argv.includes("--rerun") && argv.includes("--resume")) throw new Error("--rerun and --resume are mutually exclusive recovery policies");
+  const resolveConflict = argv.includes("--resolve-conflict");
+  if (resolveConflict && !argv.includes("--resume")) throw new Error("--resolve-conflict requires --resume; it authorizes only the typed confirmed-conflict checkpoint");
+  if (resolveConflict && argv.includes("--rerun")) throw new Error("--resolve-conflict cannot be combined with --rerun");
   const adjudicationReason = option(argv, "--adjudicate-verification");
   if (adjudicationReason !== undefined && !argv.includes("--resume")) throw new Error("--adjudicate-verification requires --resume; it authorizes typed verification checkpoint resume, not a fresh run");
   if (adjudicationReason !== undefined && argv.includes("--rerun")) throw new Error("--adjudicate-verification cannot be combined with --rerun");
@@ -522,7 +525,15 @@ async function workOn(
     }
     if (admission.action === "resume") {
       if (!argv.includes("--resume")) {
+        if (admission.checkpoint === "conflict-recovery") {
+          throw new Error(`Existing run ${admission.runId} has a confirmed target conflict. Re-run with --resume --resolve-conflict to synchronize, reverify, and obtain a fresh review; ordinary resume never rebases an approved head`);
+        }
         throw new Error(`Existing run ${admission.runId} has a recoverable ${admission.checkpoint} checkpoint. Re-run with --resume to continue it; reset only if you intentionally want to abandon its durable work`);
+      }
+      if (resolveConflict !== (admission.checkpoint === "conflict-recovery")) {
+        throw new Error(admission.checkpoint === "conflict-recovery"
+          ? `Run ${admission.runId} requires explicit --resolve-conflict authorization; ordinary --resume is fail-closed`
+          : "--resolve-conflict is valid only for a confirmed target-conflict checkpoint");
       }
       resumeRunId = admission.runId;
       progressRunId = resumeRunId;
@@ -816,7 +827,7 @@ async function workOn(
         ? latestOutcome
         : admission.checkpoint === "publication"
           ? latestArtifactOfKind(runArtifacts, "BuildResult")
-          : admission.checkpoint === "completion"
+          : admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery"
             ? latestArtifactOfKind(runArtifacts, "ReviewVerdict")
             : admission.checkpoint === "remediation"
               ? (admission.state === "blocked" ? latestArtifactOfKind(runArtifacts, "Outcome") : latestArtifactOfKind(runArtifacts, "ReviewVerdict"))
@@ -860,7 +871,7 @@ async function workOn(
       const openPullRequest = retainedBuildResult
         ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
         : undefined;
-      const checkpointPullRequest = admission.checkpoint === "completion" && priorVerdict?.subject.pr
+      const checkpointPullRequest = (admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") && priorVerdict?.subject.pr
         ? await github.getPullRequest(issue.repo, priorVerdict.subject.pr)
         : openPullRequest;
       if (admission.checkpoint === "remediation" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
@@ -869,8 +880,12 @@ async function workOn(
       if (admission.checkpoint === "remediation" && remediationCheckpoint?.kind === "RemediationBlocked" && remediationCheckpoint.payload.status === "terminal") {
         throw new Error(`Run ${resumeRunId} has a terminal recursive-remediation checkpoint; human intervention is required`);
       }
-      if (admission.checkpoint === "completion" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
-        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for completion resume`);
+      if ((admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for ${admission.checkpoint} resume`);
+      }
+      if (admission.checkpoint === "conflict-recovery"
+        && (!latestOutcome || latestOutcome.payload.status !== "blocked" || latestOutcome.payload.mergeGate?.mergeability !== "conflicting")) {
+        throw new Error(`Run ${resumeRunId} no longer has the confirmed conflicting merge-gate checkpoint required for --resolve-conflict`);
       }
       if (checkpointPullRequest && checkpointPullRequest.baseBranch !== deliveryTargetBranch) {
         throw new Error(
@@ -921,7 +936,7 @@ async function workOn(
       const verifier = new ProcessVerificationRunner();
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
-      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion") {
+      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") {
         const recoveryInput = {
           runId: resumeRunId,
           issue: issue.number,
@@ -1002,7 +1017,34 @@ async function workOn(
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent };
-      const result = admission.checkpoint === "completion"
+      const result = admission.checkpoint === "conflict-recovery"
+        ? await resumeConflictRecoveryWorkOn({
+          run,
+          intent: intentArtifact,
+          investigation,
+          packet,
+          buildResult: retainedBuildResult!,
+          verdict: priorVerdict!,
+          pullRequest: checkpointPullRequest!,
+          workspace: workspace!,
+          baseBranch: durableTargetBranch,
+          verification,
+          mergeGate: latestOutcome!.payload.mergeGate!,
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+          autoMerge,
+          maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
+          maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
+          maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+          remediationDepth: parentRemediation?.remediationDepth ?? 0,
+          scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
+          ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
+          subjectEvidence,
+          ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
+          ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
+          signal: leaseController.signal,
+        }, dependencies)
+        : admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
           verdict: priorVerdict!,

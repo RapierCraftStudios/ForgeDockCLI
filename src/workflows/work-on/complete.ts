@@ -402,6 +402,7 @@ async function blockMergeAdmission(
       ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
       prUrl: pullRequest.url,
       mergeGate: {
+        repo: gate.repo,
         pullRequest: gate.pullRequest,
         headSha: gate.headSha,
         baseBranch: gate.baseBranch,
