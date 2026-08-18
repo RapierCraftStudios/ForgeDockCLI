@@ -1,11 +1,61 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import { ForgeDockObserver } from "../observability/observer.js";
 import { SqliteObservationStore } from "../observability/sqlite-store.js";
+import { ForgeDockBackgroundTasks } from "./background-tasks.js";
 import { executeController } from "./forgedock-tools.js";
+
+test("background task supervisor persists sanitized split channels before its terminal event", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-observer-integration-"));
+  const observer = new ForgeDockObserver({
+    store: new SqliteObservationStore(":memory:"),
+    maxQueueDepth: 8,
+  });
+  const pi = { sendMessage: () => undefined } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd,
+    ui: { notify: () => undefined, setStatus: () => undefined },
+  } as unknown as ExtensionContext;
+  const tasks = new ForgeDockBackgroundTasks(pi);
+  tasks.initialize(ctx);
+  tasks.setObservationSink(observer);
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('stdout Bearer supe'); process.stderr.write('\\u001b]52;c;'); setTimeout(() => { process.stdout.write('r-integration-secret after'); process.stderr.write('\\u0007stderr visible'); }, 20)"],
+    cwd,
+    ctx,
+  });
+
+  try {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (tasks.list().find((candidate) => candidate.id === record.id)?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed");
+    await observer.flush();
+    const events = await observer.query({ scopeKey: record.id, source: "process" });
+    const outputEvents = events.filter((event) => event.output);
+    const lifecycleIndex = events.findIndex((event) => event.kind === "process.exited");
+    assert.ok(lifecycleIndex >= 0);
+    assert.ok(outputEvents.every((event) => events.indexOf(event) < lifecycleIndex));
+    assert.deepEqual(outputEvents.map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
+    const serialized = JSON.stringify(outputEvents);
+    assert.match(serialized, /stdout/);
+    assert.match(serialized, /stderr visible/);
+    assert.match(serialized, /\[REDACTED\]/);
+    assert.doesNotMatch(serialized, /integration-secret|\u001b\]52/);
+  } finally {
+    await tasks.shutdown();
+    observer.close();
+  }
+});
 
 test("controller adapter preserves stdout and stderr as separate observation channels", async () => {
   const observer = new ForgeDockObserver({

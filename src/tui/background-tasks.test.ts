@@ -8,6 +8,8 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ForgeDockBackgroundTasks } from "./background-tasks.js";
+import { ForgeDockObserver } from "../observability/observer.js";
+import { SqliteObservationStore } from "../observability/sqlite-store.js";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-"));
@@ -36,6 +38,32 @@ async function eventually(assertion: () => void): Promise<void> {
   }
   throw last;
 }
+
+test("background observation captures split stdout and stderr before its terminal event", async () => {
+  const { cwd, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 8 });
+  tasks.setObservationSink(observer);
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('stdout bearer supe'); process.stderr.write('\\u001b]52;c;'); setTimeout(()=>{process.stdout.write('r-integration-secret after'); process.stderr.write('\\u0007stderr visible')},20)"],
+    cwd,
+    ctx,
+  });
+  await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
+  await observer.flush();
+  const events = await observer.query({ scopeKey: record.id, source: "process" });
+  const outputEvents = events.filter((event) => event.output);
+  const lifecycleIndex = events.findIndex((event) => event.kind === "process.exited");
+  assert.ok(lifecycleIndex > outputEvents.length - 1);
+  assert.deepEqual(outputEvents.map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
+  const serialized = JSON.stringify(outputEvents);
+  assert.match(serialized, /stdout/);
+  assert.match(serialized, /stderr visible/);
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.doesNotMatch(serialized, /integration-secret|\u001b\]52/);
+  await tasks.shutdown();
+  observer.close();
+});
 
 test("native background controller records output and completion without blocking", async () => {
   const { cwd, messages, tasks, ctx } = fixture();
