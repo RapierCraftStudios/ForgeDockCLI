@@ -369,6 +369,7 @@ test("parent-launched orchestration carries the resolved checkout into DAG worke
     assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
     assert.equal(spawnRequests.length, 1);
     assert.equal(spawnRequests[0]?.params.cwd, target);
+    assert.equal(spawnRequests[0]?.params.model, "openai-codex/gpt-test");
   } finally {
     await state.handlers.get("session_shutdown")?.[0]?.({}, commandContext());
     if (previousControllerEntry === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;

@@ -1665,8 +1665,11 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(autoMergeOption !== undefined ? { autoMerge: autoMergeOption } : {}),
       });
       const autoMerge = autoMergeOption ?? effective.autoMerge;
+      const activeSessionModel = ctx.model?.provider && ctx.model.id
+        ? `${ctx.model.provider}/${ctx.model.id}`
+        : undefined;
       const resolvedWorkerModel = previewCheckpoint?.replay.policy.workerModel ?? modelWithThinking(
-        workerModelRequest ?? config.workerModel ?? process.env.FORGEDOCK_WORKER_MODEL,
+        workerModelRequest ?? config.workerModel ?? process.env.FORGEDOCK_WORKER_MODEL ?? activeSessionModel,
         config.workerThinking,
       );
       const dispatchMode = params.confirmed === true ? "authorized" : effective.dispatchMode;
