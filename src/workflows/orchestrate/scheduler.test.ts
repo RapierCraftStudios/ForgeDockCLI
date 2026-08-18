@@ -72,6 +72,33 @@ describe("lean orchestration scheduler", () => {
     await assert.rejects(execution, /transport capacity wait cancelled/);
   });
 
+  it("retains ownership after cancellation until a fixed-capacity worker settles", async () => {
+    const abort = new AbortController();
+    const started = deferredSignal();
+    const gate = deferredGate();
+    const execution = runSchedule(
+      [{ id: "running", issue: 1, priority: 1, dependencies: [], claims: [] }],
+      1,
+      async () => {
+        started.resolve();
+        await gate.promise;
+      },
+      { capacity: 1, signal: abort.signal },
+    );
+    let settled = false;
+    void execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+
+    await started.promise;
+    abort.abort(new Error("fixed worker wait cancelled"));
+    await sleep(20);
+    assert.equal(settled, false, "scheduler must retain ownership while an admitted worker is still active");
+    gate.release();
+    await assert.rejects(execution, /fixed worker wait cancelled/);
+  });
+
   it("drains a 500-node fleet without duplicate dispatches, orphaned work, or exceeding capacity", async () => {
     const maxParallel = 20;
     const items: ScheduledWorkItem[] = Array.from({ length: 500 }, (_, index) => ({
@@ -608,6 +635,20 @@ describe("worker leases", () => {
     assert.equal(recovered?.owner, "worker-b");
     assert.equal(leases.release("issue-1", first?.token ?? ""), false);
     assert.equal(leases.release("issue-1", recovered?.token ?? ""), true);
+  });
+
+  it("expires mutation authority even while the holder token remains current", () => {
+    const leases = new InMemoryLeaseRepository();
+    let now = 1_050;
+    const lease = leases.acquire("issue-guard", "worker-a", 100, 1_000);
+    assert.ok(lease);
+    const guard = leases.guard("issue-guard", lease.token, () => now);
+
+    assert.doesNotThrow(() => guard.assertValid());
+    now = 1_100;
+    assert.throws(() => guard.check(), /expired/i);
+    assert.equal(leases.inspect?.("issue-guard")?.token, lease.token, "guard expiry must not delete takeover evidence");
+    assert.equal(leases.acquire("issue-guard", "worker-b", 100, now)?.owner, "worker-b");
   });
 
   it("retains a non-secret node binding for live reconciliation and changes it only after expiry", () => {

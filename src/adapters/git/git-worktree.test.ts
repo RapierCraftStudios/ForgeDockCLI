@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -13,6 +13,32 @@ function git(cwd: string, ...args: string[]): string {
 
 function gitWithInput(cwd: string, input: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+
+function dependencyFailureRepository(root: string, patchSource: string): string {
+  const repo = join(root, "repo");
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "ForgeDock Test");
+  git(repo, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(repo, "README.md"), "base\n");
+  writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "failure-fixture", version: "1.0.0" }));
+  execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
+    cwd: repo,
+    stdio: "ignore",
+    shell: process.platform === "win32",
+  });
+  mkdirSync(join(repo, "scripts"));
+  writeFileSync(join(repo, "scripts", "patch-pi-subagents-visibility.mjs"), patchSource);
+  git(repo, "add", "--all");
+  git(repo, "commit", "-m", "base");
+  return repo;
+}
+
+function installFailingPostCheckoutHook(repo: string): void {
+  const hooks = resolve(repo, git(repo, "rev-parse", "--git-path", "hooks"));
+  const hook = join(hooks, "post-checkout");
+  writeFileSync(hook, "#!/bin/sh\nexit 1\n");
+  chmodSync(hook, 0o755);
 }
 
 function restoreMergeHead(cwd: string, sha: string): void {
@@ -99,6 +125,169 @@ describe("isolated Git worktrees", () => {
 
     assert.equal(workspace.branch, "forgedock/issue-91-run_dead_owner");
     assert.equal(existsSync(lockPath), false);
+  });
+
+  it("rolls back issue and review worktrees retained by a failing post-checkout hook", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-hook-failure-"));
+    try {
+      const repo = join(root, "repo");
+      const remote = join(root, "remote.git");
+      execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      git(repo, "add", "README.md");
+      git(repo, "commit", "-m", "base");
+      git(repo, "remote", "add", "origin", remote);
+      git(repo, "push", "origin", "HEAD:refs/pull/73/head");
+      installFailingPostCheckoutHook(repo);
+      const worktreeRoot = join(root, "worktrees");
+      const manager = new GitWorktreeManager(repo, worktreeRoot);
+
+      await assert.rejects(
+        () => manager.create({ runId: "run_hook_issue", issue: 73, baseRef: "HEAD" }),
+        /post-checkout|exit code|failed/i,
+      );
+      assert.equal(existsSync(join(worktreeRoot, "issue-73-run_hook_issue")), false);
+      assert.throws(() => git(repo, "show-ref", "--verify", "refs/heads/forgedock/issue-73-run_hook_issue"));
+
+      await assert.rejects(
+        () => manager.createReview({ runId: "run_hook_review", pr: 73, headSha: git(repo, "rev-parse", "HEAD") }),
+        /post-checkout|exit code|failed/i,
+      );
+      assert.equal(existsSync(join(worktreeRoot, "review-73-run_hook_review")), false);
+      assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_hook_(?:issue|review)/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a hook-failed worktree through a symlinked managed root", { skip: process.platform === "win32" }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-hook-symlink-"));
+    try {
+      const repo = join(root, "repo");
+      const realWorktrees = join(root, "real-worktrees");
+      const linkedWorktrees = join(root, "linked-worktrees");
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      git(repo, "add", "README.md");
+      git(repo, "commit", "-m", "base");
+      installFailingPostCheckoutHook(repo);
+      mkdirSync(realWorktrees);
+      symlinkSync(realWorktrees, linkedWorktrees, "dir");
+      const manager = new GitWorktreeManager(repo, linkedWorktrees);
+
+      await assert.rejects(
+        () => manager.create({ runId: "run_hook_symlink", issue: 74, baseRef: "HEAD" }),
+        /post-checkout|exit code|failed/i,
+      );
+      assert.equal(existsSync(join(realWorktrees, "issue-74-run_hook_symlink")), false);
+      assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_hook_symlink/);
+      assert.throws(() => git(repo, "show-ref", "--verify", "refs/heads/forgedock/issue-74-run_hook_symlink"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a successful worktree through a symlinked managed root", { skip: process.platform === "win32" }, async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-recover-symlink-"));
+    try {
+      const repo = join(root, "repo");
+      const realWorktrees = join(root, "real-worktrees");
+      const linkedWorktrees = join(root, "linked-worktrees");
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      git(repo, "add", "README.md");
+      git(repo, "commit", "-m", "base");
+      mkdirSync(realWorktrees);
+      symlinkSync(realWorktrees, linkedWorktrees, "dir");
+      const manager = new GitWorktreeManager(repo, linkedWorktrees);
+      const workspace = await manager.create({ runId: "run_recover_symlink", issue: 75, baseRef: "HEAD" });
+
+      const recovered = await manager.recover({ runId: "run_recover_symlink", issue: 75, baseRef: "HEAD" });
+      assert.deepEqual(recovered, workspace);
+      await manager.remove(workspace);
+      assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_recover_symlink/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a managed issue worktree when dependency setup fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-create-failure-"));
+    try {
+      const repo = dependencyFailureRepository(root, 'throw new Error("pinned setup failed");\n');
+      const worktreeRoot = join(root, "worktrees");
+      const manager = new GitWorktreeManager(repo, worktreeRoot);
+      const branch = "forgedock/issue-70-run_setup_failure";
+      const path = join(worktreeRoot, "issue-70-run_setup_failure");
+
+      await assert.rejects(
+        () => manager.create({ runId: "run_setup_failure", issue: 70, baseRef: "HEAD" }),
+        /pinned setup failed/i,
+      );
+      assert.equal(existsSync(path), false);
+      assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_setup_failure/);
+      assert.throws(() => git(repo, "show-ref", "--verify", `refs/heads/${branch}`));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a detached review worktree when dependency setup fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-review-failure-"));
+    try {
+      const repo = dependencyFailureRepository(root, 'throw new Error("review setup failed");\n');
+      const remote = join(root, "remote.git");
+      execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+      git(repo, "remote", "add", "origin", remote);
+      git(repo, "push", "origin", "HEAD:refs/pull/71/head");
+      const headSha = git(repo, "rev-parse", "HEAD");
+      const worktreeRoot = join(root, "worktrees");
+      const manager = new GitWorktreeManager(repo, worktreeRoot);
+      const path = join(worktreeRoot, "review-71-run_review_failure");
+
+      await assert.rejects(
+        () => manager.createReview({ runId: "run_review_failure", pr: 71, headSha }),
+        /review setup failed/i,
+      );
+      assert.equal(existsSync(path), false);
+      assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_review_failure/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports setup and rollback failures together", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-rollback-failure-"));
+    try {
+      const repo = dependencyFailureRepository(root, [
+        'import { readFileSync, rmSync } from "node:fs";',
+        'const gitdir = readFileSync(".git", "utf8").replace(/^gitdir:\\s*/, "").trim();',
+        'rmSync(gitdir, { recursive: true, force: true });',
+        'throw new Error("setup destroyed registration");',
+      ].join("\n"));
+      const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+
+      await assert.rejects(
+        () => manager.create({ runId: "run_rollback_failure", issue: 72, baseRef: "HEAD" }),
+        (error: unknown) => {
+          assert.ok(error instanceof AggregateError);
+          assert.match(error.message, /prepare.*rollback.*failed/i);
+          assert.equal(error.errors.length, 2);
+          assert.match(String(error.errors[0]), /setup destroyed registration/i);
+          assert.match(String(error.errors[1]), /roll back managed worktree/i);
+          return true;
+        },
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("creates, inspects, commits and removes a managed worktree", async () => {

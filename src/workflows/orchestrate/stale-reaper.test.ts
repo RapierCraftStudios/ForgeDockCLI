@@ -8,13 +8,13 @@ import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../../adapters/sqlite/orchestration-admission.js";
 import { reapStaleOrchestrations } from "./stale-reaper.js";
 
-function runningRecord(orchestrationId: string, executionAttempt = 1): OrchestrationRecord {
+function runningRecord(orchestrationId: string, executionAttempt = 1, issue = 7): OrchestrationRecord {
   return {
     schema: "forgedock.orchestration/v1",
     orchestrationId,
     repository: "owner/repo",
-    requestedIssueNumbers: [7],
-    issueNumbers: [7],
+    requestedIssueNumbers: [issue],
+    issueNumbers: [issue],
     maxParallel: 1,
     autoMerge: true,
     executionAttempt,
@@ -23,23 +23,23 @@ function runningRecord(orchestrationId: string, executionAttempt = 1): Orchestra
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:30.000Z",
     nodes: [{
-      id: "issue-7",
-      issue: 7,
+      id: `issue-${issue}`,
+      issue,
       priority: 1,
       dependencies: [],
       claims: ["src/example"],
       status: "running",
-      childRunIds: ["run-7"],
-      activeAttemptId: "attempt-7",
+      childRunIds: [`run-${issue}`],
+      activeAttemptId: `attempt-${issue}`,
       attempts: [{
-        attemptId: "attempt-7",
+        attemptId: `attempt-${issue}`,
         attempt: 1,
         recovery: "initial",
         status: "running",
         startedAt: "2026-01-01T00:00:01.000Z",
         updatedAt: "2026-01-01T00:00:30.000Z",
-        taskId: "task-7",
-        runId: "run-7",
+        taskId: `task-${issue}`,
+        runId: `run-${issue}`,
       }],
     }],
   };
@@ -88,8 +88,8 @@ describe("stale orchestration reaper", () => {
     const repository = new InMemoryOrchestrationRepository();
     const leases = new InMemoryLeaseRepository();
     const live = runningRecord("dag-live");
-    const terminal = { ...runningRecord("dag-terminal"), status: "completed" as const };
-    const neverStartedBase = runningRecord("dag-new", 0);
+    const terminal = { ...runningRecord("dag-terminal", 1, 8), status: "completed" as const };
+    const neverStartedBase = runningRecord("dag-new", 0, 9);
     const { executionClaimId: _executionClaimId, ...neverStartedRecord } = neverStartedBase;
     const { activeAttemptId: _activeAttemptId, ...neverStartedNode } = neverStartedBase.nodes[0]!;
     const neverStarted: OrchestrationRecord = {
@@ -121,7 +121,7 @@ describe("stale orchestration reaper", () => {
     const repository = new InMemoryOrchestrationRepository();
     const leases = new InMemoryLeaseRepository();
     const old = runningRecord("dag-old-start", 0);
-    const fresh = { ...runningRecord("dag-fresh-start", 0), updatedAt: "2026-01-01T00:01:59.500Z" };
+    const fresh = { ...runningRecord("dag-fresh-start", 0, 8), updatedAt: "2026-01-01T00:01:59.500Z" };
     const { executionClaimId: _oldClaim, ...oldWithoutClaim } = old;
     const { activeAttemptId: _oldActive, ...oldWithoutActive } = old.nodes[0]!;
     const oldQueued: OrchestrationRecord = {

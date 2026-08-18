@@ -63,6 +63,8 @@ export interface OrchestrationWorkerAttemptRecord {
   lastHeartbeatAt?: string;
   heartbeatSequence?: number;
   recoveryOfAttemptId?: string;
+  /** Authoritative replacement scope persisted with a terminal skipped attempt. */
+  decompositionChildren?: number[];
   error?: string;
 }
 
@@ -188,6 +190,80 @@ export interface OrchestrationRecord {
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
 }
 
+/**
+ * Durable ownership overlap discovered while admitting a new orchestration.
+ * The issue list includes only the overlap with the proposed scope; the
+ * owning record remains the authoritative source for the complete DAG.
+ */
+export interface OrchestrationIssueOwnershipConflict {
+  orchestrationId: string;
+  repository: string;
+  issueNumbers: number[];
+}
+
+/**
+ * Return every issue identity owned by a durable orchestration record.
+ *
+ * `requestedIssueNumbers` covers the operator's original scope, while node
+ * issues/memberIssues cover contracted work and generated batch projections.
+ * Decomposition children are included so a still-running parent DAG cannot be
+ * raced by a fresh orchestration after its authoritative replacement appears.
+ */
+export function orchestrationRecordIssueNumbers(record: OrchestrationRecord): number[] {
+  const values = [
+    ...(record.requestedIssueNumbers ?? []),
+    ...record.issueNumbers,
+    ...record.nodes.flatMap((node) => [
+      node.issue,
+      ...(node.memberIssues ?? []),
+      ...(node.decompositionChildren ?? []),
+      ...(node.attempts ?? []).flatMap((attempt) => attempt.decompositionChildren ?? []),
+    ]),
+  ];
+  return [...new Set(values)].sort((left, right) => left - right);
+}
+
+/**
+ * Find overlaps with running durable DAGs in one repository. This is a pure
+ * helper so both read-only previews and repository insert admission use the
+ * exact same ownership semantics.
+ */
+export function findRunningOrchestrationIssueConflicts(
+  records: readonly OrchestrationRecord[],
+  repository: string,
+  issueNumbers: readonly number[],
+): OrchestrationIssueOwnershipConflict[] {
+  const requested = new Set(issueNumbers);
+  const normalizedRepository = repository.trim().toLowerCase();
+  return records
+    .filter((record) => record.status === "running" && record.repository.trim().toLowerCase() === normalizedRepository)
+    .map((record) => ({
+      orchestrationId: record.orchestrationId,
+      repository: record.repository,
+      issueNumbers: orchestrationRecordIssueNumbers(record).filter((issue) => requested.has(issue)),
+    }))
+    .filter((conflict) => conflict.issueNumbers.length > 0)
+    .sort((left, right) => left.orchestrationId.localeCompare(right.orchestrationId));
+}
+
+/**
+ * Typed error used at the preview and durable insert boundaries. A fresh DAG
+ * cannot bypass this conflict with the issue-worker `rerun` flag; recovery of
+ * an already-owned scope belongs to the owning DAG's resume path.
+ */
+export class OrchestrationIssueOwnershipConflictError extends Error {
+  constructor(readonly conflicts: readonly OrchestrationIssueOwnershipConflict[]) {
+    const details = conflicts.map((conflict) =>
+      `${conflict.issueNumbers.map((issue) => `#${issue}`).join(", ")} → ${conflict.orchestrationId}`,
+    ).join("; ");
+    super(
+      `Orchestration scope conflicts with active durable DAG ownership: ${details}. `
+      + "The fresh DAG was not admitted; resume the owning DAG or choose issues outside its active scope.",
+    );
+    this.name = "OrchestrationIssueOwnershipConflictError";
+  }
+}
+
 /** Durable operational record for a scheduler DAG; semantic issue state remains in artifacts and RunState. */
 export interface OrchestrationRepository {
   createOrchestration(record: OrchestrationRecord): Promise<void>;
@@ -201,3 +277,34 @@ export interface OrchestrationRepository {
 }
 
 export const MAX_ORCHESTRATION_PAGE_SIZE = 100;
+
+/**
+ * Read all bounded running-DAG pages before admitting a fresh scope. Durable
+ * stores are allowed to retain more records than one status page, so callers
+ * must not treat the first page as an exhaustive ownership index.
+ */
+export async function findDurableOrchestrationIssueConflicts(
+  repository: OrchestrationRepository,
+  repositoryName: string,
+  issueNumbers: readonly number[],
+): Promise<OrchestrationIssueOwnershipConflict[]> {
+  const records: OrchestrationRecord[] = [];
+  let before: OrchestrationListCursor | undefined;
+  let previousCursor: string | undefined;
+  while (true) {
+    const page = await repository.listRunningOrchestrations(MAX_ORCHESTRATION_PAGE_SIZE, before);
+    records.push(...page);
+    if (page.length < MAX_ORCHESTRATION_PAGE_SIZE) break;
+    const last = page[page.length - 1];
+    if (!last) break;
+    const cursor: OrchestrationListCursor = {
+      updatedAt: last.updatedAt,
+      orchestrationId: last.orchestrationId,
+    };
+    const cursorKey = `${cursor.updatedAt}\u0000${cursor.orchestrationId}`;
+    if (cursorKey === previousCursor) break;
+    previousCursor = cursorKey;
+    before = cursor;
+  }
+  return findRunningOrchestrationIssueConflicts(records, repositoryName, issueNumbers);
+}

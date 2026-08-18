@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
+import {
+  findDurableOrchestrationIssueConflicts,
+  OrchestrationIssueOwnershipConflictError,
+  orchestrationRecordIssueNumbers,
+} from "../../core/ports/orchestration.js";
 import type {
   DurableOrchestrationNodeStatus,
   OrchestrationExecutionAdmission,
@@ -249,6 +254,16 @@ export class OrchestrationController {
       })),
       nodes: graph.items.map((item) => nodeRecordFromItem(item)),
     };
+    // Repository implementations also enforce this at their insert
+    // linearization point. The read here gives custom adapters the same
+    // fail-closed behavior and produces the conflict before any worker or
+    // projection can be created.
+    const conflicts = await findDurableOrchestrationIssueConflicts(
+      this.dependencies.repository,
+      record.repository,
+      orchestrationRecordIssueNumbers(record),
+    );
+    if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     await this.dependencies.repository.createOrchestration(record);
     this.emitSnapshot(record);
     return structuredClone(record);
@@ -368,11 +383,13 @@ export class OrchestrationController {
           state.record.maxParallel,
           (item, schedulerContext) => this.executePreparedWorker(executionState, item, schedulerContext, pass.actions.get(item.id)),
           {
-            capacity: async () => {
-              const capacity = await this.resolveTransportCapacity(dynamicTransportCapacity);
-              executionState.record.transportCapacity = capacity;
-              return capacity;
-            },
+            capacity: dynamicTransportCapacity
+              ? async () => {
+                  const capacity = await this.resolveTransportCapacity(true);
+                  executionState.record.transportCapacity = capacity;
+                  return capacity;
+                }
+              : transportCapacity,
             onCapacityObserved: observeTransportCapacity,
             ...(this.dependencies.signal !== undefined ? { signal: this.dependencies.signal } : {}),
             serializationEdges: pass.serializationEdges,
@@ -519,7 +536,11 @@ export class OrchestrationController {
           assertPersistedDecomposition(state.record, node);
           continue;
         }
-        const expansion = await this.resolveDecomposition(state, node, item);
+        const attempt = referencedAttempt(node);
+        const persistedChildren = attempt?.status === "skipped" && attempt.decompositionChildren?.length
+          ? attempt.decompositionChildren
+          : undefined;
+        const expansion = await this.resolveDecomposition(state, node, item, persistedChildren);
         if (expansion) continue;
         actions.set(node.id, {
           kind: "terminal",
@@ -704,18 +725,36 @@ export class OrchestrationController {
     if (depth > maxDepth) throw new Error(`Decomposition of ${nodeId} exceeds the ${maxDepth}-level depth limit`);
 
     const childSet = new Set(children);
-    const existingByIssue = new Map(state.record.nodes.map((candidate) => [candidate.issue, candidate.id] as const));
+    const existingByIssue = new Map<number, string>();
+    for (const candidate of state.record.nodes) {
+      for (const issue of new Set([candidate.issue, ...(candidate.memberIssues ?? [])])) {
+        const owner = existingByIssue.get(issue);
+        if (owner && owner !== candidate.id) {
+          throw new Error(`Orchestration contains duplicate issue identity #${issue} in ${owner} and ${candidate.id}`);
+        }
+        existingByIssue.set(issue, candidate.id);
+      }
+    }
     const childItems = expansion.items.map(cloneScheduledItem);
     if (childItems.length !== children.length) {
       throw new Error(`Decomposition of ${nodeId} returned ${childItems.length} scheduler nodes for ${children.length} child issues`);
     }
     const childIds = new Set<string>();
     const childIssuesSeen = new Set<number>();
+    const childIdentityOwners = new Map<number, string>();
     for (const child of childItems) {
       if (!childSet.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned unreported child issue #${child.issue}`);
       if (childIds.has(child.id)) throw new Error(`Decomposition of ${nodeId} returned duplicate child node ${child.id}`);
       if (childIssuesSeen.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned duplicate child issue #${child.issue}`);
-      if (existingByIssue.has(child.issue)) throw new Error(`Decomposition of ${nodeId} returned existing issue #${child.issue}`);
+      for (const issue of new Set([child.issue, ...(child.memberIssues ?? [])])) {
+        const existingOwner = existingByIssue.get(issue);
+        if (existingOwner) throw new Error(`Decomposition of ${nodeId} returned existing issue #${issue} owned by ${existingOwner}`);
+        const childOwner = childIdentityOwners.get(issue);
+        if (childOwner && childOwner !== child.id) {
+          throw new Error(`Decomposition of ${nodeId} returned duplicate child issue #${issue} in ${childOwner} and ${child.id}`);
+        }
+        childIdentityOwners.set(issue, child.id);
+      }
       if (child.dependencies.includes(parent.id)) throw new Error(`Decomposition child ${child.id} depends on its skipped parent ${parent.id}`);
       childIds.add(child.id);
       childIssuesSeen.add(child.issue);
@@ -978,6 +1017,9 @@ export class OrchestrationController {
     result: ScheduleWorkerResult,
   ): Promise<void> {
     const normalized = normalizeWorkerResult(result);
+    const decompositionChildren = normalized.status === "skipped" && normalized.childIssues !== undefined
+      ? normalizeChildIssues(normalized.childIssues, requiredNode(state.record, nodeId).issue)
+      : undefined;
     const status: DurableOrchestrationNodeStatus = normalized.status === "failed" && isLeaseContinuityFailure(normalized.error)
       ? "suspended"
       : normalized.status;
@@ -992,6 +1034,7 @@ export class OrchestrationController {
         status,
         updatedAt: now,
         completedAt: now,
+        ...(decompositionChildren !== undefined ? { decompositionChildren } : {}),
         ...(normalized.error !== undefined ? { error: errorMessage(normalized.error) } : {}),
       }),
     );
@@ -1108,29 +1151,47 @@ export class OrchestrationController {
   ): void {
     const node = requiredNode(state.record, nodeId);
     const attempt = attemptEvidence ?? activeAttempt(node);
+    const attemptId = attempt?.attemptId ?? this.createAttemptId();
+    if (!attempt) assertAttemptIdAvailable(node, attemptId);
     const now = this.now();
+    const decompositionChildren = result.status === "skipped" && result.childIssues !== undefined
+      ? normalizeChildIssues(result.childIssues, node.issue)
+      : undefined;
     this.updateNode(state, nodeId, (current) => {
       const { activeAttemptId: _activeAttemptId, error: _error, waitReason: _waitReason, ...rest } = current;
       const error = result.error ?? reason;
       return {
         ...rest,
         status: durableStatus(result.status),
-        attempts: (current.attempts ?? []).map((candidate) => {
-          if (candidate.attemptId !== attempt?.attemptId) return candidate;
-          const { error: _attemptError, ...attemptWithoutError } = candidate;
-          return {
-            ...attemptWithoutError,
-            status: workerAttemptStatus(result),
-            updatedAt: now,
-            completedAt: now,
-            ...(result.error !== undefined ? { error: errorMessage(result.error) } : {}),
-          };
-        }),
+        attempts: attempt
+          ? (current.attempts ?? []).map((candidate) => {
+              if (candidate.attemptId !== attemptId) return candidate;
+              const { error: _attemptError, ...attemptWithoutError } = candidate;
+              return {
+                ...attemptWithoutError,
+                status: workerAttemptStatus(result),
+                updatedAt: now,
+                completedAt: now,
+                ...(decompositionChildren !== undefined ? { decompositionChildren } : {}),
+                ...(result.error !== undefined ? { error: errorMessage(result.error) } : {}),
+              };
+            })
+          : [...(current.attempts ?? []), {
+              attemptId,
+              attempt: (current.attempts?.reduce((maximum, candidate) => Math.max(maximum, candidate.attempt), 0) ?? 0) + 1,
+              recovery: "resume" as const,
+              status: workerAttemptStatus(result),
+              startedAt: now,
+              updatedAt: now,
+              completedAt: now,
+              ...(decompositionChildren !== undefined ? { decompositionChildren } : {}),
+              ...(result.error !== undefined ? { error: errorMessage(result.error) } : {}),
+            }],
         ...(error !== undefined ? { error: errorMessage(error) } : {}),
         lastRecovery: {
           mode: "terminal",
           reconciledAt: now,
-          ...(attempt !== undefined ? { attemptId: attempt.attemptId } : {}),
+          attemptId,
           ...(attempt?.taskId !== undefined ? { taskId: attempt.taskId } : {}),
           ...(reason !== undefined ? { reason } : {}),
         },
@@ -1650,6 +1711,9 @@ function scheduleResultFromAttempt(
     case "invalid":
       return {
         status: attempt.status,
+        ...(attempt.status === "skipped" && attempt.decompositionChildren !== undefined
+          ? { childIssues: [...attempt.decompositionChildren] }
+          : {}),
         ...(error !== undefined ? { error } : {}),
       };
     case "interrupted":

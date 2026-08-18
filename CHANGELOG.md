@@ -7,6 +7,9 @@
 
 ### Fixed
 
+- A second ForgeDock terminal now recognizes bridge-bound controller tasks still owned by a live original TUI, suppresses false interruption/resume warnings, and cannot terminate those workers during a new dispatch; stale or explicitly released owners retain fail-closed checkpoint recovery.
+- Short preview confirmations, including the observed `prceed` typo, now bind to the exact live orchestration preview token even when a background-task notice is injected between turns, preventing accidental status discovery or unrelated DAG resume.
+- Fresh orchestration previews and dispatch admission now reject issues already owned by a running durable DAG—including original scope, batch members, and decomposition children—with an atomic repository guard against concurrent duplicate enrollment.
 - Explicit `/orchestrate resume <dag_id>` requests now expose and call only the durable orchestration-resume tool instead of entering fresh issue discovery and contradicting the requested recovery action.
 - Bounded verification tools now emit semantic progress while their approved subprocess is still active, preventing the generic 120-second idle watchdog from cancelling legitimate long-running test suites while preserving command timeouts and fail-closed stalled-runner detection.
 - Nested reviewer progress now crosses the authenticated terminal bridge into controller semantic-idle accounting, preventing actively reading or reasoning review shards from being cancelled after 120 seconds of falsely observed silence while retaining bounded interruption for truly inactive sessions.

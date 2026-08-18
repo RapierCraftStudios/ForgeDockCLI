@@ -49,7 +49,7 @@ export class LeaseBackedOrchestrationExecutionAdmission implements Orchestration
     const itemId = `orchestration-execution:${normalizedId}`;
     const lease = this.leases.acquire(itemId, this.#owner, this.#ttlMs, this.#now());
     if (!lease) return undefined;
-    const guard = this.leases.guard(itemId, lease.token);
+    const guard = this.leases.guard(itemId, lease.token, this.#now);
     const claimId = `${lease.epoch}:${createHash("sha256").update(lease.token).digest("hex").slice(0, 16)}`;
     let expiresAt = lease.expiresAt;
     let failure: unknown;

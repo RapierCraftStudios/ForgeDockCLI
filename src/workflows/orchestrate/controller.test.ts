@@ -306,6 +306,7 @@ describe("OrchestrationController", () => {
     assert.equal(result.record.status, "completed");
     assert.equal(result.record.nodes.find((node) => node.id === "parent")?.status, "skipped");
     assert.deepEqual(result.record.nodes.find((node) => node.id === "parent")?.decompositionChildren, [11, 12]);
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "parent")?.attempts?.at(-1)?.decompositionChildren, [11, 12]);
     assert.deepEqual(result.record.nodes.find((node) => node.id === "dependent")?.dependencies, ["child-11", "child-12"]);
     assert.equal(result.record.nodes.find((node) => node.id === "child-11")?.status, "completed");
     assert.equal(result.record.nodes.find((node) => node.id === "child-12")?.status, "completed");
@@ -337,6 +338,100 @@ describe("OrchestrationController", () => {
     assert.deepEqual(launched, ["child-21", "child-22"]);
     assert.equal(result.record.status, "completed");
     assert.deepEqual(result.record.nodes.find((node) => node.id === "legacy-parent")?.decompositionChildren, [21, 22]);
+  });
+
+  it("recovers decomposition children persisted with a terminal attempt before expansion", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const launched: string[] = [];
+    const service = controller(repository, async (scheduled) => { launched.push(scheduled.id); }, {
+      resolveDecomposition: async ({ childIssues }) => {
+        assert.deepEqual(childIssues, [41, 42]);
+        return {
+          childIssues: childIssues ?? [],
+          items: [item("child-41", 41), item("child-42", 42)],
+        };
+      },
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("crash-parent", 1)], maxParallel: 2 });
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [{
+        ...created.nodes[0]!,
+        status: "skipped",
+        attempts: [{
+          attemptId: "attempt-before-crash",
+          attempt: 1,
+          recovery: "initial",
+          status: "skipped",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:01.000Z",
+          completedAt: "2026-01-01T00:00:01.000Z",
+          decompositionChildren: [41, 42],
+        }],
+      }],
+    });
+
+    const result = await service.resume(created.orchestrationId);
+    assert.deepEqual(launched, ["child-41", "child-42"]);
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "crash-parent")?.decompositionChildren, [41, 42]);
+    assert.equal(result.record.nodes.filter((node) => node.issue === 41).length, 1);
+    assert.equal(result.record.nodes.filter((node) => node.issue === 42).length, 1);
+  });
+
+  it("persists terminal attempt evidence when legacy decomposition reconciliation has none", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const launched: string[] = [];
+    const service = controller(repository, async (scheduled) => { launched.push(scheduled.id); }, {
+      reconcileWorker: async () => ({
+        disposition: "terminal",
+        result: { status: "skipped", childIssues: [51, 52] },
+        reason: "recovered authoritative decomposition",
+      }),
+      resolveDecomposition: async ({ childIssues }) => ({
+        childIssues: childIssues ?? [],
+        items: [item("child-51", 51), item("child-52", 52)],
+      }),
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("legacy-running", 1)], maxParallel: 2 });
+    await repository.saveOrchestration({
+      ...created,
+      status: "failed",
+      nodes: [{ ...created.nodes[0]!, status: "running", attempts: [] }],
+    });
+
+    const result = await service.resume(created.orchestrationId);
+    const durableCheckpoint = repository.saves.find((record) => {
+      const node = record.nodes.find((candidate) => candidate.id === "legacy-running");
+      return node?.status === "skipped"
+        && node.decompositionChildren === undefined
+        && node.attempts?.at(-1)?.decompositionChildren?.join(",") === "51,52";
+    });
+    assert.ok(durableCheckpoint, "reconciliation must durably own child scope before scheduler expansion");
+    assert.equal(durableCheckpoint.nodes[0]?.attempts?.at(-1)?.status, "skipped");
+    assert.deepEqual(launched, ["child-51", "child-52"]);
+    assert.deepEqual(result.record.nodes.find((node) => node.id === "legacy-running")?.decompositionChildren, [51, 52]);
+  });
+
+  it("rejects decomposition children already represented by a batch member", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const service = controller(repository, async (scheduled) => scheduled.id === "parent"
+      ? { status: "skipped", childIssues: [1] }
+      : undefined, {
+      resolveDecomposition: async ({ childIssues }) => ({
+        childIssues: childIssues ?? [],
+        items: [{ ...item("issue-1", 1), memberIssues: [1] }],
+      }),
+    });
+
+    await assert.rejects(
+      () => service.createAndRun({
+        repository: "owner/repo",
+        items: [{ ...item("batch-100", 100), memberIssues: [1, 2] }, item("parent", 10)],
+        maxParallel: 2,
+      }),
+      /existing issue #1 owned by batch-100/i,
+    );
   });
 
   it("rejects an over-limit decomposition before dispatching child work", async () => {
@@ -771,6 +866,37 @@ describe("OrchestrationController", () => {
       const node = record.nodes[0];
       return node?.attempts?.[0]?.status === "completed" && node.activeAttemptId !== undefined;
     }), false, "attempt completion and active-attempt clearing must share one durable write");
+  });
+
+  it("passes fixed transport capacity to the scheduler without dynamic polling", async () => {
+    const repository = new InMemoryOrchestrationRepository();
+    let capacityReads = 0;
+    let attempt = 0;
+    const dependencies: OrchestrationControllerDependencies = {
+      repository,
+      worker: async () => undefined,
+      executionAdmission: new TestExecutionAdmission(),
+      transportCapacity: 2,
+      now: () => "2026-01-01T00:00:00.000Z",
+      createOrchestrationId: () => "dag-fixed-capacity",
+      createAttemptId: () => `attempt-fixed-${++attempt}`,
+    };
+    Object.defineProperty(dependencies, "transportCapacity", {
+      get: () => {
+        capacityReads++;
+        return 2;
+      },
+    });
+    const service = new OrchestrationController(dependencies);
+
+    const result = await service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 4,
+      items: [item("a", 1), item("b", 2), item("c", 3)],
+    });
+
+    assert.equal(result.record.status, "completed");
+    assert.equal(capacityReads, 2, "fixed capacity should be read only for type detection and initial resolution");
   });
 
   it("caps scheduler concurrency to the caller transport capacity", async () => {

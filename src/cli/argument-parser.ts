@@ -3,13 +3,15 @@
 const ORCHESTRATE_VALUE_OPTIONS = new Set([
   "--batching", "--priority", "--milestone", "--scope-expansion", "--max-remediation-cycles",
   "--max-remediation-depth", "--max-remediation-children", "--max-parallel", "--provider", "--model",
-  "--thinking", "--planning-model", "--planning-thinking", "--resume", "--repo",
+  "--thinking", "--planning-model", "--planning-thinking", "--reviewer-model", "--reviewer-thinking",
+  "--resume", "--repo",
 ]);
 
 const WORK_ON_VALUE_OPTIONS = new Set([
   "--depends-on", "--through", "--repo", "--scope-expansion", "--max-remediation-cycles",
   "--max-remediation-depth", "--max-remediation-children", "--provider", "--model", "--thinking",
-  "--planning-model", "--planning-thinking", "--adjudicate-verification",
+  "--planning-model", "--planning-thinking", "--reviewer-model", "--reviewer-thinking",
+  "--adjudicate-verification",
 ]);
 
 const REVIEW_VALUE_OPTIONS = new Set(["--repo", "--issue", "--provider", "--model", "--thinking"]);

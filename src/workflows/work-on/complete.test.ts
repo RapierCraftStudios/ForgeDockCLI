@@ -228,6 +228,92 @@ describe("merge and close authority", () => {
     assert.equal((await artifacts.list({ repo: "a/b", issue: 3 }, "Outcome")).length, 1);
   });
 
+  it("keeps closure-protected invalid batch members open and records the split", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs, 100);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    host.labelsByIssue.set(3, ["Operator-Only"]);
+
+    const first = await completeInvalidWorkItem({
+      run,
+      investigation,
+      outcome: provisional,
+      childIssues: [2, 3],
+    }, { host, artifacts });
+
+    assert.deepEqual(host.closes, [2, 100]);
+    assert.equal(host.closedIssues.has(3), false);
+    assert.deepEqual(first.outcome.payload.childIssues, ["issue-2"]);
+    assert.deepEqual(first.outcome.payload.preservedChildIssues, ["issue-3"]);
+    assert.match(first.outcome.payload.reason, /#3 \(operator-only\).*remain open/i);
+    assert.equal((await artifacts.list({ repo: "a/b", issue: 3 }, "Outcome")).length, 0);
+
+    const retried = await completeInvalidWorkItem({
+      run,
+      investigation,
+      outcome: provisional,
+      childIssues: [2, 3],
+    }, { host, artifacts });
+    assert.equal(retried.outcome.id, first.outcome.id);
+    assert.deepEqual(host.closes, [2, 100]);
+    assert.equal(host.closedIssues.has(3), false);
+
+    host.labelsByIssue.set(4, ["blocked"]);
+    await assert.rejects(
+      completeInvalidWorkItem({ run, investigation, outcome: provisional, childIssues: [2, 4] }, { host, artifacts }),
+      /does not match the complete expected batch membership/i,
+    );
+
+    host.closedIssues.add(3);
+    host.labelsByIssue.delete(3);
+    const humanClosedRetry = await completeInvalidWorkItem(
+      { run, investigation, outcome: provisional, childIssues: [2, 3] },
+      { host, artifacts },
+    );
+    assert.equal(humanClosedRetry.outcome.id, first.outcome.id);
+    assert.deepEqual(host.closes, [2, 100], "retry must not claim the human's closure as its own");
+
+    host.closedIssues.delete(3);
+    await assert.rejects(
+      completeInvalidWorkItem({ run, investigation, outcome: provisional, childIssues: [2, 3] }, { host, artifacts }),
+      /omits issue #3.*no longer has a closure-protected label/i,
+    );
+    assert.deepEqual(host.closes, [2, 100]);
+  });
+
+  it("refuses to re-close a batch member named by durable invalid evidence", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs, 100);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+    const first = await completeInvalidWorkItem({
+      run,
+      investigation,
+      outcome: provisional,
+      childIssues: [2, 3],
+    }, { host, artifacts });
+    host.closedIssues.delete(2);
+
+    await assert.rejects(
+      completeInvalidWorkItem({
+        run,
+        investigation,
+        outcome: provisional,
+        childIssues: [2, 3],
+      }, { host, artifacts }),
+      /names reopened issue #2.*refusing to re-close/i,
+    );
+    assert.equal(first.outcome.payload.childIssues.includes("issue-2"), true);
+    assert.deepEqual(host.closes, [2, 3, 100]);
+  });
+
   it("defaults to a human merge checkpoint without changing state", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);

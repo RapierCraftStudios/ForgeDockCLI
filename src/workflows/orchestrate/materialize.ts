@@ -78,11 +78,27 @@ export async function materializeBatchGroups(
     validateGraph(claimGraph.items);
     return { groups, materialized, validatedItems: claimGraph.items as BatchableWorkItem[] };
   } catch (error) {
-    await Promise.allSettled(createdIssueNumbers.map((issue) => input.host.closeIssue(
+    const cleanup = await Promise.allSettled(createdIssueNumbers.map((issue) => input.host.closeIssue(
       input.repo,
       issue,
       "ForgeDock closed this provisional batch issue because pre-dispatch validation failed; no controller was dispatched.",
     )));
+    const failures = cleanup.flatMap((result, index) => result.status === "rejected"
+      ? [{ issue: createdIssueNumbers[index]!, error: result.reason }]
+      : []);
+    if (failures.length) {
+      const orphaned = failures.map(({ issue }) => `#${issue}`).join(", ");
+      throw new AggregateError(
+        [
+          error,
+          ...failures.map(({ issue, error: cleanupError }) => new Error(
+            `Failed to close provisional batch issue #${issue}`,
+            { cause: cleanupError },
+          )),
+        ],
+        `Batch validation failed and provisional issues ${orphaned} could not be closed; manual cleanup is required`,
+      );
+    }
     throw error;
   }
 }

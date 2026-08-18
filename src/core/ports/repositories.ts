@@ -3,7 +3,7 @@
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot } from "./forge-host.js";
-import { MAX_ORCHESTRATION_PAGE_SIZE, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueNumbers, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
   repo: string;
@@ -150,6 +150,14 @@ export class InMemoryOrchestrationRepository implements OrchestrationRepository 
 
   async createOrchestration(record: OrchestrationRecord): Promise<void> {
     if (this.records.has(record.orchestrationId)) throw new Error(`Orchestration already exists: ${record.orchestrationId}`);
+    if (record.status === "running") {
+      const conflicts = findRunningOrchestrationIssueConflicts(
+        [...this.records.values()],
+        record.repository,
+        orchestrationRecordIssueNumbers(record),
+      );
+      if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
+    }
     this.records.set(record.orchestrationId, structuredClone(record));
   }
 
@@ -169,6 +177,14 @@ export class InMemoryOrchestrationRepository implements OrchestrationRepository 
     if (incomingAttempt > 0 && persistedAttempt === incomingAttempt
       && (record.executionClaimId ?? "") !== (current.executionClaimId ?? "")) {
       throw new Error(`Conflicting orchestration claim for ${record.orchestrationId}: execution attempt ${incomingAttempt} belongs to another controller`);
+    }
+    if (record.status === "running") {
+      const conflicts = findRunningOrchestrationIssueConflicts(
+        [...this.records.values()].filter((candidate) => candidate.orchestrationId !== record.orchestrationId),
+        record.repository,
+        orchestrationRecordIssueNumbers(record),
+      );
+      if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     }
     this.records.set(record.orchestrationId, structuredClone(record));
   }

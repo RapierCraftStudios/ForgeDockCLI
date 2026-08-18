@@ -17,6 +17,12 @@ describe("orchestrate argument parsing", () => {
     ]), [7]);
   });
 
+  it("does not treat numeric reviewer policy values as orchestration issues", () => {
+    assert.deepEqual(parseOrchestrationIssueNumbers([
+      "7", "--reviewer-model", "84", "--reviewer-thinking", "high",
+    ]), [7]);
+  });
+
   it("accepts positional issues on either side of switches and deduplicates them", () => {
     assert.deepEqual(parseOrchestrationIssueNumbers(["7", "8", "--scope-expansion", "scope-locked", "7"]), [7, 8]);
   });
@@ -33,6 +39,12 @@ describe("workflow subject parsing", () => {
     assert.equal(parseWorkOnIssueArgument([
       "--repo", "owner/repo", "--model", "42", "--thinking", "max", "73",
     ]), "73");
+  });
+
+  it("consumes reordered reviewer policy values before selecting the work-on issue", () => {
+    assert.equal(parseWorkOnIssueArgument([
+      "--reviewer-model", "anthropic/claude-sonnet-5", "--reviewer-thinking", "high", "84",
+    ]), "84");
   });
 
   it("selects a review PR after option values", () => {

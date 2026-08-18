@@ -321,6 +321,12 @@ export async function runSchedule(
   }
 
   while (running.size || queuedCount > 0) {
+    if (options.signal?.aborted && running.size) {
+      // Cancellation stops new launches immediately, but the controller must
+      // retain its execution claim until every admitted worker has settled.
+      await Promise.race(running.values());
+      continue;
+    }
     throwIfAborted();
     let waitingForCapacity = false;
     for (const item of orderedItems) {
@@ -367,10 +373,12 @@ export async function runSchedule(
     }
 
     for (const item of orderedItems) {
+      if (options.signal?.aborted) break;
       if (status.get(item.id) !== "queued"
         || !item.dependencies.every((id) => status.get(id) === "completed")
         || !(predecessorsBySuccessor.get(item.id) ?? []).every((id) => isTerminal(status.get(id)))) continue;
       const capacity = await readCapacity();
+      if (options.signal?.aborted) break;
       if (running.size >= capacity) {
         waitReasons.set(item.id, { kind: "capacity", maxParallel: capacity });
         waitingForCapacity ||= capacity === 0;
@@ -506,13 +514,16 @@ export async function runSchedule(
       // running. Poll alongside completion so newly available slots are
       // consumed without waiting for an unrelated worker to finish. A lower
       // capacity simply prevents additional launches until active work drains.
-      const capacityWait = dynamicCapacity ? waitForCapacity() : undefined;
+      const capacityWait = dynamicCapacity
+        ? new Promise<void>((resolve) => setTimeout(resolve, capacityPollMs))
+        : undefined;
       await Promise.race([
         ...running.values(),
         ...(capacityWait ? [capacityWait] : []),
       ]);
       continue;
     }
+    throwIfAborted();
     if (dynamicCapacity && waitingForCapacity && queuedCount > 0 && [...status.values()].some((value) => value === "queued")) {
       // There is ready work but no slot. Keep the queue durable and wait for a
       // fresh external capacity sample instead of failing a launch.
@@ -523,6 +534,7 @@ export async function runSchedule(
     // supervisor can resume the same DAG after durable child work completes.
     break;
   }
+  throwIfAborted();
   return {
     status,
     errors,

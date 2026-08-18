@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
+import { OrchestrationIssueOwnershipConflictError, type OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
@@ -207,6 +207,90 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("atomically rejects a fresh DAG that overlaps an active generated batch", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-orchestration-conflict-"));
+    const path = join(root, "state.db");
+    const store = new SqliteRepositories(path);
+    const active: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_batch",
+      repository: "a/b",
+      requestedIssueNumbers: [7, 8],
+      issueNumbers: [7, 8],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{ id: "issue-900", issue: 900, priority: 1, dependencies: [], claims: [], status: "running", childRunIds: [], memberIssues: [7, 8] }],
+    };
+    try {
+      await store.createOrchestration(active);
+      await assert.rejects(
+        store.createOrchestration({ ...active, orchestrationId: "dag_duplicate", requestedIssueNumbers: [8], issueNumbers: [8], nodes: [{ ...active.nodes[0]!, id: "issue-8", issue: 8, memberIssues: [8] }] }),
+        (error: unknown) => error instanceof OrchestrationIssueOwnershipConflictError
+          && /#8.*dag_batch/.test(error.message),
+      );
+      const readOnly = new SqliteRepositories(path, { readOnly: true });
+      try {
+        assert.equal((await readOnly.listRunningOrchestrations())[0]?.orchestrationId, "dag_batch");
+      } finally {
+        readOnly.close();
+      }
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("atomically rejects a running DAG update that acquires another DAG's issue", async () => {
+    const store = new SqliteRepositories(":memory:");
+    const parent: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_parent",
+      repository: "a/b",
+      requestedIssueNumbers: [1],
+      issueNumbers: [1],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{ id: "issue-1", issue: 1, priority: 1, dependencies: [], claims: [], status: "skipped", childRunIds: [] }],
+    };
+    const childOwner: OrchestrationRecord = {
+      ...parent,
+      orchestrationId: "dag_child_owner",
+      requestedIssueNumbers: [2],
+      issueNumbers: [2],
+      nodes: [{ ...parent.nodes[0]!, id: "issue-2", issue: 2, status: "running" }],
+    };
+    try {
+      await store.createOrchestration(parent);
+      await store.createOrchestration(childOwner);
+      const expanded: OrchestrationRecord = {
+        ...parent,
+        nodes: [{
+          ...parent.nodes[0]!,
+          attempts: [{
+            attemptId: "attempt-decomposed",
+            attempt: 1,
+            recovery: "initial",
+            status: "skipped",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:01.000Z",
+            completedAt: "2026-01-01T00:00:01.000Z",
+            decompositionChildren: [2],
+          }],
+        }],
+      };
+      await assert.rejects(store.saveOrchestration(expanded), /#2.*dag_child_owner/);
+      assert.deepEqual((await store.loadOrchestration("dag_parent"))?.nodes[0]?.attempts, undefined);
+    } finally {
+      store.close();
+    }
+  });
+
   it("atomically fences orchestration saves to the current lease and claim identity", async () => {
     const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
     let now = 1_000;
@@ -335,6 +419,24 @@ describe("SQLite operational repositories", () => {
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_050), undefined);
       assert.equal(store.heartbeat("issue-9", first.token, 100, 1_050).expiresAt, 1_150);
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects expired mutation guards before another holder takes over", () => {
+    const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
+    try {
+      let now = 1_050;
+      const lease = store.acquire("issue-guard", "worker-a", 100, 1_000);
+      assert.ok(lease);
+      const guard = store.guard("issue-guard", lease.token, () => now);
+
+      assert.doesNotThrow(() => guard.assertValid());
+      now = 1_100;
+      assert.throws(() => guard.check(), /expired/i);
+      assert.equal(store.inspect("issue-guard")?.token, lease.token, "guard expiry must retain takeover evidence");
+      assert.equal(store.acquire("issue-guard", "worker-b", 100, now)?.owner, "worker-b");
     } finally {
       store.close();
     }

@@ -83,6 +83,20 @@ test("native background controller records output and completion without blockin
   await tasks.shutdown();
 });
 
+test("failed native spawn is consumed without stranding a running task", async () => {
+  const { cwd, tasks, ctx } = fixture();
+  assert.throws(() => tasks.start({
+    command: join(cwd, "missing-forgedock-controller"),
+    args: [],
+    cwd,
+    ctx,
+  }), /failed to start/i);
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(tasks.list(), []);
+  await tasks.shutdown();
+});
+
 test("native controller launch is idempotent for one orchestration attempt", async () => {
   const { cwd, tasks, ctx, pi } = fixture();
   const launchKey = "dag_launch/node-1/attempt-1";
@@ -193,6 +207,55 @@ test("terminal restart adopts a still-live controller instead of marking it fail
   await second.shutdown();
 });
 
+test("terminal presentation does not warn for a bridge-bound controller owned by a live TUI", async () => {
+  const first = fixture();
+  const record = first.tasks.start({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    cwd: first.cwd,
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+    ctx: first.ctx,
+  });
+  const second = new ForgeDockBackgroundTasks(first.pi);
+
+  assert.deepEqual(second.pendingRestartRecords(first.ctx), []);
+  assert.equal(first.messages.some((message) => message.includes(record.id)), false);
+  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "running");
+  assert.equal(second.isOperationallyActive(record.id), false);
+
+  first.tasks.cancel(record.id);
+  await eventually(() => assert.equal(first.tasks.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
+  await first.tasks.shutdown();
+  await second.shutdown();
+});
+
+test("dispatch initialization leaves a live owner's bridge-bound controller untouched", async () => {
+  const first = fixture();
+  const record = first.tasks.start({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    cwd: first.cwd,
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "work-on",
+    ctx: first.ctx,
+  });
+  const second = new ForgeDockBackgroundTasks(first.pi);
+  second.initialize(first.ctx);
+
+  const persisted = JSON.parse(readFileSync(join(first.cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.status, "running");
+  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "running");
+  assert.equal(second.isOperationallyActive(record.id), false);
+  assert.equal(first.messages.some((message) => message.includes("interrupted during terminal restart")), false);
+  assert.doesNotThrow(() => process.kill(record.pid, 0));
+
+  first.tasks.cancel(record.id);
+  await eventually(() => assert.equal(first.tasks.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
+  await first.tasks.shutdown();
+  await second.shutdown();
+});
+
 test("terminal restart blocks bridge-bound controllers without persisting bridge credentials", async () => {
   const first = fixture();
   const record = first.tasks.start({
@@ -207,6 +270,10 @@ test("terminal restart blocks bridge-bound controllers without persisting bridge
     resumeScope: "orchestration",
     ctx: first.ctx,
   });
+  // A graceful owner teardown is the fail-closed handoff boundary. The
+  // controller remains alive here so the replacement must prove ownership is
+  // gone before terminating it.
+  await first.tasks.shutdown({ cancel: false });
   const second = new ForgeDockBackgroundTasks(first.pi);
   second.initialize(first.ctx);
 

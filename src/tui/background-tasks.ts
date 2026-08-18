@@ -49,9 +49,24 @@ export interface BackgroundTaskRecord {
   resumeScope?: BackgroundTaskResumeScope;
   /** Stable orchestration transport key; it is safe to persist and never contains credentials. */
   launchKey?: string;
+  /** Non-secret identity of the TUI supervisor that owns a bridge-bound task. */
+  ownerId?: string;
+  /** PID of the owning TUI supervisor, not the controller child. */
+  ownerPid?: number;
+  /** Last durable heartbeat written by the owning TUI supervisor. */
+  ownerHeartbeatAt?: string;
+  /** Set when the owner intentionally releases the task during session teardown. */
+  ownerReleasedAt?: string;
 }
 
 const MAX_BACKGROUND_TASKS = 4;
+/**
+ * The task supervisor heartbeat is operational evidence, not workflow truth.
+ * A live owner renews it from the existing task ticker; a replacement TUI
+ * requires both a live owner PID and a recent heartbeat before it leaves a
+ * bridge-bound controller alone.
+ */
+const SUPERVISOR_HEARTBEAT_TTL_MS = 15_000;
 
 interface LiveTask {
   record: BackgroundTaskRecord;
@@ -65,6 +80,7 @@ interface LiveTask {
 
 export class ForgeDockBackgroundTasks {
   readonly #pi: ExtensionAPI;
+  readonly #ownerId = crypto.randomUUID();
   readonly #live = new Map<string, LiveTask>();
   readonly #records = new Map<string, BackgroundTaskRecord>();
   readonly #directories = new Set<string>();
@@ -103,7 +119,8 @@ export class ForgeDockBackgroundTasks {
     this.bindContext(ctx);
     return [...this.recordsFromDisk().values()].filter((record) =>
       (record.status === "running" || record.status === "detached")
-      && record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED);
+      && record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED
+      && !this.bridgeOwnerIsLive(record));
   }
 
   /** Present a pending restart warning without adopting or terminalizing it. */
@@ -124,6 +141,15 @@ export class ForgeDockBackgroundTasks {
         const record = parsed;
         if (record.status === "running" || record.status === "detached") {
           if (record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED) {
+            // A second terminal can inspect the task directory while the
+            // original TUI still owns this controller and its in-memory
+            // nested-agent bridge. It must not present that healthy task as
+            // interrupted or terminate it merely because the bridge cannot
+            // be reattached by the second terminal.
+            if (this.bridgeOwnerIsLive(record)) {
+              this.#records.set(record.id, record);
+              continue;
+            }
             // The nested-agent bridge lives in the previous TUI process. It
             // cannot be reattached from a fresh terminal, so adopting this
             // controller would present a healthy PID with a dead reviewer
@@ -190,6 +216,10 @@ export class ForgeDockBackgroundTasks {
     const stderrLogPath = join(directory, `${id}.stderr.log`);
     const stdoutFd = openSync(logPath, "w");
     const stderrFd = openSync(stderrLogPath, "w");
+    let registered = false;
+    const onError = (error: Error) => {
+      if (registered) void this.finish(id, "failed", undefined, error.message);
+    };
     let child: ChildProcess;
     try {
       child = spawn(input.command, input.args, {
@@ -199,6 +229,7 @@ export class ForgeDockBackgroundTasks {
         detached: process.platform !== "win32",
         stdio: ["ignore", stdoutFd, stderrFd],
       });
+      child.once("error", onError);
     } catch (error) {
       closeSync(stdoutFd);
       closeSync(stderrFd);
@@ -220,19 +251,23 @@ export class ForgeDockBackgroundTasks {
       ...(input.restartRequired !== undefined ? { restartRequired: input.restartRequired } : {}),
       ...(input.resumeScope !== undefined ? { resumeScope: input.resumeScope } : {}),
       ...(input.launchKey !== undefined ? { launchKey: input.launchKey } : {}),
+      ...(input.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED ? {
+        ownerId: this.#ownerId,
+        ownerPid: process.pid,
+        ownerHeartbeatAt: new Date().toISOString(),
+      } : {}),
     };
     this.#ctx = input.ctx;
     const live: LiveTask = { record, child, stderrLogPath, stdoutOffset: 0, stderrOffset: 0, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) };
     this.#records.set(id, record);
     this.#live.set(id, live);
+    registered = true;
     this.persist(record);
     this.#observationAdapter?.started(record);
-    const onError = (error: Error) => void this.finish(id, "failed", undefined, error.message);
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
       const status: BackgroundTaskStatus = signal ? "cancelled" : code === 0 ? "completed" : code === 2 ? "blocked" : "failed";
       void this.finish(id, status, code ?? undefined);
     };
-    child.once("error", onError);
     child.once("exit", onExit);
     // Very short-lived controllers can exit between spawn() and listener
     // registration. Node retains their terminal fields, so reconcile once
@@ -345,11 +380,18 @@ export class ForgeDockBackgroundTasks {
       for (const task of live) this.cancel(task.record.id);
       await Promise.allSettled(live.map((task) => task.cleanup?.()));
     } else {
+      const persisted = this.recordsFromDisk();
       for (const task of live) {
+        const latest = persisted.get(task.record.id);
+        if (latest) task.record = latest;
+        if (task.record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED
+          && task.record.ownerId === this.#ownerId) {
+          task.record.ownerReleasedAt = new Date().toISOString();
+        }
         if (task.record.status === "running") {
           task.record.status = "detached";
-          this.persist(task.record);
         }
+        this.persist(task.record);
       }
     }
     this.#live.clear();
@@ -439,6 +481,7 @@ export class ForgeDockBackgroundTasks {
     if (this.#ticker) return;
     this.#ticker = setInterval(() => {
       for (const task of this.#live.values()) this.captureLogDeltas(task);
+      this.refreshBridgeOwnerHeartbeats();
       void this.reconcileAdoptedTasks();
       this.renderStatus();
     }, 1_000);
@@ -448,6 +491,21 @@ export class ForgeDockBackgroundTasks {
   private stopTicker(): void {
     if (this.#ticker) clearInterval(this.#ticker);
     this.#ticker = undefined;
+  }
+
+  /** Renew ownership without overwriting a replacement supervisor's result. */
+  private refreshBridgeOwnerHeartbeats(): void {
+    const persisted = this.recordsFromDisk();
+    const heartbeatAt = new Date().toISOString();
+    for (const task of this.#live.values()) {
+      if (task.adopted || task.record.restartRequired !== NESTED_AGENT_BRIDGE_RESTART_REQUIRED) continue;
+      const latest = persisted.get(task.record.id);
+      if (!latest || latest.ownerId !== this.#ownerId || latest.ownerPid !== process.pid || latest.ownerReleasedAt !== undefined) continue;
+      if (["completed", "blocked", "failed", "cancelled"].includes(latest.status)) continue;
+      task.record = { ...latest, ownerHeartbeatAt: heartbeatAt };
+      this.#records.set(task.record.id, task.record);
+      this.persist(task.record);
+    }
   }
 
   private reconcileAdoptedTasks(): void {
@@ -502,6 +560,10 @@ export class ForgeDockBackgroundTasks {
       // record and durable workflow checkpoint remain authoritative.
     }
   }
+
+  private bridgeOwnerIsLive(record: BackgroundTaskRecord): boolean {
+    return isBridgeOwnerLive(record, this.#ownerId);
+  }
 }
 
 function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
@@ -517,6 +579,10 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
     && (record.resumeScope === undefined || ["orchestration", "work-on", "review-pr-rerun", "promote", "workflow"].includes(record.resumeScope))
     && (record.launchKey === undefined || (typeof record.launchKey === "string" && record.launchKey.length > 0 && record.launchKey.length <= 512))
+    && (record.ownerId === undefined || (typeof record.ownerId === "string" && record.ownerId.length > 0 && record.ownerId.length <= 128))
+    && (record.ownerPid === undefined || (Number.isInteger(record.ownerPid) && (record.ownerPid ?? 0) > 0))
+    && (record.ownerHeartbeatAt === undefined || typeof record.ownerHeartbeatAt === "string")
+    && (record.ownerReleasedAt === undefined || typeof record.ownerReleasedAt === "string")
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
 }
 
@@ -593,6 +659,42 @@ function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Determine whether a bridge-bound controller still belongs to a live TUI.
+ *
+ * New records carry an owner identity and heartbeat. Older records have no
+ * owner metadata, so retain a deliberately narrow Unix compatibility probe:
+ * the controller must still be parented by a process whose command identifies
+ * the ForgeDock terminal. Unknown/ambiguous records remain fail-closed.
+ */
+function isBridgeOwnerLive(record: BackgroundTaskRecord, currentOwnerId: string): boolean {
+  if (record.ownerReleasedAt !== undefined) return false;
+  if (record.ownerId !== undefined || record.ownerPid !== undefined || record.ownerHeartbeatAt !== undefined) {
+    if (!record.ownerId || !record.ownerPid || !record.ownerHeartbeatAt) return false;
+    if (record.ownerId === currentOwnerId) return true;
+    if (!isProcessAlive(record.ownerPid)) return false;
+    const heartbeatAt = Date.parse(record.ownerHeartbeatAt);
+    return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= SUPERVISOR_HEARTBEAT_TTL_MS;
+  }
+  return legacyForgeDockParentIsLive(record.pid);
+}
+
+function legacyForgeDockParentIsLive(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return false;
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    const parentPid = Number(fields[1]);
+    if (!Number.isInteger(parentPid) || parentPid < 2 || !isProcessAlive(parentPid)) return false;
+    const command = readFileSync(`/proc/${parentPid}/cmdline`, "utf8").replaceAll("\0", " ");
+    return /(?:^|[\s/])forgedock(?:$|\s)|(?:^|[\s/])forgedock-(?:terminal|next)(?:\.m?js)?(?:$|\s)/i.test(command);
   } catch {
     return false;
   }

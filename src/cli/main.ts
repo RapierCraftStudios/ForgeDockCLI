@@ -69,6 +69,7 @@ import { createForgeDockObserver, type ForgeDockObserver } from "../observabilit
 import type { RunState } from "../core/state/machine.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
+import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
@@ -161,7 +162,14 @@ async function materializeCliDecomposition(input: {
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
-  const selected = new Set([...input.orchestration.issueNumbers, ...children]);
+  const dependencyNodes = [
+    ...input.orchestration.nodes.map((candidate) => ({
+      id: candidate.id,
+      issue: candidate.issue,
+      ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
+    })),
+    ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
+  ];
   const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
   const childItems: ScheduledWorkItem[] = [];
   for (const issue of snapshots) {
@@ -187,7 +195,7 @@ async function materializeCliDecomposition(input: {
       id: `issue-${issue.number}`,
       issue: issue.number,
       priority,
-      dependencies: dependencyIssueNumbersFromBodyCli(issue.body, selected).map((dependency) => `issue-${dependency}`),
+      dependencies: mapDecompositionDependencies(issue.number, issue.body, dependencyNodes),
       claims: affectedFiles.length ? [...affectedFiles] : [`component:${input.repository}`],
       targetBranch: lane.targetBranch,
       lane: lane.kind,
@@ -214,14 +222,6 @@ async function materializeCliDecomposition(input: {
   const serializationEdges = claimGraph.edges.filter((edge) =>
     childItems.some((child) => child.id === edge.predecessor || child.id === edge.successor));
   return { childIssues: children, items: childItems, serializationEdges };
-}
-
-function dependencyIssueNumbersFromBodyCli(body: string, selectedIssues: ReadonlySet<number>): number[] {
-  const section = /(?:^|\n)#{2,6}\s+(?:dependencies|prerequisites|blocked by)\s*\n([\s\S]*?)(?=\n#{2,6}\s|$)/i.exec(body)?.[1];
-  if (!section) return [];
-  return [...new Set([...section.matchAll(/(?<![A-Za-z0-9])#(\d+)\b/g)]
-    .map((match) => Number(match[1]))
-    .filter((issue) => Number.isSafeInteger(issue) && issue > 0 && selectedIssues.has(issue)))].sort((a, b) => a - b);
 }
 
 async function main(argv: string[]): Promise<void> {
@@ -1604,6 +1604,9 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (planningThinkingOption !== undefined && !THINKING_LEVELS.includes(planningThinkingOption as ThinkingLevel)) throw new Error(`Unsupported planning thinking level: ${planningThinkingOption}`);
   if (reviewerThinkingOption !== undefined && !THINKING_LEVELS.includes(reviewerThinkingOption as ThinkingLevel)) throw new Error(`Unsupported reviewer thinking level: ${reviewerThinkingOption}`);
   const reviewerSelection = splitConfiguredModel(reviewerModelOption);
+  if (reviewerModelOption !== undefined && reviewerSelection === undefined) {
+    throw new Error(`Reviewer model must use provider/model form: ${reviewerModelOption}`);
+  }
   const planningSelection = splitConfiguredModel(planningModelOption);
   const dispatchRuntime = resolveDispatchRuntime({
     config,

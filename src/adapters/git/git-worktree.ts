@@ -2,7 +2,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -46,12 +46,45 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
     const baseSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
-    await this.withRepositoryMetadataLock(async () => {
-      await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
-      await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
-    });
-    await this.installDependencies(path);
-    return { path, branch, baseRef: input.baseRef, baseSha };
+    let added = false;
+    try {
+      await this.withRepositoryMetadataLock(async () => {
+        const registeredBefore = await this.worktreeRegistered(path);
+        const branchBefore = await this.branchExists(branch);
+        try {
+          await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
+        } catch (error) {
+          const removeWorktree = !registeredBefore && await this.worktreeRegistered(path);
+          const removeBranch = !branchBefore && await this.branchExists(branch);
+          if (removeWorktree || removeBranch) {
+            try {
+              await this.rollbackCreatedWorktreeLocked(path, removeBranch ? branch : undefined, removeWorktree);
+            } catch (cleanupError) {
+              throw new AggregateError(
+                [error, cleanupError],
+                `Failed to add managed worktree ${path}, and rollback also failed`,
+              );
+            }
+          }
+          throw error;
+        }
+        added = true;
+        await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
+      });
+      await this.installDependencies(path);
+      return { path, branch, baseRef: input.baseRef, baseSha };
+    } catch (error) {
+      if (!added) throw error;
+      try {
+        await this.rollbackCreatedWorktree(path, branch);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Failed to prepare managed worktree ${path}, and rollback also failed`,
+        );
+      }
+      throw error;
+    }
   }
 
   async recover(input: { runId: string; issue: number; baseRef: string; baseSha?: string }): Promise<GitWorkspace> {
@@ -64,7 +97,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       if (existsSync(path)) {
         const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
         const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
-        if (root !== path || observedBranch !== branch) {
+        if (!sameFilesystemPath(root, path) || observedBranch !== branch) {
           throw new Error(`Retained workspace identity mismatch for ${path}: expected ${branch}, found ${observedBranch || "detached HEAD"}`);
         }
       } else {
@@ -102,9 +135,42 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     await mkdir(dirname(path), { recursive: true });
     const fetched = await this.fetchRemoteCommit(`refs/pull/${input.pr}/head`, this.#repo);
     if (fetched !== input.headSha) throw new Error(`Fetched review SHA ${fetched} does not match PR head ${input.headSha}`);
-    await this.withRepositoryMetadataLock(() => this.git(["worktree", "add", "--detach", path, fetched], this.#repo));
-    await this.installDependencies(path);
-    return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha, baseSha: input.headSha };
+    let added = false;
+    try {
+      await this.withRepositoryMetadataLock(async () => {
+        const registeredBefore = await this.worktreeRegistered(path);
+        try {
+          await this.git(["worktree", "add", "--detach", path, fetched], this.#repo);
+        } catch (error) {
+          const removeWorktree = !registeredBefore && await this.worktreeRegistered(path);
+          if (removeWorktree) {
+            try {
+              await this.rollbackCreatedWorktreeLocked(path, undefined, true);
+            } catch (cleanupError) {
+              throw new AggregateError(
+                [error, cleanupError],
+                `Failed to add review worktree ${path}, and rollback also failed`,
+              );
+            }
+          }
+          throw error;
+        }
+        added = true;
+      });
+      await this.installDependencies(path);
+      return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha, baseSha: input.headSha };
+    } catch (error) {
+      if (!added) throw error;
+      try {
+        await this.rollbackCreatedWorktree(path);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Failed to prepare review worktree ${path}, and rollback also failed`,
+        );
+      }
+      throw error;
+    }
   }
 
   async changedPaths(workspace: GitWorkspace): Promise<string[]> {
@@ -387,6 +453,35 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     });
   }
 
+  private async rollbackCreatedWorktree(path: string, branch?: string): Promise<void> {
+    assertInside(this.#root, path);
+    await this.withRepositoryMetadataLock(() => this.rollbackCreatedWorktreeLocked(path, branch, true));
+  }
+
+  private async rollbackCreatedWorktreeLocked(
+    path: string,
+    branch: string | undefined,
+    removeWorktree: boolean,
+  ): Promise<void> {
+    assertInside(this.#root, path);
+    const failures: unknown[] = [];
+    if (removeWorktree) {
+      try {
+        await this.git(["worktree", "remove", "--force", path], this.#repo);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (branch !== undefined) {
+      try {
+        await this.git(["branch", "-D", branch], this.#repo);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, `Unable to roll back managed worktree ${path}`);
+  }
+
   private workspaceIdentity(input: { runId: string; issue: number }): { branch: string; path: string } {
     const suffix = input.runId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(-24);
     const branch = `forgedock/issue-${input.issue}-${suffix}`;
@@ -567,6 +662,12 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         await new Promise<void>((resolveWait) => setTimeout(resolveWait, 100));
       }
     }
+  }
+
+  private async worktreeRegistered(path: string): Promise<boolean> {
+    const output = await this.git(["worktree", "list", "--porcelain", "-z"], this.#repo);
+    return output.split("\0").some((field) => field.startsWith("worktree ")
+      && sameFilesystemPath(field.slice("worktree ".length), path));
   }
 
   private async branchExists(branch: string): Promise<boolean> {
@@ -936,6 +1037,17 @@ function isSha(value: string): boolean { return /^[0-9a-f]{40,64}$/i.test(value)
 
 function assertSha(value: string, label: string): void {
   if (!isSha(value)) throw new Error(`${label} must be a full Git commit SHA`);
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const canonical = (path: string): string => {
+    try { return realpathSync.native(path); } catch { return resolve(path); }
+  };
+  const normalizedLeft = canonical(left);
+  const normalizedRight = canonical(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
 }
 
 function assertInside(root: string, candidate: string): void {

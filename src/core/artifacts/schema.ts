@@ -459,6 +459,8 @@ export const OutcomePayloadSchema = Type.Object({
   })),
   prUrl: Type.Optional(Type.String()),
   childIssues: Type.Array(Type.String()),
+  /** Batch members intentionally left open because closure-protected labels were present. */
+  preservedChildIssues: Type.Optional(Type.Array(Type.String())),
   batchParent: Type.Optional(Type.Integer({ minimum: 1 })),
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,

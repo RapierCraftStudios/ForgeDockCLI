@@ -69,7 +69,7 @@ export interface LeaseRepository {
   inspect?(itemId: string, now?: number): Lease | undefined;
   heartbeat(itemId: string, token: string, ttlMs: number, now?: number): Lease;
   release(itemId: string, token: string): boolean;
-  guard(itemId: string, token: string): LeaseGuard;
+  guard(itemId: string, token: string, now?: () => number): LeaseGuard;
   reEnroll(checkpoint: AuthenticatedLeaseCheckpoint): void;
   continuity(): LeaseWitnessSnapshot;
 }
@@ -182,15 +182,17 @@ export class InMemoryLeaseRepository implements LeaseRepository {
     return this.#leases.delete(itemId);
   }
 
-  guard(itemId: string, token: string): LeaseGuard {
-    return { assertValid: () => {
+  guard(itemId: string, token: string, now: () => number = Date.now): LeaseGuard {
+    const assertValid = (): void => {
       this.#assertContinuity();
       const lease = this.#leases.get(itemId);
       if (lease && this.#recoveryEpoch !== undefined && lease.epoch < this.#recoveryEpoch) {
         throw new LeaseContinuityError(`lease epoch is stale after re-enrollment for ${itemId}`);
       }
       if (!lease || lease.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
-    }, check: () => { this.guard(itemId, token).assertValid(); } };
+      if (lease.expiresAt <= now()) throw new LeaseContinuityError(`holder lease has expired for ${itemId}`);
+    };
+    return { assertValid, check: assertValid };
   }
 
   continuity(): LeaseWitnessSnapshot {

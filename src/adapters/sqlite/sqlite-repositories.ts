@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
-import { MAX_ORCHESTRATION_PAGE_SIZE, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueNumbers, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
@@ -19,11 +19,11 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   #recoveryEpoch: number | undefined;
   #leaseFailure: string | undefined;
 
-  constructor(path: string, options: { witness?: LeaseWitness } = {}) {
+  constructor(path: string, options: { witness?: LeaseWitness; readOnly?: boolean } = {}) {
     this.#witness = options.witness;
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.#database = new DatabaseSync(path);
-    initializeSqliteDatabase(this.#database, `
+    if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
+    this.#database = new DatabaseSync(path, options.readOnly ? { readOnly: true } : {});
+    if (!options.readOnly) initializeSqliteDatabase(this.#database, `
       CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -105,6 +105,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE INDEX IF NOT EXISTS promotions_updated ON promotion_records(updated_at);
     `);
+    if (options.readOnly) return;
     // Existing operational stores predate fencing. They are retained for
     // inspection, but lease use remains fail-closed until a witness is bound.
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
@@ -152,10 +153,23 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async createOrchestration(record: OrchestrationRecord): Promise<void> {
-    await withSqliteBusyRetry(() => this.#database.prepare(`
-      INSERT INTO orchestrations (orchestration_id, repository, status, updated_at, record_json)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(record.orchestrationId, record.repository, record.status, record.updatedAt, JSON.stringify(record)));
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      if (record.status === "running") {
+        const rows = this.#database.prepare("SELECT record_json FROM orchestrations WHERE status = 'running'")
+          .all() as Array<{ record_json: string }>;
+        const existing = rows.map((row) => JSON.parse(row.record_json) as OrchestrationRecord);
+        const conflicts = findRunningOrchestrationIssueConflicts(
+          existing,
+          record.repository,
+          orchestrationRecordIssueNumbers(record),
+        );
+        if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
+      }
+      this.#database.prepare(`
+        INSERT INTO orchestrations (orchestration_id, repository, status, updated_at, record_json)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(record.orchestrationId, record.repository, record.status, record.updatedAt, JSON.stringify(record));
+    }));
   }
 
   async loadOrchestration(orchestrationId: string): Promise<OrchestrationRecord | undefined> {
@@ -415,17 +429,19 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     });
   }
 
-  guard(itemId: string, token: string): LeaseGuard {
-    return { assertValid: () => {
+  guard(itemId: string, token: string, now: () => number = Date.now): LeaseGuard {
+    const assertValid = (): void => {
       this.inTransaction(() => {
         this.#assertLeaseContinuity();
-        const row = this.#database.prepare("SELECT token, epoch FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number } | undefined;
+        const row = this.#database.prepare("SELECT token, epoch, expires_at FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number; expires_at: number } | undefined;
         if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
           throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
         }
         if (!row || row.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
+        if (row.expires_at <= now()) throw new LeaseContinuityError(`holder lease has expired for ${itemId}`);
       });
-    }, check: () => { this.guard(itemId, token).assertValid(); } };
+    };
+    return { assertValid, check: assertValid };
   }
 
   continuity(): LeaseWitnessSnapshot {
@@ -511,6 +527,17 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         && (record.executionClaimId ?? "") !== (persisted.executionClaimId ?? "")) {
         throw new Error(`Conflicting orchestration claim for ${record.orchestrationId}: execution attempt ${incomingAttempt} belongs to another controller`);
       }
+    }
+    if (record.status === "running") {
+      const rows = this.#database.prepare(
+        "SELECT record_json FROM orchestrations WHERE status = 'running' AND orchestration_id <> ?",
+      ).all(record.orchestrationId) as Array<{ record_json: string }>;
+      const conflicts = findRunningOrchestrationIssueConflicts(
+        rows.map((row) => JSON.parse(row.record_json) as OrchestrationRecord),
+        record.repository,
+        orchestrationRecordIssueNumbers(record),
+      );
+      if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     }
     this.#database.prepare(`
       INSERT INTO orchestrations (orchestration_id, repository, status, updated_at, record_json)

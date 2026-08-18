@@ -18,6 +18,7 @@ class FakeBatchHost implements BatchMaterializationHost {
   closes = 0;
   nextIssue = 20;
   readonly closedIssues: number[] = [];
+  readonly closeFailures = new Set<number>();
   readonly issues = new Map<number, IssueSnapshot>([
     [1, { repo: "owner/repo", number: 1, title: "One", body: "## Affected Files\n- `src/api/a.ts`", url: "https://example.test/issues/1", state: "OPEN" }],
     [2, { repo: "owner/repo", number: 2, title: "Two", body: "## Affected Files\n- `src/api/a.ts`", url: "https://example.test/issues/2", state: "OPEN" }],
@@ -34,8 +35,33 @@ class FakeBatchHost implements BatchMaterializationHost {
   }
   async closeIssue(_repo: string, issue: number): Promise<void> {
     this.closes++;
+    if (this.closeFailures.has(issue)) throw new Error(`close failed for #${issue}`);
     this.closedIssues.push(issue);
   }
+}
+
+function rollbackFixture(host: FakeBatchHost) {
+  for (const issue of [3, 4, 5, 6]) {
+    host.issues.set(issue, {
+      repo: "owner/repo",
+      number: issue,
+      title: `Issue ${issue}`,
+      body: "## Affected Files\n- `src/api/a.ts`",
+      url: `https://example.test/issues/${issue}`,
+      state: issue === 6 ? "CLOSED" : "OPEN",
+    });
+  }
+  const items = [1, 2, 3, 4, 5, 6].map((issue) => item(issue));
+  return {
+    items,
+    groups: [0, 2, 4].map((start, index) => ({
+      id: `batch:${index}`,
+      kind: "same-file" as const,
+      key: "src/api/a.ts",
+      riskClass: "routine" as const,
+      members: items.slice(start, start + 2),
+    })),
+  };
 }
 
 describe("authoritative batch materialization", () => {
@@ -71,6 +97,43 @@ describe("authoritative batch materialization", () => {
     );
     assert.equal(host.writes, 1);
     assert.deepEqual(host.closedIssues, [20]);
+  });
+
+  it("reports only provisional issues whose rollback failed", async () => {
+    const host = new FakeBatchHost();
+    const fixture = rollbackFixture(host);
+    host.closeFailures.add(20);
+
+    await assert.rejects(
+      materializeBatchGroups({ repo: "owner/repo", ...fixture, host }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.match(error.message, /#20.*manual cleanup/i);
+        assert.doesNotMatch(error.message, /#21/);
+        assert.match(String(error.errors[0]), /Cannot batch #6: issue is closed/);
+        assert.match(String(error.errors[1]), /provisional batch issue #20/);
+        return true;
+      },
+    );
+    assert.deepEqual(host.closedIssues, [21]);
+  });
+
+  it("reports every orphan when all provisional rollback attempts fail", async () => {
+    const host = new FakeBatchHost();
+    const fixture = rollbackFixture(host);
+    host.closeFailures.add(20);
+    host.closeFailures.add(21);
+
+    await assert.rejects(
+      materializeBatchGroups({ repo: "owner/repo", ...fixture, host }),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.match(error.message, /#20, #21.*manual cleanup/i);
+        assert.equal(error.errors.length, 3);
+        return true;
+      },
+    );
+    assert.deepEqual(host.closedIssues, []);
   });
 
   it("accepts the controller's Markdown Source field during source-PR revalidation", async () => {

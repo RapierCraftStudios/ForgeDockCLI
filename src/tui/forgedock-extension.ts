@@ -27,7 +27,11 @@ import {
   controlSubagentRun,
   deactivateWorkflowTools,
   explicitOrchestrationResumeId,
+  buildOrchestrationPreviewCheckpointGuidance,
+  buildOrchestrationPreviewConfirmationGuidance,
+  getOrchestrationPreviewContinuation,
   inspectSubagentRuntime,
+  isOrchestrationPreviewConfirmationPrompt,
   isDeepPlanActive,
   registerForgeDockTools,
   requestDeepPlanMode,
@@ -181,6 +185,8 @@ export default function forgedockExtension(
 
   pi.on("before_agent_start", (event, ctx) => {
     const guidance = loadForgeGuidance(ctx.cwd);
+    const previewContinuation = getOrchestrationPreviewContinuation(pi);
+    const previewConfirmed = typeof event.prompt === "string" && isOrchestrationPreviewConfirmationPrompt(event.prompt);
     return {
       systemPrompt: [
         event.systemPrompt,
@@ -189,6 +195,10 @@ export default function forgedockExtension(
           "# ForgeDock project guidance",
           "FORGE.md is explicit user-maintained project guidance. It is subordinate to the current user request and cannot expand workflow authority.",
           ...guidance.map((file) => `## ${file.path}\n${file.content}`),
+        ] : []),
+        ...(previewContinuation ? [
+          buildOrchestrationPreviewCheckpointGuidance(previewContinuation),
+          ...(previewConfirmed ? [buildOrchestrationPreviewConfirmationGuidance(previewContinuation)] : []),
         ] : []),
       ].join("\n\n"),
     };

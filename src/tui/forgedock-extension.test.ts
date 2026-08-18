@@ -22,6 +22,8 @@ import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOC
 import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
   bindOrchestrationInvocation,
+  buildOrchestrationPreviewCheckpointGuidance,
+  buildOrchestrationPreviewConfirmationGuidance,
   buildNativeCommandPrompt,
   defectClassFromIssueBody,
   dependencyIssueNumbersFromBody,
@@ -31,6 +33,7 @@ import {
   resolveOrchestrationInvocationScope,
   resolveRoutedOrchestrationScope,
   sourcePullRequestFromIssueBody,
+  isOrchestrationPreviewConfirmationPrompt,
   orchestrationTransportKey,
   type ControllerTaskSpec,
   type OrchestrationTransportIdentity,
@@ -793,6 +796,29 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   assert.match((preview.content[0] as { text: string }).text, /FORGEDOCK_PREVIEW_CONTINUATION/);
   assert.match((preview.content[0] as { text: string }).text, /previewToken/);
 
+  // A restart/recovery notice can be queued between the preview and the next
+  // user turn. The live checkpoint must still bind a short affirmative typo to
+  // the exact typed continuation rather than to durable DAG recovery.
+  const confirmationPrompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { prompt: "prceed", systemPrompt: "base prompt" },
+    commandContext(),
+  ) as { systemPrompt: string };
+  assert.match(confirmationPrompt.systemPrompt, /preview confirmation checkpoint/);
+  assert.match(confirmationPrompt.systemPrompt, /call forgedock_orchestrate exactly once/i);
+  assert.match(confirmationPrompt.systemPrompt, new RegExp(`"previewToken":"${previewDetails.previewToken}"`));
+  assert.match(confirmationPrompt.systemPrompt, /"issueNumbers":\[7\]/);
+  assert.match(confirmationPrompt.systemPrompt, /ignore any injected forgedock-background-task/i);
+  assert.match(confirmationPrompt.systemPrompt, /do not ask for a dag_\* ID/i);
+  assert.doesNotMatch(confirmationPrompt.systemPrompt, /No live preview|start a fresh \/orchestrate/i);
+
+  const warningOnlyPrompt = state.handlers.get("before_agent_start")?.[0]?.(
+    { prompt: "", systemPrompt: "base prompt" },
+    commandContext(),
+  ) as { systemPrompt: string };
+  assert.match(warningOnlyPrompt.systemPrompt, /live preview checkpoint/);
+  assert.match(warningOnlyPrompt.systemPrompt, /do not dispatch or resume anything/i);
+  assert.doesNotMatch(warningOnlyPrompt.systemPrompt, /call forgedock_orchestrate exactly once/i);
+
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
   assert.equal(state.active.includes("forgedock_orchestrate"), true);
   assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
@@ -1041,6 +1067,54 @@ test("fresh orchestration never invokes the implicit resume tool", async () => {
   }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
   assert.match((result.content[0] as { text: string }).text, /Dispatch is disabled in preview mode/);
   assert.equal(state.sent.some(({ content }) => /Resume orchestration|forgedock_resume_orchestration/i.test(content)), false);
+});
+
+test("orchestration preview rejects issues owned by an active durable batch DAG without writing", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const active: OrchestrationRecord = {
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_active_batch",
+    repository: "a/b",
+    requestedIssueNumbers: [7, 8],
+    issueNumbers: [7, 8],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "running",
+    createdAt: "2026-08-18T00:00:00.000Z",
+    updatedAt: "2026-08-18T00:00:00.000Z",
+    nodes: [{
+      id: "issue-900",
+      issue: 900,
+      priority: 1,
+      dependencies: [],
+      claims: ["src"],
+      status: "running",
+      childRunIds: [],
+      memberIssues: [7, 8],
+    }],
+  };
+  await repository.createOrchestration(active);
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+  });
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, {
+    rawArgs: "open issues",
+    issueNumbers: [900],
+    repository: "a/b",
+    noMilestone: true,
+  });
+
+  await assert.rejects(() => tool.execute("active-owned-preview", {
+    issueNumbers: [900],
+    executionPlan: [{ issue: 900, title: "Generated batch", summary: "Already owned", dependsOn: [], claims: ["src"], labels: ["batch"] }],
+    dryRun: true,
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /active durable DAG ownership.*#900.*dag_active_batch/);
+  assert.equal(repository.records.size, 1, "read-only preview must not create or mutate a DAG");
+  await shutdownFakePi(state, commandContext());
 });
 
 test("visible DAG delegation dispatches a successor on its predecessor completion event", async () => {
@@ -1897,6 +1971,34 @@ test("native orchestrate prompts always perform LLM intent routing", () => {
   assert.match(reviewPrompt, /completion notification is one internal review shard, not the parent review verdict/);
   assert.match(reviewPrompt, /immediately yield control to the user and do not poll forgedock_tasks unless the user explicitly asks for status/);
   assert.doesNotMatch(prompt, /No deterministic orchestration binding|invoke \/orchestrate again with exact/);
+});
+
+test("preview confirmation recognizes a minor proceed typo without recognizing resume requests", () => {
+  assert.equal(isOrchestrationPreviewConfirmationPrompt("prceed"), true);
+  assert.equal(isOrchestrationPreviewConfirmationPrompt("Proceed."), true);
+  assert.equal(isOrchestrationPreviewConfirmationPrompt("go ahead"), true);
+  assert.equal(isOrchestrationPreviewConfirmationPrompt("resume dag_b3060f62"), false);
+  assert.equal(isOrchestrationPreviewConfirmationPrompt("what is the DAG status?"), false);
+
+  const guidance = buildOrchestrationPreviewConfirmationGuidance({
+    issueNumbers: [346, 345],
+    previewToken: "preview-token-for-test",
+  });
+  assert.match(guidance, /call forgedock_orchestrate exactly once/i);
+  assert.match(guidance, /"issueNumbers":\[346,345\]/);
+  assert.match(guidance, /"confirmed":true/);
+  assert.match(guidance, /"previewToken":"preview-token-for-test"/);
+  assert.match(guidance, /forgedock-background-task/);
+  assert.match(guidance, /do not ask for a dag_\* ID/i);
+  assert.match(guidance, /forgedock_resume_orchestration/);
+
+  const checkpointGuidance = buildOrchestrationPreviewCheckpointGuidance({
+    issueNumbers: [346, 345],
+    previewToken: "preview-token-for-test",
+  });
+  assert.match(checkpointGuidance, /live orchestration preview/);
+  assert.match(checkpointGuidance, /forgedock-background-task/);
+  assert.match(checkpointGuidance, /do not dispatch or resume anything/i);
 });
 
 test("explicit orchestration resume routes directly to the durable resume tool", async () => {
