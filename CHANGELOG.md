@@ -8,6 +8,7 @@
 ### Fixed
 
 - SQLite repository and observation-store startup now retries transient WAL/schema initialization contention across simultaneous processes, preventing a cross-process constructor race from surfacing as `database is locked`.
+- Native controller tasks bound to the TUI's ephemeral nested-agent bridge are no longer adopted as healthy after a terminal restart; they are terminated, durably marked blocked with a non-secret resume-required marker, and reported with an explicit orchestration-resume handoff while preserving workflow checkpoints.
 - Failed Node test verification now retains a bounded, redacted failing-test name, location, and assertion excerpt instead of collapsing actionable diagnostics to a generic `ERR_ASSERTION` signature.
 - Verification descendants now run without inherited controller, orchestration, task, or Pi-agent mode markers, so the repository's own tests cannot accidentally take a native controller path while preserving the sealed verification toolchain and ordinary provider/model configuration.
 - GitHub merge admission now preserves confirmed conflicts separately from transient UNKNOWN or unavailable mergeability, performs a bounded UNKNOWN refresh only for auto-merge, and records transport/computation blockers without presenting them as an awaiting-human merge.

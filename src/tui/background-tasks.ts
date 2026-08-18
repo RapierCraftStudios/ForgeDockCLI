@@ -11,6 +11,20 @@ import type { ObservationSink } from "../observability/contracts.js";
 
 export type BackgroundTaskStatus = "running" | "detached" | "completed" | "blocked" | "failed" | "cancelled";
 
+/**
+ * A native controller can depend on an in-memory transport owned by the TUI.
+ * Keep this marker deliberately non-secret: the bridge URL and bearer token
+ * stay in the child environment and are never written to the task record.
+ */
+export const NESTED_AGENT_BRIDGE_RESTART_REQUIRED = "nested-agent-bridge" as const;
+export type BackgroundTaskRestartRequirement = typeof NESTED_AGENT_BRIDGE_RESTART_REQUIRED;
+export type BackgroundTaskResumeScope = "orchestration" | "workflow";
+
+const ORCHESTRATION_RESUME_MESSAGE =
+  "The owning orchestration checkpoint is preserved; resume it explicitly with forgedock_resume_orchestration.";
+const WORKFLOW_RESUME_MESSAGE =
+  "The owning workflow checkpoint is preserved; resume that ForgeDock workflow explicitly from its durable checkpoint.";
+
 export interface BackgroundTaskRecord {
   id: string;
   command: string;
@@ -23,6 +37,10 @@ export interface BackgroundTaskRecord {
   startedAt: string;
   completedAt?: string;
   exitCode?: number;
+  /** Non-secret operational binding; never store bridge URL/token here. */
+  restartRequired?: BackgroundTaskRestartRequirement;
+  /** Non-secret routing hint for the durable recovery handoff. */
+  resumeScope?: BackgroundTaskResumeScope;
 }
 
 const MAX_BACKGROUND_TASKS = 4;
@@ -71,6 +89,21 @@ export class ForgeDockBackgroundTasks {
         if (!isBackgroundTaskRecord(parsed) || !recordBelongsToTaskFile(parsed, directory, name)) continue;
         const record = parsed;
         if (record.status === "running" || record.status === "detached") {
+          if (record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED) {
+            // The nested-agent bridge lives in the previous TUI process. It
+            // cannot be reattached from a fresh terminal, so adopting this
+            // controller would present a healthy PID with a dead reviewer
+            // transport. Stop it and make the interruption an explicit,
+            // resumable checkpoint instead.
+            if (isProcessAlive(record.pid)) terminateProcessTree(record.pid);
+            record.status = "blocked";
+            record.completedAt ??= new Date().toISOString();
+            record.exitCode ??= 2;
+            this.persist(record);
+            this.notifyRestartRequired(record);
+            this.#records.set(record.id, record);
+            continue;
+          }
           record.status = "detached";
           if (isProcessAlive(record.pid)) {
             // A terminal restart must not turn a still-running controller into a
@@ -103,6 +136,8 @@ export class ForgeDockBackgroundTasks {
     cwd: string;
     env?: Record<string, string>;
     cleanup?: () => Promise<void>;
+    restartRequired?: BackgroundTaskRestartRequirement;
+    resumeScope?: BackgroundTaskResumeScope;
     ctx: ExtensionContext;
   }): BackgroundTaskRecord {
     if (this.#live.size >= MAX_BACKGROUND_TASKS) {
@@ -143,6 +178,8 @@ export class ForgeDockBackgroundTasks {
       stderrLogPath,
       status: "running",
       startedAt: new Date().toISOString(),
+      ...(input.restartRequired !== undefined ? { restartRequired: input.restartRequired } : {}),
+      ...(input.resumeScope !== undefined ? { resumeScope: input.resumeScope } : {}),
     };
     this.#ctx = input.ctx;
     const live: LiveTask = { record, child, stderrLogPath, stdoutOffset: 0, stderrOffset: 0, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) };
@@ -275,7 +312,15 @@ export class ForgeDockBackgroundTasks {
     if (!live || (observationAdapter && this.#finishing.has(id))) return;
     if (observationAdapter) this.#finishing.add(id);
     try {
-      if (live.record.status !== "cancelled") live.record.status = status;
+      // A previous supervisor may still observe the process exit after the
+      // replacement TUI has durably blocked a bridge-bound task. Preserve that
+      // restart classification instead of letting the old supervisor turn it
+      // back into an ordinary failed/cancelled result.
+      const persisted = this.recordsFromDisk().get(id);
+      const restartBlocked = persisted?.status === "blocked"
+        && persisted.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED;
+      if (persisted) live.record = persisted;
+      if (!restartBlocked && live.record.status !== "cancelled") live.record.status = status;
       live.record.completedAt ??= new Date().toISOString();
       if (exitCode !== undefined) live.record.exitCode = exitCode;
       this.captureLogDeltas(live);
@@ -386,6 +431,18 @@ export class ForgeDockBackgroundTasks {
     const elapsed = recent ? Math.max(0, Math.round((Date.now() - Date.parse(recent.startedAt)) / 1_000)) : 0;
     this.#ctx.ui.setStatus("forgedock-tasks", `◆ ${running.length} background task${running.length === 1 ? "" : "s"} · ${recent?.id ?? ""} · ${elapsed}s`);
   }
+
+  private notifyRestartRequired(record: BackgroundTaskRecord): void {
+    const resumeMessage = record.resumeScope === "orchestration" ? ORCHESTRATION_RESUME_MESSAGE : WORKFLOW_RESUME_MESSAGE;
+    const message = `${renderRecord(record)} — interrupted during terminal restart because its ephemeral nested-agent bridge cannot be reattached. ${resumeMessage}`;
+    this.#ctx?.ui.notify(message, "warning");
+    try {
+      this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
+    } catch {
+      // Session startup/teardown can race notification delivery; the blocked
+      // record and durable workflow checkpoint remain authoritative.
+    }
+  }
 }
 
 function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
@@ -398,6 +455,8 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && Number.isInteger(record.pid) && (record.pid ?? 0) > 0
     && typeof record.logPath === "string" && Boolean(record.logPath)
     && typeof record.startedAt === "string"
+    && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
+    && (record.resumeScope === undefined || ["orchestration", "workflow"].includes(record.resumeScope))
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
 }
 
@@ -442,7 +501,10 @@ function readLogDelta(path: string | undefined, offset: number): { text: string;
 }
 
 export function renderRecord(record: BackgroundTaskRecord): string {
-  return `${record.id} · ${record.status}${record.exitCode !== undefined ? ` (exit ${record.exitCode})` : ""} · pid ${record.pid} · ${record.args.slice(1, 3).join(" ") || record.command}`;
+  const restartHint = record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED && record.status === "blocked"
+    ? " · resume required after TUI restart"
+    : "";
+  return `${record.id} · ${record.status}${record.exitCode !== undefined ? ` (exit ${record.exitCode})` : ""}${restartHint} · pid ${record.pid} · ${record.args.slice(1, 3).join(" ") || record.command}`;
 }
 
 export function terminateProcessTree(childOrPid: ChildProcess | number): void {

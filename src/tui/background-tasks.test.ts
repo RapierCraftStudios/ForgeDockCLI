@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ForgeDockBackgroundTasks } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import { ForgeDockObserver } from "../observability/observer.js";
 import { SqliteObservationStore } from "../observability/sqlite-store.js";
 
@@ -163,6 +163,60 @@ test("terminal restart adopts a still-live controller instead of marking it fail
   await eventually(() => assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
   await first.tasks.shutdown();
   await second.shutdown();
+});
+
+test("terminal restart blocks bridge-bound controllers without persisting bridge credentials", async () => {
+  const first = fixture();
+  const record = first.tasks.start({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    cwd: first.cwd,
+    env: {
+      FORGEDOCK_NESTED_AGENT_URL: "http://127.0.0.1:45678/v1/run",
+      FORGEDOCK_NESTED_AGENT_TOKEN: "bridge-secret-that-must-not-persist",
+    },
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+    ctx: first.ctx,
+  });
+  const second = new ForgeDockBackgroundTasks(first.pi);
+  second.initialize(first.ctx);
+
+  const persisted = JSON.parse(readFileSync(join(first.cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.status, "blocked");
+  assert.equal(persisted.restartRequired, NESTED_AGENT_BRIDGE_RESTART_REQUIRED);
+  assert.equal(persisted.resumeScope, "orchestration");
+  assert.doesNotMatch(JSON.stringify(persisted), /FORGEDOCK_NESTED_AGENT|bridge-secret|45678/);
+  assert.equal(second.isOperationallyActive(record.id), false);
+  assert.match(second.output(record.id), /resume required after TUI restart/);
+  assert.match(first.messages.at(-1) ?? "", /forgedock_resume_orchestration/);
+  await eventually(() => assert.throws(() => process.kill(record.pid, 0)));
+
+  await first.tasks.shutdown({ cancel: false });
+  await second.shutdown();
+});
+
+test("older bridge-bound records without a resume scope remain parseable", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const id = "task_legacy_bridge";
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: 999_999_999,
+    logPath: join(directory, `${id}.log`),
+    status: "detached",
+    startedAt: new Date().toISOString(),
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+  }));
+  tasks.initialize(ctx);
+  assert.equal(tasks.list().find((record) => record.id === id)?.status, "blocked");
+  assert.doesNotMatch(messages.at(-1) ?? "", /forgedock_resume_orchestration/);
+  assert.match(messages.at(-1) ?? "", /owning workflow checkpoint/);
+  await tasks.shutdown();
 });
 
 test("an adopter preserves the original supervisor's durable completion result", async () => {

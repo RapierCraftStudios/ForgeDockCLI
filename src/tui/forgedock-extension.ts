@@ -248,8 +248,11 @@ export default function forgedockExtension(
 
   pi.on("session_shutdown", async () => {
     // Native controller processes own durable work. Ordinary terminal/session
-    // teardown detaches them so the next supervisor can reconcile or resume;
-    // explicit forgedock_tasks cancellation remains destructive.
+    // teardown detaches them; the next supervisor adopts only tasks whose
+    // transport is reconnectable. Controllers bound to the in-memory nested
+    // reviewer bridge are durably blocked on restart and must resume from the
+    // workflow checkpoint. Explicit forgedock_tasks cancellation remains
+    // destructive.
     await backgroundTasks.shutdown({ cancel: false });
     backgroundTasks.setObservationSink(undefined);
     await observer?.flush();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/o
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
+import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
@@ -189,6 +190,41 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate", "forgedock_ask_user"]);
+});
+
+test("session restart reports bridge-bound controller recovery as an explicit resume", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-extension-restart-"));
+  const tasksDirectory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(tasksDirectory, { recursive: true });
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { cwd, detached: true, stdio: "ignore" });
+  assert.ok(child.pid);
+  child.unref();
+  const taskId = "task_restart_bridge";
+  const logPath = join(tasksDirectory, `${taskId}.log`);
+  writeFileSync(join(tasksDirectory, `${taskId}.json`), JSON.stringify({
+    id: taskId,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: child.pid,
+    logPath,
+    status: "detached",
+    startedAt: new Date().toISOString(),
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "workflow",
+  }));
+  const state = fakePi();
+  const context = { ...jsonSessionContext(), cwd };
+  try {
+    await state.handlers.get("session_start")?.[0]?.({}, context);
+    const message = state.sent.map((entry) => entry.content).find((content) => content.includes(taskId));
+    assert.match(message ?? "", /ephemeral nested-agent bridge cannot be reattached/);
+    assert.match(message ?? "", /owning workflow checkpoint/);
+    assert.doesNotMatch(message ?? "", /forgedock_resume_orchestration/);
+    await state.handlers.get("session_shutdown")?.[0]?.({}, context);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("assistant mode keeps generic PR requests on normal GitHub tooling", async () => {

@@ -72,7 +72,7 @@ import {
 } from "../runtime/orchestration-claim-transport.js";
 import { startNestedAgentBridge } from "./nested-agent-bridge.js";
 import { runDecisionFlow, validateDecisionFlow, type DecisionFlowInput, type DecisionFlowResult } from "./decision-flow.js";
-import { ForgeDockBackgroundTasks, renderRecord, terminateProcessTree, type BackgroundTaskRecord } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, renderRecord, terminateProcessTree, type BackgroundTaskRecord } from "./background-tasks.js";
 import { classifyIssueLane, provisionMissingMilestoneBranches, resolveIssueLane } from "../workflows/work-on/lane.js";
 import {
   OrchestrationBoardController,
@@ -3086,6 +3086,8 @@ async function startNativeControllerTask(
       args: [entry, "work-on", ...spec.args, ...workerArgs],
       cwd: spec.cwd,
       env,
+      restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+      resumeScope: "orchestration",
       cleanup: async () => {
         await Promise.all([
           nestedBridge.close(),
@@ -3135,6 +3137,8 @@ async function runControllerToolBackground(
       args: [entry, command, ...args, ...modelArgs],
       cwd: ctx.cwd,
       env,
+      restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+      resumeScope: "workflow",
       cleanup: () => nestedBridge.close(),
       ctx,
     });

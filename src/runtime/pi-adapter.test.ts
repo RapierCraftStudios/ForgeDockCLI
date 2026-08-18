@@ -118,6 +118,26 @@ test("nested reviewer transport rejects non-loopback bridge destinations", async
   );
 });
 
+test("a stale nested reviewer bridge fails closed without exposing its bearer token", async () => {
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  const token = "stale-bridge-token-must-not-appear";
+  process.env.FORGEDOCK_NESTED_AGENT_URL = "http://127.0.0.1:1/v1/run";
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = token;
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  try {
+    await assert.rejects(runtime.run(taskForRole("reviewer") as any), (error: any) => {
+      assert.equal(error.name, "AgentRunError");
+      assert.match(error.message, /Nested reviewer transport failed/);
+      assert.doesNotMatch(error.message, /stale-bridge-token|authorization|Bearer/i);
+      return true;
+    });
+  } finally {
+    await runtime.close();
+    restoreNestedEnvironment(previousUrl, previousToken);
+  }
+});
+
 test("nested reviewer transport bounds response buffering", async () => {
   const endpoint = await listen((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
