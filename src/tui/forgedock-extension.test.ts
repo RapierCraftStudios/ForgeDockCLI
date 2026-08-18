@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
@@ -30,6 +30,9 @@ import {
   type ControllerTaskSpec,
   VisibleDagDelegator,
 } from "./forgedock-tools.js";
+
+const isolatedSessionCwd = mkdtempSync(join(tmpdir(), "forgedock-extension-session-"));
+after(() => rmSync(isolatedSessionCwd, { recursive: true, force: true }));
 
 interface FakePiState {
   pi: ExtensionAPI;
@@ -129,6 +132,14 @@ function commandContext(idle = true): ExtensionCommandContext {
   } as unknown as ExtensionCommandContext;
 }
 
+function jsonSessionContext(): ExtensionCommandContext {
+  return {
+    ...commandContext(),
+    cwd: isolatedSessionCwd,
+    mode: "json",
+  } as unknown as ExtensionCommandContext;
+}
+
 function createGitCheckout(parent: string, name: string, remote: string): string {
   const checkout = join(parent, name);
   mkdirSync(checkout, { recursive: true });
@@ -144,7 +155,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
     ["forgedock_ask_user", "forgedock_configure", "forgedock_deep_plan", "forgedock_memory_search", "forgedock_orchestrate", "forgedock_promote", "forgedock_remember", "forgedock_resume_orchestration", "forgedock_review_pr", "forgedock_status", "forgedock_tasks", "forgedock_work_on"],
   );
 
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
   assert.ok(state.tools.get("forgedock_resume_orchestration"));
   const resumeTool = state.tools.get("forgedock_resume_orchestration") as any;
@@ -182,7 +193,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
 
 test("assistant mode keeps generic PR requests on normal GitHub tooling", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   const prompt = state.handlers.get("before_agent_start")?.[0]?.(
     { systemPrompt: "base prompt" },
     { cwd: process.cwd() },
@@ -201,7 +212,7 @@ test("assistant mode keeps generic PR requests on normal GitHub tooling", async 
 
 test("explicit promote activates one semantic workflow and settled failure returns to assistant mode", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   await state.commands.get("promote")?.("--production --confirm", commandContext());
 
   assert.equal(state.sent.length, 1);
@@ -244,7 +255,7 @@ test("direct semantic workflow invocation enters workflow mode under current-tur
 
 test("failed slash-command dispatch restores assistant mode immediately", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   state.pi.sendUserMessage = (() => { throw new Error("dispatch failed"); }) as typeof state.pi.sendUserMessage;
 
   await assert.rejects(
@@ -261,7 +272,7 @@ test("failed slash-command dispatch restores assistant mode immediately", async 
 
 test("keeps native workflow tools active through a transient provider retry", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   await state.commands.get("orchestrate")?.("throwaway-milestone --dry-run", commandContext());
   const activeDuringWorkflow = [...state.active];
 
@@ -481,7 +492,7 @@ test("busy sessions queue native workflow intent as a follow-up", async () => {
 
 test("supervisor escalations lazily expose decision-interview and reply tools", async () => {
   const state = fakePi();
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
@@ -665,7 +676,7 @@ test("native promotion exposes an explicit mutation-aware entrypoint", async () 
   assert.ok(promote);
   assert.equal(promote.parameters.properties.confirm.type, "boolean");
   assert.equal(promote.parameters.properties.authorizeMerge.type, "boolean");
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   assert.equal(state.active.includes("forgedock_promote"), false);
 });
 
@@ -767,7 +778,7 @@ test("fresh orchestration never invokes the implicit resume tool", async () => {
   bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
   const resume = state.tools.get("forgedock_resume_orchestration");
   assert.ok(resume);
-  await state.handlers.get("session_start")?.[0]?.({}, { mode: "json", cwd: process.cwd(), ui: {} });
+  await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
   assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
   assert.equal((resume as any).parameters.properties.orchestrationId.type, "string");
   const result = await tool.execute("fresh-preview", {

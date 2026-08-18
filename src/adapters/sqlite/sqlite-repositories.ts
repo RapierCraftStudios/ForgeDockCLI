@@ -339,8 +339,12 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
-    this.#assertLeaseContinuity();
     return this.inTransaction(() => {
+      // The retained checkpoint is advanced before the SQLite epoch is
+      // committed. Serialize verification with that entire two-store update
+      // so another process cannot mistake the intentional transient gap for
+      // rollback or divergence.
+      this.#assertLeaseContinuity();
       const current = this.#database.prepare("SELECT epoch, expires_at FROM leases WHERE item_id = ?").get(itemId) as { epoch: number; expires_at: number } | undefined;
       if (current && current.epoch > this.#localMaximum()) this.#failLease("local lease epoch is ahead of the retained witness");
       const recoveredRow = current && this.#recoveryEpoch !== undefined && current.epoch < this.#recoveryEpoch;
@@ -363,59 +367,78 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {
-    this.#assertLeaseContinuity();
-    const rowBefore = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
-    if (rowBefore && rowBefore.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
-    if (rowBefore && this.#recoveryEpoch !== undefined && rowBefore.epoch < this.#recoveryEpoch) {
-      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-    }
-    const result = this.#database.prepare(`
-      UPDATE leases SET heartbeat_at = ?, expires_at = ?
-      WHERE item_id = ? AND token = ? AND expires_at > ?
-    `).run(now, now + ttlMs, itemId, token, now);
-    if (result.changes !== 1) throw new Error(`Lease is absent, stale, or owned by another worker: ${itemId}`);
-    return leaseFromRow(this.#database.prepare("SELECT * FROM leases WHERE item_id = ?").get(itemId) as Record<string, string | number>);
+    return this.inTransaction(() => {
+      this.#assertLeaseContinuity();
+      const rowBefore = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
+      if (rowBefore && rowBefore.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
+      if (rowBefore && this.#recoveryEpoch !== undefined && rowBefore.epoch < this.#recoveryEpoch) {
+        throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+      }
+      const result = this.#database.prepare(`
+        UPDATE leases SET heartbeat_at = ?, expires_at = ?
+        WHERE item_id = ? AND token = ? AND expires_at > ?
+      `).run(now, now + ttlMs, itemId, token, now);
+      if (result.changes !== 1) throw new Error(`Lease is absent, stale, or owned by another worker: ${itemId}`);
+      return leaseFromRow(this.#database.prepare("SELECT * FROM leases WHERE item_id = ?").get(itemId) as Record<string, string | number>);
+    });
   }
 
   release(itemId: string, token: string): boolean {
-    this.#assertLeaseContinuity();
-    const row = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
-    if (row && row.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
-    if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
-      throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-    }
-    return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
+    return this.inTransaction(() => {
+      this.#assertLeaseContinuity();
+      const row = this.#database.prepare("SELECT epoch FROM leases WHERE item_id = ?").get(itemId) as { epoch: number } | undefined;
+      if (row && row.epoch > this.#localMaximum()) this.#failLease("lease row is divergent from the retained witness");
+      if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
+        throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+      }
+      return this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND token = ?").run(itemId, token).changes === 1;
+    });
   }
 
   guard(itemId: string, token: string): LeaseGuard {
     return { assertValid: () => {
-      this.#assertLeaseContinuity();
-      const row = this.#database.prepare("SELECT token, epoch FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number } | undefined;
-      if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
-        throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
-      }
-      if (!row || row.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
+      this.inTransaction(() => {
+        this.#assertLeaseContinuity();
+        const row = this.#database.prepare("SELECT token, epoch FROM leases WHERE item_id = ?").get(itemId) as { token: string; epoch: number } | undefined;
+        if (row && this.#recoveryEpoch !== undefined && row.epoch < this.#recoveryEpoch) {
+          throw new LeaseContinuityError("lease row predates authenticated re-enrollment");
+        }
+        if (!row || row.token !== token) throw new LeaseContinuityError(`holder token is no longer current for ${itemId}`);
+      });
     }, check: () => { this.guard(itemId, token).assertValid(); } };
   }
 
   continuity(): LeaseWitnessSnapshot {
     if (this.#leaseFailure) return { state: "unverifiable", epoch: this.#localMaximum(), reason: this.#leaseFailure };
     if (!this.#witness) return { state: "unverifiable", epoch: this.#localMaximum(), reason: "no retained checkpoint witness is configured" };
-    const snapshot = this.#witness.verify();
-    if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
-      return { ...snapshot, state: "unverifiable", reason: snapshot.reason ?? "local maximum diverges from the retained witness" };
-    }
-    return snapshot;
+    return this.inTransaction(() => {
+      const snapshot = this.#witness!.verify();
+      if (snapshot.state !== "verified" || snapshot.epoch !== this.#localMaximum()) {
+        return { ...snapshot, state: "unverifiable" as const, reason: snapshot.reason ?? "local maximum diverges from the retained witness" };
+      }
+      return snapshot;
+    });
   }
 
   reEnroll(checkpoint: AuthenticatedLeaseCheckpoint): void {
     if (!this.#witness) throw new LeaseContinuityError("no retained checkpoint witness is configured");
-    if (!Number.isSafeInteger(checkpoint.epoch) || checkpoint.epoch <= this.#localMaximum()) {
-      throw new LeaseContinuityError("re-enrollment checkpoint is not higher than the local maximum");
-    }
-    const snapshot = this.#witness.reEnroll(checkpoint);
-    this.#acceptWitness(snapshot);
-    this.#recoveryEpoch = snapshot.epoch;
+    const recoveryEpoch = this.inTransaction(() => {
+      if (!Number.isSafeInteger(checkpoint.epoch) || checkpoint.epoch <= this.#localMaximum()) {
+        throw new LeaseContinuityError("re-enrollment checkpoint is not higher than the local maximum");
+      }
+      const current = this.#witness!.verify();
+      // The witness is intentionally advanced before SQLite. If a prior
+      // attempt reached the witness and then lost its SQLite commit, adopt the
+      // exact authenticated checkpoint idempotently instead of requiring the
+      // operator to mint another, still-higher recovery epoch.
+      const snapshot = current.state === "verified" && sameCheckpoint(current.checkpoint, checkpoint)
+        ? current
+        : this.#witness!.reEnroll(checkpoint);
+      this.#acceptWitness(snapshot);
+      return snapshot.epoch;
+    });
+    // Do not publish in-memory recovery state until SQLite committed it.
+    this.#recoveryEpoch = recoveryEpoch;
     this.#leaseFailure = undefined;
   }
 
@@ -469,6 +492,12 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       throw error;
     }
   }
+}
+
+function sameCheckpoint(left: AuthenticatedLeaseCheckpoint | undefined, right: AuthenticatedLeaseCheckpoint): boolean {
+  return left?.epoch === right.epoch
+    && left.signature === right.signature
+    && left.keyId === right.keyId;
 }
 
 async function withSqliteBusyRetry<T>(operation: () => T | Promise<T>): Promise<T> {

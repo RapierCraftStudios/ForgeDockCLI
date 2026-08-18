@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
@@ -11,6 +11,51 @@ import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
+
+interface ChildOutputState {
+  buffer: string;
+  stderr: string;
+  waiter: { marker: string; resolve: (output: string) => void; reject: (error: Error) => void } | undefined;
+}
+
+const childOutputStates = new WeakMap<ReturnType<typeof spawn>, ChildOutputState>();
+
+function waitForChildOutput(child: ReturnType<typeof spawn>, marker: string): Promise<string> {
+  let state = childOutputStates.get(child);
+  if (!state) {
+    state = { buffer: "", stderr: "", waiter: undefined };
+    childOutputStates.set(child, state);
+    child.stdout?.on("data", (chunk) => {
+      state!.buffer += String(chunk);
+      resolveChildOutput(state!);
+    });
+    child.stderr?.on("data", (chunk) => { state!.stderr += String(chunk); });
+    child.on("error", (error) => state!.waiter?.reject(error));
+    child.on("exit", (code) => {
+      if (state!.waiter && !state!.buffer.includes(state!.waiter.marker)) {
+        state!.waiter.reject(new Error(`Lease race child exited ${code}: ${state!.stderr}`));
+        state!.waiter = undefined;
+      }
+    });
+  }
+  if (state.waiter) throw new Error("Only one child-output wait may be active at a time");
+  return new Promise<string>((resolve, reject) => {
+    state!.waiter = { marker, resolve, reject };
+    resolveChildOutput(state!);
+  });
+}
+
+function resolveChildOutput(state: ChildOutputState): void {
+  if (!state.waiter) return;
+  const index = state.buffer.indexOf(state.waiter.marker);
+  if (index < 0) return;
+  const end = index + state.waiter.marker.length;
+  const output = state.buffer.slice(0, end);
+  state.buffer = state.buffer.slice(end);
+  const { resolve } = state.waiter;
+  state.waiter = undefined;
+  resolve(output);
+}
 
 describe("SQLite operational repositories", () => {
   it("waits for a concurrent writer before recording operational progress", async () => {
@@ -210,6 +255,78 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("serializes continuity verification across a concurrent checkpoint advance", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-lease-race-"));
+    const path = join(root, "state.db");
+    const checkpointPath = join(root, "checkpoint");
+    const firstGo = join(root, "first.go");
+    const secondGo = join(root, "second.go");
+    const release = join(root, "release");
+    writeFileSync(checkpointPath, "0");
+    const childSource = [
+      'const fs = require("node:fs");',
+      'const [databasePath, checkpointPath, goPath, releasePath, role, moduleUrl] = process.argv.slice(1);',
+      'const waitArray = new Int32Array(new SharedArrayBuffer(4));',
+      'const snapshot = () => ({ state: "verified", epoch: Number(fs.readFileSync(checkpointPath, "utf8")) });',
+      'const witness = {',
+      '  verify: snapshot,',
+      '  compareAndAdvance(observedEpoch) {',
+      '    const epoch = Math.max(observedEpoch, snapshot().epoch) + 1;',
+      '    fs.writeFileSync(checkpointPath, String(epoch));',
+      '    if (role === "first") {',
+      '      process.stdout.write("advanced\\n");',
+      '      while (!fs.existsSync(releasePath)) Atomics.wait(waitArray, 0, 0, 10);',
+      '    }',
+      '    return snapshot();',
+      '  },',
+      '  reEnroll() { throw new Error("not used"); },',
+      '};',
+      'import(moduleUrl).then(({ SqliteRepositories }) => {',
+      '  const store = new SqliteRepositories(databasePath, { witness });',
+      '  process.stdout.write("ready\\n");',
+      '  const timer = setInterval(() => {',
+      '    if (!fs.existsSync(goPath)) return;',
+      '    clearInterval(timer);',
+      '    try {',
+      '      const lease = store.acquire(`item-${role}`, `worker-${role}`, 60_000);',
+      '      process.stdout.write(`${JSON.stringify({ ok: Boolean(lease), epoch: lease?.epoch })}\\n`);',
+      '      store.close();',
+      '    } catch (error) {',
+      '      process.stdout.write(`${JSON.stringify({ ok: false, error: String(error) })}\\n`);',
+      '      store.close();',
+      '    }',
+      '  }, 5);',
+      '}).catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });',
+    ].join("\n");
+    const moduleUrl = new URL("./sqlite-repositories.js", import.meta.url).href;
+    const start = (role: "first" | "second", goPath: string) => spawn(process.execPath, [
+      "-e", childSource, path, checkpointPath, goPath, release, role, moduleUrl,
+    ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const first = start("first", firstGo);
+    const second = start("second", secondGo);
+    try {
+      await Promise.all([waitForChildOutput(first, "ready\n"), waitForChildOutput(second, "ready\n")]);
+      writeFileSync(firstGo, "go");
+      await waitForChildOutput(first, "advanced\n");
+      writeFileSync(secondGo, "go");
+      // Give the second process time to reach BEGIN IMMEDIATE while the first
+      // has advanced the external checkpoint but not committed lease_state.
+      const firstResultOutput = waitForChildOutput(first, "\n");
+      const secondResultOutput = waitForChildOutput(second, "\n");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      writeFileSync(release, "release");
+      const [firstResult, secondResult] = (await Promise.all([firstResultOutput, secondResultOutput]))
+        .map((output) => JSON.parse(output.trim()) as { ok: boolean; epoch?: number; error?: string });
+      assert.deepEqual(firstResult, { ok: true, epoch: 1 });
+      assert.deepEqual(secondResult, { ok: true, epoch: 2 });
+    } finally {
+      writeFileSync(release, "release");
+      first.kill();
+      second.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed on rollback and permits only higher authenticated re-enrollment", () => {
     const witness = new InMemoryLeaseWitness();
     const store = new SqliteRepositories(":memory:", { witness });
@@ -227,6 +344,32 @@ describe("SQLite operational repositories", () => {
       const recovered = store.acquire("issue-rollback", "worker-b", 100, 1_020);
       assert.equal(recovered?.epoch, 11);
       assert.equal(recovered?.token === first.token, false);
+    } finally { store.close(); }
+  });
+
+  it("idempotently adopts a witness checkpoint advanced by an interrupted re-enrollment", () => {
+    const retained = new InMemoryLeaseWitness();
+    let interruptAfterAdvance = true;
+    const witness = {
+      verify: () => retained.verify(),
+      compareAndAdvance: (epoch: number) => retained.compareAndAdvance(epoch),
+      reEnroll: (checkpoint: Parameters<typeof retained.reEnroll>[0]) => {
+        const snapshot = retained.reEnroll(checkpoint);
+        if (interruptAfterAdvance) {
+          interruptAfterAdvance = false;
+          throw new Error("simulated interruption after retained checkpoint advance");
+        }
+        return snapshot;
+      },
+    };
+    const store = new SqliteRepositories(":memory:", { witness });
+    const checkpoint = { epoch: 10, signature: Buffer.from("10:forgedock-test-retained-key", "utf8").toString("base64url") };
+    try {
+      assert.throws(() => store.reEnroll(checkpoint), /simulated interruption/);
+      assert.equal(retained.verify().epoch, 10);
+      assert.doesNotThrow(() => store.reEnroll(checkpoint));
+      assert.equal(store.continuity().state, "verified");
+      assert.equal(store.acquire("issue-recovered", "worker", 100, 1_000)?.epoch, 11);
     } finally { store.close(); }
   });
 
