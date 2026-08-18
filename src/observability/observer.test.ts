@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, observationStreamKey, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, observationStreamKey, retainObservationLogicalStreamId, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationIdentity, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -50,8 +50,9 @@ test("journal assigns per-run sequences, preserves channels, and redacts sensiti
 test("observer backpressure emits an explicit dropped-output marker", async () => {
   const options = { store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 };
   const observer = new ForgeDockObserver(options);
-  const first = observer.emit({ producer, identity: { forgeRunId: "run-pressure" }, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "first" } });
-  const dropped = observer.emit({ producer, identity: { forgeRunId: "run-pressure" }, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "dropped" } });
+  const identity = { forgeRunId: "run-pressure" };
+  const first = observer.emit({ producer, identity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "dropped" } });
   await Promise.all([first, dropped]);
   const events = await observer.query({ forgeRunId: "run-pressure" });
   assert.equal(events.at(-1)?.kind, "output.dropped");
@@ -65,6 +66,12 @@ test("logical stream IDs are collision-free and survive identity enrichment in S
   const second = { logicalStreamId: "stream|two", forgeRunId: "run", agentTaskId: "shared" };
   assert.equal(observationStreamKey(first, "stdout"), observationStreamKey(refreshed, "stdout"));
   assert.notEqual(observationStreamKey(first, "stdout"), observationStreamKey(second, "stdout"));
+  assert.notEqual(observationStreamKey({ logicalStreamId: "stream|one" }, "stdout"), observationStreamKey({ logicalStreamId: "stream|one" }, "stderr"));
+
+  const retained = {};
+  const allocated = retainObservationLogicalStreamId(retained);
+  assert.ok(allocated.logicalStreamId);
+  assert.equal(retainObservationLogicalStreamId(retained).logicalStreamId, allocated.logicalStreamId);
 
   const store = new SqliteObservationStore(":memory:");
   const observer = observerWithStore(store);
@@ -88,6 +95,47 @@ test("identity refresh cannot release one quarantined stream or reset its neighb
   const serialized = JSON.stringify(events);
   assert.doesNotMatch(serialized, /dropped-secret|continuation-secret/);
   assert.match(serialized, /independent/);
+  observer.close();
+});
+
+test("direct output retains a no-ID stream through enrichment, reset, and terminal cleanup", async () => {
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 });
+  const retainedIdentity: ObservationIdentity = { forgeRunId: "run-direct-retained", controllerTaskId: "shared" };
+  const independentIdentity = { forgeRunId: "run-direct-retained", controllerTaskId: "shared" };
+  const first = observer.emit({ producer, identity: retainedIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity: retainedIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "dropped-raw" } });
+  const marker = await dropped;
+  await first;
+  assert.equal(marker.kind, "output.dropped");
+  assert.equal(marker.delivery.droppedEvents, 1);
+  assert.ok(retainedIdentity.logicalStreamId);
+
+  retainedIdentity.workUnitId = "enriched";
+  await observer.emit({ producer, identity: retainedIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "continuation-raw" } });
+  await observer.emit({ producer, identity: independentIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "independent-visible" } });
+  await observer.emit({ producer, identity: retainedIdentity, source: "process", channel: "lifecycle", kind: "process.exited", payload: { status: "completed" } });
+  await observer.emit({ producer, identity: independentIdentity, source: "process", channel: "lifecycle", kind: "process.exited", payload: { status: "completed" } });
+  await observer.emit({ producer, identity: retainedIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "after-reset-visible" } });
+  await observer.emit({ producer, identity: independentIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "after-terminal-visible" } });
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-direct-retained" });
+  const serialized = JSON.stringify(events);
+  assert.equal(events.filter((event) => event.kind === "output.dropped").length, 1);
+  assert.doesNotMatch(serialized, /dropped-raw|continuation-raw/);
+  assert.match(serialized, /independent-visible|after-reset-visible|after-terminal-visible/);
+  observer.close();
+});
+
+test("output without a retainable identity is rejected before queueing or storage", async () => {
+  const observer = observerWithStore();
+  const draft = { producer, source: "process" as const, channel: "stdout" as const, kind: "output.stdout", payload: {}, output: { channel: "stdout" as const, text: "must-not-persist" } };
+  await assert.rejects(observer.emit(draft), /retainable identity/);
+  await assert.rejects(observer.emit({ ...draft, identity: Object.freeze({ forgeRunId: "frozen" }) }), /mutable/);
+  await observer.emit({ producer, source: "process", channel: "lifecycle", kind: "process.started", payload: {} });
+  const events = await observer.query({});
+  assert.equal(events.length, 1);
+  assert.throws(() => observationStreamKey({}, "stdout"), /logicalStreamId/);
   observer.close();
 });
 
@@ -347,10 +395,11 @@ test("streaming sanitizer fails closed after a dropped chunk until reset", () =>
 
 test("observer never retains raw dropped output and quarantines the next chunk", async () => {
   const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 });
-  const first = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "first" }, output: { channel: "stdout", text: "first" } });
-  const dropped = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "drop-secret-value" }, output: { channel: "stdout", text: "drop-secret-value" } });
+  const identity = { forgeRunId: "run-quarantine", agentTaskId: "task-1" };
+  const first = observer.emit({ producer, identity, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "first" }, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "drop-secret-value" }, output: { channel: "stdout", text: "drop-secret-value" } });
   await Promise.all([first, dropped]);
-  const next = observer.emit({ producer, identity: { forgeRunId: "run-quarantine", agentTaskId: "task-1" }, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "next-secret-value" }, output: { channel: "stdout", text: "next-secret-value" } });
+  const next = observer.emit({ producer, identity, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "next-secret-value" }, output: { channel: "stdout", text: "next-secret-value" } });
   await next;
   const events = await observer.query({ forgeRunId: "run-quarantine" });
   const serialized = JSON.stringify(events);
