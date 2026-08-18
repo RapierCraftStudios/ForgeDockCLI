@@ -237,7 +237,7 @@ export class StreamingObservationText {
       return "";
     }
     const tail = streamingSecretSuffixStart(this.#holdback) === undefined
-      ? redactStreamingSecrets(this.#holdback)
+      ? redactStreamingOutput(this.#holdback)
       : "[REDACTED]";
     this.#holdback = "";
     this.#state = "ground";
@@ -256,10 +256,10 @@ export class StreamingObservationText {
         return "";
       }
       this.#holdback = holdback;
-      return redactStreamingSecrets(candidate.slice(0, secretStart));
+      return redactStreamingOutput(candidate.slice(0, secretStart));
     }
     this.#holdback = "";
-    return redactStreamingSecrets(candidate);
+    return redactStreamingOutput(candidate);
   }
 
   private consumeTerminal(value: string): string {
@@ -316,6 +316,10 @@ export function redactStreamingSecrets(value: string): string {
   let result = value;
   for (const pattern of STREAM_SECRET_PATTERNS) result = result.replace(pattern, "[REDACTED]");
   return result;
+}
+
+function redactStreamingOutput(value: string): string {
+  return maskCredentialAssignments(redactStreamingSecrets(value));
 }
 
 function streamingSecretSuffixStart(value: string): number | undefined {

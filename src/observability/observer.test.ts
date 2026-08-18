@@ -200,6 +200,18 @@ test("streaming assignment holdback never emits a credential fragment", () => {
   assert.doesNotMatch(chunks.join(""), /token|secret/);
 });
 
+test("streaming assignment redaction remains masked when a later chunk supplies its delimiter", () => {
+  const commaDelimited = createStreamingObservationText();
+  const commaOutput = [commaDelimited.push("prefix token=secret"), commaDelimited.push(", tail"), commaDelimited.finish()].join("");
+  assert.equal(commaOutput, "prefix token=[REDACTED], tail");
+  assert.doesNotMatch(commaOutput, /secret/);
+
+  const whitespaceDelimited = createStreamingObservationText();
+  const whitespaceOutput = [whitespaceDelimited.push("token=secret"), whitespaceDelimited.push(" tail"), whitespaceDelimited.finish()].join("");
+  assert.equal(whitespaceOutput, "token=[REDACTED] tail");
+  assert.doesNotMatch(whitespaceOutput, /secret/);
+});
+
 test("redaction masks spaced assignments and short bearer values", () => {
   for (const value of ["{ \"api_key\": \"secret\" }", "api_key = secret", "Bearer x"]) {
     const result = redactObservationValue(value);
@@ -224,6 +236,18 @@ test("observer and SQLite persistence retain assignment redaction", async () => 
   const serialized = JSON.stringify(events);
   assert.doesNotMatch(serialized, /persist-secret|Bearer x/);
   assert.equal(events[0]?.security.redacted, true);
+  observer.close();
+});
+
+test("agent streaming assignment redaction remains masked in SQLite after delimiter completion", async () => {
+  const observer = observerWithStore();
+  const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-stream-redaction" }, producer });
+  sink({ type: "text.delta", taskId: "agent-stream-redaction", text: "prefix token=stream-secret" });
+  sink({ type: "text.delta", taskId: "agent-stream-redaction", text: ", tail" });
+  sink({ type: "session.completed", taskId: "agent-stream-redaction", sessionRef: "pi-stream-redaction" });
+  await observer.flush();
+  const events = await observer.query({ forgeRunId: "run-stream-redaction" });
+  assert.doesNotMatch(JSON.stringify(events), /stream-secret/);
   observer.close();
 });
 
