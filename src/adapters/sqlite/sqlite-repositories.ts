@@ -2,19 +2,16 @@
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
-import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
-import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
+import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
+import { MAX_ORCHESTRATION_PAGE_SIZE, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
-
-const SQLITE_BUSY_TIMEOUT_MS = 10_000;
-const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
+import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
 
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
@@ -26,16 +23,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#witness = options.witness;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
-    // WAL permits concurrent readers, but SQLite still has one writer. Wait for
-    // short cross-process controller transactions instead of turning contention
-    // into a terminal workflow failure. Set it before WAL initialization so a
-    // concurrent constructor is covered too.
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    // Setting journal mode may replace SQLite's busy handler, so configure the
-    // timeout after WAL is enabled.
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec(`
+    initializeSqliteDatabase(this.#database, `
       CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -68,6 +56,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         item_id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
         token TEXT NOT NULL,
+        binding TEXT,
         epoch INTEGER NOT NULL DEFAULT 0,
         acquired_at INTEGER NOT NULL,
         heartbeat_at INTEGER NOT NULL,
@@ -105,6 +94,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         record_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS orchestrations_updated ON orchestrations(updated_at);
+      CREATE INDEX IF NOT EXISTS orchestrations_running_updated ON orchestrations(status, updated_at, orchestration_id);
       CREATE TABLE IF NOT EXISTS promotion_records (
         promotion_id TEXT PRIMARY KEY,
         repository TEXT NOT NULL,
@@ -118,6 +108,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     // Existing operational stores predate fencing. They are retained for
     // inspection, but lease use remains fail-closed until a witness is bound.
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
+    try { this.#database.exec("ALTER TABLE leases ADD COLUMN binding TEXT"); } catch { /* already migrated */ }
   }
 
   async append(artifact: DurableArtifact): Promise<void> {
@@ -174,19 +165,38 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async saveOrchestration(record: OrchestrationRecord): Promise<void> {
-    await withSqliteBusyRetry(() => this.#database.prepare(`
-      INSERT INTO orchestrations (orchestration_id, repository, status, updated_at, record_json)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(orchestration_id) DO UPDATE SET
-        repository = excluded.repository,
-        status = excluded.status,
-        updated_at = excluded.updated_at,
-        record_json = excluded.record_json
-    `).run(record.orchestrationId, record.repository, record.status, record.updatedAt, JSON.stringify(record)));
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      this.saveOrchestrationInTransaction(record);
+    }));
+  }
+
+  async saveOrchestrationFenced(record: OrchestrationRecord, fence: OrchestrationExecutionFence): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      this.#assertLeaseContinuity();
+      const lease = this.#database.prepare("SELECT token, epoch, expires_at FROM leases WHERE item_id = ?")
+        .get(fence.itemId) as { token: string; epoch: number; expires_at: number } | undefined;
+      if (!lease || lease.token !== fence.token || lease.epoch !== fence.epoch) {
+        throw new LeaseContinuityError("orchestration execution claim is no longer current");
+      }
+      if (lease.expires_at <= fence.now()) {
+        throw new LeaseContinuityError("orchestration execution claim expired before durable save");
+      }
+      this.saveOrchestrationInTransaction(record);
+    }));
   }
 
   async listOrchestrations(limit = 50): Promise<OrchestrationRecord[]> {
     const rows = this.#database.prepare("SELECT record_json FROM orchestrations ORDER BY updated_at DESC LIMIT ?").all(limit);
+    return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
+  }
+
+  async listRunningOrchestrations(limit = 100, before?: OrchestrationListCursor): Promise<OrchestrationRecord[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ORCHESTRATION_PAGE_SIZE) {
+      throw new Error(`Orchestration page limit must be an integer from 1 to ${MAX_ORCHESTRATION_PAGE_SIZE}`);
+    }
+    const rows = before === undefined
+      ? this.#database.prepare("SELECT record_json FROM orchestrations WHERE status = 'running' ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(limit)
+      : this.#database.prepare("SELECT record_json FROM orchestrations WHERE status = 'running' AND (updated_at < ? OR (updated_at = ? AND orchestration_id < ?)) ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(before.updatedAt, before.updatedAt, before.orchestrationId, limit);
     return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
   }
 
@@ -338,7 +348,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => ({ runId: row.run_id, phase: row.phase, message: row.message, occurredAt: row.occurred_at }));
   }
 
-  acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
+  acquire(itemId: string, owner: string, ttlMs: number, now = Date.now(), options?: LeaseAcquisitionOptions): Lease | undefined {
     return this.inTransaction(() => {
       // The retained checkpoint is advanced before the SQLite epoch is
       // committed. Serialize verification with that entire two-store update
@@ -356,13 +366,23 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       if (recoveredRow) this.#database.prepare("DELETE FROM leases WHERE item_id = ?").run(itemId);
       else this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
       const token = crypto.randomUUID();
+      const binding = normalizeLeaseBinding(options?.binding);
       const result = this.#database.prepare(`
-        INSERT INTO leases (item_id, owner, token, epoch, acquired_at, heartbeat_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
-      `).run(itemId, owner, token, advanced.epoch, now, now, now + ttlMs);
+        INSERT INTO leases (item_id, owner, token, binding, epoch, acquired_at, heartbeat_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
+      `).run(itemId, owner, token, binding ?? null, advanced.epoch, now, now, now + ttlMs);
       if (result.changes !== 1) return undefined;
       this.#recoveryEpoch = undefined;
-      return { itemId, owner, token, epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" as const };
+      return { itemId, owner, token, ...(binding !== undefined ? { binding } : {}), epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" as const };
+    });
+  }
+
+  inspect(itemId: string): Lease | undefined {
+    return this.inTransaction(() => {
+      this.#assertLeaseContinuity();
+      const row = this.#database.prepare("SELECT * FROM leases WHERE item_id = ?")
+        .get(itemId) as Record<string, string | number> | undefined;
+      return row ? leaseFromRow(row) : undefined;
     });
   }
 
@@ -477,6 +497,32 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#database.close();
   }
 
+  private saveOrchestrationInTransaction(record: OrchestrationRecord): void {
+    const current = this.#database.prepare("SELECT record_json FROM orchestrations WHERE orchestration_id = ?")
+      .get(record.orchestrationId) as { record_json: string } | undefined;
+    if (current) {
+      const persisted = JSON.parse(current.record_json) as OrchestrationRecord;
+      const incomingAttempt = orchestrationExecutionAttempt(record);
+      const persistedAttempt = orchestrationExecutionAttempt(persisted);
+      if (incomingAttempt < persistedAttempt) {
+        throw new Error(`Stale orchestration update for ${record.orchestrationId}: execution attempt ${incomingAttempt} is behind persisted attempt ${persistedAttempt}`);
+      }
+      if (incomingAttempt > 0 && persistedAttempt === incomingAttempt
+        && (record.executionClaimId ?? "") !== (persisted.executionClaimId ?? "")) {
+        throw new Error(`Conflicting orchestration claim for ${record.orchestrationId}: execution attempt ${incomingAttempt} belongs to another controller`);
+      }
+    }
+    this.#database.prepare(`
+      INSERT INTO orchestrations (orchestration_id, repository, status, updated_at, record_json)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(orchestration_id) DO UPDATE SET
+        repository = excluded.repository,
+        status = excluded.status,
+        updated_at = excluded.updated_at,
+        record_json = excluded.record_json
+    `).run(record.orchestrationId, record.repository, record.status, record.updatedAt, JSON.stringify(record));
+  }
+
   private inTransaction<T>(operation: () => T): T {
     this.#database.exec("BEGIN IMMEDIATE");
     let active = true;
@@ -500,29 +546,28 @@ function sameCheckpoint(left: AuthenticatedLeaseCheckpoint | undefined, right: A
     && left.keyId === right.keyId;
 }
 
-async function withSqliteBusyRetry<T>(operation: () => T | Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (!isSqliteBusyError(error) || attempt >= SQLITE_BUSY_RETRY_DELAYS_MS.length) throw error;
-      await sleep(SQLITE_BUSY_RETRY_DELAYS_MS[attempt]);
-    }
-  }
-}
-
-function isSqliteBusyError(error: unknown): boolean {
-  const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
-  return /database is locked|database is busy|SQLITE_(?:BUSY|LOCKED)/i.test(message);
-}
-
 function subjectKey(subject: Subject): string {
   return `${subject.repo}|i:${subject.issue ?? ""}|p:${subject.pr ?? ""}`;
 }
 
 function leaseFromRow(row: Record<string, string | number>): Lease {
+  const binding = typeof row.binding === "string" && row.binding.trim() ? row.binding : undefined;
   return {
-    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token), epoch: Number(row.epoch),
+    itemId: String(row.item_id), owner: String(row.owner), token: String(row.token), ...(binding !== undefined ? { binding } : {}), epoch: Number(row.epoch),
     acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at), continuity: "verified",
   };
+}
+
+function normalizeLeaseBinding(binding: string | undefined): string | undefined {
+  if (binding === undefined) return undefined;
+  const value = binding.trim();
+  if (!value) throw new Error("Lease binding must not be empty");
+  if (value.length > 512) throw new Error("Lease binding is too long");
+  return value;
+}
+
+function orchestrationExecutionAttempt(record: OrchestrationRecord): number {
+  return Number.isSafeInteger(record.executionAttempt) && record.executionAttempt !== undefined
+    ? record.executionAttempt
+    : 0;
 }

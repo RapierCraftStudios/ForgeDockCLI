@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
+import { pullRequestMergeability } from "../../core/ports/forge-host.js";
 import type {
   BranchSnapshot,
   DecompositionChild,
@@ -14,7 +15,9 @@ import type {
   PlanMaterializationRequest,
   PlanMaterializationResult,
   PullRequestCheckDiagnostic,
+  PullRequestMergeability,
   PullRequestMergeGate,
+  PullRequestMergeGateOptions,
   PullRequestSnapshot,
   ReviewFindingInput,
 } from "../../core/ports/forge-host.js";
@@ -41,9 +44,32 @@ const WORKFLOW_LABELS = [
 const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
+// One branch per issue is enough for a 500-issue orchestration. Keep room for
+// pre-existing and integration branches without allowing an unbounded
+// matching-refs response into the controller.
+const GITHUB_BRANCH_PAGE_SIZE = 100;
+const MAX_GITHUB_BRANCHES = 5_000;
+const MAX_GITHUB_BRANCH_PAGES = Math.ceil(MAX_GITHUB_BRANCHES / GITHUB_BRANCH_PAGE_SIZE);
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
 const MAX_READ_ATTEMPTS = 6;
 const READ_RETRY_DELAY_MS = 50;
+const MAX_MERGEABILITY_REFRESH_ATTEMPTS = 3;
+
+function normalizePullRequestMergeability(value: unknown): PullRequestMergeability {
+  const normalized = String(value ?? "UNKNOWN").trim().toUpperCase();
+  if (normalized === "MERGEABLE") return "mergeable";
+  if (normalized === "CONFLICTING") return "conflicting";
+  if (normalized === "UNKNOWN") return "unknown";
+  return "unavailable";
+}
+
+function mergeabilityReason(value: unknown, state: PullRequestMergeability, attempts = 1): string | undefined {
+  if (state === "mergeable" || state === "conflicting") return undefined;
+  const raw = String(value ?? "UNKNOWN").trim().toUpperCase();
+  return state === "unknown"
+    ? `GitHub mergeability remained ${raw} after ${attempts} bounded read${attempts === 1 ? "" : "s"}`
+    : `GitHub returned an unrecognized mergeability state: ${raw}`;
+}
 
 function isReadOnlyGhInvocation(args: readonly string[]): boolean {
   const [command, subcommand] = args;
@@ -988,7 +1014,7 @@ export class GitHubClient implements ForgeHost {
     return pullRequestSnapshotFromGitHub(repo, number, JSON.parse(result));
   }
 
-  async getPullRequestMergeGate(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate> {
+  async getPullRequestMergeGate(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string, options: PullRequestMergeGateOptions = {}): Promise<PullRequestMergeGate> {
     const pullRequest = await this.getPullRequest(repo, number);
     if (pullRequest.headSha !== expectedHeadSha) {
       throw new Error(`Pull request head changed: reviewed ${expectedHeadSha}, current ${pullRequest.headSha}`);
@@ -999,20 +1025,29 @@ export class GitHubClient implements ForgeHost {
     if (pullRequest.state !== "OPEN") {
       throw new Error(`Pull request #${number} is not open (GitHub state: ${pullRequest.state})`);
     }
-    let mergeable = false;
-    try {
-      const result = await this.gh([
-        "pr", "view", String(number), "--repo", repo,
-        "--json", "mergeable,mergeStateStatus",
-      ]);
-      const value = JSON.parse(result) as { mergeable?: string };
-      // GitHub's mergeable field reports whether the head can be merged
-      // without conflicts. mergeStateStatus also includes branch-protection
-      // and required-check state; review evaluates the individual exact-head
-      // check observations separately so contradictory results remain visible.
-      mergeable = String(value.mergeable ?? "UNKNOWN").toUpperCase() === "MERGEABLE";
-    } catch {
-      mergeable = false;
+    let mergeability: PullRequestMergeability = "unavailable";
+    let mergeabilityReasonText: string | undefined;
+    const maxMergeabilityReads = options.refreshUnknown ? MAX_MERGEABILITY_REFRESH_ATTEMPTS : 1;
+    for (let attempt = 1; attempt <= maxMergeabilityReads; attempt++) {
+      try {
+        const result = await this.gh([
+          "pr", "view", String(number), "--repo", repo,
+          "--json", "mergeable,mergeStateStatus",
+        ]);
+        const value = JSON.parse(result) as { mergeable?: unknown };
+        // GitHub's mergeable field reports whether the head can be merged
+        // without conflicts. Keep UNKNOWN distinct from CONFLICTING;
+        // mergeStateStatus includes branch-protection/check state and is not
+        // a substitute for the asynchronous mergeability result.
+        mergeability = normalizePullRequestMergeability(value.mergeable);
+        mergeabilityReasonText = mergeabilityReason(value.mergeable, mergeability, attempt);
+        if (mergeability !== "unknown" || attempt >= maxMergeabilityReads) break;
+        await waitForReadRetry(attempt);
+      } catch (error) {
+        mergeability = "unavailable";
+        mergeabilityReasonText = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+        break;
+      }
     }
 
     const parseChecks = (result: string, omitInapplicable = false): PullRequestMergeGate["requiredChecks"] => {
@@ -1085,7 +1120,9 @@ export class GitHubClient implements ForgeHost {
       pullRequest: number,
       headSha: expectedHeadSha,
       baseBranch: expectedBaseBranch,
-      mergeable,
+      mergeable: mergeability === "mergeable",
+      mergeability,
+      ...(mergeabilityReasonText ? { mergeabilityReason: mergeabilityReasonText } : {}),
       requiredChecks,
       observedAt: new Date().toISOString(),
     };
@@ -1126,8 +1163,26 @@ export class GitHubClient implements ForgeHost {
       throw new Error(`Invalid Git branch prefix: '${prefix}'`);
     }
     const encodedPrefix = prefix.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-    const result = await this.gh(["api", `repos/${repo}/git/matching-refs/heads/${encodedPrefix}`]);
-    const values = JSON.parse(result) as Array<{ ref?: string; object?: { sha?: string } }>;
+    const result = await this.gh([
+      "api", `repos/${repo}/git/matching-refs/heads/${encodedPrefix}?per_page=${GITHUB_BRANCH_PAGE_SIZE}`,
+      "--paginate", "--slurp",
+    ]);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(result);
+    } catch (error) {
+      throw new Error("GitHub returned malformed paginated matching-refs JSON", { cause: error });
+    }
+    if (!Array.isArray(decoded) || decoded.some((page) => !Array.isArray(page))) {
+      throw new Error("GitHub returned an invalid paginated matching-refs response");
+    }
+    if (decoded.length > MAX_GITHUB_BRANCH_PAGES) {
+      throw new Error(`GitHub branch catalog exceeds the safe bound of ${MAX_GITHUB_BRANCHES} branches`);
+    }
+    const values = decoded.flat() as Array<{ ref?: string; object?: { sha?: string } }>;
+    if (values.length > MAX_GITHUB_BRANCHES) {
+      throw new Error(`GitHub branch catalog exceeds the safe bound of ${MAX_GITHUB_BRANCHES} branches`);
+    }
     const refPrefix = "refs/heads/";
     return values.flatMap((value) => {
       if (!value.ref?.startsWith(refPrefix) || !value.object?.sha) return [];
@@ -1166,7 +1221,7 @@ export class GitHubClient implements ForgeHost {
     if (current.state !== "OPEN") {
       throw new Error(`Pull request #${number} is not open (GitHub state: ${current.state})`);
     }
-    const gate = await this.getPullRequestMergeGate(repo, number, expectedHeadSha, expectedBaseBranch);
+    const gate = await this.getPullRequestMergeGate(repo, number, expectedHeadSha, expectedBaseBranch, { refreshUnknown: true });
     const failure = mergeGateFailure(gate);
     if (failure) throw new Error(failure);
     try {
@@ -1774,7 +1829,10 @@ function mergeCheckState(value: string | undefined): PullRequestMergeGate["requi
 function githubActionsRunBelongsToRepo(value: string, repo: string): boolean { try { const url = new URL(value); const [owner, name] = repo.toLowerCase().split("/"); const parts = url.pathname.split("/").filter(Boolean).map((part) => part.toLowerCase()); return url.hostname.toLowerCase() === "github.com" && parts[0] === owner && parts[1] === name && parts[2] === "actions" && parts[3] === "runs" && /^\d+$/.test(parts[4] ?? ""); } catch { return false; } }
 
 function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
-  if (!gate.mergeable) return `Pull request #${gate.pullRequest} is not mergeable at ${gate.baseBranch} for reviewed ${gate.headSha}`;
+  const mergeability = pullRequestMergeability(gate);
+  if (mergeability === "conflicting") return `Pull request #${gate.pullRequest} is confirmed conflicting at ${gate.baseBranch} for reviewed ${gate.headSha}`;
+  if (mergeability === "unknown") return `Pull request #${gate.pullRequest} mergeability is UNKNOWN at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  if (mergeability === "unavailable") return `Pull request #${gate.pullRequest} mergeability query is unavailable at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
   const failed = gate.requiredChecks.filter((check) => check.state !== "passed");
   if (failed.length) {
     return `Required GitHub checks are not all passing for PR #${gate.pullRequest}: ${failed.map((check) => `${check.name}=${check.state}`).join(", ")}`;

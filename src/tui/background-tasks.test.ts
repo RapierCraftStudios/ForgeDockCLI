@@ -7,7 +7,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ForgeDockBackgroundTasks } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
+import { ForgeDockObserver } from "../observability/observer.js";
+import { SqliteObservationStore } from "../observability/sqlite-store.js";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-"));
@@ -37,6 +39,32 @@ async function eventually(assertion: () => void): Promise<void> {
   throw last;
 }
 
+test("background observation captures split stdout and stderr before its terminal event", async () => {
+  const { cwd, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 8 });
+  tasks.setObservationSink(observer);
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "process.stdout.write('stdout bearer supe'); process.stderr.write('\\u001b]52;c;'); setTimeout(()=>{process.stdout.write('r-integration-secret after'); process.stderr.write('\\u0007stderr visible')},20)"],
+    cwd,
+    ctx,
+  });
+  await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
+  await observer.flush();
+  const events = await observer.query({ scopeKey: record.id, source: "process" });
+  const outputEvents = events.filter((event) => event.output);
+  const lifecycleIndex = events.findIndex((event) => event.kind === "process.exited");
+  assert.ok(lifecycleIndex > outputEvents.length - 1);
+  assert.deepEqual(outputEvents.map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
+  const serialized = JSON.stringify(outputEvents);
+  assert.match(serialized, /stdout/);
+  assert.match(serialized, /stderr visible/);
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.doesNotMatch(serialized, /integration-secret|\u001b\]52/);
+  await tasks.shutdown();
+  observer.close();
+});
+
 test("native background controller records output and completion without blocking", async () => {
   const { cwd, messages, tasks, ctx } = fixture();
   const record = tasks.start({
@@ -53,6 +81,34 @@ test("native background controller records output and completion without blockin
   const persisted = JSON.parse(readFileSync(join(cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as { status: string };
   assert.equal(persisted.status, "completed");
   await tasks.shutdown();
+});
+
+test("native controller launch is idempotent for one orchestration attempt", async () => {
+  const { cwd, tasks, ctx, pi } = fixture();
+  const launchKey = "dag_launch/node-1/attempt-1";
+  const first = tasks.start({
+    command: process.execPath,
+    args: ["-e", "setTimeout(()=>{},100)"],
+    cwd,
+    launchKey,
+    ctx,
+  });
+  const adopted = tasks.start({
+    command: process.execPath,
+    args: ["-e", "throw new Error('duplicate must not start')"],
+    cwd,
+    launchKey,
+    ctx,
+  });
+  assert.equal(adopted.id, first.id);
+  assert.equal(tasks.findByLaunchKey(launchKey)?.id, first.id);
+  assert.equal(tasks.list().filter((record) => record.launchKey === launchKey).length, 1);
+  await eventually(() => assert.equal(tasks.list().find((record) => record.id === first.id)?.status, "completed"));
+  await tasks.shutdown();
+  const restarted = new ForgeDockBackgroundTasks(pi);
+  restarted.initialize(ctx);
+  assert.equal(restarted.findByLaunchKey(launchKey)?.id, first.id);
+  await restarted.shutdown();
 });
 
 test("an immediately exiting controller is reconciled exactly once", async () => {
@@ -135,6 +191,91 @@ test("terminal restart adopts a still-live controller instead of marking it fail
   await eventually(() => assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "cancelled"));
   await first.tasks.shutdown();
   await second.shutdown();
+});
+
+test("terminal restart blocks bridge-bound controllers without persisting bridge credentials", async () => {
+  const first = fixture();
+  const record = first.tasks.start({
+    command: process.execPath,
+    args: ["-e", "setInterval(()=>{},1000)"],
+    cwd: first.cwd,
+    env: {
+      FORGEDOCK_NESTED_AGENT_URL: "http://127.0.0.1:45678/v1/run",
+      FORGEDOCK_NESTED_AGENT_TOKEN: "bridge-secret-that-must-not-persist",
+    },
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+    ctx: first.ctx,
+  });
+  const second = new ForgeDockBackgroundTasks(first.pi);
+  second.initialize(first.ctx);
+
+  const persisted = JSON.parse(readFileSync(join(first.cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.status, "blocked");
+  assert.equal(persisted.restartRequired, NESTED_AGENT_BRIDGE_RESTART_REQUIRED);
+  assert.equal(persisted.resumeScope, "orchestration");
+  assert.doesNotMatch(JSON.stringify(persisted), /FORGEDOCK_NESTED_AGENT|bridge-secret|45678/);
+  assert.equal(second.isOperationallyActive(record.id), false);
+  assert.match(second.output(record.id), /resume required after TUI restart/);
+  assert.match(first.messages.at(-1) ?? "", /forgedock_resume_orchestration/);
+  await eventually(() => assert.throws(() => process.kill(record.pid, 0)));
+
+  await first.tasks.shutdown({ cancel: false });
+  await second.shutdown();
+});
+
+test("older bridge-bound records without a resume scope remain parseable", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const id = "task_legacy_bridge";
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: 999_999_999,
+    logPath: join(directory, `${id}.log`),
+    status: "detached",
+    startedAt: new Date().toISOString(),
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+  }));
+  tasks.initialize(ctx);
+  assert.equal(tasks.list().find((record) => record.id === id)?.status, "blocked");
+  assert.doesNotMatch(messages.at(-1) ?? "", /forgedock_resume_orchestration/);
+  assert.match(messages.at(-1) ?? "", /owning workflow checkpoint/);
+  await tasks.shutdown();
+});
+
+test("restart guidance matches each controller recovery contract", async () => {
+  const cases = [
+    { scope: "work-on" as const, expected: /work-on checkpoint/, forbidden: /not resumable|promotion checkpoint/ },
+    { scope: "review-pr-rerun" as const, expected: /not resumable.*\/review-pr/, forbidden: /checkpoint is preserved/ },
+    { scope: "promote" as const, expected: /promotion checkpoint.*promotionId/i, forbidden: /not resumable|work-on checkpoint/ },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const { cwd, messages, tasks, ctx } = fixture();
+    const directory = join(cwd, ".forgedock", "tasks");
+    mkdirSync(directory, { recursive: true });
+    const id = `task_scope_${index}`;
+    writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+      id,
+      command: process.execPath,
+      args: ["controller"],
+      cwd,
+      pid: 999_999_999,
+      logPath: join(directory, `${id}.log`),
+      status: "detached",
+      startedAt: new Date().toISOString(),
+      restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+      resumeScope: scenario.scope,
+    }));
+    tasks.initialize(ctx);
+    const message = messages.at(-1) ?? "";
+    assert.match(message, scenario.expected);
+    assert.doesNotMatch(message, scenario.forbidden);
+    await tasks.shutdown();
+  }
 });
 
 test("an adopter preserves the original supervisor's durable completion result", async () => {

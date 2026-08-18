@@ -40,6 +40,7 @@ export type TransitionEvent =
   | "RESUME_EXPANDED_REVIEW"
   | "RESUME_REMEDIATION"
   | "RESUME_COMPLETION"
+  | "RESUME_CONFLICT_RECOVERY"
   | "RESUME_PUBLICATION"
   | "RECOVER_REVISION_PUBLICATION"
   | "PR_PUBLISHED"
@@ -143,6 +144,9 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     RESUME_VERIFICATION: "verifying",
     RESUME_REVIEW: "reviewing",
     RESUME_EXPANDED_REVIEW: "reviewing",
+    // Conflict recovery is a distinct admission boundary. Ordinary resume
+    // must never turn a stale approved head into an implicit rebase/merge.
+    RESUME_CONFLICT_RECOVERY: "verifying",
   },
   // A failed revision publication may be recovered only through the distinct
   // proof-checked controller path; ordinary publication resume is insufficient.
@@ -212,7 +216,7 @@ export function transition(
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
-  if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
+  if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

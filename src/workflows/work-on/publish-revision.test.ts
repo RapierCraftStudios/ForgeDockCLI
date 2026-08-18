@@ -18,6 +18,7 @@ const stalePr: PullRequestSnapshot = {
 };
 
 class RevisionGit implements GitWorkspaceManager {
+  pushes = 0;
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return ["docs/a.md"]; }
   async revisionChangedPaths(): Promise<string[]> { return ["docs/a.md"]; }
@@ -26,7 +27,7 @@ class RevisionGit implements GitWorkspaceManager {
   async prepareWorkspaceDependencies(): Promise<void> {}
   async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { return verifiedSha; }
-  async push(): Promise<void> {}
+  async push(): Promise<void> { this.pushes += 1; }
   async head(): Promise<string> { return verifiedSha; }
   async remove(): Promise<void> {}
 }
@@ -76,5 +77,42 @@ describe("remediation revision publication", () => {
     assert.equal(result.run.state, "reviewing");
     assert.equal(result.pullRequest.headSha, verifiedSha);
     assert.equal(host.directRefReads, 1);
+  });
+
+  it("fences a target that advanced after remediation verification before pushing", async () => {
+    const runs = new InMemoryRunRepository();
+    let run = createRun({
+      workflow: "work-on",
+      subject: { repo: "a/b", issue: 6 },
+      runId: "run_revision_target_fence",
+      target: { lane: "fast", targetBranch: "main" },
+    });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED", "REMEDIATION_COMPLETED", "VERIFICATION_PASSED",
+    ] as const) {
+      const next = transition(run, event, event === "VERIFICATION_PASSED" ? { headSha: verifiedSha } : {});
+      await runs.commit(run.version, next.state, next.record);
+      run = next.state;
+    }
+    const expectedBaseSha = oldSha;
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, baseSha: expectedBaseSha, headSha: verifiedSha, changedPaths: ["docs/a.md"], summary: "remediated",
+        acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [],
+      },
+    });
+    const git = new RevisionGit();
+    const host = new LaggingPrHost();
+    await assert.rejects(
+      publishRemediationRevision({ run, pullRequest: stalePr, buildResult, workspace: { ...workspace, baseSha: expectedBaseSha }, expectedTargetHeadSha: expectedBaseSha }, {
+        git, host, runs,
+      }),
+      /Target branch main advanced before publication/,
+    );
+    assert.equal(git.pushes, 0);
+    assert.equal((await runs.load(run.runId))?.state, "blocked");
   });
 });

@@ -83,6 +83,50 @@ describe("controller environment boundary", () => {
     assert.equal(identity.stdout.trim(), "verification@forgedock.invalid");
   });
 
+  it("removes inherited controller and orchestration mode from verification descendants", () => {
+    const environment = verificationEnvironment({
+      PATH: process.env.PATH,
+      FORGEDOCK_VERIFICATION_PATH: "/sealed/verification/tools",
+      FORGEDOCK_CONTROLLER_ENTRY: "/checkout/bin/forgedock-next.mjs",
+      FORGEDOCK_CONTROLLER_TASK_ID: "task_controller",
+      FORGEDOCK_ORCHESTRATION_ID: "orchestration",
+      FORGEDOCK_ORCHESTRATION_NODE: "node-1",
+      FORGEDOCK_ORCHESTRATION_ISSUE: "230",
+      FORGEDOCK_ORCHESTRATION_ATTEMPT: "attempt-1",
+      FORGEDOCK_RUNTIME_ROOT: "/checkout",
+      FORGEDOCK_TERMINAL: "1",
+      FORGEDOCK_CODING_AGENT_DIR: "/controller/agent",
+      PI_CODING_AGENT: "forgedock-issue-worker",
+      PI_PROVIDER: "openai-codex",
+      PI_MODEL: "gpt-5.6-luna",
+      FORGEDOCK_NESTED_AGENT_TOKEN: "nested-token",
+      FORGEDOCK_NESTED_AGENT_URL: "http://127.0.0.1:1234/v1/run",
+      FORGEDOCK_CLAIM_PROMOTION_TOKEN: "claim-token",
+      FORGEDOCK_CLAIM_PROMOTION_URL: "http://127.0.0.1:1235/promote",
+      FORGEDOCK_RUN_ID: "run-controller",
+    });
+    for (const name of [
+      "FORGEDOCK_CONTROLLER_ENTRY",
+      "FORGEDOCK_CONTROLLER_TASK_ID",
+      "FORGEDOCK_ORCHESTRATION_ID",
+      "FORGEDOCK_ORCHESTRATION_NODE",
+      "FORGEDOCK_ORCHESTRATION_ISSUE",
+      "FORGEDOCK_ORCHESTRATION_ATTEMPT",
+      "FORGEDOCK_RUNTIME_ROOT",
+      "FORGEDOCK_TERMINAL",
+      "FORGEDOCK_CODING_AGENT_DIR",
+      "PI_CODING_AGENT",
+      "FORGEDOCK_NESTED_AGENT_TOKEN",
+      "FORGEDOCK_NESTED_AGENT_URL",
+      "FORGEDOCK_CLAIM_PROMOTION_TOKEN",
+      "FORGEDOCK_CLAIM_PROMOTION_URL",
+      "FORGEDOCK_RUN_ID",
+    ]) assert.equal(environment[name], undefined, `${name} leaked into verification`);
+    assert.equal(environment.FORGEDOCK_VERIFICATION_PATH, "/sealed/verification/tools");
+    assert.equal(environment.PI_PROVIDER, "openai-codex");
+    assert.equal(environment.PI_MODEL, "gpt-5.6-luna");
+  });
+
   it("puts discovered Git Bash and user tools ahead of ambiguous Windows launchers", () => {
     if (process.platform !== "win32") return;
     const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;

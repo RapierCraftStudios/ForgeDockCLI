@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
-import { createAgentEventObservationSink } from "./adapters.js";
+import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, redactObservationValue, sanitizeTerminalText } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, redactObservationValue, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -177,6 +177,75 @@ test("streaming sanitizer carries split terminal and credential state across chu
   assert.match(output, /after/);
   assert.doesNotMatch(output, /super-secret-value/);
   assert.doesNotMatch(output, /https:\/\/example\.test/);
+});
+
+test("background task adapter isolates colon-containing task streams and drains before lifecycle", async () => {
+  const observer = observerWithStore();
+  const adapter = new BackgroundTaskObservationAdapter(observer, producer);
+  adapter.output("task:child", "stdout", "\u001b]52;c;", 1);
+  adapter.output("task", "stdout", "parent tail", 1);
+  const parentFinished = adapter.finished("task", "completed", 0);
+  adapter.output("task:child", "stdout", "\u0007visible bearer supe", 2);
+  adapter.output("task:child", "stdout", "r-child-secret after", 3);
+  await Promise.all([parentFinished, adapter.finished("task:child", "completed", 0)]);
+  await observer.flush();
+
+  const events = await observer.query({ source: "process" });
+  const parentOutput = events.findIndex((event) => event.identity.controllerTaskId === "task" && event.output?.text === "parent tail");
+  const parentLifecycle = events.findIndex((event) => event.identity.controllerTaskId === "task" && event.kind === "process.exited");
+  assert.ok(parentOutput >= 0);
+  assert.ok(parentLifecycle > parentOutput);
+  const childText = events.filter((event) => event.identity.controllerTaskId === "task:child" && event.output).map((event) => event.output?.text ?? "").join("");
+  assert.match(childText, /visible/);
+  assert.match(childText, /after/);
+  assert.doesNotMatch(JSON.stringify(events), /child-secret|\u001b\]52/);
+  observer.close();
+});
+
+test("background task adapter quarantines only the stream dropped by bounded observer backpressure", async () => {
+  const observer = new ForgeDockObserver({
+    store: new SqliteObservationStore(":memory:"),
+    producer,
+    maxQueueDepth: 1,
+  });
+  const adapter = new BackgroundTaskObservationAdapter(observer, producer);
+  const first = adapter.output("kept", "stdout", "kept visible", 1);
+  const dropped = adapter.output("dropped", "stdout", "dropped visible", 1);
+  const secret = adapter.output("dropped", "stdout", "Bearer dropped-secret", 2);
+  await Promise.all([
+    first,
+    dropped,
+    secret,
+    adapter.finished("kept", "completed", 0),
+    adapter.finished("dropped", "cancelled"),
+  ]);
+  await observer.flush();
+  const events = await observer.query({ source: "process" });
+  const serialized = JSON.stringify(events);
+  assert.match(serialized, /kept visible/);
+  assert.doesNotMatch(serialized, /dropped visible|dropped-secret/);
+  assert.equal(events.filter((event) => event.identity.controllerTaskId === "dropped" && event.kind === "process.failed").length, 1);
+  observer.close();
+});
+
+test("background task adapter quarantines only a rejected stream", async () => {
+  const drafts: ObservationDraft[] = [];
+  const sink: ObservationSink = {
+    emit: async (draft) => {
+      drafts.push(draft);
+      if (draft.output?.text === "reject-me") throw new Error("sink unavailable");
+      return {} as ObservationEnvelopeV1;
+    },
+  };
+  const adapter = new BackgroundTaskObservationAdapter(sink, producer);
+  adapter.output("rejected", "stdout", "reject-me", 1);
+  adapter.output("rejected", "stdout", "Bearer rejected-secret", 2);
+  adapter.output("independent", "stdout", "independent visible", 1);
+  await Promise.all([adapter.finished("rejected", "cancelled"), adapter.finished("independent", "completed", 0)]);
+
+  assert.equal(drafts.filter((draft) => draft.identity?.controllerTaskId === "rejected" && draft.output).length, 1);
+  assert.match(JSON.stringify(drafts), /independent visible/);
+  assert.doesNotMatch(JSON.stringify(drafts), /rejected-secret/);
 });
 
 test("streaming sanitizer retains a long split token until its delimiter", () => {

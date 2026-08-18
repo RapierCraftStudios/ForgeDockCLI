@@ -111,6 +111,39 @@ describe("GitHub issue-search resolution", () => {
 });
 
 describe("GitHub branch provisioning", () => {
+  it("paginates the complete matching-refs branch catalog", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      return JSON.stringify([
+        [{ ref: "refs/heads/milestone/one", object: { sha: "a".repeat(40) } }],
+        [{ ref: "refs/heads/milestone/two", object: { sha: "b".repeat(40) } }],
+      ]);
+    } });
+
+    assert.deepEqual(await client.listBranches("a/b", "milestone/"), [
+      { name: "milestone/one", headSha: "a".repeat(40) },
+      { name: "milestone/two", headSha: "b".repeat(40) },
+    ]);
+    assert.deepEqual(calls, [[
+      "api", "repos/a/b/git/matching-refs/heads/milestone/?per_page=100", "--paginate", "--slurp",
+    ]]);
+  });
+
+  it("rejects a matching-refs catalog beyond the bounded orchestration size", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async () => JSON.stringify([Array.from(
+      { length: 5_001 },
+      (_, index) => ({ ref: `refs/heads/milestone/${index}`, object: { sha: "a".repeat(40) } }),
+    )]) });
+
+    await assert.rejects(
+      client.listBranches("a/b", "milestone/"),
+      /branch catalog exceeds the safe bound of 5000 branches/,
+    );
+  });
+
   it("creates a milestone branch from an authoritative default head and reconciles its SHA", async () => {
     const client = new GitHubClient();
     const calls: Array<{ args: string[]; input?: string }> = [];

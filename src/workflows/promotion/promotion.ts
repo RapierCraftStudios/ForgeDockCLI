@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type {
   PromotionMode,
@@ -508,10 +508,21 @@ async function mergePromotion(record: PromotionRecord, dependencies: PromotionDe
   await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
   if (pullRequest.state !== "MERGED") {
     if (!dependencies.host.getPullRequestMergeGate) throw new Error("Promotion merge requires authoritative GitHub merge-admission support");
-    const gate = await dependencies.host.getPullRequestMergeGate(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
+    const gate = await dependencies.host.getPullRequestMergeGate(
+      record.repository,
+      pullRequest.number,
+      record.review.headSha,
+      record.targetBranch,
+      { refreshUnknown: true },
+    );
+    const mergeability = pullRequestMergeability(gate);
     const failedChecks = gate.requiredChecks.filter((check) => check.state !== "passed");
-    if (!gate.mergeable || failedChecks.length) {
-      throw new Error(`Promotion merge admission is blocked for PR #${pullRequest.number}: ${!gate.mergeable ? "PR is not mergeable" : failedChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`);
+    if (mergeability !== "mergeable" || failedChecks.length) {
+      const blockers = [
+        ...(mergeability !== "mergeable" ? [`mergeability=${mergeability}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`] : []),
+        ...failedChecks.map((check) => `${check.name}=${check.state}`),
+      ];
+      throw new Error(`Promotion merge admission is blocked for PR #${pullRequest.number}: ${blockers.join(", ")}`);
     }
     await dependencies.host.mergePullRequest(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
   }

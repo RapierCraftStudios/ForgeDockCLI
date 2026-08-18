@@ -170,12 +170,30 @@ export interface PullRequestSnapshot {
   baseBranch: string;
 }
 
+/**
+ * GitHub computes pull-request mergeability asynchronously.  Keep that
+ * indeterminate state distinct from a confirmed conflict (and from a failed
+ * mergeability query); a boolean projection cannot safely carry those
+ * meanings across a resumable merge checkpoint.
+ */
+export type PullRequestMergeability = "mergeable" | "conflicting" | "unknown" | "unavailable";
+
+export interface PullRequestMergeGateOptions {
+  /** Refresh a transient GitHub UNKNOWN result with a bounded attempt budget. */
+  refreshUnknown?: boolean;
+}
+
 export interface PullRequestMergeGate {
   repo: string;
   pullRequest: number;
   headSha: string;
   baseBranch: string;
+  /** Backward-compatible boolean projection; use mergeability for admission. */
   mergeable: boolean;
+  /** Explicit GitHub mergeability classification, when supplied by the host. */
+  mergeability?: PullRequestMergeability;
+  /** Bounded, redacted diagnostic for unknown/unavailable mergeability. */
+  mergeabilityReason?: string;
   requiredChecks: Array<{
     name: string;
     state: "pending" | "passed" | "failed" | "cancelled" | "unavailable";
@@ -183,6 +201,19 @@ export interface PullRequestMergeGate {
   }>;
   observedAt: string;
 }
+
+/** Normalize legacy test doubles and pre-status checkpoints to the typed state. */
+export function pullRequestMergeability(gate: Pick<PullRequestMergeGate, "mergeable" | "mergeability">): PullRequestMergeability {
+  if (gate.mergeability === undefined) return gate.mergeable ? "mergeable" : "conflicting";
+  if (![
+    "mergeable", "conflicting", "unknown", "unavailable",
+  ].includes(gate.mergeability)) return "unavailable";
+  // The boolean is retained for compatibility, but a contradictory typed
+  // projection is malformed evidence and must never authorize a merge.
+  if ((gate.mergeability === "mergeable") !== gate.mergeable) return "unavailable";
+  return gate.mergeability;
+}
+
 export interface PullRequestCheckDiagnostic { name: string; state: PullRequestMergeGate["requiredChecks"][number]["state"]; detailsUrl?: string; logExcerpt: string; }
 
 export interface ForgeHost {
@@ -252,7 +283,7 @@ export interface ForgeHost {
   isBranchProtected?(repo: string, branch: string): Promise<boolean>;
   getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot>;
   /** Read authoritative PR mergeability and required-check state before merge. */
-  getPullRequestMergeGate?(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate>;
+  getPullRequestMergeGate?(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string, options?: PullRequestMergeGateOptions): Promise<PullRequestMergeGate>;
   getPullRequestHeadRepository?(repo: string, number: number, expectedHeadSha: string): Promise<{ repo: string; isCrossRepository: boolean }>;
   getPullRequestCheckDiagnostics?(repo: string, number: number, expectedHeadSha: string, checks: readonly string[]): Promise<readonly PullRequestCheckDiagnostic[]>;
   /** Read the Git ref directly when a PR projection may lag a successful push. */

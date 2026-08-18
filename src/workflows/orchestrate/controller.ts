@@ -5,6 +5,7 @@ import type {
   DurableOrchestrationNodeStatus,
   OrchestrationExecutionAdmission,
   OrchestrationExecutionClaim,
+  OrchestrationExecutionLeaseStatus,
   OrchestrationNodeRecord,
   OrchestrationPlanMetadata,
   OrchestrationRecord,
@@ -57,6 +58,8 @@ export interface OrchestrationTaskIdentity {
 
 export interface OrchestrationWorkerContext extends ScheduleWorkerContext {
   orchestrationId: string;
+  /** Durable controller execution attempt used to bind per-node leases. */
+  executionAttempt: number;
   attemptId: string;
   recovery: OrchestrationRecoveryMode;
   /** Persist transport identity immediately after the caller launches work-on. */
@@ -147,6 +150,8 @@ export interface OrchestrationControllerDependencies {
   maxDecompositionDepth?: number;
   /** Available worker slots in the caller's process/RPC/subagent transport. */
   transportCapacity: number | (() => number | Promise<number>);
+  /** Optional cancellation for a run waiting on external transport capacity. */
+  signal?: AbortSignal;
   onEvent?: OrchestrationEventSink;
   /** Observer failures are diagnostic only and never change workflow state. */
   onEventError?: (error: unknown, event: OrchestrationEvent) => void;
@@ -166,6 +171,8 @@ interface PersistenceState {
   record: OrchestrationRecord;
   claim: OrchestrationExecutionClaim;
   pending: Promise<void>;
+  /** Synthetic scheduler starts wait for the durable launching attempt. */
+  deferredStartedEvents: Array<{ itemId: string }>;
   error?: unknown;
 }
 
@@ -285,7 +292,15 @@ export class OrchestrationController {
         }
         throw error;
       }
-      if (!claim) throw new Error(`Orchestration ${orchestrationId} is already active in another controller`);
+      if (!claim) {
+        let leaseStatus;
+        try {
+          leaseStatus = await this.dependencies.executionAdmission.describe?.(orchestrationId);
+        } catch {
+          leaseStatus = undefined;
+        }
+        throw new Error(activeOrchestrationExecutionMessage(orchestrationId, leaseStatus));
+      }
       if (!claim.claimId.trim()) throw new Error(`Execution admission returned an empty claim id for ${orchestrationId}`);
       claim.assertValid();
 
@@ -297,10 +312,18 @@ export class OrchestrationController {
         throw new Error(`Orchestration ${orchestrationId} has already started; use resume`);
       }
 
-      state = { record: structuredClone(loaded), claim, pending: Promise.resolve() };
-      const transportCapacity = await this.resolveTransportCapacity();
+      state = {
+        record: structuredClone(loaded),
+        claim,
+        pending: Promise.resolve(),
+        deferredStartedEvents: [],
+      };
+      const dynamicTransportCapacity = typeof this.dependencies.transportCapacity === "function";
+      // A live transport can be temporarily out of slots. Keep the durable
+      // run admitted with an effective cap of zero and let the scheduler
+      // backpressure queued work until a later sample is available.
+      const transportCapacity = await this.resolveTransportCapacity(dynamicTransportCapacity);
       const effectiveMaxParallel = Math.min(state.record.maxParallel, transportCapacity);
-      assertPositiveInteger(effectiveMaxParallel, "effectiveMaxParallel");
       this.replaceRecord(state, {
         ...state.record,
         status: "running",
@@ -334,11 +357,24 @@ export class OrchestrationController {
       let schedule: ScheduleResult = scheduleResultFromRecord(state.record, []);
       let pass = prepared;
       while (pass.items.length) {
+        const observeTransportCapacity = (capacity: number): void => {
+          // This is intentionally an in-memory observation. The next
+          // controller checkpoint (attempt, heartbeat, worker transition, or
+          // final snapshot) persists it without writing once per poll tick.
+          executionState.record.effectiveMaxParallel = Math.min(executionState.record.maxParallel, capacity);
+        };
         const current = await runSchedule(
           pass.items,
-          effectiveMaxParallel,
+          state.record.maxParallel,
           (item, schedulerContext) => this.executePreparedWorker(executionState, item, schedulerContext, pass.actions.get(item.id)),
           {
+            capacity: async () => {
+              const capacity = await this.resolveTransportCapacity(dynamicTransportCapacity);
+              executionState.record.transportCapacity = capacity;
+              return capacity;
+            },
+            onCapacityObserved: observeTransportCapacity,
+            ...(this.dependencies.signal !== undefined ? { signal: this.dependencies.signal } : {}),
             serializationEdges: pass.serializationEdges,
             resumedItemIds: pass.resumedItemIds,
             onClaimsPromoted: async (itemId, claims) => {
@@ -365,7 +401,7 @@ export class OrchestrationController {
       await this.flush(state);
       return {
         orchestrationId,
-        effectiveMaxParallel,
+        effectiveMaxParallel: state.record.effectiveMaxParallel ?? effectiveMaxParallel,
         schedule: mergeResultWithRecord({ ...schedule, startOrder }, state.record),
         record: structuredClone(state.record),
       };
@@ -850,6 +886,7 @@ export class OrchestrationController {
   ): OrchestrationWorkerContext {
     return {
       orchestrationId: state.record.orchestrationId,
+      executionAttempt: state.record.executionAttempt ?? 0,
       attemptId,
       recovery,
       promoteClaims: async (claims) => {
@@ -924,11 +961,13 @@ export class OrchestrationController {
     };
     this.updateNode(state, nodeId, (current) => ({
       ...current,
+      status: "running",
       attempts: [...(current.attempts ?? []), attempt],
       activeAttemptId: attempt.attemptId,
     }));
     await this.flush(state);
-    this.emitSnapshot(state.record);
+    this.releaseStartedEvent(state, nodeId);
+    this.emitSnapshot(state.record, state);
     return attempt;
   }
 
@@ -1134,18 +1173,33 @@ export class OrchestrationController {
     event: ScheduleEvent,
     actions: ReadonlyMap<string, PreparedAction>,
   ): void {
+    const action = event.itemId === undefined ? undefined : actions.get(event.itemId);
+    if (event.type === "started" && event.itemId !== undefined && action?.kind === "launch") {
+      // The scheduler's started event is a projection, not an independent
+      // durable transition. Keep the in-memory status running so the next
+      // beginAttempt write includes it, but do not write a full record before
+      // the launching attempt identity is durable. The event is released by
+      // beginAttempt after that fenced write completes.
+      this.replaceNodeInMemory(state, event.itemId, (node) => {
+        const { error: _error, waitReason: _waitReason, ...rest } = node;
+        return { ...rest, status: "running" };
+      });
+      state.deferredStartedEvents.push({ itemId: event.itemId });
+      return;
+    }
     const now = this.now();
-    this.replaceRecord(state, {
+    let changed = false;
+    const projectedRecord = {
       ...state.record,
       updatedAt: now,
       nodes: state.record.nodes.map((node) => {
         const scheduledStatus = event.status.get(node.id);
         if (scheduledStatus === undefined) return node;
-        const action = actions.get(node.id);
+        const nodeAction = actions.get(node.id);
         // Do not erase a durable live/terminal reconciliation merely because
         // the fresh in-memory scheduler first emits its synthetic queued view.
-        if (action?.kind === "terminal" && (scheduledStatus === "queued" || scheduledStatus === "running")) return node;
-        if (scheduledStatus === "queued" && action?.kind === "live") return node;
+        if (nodeAction?.kind === "terminal" && (scheduledStatus === "queued" || scheduledStatus === "running")) return node;
+        if (scheduledStatus === "queued" && nodeAction?.kind === "live") return node;
         // A parallel worker can emit an event after this node has durably
         // completed but before the scheduler observes its callback return.
         // Never regress that atomic terminal transition to the event's stale
@@ -1161,28 +1215,27 @@ export class OrchestrationController {
         const error = event.errors.get(node.id);
         const waitReason = event.waitReasons?.get(node.id);
         const { error: _error, waitReason: _waitReason, ...rest } = node;
-        return {
+        const candidate = {
           ...rest,
           status: durableStatus(scheduledStatus),
           ...(error !== undefined ? { error: error.message } : {}),
           ...(waitReason !== undefined ? { waitReason: structuredClone(waitReason) } : {}),
         };
+        if (!sameJson(node, candidate)) changed = true;
+        return candidate;
       }),
-    });
+    };
 
-    const fullEvent = scheduleEventFromRecord(event, state.record);
-    const snapshot = buildOrchestrationSnapshot({
-      orchestrationId: state.record.orchestrationId,
-      items: state.record.nodes.map(itemFromNodeRecord),
-      serializationEdges: (state.record.serializationEdges ?? []).map(cloneSerializationEdge),
-      result: {
-        status: new Map(fullEvent.status),
-        errors: new Map(fullEvent.errors),
-        ...(fullEvent.waitReasons !== undefined ? { waitReasons: new Map(fullEvent.waitReasons) } : {}),
-      },
-      updatedAt: now,
-    });
-    this.queueEvent(state, orchestrationEventFromSchedule(fullEvent, snapshot));
+    if (!changed) {
+      // Synthetic queued/completed events often describe the exact durable
+      // node projection already written by create/beginAttempt/finishAttempt.
+      // Keep their observer notification, but retain the durable timestamp so
+      // delivery remains ordered after the write that established the state.
+      this.queueScheduleEvent(state, event);
+      return;
+    }
+    this.replaceRecord(state, projectedRecord);
+    this.queueScheduleEvent(state, event, now);
   }
 
   private applyScheduleResult(state: PersistenceState, result: ScheduleResult): void {
@@ -1241,6 +1294,24 @@ export class OrchestrationController {
     this.replaceRecord(state, record);
   }
 
+  /** Apply a scheduler projection without claiming it is durable yet. */
+  private replaceNodeInMemory(
+    state: PersistenceState,
+    nodeId: string,
+    update: (node: OrchestrationNodeRecord) => OrchestrationNodeRecord,
+  ): void {
+    let matched = false;
+    state.record = {
+      ...state.record,
+      nodes: state.record.nodes.map((node) => {
+        if (node.id !== nodeId) return node;
+        matched = true;
+        return update(node);
+      }),
+    };
+    if (!matched) throw new Error(`Unknown orchestration node: ${nodeId}`);
+  }
+
   private updateAttempt(
     state: PersistenceState,
     nodeId: string,
@@ -1288,17 +1359,54 @@ export class OrchestrationController {
   }
 
   private replaceRecord(state: PersistenceState, record: OrchestrationRecord): void {
+    // Scheduler lifecycle notifications frequently carry only a fresh
+    // timestamp. Do not enqueue a full-record write when the durable
+    // projection is unchanged; callers still retain the last durable time for
+    // observer ordering.
+    if (sameJsonWithoutUpdatedAt(state.record, record)) return;
     state.record = record;
     const snapshot = structuredClone(record);
     state.pending = state.pending.then(async () => {
       if (state.error !== undefined) return;
       try {
         state.claim.assertValid();
-        await this.dependencies.repository.saveOrchestration(snapshot);
+        await persistOrchestrationWithClaim(state.claim, this.dependencies.repository, snapshot);
       } catch (error) {
         state.error = error;
       }
     });
+  }
+
+  private releaseStartedEvent(state: PersistenceState, nodeId: string): void {
+    const index = state.deferredStartedEvents.findIndex((event) => event.itemId === nodeId);
+    if (index < 0) return;
+    state.deferredStartedEvents.splice(index, 1);
+    this.queueScheduleEvent(state, { type: "started", itemId: nodeId });
+  }
+
+  private queueScheduleEvent(
+    state: PersistenceState,
+    event: Pick<ScheduleEvent, "type" | "itemId">,
+    updatedAt = state.record.updatedAt,
+  ): void {
+    const fullEvent = scheduleEventFromRecord({
+      type: event.type,
+      ...(event.itemId !== undefined ? { itemId: event.itemId } : {}),
+      status: new Map(),
+      errors: new Map(),
+    }, state.record);
+    const snapshot = buildOrchestrationSnapshot({
+      orchestrationId: state.record.orchestrationId,
+      items: state.record.nodes.map(itemFromNodeRecord),
+      serializationEdges: (state.record.serializationEdges ?? []).map(cloneSerializationEdge),
+      result: {
+        status: new Map(fullEvent.status),
+        errors: new Map(fullEvent.errors),
+        ...(fullEvent.waitReasons !== undefined ? { waitReasons: new Map(fullEvent.waitReasons) } : {}),
+      },
+      updatedAt,
+    });
+    this.queueEvent(state, orchestrationEventFromSchedule(fullEvent, snapshot));
   }
 
   private async flush(state: PersistenceState): Promise<void> {
@@ -1306,10 +1414,18 @@ export class OrchestrationController {
     if (state.error !== undefined) throw state.error;
   }
 
-  private async resolveTransportCapacity(): Promise<number> {
+  private async resolveTransportCapacity(allowZero = false): Promise<number> {
     const source = this.dependencies.transportCapacity;
-    const capacity = typeof source === "function" ? await source() : source;
-    assertPositiveInteger(capacity, "transportCapacity");
+    let capacity: number;
+    try {
+      capacity = typeof source === "function" ? await source() : source;
+    } catch (error) {
+      if (allowZero) return 0;
+      throw error;
+    }
+    if (!Number.isSafeInteger(capacity) || (allowZero ? capacity < 0 : capacity < 1)) {
+      throw new Error(`${allowZero ? "transportCapacity must be a non-negative integer" : "transportCapacity must be a positive integer"}`);
+    }
     return capacity;
   }
 
@@ -1704,6 +1820,43 @@ function assertPositiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
 }
 
+function activeOrchestrationExecutionMessage(
+  orchestrationId: string,
+  leaseStatus?: OrchestrationExecutionLeaseStatus,
+): string {
+  const details: string[] = [];
+  if (leaseStatus?.owner) details.push(`owner ${leaseStatus.owner}`);
+  if (leaseStatus?.expiresAt !== undefined) details.push(`expires ${new Date(leaseStatus.expiresAt).toISOString()}`);
+  if (leaseStatus?.heartbeatAt !== undefined) details.push(`heartbeat ${new Date(leaseStatus.heartbeatAt).toISOString()}`);
+  const suffix = details.length ? ` (${details.join(", ")})` : "";
+  return `Orchestration ${orchestrationId} is already active in another controller${suffix}`;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Orchestration records are JSON-safe; preserve key order from the record. */
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameJsonWithoutUpdatedAt(left: OrchestrationRecord, right: OrchestrationRecord): boolean {
+  const { updatedAt: _leftUpdatedAt, ...leftWithoutUpdatedAt } = left;
+  const { updatedAt: _rightUpdatedAt, ...rightWithoutUpdatedAt } = right;
+  return sameJson(leftWithoutUpdatedAt, rightWithoutUpdatedAt);
+}
+
+async function persistOrchestrationWithClaim(
+  claim: OrchestrationExecutionClaim,
+  repository: OrchestrationRepository,
+  record: OrchestrationRecord,
+): Promise<void> {
+  if (claim.persist) {
+    await claim.persist(repository, record);
+    return;
+  }
+  claim.assertValid();
+  await repository.saveOrchestration(record);
+  claim.assertValid();
 }

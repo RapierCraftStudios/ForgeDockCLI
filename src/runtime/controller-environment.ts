@@ -8,6 +8,11 @@ import { basename, delimiter, dirname, join } from "node:path";
 const AGENT_TRANSPORT_PREFIXES = ["PI_SUBAGENT_", "PI_SUBAGENTS_"] as const;
 export const FORGEDOCK_VERIFICATION_PATH = "FORGEDOCK_VERIFICATION_PATH";
 const FORGEDOCK_VERIFICATION_HOME = "FORGEDOCK_VERIFICATION_HOME_V1";
+const VERIFICATION_MODE_KEYS = new Set([
+  "FORGEDOCK_TERMINAL",
+  "FORGEDOCK_CODING_AGENT_DIR",
+  "PI_CODING_AGENT",
+]);
 const AGENT_TRANSPORT_KEYS = new Set([
   "PI_INTERCOM_SESSION_ID",
 ]);
@@ -42,6 +47,7 @@ export function withoutAgentTransportEnvironment(environment: NodeJS.ProcessEnv)
 export function verificationEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const clean = withoutAgentTransportEnvironment(environment);
   for (const name of Object.keys(clean)) {
+    if (isVerificationModeVariable(name)) delete clean[name];
     if (isSensitiveVerificationVariable(name, clean[name])) delete clean[name];
   }
   if (process.platform !== "win32") return isolateVerificationHome(clean);
@@ -258,4 +264,16 @@ export function isAgentTransportVariable(name: string): boolean {
   const normalized = name.toUpperCase();
   return AGENT_TRANSPORT_KEYS.has(normalized)
     || AGENT_TRANSPORT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+function isVerificationModeVariable(name: string): boolean {
+  const normalized = name.toUpperCase();
+  return VERIFICATION_MODE_KEYS.has(normalized)
+    || normalized.startsWith("FORGEDOCK_CONTROLLER_")
+    || normalized.startsWith("FORGEDOCK_ORCHESTRATION_")
+    || normalized.startsWith("FORGEDOCK_NESTED_AGENT_")
+    || normalized.startsWith("FORGEDOCK_CLAIM_PROMOTION_")
+    || normalized === "FORGEDOCK_RUNTIME_ROOT"
+    || normalized === "FORGEDOCK_RUNTIME_TERMINAL"
+    || normalized === "FORGEDOCK_RUN_ID";
 }

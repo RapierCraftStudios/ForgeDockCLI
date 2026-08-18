@@ -18,6 +18,92 @@ function deferredGate(): { promise: Promise<void>; release: () => void } {
 }
 
 describe("lean orchestration scheduler", () => {
+  it("backpressures a live capacity drop and resumes queued work when slots return", async () => {
+    let available = 2;
+    const gates = new Map(["a", "b", "c", "d"].map((id) => [id, deferredGate()] as const));
+    const started: string[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    const execution = runSchedule(
+      ["a", "b", "c", "d"].map((id, index) => ({ id, issue: index + 1, priority: index + 1, dependencies: [], claims: [] })),
+      4,
+      async (item) => {
+        started.push(item.id);
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await gates.get(item.id)!.promise;
+        active -= 1;
+      },
+      { capacity: () => available, capacityPollMs: 5 },
+    );
+
+    while (started.length !== 2) await new Promise<void>((resolve) => setTimeout(resolve, 2));
+    assert.deepEqual(started, ["a", "b"]);
+    available = 0;
+    gates.get("a")!.release();
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(started, ["a", "b"], "a capacity drop must not launch a worker or fail the queued node");
+
+    available = 2;
+    while (started.length < 3) await new Promise<void>((resolve) => setTimeout(resolve, 2));
+    assert.deepEqual(started, ["a", "b", "c"]);
+    available = 0;
+    gates.get("b")!.release();
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(started, ["a", "b", "c"]);
+    available = 1;
+    gates.get("c")!.release();
+    gates.get("d")!.release();
+    const result = await execution;
+    assert.deepEqual(result.startOrder, ["a", "b", "c", "d"]);
+    assert.ok([...result.status.values()].every((status) => status === "completed"));
+    assert.equal(maximumActive, 2);
+  });
+
+  it("allows a permanently unavailable transport queue to be cancelled", async () => {
+    const abort = new AbortController();
+    const execution = runSchedule(
+      [{ id: "waiting", issue: 1, priority: 1, dependencies: [], claims: [] }],
+      1,
+      async () => { throw new Error("transport must not launch while capacity is zero"); },
+      { capacity: () => 0, capacityPollMs: 5, signal: abort.signal },
+    );
+    setTimeout(() => abort.abort(new Error("transport capacity wait cancelled")), 20);
+    await assert.rejects(execution, /transport capacity wait cancelled/);
+  });
+
+  it("drains a 500-node fleet without duplicate dispatches, orphaned work, or exceeding capacity", async () => {
+    const maxParallel = 20;
+    const items: ScheduledWorkItem[] = Array.from({ length: 500 }, (_, index) => ({
+      id: `fleet-${index + 1}`,
+      issue: 10_000 + index,
+      priority: index % 4,
+      dependencies: index >= 100 && index % 5 === 0 ? [`fleet-${index - 99}`] : [],
+      claims: [`fleet/scope-${index + 1}`],
+    }));
+    const dispatches = new Map<string, number>();
+    let active = 0;
+    let maximumActive = 0;
+
+    const result = await runSchedule(items, maxParallel, async (item) => {
+      dispatches.set(item.id, (dispatches.get(item.id) ?? 0) + 1);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active -= 1;
+    });
+
+    assert.equal(result.status.size, 500);
+    assert.equal(result.startOrder.length, 500);
+    assert.equal(new Set(result.startOrder).size, 500);
+    assert.equal(dispatches.size, 500);
+    assert.ok([...dispatches.values()].every((count) => count === 1));
+    assert.ok([...result.status.values()].every((status) => status === "completed"));
+    assert.ok(maximumActive > 1);
+    assert.ok(maximumActive <= maxParallel);
+    assert.equal(active, 0);
+  });
+
   it("honors dependencies, priority, concurrency and path claims", async () => {
     const items = [
       { id: "a", issue: 1, priority: 1, dependencies: [], claims: ["db/migrations"] },
@@ -88,6 +174,104 @@ describe("lean orchestration scheduler", () => {
     assert.deepEqual(preview.initialReady.map((item) => item.id), ["c", "a"]);
     assert.equal(preview.criticalPath.length, 2);
     assert.equal(preview.criticalPath[0]?.id, "a");
+  });
+
+  it("keeps dense shared fallback claims sparse and dispatches every node exactly once", async () => {
+    const items: ScheduledWorkItem[] = Array.from({ length: 500 }, (_, index) => ({
+      id: `shared-${index + 1}`,
+      issue: 20_000 + index,
+      priority: index % 3,
+      dependencies: [],
+      claims: ["component:repository", "*"],
+    }));
+    const materialized = materializeClaimDependencies(items);
+
+    // Both claims conflict for every pair, but one immediate predecessor per
+    // resource is sufficient to preserve the canonical issue ordering.
+    assert.equal(materialized.edges.length, items.length - 1);
+    assert.equal(new Set(materialized.edges.map((edge) => `${edge.predecessor}->${edge.successor}`)).size, items.length - 1);
+    assert.deepEqual(materialized.edges.slice(0, 2).map(({ predecessor, successor }) => [predecessor, successor]), [
+      ["shared-1", "shared-2"],
+      ["shared-2", "shared-3"],
+    ]);
+    assert.deepEqual(materialized.edges.at(-1) && [materialized.edges.at(-1)!.predecessor, materialized.edges.at(-1)!.successor], ["shared-499", "shared-500"]);
+    assert.ok(materialized.edges.every((edge) => edge.overlappingClaims.includes("component:repository ↔ component:repository")));
+    assert.deepEqual(materialized.items.map((item) => item.dependencies), items.map((item) => item.dependencies));
+
+    const dispatches = new Map<string, number>();
+    const result = await runSchedule(materialized.items, 20, async (item) => {
+      dispatches.set(item.id, (dispatches.get(item.id) ?? 0) + 1);
+    }, { serializationEdges: materialized.edges });
+    assert.equal(result.startOrder.length, items.length);
+    assert.equal(dispatches.size, items.length);
+    assert.ok([...dispatches.values()].every((count) => count === 1));
+    assert.ok([...result.status.values()].every((status) => status === "completed"));
+  });
+
+  it("keeps repeated broad and unique descendant claims on a bounded frontier", () => {
+    const count = 1_000;
+    const items: ScheduledWorkItem[] = Array.from({ length: count }, (_, index) => ({
+      id: `frontier-${index + 1}`,
+      issue: 30_000 + index,
+      priority: 1,
+      dependencies: [],
+      claims: ["*", `src/frontier-${index + 1}/file.ts`],
+    }));
+    const diagnostics = { conflictCandidates: 0, reachabilityChecks: 0, reachabilityNodeVisits: 0, frontierUpdates: 0 };
+    const materialized = materializeClaimDependencies(items, diagnostics);
+
+    // Every broad claim conflicts with every prior descendant claim, but the
+    // broad frontier reaches those holders through the preceding chain. The
+    // edge count therefore stays linear even with 1,000 sparse descendants.
+    assert.equal(materialized.edges.length, count - 1);
+    assert.deepEqual(materialized.edges.slice(0, 2).map(({ predecessor, successor }) => [predecessor, successor]), [
+      ["frontier-1", "frontier-2"],
+      ["frontier-2", "frontier-3"],
+    ]);
+    assert.deepEqual(materialized.edges.at(-1) && [materialized.edges.at(-1)!.predecessor, materialized.edges.at(-1)!.successor], [
+      `frontier-${count - 1}`,
+      `frontier-${count}`,
+    ]);
+    // The old implementation produced the same sparse edges but recursively
+    // walked the growing trie/derived chain. These structural counters prove
+    // the materializer examines only a constant-size frontier per item.
+    assert.ok(diagnostics.conflictCandidates <= count * 2);
+    assert.ok(diagnostics.reachabilityChecks <= count * 2);
+    assert.ok(diagnostics.reachabilityNodeVisits <= count);
+    assert.ok(diagnostics.frontierUpdates <= count * 12);
+  });
+
+  it("materializes a late broad scope without pairwise descendant traversal", () => {
+    const count = 1_000;
+    const items: ScheduledWorkItem[] = Array.from({ length: count }, (_, index) => ({
+      id: `unique-${index + 1}`,
+      issue: 40_000 + index,
+      priority: 1,
+      dependencies: [],
+      claims: [`src/unique-${index + 1}/file.ts`],
+    }));
+    items.push({ id: "broad", issue: 50_000, priority: 1, dependencies: [], claims: ["src"] });
+    const diagnostics = { conflictCandidates: 0, reachabilityChecks: 0, reachabilityNodeVisits: 0, frontierUpdates: 0 };
+    const materialized = materializeClaimDependencies(items, diagnostics);
+
+    // Every unique holder needs one edge to the late broad holder, but finding
+    // that irreducible frontier must remain linear rather than comparing every
+    // pair of independent descendants.
+    assert.equal(materialized.edges.length, count);
+    assert.ok(materialized.edges.every((edge) => edge.successor === "broad"));
+    assert.ok(diagnostics.conflictCandidates <= count);
+    assert.ok(diagnostics.reachabilityChecks <= count);
+    assert.equal(diagnostics.reachabilityNodeVisits, 0);
+    assert.ok(diagnostics.frontierUpdates <= count * 8);
+  });
+
+  it("orders claim materialization topologically when issue numbers run backward", () => {
+    const materialized = materializeClaimDependencies([
+      { id: "a", issue: 1, priority: 1, dependencies: ["b"], claims: ["src/shared"] },
+      { id: "b", issue: 2, priority: 1, dependencies: [], claims: ["src/shared"] },
+    ]);
+    assert.deepEqual(materialized.edges, []);
+    assert.deepEqual(materialized.items.map((item) => item.dependencies), [["b"], []]);
   });
 
   it("uses conservative glob scopes for accepted forms, uncertain segments, and boundaries", () => {
@@ -309,6 +493,19 @@ describe("lean orchestration scheduler", () => {
     assert.ok(events.includes("suspended"));
   });
 
+  it("keeps a merge-admission blocker distinct from an awaiting-human suspension", async () => {
+    const result = await runSchedule([
+      { id: "merge-gate", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 2, priority: 1, dependencies: ["merge-gate"], claims: [] },
+    ], 1, async (item) => item.id === "merge-gate"
+      ? { status: "blocked", error: "GitHub mergeability query is unavailable" }
+      : undefined);
+    assert.equal(result.status.get("merge-gate"), "blocked");
+    assert.equal(result.status.get("dependent"), "blocked");
+    assert.equal(result.errors.get("merge-gate")?.message, "GitHub mergeability query is unavailable");
+    assert.equal(result.errors.get("dependent")?.message.includes("merge-gate"), true);
+  });
+
   it("blocks on any failed dependency even when an earlier dependency is suspended", async () => {
     const result = await runSchedule([
       { id: "suspended", issue: 1, priority: 1, dependencies: [], claims: [] },
@@ -411,6 +608,27 @@ describe("worker leases", () => {
     assert.equal(recovered?.owner, "worker-b");
     assert.equal(leases.release("issue-1", first?.token ?? ""), false);
     assert.equal(leases.release("issue-1", recovered?.token ?? ""), true);
+  });
+
+  it("retains a non-secret node binding for live reconciliation and changes it only after expiry", () => {
+    const leases = new InMemoryLeaseRepository();
+    const first = leases.acquire("issue-recovery", "old-worker", 100, 1_000, {
+      binding: "orchestration:dag-1:attempt:old:item:issue-recovery",
+      recovery: "initial",
+    });
+    assert.equal(first?.binding, "orchestration:dag-1:attempt:old:item:issue-recovery");
+    assert.equal(leases.inspect?.("issue-recovery")?.binding, first?.binding);
+    assert.equal(leases.acquire("issue-recovery", "new-worker", 100, 1_050, {
+      binding: "orchestration:dag-1:attempt:new:item:issue-recovery",
+      recovery: "resume",
+    }), undefined, "recovery must not steal a live heartbeat");
+    const recovered = leases.acquire("issue-recovery", "new-worker", 100, 1_101, {
+      binding: "orchestration:dag-1:attempt:new:item:issue-recovery",
+      recovery: "relaunch",
+    });
+    assert.equal(recovered?.binding, "orchestration:dag-1:attempt:new:item:issue-recovery");
+    assert.equal(leases.release("issue-recovery", first?.token ?? ""), false);
+    assert.equal(leases.release("issue-recovery", recovered?.token ?? ""), true);
   });
 
   it("fails closed when the retained witness rolls back", () => {

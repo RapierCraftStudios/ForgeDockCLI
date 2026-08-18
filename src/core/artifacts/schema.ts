@@ -437,10 +437,16 @@ export const OutcomePayloadSchema = Type.Object({
   finalSha: Type.Optional(Sha),
   /** Recoverable merge-admission evidence retained when GitHub checks are not ready. */
   mergeGate: Type.Optional(Type.Object({
+    /** Additive repository identity; older checkpoints may omit it. */
+    repo: Type.Optional(NonEmptyString),
     pullRequest: Type.Integer({ minimum: 1 }),
     headSha: Sha,
     baseBranch: NonEmptyString,
     mergeable: Type.Boolean(),
+    mergeability: Type.Optional(Type.Union([
+      Type.Literal("mergeable"), Type.Literal("conflicting"), Type.Literal("unknown"), Type.Literal("unavailable"),
+    ])),
+    mergeabilityReason: Type.Optional(Type.String({ maxLength: 500 })),
     observedAt: IsoDateTime,
     requiredChecks: Type.Array(Type.Object({
       name: NonEmptyString,

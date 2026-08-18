@@ -128,7 +128,13 @@ function formatWriteCall(args, options, theme, cache, cwd) {
 }
 function formatWriteResult(result, theme) {
     if (!result.isError) {
-        return result.details?.diff ? `\n${renderDiff(result.details.diff)}` : undefined;
+        const output = result.content
+            .filter((c) => c.type === "text")
+            .map((c) => c.text || "")
+            .join("\n");
+        const successOutput = output ? `\n${output}` : "";
+        const diffOutput = result.details?.diff ? `\n${renderDiff(result.details.diff)}` : "";
+        return successOutput || diffOutput ? `${successOutput}${diffOutput}` : undefined;
     }
     const output = result.content
         .filter((c) => c.type === "text")

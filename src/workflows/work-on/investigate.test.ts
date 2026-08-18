@@ -5,6 +5,7 @@ import type { DecompositionChild, IssueSnapshot } from "../../core/ports/forge-h
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
+import { AgentExecutionInterruptedError } from "../../runtime/agent-runtime.js";
 import {
   investigateWorkItem,
   latestPriorLearningArtifacts,
@@ -165,6 +166,20 @@ describe("work-on investigation", () => {
       investigateWorkItem({ intent: intent("run_provider_failure"), cwd: process.cwd() }, deps),
       (error: unknown) => error instanceof WorkflowExecutionError && error.run.failure === "provider unavailable",
     );
+  });
+
+  it("preserves an interrupted provider checkpoint for restart instead of failing the run", async () => {
+    const runtime = new FakeAgentRuntime([
+      new AgentExecutionInterruptedError("provider became semantically idle", { reason: "semantic-idle", idleMs: 120_000 }),
+    ]);
+    const deps = dependencies(runtime);
+    await assert.rejects(
+      investigateWorkItem({ intent: intent("run_provider_idle"), cwd: process.cwd() }, deps),
+      (error: unknown) => error instanceof WorkflowExecutionError
+        && error.recoverable
+        && error.run.state === "investigating",
+    );
+    assert.deepEqual((await deps.runs.history("run_provider_idle")).map((record) => record.event), ["START_INVESTIGATION", "RESUME_INVESTIGATION"]);
   });
 
   it("recovers an Intent-only crash by dispatching exactly one investigator", async () => {

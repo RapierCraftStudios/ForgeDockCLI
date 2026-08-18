@@ -443,6 +443,30 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(runtime.tasks, []);
   });
 
+  it("refuses to trust mismatched build-resume preflight evidence", async () => {
+    const fixture = await createBuildCheckpointFixture("run_build_claim_preflight_mismatch");
+    const runtime = new FakeAgentRuntime([]);
+    let promoted = false;
+
+    await assert.rejects(resumeBuildWorkOn({
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      packet: fixture.packetArtifact,
+      workspace,
+      baseBranch: "main",
+      verification: [],
+      preflightedPacketClaims: ["src/not-the-packet.ts"],
+      onClaimsPromoted: () => { promoted = true; },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    }), /preflighted Build Packet claims do not match/i);
+
+    assert.equal(promoted, false);
+    assert.deepEqual(runtime.tasks, []);
+  });
+
   it("records a non-conflict callback failure from the adopted fresh packet checkpoint", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet]);
     const artifacts = new InMemoryArtifactRepository();

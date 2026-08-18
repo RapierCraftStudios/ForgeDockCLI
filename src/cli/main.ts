@@ -35,15 +35,16 @@ import {
   type AgentRuntime,
   type RuntimePreflightOptions,
 } from "../runtime/agent-runtime.js";
+import { DEFAULT_SEMANTIC_IDLE_MS, LivenessRecoveringAgentRuntime, validateSemanticIdleMs } from "../runtime/semantic-idle.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { persistControllerTaskTerminal } from "../runtime/controller-task-record.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
 import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
-import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
+import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
@@ -58,6 +59,9 @@ import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-r
 import { promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController } from "../workflows/orchestrate/controller.js";
+import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
+import { acquireNodeLease, inspectNodeLease, orchestrationNodeLeaseBinding, waitForNodeLease } from "../workflows/orchestrate/node-lease.js";
+import { reconcileAuthoritativeWorkerArtifacts } from "../workflows/orchestrate/reconcile-worker.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
 import { AgentEventStreamWriter, observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "./agent-event-stream.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
@@ -66,6 +70,8 @@ import type { RunState } from "../core/state/machine.js";
 import { discoverVerificationCommands } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
+import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
+import { mapWithConcurrency } from "../core/concurrency.js";
 
 const args = process.argv.slice(2);
 const mode = colorMode();
@@ -156,7 +162,7 @@ async function materializeCliDecomposition(input: {
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
   const selected = new Set([...input.orchestration.issueNumbers, ...children]);
-  const snapshots = await Promise.all(children.map((issue) => input.github.getIssue(issue, input.repository)));
+  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
   const childItems: ScheduledWorkItem[] = [];
   for (const issue of snapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
@@ -292,7 +298,16 @@ async function status(argv: string[]): Promise<void> {
   const statusWitness = createConfiguredLeaseWitness(process.cwd());
   if (!statusWitness) throw new Error("Authenticated lease witness is required for status/recovery inspection; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: statusWitness });
+  const orchestrationId = option(argv, "--orchestration");
+  const issueValue = option(argv, "--issue");
   try {
+    const shouldReap = !argv.includes("--promotions") && (orchestrationId !== undefined || issueValue === undefined);
+    if (shouldReap) {
+      await reapStaleOrchestrations({
+        repository: store,
+        executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      });
+    }
     if (argv.includes("--promotions")) {
       const promotions = await store.listPromotions();
       if (argv.includes("--json")) process.stdout.write(`${JSON.stringify(promotions, null, 2)}\n`);
@@ -306,7 +321,6 @@ async function status(argv: string[]): Promise<void> {
       }
       return;
     }
-    const orchestrationId = option(argv, "--orchestration");
     if (orchestrationId !== undefined) {
       const orchestration = await store.loadOrchestration(orchestrationId);
       if (!orchestration) throw new Error(`Unknown orchestration ${orchestrationId}`);
@@ -323,7 +337,6 @@ async function status(argv: string[]): Promise<void> {
       }
       return;
     }
-    const issueValue = option(argv, "--issue");
     if (issueValue !== undefined) {
       if (!/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
       const github = new GitHubClient(process.cwd());
@@ -412,18 +425,32 @@ async function workOn(
   requirePiNodeVersion();
   const issueArg = parseWorkOnIssueArgument(argv);
   if (!issueArg || !/^\d+$/.test(issueArg)) {
-    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--planning-model provider/model] [--planning-thinking high] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]");
+    throw new Error("Usage: forgedock-next work-on <issue-number> [--depends-on N,N] [--through investigate] [--repo owner/repo] [--provider NAME] [--model NAME] [--thinking LEVEL] [--reviewer-model provider/model] [--reviewer-thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run] [--auto-merge | --no-auto-merge] [--resume] [--resolve-conflict] [--adjudicate-verification REASON] [--rerun]");
   }
   const through = option(argv, "--through");
   if (through && through !== "investigate") throw new Error("--through currently accepts only investigate");
   const dryRun = argv.includes("--dry-run");
   if (dryRun && through !== "investigate") throw new Error("--dry-run must be paired with --through investigate; full work-on creates a branch and PR");
   if (argv.includes("--rerun") && argv.includes("--resume")) throw new Error("--rerun and --resume are mutually exclusive recovery policies");
+  const resolveConflict = argv.includes("--resolve-conflict");
+  if (resolveConflict && !argv.includes("--resume")) throw new Error("--resolve-conflict requires --resume; it authorizes only the typed confirmed-conflict checkpoint");
+  if (resolveConflict && argv.includes("--rerun")) throw new Error("--resolve-conflict cannot be combined with --rerun");
   const adjudicationReason = option(argv, "--adjudicate-verification");
   if (adjudicationReason !== undefined && !argv.includes("--resume")) throw new Error("--adjudicate-verification requires --resume; it authorizes typed verification checkpoint resume, not a fresh run");
   if (adjudicationReason !== undefined && argv.includes("--rerun")) throw new Error("--adjudicate-verification cannot be combined with --rerun");
-  const autoMerge = commandAutoMerge(argv);
-  const configuredNext = readForgeDockConfig(process.cwd());
+  const configurationErrors: unknown[] = [];
+  const recordConfigurationError = (error: unknown): void => { configurationErrors.push(error); };
+  let configuredNext: ReturnType<typeof readForgeDockConfig> = {};
+  try {
+    configuredNext = readForgeDockConfig(process.cwd());
+  } catch (error) {
+    // Readiness must report malformed project configuration alongside runtime,
+    // lease, and GitHub blockers. Do not let this entrypoint throw before its
+    // aggregate GitHub probe runs.
+    recordConfigurationError(error);
+  }
+  const autoMerge = commandAutoMerge(argv, configuredNext);
+  collectDispatchEnvironmentErrors(process.env, recordConfigurationError);
   const scopeExpansionOption = option(argv, "--scope-expansion");
   if (scopeExpansionOption !== undefined && scopeExpansionOption !== "scope-locked" && scopeExpansionOption !== "recursive") throw new Error("--scope-expansion must be scope-locked or recursive");
   const remediationCyclesOption = option(argv, "--max-remediation-cycles");
@@ -435,7 +462,100 @@ async function workOn(
     ...(remediationDepthOption !== undefined ? { maxRemediationDepth: Number(remediationDepthOption) } : {}),
     ...(remediationChildrenOption !== undefined ? { maxRemediationChildren: Number(remediationChildrenOption) } : {}),
   });
-  const maxReviewSpecialists = configuredMaxReviewSpecialists();
+  const maxReviewSpecialists = configuredMaxReviewSpecialists(configuredNext, recordConfigurationError);
+
+  // Dispatch readiness is an entrypoint barrier, not a worker-phase check.
+  // Keep it ahead of GitHub reads that can otherwise fail early and hide the
+  // remaining configuration/auth diagnostics, and ahead of every durable or
+  // GitHub mutation (including adjudication, invalid closure, and completion
+  // resume paths).
+  const requestedProvider = option(argv, "--provider");
+  const requestedModel = option(argv, "--model");
+  const requestedThinking = configuredWorkerThinking(argv, configuredNext, recordConfigurationError);
+  const requestedReviewer = configuredReviewerOptions(argv, configuredNext, recordConfigurationError);
+  const requestedPlanning = configuredPlanningOptions(argv, configuredNext, recordConfigurationError);
+  const dispatchRuntime = resolveDispatchRuntime({
+    config: configuredNext,
+    invocation: {
+      worker: {
+        ...(requestedProvider !== undefined ? { provider: requestedProvider } : {}),
+        ...(requestedModel !== undefined ? { model: requestedModel } : {}),
+        ...(requestedThinking !== undefined ? { thinking: requestedThinking } : {}),
+      },
+      reviewer: {
+        ...(requestedReviewer.reviewerProvider !== undefined ? { provider: requestedReviewer.reviewerProvider } : {}),
+        ...(requestedReviewer.reviewerModel !== undefined ? { model: requestedReviewer.reviewerModel } : {}),
+        ...(requestedReviewer.reviewerThinking !== undefined ? { thinking: requestedReviewer.reviewerThinking } : {}),
+      },
+      planning: {
+        ...(requestedPlanning.planningProvider !== undefined ? { provider: requestedPlanning.planningProvider } : {}),
+        ...(requestedPlanning.planningModel !== undefined ? { model: requestedPlanning.planningModel } : {}),
+        ...(requestedPlanning.planningThinking !== undefined ? { thinking: requestedPlanning.planningThinking } : {}),
+      },
+    },
+  });
+  const provider = dispatchRuntime.worker.provider;
+  const model = dispatchRuntime.worker.model;
+  const thinking = dispatchRuntime.worker.thinking;
+  const planning = {
+    ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
+    ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
+    ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
+  };
+  const reviewer = {
+    ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
+    ...(dispatchRuntime.reviewer.model !== undefined ? { reviewerModel: dispatchRuntime.reviewer.model } : {}),
+    ...(dispatchRuntime.reviewer.thinking !== undefined ? { reviewerThinking: dispatchRuntime.reviewer.thinking } : {}),
+  };
+  let leaseWitness: ReturnType<typeof createConfiguredLeaseWitness>;
+  let leaseError: unknown;
+  try {
+    leaseWitness = createConfiguredLeaseWitness(process.cwd());
+  } catch (error) {
+    leaseError = error;
+    leaseWitness = undefined;
+  }
+  const readinessRuntime = new PiAgentRuntime({
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
+    ...(dispatchRuntime.reviewer.model !== undefined ? { reviewerModel: dispatchRuntime.reviewer.model } : {}),
+    ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
+    ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
+    ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
+  });
+  try {
+    await assertDispatchReady({
+      checkoutRoot: process.cwd(),
+      config: configuredNext,
+      ...(configurationErrors.length ? { configError: aggregateConfigurationErrors(configurationErrors) } : {}),
+      invocation: {
+        worker: {
+          ...(requestedProvider !== undefined ? { provider: requestedProvider } : {}),
+          ...(requestedModel !== undefined ? { model: requestedModel } : {}),
+          ...(requestedThinking !== undefined ? { thinking: requestedThinking } : {}),
+        },
+        reviewer: {
+          ...(requestedReviewer.reviewerProvider !== undefined ? { provider: requestedReviewer.reviewerProvider } : {}),
+          ...(requestedReviewer.reviewerModel !== undefined ? { model: requestedReviewer.reviewerModel } : {}),
+          ...(requestedReviewer.reviewerThinking !== undefined ? { thinking: requestedReviewer.reviewerThinking } : {}),
+        },
+        planning: {
+          ...(requestedPlanning.planningProvider !== undefined ? { provider: requestedPlanning.planningProvider } : {}),
+          ...(requestedPlanning.planningModel !== undefined ? { model: requestedPlanning.planningModel } : {}),
+          ...(requestedPlanning.planningThinking !== undefined ? { thinking: requestedPlanning.planningThinking } : {}),
+        },
+      },
+      requireLeaseWitness: true,
+      ...(leaseWitness !== undefined ? { leaseWitness } : {}),
+      ...(leaseError !== undefined ? { leaseError } : {}),
+      runtime: readinessRuntime,
+      githubProbe: async () => await new GitHubClient(process.cwd()).getRepository(),
+    });
+  } finally {
+    await readinessRuntime.close();
+  }
+  if (!leaseWitness) throw new Error("Authenticated lease witness is required before work-on dispatch");
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
   let github = new GitHubClient(process.cwd());
@@ -522,7 +642,15 @@ async function workOn(
     }
     if (admission.action === "resume") {
       if (!argv.includes("--resume")) {
+        if (admission.checkpoint === "conflict-recovery") {
+          throw new Error(`Existing run ${admission.runId} has a confirmed target conflict. Re-run with --resume --resolve-conflict to synchronize, reverify, and obtain a fresh review; ordinary resume never rebases an approved head`);
+        }
         throw new Error(`Existing run ${admission.runId} has a recoverable ${admission.checkpoint} checkpoint. Re-run with --resume to continue it; reset only if you intentionally want to abandon its durable work`);
+      }
+      if (resolveConflict !== (admission.checkpoint === "conflict-recovery")) {
+        throw new Error(admission.checkpoint === "conflict-recovery"
+          ? `Run ${admission.runId} requires explicit --resolve-conflict authorization; ordinary --resume is fail-closed`
+          : "--resolve-conflict is valid only for a confirmed target-conflict checkpoint");
       }
       resumeRunId = admission.runId;
       progressRunId = resumeRunId;
@@ -561,13 +689,7 @@ async function workOn(
     },
   });
 
-  const provider = option(argv, "--provider");
-  const model = option(argv, "--model");
-  const thinking = configuredWorkerThinking(argv);
-  const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const leaseWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!leaseWitness) throw new Error("Authenticated lease witness is required; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: leaseWitness });
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
@@ -585,6 +707,7 @@ async function workOn(
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(thinking !== undefined ? { thinking } : {}),
+    ...reviewer,
     ...planning,
   }, store);
   const onAgentEvent = (event: AgentEvent) => {
@@ -635,12 +758,6 @@ async function workOn(
   let leaseHeartbeat: NodeJS.Timeout | undefined;
 
   try {
-    if (resumeCheckpoint !== "completion" && resumeCheckpoint !== "invalid-closure") {
-      await preflightRuntime(runtime, {
-        ...(provider !== undefined ? { provider } : {}),
-        ...(model !== undefined ? { model } : {}),
-      });
-    }
     const lease = store.acquire(leaseItem, leaseOwner, 60_000);
     if (!lease) throw new Error(`Issue #${issue.number} already has an active local ForgeDock controller; wait for it or cancel that task before resuming`);
     leaseToken = lease.token;
@@ -816,7 +933,7 @@ async function workOn(
         ? latestOutcome
         : admission.checkpoint === "publication"
           ? latestArtifactOfKind(runArtifacts, "BuildResult")
-          : admission.checkpoint === "completion"
+          : admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery"
             ? latestArtifactOfKind(runArtifacts, "ReviewVerdict")
             : admission.checkpoint === "remediation"
               ? (admission.state === "blocked" ? latestArtifactOfKind(runArtifacts, "Outcome") : latestArtifactOfKind(runArtifacts, "ReviewVerdict"))
@@ -860,7 +977,7 @@ async function workOn(
       const openPullRequest = retainedBuildResult
         ? await github.findOpenPullRequest(issue.repo, retainedBuildResult.payload.branch)
         : undefined;
-      const checkpointPullRequest = admission.checkpoint === "completion" && priorVerdict?.subject.pr
+      const checkpointPullRequest = (admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") && priorVerdict?.subject.pr
         ? await github.getPullRequest(issue.repo, priorVerdict.subject.pr)
         : openPullRequest;
       if (admission.checkpoint === "remediation" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
@@ -869,8 +986,12 @@ async function workOn(
       if (admission.checkpoint === "remediation" && remediationCheckpoint?.kind === "RemediationBlocked" && remediationCheckpoint.payload.status === "terminal") {
         throw new Error(`Run ${resumeRunId} has a terminal recursive-remediation checkpoint; human intervention is required`);
       }
-      if (admission.checkpoint === "completion" && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
-        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for completion resume`);
+      if ((admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") && (!retainedBuildResult || !priorVerdict || !checkpointPullRequest)) {
+        throw new Error(`Run ${resumeRunId} no longer has the Build Result, approving Review Verdict, and PR required for ${admission.checkpoint} resume`);
+      }
+      if (admission.checkpoint === "conflict-recovery"
+        && (!latestOutcome || latestOutcome.payload.status !== "blocked" || latestOutcome.payload.mergeGate?.mergeability !== "conflicting")) {
+        throw new Error(`Run ${resumeRunId} no longer has the confirmed conflicting merge-gate checkpoint required for --resolve-conflict`);
       }
       if (checkpointPullRequest && checkpointPullRequest.baseBranch !== deliveryTargetBranch) {
         throw new Error(
@@ -909,8 +1030,10 @@ async function workOn(
       }
 
       // A crash can leave a durable Build Packet immediately before its first
-      // parent-scheduler promotion. Re-arbitrate every retained packet before
-      // any resume path can edit, publish, remediate, or complete delivery.
+      // parent-scheduler promotion. Re-arbitrate retained packets before any
+      // resume path can recover a worktree or perform a mutation. Build resume
+      // receives exact evidence of this promotion below so its typed
+      // RESUME_BUILD boundary does not submit the same packet a second time.
       await promoteOrchestrationClaims(packet.payload.expectedPaths, {
         ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
       });
@@ -919,7 +1042,7 @@ async function workOn(
       const verifier = new ProcessVerificationRunner();
       let workspace;
       let outcome: DurableArtifact<"Outcome"> | undefined;
-      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion") {
+      if (admission.checkpoint === "build" || admission.checkpoint === "publication" || admission.checkpoint === "remediation" || admission.checkpoint === "completion" || admission.checkpoint === "conflict-recovery") {
         const recoveryInput = {
           runId: resumeRunId,
           issue: issue.number,
@@ -1000,7 +1123,34 @@ async function workOn(
         signal: leaseController.signal,
       };
       const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent };
-      const result = admission.checkpoint === "completion"
+      const result = admission.checkpoint === "conflict-recovery"
+        ? await resumeConflictRecoveryWorkOn({
+          run,
+          intent: intentArtifact,
+          investigation,
+          packet,
+          buildResult: retainedBuildResult!,
+          verdict: priorVerdict!,
+          pullRequest: checkpointPullRequest!,
+          workspace: workspace!,
+          baseBranch: durableTargetBranch,
+          verification,
+          mergeGate: latestOutcome!.payload.mergeGate!,
+          ...(provider !== undefined ? { provider } : {}),
+          ...(model !== undefined ? { model } : {}),
+          autoMerge,
+          maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
+          maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
+          maxRemediationChildren: parentRemediation?.maxRemediationChildren ?? effectiveOrchestration.maxRemediationChildren,
+          remediationDepth: parentRemediation?.remediationDepth ?? 0,
+          scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
+          ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
+          subjectEvidence,
+          ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
+          ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
+          signal: leaseController.signal,
+        }, dependencies)
+        : admission.checkpoint === "completion"
         ? await resumeCompletionWorkOn({
           run,
           verdict: priorVerdict!,
@@ -1013,8 +1163,9 @@ async function workOn(
         }, dependencies)
         : admission.checkpoint === "build"
           ? await resumeBuildWorkOn({
-            ...common,
-          }, dependencies)
+              ...common,
+              preflightedPacketClaims: packet.payload.expectedPaths,
+            }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({
               ...common,
@@ -1034,8 +1185,8 @@ async function workOn(
                     checkpoint = dispatched.checkpoint;
                   }
                   if (checkpoint.payload.status === "children-running") {
-                    const childOutcomes = (await Promise.all(checkpoint.payload.childIssues.map(async (childIssue: number) =>
-                      authoritativeArtifacts.list({ repo: issue.repo, issue: childIssue })))).flat()
+                    const childOutcomes = (await mapWithConcurrency(checkpoint.payload.childIssues, async (childIssue: number) =>
+                      authoritativeArtifacts.list({ repo: issue.repo, issue: childIssue }))).flat()
                       .filter((artifact: DurableArtifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.payload.status === "merged");
                     checkpoint = await supervisor.reconcileChildren({ checkpoint, childOutcomes, parentPullRequest: checkpointPullRequest! });
                   }
@@ -1413,7 +1564,13 @@ async function orchestrate(argv: string[]): Promise<void> {
     allowUnresolvedTarget: true,
   });
   let checkoutRoot = provisionalCheckout.checkoutRoot;
-  const config = readForgeDockConfig(checkoutRoot);
+  let config: ReturnType<typeof readForgeDockConfig> = {};
+  let configError: unknown;
+  try {
+    config = readForgeDockConfig(checkoutRoot);
+  } catch (error) {
+    configError = error;
+  }
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
   const remediationChildrenValue = option(argv, "--max-remediation-children");
@@ -1436,10 +1593,107 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (dispatchAuthorized) checkoutRoot = resolveCheckoutContext(launchCwd, targetRepository).checkoutRoot;
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
   let github = new GitHubClient(checkoutRoot);
-  const repository = await github.getRepository(targetRepository);
+  const provider = option(argv, "--provider");
+  const model = option(argv, "--model");
+  const thinkingOption = option(argv, "--thinking");
+  if (thinkingOption !== undefined && !THINKING_LEVELS.includes(thinkingOption as ThinkingLevel)) throw new Error(`Unsupported worker thinking level: ${thinkingOption}`);
+  const planningModelOption = option(argv, "--planning-model");
+  const planningThinkingOption = option(argv, "--planning-thinking");
+  const reviewerModelOption = option(argv, "--reviewer-model");
+  const reviewerThinkingOption = option(argv, "--reviewer-thinking");
+  if (planningThinkingOption !== undefined && !THINKING_LEVELS.includes(planningThinkingOption as ThinkingLevel)) throw new Error(`Unsupported planning thinking level: ${planningThinkingOption}`);
+  if (reviewerThinkingOption !== undefined && !THINKING_LEVELS.includes(reviewerThinkingOption as ThinkingLevel)) throw new Error(`Unsupported reviewer thinking level: ${reviewerThinkingOption}`);
+  const reviewerSelection = splitConfiguredModel(reviewerModelOption);
+  const planningSelection = splitConfiguredModel(planningModelOption);
+  const dispatchRuntime = resolveDispatchRuntime({
+    config,
+    invocation: {
+      worker: {
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(thinkingOption !== undefined ? { thinking: thinkingOption as ThinkingLevel } : {}),
+      },
+      reviewer: {
+        ...(reviewerSelection !== undefined ? { provider: reviewerSelection.provider, model: reviewerSelection.model } : {}),
+        ...(reviewerThinkingOption !== undefined ? { thinking: reviewerThinkingOption as ThinkingLevel } : {}),
+      },
+      planning: {
+        ...(planningSelection !== undefined ? { provider: planningSelection.provider, model: planningSelection.model } : {}),
+        ...(planningThinkingOption !== undefined ? { thinking: planningThinkingOption as ThinkingLevel } : {}),
+      },
+    },
+  });
+  const resolvedProvider = dispatchRuntime.worker.provider;
+  const resolvedModel = dispatchRuntime.worker.model;
+  const resolvedThinking = dispatchRuntime.worker.thinking;
+  const resolvedPlanning = {
+    ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
+    ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
+    ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
+  };
+  const resolvedReviewer = {
+    ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
+    ...(dispatchRuntime.reviewer.model !== undefined ? { reviewerModel: dispatchRuntime.reviewer.model } : {}),
+    ...(dispatchRuntime.reviewer.thinking !== undefined ? { reviewerThinking: dispatchRuntime.reviewer.thinking } : {}),
+  };
+  const thinking = resolvedThinking;
+  const planning = resolvedPlanning;
+  let orchestrationWitness: ReturnType<typeof createConfiguredLeaseWitness>;
+  let orchestrationLeaseError: unknown;
+  let repository: Awaited<ReturnType<GitHubClient["getRepository"]>>;
+  if (dispatchAuthorized) {
+    try {
+      orchestrationWitness = createConfiguredLeaseWitness(checkoutRoot);
+    } catch (error) {
+      orchestrationLeaseError = error;
+      orchestrationWitness = undefined;
+    }
+    const readinessRuntime = new PiAgentRuntime({
+      ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
+      ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+      ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
+      ...(dispatchRuntime.reviewer.model !== undefined ? { reviewerModel: dispatchRuntime.reviewer.model } : {}),
+      ...(dispatchRuntime.reviewer.thinking !== undefined ? { reviewerThinking: dispatchRuntime.reviewer.thinking } : {}),
+      ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
+      ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
+      ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
+    });
+    try {
+      const readiness = await assertDispatchReady({
+        checkoutRoot,
+        config,
+        ...(configError !== undefined ? { configError } : {}),
+        invocation: {
+          worker: {
+            ...(provider !== undefined ? { provider } : {}),
+            ...(model !== undefined ? { model } : {}),
+            ...(thinkingOption !== undefined ? { thinking: thinkingOption as ThinkingLevel } : {}),
+          },
+          reviewer: {
+            ...(reviewerSelection !== undefined ? { provider: reviewerSelection.provider, model: reviewerSelection.model } : {}),
+            ...(reviewerThinkingOption !== undefined ? { thinking: reviewerThinkingOption as ThinkingLevel } : {}),
+          },
+          planning: {
+            ...(planningSelection !== undefined ? { provider: planningSelection.provider, model: planningSelection.model } : {}),
+            ...(planningThinkingOption !== undefined ? { thinking: planningThinkingOption as ThinkingLevel } : {}),
+          },
+        },
+        requireLeaseWitness: true,
+        ...(orchestrationWitness !== undefined ? { leaseWitness: orchestrationWitness } : {}),
+        ...(orchestrationLeaseError !== undefined ? { leaseError: orchestrationLeaseError } : {}),
+        runtime: readinessRuntime,
+        githubProbe: async () => github.getRepository(targetRepository),
+      });
+      repository = readiness.repository as Awaited<ReturnType<GitHubClient["getRepository"]>>;
+    } finally {
+      await readinessRuntime.close();
+    }
+  } else {
+    repository = await github.getRepository(targetRepository);
+  }
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
   const readAuthoritativeItems = async (allowMissingMilestoneBranch = !dispatchAuthorized) => {
-    const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
+    const issueSnapshots = await mapWithConcurrency(baseItems, (item) => github.getIssue(item.issue, repository.repo));
     let milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
       ? await github.listBranches(repository.repo, "milestone/")
       : [];
@@ -1456,11 +1710,10 @@ async function orchestrate(argv: string[]): Promise<void> {
         }),
       });
     }
-    await Promise.all([...new Set([...routedIssues.values()]
+    await mapWithConcurrency([...new Set([...routedIssues.values()]
       .map(({ lane }) => lane)
       .filter((lane) => lane.resolution !== "planned-canonical")
-      .map((lane) => lane.targetBranch))]
-      .map((branch) => github.getBranchHead(repository.repo, branch)));
+      .map((lane) => lane.targetBranch))], (branch) => github.getBranchHead(repository.repo, branch));
     const items: BatchableWorkItem[] = baseItems.map((item) => {
       const observed = requiredIssueRoute(routedIssues, item.issue).issue;
       const lane = requiredIssueRoute(routedIssues, item.issue).lane;
@@ -1523,20 +1776,16 @@ async function orchestrate(argv: string[]): Promise<void> {
   // initial preview is not a freshness grant and must not carry stale groups,
   // claims, or route metadata into materialization.
   assembly = assembleWorkUnits(items, assemblyOptions);
-  const provider = option(argv, "--provider");
-  const model = option(argv, "--model");
-  const thinking = configuredWorkerThinking(argv);
-  const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const orchestrationWitness = createConfiguredLeaseWitness(checkoutRoot);
   if (!orchestrationWitness) throw new Error(leaseWitnessRequirementMessage("before orchestrate dispatch", checkoutRoot));
   const store = new SqliteRepositories(join(checkoutRoot, ".forgedock", "state.db"), { witness: orchestrationWitness });
   github = new GitHubClient(checkoutRoot, store);
   const runtime = createCliRuntime({
-    ...(provider !== undefined ? { provider } : {}),
-    ...(model !== undefined ? { model } : {}),
-    ...(thinking !== undefined ? { thinking } : {}),
-    ...planning,
+    ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
+    ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+    ...(resolvedThinking !== undefined ? { thinking: resolvedThinking } : {}),
+    ...resolvedReviewer,
+    ...resolvedPlanning,
   }, store);
   const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   const artifacts = activeObserver
@@ -1546,9 +1795,9 @@ async function orchestrate(argv: string[]): Promise<void> {
   const git = new GitWorktreeManager(checkoutRoot);
   const verifier = new ProcessVerificationRunner();
   try {
-    await preflightRuntime(runtime, {
-      ...(provider !== undefined ? { provider } : {}),
-      ...(model !== undefined ? { model } : {}),
+    await reapStaleOrchestrations({
+      repository: store,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
     });
     // Validate the frozen verification policy for every authoritative lane before any batch issue is created.
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
@@ -1609,9 +1858,19 @@ async function orchestrate(argv: string[]): Promise<void> {
         ...(childIssues !== undefined ? { childIssues } : {}),
       }),
       worker: async (item, controllerContext) => {
-      const lease = store.acquire(item.id, owner, 60_000);
-      if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
       const workerAbort = new AbortController();
+      const lease = await acquireNodeLease(store, item.id, owner, 60_000, {
+        binding: orchestrationNodeLeaseBinding(
+          controllerContext.orchestrationId,
+          controllerContext.executionAttempt,
+          item.id,
+          controllerContext.attemptId,
+        ),
+        recovery: controllerContext.recovery,
+        waitForLive: controllerContext.recovery !== "initial",
+        signal: workerAbort.signal,
+      });
+      if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
       const heartbeat = setInterval(() => {
         try {
           store.heartbeat(item.id, lease.token, 60_000);
@@ -1781,6 +2040,8 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `Recursive remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey} is active` };
           }
+          const reason = result.outcome?.payload.reason ?? result.run.blockedReason ?? "durable recovery details are required";
+          return { status: "blocked", error: reason };
         }
         if (result.run.state === "decomposed") {
           const issueArtifacts = await artifacts.list(subject);
@@ -1859,6 +2120,9 @@ async function orchestrate(argv: string[]): Promise<void> {
         workerProvider: provider ?? null,
         workerModel: model ?? null,
         workerThinking: thinking ?? null,
+        reviewerProvider: resolvedReviewer.reviewerProvider ?? null,
+        reviewerModel: resolvedReviewer.reviewerModel ?? null,
+        reviewerThinking: resolvedReviewer.reviewerThinking ?? null,
         planningProvider: planning.planningProvider ?? null,
         planningModel: planning.planningModel ?? null,
         planningThinking: planning.planningThinking ?? null,
@@ -1893,29 +2157,137 @@ async function orchestrate(argv: string[]): Promise<void> {
 async function resumeCliOrchestration(argv: string[], orchestrationId: string): Promise<void> {
   if (argv.includes("--rerun")) throw new Error("orchestrate --resume does not authorize a fresh semantic rerun; resume the durable checkpoints or create a new orchestration explicitly");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const witness = createConfiguredLeaseWitness(process.cwd());
-  if (!witness) throw new Error("Authenticated lease witness is required before orchestration resume; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
+  let configured: ReturnType<typeof readForgeDockConfig> = {};
+  let configError: unknown;
+  try {
+    configured = readForgeDockConfig(process.cwd());
+  } catch (error) {
+    configError = error;
+  }
+  let witness: ReturnType<typeof createConfiguredLeaseWitness>;
+  let witnessError: unknown;
+  try {
+    witness = createConfiguredLeaseWitness(process.cwd());
+  } catch (error) {
+    witnessError = error;
+    witness = undefined;
+  }
+  // Without a witness the durable plan cannot be inspected. Run the generic
+  // doctor only in that terminal failure case so the operator still receives
+  // aggregate config/provider/GitHub diagnostics. With a valid witness, defer
+  // role validation until the frozen durable plan has been loaded below.
+  const requestedProvider = option(argv, "--provider");
+  const requestedModel = option(argv, "--model");
+  const genericResolution = resolveDispatchRuntime({
+    config: configured,
+    invocation: {
+      worker: {
+        ...(requestedProvider !== undefined ? { provider: requestedProvider } : {}),
+        ...(requestedModel !== undefined ? { model: requestedModel } : {}),
+      },
+    },
+  });
+  const genericRuntime = !witness ? new PiAgentRuntime({
+    ...(genericResolution.worker.provider !== undefined ? { provider: genericResolution.worker.provider } : {}),
+    ...(genericResolution.worker.model !== undefined ? { model: genericResolution.worker.model } : {}),
+    ...(genericResolution.reviewer.provider !== undefined ? { reviewerProvider: genericResolution.reviewer.provider } : {}),
+    ...(genericResolution.reviewer.model !== undefined ? { reviewerModel: genericResolution.reviewer.model } : {}),
+    ...(genericResolution.planning.provider !== undefined ? { planningProvider: genericResolution.planning.provider } : {}),
+    ...(genericResolution.planning.model !== undefined ? { planningModel: genericResolution.planning.model } : {}),
+  }) : undefined;
+  if (genericRuntime) {
+    try {
+      await assertDispatchReady({
+        checkoutRoot: process.cwd(),
+        config: configured,
+        ...(configError !== undefined ? { configError } : {}),
+        invocation: {
+          worker: {
+            ...(requestedProvider !== undefined ? { provider: requestedProvider } : {}),
+            ...(requestedModel !== undefined ? { model: requestedModel } : {}),
+          },
+        },
+        requireLeaseWitness: true,
+        ...(witnessError !== undefined ? { leaseError: witnessError } : {}),
+        runtime: genericRuntime,
+        githubProbe: async () => await new GitHubClient(process.cwd()).getRepository(),
+      });
+    } finally {
+      await genericRuntime.close();
+    }
+  }
+  if (!witness) throw new Error("Authenticated lease witness is required before orchestration resume");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness });
   try {
     const record = await store.loadOrchestration(orchestrationId);
     if (!record) throw new Error(`Unknown orchestration ${orchestrationId}`);
-    const github = new GitHubClient(process.cwd(), store);
-    const checkout = await github.getRepository();
-    if (checkout.repo.toLowerCase() !== record.repository.toLowerCase()) {
-      throw new Error(`Orchestration ${orchestrationId} belongs to ${record.repository}; current checkout is ${checkout.repo}`);
-    }
-    const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
-    const artifacts = activeObserver
-      ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: record.repository, orchestrationId })
-      : baseArtifacts;
-    const configured = readForgeDockConfig(process.cwd());
     const configuredOrchestration = resolveOrchestrationConfig(configured);
     const workerProvider = orchestrationPlanString(record.plan, "workerProvider") ?? option(argv, "--provider");
     const workerModel = orchestrationPlanString(record.plan, "workerModel") ?? option(argv, "--model");
     const workerThinking = orchestrationPlanThinking(record.plan, "workerThinking") ?? configuredWorkerThinking(argv);
+    const reviewerProvider = orchestrationPlanString(record.plan, "reviewerProvider");
+    const reviewerModel = orchestrationPlanString(record.plan, "reviewerModel");
+    const reviewerThinking = orchestrationPlanThinking(record.plan, "reviewerThinking");
     const planningProvider = orchestrationPlanString(record.plan, "planningProvider");
     const planningModel = orchestrationPlanString(record.plan, "planningModel");
     const planningThinking = orchestrationPlanThinking(record.plan, "planningThinking");
+    const resumeRuntime = new PiAgentRuntime({
+      ...(workerProvider !== undefined ? { provider: workerProvider } : {}),
+      ...(workerModel !== undefined ? { model: workerModel } : {}),
+      ...(reviewerProvider !== undefined ? { reviewerProvider } : {}),
+      ...(reviewerModel !== undefined ? { reviewerModel } : {}),
+      ...(reviewerThinking !== undefined ? { reviewerThinking } : {}),
+      ...(planningProvider !== undefined ? { planningProvider } : {}),
+      ...(planningModel !== undefined ? { planningModel } : {}),
+      ...(planningThinking !== undefined ? { planningThinking } : {}),
+    });
+    const github = new GitHubClient(process.cwd(), store);
+    let checkout: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined;
+    try {
+      await assertDispatchReady({
+        checkoutRoot: process.cwd(),
+        config: configured,
+        ...(configError !== undefined ? { configError } : {}),
+        invocation: {
+          worker: {
+            ...(workerProvider !== undefined ? { provider: workerProvider } : {}),
+            ...(workerModel !== undefined ? { model: workerModel } : {}),
+            ...(workerThinking !== undefined ? { thinking: workerThinking } : {}),
+          },
+          reviewer: {
+            ...(reviewerProvider !== undefined ? { provider: reviewerProvider } : {}),
+            ...(reviewerModel !== undefined ? { model: reviewerModel } : {}),
+            ...(reviewerThinking !== undefined ? { thinking: reviewerThinking } : {}),
+          },
+          planning: {
+            ...(planningProvider !== undefined ? { provider: planningProvider } : {}),
+            ...(planningModel !== undefined ? { model: planningModel } : {}),
+            ...(planningThinking !== undefined ? { thinking: planningThinking } : {}),
+          },
+        },
+        requireLeaseWitness: true,
+        leaseWitness: witness,
+        runtime: resumeRuntime,
+        githubProbe: async () => checkout ??= await github.getRepository(),
+      });
+    } finally {
+      await resumeRuntime.close();
+    }
+    checkout ??= await github.getRepository();
+    const checkedCheckout = checkout;
+    if (checkedCheckout.repo.toLowerCase() !== record.repository.toLowerCase()) {
+      throw new Error(`Orchestration ${orchestrationId} belongs to ${record.repository}; current checkout is ${checkedCheckout.repo}`);
+    }
+    // Reaping acquires a lease and persists recovery. It must remain behind the
+    // complete readiness barrier just like worker identity/lease acquisition.
+    await reapStaleOrchestrations({
+      repository: store,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+    });
+    const baseArtifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
+    const artifacts = activeObserver
+      ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: record.repository, orchestrationId })
+      : baseArtifacts;
     const frozenScopeExpansion = orchestrationPlanString(record.plan, "scopeExpansion");
     const scopeExpansion = frozenScopeExpansion === "recursive" || frozenScopeExpansion === "scope-locked"
       ? frozenScopeExpansion
@@ -1932,23 +2304,32 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
 
     const reconcileWorker = async (item: ScheduledWorkItem) => {
       const subject = { repo: record.repository, issue: item.issue };
-      const issueArtifacts = await artifacts.list(subject);
-      const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
-      if (reconciled.state === "completed") return { disposition: "terminal" as const, result: { status: "completed" as const }, reason: "Durable Outcome is complete" };
-      if (reconciled.state === "invalid") return { disposition: "terminal" as const, result: { status: "invalid" as const, error: `#${item.issue} is authoritatively invalid` } };
-      if (reconciled.state === "decomposed") return {
-        disposition: "terminal" as const,
-        result: {
-          status: "skipped" as const,
-          error: `#${item.issue} decomposed into replacement scope`,
-          childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
-        },
-      };
-      if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
-        return { disposition: "interrupted" as const, reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
+      let issueArtifacts = await artifacts.list(subject);
+      let reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+      const initialClassification = reconcileAuthoritativeWorkerArtifacts({
+        issue: item.issue,
+        artifacts: issueArtifacts,
+        childIssuesFromArtifacts: decompositionChildIssuesFromArtifacts,
+        phase: "initial",
+      });
+      if (initialClassification) return initialClassification;
+      const nodeLease = inspectNodeLease(store, item.id);
+      if (nodeLease?.state === "active") {
+        // The old controller may still have a live worker heartbeat even
+        // though its orchestration lease expired. Wait for release/expiry
+        // before relaunching, then read authoritative artifacts again.
+        await waitForNodeLease(store, item.id, { pollMs: 100 });
+        issueArtifacts = await artifacts.list(subject);
+        reconciled = reconcileLatestRunArtifacts(issueArtifacts);
+        const afterWaitClassification = reconcileAuthoritativeWorkerArtifacts({
+          issue: item.issue,
+          artifacts: issueArtifacts,
+          childIssuesFromArtifacts: decompositionChildIssuesFromArtifacts,
+          phase: "after-wait",
+        });
+        if (afterWaitClassification) return afterWaitClassification;
+        return { disposition: "interrupted" as const, reason: `Previous node lease for #${item.issue} released or expired; no terminal worker outcome was found` };
       }
-      const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
-      if (terminal) return { disposition: "terminal" as const, result: terminal };
       return { disposition: "interrupted" as const, reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
     };
 
@@ -1962,7 +2343,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         github,
         artifacts,
         repository: record.repository,
-        defaultBranch: checkout.defaultBranch,
+        defaultBranch: checkedCheckout.defaultBranch,
         effective: {
           ...configuredOrchestration,
           maxRemediationChildren,
@@ -1977,7 +2358,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         const issue = await github.getIssue(item.issue, record.repository);
         const lane = await resolveIssueLane(
           issue,
-          checkout.defaultBranch,
+          checkedCheckout.defaultBranch,
           github,
           configuredOrchestration.fastLaneTarget,
           configuredOrchestration.featurePromotionTarget,
@@ -2038,12 +2419,24 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         if (workerProvider) workerArgs.push("--provider", workerProvider);
         if (workerModel) workerArgs.push("--model", workerModel);
         if (workerThinking) workerArgs.push("--thinking", workerThinking);
+        if (reviewerProvider && reviewerModel) workerArgs.push("--reviewer-model", `${reviewerProvider}/${reviewerModel}`);
+        if (reviewerThinking) workerArgs.push("--reviewer-thinking", reviewerThinking);
         if (planningProvider && planningModel) workerArgs.push("--planning-model", `${planningProvider}/${planningModel}`);
         if (planningThinking) workerArgs.push("--planning-thinking", planningThinking);
-        const workerLeaseItem = `orchestration:${record.orchestrationId}:${item.id}`;
-        const workerLease = store.acquire(workerLeaseItem, orchestrationWorkerOwner, 60_000);
-        if (!workerLease) throw new Error(`${item.id} already has an active orchestration worker lease`);
+        const workerLeaseItem = item.id;
         const workerAbort = new AbortController();
+        const workerLease = await acquireNodeLease(store, workerLeaseItem, orchestrationWorkerOwner, 60_000, {
+          binding: orchestrationNodeLeaseBinding(
+            context.orchestrationId,
+            context.executionAttempt,
+            item.id,
+            context.attemptId,
+          ),
+          recovery: context.recovery,
+          waitForLive: true,
+          signal: workerAbort.signal,
+        });
+        if (!workerLease) throw new Error(`${item.id} already has an active orchestration worker lease`);
         const heartbeat = setInterval(() => {
           try {
             store.heartbeat(workerLeaseItem, workerLease.token, 60_000);
@@ -2234,16 +2627,25 @@ function writeAgentEvent(event: AgentEvent, prefix?: string): void {
   agentEventStream.write(event, prefix);
 }
 
-function configuredPlanningOptions(argv: string[]): {
+function configuredPlanningOptions(
+  argv: string[],
+  configured: ReturnType<typeof readForgeDockConfig> = readForgeDockConfig(process.cwd()),
+  onError?: (error: unknown) => void,
+): {
   planningProvider?: string;
   planningModel?: string;
   planningThinking?: ThinkingLevel;
 } {
-  const configured = readForgeDockConfig(process.cwd());
   const reference = option(argv, "--planning-model") ?? configured.planningModel ?? process.env.FORGEDOCK_PLANNING_MODEL;
   const planningThinkingValue = option(argv, "--planning-thinking") ?? configured.planningThinking ?? process.env.FORGEDOCK_PLANNING_THINKING;
-  if (planningThinkingValue !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(planningThinkingValue)) throw new Error(`Unsupported planning thinking level: ${planningThinkingValue}`);
-  if (reference !== undefined && !splitConfiguredModel(reference)) throw new Error(`Planning model must use provider/model form: ${reference}`);
+  if (planningThinkingValue !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(planningThinkingValue)) {
+    onError?.(new Error(`Unsupported planning thinking level: ${planningThinkingValue}`));
+    return {};
+  }
+  if (reference !== undefined && !splitConfiguredModel(reference)) {
+    onError?.(new Error(`Planning model must use provider/model form: ${reference}`));
+    return {};
+  }
   const selected = splitConfiguredModel(reference);
   return {
     ...(selected ? { planningProvider: selected.provider, planningModel: selected.model } : {}),
@@ -2251,34 +2653,83 @@ function configuredPlanningOptions(argv: string[]): {
   };
 }
 
-function configuredWorkerThinking(argv: string[]): ThinkingLevel | undefined {
-  const value = option(argv, "--thinking") ?? readForgeDockConfig(process.cwd()).workerThinking;
+function configuredReviewerOptions(
+  argv: string[],
+  configured: ReturnType<typeof readForgeDockConfig> = readForgeDockConfig(process.cwd()),
+  onError?: (error: unknown) => void,
+): {
+  reviewerProvider?: string;
+  reviewerModel?: string;
+  reviewerThinking?: ThinkingLevel;
+} {
+  const reference = option(argv, "--reviewer-model") ?? configured.reviewerModel ?? process.env.FORGEDOCK_REVIEWER_MODEL;
+  const thinkingValue = option(argv, "--reviewer-thinking") ?? configured.reviewerThinking ?? process.env.FORGEDOCK_REVIEWER_THINKING;
+  if (thinkingValue !== undefined && !THINKING_LEVELS.includes(thinkingValue as ThinkingLevel)) {
+    onError?.(new Error(`Unsupported reviewer thinking level: ${thinkingValue}`));
+    return {};
+  }
+  if (reference !== undefined && !splitConfiguredModel(reference)) {
+    onError?.(new Error(`Reviewer model must use provider/model form: ${reference}`));
+    return {};
+  }
+  const selected = splitConfiguredModel(reference);
+  return {
+    ...(selected ? { reviewerProvider: selected.provider, reviewerModel: selected.model } : {}),
+    ...(thinkingValue ? { reviewerThinking: thinkingValue as ThinkingLevel } : {}),
+  };
+}
+
+function configuredWorkerThinking(
+  argv: string[],
+  configured: ReturnType<typeof readForgeDockConfig> = readForgeDockConfig(process.cwd()),
+  onError?: (error: unknown) => void,
+): ThinkingLevel | undefined {
+  const value = option(argv, "--thinking") ?? configured.workerThinking ?? process.env.FORGEDOCK_WORKER_THINKING;
   if (value !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
-    throw new Error(`Unsupported worker thinking level: ${value}`);
+    onError?.(new Error(`Unsupported worker thinking level: ${value}`));
+    return undefined;
   }
   return value as ThinkingLevel | undefined;
 }
 
-function configuredMaxReviewSpecialists(): number | undefined {
-  const configured = process.env.FORGEDOCK_MAX_REVIEW_SPECIALISTS;
-  if (configured !== undefined) {
-    const parsed = Number(configured);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 6) throw new Error("FORGEDOCK_MAX_REVIEW_SPECIALISTS must be an integer from 1 to 6");
+function configuredMaxReviewSpecialists(
+  configuration: ReturnType<typeof readForgeDockConfig> = readForgeDockConfig(process.cwd()),
+  onError?: (error: unknown) => void,
+): number | undefined {
+  const environmentValue = process.env.FORGEDOCK_MAX_REVIEW_SPECIALISTS;
+  if (environmentValue !== undefined) {
+    const parsed = Number(environmentValue);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 6) {
+      onError?.(new Error("FORGEDOCK_MAX_REVIEW_SPECIALISTS must be an integer from 1 to 6"));
+      return undefined;
+    }
     return parsed;
   }
-  return readForgeDockConfig(process.cwd()).maxReviewSpecialists;
+  return configuration.maxReviewSpecialists;
 }
 
-function createCliRuntime(options: { provider?: string; model?: string; thinking?: ThinkingLevel; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
+function createCliRuntime(options: { provider?: string; model?: string; thinking?: ThinkingLevel; reviewerProvider?: string; reviewerModel?: string; reviewerThinking?: ThinkingLevel; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
   const inner = new PiAgentRuntime({
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.model !== undefined ? { model: options.model } : {}),
     ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
+    ...(options.reviewerProvider !== undefined ? { reviewerProvider: options.reviewerProvider } : {}),
+    ...(options.reviewerModel !== undefined ? { reviewerModel: options.reviewerModel } : {}),
+    ...(options.reviewerThinking !== undefined ? { reviewerThinking: options.reviewerThinking } : {}),
     ...(options.planningProvider !== undefined ? { planningProvider: options.planningProvider } : {}),
     ...(options.planningModel !== undefined ? { planningModel: options.planningModel } : {}),
     ...(options.planningThinking !== undefined ? { planningThinking: options.planningThinking } : {}),
   });
-  return new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
+  const idleMs = configuredSemanticIdleMs();
+  const telemetryRuntime = new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
+  return new LivenessRecoveringAgentRuntime(telemetryRuntime, { idleMs, retryLimit: 1 });
+}
+
+function configuredSemanticIdleMs(): number {
+  const configured = process.env.FORGEDOCK_AGENT_SEMANTIC_IDLE_MS;
+  if (configured === undefined || configured.trim() === "") return DEFAULT_SEMANTIC_IDLE_MS;
+  const parsed = Number(configured);
+  return validateSemanticIdleMs(parsed);
 }
 
 async function preflightRuntime(runtime: AgentRuntime, options: RuntimePreflightOptions): Promise<void> {
@@ -2370,12 +2821,37 @@ function renderControllerTimingLine(summary: ReturnType<typeof summarizeControll
     process.stdout.write(`${prefix}controller timing: active=${summary.activeMs}ms unknown=${summary.unknownMs}ms queued=${summary.queuedMs}ms human-held=${summary.humanHeldMs}ms activity=${summary.activityStatus}${summary.activityAgeMs !== undefined ? ` age=${summary.activityAgeMs}ms` : ""} phases=${summary.phases.length}\n`);
 }
 
-function commandAutoMerge(argv: string[]): boolean {
+function collectDispatchEnvironmentErrors(
+  environment: NodeJS.ProcessEnv,
+  onError: (error: unknown) => void,
+): void {
+  for (const role of ["WORKER", "REVIEWER", "PLANNING"] as const) {
+    const modelKey = `FORGEDOCK_${role}_MODEL`;
+    const providerKey = `FORGEDOCK_${role}_PROVIDER`;
+    const thinkingKey = `FORGEDOCK_${role}_THINKING`;
+    const model = environment[modelKey];
+    const provider = environment[providerKey];
+    if (model !== undefined && provider === undefined && !splitConfiguredModel(model)) {
+      onError(new Error(`${modelKey} must use provider/model form when ${providerKey} is not configured: ${model}`));
+    }
+    const thinking = environment[thinkingKey];
+    if (thinking !== undefined && !THINKING_LEVELS.includes(thinking as ThinkingLevel)) {
+      onError(new Error(`${thinkingKey} must be one of ${THINKING_LEVELS.join(", ")}: ${thinking}`));
+    }
+  }
+}
+
+function aggregateConfigurationErrors(errors: readonly unknown[]): Error {
+  const messages = errors.map((error) => error instanceof Error ? error.message : String(error)).filter(Boolean);
+  return new Error(messages.length ? messages.join("; ") : "ForgeDock configuration or environment parsing failed");
+}
+
+function commandAutoMerge(argv: string[], configured?: ReturnType<typeof readForgeDockConfig>): boolean {
   const enabled = argv.includes("--auto-merge");
   const disabled = argv.includes("--no-auto-merge");
   if (enabled && disabled) throw new Error("--auto-merge and --no-auto-merge cannot be used together");
   const requested = enabled ? true : disabled ? false : undefined;
-  return resolveAutoMerge(requested, readForgeDockConfig(process.cwd()).autoMerge);
+  return resolveAutoMerge(requested, (configured ?? readForgeDockConfig(process.cwd())).autoMerge);
 }
 
 function option(argv: string[], name: string): string | undefined {
@@ -2429,7 +2905,7 @@ function bootstrapLeaseWitness(argv: string[]): void {
 function printHelp(): void {
   process.stdout.write(`${renderHeader({ subtitle: "greenfield workflow runtime" })}\n\n`);
   process.stdout.write("Core workflows\n");
-  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--provider NAME] [--model NAME] [--thinking LEVEL] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
+  process.stdout.write("  forgedock-next work-on <issue> [--depends-on N,N] [--repo owner/repo] [--provider NAME] [--model NAME] [--thinking LEVEL] [--reviewer-model provider/model] [--reviewer-thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--no-auto-merge] [--resume] [--adjudicate-verification REASON] [--rerun]\n");
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number] [--provider NAME] [--model NAME] [--thinking LEVEL]\n");
   process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");

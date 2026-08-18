@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
-import { readForgeDockConfig } from "../core/config/forgedock-config.js";
+import { readForgeDockConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
+import { DEFAULT_REMOTE_READ_CONCURRENCY } from "../core/concurrency.js";
+import { GitHubClient } from "../adapters/github/github-client.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
+import type { OrchestrationRecord } from "../core/ports/orchestration.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
+import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
   bindOrchestrationInvocation,
   buildNativeCommandPrompt,
@@ -27,12 +31,19 @@ import {
   resolveOrchestrationInvocationScope,
   resolveRoutedOrchestrationScope,
   sourcePullRequestFromIssueBody,
+  orchestrationTransportKey,
   type ControllerTaskSpec,
+  type OrchestrationTransportIdentity,
   VisibleDagDelegator,
 } from "./forgedock-tools.js";
 
 const isolatedSessionCwd = mkdtempSync(join(tmpdir(), "forgedock-extension-session-"));
-after(() => rmSync(isolatedSessionCwd, { recursive: true, force: true }));
+const fakePiStates: FakePiState[] = [];
+const shutDownFakePiStates = new WeakSet<object>();
+after(async () => {
+  for (const state of fakePiStates) await shutdownFakePi(state, commandContext());
+  rmSync(isolatedSessionCwd, { recursive: true, force: true });
+});
 
 interface FakePiState {
   pi: ExtensionAPI;
@@ -56,6 +67,7 @@ function fakePi(
   toolOptions: Parameters<typeof forgedockExtension>[1] = {
     orchestrationRepository: new InMemoryOrchestrationRepository(),
     orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
   },
 ): FakePiState {
   const tools = new Map<string, ToolDefinition>();
@@ -99,6 +111,7 @@ function fakePi(
   } as unknown as ExtensionAPI;
   Object.assign(state, { pi, tools, commands, handlers, sent, messageRenderers, active, emitted });
   forgedockExtension(pi, toolOptions);
+  fakePiStates.push(state);
   return state;
 }
 
@@ -117,6 +130,21 @@ function witnessedDagDelegator(
   );
 }
 
+/** Fail once at the exact post-launch persistence boundary. */
+class LaunchIdentityFaultRepository extends InMemoryOrchestrationRepository {
+  failAfterLaunchIdentity = true;
+
+  override async saveOrchestration(record: OrchestrationRecord): Promise<void> {
+    const launched = record.nodes.some((node) => (node.attempts ?? []).some((attempt) =>
+      attempt.taskId !== undefined || attempt.agentTaskId !== undefined || attempt.runId !== undefined));
+    if (this.failAfterLaunchIdentity && launched) {
+      this.failAfterLaunchIdentity = false;
+      throw new Error("fault injected after worker launch before durable task identity");
+    }
+    await super.saveOrchestration(record);
+  }
+}
+
 function commandContext(idle = true): ExtensionCommandContext {
   return {
     cwd: process.cwd(),
@@ -130,6 +158,12 @@ function commandContext(idle = true): ExtensionCommandContext {
       setWidget: () => undefined,
     },
   } as unknown as ExtensionCommandContext;
+}
+
+async function shutdownFakePi(state: FakePiState, context: ExtensionCommandContext): Promise<void> {
+  if (shutDownFakePiStates.has(state)) return;
+  shutDownFakePiStates.add(state);
+  for (const handler of state.handlers.get("session_shutdown") ?? []) await handler({}, context);
 }
 
 function jsonSessionContext(): ExtensionCommandContext {
@@ -189,6 +223,41 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_orchestrate", "forgedock_ask_user"]);
+});
+
+test("session restart reports bridge-bound controller recovery as an explicit resume", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-extension-restart-"));
+  const tasksDirectory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(tasksDirectory, { recursive: true });
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { cwd, detached: true, stdio: "ignore" });
+  assert.ok(child.pid);
+  child.unref();
+  const taskId = "task_restart_bridge";
+  const logPath = join(tasksDirectory, `${taskId}.log`);
+  writeFileSync(join(tasksDirectory, `${taskId}.json`), JSON.stringify({
+    id: taskId,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: child.pid,
+    logPath,
+    status: "detached",
+    startedAt: new Date().toISOString(),
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "workflow",
+  }));
+  const state = fakePi();
+  const context = { ...jsonSessionContext(), cwd };
+  try {
+    await state.handlers.get("session_start")?.[0]?.({}, context);
+    const message = state.sent.map((entry) => entry.content).find((content) => content.includes(taskId));
+    assert.match(message ?? "", /ephemeral nested-agent bridge cannot be reattached/);
+    assert.match(message ?? "", /owning workflow checkpoint/);
+    assert.doesNotMatch(message ?? "", /forgedock_resume_orchestration/);
+    await shutdownFakePi(state, context);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("assistant mode keeps generic PR requests on normal GitHub tooling", async () => {
@@ -300,7 +369,7 @@ test("keeps native workflow tools active through a transient provider retry", as
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
 });
 
-test("dispatch-capable orchestration bootstraps its first-use witness before durable admission", async () => {
+test("invalid confirmed orchestration remains read-only before durable admission", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-orchestrate-witness-"));
   const cwd = createGitCheckout(root, "target", "https://github.com/a/b.git");
   const localDataRoot = join(root, "local-data");
@@ -326,8 +395,8 @@ test("dispatch-capable orchestration bootstraps its first-use witness before dur
       }, undefined, undefined, { ...commandContext(), cwd, mode: "tui" } as any),
       /issue substitution rejected/,
     );
-    assert.equal(existsSync(join(cwd, ".forgedock", "lease-witness.json")), true);
-    assert.equal(existsSync(join(cwd, ".forgedock", "state.db")), true);
+    assert.equal(existsSync(join(cwd, ".forgedock", "lease-witness.json")), false);
+    assert.equal(existsSync(join(cwd, ".forgedock", "state.db")), false);
     assert.equal(existsSync(join(root, ".forgedock", "state.db")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -382,7 +451,7 @@ test("parent-launched orchestration carries the resolved checkout into DAG worke
     assert.equal(spawnRequests[0]?.params.cwd, target);
     assert.equal(spawnRequests[0]?.params.model, "openai-codex/gpt-test");
   } finally {
-    await state.handlers.get("session_shutdown")?.[0]?.({}, commandContext());
+    await shutdownFakePi(state, commandContext());
     if (previousControllerEntry === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
     else process.env.FORGEDOCK_CONTROLLER_ENTRY = previousControllerEntry;
     rmSync(root, { recursive: true, force: true });
@@ -584,7 +653,15 @@ test("ForgeDock issue children receive only the typed mutation tool", async () =
 });
 
 test("orchestrate starts only the live DAG ready set without static batch phases", async () => {
-  const state = fakePi();
+  let readinessChecks = 0;
+  const state = fakePi(undefined, {
+    orchestrationRepository: new InMemoryOrchestrationRepository(),
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async (input) => {
+      readinessChecks += 1;
+      assert.equal(input.requireLeaseWitness, true);
+    },
+  });
   const spawnRequests: any[] = [];
   const originalEmit = state.pi.events.emit.bind(state.pi.events);
   state.pi.events.emit = ((name: string, data: any) => {
@@ -596,6 +673,10 @@ test("orchestrate starts only the live DAG ready set without static batch phases
         requestId: data.requestId,
         success: true,
         data: { text: "started", details: { asyncId: `test-run-${spawnRequests.length}` } },
+      }));
+    } else if (name === "subagents:rpc:v1:request" && data.method === "stop") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { stopped: true },
       }));
     }
   }) as typeof state.pi.events.emit;
@@ -628,6 +709,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   }
 
   assert.equal(spawnRequests.length, 1);
+  assert.equal(readinessChecks, 1, "an injected orchestration repository must not bypass dispatch readiness");
   const spawnRequest = spawnRequests[0];
   assert.equal(spawnRequest.method, "spawn");
   assert.equal(spawnRequest.params.async, true);
@@ -644,6 +726,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.match(spawnRequest.params.task, /"resume":false/);
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);
+  await shutdownFakePi(state, commandContext());
 });
 
 test("headless orchestration requires explicit dispatch authorization", async () => {
@@ -691,6 +774,10 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
       queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
         version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "preview-continuation-run" } },
       }));
+    } else if (name === "subagents:rpc:v1:request" && data.method === "stop") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { stopped: true },
+      }));
     }
   }) as typeof state.pi.events.emit;
   const tool = state.tools.get("forgedock_orchestrate") as any;
@@ -715,6 +802,173 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
   assert.match((continued.content[0] as { text: string }).text, /started streaming DAG/);
   assert.equal(spawnRequests.length, 1);
+  await shutdownFakePi(state, commandContext());
+});
+
+test("confirmation prompt remains read-only until the user authorizes dispatch", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-confirm-readonly-"));
+  let witnessCalls = 0;
+  updateForgeDockConfig(cwd, { orchestration: { dispatchMode: "confirm" } });
+  const state = fakePi(undefined, {
+    ensureLeaseWitness: () => {
+      witnessCalls += 1;
+      throw new Error("witness bootstrap must not run before confirmation");
+    },
+  });
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7 --confirm", issueNumbers: [7], repository: "a/b", noMilestone: true });
+  const ctx = {
+    ...commandContext(),
+    cwd,
+    ui: { ...commandContext().ui, confirm: async () => false },
+  } as any;
+  try {
+    await assert.rejects(() => tool.execute("declined-confirmation", {
+      issueNumbers: [7],
+      executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+    }, undefined, undefined, ctx), /cancelled before dispatch/);
+    assert.equal(witnessCalls, 0);
+    assert.equal(existsSync(join(cwd, ".forgedock", "lease-witness.json")), false);
+    assert.equal(existsSync(join(cwd, ".forgedock", "state.db")), false);
+    assert.equal(existsSync(join(cwd, ".forgedock", "tasks")), false, "preview must not initialize or reconcile background tasks");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("confirm-mode orchestration provisions and re-reads a missing milestone branch before dispatch", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-confirm-milestone-"));
+  const branchNames = new Set<string>();
+  const branchEvents: string[] = [];
+  let listBranchesCalls = 0;
+  const originalGetIssue = GitHubClient.prototype.getIssue;
+  const originalListBranches = GitHubClient.prototype.listBranches;
+  const originalGetBranchHead = GitHubClient.prototype.getBranchHead;
+  const originalCreateBranch = GitHubClient.prototype.createBranch;
+  GitHubClient.prototype.getIssue = (async function (number, repo) {
+    return {
+      repo: repo ?? "a/b",
+      number,
+      title: `Issue ${number}`,
+      body: "Deliver the milestone work.",
+      url: `https://github.test/a/b/issues/${number}`,
+      state: "OPEN",
+      labels: [],
+      milestone: { number: 1, title: "Milestone One" },
+      comments: [],
+    };
+  }) as typeof GitHubClient.prototype.getIssue;
+  GitHubClient.prototype.listBranches = (async function () {
+    listBranchesCalls += 1;
+    return [...branchNames].map((name) => ({ name, headSha: "a".repeat(40) }));
+  }) as typeof GitHubClient.prototype.listBranches;
+  GitHubClient.prototype.getBranchHead = (async function (_repo, branch) {
+    branchEvents.push(`head:${branch}`);
+    return "a".repeat(40);
+  }) as typeof GitHubClient.prototype.getBranchHead;
+  GitHubClient.prototype.createBranch = (async function (_repo, branch) {
+    branchEvents.push(`create:${branch}`);
+    branchNames.add(branch);
+    return { name: branch, headSha: "a".repeat(40) };
+  }) as typeof GitHubClient.prototype.createBranch;
+  try {
+    updateForgeDockConfig(cwd, { orchestration: { dispatchMode: "confirm" } });
+    const state = fakePi(undefined, {
+      orchestrationRepository: new InMemoryOrchestrationRepository(),
+      orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+      dispatchReadinessCheck: async () => undefined,
+    });
+    const spawnRequests: any[] = [];
+    const originalEmit = state.pi.events.emit.bind(state.pi.events);
+    state.pi.events.emit = ((name: string, data: any) => {
+      originalEmit(name, data);
+      if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+        spawnRequests.push(data);
+        branchEvents.push("spawn");
+        queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+          version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "confirm-milestone-run" } },
+        }));
+      }
+    }) as typeof state.pi.events.emit;
+    const tool = state.tools.get("forgedock_orchestrate");
+    assert.ok(tool);
+    bindOrchestrationInvocation(state.pi, {
+      rawArgs: "7 --confirm",
+      issueNumbers: [7],
+      repository: "a/b",
+      defaultBranch: "main",
+      milestone: "Milestone One",
+      noMilestone: false,
+    });
+    const result = await tool.execute("confirm-milestone", {
+      issueNumbers: [7],
+      executionPlan: [{ issue: 7, title: "Issue 7", summary: "Milestone work", dependsOn: [], claims: ["src/milestone"], labels: [] }],
+    }, undefined, undefined, {
+      ...commandContext(),
+      cwd,
+      ui: { ...commandContext().ui, confirm: async () => true },
+    } as any);
+    assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
+    assert.deepEqual([...branchNames], ["milestone/milestone-one"]);
+    assert.equal(listBranchesCalls, 4, "discovery, provisioning validation, and post-authorization route refresh must read the branch catalog");
+    assert.deepEqual(branchEvents.slice(0, 3), ["head:main", "create:milestone/milestone-one", "head:milestone/milestone-one"]);
+    assert.equal(branchEvents.at(-1), "spawn");
+    assert.equal(spawnRequests.length, 1);
+  } finally {
+    GitHubClient.prototype.getIssue = originalGetIssue;
+    GitHubClient.prototype.listBranches = originalListBranches;
+    GitHubClient.prototype.getBranchHead = originalGetBranchHead;
+    GitHubClient.prototype.createBranch = originalCreateBranch;
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("preview continuation carries the full frozen runtime contract into the child controller invocation", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-preview-runtime-"));
+  updateForgeDockConfig(cwd, {
+    workerModel: "worker/old-model", workerThinking: "high",
+    reviewerModel: "reviewer/old-model", reviewerThinking: "medium",
+    planningModel: "planner/old-model", planningThinking: "low",
+  });
+  const state = fakePi();
+  const spawnRequests: any[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      spawnRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "frozen-runtime-run" } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const tool = state.tools.get("forgedock_orchestrate") as any;
+  bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], repository: "a/b", noMilestone: true });
+  const ctx = { ...commandContext(), cwd, hasUI: false } as any;
+  try {
+    await tool.execute("runtime-preview", {
+      issueNumbers: [7],
+      executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+    }, undefined, undefined, ctx);
+    updateForgeDockConfig(cwd, {
+      workerModel: "worker/new-model", workerThinking: "max",
+      reviewerModel: "reviewer/new-model", reviewerThinking: "max",
+      planningModel: "planner/new-model", planningThinking: "max",
+    });
+    await tool.execute("runtime-confirm", { issueNumbers: [7], confirmed: true }, undefined, undefined, ctx);
+    assert.equal(spawnRequests.length, 1);
+    assert.equal(spawnRequests[0]?.params.model, "worker/old-model:high");
+    const task = spawnRequests[0]?.params.task ?? "";
+    assert.match(task, /"workerModel":"worker\/old-model:high"/);
+    assert.match(task, /"reviewerModel":"reviewer\/old-model"/);
+    assert.match(task, /"reviewerThinking":"medium"/);
+    assert.match(task, /"planningModel":"planner\/old-model"/);
+    assert.match(task, /"planningThinking":"low"/);
+    assert.doesNotMatch(task, /(?:worker|reviewer|planner)\/new-model/);
+  } finally {
+    await shutdownFakePi(state, ctx);
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("bound decomposed scope rebinds a parent execution plan before DAG validation", async () => {
@@ -866,6 +1120,43 @@ test("visible DAG start surfaces failure before the first worker dispatch", asyn
   await delegator.shutdown();
 });
 
+test("visible DAG shutdown aborts a native scheduler waiting for capacity", async () => {
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const occupied = Array.from({ length: 4 }, (_, index) => ({
+    id: `occupied-${index}`,
+    command: "node",
+    args: [],
+    cwd: process.cwd(),
+    pid: index + 1,
+    logPath: "",
+    status: "running" as const,
+    startedAt: new Date(0).toISOString(),
+  }));
+  let starts = 0;
+  const transport = {
+    list: () => occupied,
+    isActive: () => true,
+    start: async () => { starts += 1; return "unexpected-task"; },
+    wait: async () => undefined,
+  };
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const delegator = new VisibleDagDelegator(state.pi, () => repository, undefined, transport, () => admission);
+  const start = delegator.start({
+    repository: "a/b",
+    items: [{ id: "issue-capacity", issue: 1, title: "Capacity", summary: "Capacity", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] }],
+    maxParallel: 1,
+    taskFor: () => ({ agent: "forgedock-issue-worker", task: "Deliver issue #1", cwd: process.cwd() }),
+    controllerTaskFor: () => ({ args: [], cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+
+  await delegator.shutdown();
+  await assert.rejects(start, /TUI shutdown|cancelled/i);
+  assert.equal(starts, 0);
+});
+
 test("dead detached task evidence does not reduce native orchestration capacity", async () => {
   const state = fakePi();
   const repository = new InMemoryOrchestrationRepository();
@@ -900,6 +1191,36 @@ test("dead detached task evidence does not reduce native orchestration capacity"
   const durable = await repository.loadOrchestration(run.id);
   assert.equal(durable?.transportCapacity, 4);
   assert.equal(durable?.effectiveMaxParallel, 4);
+  await delegator.shutdown();
+});
+
+test("live capacity excludes this DAG's immediate native launch receipts", async () => {
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const launched: any[] = [];
+  const transport = {
+    list: () => launched,
+    isActive: () => true,
+    start: async () => {
+      const id = `owned-${launched.length + 1}`;
+      launched.push({ id, command: "node", args: [], cwd: process.cwd(), pid: launched.length + 1, logPath: "", status: "running" as const, startedAt: new Date(0).toISOString() });
+      return id;
+    },
+    wait: async (id: string) => ({ ...launched.find((record) => record.id === id), status: "completed" as const, exitCode: 0 }),
+  };
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const delegator = new VisibleDagDelegator(state.pi, () => repository, undefined, transport, () => admission);
+  const run = await delegator.start({
+    repository: "a/b",
+    items: Array.from({ length: 5 }, (_, index) => ({ id: `issue-${index + 1}`, issue: index + 1, title: `Issue ${index + 1}`, summary: "Capacity ownership", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [index + 1] })),
+    maxParallel: 4,
+    taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    controllerTaskFor: () => ({ args: [], cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+  await run.completion;
+  assert.equal(launched.length, 5);
   await delegator.shutdown();
 });
 
@@ -972,9 +1293,117 @@ test("native controller tasks promote Build Packet claims into the parent schedu
   await delegator.shutdown();
 });
 
+test("native DAG recovery adopts a task launched before task identity persistence", async () => {
+  const state = fakePi();
+  const repository = new LaunchIdentityFaultRepository();
+  const tasks = new Map<string, any>();
+  let launches = 0;
+  const transport = {
+    start: async (spec: ControllerTaskSpec) => {
+      assert.ok(spec.launchIdentity);
+      assert.equal(spec.launchKey, orchestrationTransportKey(spec.launchIdentity!));
+      const id = `native-crash-window-${++launches}`;
+      tasks.set(id, {
+        id,
+        command: "node",
+        args: [],
+        cwd: process.cwd(),
+        pid: 1,
+        logPath: "",
+        status: "running" as const,
+        startedAt: new Date(0).toISOString(),
+        launchKey: spec.launchKey,
+      });
+      return id;
+    },
+    findByLaunchIdentity: (identity: OrchestrationTransportIdentity) =>
+      [...tasks.values()].find((task) => task.launchKey === orchestrationTransportKey(identity))?.id,
+    list: () => [...tasks.values()],
+    isActive: () => true,
+    wait: async (id: string) => ({ ...tasks.get(id), status: "completed" as const, exitCode: 0 }),
+  };
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const delegator = new VisibleDagDelegator(state.pi, () => repository, undefined, transport, () => admission);
+  const input = {
+    repository: "a/b",
+    items: [{ id: "issue-launch", issue: 101, title: "Launch", summary: "Launch", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [101] }],
+    maxParallel: 1,
+    taskFor: () => ({ agent: "forgedock-issue-worker", task: "Deliver issue #101", cwd: process.cwd() }),
+    controllerTaskFor: () => ({ args: [], cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  };
+
+  await assert.rejects(() => delegator.start(input), /fault injected after worker launch/);
+  const [crashed] = await repository.listOrchestrations();
+  assert.ok(crashed);
+  const crashedAttempt = crashed.nodes[0]?.attempts?.[0];
+  assert.equal(crashed.nodes[0]?.status, "running");
+  assert.equal(crashedAttempt?.status, "launching");
+  assert.equal(crashedAttempt?.taskId, undefined, "the injected write must leave the durable identity absent");
+
+  const resumed = await delegator.resume(crashed.orchestrationId);
+  await resumed.completion;
+  assert.equal(launches, 1, "recovery must adopt the exact native task instead of spawning a duplicate");
+  const recovered = await repository.loadOrchestration(crashed.orchestrationId);
+  assert.equal(recovered?.status, "completed");
+  assert.equal(recovered?.nodes[0]?.attempts?.length, 1);
+  assert.equal(recovered?.nodes[0]?.attempts?.[0]?.taskId, "native-crash-window-1");
+  await delegator.shutdown();
+});
+
+test("Pi fallback recovery reuses its launch receipt across the launch-to-record crash window", async () => {
+  const state = fakePi();
+  const repository = new LaunchIdentityFaultRepository();
+  let launches = 0;
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      launches++;
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { details: { asyncId: "pi-crash-window-1" } },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const delegator = witnessedDagDelegator(state.pi, repository);
+  const input = {
+    repository: "a/b",
+    items: [{ id: "issue-pi-launch", issue: 102, title: "Pi launch", summary: "Pi launch", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [102] }],
+    maxParallel: 1,
+    taskFor: () => ({ agent: "forgedock-issue-worker", task: "Deliver issue #102", cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  };
+
+  await assert.rejects(() => delegator.start(input), /fault injected after worker launch/);
+  const [crashed] = await repository.listOrchestrations();
+  assert.ok(crashed);
+  assert.equal(crashed.nodes[0]?.attempts?.[0]?.runId, undefined);
+
+  const resumedPromise = delegator.resume(crashed.orchestrationId);
+  const completionTicker = setInterval(() => originalEmit("subagent:async-complete", { runId: "pi-crash-window-1" }), 10);
+  const resumed = await Promise.race([
+    resumedPromise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Pi recovery did not adopt the launched run")), 2_000)),
+  ]);
+  clearInterval(completionTicker);
+  await resumed.completion;
+  assert.equal(launches, 1, "Pi recovery must wait for the existing GitHub-capable worker");
+  const recovered = await repository.loadOrchestration(crashed.orchestrationId);
+  assert.equal(recovered?.status, "completed");
+  assert.equal(recovered?.nodes[0]?.attempts?.length, 1);
+  assert.equal(recovered?.nodes[0]?.attempts?.[0]?.runId, "pi-crash-window-1");
+  await delegator.shutdown();
+});
+
 test("fresh-rerun authorization cannot be converted back into checkpoint resume", () => {
   assert.deepEqual(resolveIssueWorkerRecovery(["needs-human"], false, "rerun"), { rerun: true, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:engine-error"], true, "initial"), { rerun: true, resume: false });
+  assert.deepEqual(resolveIssueWorkerRecovery([], true, "resume"), { rerun: false, resume: true });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:in-review", "needs-human"], false, "initial"), { rerun: false, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
 });
@@ -1269,6 +1698,61 @@ test("work-on rejects contradictory fresh-rerun and checkpoint-resume policies",
   await assert.rejects(tool.execute("conflicting-recovery", { issue: 6, rerun: true, resume: true }, undefined, undefined, ctx), /mutually exclusive/);
 });
 
+test("work-on readiness failure prevents native task launch", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-readiness-no-launch-"));
+  const repository = new InMemoryOrchestrationRepository();
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => { throw new Error("aggregate readiness blocked"); },
+  });
+  const ctx = { ...commandContext(), cwd: root } as any;
+  const tool = state.tools.get("forgedock_work_on");
+  assert.ok(tool);
+  await assert.rejects(
+    () => tool.execute("blocked-before-launch", { issue: 20, background: true }, undefined, undefined, ctx),
+    /aggregate readiness blocked/,
+  );
+  assert.equal(state.emitted.some(({ event }) => event === "subagents:rpc:v1:request"), false);
+  assert.equal(existsSync(join(ctx.cwd, ".forgedock", "tasks")), false);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("orchestration resume readiness failure prevents durable execution mutation", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const timestamp = new Date(0).toISOString();
+  await repository.createOrchestration({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_readiness_blocked",
+    repository: "a/b",
+    issueNumbers: [20],
+    maxParallel: 1,
+    autoMerge: true,
+    executionAttempt: 1,
+    status: "failed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    nodes: [{
+      id: "issue-20", issue: 20, priority: 1, dependencies: [], claims: [],
+      status: "failed", childRunIds: [], attempts: [],
+    }],
+  });
+  const before = await repository.loadOrchestration("dag_readiness_blocked");
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => { throw new Error("aggregate readiness blocked"); },
+  });
+  const tool = state.tools.get("forgedock_resume_orchestration");
+  assert.ok(tool);
+  await assert.rejects(
+    () => tool.execute("blocked-resume", { orchestrationId: "dag_readiness_blocked" }, undefined, undefined, commandContext() as any),
+    /aggregate readiness blocked/,
+  );
+  assert.deepEqual(await repository.loadOrchestration("dag_readiness_blocked"), before);
+  assert.equal(state.emitted.some(({ event }) => event === "subagents:rpc:v1:request"), false);
+});
+
 test("direct work-on defaults to a native non-blocking controller task", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
   const entry = join(root, "controller.mjs");
@@ -1288,6 +1772,8 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     assert.equal(details.state, "delegated");
     assert.ok(details.args?.includes("--auto-merge"));
     assert.match(details.taskId ?? "", /^task_/);
+    const persisted = JSON.parse(readFileSync(join(root, ".forgedock", "tasks", `${details.taskId}.json`), "utf8")) as { resumeScope?: string };
+    assert.equal(persisted.resumeScope, "work-on");
     const tasks = state.tools.get("forgedock_tasks");
     assert.ok(tasks);
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -1299,7 +1785,46 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     const listed = await tasks.execute("list-final", { action: "list" }, undefined, undefined, ctx);
     assert.equal((listed.details as { records: Array<{ id: string; status: string }> }).records.find((record) => record.id === details.taskId)?.status, "completed");
   } finally {
-    await state.handlers.get("session_shutdown")?.[0]?.({}, ctx);
+    await shutdownFakePi(state, ctx);
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+  }
+});
+
+test("background review and promotion tasks persist truthful restart scopes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-tool-recovery-scope-"));
+  const entry = join(root, "controller.mjs");
+  writeFileSync(entry, "setTimeout(() => process.exit(0), 50);\n");
+  const state = fakePi();
+  const ctx = { ...commandContext(), cwd: root, mode: "rpc" } as any;
+  await state.handlers.get("session_start")?.[0]?.({}, ctx);
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  process.env.FORGEDOCK_CONTROLLER_ENTRY = entry;
+  const taskIds: string[] = [];
+  try {
+    for (const [toolName, params, expectedScope] of [
+      ["forgedock_review_pr", { pullRequest: 21 }, "review-pr-rerun"],
+      ["forgedock_promote", { production: true }, "promote"],
+    ] as const) {
+      const tool = state.tools.get(toolName);
+      assert.ok(tool);
+      const result = await tool.execute(`background-${toolName}`, params, undefined, undefined, ctx);
+      const taskId = (result.details as { taskId?: string }).taskId;
+      assert.ok(taskId);
+      taskIds.push(taskId);
+      const persisted = JSON.parse(readFileSync(join(root, ".forgedock", "tasks", `${taskId}.json`), "utf8")) as { resumeScope?: string };
+      assert.equal(persisted.resumeScope, expectedScope);
+    }
+    const tasks = state.tools.get("forgedock_tasks");
+    assert.ok(tasks);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const listed = await tasks.execute("recovery-scope-list", { action: "list" }, undefined, undefined, ctx);
+      const records = (listed.details as { records: Array<{ id: string; status: string }> }).records;
+      if (taskIds.every((id) => records.find((record) => record.id === id)?.status === "completed")) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } finally {
+    await shutdownFakePi(state, ctx);
     if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
     else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
   }
@@ -1595,6 +2120,27 @@ test("orchestration scope resolves a GitHub milestone URL before selecting open 
     noMilestone: false,
   });
   assert.deepEqual(calls, [1, "Milestone One"]);
+});
+
+test("TUI issue discovery bounds 500 GitHub reads while preserving scope order", async () => {
+  const issueNumbers = Array.from({ length: 500 }, (_, index) => index + 1);
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const scope = await resolveOrchestrationInvocationScope(issueNumbers.join(" "), process.cwd(), {
+    async getRepository() { return { repo: "a/b", defaultBranch: "main" }; },
+    async getMilestone(number) { return { number, title: "unused", state: "open" as const }; },
+    async listOpenIssueNumbersForMilestone() { return []; },
+    async getIssue(number) {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise<void>((resolve) => setTimeout(resolve, number % 2));
+      inFlight -= 1;
+      return { number, state: "OPEN" as const };
+    },
+  });
+  assert.equal(maxInFlight, DEFAULT_REMOTE_READ_CONCURRENCY);
+  assert.equal(inFlight, 0);
+  assert.deepEqual(scope.issueNumbers, issueNumbers);
 });
 
 test("milestone scope replaces an authoritative decomposed parent with same-milestone children", async () => {

@@ -6,6 +6,8 @@ import { LeaseContinuityError } from "../../core/ports/lease.js";
 import type {
   OrchestrationExecutionAdmission,
   OrchestrationExecutionClaim,
+  OrchestrationRepository,
+  OrchestrationExecutionLeaseStatus,
 } from "../../core/ports/orchestration.js";
 
 const DEFAULT_TTL_MS = 60_000;
@@ -48,6 +50,7 @@ export class LeaseBackedOrchestrationExecutionAdmission implements Orchestration
     const lease = this.leases.acquire(itemId, this.#owner, this.#ttlMs, this.#now());
     if (!lease) return undefined;
     const guard = this.leases.guard(itemId, lease.token);
+    const claimId = `${lease.epoch}:${createHash("sha256").update(lease.token).digest("hex").slice(0, 16)}`;
     let expiresAt = lease.expiresAt;
     let failure: unknown;
     let released = false;
@@ -55,34 +58,70 @@ export class LeaseBackedOrchestrationExecutionAdmission implements Orchestration
       if (released || failure !== undefined) return;
       try {
         expiresAt = this.leases.heartbeat(itemId, lease.token, this.#ttlMs, this.#now()).expiresAt;
-      } catch (error) {
-        failure = error;
+      } catch {
+        failure = new LeaseContinuityError(`orchestration execution heartbeat failed for claim ${claimId}`);
       }
     }, this.#heartbeatMs);
     heartbeat.unref?.();
 
     const assertValid = (): void => {
-      if (released) throw new LeaseContinuityError(`orchestration execution claim ${lease.token} was released`);
+      if (released) throw new LeaseContinuityError(`orchestration execution claim ${claimId} was released`);
       if (failure !== undefined) {
         throw failure instanceof Error
           ? failure
           : new LeaseContinuityError(`orchestration execution heartbeat failed: ${String(failure)}`);
       }
-      if (this.#now() >= expiresAt) throw new LeaseContinuityError(`orchestration execution claim ${lease.token} expired`);
-      guard.assertValid();
+      if (this.#now() >= expiresAt) throw new LeaseContinuityError(`orchestration execution claim ${claimId} expired`);
+      try {
+        guard.assertValid();
+      } catch {
+        throw new LeaseContinuityError(`orchestration execution claim ${claimId} is no longer current`);
+      }
     };
 
     return {
       // The raw holder token is secret fencing authority and must never enter
       // the durable orchestration record. Retain only a one-way audit handle.
-      claimId: `${lease.epoch}:${createHash("sha256").update(lease.token).digest("hex").slice(0, 16)}`,
+      claimId,
       assertValid,
+      persist: async (repository: OrchestrationRepository, record) => {
+        assertValid();
+        if (!repository.saveOrchestrationFenced) {
+          throw new LeaseContinuityError("orchestration execution claim requires an atomic fenced repository; durable save refused");
+        }
+        await repository.saveOrchestrationFenced(record, {
+          itemId,
+          token: lease.token,
+          epoch: lease.epoch,
+          now: this.#now,
+        });
+        assertValid();
+      },
       release: () => {
         if (released) return;
         released = true;
         clearInterval(heartbeat);
-        this.leases.release(itemId, lease.token);
+        try {
+          this.leases.release(itemId, lease.token);
+        } catch {
+          throw new LeaseContinuityError(`orchestration execution claim ${claimId} release failed`);
+        }
       },
+    };
+  }
+
+  async describe(orchestrationId: string): Promise<OrchestrationExecutionLeaseStatus> {
+    const normalizedId = orchestrationId.trim();
+    if (!normalizedId) throw new Error("Orchestration admission requires an orchestration ID");
+    const inspect = this.leases.inspect;
+    if (!inspect) return { state: "unknown" };
+    const lease = inspect.call(this.leases, `orchestration-execution:${normalizedId}`, this.#now());
+    if (!lease) return { state: "absent" };
+    return {
+      state: lease.expiresAt > this.#now() ? "active" : "expired",
+      owner: lease.owner,
+      heartbeatAt: lease.heartbeatAt,
+      expiresAt: lease.expiresAt,
     };
   }
 }

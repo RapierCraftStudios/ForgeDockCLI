@@ -164,7 +164,9 @@ export class ControllerObservationAdapter {
 export class BackgroundTaskObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #producer: ReturnType<typeof createObservationProducer>;
-  readonly #streams = new Map<string, StreamingObservationText>();
+  readonly #streams = new Map<string, Map<"stdout" | "stderr", StreamingObservationText>>();
+  readonly #queues = new Map<string, Promise<void>>();
+  readonly #finished = new Map<string, Promise<void>>();
 
   constructor(observer: ObservationSink, producer = createObservationProducer("forgedock-background-task")) {
     this.#observer = observer;
@@ -179,41 +181,100 @@ export class BackgroundTaskObservationAdapter {
     this.emit(taskId, "process.adopted", "notice", { pid, summary: "Controller adopted after terminal restart" });
   }
 
-  output(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): void {
-    const key = `${taskId}:${channel}`;
-    const stream = this.#streams.get(key) ?? createStreamingObservationText();
-    this.#streams.set(key, stream);
-    const safeText = stream.push(text);
-    if (!safeText) return;
-    this.emitOutput(taskId, channel, safeText, chunkSequence);
-  }
-
-  finished(taskId: string, status: string, exitCode?: number): void {
-    for (const channel of ["stdout", "stderr"] as const) {
-      const key = `${taskId}:${channel}`;
-      const stream = this.#streams.get(key);
-      if (!stream) continue;
-      const safeText = stream.finish();
-      this.#streams.delete(key);
-      if (safeText) this.emitOutput(taskId, channel, safeText, 0);
-    }
-    this.emit(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
-  }
-
-  private emitOutput(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): void {
-    void this.#observer.emit({
-      producer: this.#producer,
-      identity: { controllerTaskId: taskId },
-      source: "process",
-      channel,
-      kind: channel === "stdout" ? "output.stdout" : "output.stderr",
-      payload: { bytes: Buffer.byteLength(text, "utf8") },
-      output: { channel, text, ...(chunkSequence > 0 ? { chunkSequence } : {}) },
+  output(taskId: string, channel: "stdout" | "stderr", text: string, chunkSequence: number): Promise<void> {
+    if (!text || this.#finished.has(taskId)) return Promise.resolve();
+    return this.enqueue(taskId, async () => {
+      const stream = this.streamFor(taskId, channel);
+      const sanitized = stream.push(text);
+      if (!sanitized) return;
+      await this.emitOutput(taskId, channel, sanitized, text, chunkSequence, stream);
     });
   }
 
+  finished(taskId: string, status: string, exitCode?: number): Promise<void> {
+    const existing = this.#finished.get(taskId);
+    if (existing) return existing;
+    const completion = this.enqueue(taskId, async () => {
+      try {
+        const streams = this.#streams.get(taskId);
+        if (streams) {
+          for (const channel of ["stdout", "stderr"] as const) {
+            const stream = streams.get(channel);
+            if (!stream) continue;
+            const tail = stream.finish();
+            if (tail) await this.emitOutput(taskId, channel, tail, tail, undefined, stream);
+          }
+        }
+        await this.emitLifecycle(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
+      } finally {
+        this.#streams.delete(taskId);
+        this.#queues.delete(taskId);
+      }
+    });
+    this.#finished.set(taskId, completion);
+    return completion;
+  }
+
+  /** Discard parser state when an adopted process disappears without a semantic result. */
+  discarded(taskId: string): Promise<void> {
+    const existing = this.#finished.get(taskId);
+    if (existing) return existing;
+    const completion = this.enqueue(taskId, async () => {
+      this.#streams.delete(taskId);
+      this.#queues.delete(taskId);
+    });
+    this.#finished.set(taskId, completion);
+    return completion;
+  }
+
+  private streamFor(taskId: string, channel: "stdout" | "stderr"): StreamingObservationText {
+    let streams = this.#streams.get(taskId);
+    if (!streams) {
+      streams = new Map();
+      this.#streams.set(taskId, streams);
+    }
+    let stream = streams.get(channel);
+    if (!stream) {
+      stream = createStreamingObservationText();
+      streams.set(channel, stream);
+    }
+    return stream;
+  }
+
+  private enqueue(taskId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.#queues.get(taskId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    this.#queues.set(taskId, current);
+    return current;
+  }
+
+  private async emitOutput(taskId: string, channel: "stdout" | "stderr", text: string, sourceText: string, chunkSequence: number | undefined, stream: StreamingObservationText): Promise<void> {
+    try {
+      const result = await this.#observer.emit({
+        producer: this.#producer,
+        identity: { controllerTaskId: taskId },
+        source: "process",
+        channel,
+        kind: channel === "stdout" ? "output.stdout" : "output.stderr",
+        payload: { bytes: Buffer.byteLength(sourceText, "utf8") },
+        output: { channel, text, ...(chunkSequence === undefined ? {} : { chunkSequence }) },
+      });
+      if (result.kind === "output.dropped") stream.markDropped();
+    } catch {
+      stream.markDropped();
+    }
+  }
+
+  private async emitLifecycle(taskId: string, kind: string, severity: ObservationSeverity, payload: unknown): Promise<void> {
+    try {
+      await this.#observer.emit({ producer: this.#producer, identity: { controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
+    } catch {
+      // Lifecycle delivery failures must not retain parser state or block task cleanup.
+    }
+  }
+
   private emit(taskId: string, kind: string, severity: ObservationSeverity, payload: unknown): void {
-    void this.#observer.emit({ producer: this.#producer, identity: { controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
+    void this.emitLifecycle(taskId, kind, severity, payload);
   }
 }
 

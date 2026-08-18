@@ -36,12 +36,45 @@ import { assertRuntimeInstallAsync } from "./runtime-install.js";
 
 export const MAX_NESTED_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * Validate every frozen provider/model target without starting an agent
+ * session. Model presence alone is insufficient: a provider can be installed
+ * while its ambient or stored credentials are absent. Keep this helper
+ * injectable so dispatch readiness tests do not need a live provider.
+ */
+export async function assertPiRuntimeTargetsReady(
+  runtime: Pick<ModelRuntime, "getModel" | "checkAuth">,
+  targets: readonly { provider: string; model: string }[],
+): Promise<void> {
+  const providers = [...new Set(targets.map((target) => target.provider))];
+  for (const provider of providers) {
+    let auth;
+    try {
+      auth = await runtime.checkAuth(provider);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Pi runtime preflight authentication check failed for provider ${provider}: ${message}`);
+    }
+    if (!auth) {
+      throw new Error(`Pi runtime preflight could not resolve authentication for provider ${provider}; configure provider credentials before dispatch`);
+    }
+  }
+  for (const target of targets) {
+    if (!runtime.getModel(target.provider, target.model)) {
+      throw new Error(`Pi runtime preflight could not resolve model ${target.provider}/${target.model}`);
+    }
+  }
+}
+
 export interface PiRuntimeOptions {
   agentDir?: string;
   provider?: string;
   model?: string;
   thinking?: ModelPolicy["thinking"];
   /** Provider/model override for read-only planning roles. */
+  reviewerProvider?: string;
+  reviewerModel?: string;
+  reviewerThinking?: ModelPolicy["thinking"];
   planningProvider?: string;
   planningModel?: string;
   planningThinking?: ModelPolicy["thinking"];
@@ -51,6 +84,7 @@ export interface PiRuntimeOptions {
 type PiSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
 interface ActiveExecution {
+  taskId: string;
   controller: AbortController;
   done: Promise<void>;
   complete(): void;
@@ -89,38 +123,43 @@ export class PiAgentRuntime implements AgentRuntime {
 
   async preflight(options: RuntimePreflightOptions = {}): Promise<{ provider: string; model: string }> {
     await assertRuntimeInstallAsync();
-    const configuredReviewer = splitConfiguredModel(process.env.FORGEDOCK_REVIEWER_MODEL);
-    const configuredPlanning = splitConfiguredModel(
-      process.env.FORGEDOCK_PLANNING_MODEL ??
-        (this.#options.planningProvider && this.#options.planningModel
-          ? `${this.#options.planningProvider}/${this.#options.planningModel}`
-          : this.#options.planningModel),
-    );
-    const worker = {
-      provider: options.provider ?? this.#options.provider ?? process.env.PI_PROVIDER,
-      model: options.model ?? this.#options.model ?? process.env.PI_MODEL,
-    };
-    const primary = options.role === "reviewer" && configuredReviewer
-      ? { provider: configuredReviewer.provider, model: configuredReviewer.model }
-      : worker;
-    const targets = [
-      primary,
-      ...(options.role !== "reviewer" && configuredReviewer ? [configuredReviewer] : []),
-      ...(configuredPlanning ? [configuredPlanning] : []),
-    ];
+    const environment = process.env;
+    const worker = resolvePiModelSource([
+      piModelSource(this.#options.provider, this.#options.model, this.#options.thinking),
+      environmentSource(environment.FORGEDOCK_WORKER_PROVIDER, environment.FORGEDOCK_WORKER_MODEL, environment.FORGEDOCK_WORKER_THINKING),
+      environmentSource(environment.PI_PROVIDER, environment.PI_MODEL),
+    ]);
+    const reviewer = resolvePiModelSource([
+      piModelSource(this.#options.reviewerProvider, this.#options.reviewerModel, this.#options.reviewerThinking),
+      environmentSource(environment.FORGEDOCK_REVIEWER_PROVIDER, environment.FORGEDOCK_REVIEWER_MODEL, environment.FORGEDOCK_REVIEWER_THINKING),
+      worker,
+    ]);
+    const planning = resolvePiModelSource([
+      piModelSource(this.#options.planningProvider, this.#options.planningModel, this.#options.planningThinking),
+      environmentSource(environment.FORGEDOCK_PLANNING_PROVIDER, environment.FORGEDOCK_PLANNING_MODEL, environment.FORGEDOCK_PLANNING_THINKING),
+      worker,
+    ]);
+    const explicitlyRequested = options.provider !== undefined || options.model !== undefined;
+    const requested = explicitlyRequested
+      ? resolvePiModelSource([piModelSource(options.provider, options.model)])
+      : options.role === "reviewer"
+        ? reviewer
+        : options.role === "investigator" || options.role === "packet-author"
+          ? planning
+          : worker;
+    const targets = explicitlyRequested ? [requested] : [worker, reviewer, planning];
     const runtime = await this.modelRuntime();
+    const completeTargets = targets.filter((target): target is PiModelSource & { provider: string; model: string } => Boolean(target.provider && target.model));
+    await assertPiRuntimeTargetsReady(runtime, completeTargets);
     for (const target of targets) {
       if (!target.provider || !target.model) {
         throw new Error("Pi runtime preflight requires a provider and model; pass --provider/--model or configure PI_PROVIDER/PI_MODEL");
       }
-      if (!runtime.getModel(target.provider, target.model)) {
-        throw new Error(`Pi runtime preflight could not resolve model ${target.provider}/${target.model}`);
-      }
     }
-    if (!primary.provider || !primary.model) {
+    if (!requested.provider || !requested.model) {
       throw new Error("Pi runtime preflight requires a provider and model; pass --provider/--model or configure PI_PROVIDER/PI_MODEL");
     }
-    return { provider: primary.provider, model: primary.model };
+    return { provider: requested.provider, model: requested.model };
   }
 
   async run<T>(
@@ -132,7 +171,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const task = effectiveRuntimeTask(suppliedTask);
     await assertRuntimeInstallAsync();
     throwIfAborted(options.signal);
-    const execution = this.beginExecution(options.signal);
+    const execution = this.beginExecution(options.signal, task.id);
     try {
     const emit = options.onEvent ?? (() => undefined);
     const startedAt = Date.now();
@@ -341,6 +380,13 @@ export class PiAgentRuntime implements AgentRuntime {
     await Promise.allSettled(executions.map((execution) => execution.done));
   }
 
+  interrupt(taskId: string, reason?: unknown): void {
+    const error = reason instanceof Error ? reason : new Error(`Agent task ${taskId} interrupted`);
+    for (const execution of this.#activeExecutions) {
+      if (execution.taskId === taskId) execution.controller.abort(error);
+    }
+  }
+
   private modelRuntime(): Promise<ModelRuntime> {
     if (!this.#modelRuntime) {
       const agentDir = this.#options.agentDir ?? getAgentDir();
@@ -357,7 +403,7 @@ export class PiAgentRuntime implements AgentRuntime {
     return this.#modelRuntime;
   }
 
-  private beginExecution(signal?: AbortSignal): ActiveExecution {
+  private beginExecution(signal: AbortSignal | undefined, taskId: string): ActiveExecution {
     if (this.#closed) throw new Error("Pi runtime is closed");
     throwIfAborted(signal);
     const controller = new AbortController();
@@ -366,6 +412,7 @@ export class PiAgentRuntime implements AgentRuntime {
     let resolveDone!: () => void;
     let completed = false;
     const execution: ActiveExecution = {
+      taskId,
       controller,
       done: new Promise<void>((resolve) => { resolveDone = resolve; }),
       complete: () => {
@@ -407,37 +454,144 @@ export interface ResolvedPiModelPolicy {
   thinking: ThinkingLevel | undefined;
 }
 
-/** Resolve role-specific model settings without changing controller authority. */
+interface PiModelSource {
+  provider?: string;
+  model?: string;
+  thinking?: ThinkingLevel;
+  reference?: string;
+}
+
+interface ParsedPiModelSource {
+  provider?: string;
+  model?: string;
+  thinking?: ThinkingLevel;
+}
+
+/**
+ * Resolve role-specific model settings without changing controller authority.
+ *
+ * Provider/model is one contract: once a source contributes either half of a
+ * pair, the other half is never borrowed from a lower-precedence source. This
+ * matters at execution time because the readiness doctor and the worker must
+ * validate and use the same frozen target. Role-specific durable options also
+ * outrank ambient FORGEDOCK_* settings; those variables are fallbacks for a
+ * controller that did not freeze a role contract.
+ */
 export function resolvePiModelPolicy<T>(
   task: AgentTask<T>,
   runtimeOptions: PiRuntimeOptions = {},
   environment: NodeJS.ProcessEnv = process.env,
 ): ResolvedPiModelPolicy {
   const planningRole = task.role === "investigator" || task.role === "packet-author";
-  const configured = planningRole
-    ? environment.FORGEDOCK_PLANNING_MODEL ??
-      (runtimeOptions.planningProvider && runtimeOptions.planningModel
-        ? `${runtimeOptions.planningProvider}/${runtimeOptions.planningModel}`
-        : runtimeOptions.planningModel)
-    : task.role === "reviewer"
-      ? environment.FORGEDOCK_REVIEWER_MODEL
-      : undefined;
-  const selected = splitConfiguredModel(configured);
-  const selectedThinking = planningRole
-    ? configuredThinking(environment.FORGEDOCK_PLANNING_THINKING) ?? runtimeOptions.planningThinking
-    : task.role === "reviewer"
-      ? configuredThinking(environment.FORGEDOCK_REVIEWER_THINKING)
-      : undefined;
+  const taskGeneric: PiModelSource = {
+    ...(task.modelPolicy.provider !== undefined ? { provider: task.modelPolicy.provider } : {}),
+    ...(task.modelPolicy.model !== undefined ? { model: task.modelPolicy.model } : {}),
+    ...(task.modelPolicy.thinking !== undefined ? { thinking: task.modelPolicy.thinking } : {}),
+  };
+  const runtimeGeneric: PiModelSource = {
+    ...(runtimeOptions.provider !== undefined ? { provider: runtimeOptions.provider } : {}),
+    ...(runtimeOptions.model !== undefined ? { model: runtimeOptions.model } : {}),
+    ...(runtimeOptions.thinking !== undefined ? { thinking: runtimeOptions.thinking } : {}),
+  };
+  const taskPlanning: PiModelSource = {
+    ...(task.modelPolicy.planningProvider !== undefined ? { provider: task.modelPolicy.planningProvider } : {}),
+    ...(task.modelPolicy.planningModel !== undefined ? { model: task.modelPolicy.planningModel } : {}),
+    ...(task.modelPolicy.planningThinking !== undefined ? { thinking: task.modelPolicy.planningThinking } : {}),
+  };
+  const runtimePlanning: PiModelSource = {
+    ...(runtimeOptions.planningProvider !== undefined ? { provider: runtimeOptions.planningProvider } : {}),
+    ...(runtimeOptions.planningModel !== undefined ? { model: runtimeOptions.planningModel } : {}),
+    ...(runtimeOptions.planningThinking !== undefined ? { thinking: runtimeOptions.planningThinking } : {}),
+  };
+  const runtimeReviewer: PiModelSource = {
+    ...(runtimeOptions.reviewerProvider !== undefined ? { provider: runtimeOptions.reviewerProvider } : {}),
+    ...(runtimeOptions.reviewerModel !== undefined ? { model: runtimeOptions.reviewerModel } : {}),
+    ...(runtimeOptions.reviewerThinking !== undefined ? { thinking: runtimeOptions.reviewerThinking } : {}),
+  };
+  const worker = resolvePiModelSource([
+    taskGeneric,
+    runtimeGeneric,
+    environmentSource(environment.FORGEDOCK_WORKER_PROVIDER, environment.FORGEDOCK_WORKER_MODEL, environment.FORGEDOCK_WORKER_THINKING),
+    environmentSource(environment.PI_PROVIDER, environment.PI_MODEL),
+  ]);
+  if (planningRole) {
+    return asResolvedPiModelPolicy(resolvePiModelSource([
+      taskPlanning,
+      runtimePlanning,
+      environmentSource(environment.FORGEDOCK_PLANNING_PROVIDER, environment.FORGEDOCK_PLANNING_MODEL, environment.FORGEDOCK_PLANNING_THINKING),
+      taskGeneric,
+      runtimeGeneric,
+      environmentSource(environment.PI_PROVIDER, environment.PI_MODEL),
+    ]));
+  }
+  if (task.role === "reviewer") {
+    return asResolvedPiModelPolicy(resolvePiModelSource([
+      // The reviewer contract is deliberately first: work-on's generic
+      // provider/model is the worker contract and must not shadow a frozen
+      // reviewer selection supplied by the controller.
+      runtimeReviewer,
+      environmentSource(environment.FORGEDOCK_REVIEWER_PROVIDER, environment.FORGEDOCK_REVIEWER_MODEL, environment.FORGEDOCK_REVIEWER_THINKING),
+      taskGeneric,
+      runtimeGeneric,
+      environmentSource(environment.PI_PROVIDER, environment.PI_MODEL),
+    ]));
+  }
+  return asResolvedPiModelPolicy(worker);
+}
+
+function environmentSource(provider: string | undefined, model: string | undefined, thinking?: string): PiModelSource {
+  const parsedThinking = configuredThinking(thinking);
   return {
-    provider: planningRole
-      ? task.modelPolicy.planningProvider ?? selected?.provider ?? task.modelPolicy.provider ?? runtimeOptions.provider ?? environment.PI_PROVIDER
-      : selected?.provider ?? task.modelPolicy.provider ?? runtimeOptions.provider ?? environment.PI_PROVIDER,
-    model: planningRole
-      ? task.modelPolicy.planningModel ?? selected?.model ?? task.modelPolicy.model ?? runtimeOptions.model ?? environment.PI_MODEL
-      : selected?.model ?? task.modelPolicy.model ?? runtimeOptions.model ?? environment.PI_MODEL,
-    thinking: planningRole
-      ? task.modelPolicy.planningThinking ?? selectedThinking ?? task.modelPolicy.thinking ?? runtimeOptions.thinking
-      : selectedThinking ?? task.modelPolicy.thinking ?? runtimeOptions.thinking,
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(parsedThinking !== undefined ? { thinking: parsedThinking } : {}),
+  };
+}
+
+function piModelSource(provider?: string, model?: string, thinking?: ThinkingLevel): PiModelSource {
+  return {
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
+  };
+}
+
+function asResolvedPiModelPolicy(source: PiModelSource): ResolvedPiModelPolicy {
+  return { provider: source.provider, model: source.model, thinking: source.thinking };
+}
+
+function resolvePiModelSource(sources: readonly PiModelSource[]): PiModelSource {
+  const selected = sources.find((source) => source.reference !== undefined
+    || source.provider !== undefined
+    || source.model !== undefined);
+  const parsed = selected ? parsePiModelSource(selected) : {};
+  const thinking = sources.find((source) => source.thinking !== undefined)?.thinking ?? parsed.thinking;
+  return {
+    ...(parsed.provider !== undefined ? { provider: parsed.provider } : {}),
+    ...(parsed.model !== undefined ? { model: parsed.model } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
+  };
+}
+
+function parsePiModelSource(source: PiModelSource): ParsedPiModelSource {
+  const reference = source.reference ?? source.model;
+  if (reference === undefined) {
+    return source.provider !== undefined ? { provider: source.provider } : {};
+  }
+  const suffix = reference.match(/:(off|minimal|low|medium|high|xhigh|max)$/)?.[1] as ThinkingLevel | undefined;
+  const value = suffix === undefined ? reference : reference.slice(0, -(suffix.length + 1));
+  const parsed = splitConfiguredModel(value);
+  if (parsed) {
+    return {
+      provider: source.provider ?? parsed.provider,
+      model: parsed.model,
+      ...(suffix !== undefined ? { thinking: suffix } : {}),
+    };
+  }
+  return {
+    ...(source.provider !== undefined ? { provider: source.provider } : {}),
+    model: value,
+    ...(suffix !== undefined ? { thinking: suffix } : {}),
   };
 }
 

@@ -12,7 +12,7 @@ import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
 import {
-  AgentExecutionBudgetExceededError,
+  isRecoverableAgentExecutionError,
   scopeDiscoveryRoots,
   scopeManifestFor,
   STANDARD_SCOPE_DISCOVERY_ROOTS,
@@ -225,7 +225,7 @@ async function continueInvestigation(
     );
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (error instanceof AgentExecutionBudgetExceededError) {
+    if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = await applyTransition(dependencies.runs, run, "RESUME_INVESTIGATION", reason);
       throw new WorkflowExecutionError(reason, checkpoint, { cause: error, recoverable: true });
     }

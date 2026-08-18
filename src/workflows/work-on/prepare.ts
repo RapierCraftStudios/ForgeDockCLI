@@ -5,8 +5,8 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import type { VerificationCommand } from "../../core/ports/verification.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import {
-  AgentExecutionBudgetExceededError,
   canonicalizeConcreteScopePaths,
+  isRecoverableAgentExecutionError,
   isConcreteScopePath,
   scopeDiscoveryRoots,
   scopeManifestFor,
@@ -146,7 +146,7 @@ export async function prepareBuildPacket(
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (error instanceof AgentExecutionBudgetExceededError) {
+    if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_PREPARATION", { reason });
       await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
       throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });

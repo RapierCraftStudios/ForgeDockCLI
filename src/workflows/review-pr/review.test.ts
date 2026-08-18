@@ -756,6 +756,41 @@ describe("fresh-context PR review", () => {
     assert.ok(progress.some(({ message }) => message.includes("fresh retry 2/2 scheduled")));
   });
 
+  it("drains an externally cancelled reviewer before releasing its operation", async () => {
+    class CancellationIgnoringRuntime extends FakeAgentRuntime {
+      started = 0;
+      releases: (() => void)[] = [];
+
+      override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        this.started += 1;
+        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef: `cancel-${this.started}`, provider: "fake", model: "cancel" });
+        return new Promise<AgentRunResult<T>>((resolve) => {
+          this.releases.push(() => resolve({ output: clean as T, sessionRef: `cancel-${this.started}`, provider: "fake", model: "cancel" }));
+        });
+      }
+    }
+
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new CancellationIgnoringRuntime();
+    const controller = new AbortController();
+    const pending = reviewPullRequest({
+      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, signal: controller.signal,
+    }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
+    for (let attempt = 0; attempt < 20 && runtime.started === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    }
+    controller.abort(new Error("operator cancelled"));
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    assert.equal(settled, false);
+    for (const release of runtime.releases) release();
+    await assert.rejects(pending, /operator cancelled/);
+  });
+
   it("accepts a successful late result after abort without overlapping a retry", async () => {
     class AbortIgnoringLateRuntime extends FakeAgentRuntime {
       abortedAttempts = 0;

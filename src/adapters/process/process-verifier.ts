@@ -221,6 +221,8 @@ function summarize(output: string, timedOut: boolean, status: "passed" | "failed
   if (status === "failed") {
     const firstFailure = lines.findIndex((line) => /^\s*not ok\s+\d+\s+-\s+/.test(line));
     if (firstFailure >= 0) return lines.slice(firstFailure, firstFailure + 16).join(" | ").slice(0, 1_500);
+    const nodeFailure = lines.findIndex((line) => /^\s*[✖✕]\s+failing tests:\s*$/i.test(line));
+    if (nodeFailure >= 0) return lines.slice(nodeFailure, nodeFailure + 16).join(" | ").slice(0, 1_500);
   }
   return lines.slice(-3).join(" | ").slice(0, 500);
 }
@@ -233,6 +235,14 @@ function extractFailureSignatures(output: string, timedOut: boolean): string[] {
     .filter((line) => /^not ok\s+\d+\s+-\s+/.test(line))
     .map((line) => line.replace(/^not ok\s+\d+\s+-\s+/, "not ok - "));
   if (signatures.length) return [...new Set(signatures)].sort();
+  const nodeLines = normalized.split(/\r?\n/);
+  const nodeFailure = nodeLines.findIndex((line) => /^\s*[✖✕]\s+failing tests:\s*$/i.test(line));
+  const nodeTestSignatures = (nodeFailure >= 0 ? nodeLines.slice(nodeFailure + 1) : [])
+    .map((line) => line.trim())
+    .map((line) => /^\s*[✖✕]\s+(.+?)(?:\s+\([\d.]+ms\))?\s*$/.exec(line)?.[1]?.trim())
+    .filter((value): value is string => value !== undefined && value.length > 0)
+    .map((value) => `node test - ${value}`);
+  if (nodeTestSignatures.length) return [...new Set(nodeTestSignatures)].sort();
   const codes = [...normalized.matchAll(/\b(?:ERR|E)[A-Z0-9_]{2,}\b/g)].map((match) => match[0]);
   return [...new Set(codes)].sort();
 }

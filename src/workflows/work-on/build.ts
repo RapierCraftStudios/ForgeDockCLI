@@ -5,7 +5,7 @@ import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { AgentExecutionBudgetExceededError, scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
+import { isRecoverableAgentExecutionError, scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
@@ -100,7 +100,7 @@ export async function buildWorkItem(
     return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (error instanceof AgentExecutionBudgetExceededError) {
+    if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_BUILD", { reason });
       await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
       throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });

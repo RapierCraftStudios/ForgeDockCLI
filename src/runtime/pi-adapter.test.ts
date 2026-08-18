@@ -5,10 +5,32 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy } from "./pi-adapter.js";
+import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
+
+test("Pi runtime readiness checks provider authentication before dispatch", async () => {
+  const authChecks: string[] = [];
+  await assert.rejects(
+    assertPiRuntimeTargetsReady({
+      getModel: () => ({}) as any,
+      checkAuth: async (provider) => { authChecks.push(provider); return undefined; },
+    }, [{ provider: "provider-a", model: "model-a" }, { provider: "provider-a", model: "model-b" }]),
+    /could not resolve authentication for provider provider-a/,
+  );
+  assert.deepEqual(authChecks, ["provider-a"]);
+});
+
+test("Pi runtime readiness validates each unique provider and selected model", async () => {
+  const authChecks: string[] = [];
+  const models = new Set(["provider-a/model-a", "provider-b/model-b"]);
+  await assertPiRuntimeTargetsReady({
+    getModel: (provider, model) => models.has(`${provider}/${model}`) ? ({}) as any : undefined,
+    checkAuth: async (provider) => { authChecks.push(provider); return { type: "api_key", source: "test" }; },
+  }, [{ provider: "provider-a", model: "model-a" }, { provider: "provider-a", model: "model-a" }, { provider: "provider-b", model: "model-b" }]);
+  assert.deepEqual(authChecks, ["provider-a", "provider-b"]);
+});
 
 async function listen(handler: (request: IncomingMessage, response: ServerResponse) => void) {
   const server = createServer(handler);
@@ -52,6 +74,82 @@ test("planning model resolution is role-specific and invocation policy wins", ()
   assert.deepEqual(resolvePiModelPolicy(taskForRole("packet-author"), {}, environment), { provider: "env", model: "planner", thinking: "high" });
   assert.deepEqual(resolvePiModelPolicy(taskForRole("builder", { provider: "worker", model: "builder" }), {}, environment), { provider: "worker", model: "builder", thinking: undefined });
   assert.deepEqual(resolvePiModelPolicy(taskForRole("reviewer", { provider: "task", model: "task" }), {}, environment), { provider: "env", model: "reviewer", thinking: undefined });
+});
+
+test("frozen role contracts outrank ambient settings without mixing provider/model sources", () => {
+  const environment = {
+    FORGEDOCK_WORKER_PROVIDER: "ambient-worker-provider",
+    FORGEDOCK_WORKER_MODEL: "ambient-worker-model",
+    FORGEDOCK_REVIEWER_PROVIDER: "ambient-reviewer-provider",
+    FORGEDOCK_REVIEWER_MODEL: "ambient-reviewer-model",
+    FORGEDOCK_PLANNING_PROVIDER: "ambient-planner-provider",
+    FORGEDOCK_PLANNING_MODEL: "ambient-planner-model",
+    PI_PROVIDER: "ambient-pi-provider",
+    PI_MODEL: "ambient-pi-model",
+  };
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("builder", { provider: "frozen-worker-provider", model: "frozen-worker-model" }), {
+    provider: "runtime-worker-provider",
+    model: "runtime-worker-model",
+  }, environment), { provider: "frozen-worker-provider", model: "frozen-worker-model", thinking: undefined });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("investigator"), {
+    planningProvider: "frozen-planner-provider",
+    planningModel: "frozen-planner-model",
+    planningThinking: "low",
+  }, environment), { provider: "frozen-planner-provider", model: "frozen-planner-model", thinking: "low" });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("reviewer", { provider: "task-worker-provider", model: "task-worker-model" }), {
+    provider: "runtime-worker-provider",
+    model: "runtime-worker-model",
+    reviewerProvider: "frozen-reviewer-provider",
+    reviewerModel: "frozen-reviewer-model",
+    reviewerThinking: "high",
+  }, environment), { provider: "frozen-reviewer-provider", model: "frozen-reviewer-model", thinking: "high" });
+  assert.deepEqual(resolvePiModelPolicy(taskForRole("builder", { provider: "frozen-provider" }), {}, {
+    PI_PROVIDER: "ambient-provider",
+    PI_MODEL: "ambient-model",
+  }), { provider: "frozen-provider", model: undefined, thinking: undefined });
+});
+
+test("reviewer execution sends the frozen reviewer contract to the nested bridge", async () => {
+  let request: Record<string, unknown> | undefined;
+  const endpoint = await listen((incoming, response) => {
+    const chunks: Buffer[] = [];
+    incoming.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    incoming.once("end", () => {
+      request = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        output: { summary: "review complete" },
+        sessionRef: "frozen-reviewer-session",
+        scopeVersion: request.scopeVersion,
+        scopeDigest: request.scopeDigest,
+      }));
+    });
+  });
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  const previousReviewerModel = process.env.FORGEDOCK_REVIEWER_MODEL;
+  process.env.FORGEDOCK_NESTED_AGENT_URL = endpoint.url;
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = "test-token";
+  process.env.FORGEDOCK_REVIEWER_MODEL = "ambient-reviewer/ambient-model";
+  const runtime = new PiAgentRuntime({
+    provider: "worker-provider",
+    model: "worker-model",
+    reviewerProvider: "frozen-reviewer-provider",
+    reviewerModel: "frozen-reviewer-model",
+    reviewerThinking: "low",
+  });
+  try {
+    await runtime.run(taskForRole("reviewer", { provider: "task-worker-provider", model: "task-worker-model" }));
+    assert.equal(request?.provider, "frozen-reviewer-provider");
+    assert.equal(request?.model, "frozen-reviewer-model");
+    assert.equal(request?.thinking, "low");
+  } finally {
+    await runtime.close();
+    restoreNestedEnvironment(previousUrl, previousToken);
+    if (previousReviewerModel === undefined) delete process.env.FORGEDOCK_REVIEWER_MODEL;
+    else process.env.FORGEDOCK_REVIEWER_MODEL = previousReviewerModel;
+    await endpoint.close();
+  }
 });
 
 test("tool-call budget reserves parallel beforeToolCall slots without overshoot", () => {
@@ -116,6 +214,26 @@ test("nested reviewer transport rejects non-loopback bridge destinations", async
     postNestedAgentRequest({ url: "http://attacker.example/v1/run", token: "test-token", body: {} }),
     /127\.0\.0\.1 \/v1\/run/,
   );
+});
+
+test("a stale nested reviewer bridge fails closed without exposing its bearer token", async () => {
+  const previousUrl = process.env.FORGEDOCK_NESTED_AGENT_URL;
+  const previousToken = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  const token = "stale-bridge-token-must-not-appear";
+  process.env.FORGEDOCK_NESTED_AGENT_URL = "http://127.0.0.1:1/v1/run";
+  process.env.FORGEDOCK_NESTED_AGENT_TOKEN = token;
+  const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
+  try {
+    await assert.rejects(runtime.run(taskForRole("reviewer") as any), (error: any) => {
+      assert.equal(error.name, "AgentRunError");
+      assert.match(error.message, /Nested reviewer transport failed/);
+      assert.doesNotMatch(error.message, /stale-bridge-token|authorization|Bearer/i);
+      return true;
+    });
+  } finally {
+    await runtime.close();
+    restoreNestedEnvironment(previousUrl, previousToken);
+  }
 });
 
 test("nested reviewer transport bounds response buffering", async () => {

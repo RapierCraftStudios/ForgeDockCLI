@@ -314,6 +314,52 @@ export class AgentRunError extends Error {
   }
 }
 
+/** Operational interruption, distinct from a provider/semantic failure. */
+export class AgentExecutionInterruptedError extends AgentRunError {
+  readonly interrupted = true as const;
+  readonly reason: "semantic-idle" | "cancelled" | "process-tree";
+  readonly idleMs: number | undefined;
+  readonly lastProgressAt: number | undefined;
+  readonly drainExpired: boolean;
+  readonly drainMs: number | undefined;
+
+  constructor(
+    message: string,
+    options: {
+      reason: "semantic-idle" | "cancelled" | "process-tree";
+      idleMs?: number;
+      lastProgressAt?: number;
+      drainExpired?: boolean;
+      drainMs?: number;
+      sessionRef?: string;
+      resumable?: boolean;
+      cause?: unknown;
+      execution?: AgentExecutionUsage;
+    },
+  ) {
+    super(message, {
+      ...(options.sessionRef !== undefined ? { sessionRef: options.sessionRef } : {}),
+      resumable: options.resumable === true,
+      ...(options.cause !== undefined ? { cause: options.cause } : {}),
+      ...(options.execution !== undefined ? { execution: options.execution } : {}),
+    });
+    this.name = "AgentExecutionInterruptedError";
+    this.reason = options.reason;
+    this.idleMs = options.idleMs;
+    this.lastProgressAt = options.lastProgressAt;
+    this.drainExpired = options.drainExpired === true;
+    this.drainMs = options.drainMs;
+  }
+}
+
+/** Alias for callers that describe the interruption as a liveness failure. */
+export class AgentExecutionLivenessError extends AgentExecutionInterruptedError {
+  constructor(message: string, options: ConstructorParameters<typeof AgentExecutionInterruptedError>[1]) {
+    super(message, options);
+    this.name = "AgentExecutionLivenessError";
+  }
+}
+
 /** A bounded provider session stopped before producing its typed artifact. */
 export class AgentExecutionBudgetExceededError extends AgentRunError {
   constructor(
@@ -330,6 +376,11 @@ export class AgentExecutionBudgetExceededError extends AgentRunError {
     });
     this.name = "AgentExecutionBudgetExceededError";
   }
+}
+
+export function isRecoverableAgentExecutionError(error: unknown): boolean {
+  return error instanceof AgentExecutionBudgetExceededError
+    || error instanceof AgentExecutionInterruptedError;
 }
 
 export type AgentEventSink = (event: AgentEvent) => void;
@@ -392,6 +443,8 @@ export interface AgentRuntime {
   run<T>(task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>>;
   /** Resume one explicitly identified persisted session; runtimes without this seam report resumableSessions=false. */
   resume?<T>(sessionRef: string, task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>>;
+  /** Interrupt one owned task without closing unrelated provider sessions. */
+  interrupt?(taskId: string, reason?: unknown): void | Promise<void>;
   close(): Promise<void>;
 }
 
@@ -424,6 +477,10 @@ export class BudgetedAgentRuntime implements AgentRuntime {
     const result = await this.inner.resume(sessionRef, task, options);
     this.record(result, task.id);
     return result;
+  }
+
+  interrupt(taskId: string, reason?: unknown): void | Promise<void> {
+    return this.inner.interrupt?.(taskId, reason);
   }
 
   close(): Promise<void> { return this.inner.close(); }
@@ -512,6 +569,10 @@ export class TelemetryAgentRuntime implements AgentRuntime {
       await this.record(failureReceipt(task, startedAt, error, sessionRef));
       throw error;
     }
+  }
+
+  interrupt(taskId: string, reason?: unknown): void | Promise<void> {
+    return this.inner.interrupt?.(taskId, reason);
   }
 
   close(): Promise<void> { return this.inner.close(); }

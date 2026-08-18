@@ -162,7 +162,13 @@ export default function forgedockExtension(
     }
     harnessMode = "assistant";
     activeWorkflow = undefined;
-    backgroundTasks.initialize(ctx);
+    // Startup is presentation-only. initialize() may adopt a live controller
+    // or terminalize a bridge-bound task, so operational recovery is deferred
+    // until an authorized controller dispatch. Keep the restart warning
+    // visible through a read-only task-directory inspection.
+    for (const record of backgroundTasks.pendingRestartRecords(ctx)) {
+      backgroundTasks.announceRestartRequired(record);
+    }
     deactivateWorkflowTools(pi);
     activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, DEEP_PLAN_TOOL, WORKFLOW_TOOLS.status, ORCHESTRATION_RESUME_TOOL]);
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
@@ -248,8 +254,11 @@ export default function forgedockExtension(
 
   pi.on("session_shutdown", async () => {
     // Native controller processes own durable work. Ordinary terminal/session
-    // teardown detaches them so the next supervisor can reconcile or resume;
-    // explicit forgedock_tasks cancellation remains destructive.
+    // teardown detaches them; the next supervisor adopts only tasks whose
+    // transport is reconnectable. Controllers bound to the in-memory nested
+    // reviewer bridge are durably blocked on restart and must resume from the
+    // workflow checkpoint. Explicit forgedock_tasks cancellation remains
+    // destructive.
     await backgroundTasks.shutdown({ cancel: false });
     backgroundTasks.setObservationSink(undefined);
     await observer?.flush();
