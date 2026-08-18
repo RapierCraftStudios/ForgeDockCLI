@@ -204,7 +204,14 @@ export interface PullRequestMergeGate {
 
 /** Normalize legacy test doubles and pre-status checkpoints to the typed state. */
 export function pullRequestMergeability(gate: Pick<PullRequestMergeGate, "mergeable" | "mergeability">): PullRequestMergeability {
-  return gate.mergeability ?? (gate.mergeable ? "mergeable" : "conflicting");
+  if (gate.mergeability === undefined) return gate.mergeable ? "mergeable" : "conflicting";
+  if (![
+    "mergeable", "conflicting", "unknown", "unavailable",
+  ].includes(gate.mergeability)) return "unavailable";
+  // The boolean is retained for compatibility, but a contradictory typed
+  // projection is malformed evidence and must never authorize a merge.
+  if ((gate.mergeability === "mergeable") !== gate.mergeable) return "unavailable";
+  return gate.mergeability;
 }
 
 export interface PullRequestCheckDiagnostic { name: string; state: PullRequestMergeGate["requiredChecks"][number]["state"]; detailsUrl?: string; logExcerpt: string; }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestMergeability, type PullRequestMergeGateOptions, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryPromotionRepository, type PromotionRecord } from "../../core/ports/promotion.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -21,6 +21,9 @@ class PromotionHost implements ForgeHost {
   merged = false;
   stagingIsSource = false;
   requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
+  mergeabilitySequence: PullRequestMergeability[] = ["mergeable"];
+  mergeGateReads = 0;
+  mergeGateOptions: PullRequestMergeGateOptions[] = [];
   pullRequest: PullRequestSnapshot | undefined;
   async getBranchHead(_repo: string, branch: string): Promise<string> {
     return branch === "milestone/feature" || (branch === "staging" && this.stagingIsSource) ? this.sourceSha : this.targetSha;
@@ -43,13 +46,19 @@ class PromotionHost implements ForgeHost {
     if (!this.pullRequest) throw new Error("missing promotion PR");
     return { ...this.pullRequest, state: this.merged ? "MERGED" : "OPEN" };
   }
-  async getPullRequestMergeGate() {
+  async getPullRequestMergeGate(_repo: string, _number: number, _headSha: string, _baseBranch: string, options?: PullRequestMergeGateOptions) {
+    this.mergeGateOptions.push(options ?? {});
+    let mergeability: PullRequestMergeability = "unavailable";
+    do {
+      mergeability = this.mergeabilitySequence[Math.min(this.mergeGateReads++, this.mergeabilitySequence.length - 1)] ?? "unavailable";
+    } while (options?.refreshUnknown === true && mergeability === "unknown" && this.mergeGateReads < this.mergeabilitySequence.length);
     return {
       repo: "a/b",
       pullRequest: this.pullRequest?.number ?? 7,
       headSha: this.sourceSha,
       baseBranch: this.pullRequest?.baseBranch ?? "staging",
-      mergeable: true,
+      mergeable: mergeability === "mergeable",
+      mergeability,
       requiredChecks: [...this.requiredChecks],
       observedAt: new Date().toISOString(),
     };
@@ -127,6 +136,27 @@ describe("explicit branch promotion", () => {
     assert.equal(result.review?.disposition, "approve");
     assert.equal(result.pullRequest?.headSha, sourceSha);
     assert.equal(host.merged, true);
+  });
+
+  it("refreshes transient UNKNOWN mergeability before authorized promotion merge", async () => {
+    const host = new PromotionHost();
+    host.mergeabilitySequence = ["unknown", "unknown", "mergeable"];
+    const deps = dependencies(host);
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+    }, deps);
+    assert.equal(result.phase, "completed");
+    assert.equal(host.merged, true);
+    assert.equal(host.mergeGateReads, 3);
+    assert.deepEqual(host.mergeGateOptions.map((options) => options.refreshUnknown), [true]);
+  });
+
+  it("fails closed on malformed mergeability projections", () => {
+    assert.equal(pullRequestMergeability({ mergeable: false, mergeability: "bogus" as PullRequestMergeability }), "unavailable");
+    assert.equal(pullRequestMergeability({ mergeable: false, mergeability: "mergeable" }), "unavailable");
+    assert.equal(pullRequestMergeability({ mergeable: true, mergeability: "conflicting" }), "unavailable");
   });
 
   it("resumes the exact frozen verification command plan", async () => {
