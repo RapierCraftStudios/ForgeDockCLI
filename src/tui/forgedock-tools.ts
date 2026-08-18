@@ -2835,6 +2835,14 @@ export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: stri
     ].join("\n");
   }
   if (command === "orchestrate") {
+    const resumeOrchestrationId = explicitOrchestrationResumeId(rawArgs);
+    if (resumeOrchestrationId) {
+      return [
+        `The user explicitly selected durable orchestration ${resumeOrchestrationId} for resume.`,
+        `Call ${ORCHESTRATION_RESUME_TOOL} exactly once with orchestrationId="${resumeOrchestrationId}" and no rerun, adjudication, or conflict-recovery overrides.`,
+        "Do not perform repository, filesystem, issue, or GitHub discovery; durable controller state is authoritative. Do not call forgedock_orchestrate and do not invoke a lifecycle CLI through bash/shell.",
+      ].join("\n");
+    }
     return [
       `The user invoked /orchestrate ${rawArgs}`.trim(),
       "Every /orchestrate invocation must go through your natural-language intent routing. Do not require an exact slash syntax, exact milestone title, or bare issue-number list before interpreting the request.",
@@ -2861,6 +2869,10 @@ export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: stri
     return `The user invoked /promote ${rawArgs}. Resolve explicit source/target route evidence from typed configuration and GitHub reads, then call ${tool} exactly once. Preview is mutation-free; only pass confirm when the user explicitly authorized PR creation, and only pass authorizeMerge when the user explicitly authorized merging the exact reviewed SHA. Use promotionId to resume or cancel a durable checkpoint. Never invoke the lifecycle CLI through bash/shell or add a wall-clock timeout.`;
   }
   return `The user invoked /forgedock-status ${rawArgs}. Call ${tool} exactly once with the requested status filters.`;
+}
+
+export function explicitOrchestrationResumeId(rawArgs: string): string | undefined {
+  return /^resume(?:\s+orchestration)?\s+(dag_[A-Za-z0-9][A-Za-z0-9_-]*)\s*$/i.exec(rawArgs.trim())?.[1];
 }
 
 function buildVisibleOrchestrationPlan(

@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Explicit `/orchestrate resume <dag_id>` requests now expose and call only the durable orchestration-resume tool instead of entering fresh issue discovery and contradicting the requested recovery action.
 - Bounded verification tools now emit semantic progress while their approved subprocess is still active, preventing the generic 120-second idle watchdog from cancelling legitimate long-running test suites while preserving command timeouts and fail-closed stalled-runner detection.
 - Nested reviewer progress now crosses the authenticated terminal bridge into controller semantic-idle accounting, preventing actively reading or reasoning review shards from being cancelled after 120 seconds of falsely observed silence while retaining bounded interruption for truly inactive sessions.
 - Retained conflict-recovery merges now survive a controller restart with the immutable delivery baseline by proving the prior merge checkpoint is a descendant of that baseline and an ancestor of the current target, instead of incorrectly requiring the baseline and checkpoint SHAs to be identical.

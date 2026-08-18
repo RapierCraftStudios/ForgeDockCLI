@@ -1899,6 +1899,22 @@ test("native orchestrate prompts always perform LLM intent routing", () => {
   assert.doesNotMatch(prompt, /No deterministic orchestration binding|invoke \/orchestrate again with exact/);
 });
 
+test("explicit orchestration resume routes directly to the durable resume tool", async () => {
+  const orchestrationId = "dag_cd83f20b-7670-4be3-984c-63f20a77a72f";
+  const prompt = buildNativeCommandPrompt("orchestrate", `resume ${orchestrationId}`);
+  assert.match(prompt, new RegExp(`Call forgedock_resume_orchestration exactly once with orchestrationId="${orchestrationId}"`));
+  assert.match(prompt, /Do not perform repository, filesystem, issue, or GitHub discovery/);
+  assert.doesNotMatch(prompt, /natural-language intent routing|GitHub tools to resolve/);
+  assert.match(prompt, /Do not call forgedock_orchestrate/);
+
+  const state = fakePi();
+  forgedockExtension(state.pi);
+  await state.commands.get("orchestrate")?.(`resume ${orchestrationId}`, commandContext());
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_resume_orchestration"]);
+  assert.match(state.sent.at(-1)?.content ?? "", /durable controller state is authoritative/);
+  assert.doesNotThrow(() => bindOrchestrationInvocation(state.pi, { rawArgs: "another fresh request" }));
+});
+
 test("typed orchestration derives bounded authoritative plan metadata", () => {
   const body = [
     "**Source:** PR #186 — staging review",

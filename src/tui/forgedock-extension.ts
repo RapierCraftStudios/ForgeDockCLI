@@ -26,6 +26,7 @@ import {
   clearOrchestrationInvocation,
   controlSubagentRun,
   deactivateWorkflowTools,
+  explicitOrchestrationResumeId,
   inspectSubagentRuntime,
   isDeepPlanActive,
   registerForgeDockTools,
@@ -431,7 +432,7 @@ function registerWorkflow(
       if (workflow !== "orchestrate" && workflow !== "deep-plan" && !await confirmWorkflow(workflow, normalized, ctx)) return;
       if (workflow === "deep-plan") requestDeepPlanMode();
       activateWorkflow();
-      if (workflow === "orchestrate") {
+      if (workflow === "orchestrate" && !explicitOrchestrationResumeId(normalized)) {
         bindOrchestrationInvocation(pi, { rawArgs: normalized });
       }
       try {
@@ -451,7 +452,10 @@ async function queueNativeWorkflow(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
-  activateOnly(pi, command === "orchestrate" ? [tool, HUMAN_DECISION_TOOL] : [tool]);
+  const resumeOrchestrationId = command === "orchestrate" ? explicitOrchestrationResumeId(rawArgs) : undefined;
+  activateOnly(pi, command === "orchestrate"
+    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [tool, HUMAN_DECISION_TOOL]
+    : [tool]);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs);
   // Slash-command dispatch itself occupies Pi's prompt pipeline, so deliverAs
