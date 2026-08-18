@@ -32,8 +32,8 @@ function formatLsResult(result, options, theme, showImages, isError = false) {
     if (output) {
         const lines = output.split("\n");
         if (!options.expanded && !isError) {
-            const count = lines.filter((line) => line.trim()).length;
-            text += `\n${theme.fg("muted", `↳ ${count} ${count === 1 ? "entry" : "entries"} ·`)} ${keyHint("app.tools.expand", "to preview")}`;
+            const count = result.details?.entryCount;
+            if (typeof count === "number") text += `\n${theme.fg("muted", `↳ ${count} ${count === 1 ? "entry" : "entries"} ·`)} ${keyHint("app.tools.expand", "to preview")}`;
         }
         else {
             const maxLines = options.expanded ? lines.length : 20;
@@ -122,14 +122,14 @@ export function createLsToolDefinition(cwd, options) {
                         }
                         signal?.removeEventListener("abort", onAbort);
                         if (results.length === 0) {
-                            resolve({ content: [{ type: "text", text: "(empty directory)" }], details: undefined });
+                            resolve({ content: [{ type: "text", text: "(empty directory)" }], details: { entryCount: 0 } });
                             return;
                         }
                         const rawOutput = results.join("\n");
                         // Apply byte truncation. There is no separate line limit because entry count is already capped.
                         const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
                         let output = truncation.content;
-                        const details = {};
+                        const details = { entryCount: results.length };
                         // Build actionable notices for truncation and entry limits.
                         const notices = [];
                         if (entryLimitReached) {
