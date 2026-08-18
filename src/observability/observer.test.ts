@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
-import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
+import { BackgroundTaskObservationAdapter, ControllerObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, normalizeObservationDraft, redactObservationValue, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -18,6 +18,65 @@ const producer = createObservationProducer("observer-test", 1);
 function observerWithStore(store = new SqliteObservationStore(":memory:")): ForgeDockObserver {
   return new ForgeDockObserver({ store, producer });
 }
+
+test("credential assignments are redacted in nested payloads and output text", () => {
+  const input = "token=[REDACTED] password=secret --api-key=second 'client_secret':'third'";
+  const normalized = normalizeObservationDraft({
+    producer,
+    source: "agent",
+    channel: "activity",
+    kind: "output.delta",
+    payload: { nested: input },
+    output: { channel: "stdout", text: input, chunkSequence: 7 },
+  });
+  assert.deepEqual(normalized.payload, { nested: "token=[REDACTED] password=[REDACTED] --api-key=[REDACTED] 'client_secret':'[REDACTED]'" });
+  assert.equal(normalized.output?.text, "token=[REDACTED] password=[REDACTED] --api-key=[REDACTED] 'client_secret':'[REDACTED]'");
+  assert.equal(normalized.security?.redacted, true);
+  assert.doesNotMatch(JSON.stringify(normalized), /(?<!client_)secret|second|third/);
+});
+
+test("redaction preserves safe marker variants and masks marker suffixes and URL userinfo", () => {
+  const safe = ["[REDACTED]", "[REDACTED_1]", "[REDACTED-TOKEN]", "[REDACTED:2]"].map((marker) => `password=${marker}`).join(" ");
+  const safeResult = redactObservationValue(safe);
+  assert.equal(safeResult.value, safe);
+  assert.equal(safeResult.redacted, false);
+  const unsafe = redactObservationValue("password=[REDACTED]suffix https://user:secret@example.test next=ok");
+  assert.equal(unsafe.value, "password=[REDACTED] https://[REDACTED]@example.test next=ok");
+  assert.equal(unsafe.redacted, true);
+});
+
+test("marker boundaries keep safe delimiters and do not skip following assignments", () => {
+  const cases = [
+    ["token=[REDACTED] password=secret", "token=[REDACTED] password=[REDACTED]"],
+    ["--password [REDACTED] --token secret", "--password [REDACTED] --token [REDACTED]"],
+    ["{\"password\":\"[REDACTED]\",\"token\":\"secret\"}", "{\"password\":\"[REDACTED]\",\"token\":\"[REDACTED]\"}"],
+    ["password=[REDACTED];token=secret", "password=[REDACTED];token=[REDACTED]"],
+  ] as const;
+  for (const [input, expected] of cases) {
+    const result = redactObservationValue(input);
+    assert.equal(result.value, expected);
+    assert.equal(result.redacted, true);
+    assert.doesNotMatch(String(result.value), /secret/);
+  }
+
+  const safe = redactObservationValue("password=[REDACTED]&next=ok");
+  assert.equal(safe.value, "password=[REDACTED]&next=ok");
+  assert.equal(safe.redacted, false);
+});
+
+test("controller adapter output uses the central assignment redaction boundary", async () => {
+  const observer = observerWithStore();
+  const adapter = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller-marker" }, producer });
+  adapter.output("stdout", "token=[REDACTED] password=controller-secret");
+  adapter.completed(0);
+  await observer.flush();
+  const events = await observer.query({ forgeRunId: "run-controller-marker" });
+  const output = events.find((event) => event.output);
+  assert.equal(output?.output?.text, "token=[REDACTED] password=[REDACTED]");
+  assert.doesNotMatch(JSON.stringify(events), /controller-secret/);
+  assert.equal(events.find((event) => event.kind === "controller.completed")?.severity, "info");
+  observer.close();
+});
 
 test("journal assigns per-run sequences, preserves channels, and redacts sensitive payloads", async () => {
   const observer = observerWithStore();
@@ -44,6 +103,35 @@ test("journal assigns per-run sequences, preserves channels, and redacts sensiti
   assert.deepEqual((events[0]?.payload as { token?: string }).token, "[REDACTED]");
   assert.equal(events[1]?.output?.channel, "stderr");
   assert.equal(events[1]?.output?.text, "warning");
+  observer.close();
+});
+
+test("observer and SQLite persist marker-following assignments only in redacted form", async () => {
+  const store = new SqliteObservationStore(":memory:");
+  const observer = observerWithStore(store);
+  const draft: ObservationDraft = {
+    producer,
+    identity: { forgeRunId: "run-marker", controllerTaskId: "controller-marker" },
+    source: "controller",
+    channel: "stdout",
+    kind: "output.stdout",
+    payload: { command: "token=[REDACTED] password=sqlite-secret" },
+    output: { channel: "stdout", text: "token=[REDACTED] password=sqlite-secret", chunkSequence: 12 },
+  };
+  const once = normalizeObservationDraft(draft);
+  const twice = normalizeObservationDraft(once);
+  assert.deepEqual(twice, once);
+  await observer.emit(draft);
+  await observer.flush();
+  const events = await store.query({ forgeRunId: "run-marker" });
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.security.redacted, true);
+  assert.equal(events[0]?.identity.controllerTaskId, "controller-marker");
+  assert.equal(events[0]?.output?.channel, "stdout");
+  assert.equal(events[0]?.output?.chunkSequence, 12);
+  assert.doesNotMatch(JSON.stringify(events), /sqlite-secret/);
+  assert.equal((events[0]?.payload as { command?: string }).command, "token=[REDACTED] password=[REDACTED]");
+  assert.equal(events[0]?.output?.text, "token=[REDACTED] password=[REDACTED]");
   observer.close();
 });
 

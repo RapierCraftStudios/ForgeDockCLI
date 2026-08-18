@@ -379,14 +379,16 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
 
   if (typeof value === "string") {
     const sanitized = sanitizeTerminalText(value);
-    const masked = redactStreamingSecrets(sanitized);
-    if (masked !== sanitized || SENSITIVE_VALUE.test(sanitized)) {
+    const assignmentMask = maskCredentialAssignments(sanitized);
+    const masked = redactStreamingSecrets(assignmentMask.value);
+    if (masked !== assignmentMask.value || SENSITIVE_VALUE.test(sanitized)) {
       return { value: "[REDACTED]", redacted: true, originalBytes, outputBytes: 11, truncated: false };
     }
     const terminalSequencesRemoved = sanitized !== value;
-    const bytes = Buffer.byteLength(sanitized, "utf8");
-    if (bytes <= maxStringBytes) return { value: sanitized, redacted: terminalSequencesRemoved, originalBytes, outputBytes: bytes, truncated: false };
-    const clipped = clipUtf8(sanitized, maxStringBytes);
+    const redacted = terminalSequencesRemoved || assignmentMask.redacted;
+    const bytes = Buffer.byteLength(assignmentMask.value, "utf8");
+    if (bytes <= maxStringBytes) return { value: assignmentMask.value, redacted, originalBytes, outputBytes: bytes, truncated: false };
+    const clipped = clipUtf8(assignmentMask.value, maxStringBytes);
     return {
       value: `${clipped}… [truncated]`,
       redacted: true,
@@ -472,6 +474,112 @@ export function sanitizeTerminalText(value: string): string {
     .replace(/\u001B(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])/g, "")
     // Preserve newline, carriage return, and tab while removing other C0 controls.
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function maskCredentialAssignments(value: string): { value: string; redacted: boolean } {
+  let result = maskUrlUserinfo(value);
+  result = maskDelimitedAssignments(result);
+  result = maskCommandLineAssignments(result);
+  return { value: result, redacted: result !== value };
+}
+
+function maskUrlUserinfo(value: string): string {
+  return value.replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi, (match, scheme: string, userinfo: string) => {
+    if (isCompleteRedactionMarker(userinfo)) return match;
+    return `${scheme}[REDACTED]@`;
+  });
+}
+
+function maskDelimitedAssignments(value: string): string {
+  const assignment = /(^|[^\w-])((?:["']?)(?:--)?[A-Za-z][A-Za-z0-9_.-]*(?:["']?))\s*([:=])\s*/g;
+  return maskAssignmentMatches(value, assignment, (match) => {
+    const rawKey = match[2];
+    if (!rawKey) return undefined;
+    const key = rawKey.replace(/["']/g, "").replace(/^-+/, "");
+    return SENSITIVE_KEY.test(key) ? match.index + match[0].length : undefined;
+  });
+}
+
+function maskCommandLineAssignments(value: string): string {
+  const commandLine = /(^|[^\w-])(--[A-Za-z][A-Za-z0-9_.-]*)[ \t]+/g;
+  return maskAssignmentMatches(value, commandLine, (match) => {
+    const rawKey = match[2];
+    if (!rawKey || !SENSITIVE_KEY.test(rawKey.slice(2))) return undefined;
+    return match.index + match[0].length;
+  });
+}
+
+/**
+ * Replace sensitive assignment values while scanning the original string.
+ * In particular, a preserved marker ends at the delimiter, not after it; the
+ * delimiter must remain available for the next assignment match.
+ */
+function maskAssignmentMatches(
+  value: string,
+  assignment: RegExp,
+  valueStartFor: (match: RegExpExecArray) => number | undefined,
+): string {
+  let output = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = assignment.exec(value)) !== null) {
+    const valueStart = valueStartFor(match);
+    if (valueStart === undefined) continue;
+    const masked = maskCredentialValue(value, valueStart);
+    output += value.slice(cursor, valueStart);
+    output += masked.replacement;
+    cursor = masked.end;
+    // Resume at the value's end, including a preserved marker's delimiter.
+    assignment.lastIndex = masked.end;
+  }
+  return output + value.slice(cursor);
+}
+
+function maskCredentialValue(value: string, start: number): { end: number; replacement: string } {
+  const opening = value[start];
+  if (opening === "\"" || opening === "'") {
+    let escaped = false;
+    for (let index = start + 1; index < value.length; index += 1) {
+      const character = value[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (character !== opening) continue;
+      const raw = value.slice(start + 1, index);
+      return isCompleteRedactionMarker(raw)
+        ? { end: index + 1, replacement: value.slice(start, index + 1) }
+        : { end: index + 1, replacement: `${opening}[REDACTED]${opening}` };
+    }
+    return { end: value.length, replacement: `${opening}[REDACTED]` };
+  }
+
+  let end = start;
+  while (end < value.length) {
+    // A marker's closing bracket is part of the value, not its delimiter.
+    if (value[start] === "[" && value[end] === "]") {
+      end += 1;
+      continue;
+    }
+    if (isCredentialValueDelimiter(value[end]!)) break;
+    end += 1;
+  }
+  const raw = value.slice(start, end);
+  return raw && isCompleteRedactionMarker(raw)
+    ? { end, replacement: raw }
+    : { end, replacement: raw ? "[REDACTED]" : "" };
+}
+
+function isCredentialValueDelimiter(character: string): boolean {
+  return /[\s,;})\]&]/.test(character);
+}
+
+function isCompleteRedactionMarker(value: string): boolean {
+  return /^\[REDACTED(?:[A-Za-z0-9 _:#.-]*)?\]$/i.test(value);
 }
 
 function enforcePayloadLimit(value: RedactedValue, maxBytes: number): RedactedValue {
