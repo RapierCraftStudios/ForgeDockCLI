@@ -77,10 +77,10 @@ test("semantic idle resets on useful progress and has no total-run deadline", ()
   const watchdog = new SemanticIdleWatchdog({ idleMs: 10, clock, onIdle: (lastProgressAt) => { idleAt = lastProgressAt; } });
 
   clock.advance(5);
-  watchdog.markProgress({ type: "session.started", taskId: task.id, sessionRef: "s", provider: "fake", model: "test" });
+  watchdog.markProgress({ type: "session.started", logicalStreamId: "stream-watchdog", taskId: task.id, sessionRef: "s", provider: "fake", model: "test" });
   clock.advance(4);
   assert.equal(idleAt, undefined);
-  watchdog.markProgress({ type: "text.delta", taskId: task.id, text: "still working" });
+  watchdog.markProgress({ type: "text.delta", logicalStreamId: "stream-watchdog", taskId: task.id, text: "still working" });
   clock.advance(9);
   assert.equal(idleAt, undefined);
   clock.advance(1);
@@ -94,7 +94,7 @@ test("relayed nested-session progress resets semantic idle", () => {
   const watchdog = new SemanticIdleWatchdog({ idleMs: 10, clock, onIdle: (lastProgressAt) => { idleAt = lastProgressAt; } });
 
   clock.advance(9);
-  watchdog.markProgress({ type: "session.progress", taskId: task.id, sessionRef: "nested", });
+  watchdog.markProgress({ type: "session.progress", logicalStreamId: "stream-watchdog", taskId: task.id, sessionRef: "nested", });
   clock.advance(9);
   assert.equal(idleAt, undefined);
   clock.advance(1);
@@ -110,7 +110,7 @@ test("frozen provider is interrupted, cleaned up, and retried exactly once", asy
     capabilities: async () => capabilities,
     async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
       runCalls += 1;
-      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: `session-${runCalls}`, provider: "fake", model: "test" });
+      options.onEvent?.({ type: "session.started", logicalStreamId: `stream-attempt-${runCalls}`, taskId: suppliedTask.id, sessionRef: `session-${runCalls}`, provider: "fake", model: "test" });
       return new Promise<AgentRunResult<T>>((_, reject) => {
         options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
       });
@@ -141,7 +141,7 @@ test("periodic semantic progress survives repeated idle windows", async () => {
     capabilities: async () => capabilities,
     async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
       emit = options.onEvent;
-      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: "live", provider: "fake", model: "test" });
+      options.onEvent?.({ type: "session.started", logicalStreamId: "stream-live", taskId: suppliedTask.id, sessionRef: "live", provider: "fake", model: "test" });
       return new Promise<AgentRunResult<T>>((resolve) => {
         finish = () => resolve({ output: { ok: true } as T, sessionRef: "live", provider: "fake", model: "test" });
       });
@@ -154,7 +154,7 @@ test("periodic semantic progress survives repeated idle windows", async () => {
   await flush();
   for (let index = 0; index < 6; index += 1) {
     clock.advance(9);
-    emit?.({ type: "tool.completed", taskId: task.id, toolCallId: `tool-${index}`, tool: "read", isError: false });
+    emit?.({ type: "tool.completed", logicalStreamId: "stream-live", taskId: task.id, toolCallId: `tool-${index}`, tool: "read", isError: false });
   }
   finish();
   const result = await pending;
@@ -170,8 +170,8 @@ test("in-flight bounded verification heartbeat survives the generic idle window"
     capabilities: async () => capabilities,
     async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
       emit = options.onEvent;
-      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: "verify-live", provider: "fake", model: "test" });
-      options.onEvent?.({ type: "tool.started", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
+      options.onEvent?.({ type: "session.started", logicalStreamId: "stream-verify-live", taskId: suppliedTask.id, sessionRef: "verify-live", provider: "fake", model: "test" });
+      options.onEvent?.({ type: "tool.started", logicalStreamId: "stream-verify-live", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
       return new Promise<AgentRunResult<T>>((resolve) => {
         finish = () => resolve({ output: { ok: true } as T, sessionRef: "verify-live", provider: "fake", model: "test" });
       });
@@ -184,7 +184,7 @@ test("in-flight bounded verification heartbeat survives the generic idle window"
   await flush();
   for (let index = 0; index < 20; index += 1) {
     clock.advance(9);
-    emit?.({ type: "tool.progress", taskId: task.id, toolCallId: "verify-1", tool: "verify", elapsedMs: (index + 1) * 9, timeoutMs: 300 });
+    emit?.({ type: "tool.progress", logicalStreamId: "stream-verify-live", taskId: task.id, toolCallId: "verify-1", tool: "verify", elapsedMs: (index + 1) * 9, timeoutMs: 300 });
   }
   assert.equal(interruptCalls, 0);
   finish();
@@ -198,8 +198,8 @@ test("a verify call without heartbeats still reaches the generic fail-closed bou
   const inner: AgentRuntime = {
     capabilities: async () => capabilities,
     async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
-      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: "verify-hung", provider: "fake", model: "test" });
-      options.onEvent?.({ type: "tool.started", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
+      options.onEvent?.({ type: "session.started", logicalStreamId: "stream-verify-hung", taskId: suppliedTask.id, sessionRef: "verify-hung", provider: "fake", model: "test" });
+      options.onEvent?.({ type: "tool.started", logicalStreamId: "stream-verify-hung", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
       return new Promise<AgentRunResult<T>>((_, reject) => {
         options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
       });

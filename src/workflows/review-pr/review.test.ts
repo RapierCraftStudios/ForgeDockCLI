@@ -764,7 +764,7 @@ describe("fresh-context PR review", () => {
       override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
         this.tasks.push(task as AgentTask<unknown>);
         this.started += 1;
-        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef: `cancel-${this.started}`, provider: "fake", model: "cancel" });
+        options.onEvent?.({ type: "session.started", logicalStreamId: `stream-cancel-${this.started}`, taskId: task.id, sessionRef: `cancel-${this.started}`, provider: "fake", model: "cancel" });
         return new Promise<AgentRunResult<T>>((resolve) => {
           this.releases.push(() => resolve({ output: clean as T, sessionRef: `cancel-${this.started}`, provider: "fake", model: "cancel" }));
         });
@@ -798,11 +798,11 @@ describe("fresh-context PR review", () => {
       override async run<T>(task: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
         this.tasks.push(task as AgentTask<unknown>);
         const sessionRef = `late-session-${this.tasks.length}`;
-        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late" });
+        options.onEvent?.({ type: "session.started", logicalStreamId: `stream-late-${this.tasks.length}`, taskId: task.id, sessionRef, provider: "fake", model: "late" });
         await new Promise<void>((resolve) => setTimeout(resolve, 35));
         if (options.signal?.aborted) this.abortedAttempts++;
-        options.onEvent?.({ type: "artifact.submitted", taskId: task.id });
-        options.onEvent?.({ type: "session.completed", taskId: task.id, sessionRef });
+        options.onEvent?.({ type: "artifact.submitted", logicalStreamId: `stream-late-${this.tasks.length}`, taskId: task.id });
+        options.onEvent?.({ type: "session.completed", logicalStreamId: `stream-late-${this.tasks.length}`, taskId: task.id, sessionRef });
         return { output: clean as T, sessionRef, provider: "fake", model: "late" };
       }
     }
@@ -843,7 +843,7 @@ describe("fresh-context PR review", () => {
         const attempt = (this.attempts.get(task.id) ?? 0) + 1;
         this.attempts.set(task.id, attempt);
         const sessionRef = `terminal-${task.id}-${attempt}`;
-        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "terminal" });
+        options.onEvent?.({ type: "session.started", logicalStreamId: `stream-terminal-${attempt}`, taskId: task.id, sessionRef, provider: "fake", model: "terminal" });
         if (attempt === 1) {
           await new Promise<void>((resolve) => setTimeout(resolve, 20));
           throw new AgentRunError("provider rejected the session as terminal", { sessionRef, resumable: false });
@@ -882,10 +882,10 @@ describe("fresh-context PR review", () => {
         // The provider ignores abort and does not reveal its session identity
         // until after timeout + the 100ms minimum drain have both elapsed.
         await new Promise<void>((resolve) => setTimeout(resolve, 125));
-        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "post-drain" });
+        options.onEvent?.({ type: "session.started", logicalStreamId: `stream-post-drain-${this.tasks.length}`, taskId: task.id, sessionRef, provider: "fake", model: "post-drain" });
         await new Promise<void>((resolve) => setTimeout(resolve, 20));
-        options.onEvent?.({ type: "artifact.submitted", taskId: task.id });
-        options.onEvent?.({ type: "session.completed", taskId: task.id, sessionRef });
+        options.onEvent?.({ type: "artifact.submitted", logicalStreamId: `stream-post-drain-${this.tasks.length}`, taskId: task.id });
+        options.onEvent?.({ type: "session.completed", logicalStreamId: `stream-post-drain-${this.tasks.length}`, taskId: task.id, sessionRef });
         this.returned++;
         if (this.returned === 2) this.resolveAllReturned();
         return { output: clean as T, sessionRef, provider: "fake", model: "post-drain" };
@@ -949,14 +949,14 @@ describe("fresh-context PR review", () => {
         if (task.role !== "adjudicator") {
           this.reviewerCalls++;
           const sessionRef = `reviewer-${this.reviewerCalls}`;
-          options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
+          options.onEvent?.({ type: "session.started", logicalStreamId: `stream-reviewer-${this.reviewerCalls}`, taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
           const output = (this.reviewerCalls === 1 ? { summary: "blocking finding", findings: [finding] } : clean) as T;
           return { output, sessionRef, provider: "fake", model: "late-scope" };
         }
 
         const sessionRef = "post-drain-scope-session";
         await new Promise<void>((resolve) => setTimeout(resolve, 125));
-        options.onEvent?.({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
+        options.onEvent?.({ type: "session.started", logicalStreamId: "stream-post-drain-scope", taskId: task.id, sessionRef, provider: "fake", model: "late-scope" });
         await new Promise<void>((resolve) => setTimeout(resolve, 20));
         const output = acceptAdjudication(task) as T;
         this.resolveAdjudicationReturned();
