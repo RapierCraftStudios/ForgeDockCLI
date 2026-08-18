@@ -2766,7 +2766,14 @@ export function resolveIssueWorkerRecovery(
   orchestrationRerun: boolean,
   recovery: DagRecoveryMode,
 ): { rerun: boolean; resume: boolean } {
-  if (orchestrationRerun || recovery === "rerun") return { rerun: true, resume: false };
+  // `rerun` is an admission override for the initial launch. Once a worker
+  // has created a durable checkpoint, a scheduler retry must continue that
+  // same run even when the parent orchestration was initially authorized to
+  // bypass duplicate-run admission. An explicit recovery override remains a
+  // fresh rerun only when the controller marks this attempt as `rerun`.
+  if (recovery === "rerun" || (orchestrationRerun && recovery === "initial")) {
+    return { rerun: true, resume: false };
+  }
   return { rerun: false, resume: shouldResumeObservedItem(labels, recovery === "resume") };
 }
 

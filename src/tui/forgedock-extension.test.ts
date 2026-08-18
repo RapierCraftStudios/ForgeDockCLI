@@ -975,6 +975,7 @@ test("native controller tasks promote Build Packet claims into the parent schedu
 test("fresh-rerun authorization cannot be converted back into checkpoint resume", () => {
   assert.deepEqual(resolveIssueWorkerRecovery(["needs-human"], false, "rerun"), { rerun: true, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:engine-error"], true, "initial"), { rerun: true, resume: false });
+  assert.deepEqual(resolveIssueWorkerRecovery([], true, "resume"), { rerun: false, resume: true });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:in-review", "needs-human"], false, "initial"), { rerun: false, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
 });
