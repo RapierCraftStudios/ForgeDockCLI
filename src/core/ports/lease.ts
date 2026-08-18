@@ -5,11 +5,24 @@ export interface Lease {
   itemId: string;
   owner: string;
   token: string;
+  /** Non-secret logical owner binding used to reconcile stale workers. */
+  binding?: string;
   epoch: number;
   acquiredAt: number;
   heartbeatAt: number;
   expiresAt: number;
   continuity: "verified";
+}
+
+/**
+ * Optional logical binding carried by a lease row. It is deliberately
+ * separate from the secret holder token: recovery can identify which
+ * orchestration/node attempt owns a live row without gaining authority to
+ * heartbeat, release, or fence it.
+ */
+export interface LeaseAcquisitionOptions {
+  binding?: string;
+  recovery?: "initial" | "resume" | "relaunch" | "reattach";
 }
 
 export interface AuthenticatedLeaseCheckpoint {
@@ -51,7 +64,9 @@ export interface LeaseGuard {
 }
 
 export interface LeaseRepository {
-  acquire(itemId: string, owner: string, ttlMs: number, now?: number): Lease | undefined;
+  acquire(itemId: string, owner: string, ttlMs: number, now?: number, options?: LeaseAcquisitionOptions): Lease | undefined;
+  /** Read-only lease evidence for diagnostics and stale-controller reconciliation. */
+  inspect?(itemId: string, now?: number): Lease | undefined;
   heartbeat(itemId: string, token: string, ttlMs: number, now?: number): Lease;
   release(itemId: string, token: string): boolean;
   guard(itemId: string, token: string): LeaseGuard;
@@ -108,6 +123,14 @@ function verifyTestCheckpoint(checkpoint: AuthenticatedLeaseCheckpoint, secret: 
   return checkpoint.signature === signTestCheckpoint(checkpoint.epoch, secret);
 }
 
+function normalizedBinding(binding: string | undefined): string | undefined {
+  if (binding === undefined) return undefined;
+  const value = binding.trim();
+  if (!value) throw new Error("Lease binding must not be empty");
+  if (value.length > 512) throw new Error("Lease binding is too long");
+  return value;
+}
+
 export class InMemoryLeaseRepository implements LeaseRepository {
   readonly #leases = new Map<string, Lease>();
   readonly #witness: LeaseWitness;
@@ -117,17 +140,24 @@ export class InMemoryLeaseRepository implements LeaseRepository {
 
   constructor(witness: LeaseWitness = new InMemoryLeaseWitness()) { this.#witness = witness; }
 
-  acquire(itemId: string, owner: string, ttlMs: number, now = Date.now()): Lease | undefined {
+  acquire(itemId: string, owner: string, ttlMs: number, now = Date.now(), options?: LeaseAcquisitionOptions): Lease | undefined {
     this.#assertContinuity();
     const current = this.#leases.get(itemId);
     const recoveredRow = current && this.#recoveryEpoch !== undefined && current.epoch < this.#recoveryEpoch;
     if (current && current.expiresAt > now && !recoveredRow) return undefined;
     const advanced = this.#witness.compareAndAdvance(this.#localMaximum);
     this.#acceptWitness(advanced);
-    const lease: Lease = { itemId, owner, token: crypto.randomUUID(), epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" };
+    const binding = normalizedBinding(options?.binding);
+    const lease: Lease = { itemId, owner, token: crypto.randomUUID(), ...(binding !== undefined ? { binding } : {}), epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" };
     this.#leases.set(itemId, lease);
     this.#recoveryEpoch = undefined;
     return { ...lease };
+  }
+
+  inspect(itemId: string): Lease | undefined {
+    this.#assertContinuity();
+    const lease = this.#leases.get(itemId);
+    return lease ? { ...lease } : undefined;
   }
 
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {

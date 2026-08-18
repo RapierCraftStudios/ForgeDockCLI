@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { InMemoryLeaseRepository, InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
 import { OrchestrationController } from "../../workflows/orchestrate/controller.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
@@ -33,6 +34,61 @@ describe("lease-backed orchestration execution admission", () => {
     assert.ok(holderToken);
     assert.equal(claim.claimId.includes(holderToken), false);
     assert.match(claim.claimId, /^\d+:[a-f0-9]{16}$/);
+    await claim.release();
+  });
+
+  it("never exposes the secret lease token in claim failures", async () => {
+    const inner = new InMemoryLeaseRepository();
+    let now = 1_000;
+    const admission = new LeaseBackedOrchestrationExecutionAdmission(inner, { owner: "first", ttlMs: 100, heartbeatMs: 50, now: () => now });
+    const claim = await admission.acquire("dag-secret-error");
+    assert.ok(claim);
+    const token = inner.inspect?.("orchestration-execution:dag-secret-error")?.token;
+    assert.ok(token);
+    now = 1_101;
+    inner.acquire("orchestration-execution:dag-secret-error", "replacement", 100, now);
+    assert.throws(() => claim.assertValid(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /claim/);
+      assert.equal(error.message.includes(token), false);
+      return true;
+    });
+    await claim.release();
+  });
+
+  it("refuses an unfenced repository before writing durable state", async () => {
+    const leases = new InMemoryLeaseRepository();
+    const admission = new LeaseBackedOrchestrationExecutionAdmission(leases, { owner: "unfenced-test" });
+    const claim = await admission.acquire("dag-unfenced");
+    assert.ok(claim);
+    const backing = new InMemoryOrchestrationRepository();
+    let writes = 0;
+    const unfenced: OrchestrationRepository = {
+      createOrchestration: (record) => backing.createOrchestration(record),
+      loadOrchestration: (id) => backing.loadOrchestration(id),
+      saveOrchestration: async (record: OrchestrationRecord) => { writes++; await backing.saveOrchestration(record); },
+      listOrchestrations: (limit) => backing.listOrchestrations(limit),
+      listRunningOrchestrations: (limit, before) => backing.listRunningOrchestrations(limit, before),
+    };
+    assert.ok(claim.persist);
+    await assert.rejects(
+      claim.persist(unfenced, {
+        schema: "forgedock.orchestration/v1",
+        orchestrationId: "dag-unfenced",
+        repository: "a/b",
+        issueNumbers: [],
+        maxParallel: 1,
+        autoMerge: true,
+        executionAttempt: 1,
+        executionClaimId: claim.claimId,
+        status: "failed",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+        nodes: [],
+      }),
+      /atomic fenced repository.*refused/i,
+    );
+    assert.equal(writes, 0);
     await claim.release();
   });
 
@@ -115,5 +171,27 @@ describe("lease-backed orchestration execution admission", () => {
     } finally {
       store.close();
     }
+  });
+
+  it("reports non-secret holder and expiry diagnostics for status surfaces", async () => {
+    const leases = new InMemoryLeaseRepository();
+    let now = 1_000;
+    leases.acquire("orchestration-execution:dag-diagnostics", "controller-owner", 100, now);
+    const admission = new LeaseBackedOrchestrationExecutionAdmission(leases, { now: () => now });
+
+    assert.deepEqual(await admission.describe?.("dag-diagnostics"), {
+      state: "active",
+      owner: "controller-owner",
+      heartbeatAt: 1_000,
+      expiresAt: 1_100,
+    });
+    now = 1_101;
+    assert.deepEqual(await admission.describe?.("dag-diagnostics"), {
+      state: "expired",
+      owner: "controller-owner",
+      heartbeatAt: 1_000,
+      expiresAt: 1_100,
+    });
+    assert.deepEqual(await admission.describe?.("dag-absent"), { state: "absent" });
   });
 });

@@ -3,7 +3,7 @@
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot } from "./forge-host.js";
-import type { OrchestrationRecord, OrchestrationRepository } from "./orchestration.js";
+import { MAX_ORCHESTRATION_PAGE_SIZE, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
   repo: string;
@@ -159,12 +159,51 @@ export class InMemoryOrchestrationRepository implements OrchestrationRepository 
   }
 
   async saveOrchestration(record: OrchestrationRecord): Promise<void> {
-    if (!this.records.has(record.orchestrationId)) throw new Error(`Unknown orchestration: ${record.orchestrationId}`);
+    const current = this.records.get(record.orchestrationId);
+    if (!current) throw new Error(`Unknown orchestration: ${record.orchestrationId}`);
+    const incomingAttempt = record.executionAttempt ?? 0;
+    const persistedAttempt = current.executionAttempt ?? 0;
+    if (incomingAttempt < persistedAttempt) {
+      throw new Error(`Stale orchestration update for ${record.orchestrationId}: execution attempt ${incomingAttempt} is behind persisted attempt ${persistedAttempt}`);
+    }
+    if (incomingAttempt > 0 && persistedAttempt === incomingAttempt
+      && (record.executionClaimId ?? "") !== (current.executionClaimId ?? "")) {
+      throw new Error(`Conflicting orchestration claim for ${record.orchestrationId}: execution attempt ${incomingAttempt} belongs to another controller`);
+    }
     this.records.set(record.orchestrationId, structuredClone(record));
+  }
+
+  async saveOrchestrationFenced(record: OrchestrationRecord, fence: OrchestrationExecutionFence): Promise<void> {
+    if (!fence.itemId.trim() || !fence.token.trim() || !Number.isSafeInteger(fence.epoch)) {
+      throw new Error("Invalid orchestration execution fence");
+    }
+    // In-memory writes are synchronous at their linearization point; the
+    // LeaseBacked claim performs the holder/expiry assertion immediately
+    // before and after this operation.
+    await this.saveOrchestration(record);
   }
 
   async listOrchestrations(limit = 50): Promise<OrchestrationRecord[]> {
     return [...this.records.values()].slice(-limit).reverse().map((record) => structuredClone(record));
+  }
+
+  async listRunningOrchestrations(limit = 100, before?: OrchestrationListCursor): Promise<OrchestrationRecord[]> {
+    assertOrchestrationPageLimit(limit);
+    const records = [...this.records.values()]
+      .filter((record) => record.status === "running")
+      .sort((left, right) => right.updatedAt < left.updatedAt ? -1 : right.updatedAt > left.updatedAt ? 1
+        : right.orchestrationId < left.orchestrationId ? -1 : right.orchestrationId > left.orchestrationId ? 1 : 0)
+      .filter((record) => before === undefined
+        || record.updatedAt < before.updatedAt
+        || (record.updatedAt === before.updatedAt && record.orchestrationId < before.orchestrationId))
+      .slice(0, limit);
+    return records.map((record) => structuredClone(record));
+  }
+}
+
+function assertOrchestrationPageLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ORCHESTRATION_PAGE_SIZE) {
+    throw new Error(`Orchestration page limit must be an integer from 1 to ${MAX_ORCHESTRATION_PAGE_SIZE}`);
   }
 }
 

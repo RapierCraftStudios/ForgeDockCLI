@@ -43,6 +43,8 @@ export interface ScheduleResult {
   waitReasons?: Map<string, WaitReason>;
   /** Decomposition outcomes discovered during this scheduler pass. */
   decompositions?: Map<string, number[]>;
+  /** Last live transport capacity observed by this scheduler pass. */
+  observedCapacity?: number;
 }
 export interface ScheduleEvent {
   type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed";
@@ -53,6 +55,12 @@ export interface ScheduleEvent {
 }
 export type ScheduleEventSink = (event: ScheduleEvent) => void;
 export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => void | Promise<void>;
+/**
+ * A transport may expose either a fixed bound or the number of currently
+ * available slots. Function sources are sampled while the queue is live; a
+ * zero value is backpressure, not a launch failure.
+ */
+export type ScheduleCapacity = number | (() => number | Promise<number>);
 export interface ScheduleWorkerContext {
   /** Add concrete Build Packet paths before the worker mutates its checkout. */
   promoteClaims(claims: readonly string[]): Promise<void>;
@@ -60,6 +68,14 @@ export interface ScheduleWorkerContext {
 export interface RunScheduleOptions {
   onEvent?: ScheduleEventSink;
   onClaimsPromoted?: ScheduleClaimsSink;
+  /** Current transport capacity. Function sources are read before launches. */
+  capacity?: ScheduleCapacity;
+  /** Poll interval while queued work is waiting for capacity to return. */
+  capacityPollMs?: number;
+  /** Observe each live capacity sample without making it part of scheduling policy. */
+  onCapacityObserved?: (capacity: number) => void;
+  /** Cancel a queue that is waiting on a permanently unavailable transport. */
+  signal?: AbortSignal;
   /** Derived release-only edges; semantic dependencies remain on each item. */
   serializationEdges?: readonly ClaimSerializationEdge[];
   /** IDs being retried from a durable orchestration attempt. */
@@ -84,10 +100,26 @@ export interface SchedulePreview {
   criticalPath: ScheduledWorkItem[];
 }
 
-export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]): {
+export interface ClaimMaterializationDiagnostics {
+  conflictCandidates: number;
+  reachabilityChecks: number;
+  reachabilityNodeVisits: number;
+  frontierUpdates: number;
+}
+
+export function materializeClaimDependencies(
+  items: readonly ScheduledWorkItem[],
+  diagnostics?: ClaimMaterializationDiagnostics,
+): {
   items: ScheduledWorkItem[];
   edges: ClaimSerializationEdge[];
 } {
+  if (diagnostics) {
+    diagnostics.conflictCandidates = 0;
+    diagnostics.reachabilityChecks = 0;
+    diagnostics.reachabilityNodeVisits = 0;
+    diagnostics.frontierUpdates = 0;
+  }
   validateGraph(items);
   // Keep claim serialization separate from semantic dependencies. A claim
   // conflict only means "wait until the predecessor releases its claim"; it
@@ -103,23 +135,56 @@ export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]
       },
     ]),
   );
-  const ordered = [...graph.values()].sort(
-    (left, right) => left.issue - right.issue || left.id.localeCompare(right.id),
-  );
+  const ordered = topologicallyOrderItems(graph);
   const edges: ClaimSerializationEdge[] = [];
 
-  for (let leftIndex = 0; leftIndex < ordered.length; leftIndex++) {
-    for (let rightIndex = leftIndex + 1; rightIndex < ordered.length; rightIndex++) {
-      const left = ordered[leftIndex]!;
-      const right = ordered[rightIndex]!;
-      if (!claimsConflict(left.claims, right.claims)) continue;
-      if (
-        dependsTransitively(graph, right.id, left.id)
-        || dependsTransitively(graph, left.id, right.id)
-      ) continue;
-      // Track the derived edge only in the temporary ordering graph so later
-      // conflicts do not create redundant transitive edges. It is deliberately
-      // not copied to the returned item's semantic dependencies.
+  // Claims are canonical repository scopes (or exact component resources),
+  // so an item only conflicts with equal/ancestor/descendant path scopes. Keep
+  // an index of scopes already seen instead of comparing every pair of items.
+  // The index may still return several candidates for a broad scope, but the
+  // frontier below emits only the irreducible predecessors needed to retain
+  // the same happens-before relation.
+  const claimIndex = createClaimScopeIndex(diagnostics);
+  const order = new Map(ordered.map((item, index) => [item.id, index]));
+
+  for (const right of ordered) {
+    const conflictingItemIds = claimIndex.conflictingItemIds(right.claims);
+    if (diagnostics) diagnostics.conflictCandidates += conflictingItemIds.length;
+    const reaches = (itemId: string, dependencyId: string): boolean => {
+      if (diagnostics) diagnostics.reachabilityChecks += 1;
+      return dependsTransitively(graph, itemId, dependencyId, () => {
+        if (diagnostics) diagnostics.reachabilityNodeVisits += 1;
+      });
+    };
+    const candidates = conflictingItemIds
+      .flatMap((id) => {
+        const left = graph.get(id);
+        if (!left
+          || !claimsConflict(left.claims, right.claims)
+          || reaches(right.id, left.id)) return [];
+        // `ordered` is a topological order of the semantic graph, and every
+        // derived edge added in this loop points from an already-visited item
+        // to the current item. An earlier candidate therefore cannot depend on
+        // `right`; walking its growing predecessor chain to prove that
+        // impossibility made a shared-claim chain quadratic.
+        return [left];
+      });
+
+    // If one candidate already reaches another candidate through a semantic
+    // dependency or an earlier claim edge, the reached candidate's edge would
+    // be transitively redundant. Keep only the sinks of the candidate DAG.
+    // This is important for a shared fallback claim: 500 mutually conflicting
+    // nodes become one deterministic chain (499 edges), not a complete DAG.
+    const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+    const transitivelyRedundant = new Set<string>();
+    if (candidates.length > 1) {
+      for (const candidate of candidates) {
+        markCandidateAncestors(graph, candidate.id, candidateIds, transitivelyRedundant, diagnostics);
+      }
+    }
+    const frontier = candidates.filter((candidate) => !transitivelyRedundant.has(candidate.id));
+    frontier.sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+    for (const left of frontier) {
       graph.get(right.id)?.dependencies.push(left.id);
       edges.push({
         predecessor: left.id,
@@ -127,6 +192,7 @@ export function materializeClaimDependencies(items: readonly ScheduledWorkItem[]
         overlappingClaims: overlappingClaims(left.claims, right.claims),
       });
     }
+    claimIndex.add(right, new Set(conflictingItemIds));
   }
 
   const result = items.map((item) => ({
@@ -179,6 +245,55 @@ export async function runSchedule(
   options: RunScheduleOptions = {},
 ): Promise<ScheduleResult> {
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
+  const capacitySource = options.capacity;
+  const dynamicCapacity = typeof capacitySource === "function";
+  const capacityPollMs = options.capacityPollMs ?? 25;
+  if (!Number.isInteger(capacityPollMs) || capacityPollMs < 1) throw new Error("capacityPollMs must be a positive integer");
+  const throwIfAborted = (): void => {
+    if (!options.signal?.aborted) return;
+    const reason = options.signal.reason;
+    throw reason instanceof Error ? reason : new Error(String(reason ?? "Orchestration scheduling was cancelled"));
+  };
+  const waitForCapacity = async (): Promise<void> => {
+    throwIfAborted();
+    const signal = options.signal;
+    if (!signal) {
+      await new Promise<void>((resolve) => setTimeout(resolve, capacityPollMs));
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, capacityPollMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        const reason = signal.reason;
+        reject(reason instanceof Error ? reason : new Error(String(reason ?? "Orchestration scheduling was cancelled")));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+  };
+  let observedCapacity = maxParallel;
+  const readCapacity = async (): Promise<number> => {
+    let value: number;
+    try {
+      value = capacitySource === undefined
+        ? maxParallel
+        : typeof capacitySource === "function" ? await capacitySource() : capacitySource;
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error("transport capacity must be a non-negative integer");
+    } catch {
+      // Capacity is an external admission signal. A transient probe failure
+      // must stop new launches and leave queued work recoverable; it must not
+      // turn into a worker failure or allow a best-effort oversubscription.
+      value = 0;
+    }
+    observedCapacity = Math.min(maxParallel, value);
+    options.onCapacityObserved?.(observedCapacity);
+    return observedCapacity;
+  };
   const serializationEdges = options.serializationEdges ?? [];
   validateGraph(items, serializationEdges);
   const orderedItems = [...items].sort((left, right) => left.priority - right.priority || left.issue - right.issue);
@@ -206,6 +321,8 @@ export async function runSchedule(
   }
 
   while (running.size || queuedCount > 0) {
+    throwIfAborted();
+    let waitingForCapacity = false;
     for (const item of orderedItems) {
       if (status.get(item.id) !== "queued") continue;
       // Only explicit semantic dependencies block their successors on
@@ -253,8 +370,10 @@ export async function runSchedule(
       if (status.get(item.id) !== "queued"
         || !item.dependencies.every((id) => status.get(id) === "completed")
         || !(predecessorsBySuccessor.get(item.id) ?? []).every((id) => isTerminal(status.get(id)))) continue;
-      if (running.size >= maxParallel) {
-        waitReasons.set(item.id, { kind: "capacity", maxParallel });
+      const capacity = await readCapacity();
+      if (running.size >= capacity) {
+        waitReasons.set(item.id, { kind: "capacity", maxParallel: capacity });
+        waitingForCapacity ||= capacity === 0;
         continue;
       }
       const activeItems = [...running.keys()].map((id) => byId.get(id)).filter((value): value is ScheduledWorkItem => Boolean(value));
@@ -383,7 +502,21 @@ export async function runSchedule(
     }
 
     if (running.size) {
-      await Promise.race(running.values());
+      // A live capacity source can increase while existing work is still
+      // running. Poll alongside completion so newly available slots are
+      // consumed without waiting for an unrelated worker to finish. A lower
+      // capacity simply prevents additional launches until active work drains.
+      const capacityWait = dynamicCapacity ? waitForCapacity() : undefined;
+      await Promise.race([
+        ...running.values(),
+        ...(capacityWait ? [capacityWait] : []),
+      ]);
+      continue;
+    }
+    if (dynamicCapacity && waitingForCapacity && queuedCount > 0 && [...status.values()].some((value) => value === "queued")) {
+      // There is ready work but no slot. Keep the queue durable and wait for a
+      // fresh external capacity sample instead of failing a launch.
+      await waitForCapacity();
       continue;
     }
     // A suspended prerequisite intentionally leaves its dependents queued so a
@@ -396,6 +529,7 @@ export async function runSchedule(
     startOrder,
     ...(waitReasons.size ? { waitReasons } : {}),
     ...(decompositions.size ? { decompositions } : {}),
+    observedCapacity,
   };
 }
 
@@ -488,10 +622,221 @@ function overlappingClaims(left: readonly string[], right: readonly string[]): s
   return [...new Set(left.flatMap((a) => right.filter((b) => claimOverlaps(a, b)).map((b) => `${a} ↔ ${b}`)))];
 }
 
-function dependsTransitively(items: ReadonlyMap<string, ScheduledWorkItem>, itemId: string, dependencyId: string): boolean {
+interface ClaimScopeIndex {
+  add(item: ScheduledWorkItem, dominatedItemIds: ReadonlySet<string>): void;
+  conflictingItemIds(claims: readonly string[]): string[];
+}
+
+interface ClaimPathTrieNode {
+  holders: string[];
+  children: Map<string, ClaimPathTrieNode>;
+  /** Compact reachability frontier for holders strictly below this scope. */
+  descendantHolders: Set<string>;
+}
+
+/**
+ * Index canonical claims for materialization without constructing the dense
+ * pairwise conflict graph. Component claims are exact resources. Path claims
+ * are indexed in a trie so a query can inspect ancestors and descendants only
+ * (the same relation used by `claimOverlaps`).
+ */
+function createClaimScopeIndex(diagnostics?: ClaimMaterializationDiagnostics): ClaimScopeIndex {
+  const components = new Map<string, string[]>();
+  const root: ClaimPathTrieNode = { holders: [], children: new Map(), descendantHolders: new Set() };
+
+  const pathNodes = (scope: string, create: boolean): ClaimPathTrieNode[] | undefined => {
+    const nodes = [root];
+    if (!scope) return nodes;
+    let node = root;
+    for (const segment of scope.split("/")) {
+      let child = node.children.get(segment);
+      if (!child && create) {
+        child = { holders: [], children: new Map(), descendantHolders: new Set() };
+        node.children.set(segment, child);
+      }
+      if (!child) return undefined;
+      node = child;
+      nodes.push(node);
+    }
+    return nodes;
+  };
+
+  const pathNode = (scope: string, create: boolean): ClaimPathTrieNode | undefined =>
+    pathNodes(scope, create)?.at(-1);
+
+  const collectDescendants = (node: ClaimPathTrieNode, itemIds: Set<string>): void => {
+    for (const itemId of node.descendantHolders) itemIds.add(itemId);
+  };
+
+  const collectPathConflicts = (scope: string, itemIds: Set<string>): void => {
+    // Every ancestor scope conflicts with this scope. The root node represents
+    // a repository-wide claim (for example `*.ts` after conservative scope
+    // reduction), and is therefore always included.
+    let node: ClaimPathTrieNode | undefined = root;
+    for (const itemId of node.holders) itemIds.add(itemId);
+    if (scope) {
+      for (const segment of scope.split("/")) {
+        node = node.children.get(segment);
+        if (!node) break;
+        for (const itemId of node.holders) itemIds.add(itemId);
+      }
+    }
+
+    // Every descendant scope conflicts with this scope. Sibling subtrees are
+    // never visited, preserving the existing boundary behavior (`src/a` does
+    // not conflict with `src/b`).
+    const exact = pathNode(scope, false);
+    if (exact) collectDescendants(exact, itemIds);
+  };
+
+  return {
+    add(item, dominatedItemIds) {
+      const seen = new Set<string>();
+      for (const claim of item.claims) {
+        const scope = canonicalClaimScope(claim);
+        const key = `${scope.kind}:${scope.value}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (scope.kind === "component") {
+          // Every prior holder of this exact resource was returned as a
+          // conflict. Once the derived frontier edges have been inserted, the
+          // current item reaches all of them and is the sole useful frontier.
+          components.set(scope.value, [item.id]);
+          if (diagnostics) diagnostics.frontierUpdates += 1;
+        } else {
+          const nodes = pathNodes(scope.value, true)!;
+          const node = nodes.at(-1)!;
+          // An exact/broad holder reaches every conflicting holder at this
+          // scope and below after materialization, so it replaces both exact
+          // and descendant frontiers without walking the subtree.
+          node.holders = [item.id];
+          node.descendantHolders.clear();
+          if (diagnostics) diagnostics.frontierUpdates += 2;
+          for (const ancestor of nodes.slice(0, -1)) {
+            // At a strict ancestor, keep unrelated sibling holders and remove
+            // only conflicts the current item is now known to reach. This set
+            // came from the index query that immediately preceded insertion,
+            // avoiding both recursive trie scans and transitive DAG walks.
+            for (const holder of dominatedItemIds) {
+              ancestor.descendantHolders.delete(holder);
+              if (diagnostics) diagnostics.frontierUpdates += 1;
+            }
+            ancestor.descendantHolders.add(item.id);
+            if (diagnostics) diagnostics.frontierUpdates += 1;
+          }
+        }
+      }
+    },
+    conflictingItemIds(claims) {
+      const itemIds = new Set<string>();
+      const seen = new Set<string>();
+      for (const claim of claims) {
+        const scope = canonicalClaimScope(claim);
+        const key = `${scope.kind}:${scope.value}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (scope.kind === "component") {
+          for (const itemId of components.get(scope.value) ?? []) itemIds.add(itemId);
+        } else {
+          collectPathConflicts(scope.value, itemIds);
+        }
+      }
+      return [...itemIds];
+    },
+  };
+}
+
+function topologicallyOrderItems(
+  items: ReadonlyMap<string, ScheduledWorkItem>,
+): ScheduledWorkItem[] {
+  const compare = (left: ScheduledWorkItem, right: ScheduledWorkItem): number =>
+    left.issue - right.issue || left.id.localeCompare(right.id);
+  const remainingDependencies = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+  for (const item of items.values()) {
+    remainingDependencies.set(item.id, item.dependencies.length);
+    for (const dependency of item.dependencies) {
+      const values = dependents.get(dependency) ?? [];
+      values.push(item.id);
+      dependents.set(dependency, values);
+    }
+  }
+
+  const ready: ScheduledWorkItem[] = [];
+  const pushReady = (item: ScheduledWorkItem): void => {
+    ready.push(item);
+    let index = ready.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (compare(ready[parent]!, ready[index]!) <= 0) break;
+      [ready[parent], ready[index]] = [ready[index]!, ready[parent]!];
+      index = parent;
+    }
+  };
+  const popReady = (): ScheduledWorkItem => {
+    const first = ready[0]!;
+    const last = ready.pop()!;
+    if (ready.length) {
+      ready[0] = last;
+      let index = 0;
+      while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        let smallest = index;
+        if (left < ready.length && compare(ready[left]!, ready[smallest]!) < 0) smallest = left;
+        if (right < ready.length && compare(ready[right]!, ready[smallest]!) < 0) smallest = right;
+        if (smallest === index) break;
+        [ready[index], ready[smallest]] = [ready[smallest]!, ready[index]!];
+        index = smallest;
+      }
+    }
+    return first;
+  };
+  for (const item of items.values()) if (item.dependencies.length === 0) pushReady(item);
+  const ordered: ScheduledWorkItem[] = [];
+  while (ready.length) {
+    const item = popReady();
+    ordered.push(item);
+    for (const dependentId of dependents.get(item.id) ?? []) {
+      const remaining = (remainingDependencies.get(dependentId) ?? 0) - 1;
+      remainingDependencies.set(dependentId, remaining);
+      if (remaining !== 0) continue;
+      pushReady(items.get(dependentId)!);
+    }
+  }
+  if (ordered.length !== items.size) throw new Error("Dependency cycle detected while ordering claim materialization");
+  return ordered;
+}
+
+function markCandidateAncestors(
+  items: ReadonlyMap<string, ScheduledWorkItem>,
+  itemId: string,
+  candidateIds: ReadonlySet<string>,
+  redundant: Set<string>,
+  diagnostics?: ClaimMaterializationDiagnostics,
+): void {
   const pending = [...(items.get(itemId)?.dependencies ?? [])];
   const visited = new Set<string>();
   while (pending.length) {
+    const current = pending.pop()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    if (diagnostics) diagnostics.reachabilityNodeVisits += 1;
+    if (candidateIds.has(current)) redundant.add(current);
+    pending.push(...(items.get(current)?.dependencies ?? []));
+  }
+}
+
+function dependsTransitively(
+  items: ReadonlyMap<string, ScheduledWorkItem>,
+  itemId: string,
+  dependencyId: string,
+  onVisit?: () => void,
+): boolean {
+  const pending = [...(items.get(itemId)?.dependencies ?? [])];
+  const visited = new Set<string>();
+  while (pending.length) {
+    onVisit?.();
     const current = pending.pop()!;
     if (current === dependencyId) return true;
     if (visited.has(current)) continue;

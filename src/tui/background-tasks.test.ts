@@ -83,6 +83,34 @@ test("native background controller records output and completion without blockin
   await tasks.shutdown();
 });
 
+test("native controller launch is idempotent for one orchestration attempt", async () => {
+  const { cwd, tasks, ctx, pi } = fixture();
+  const launchKey = "dag_launch/node-1/attempt-1";
+  const first = tasks.start({
+    command: process.execPath,
+    args: ["-e", "setTimeout(()=>{},100)"],
+    cwd,
+    launchKey,
+    ctx,
+  });
+  const adopted = tasks.start({
+    command: process.execPath,
+    args: ["-e", "throw new Error('duplicate must not start')"],
+    cwd,
+    launchKey,
+    ctx,
+  });
+  assert.equal(adopted.id, first.id);
+  assert.equal(tasks.findByLaunchKey(launchKey)?.id, first.id);
+  assert.equal(tasks.list().filter((record) => record.launchKey === launchKey).length, 1);
+  await eventually(() => assert.equal(tasks.list().find((record) => record.id === first.id)?.status, "completed"));
+  await tasks.shutdown();
+  const restarted = new ForgeDockBackgroundTasks(pi);
+  restarted.initialize(ctx);
+  assert.equal(restarted.findByLaunchKey(launchKey)?.id, first.id);
+  await restarted.shutdown();
+});
+
 test("an immediately exiting controller is reconciled exactly once", async () => {
   const { cwd, messages, tasks, ctx } = fixture();
   const record = tasks.start({ command: process.execPath, args: ["-e", "process.exit(0)"], cwd, ctx });

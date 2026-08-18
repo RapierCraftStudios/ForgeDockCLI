@@ -53,6 +53,7 @@ import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
 import { OrchestrationController, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation } from "../workflows/orchestrate/controller.js";
+import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { buildOrchestrationSnapshot } from "../workflows/orchestrate/view-model.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
 import {
@@ -65,6 +66,9 @@ import {
   type ScheduleWorkerResult,
 } from "../workflows/orchestrate/scheduler.js";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
+import { assertDispatchReady, dispatchModelReference, resolveDispatchRuntime, type DispatchReadinessInput, type DispatchRuntimeResolutionInput, type ResolvedDispatchRuntime } from "../core/admission/dispatch-readiness.js";
+import { mapWithConcurrency } from "../core/concurrency.js";
+import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import {
   startOrchestrationClaimPromotionServer,
   type OrchestrationClaimIdentity,
@@ -215,6 +219,7 @@ interface OrchestrationPreviewReplay {
   routing?: OrchestrationRouting;
   policy: OrchestrationPreviewPolicy;
   effective: EffectiveOrchestrationConfig;
+  runtime: ResolvedDispatchRuntime;
   proposalDigest: string;
 }
 
@@ -371,7 +376,7 @@ export async function resolveOrchestrationInvocationScope(
   const repository = await host.getRepository();
   if (/^\d+(?:[\s,]+\d+)*$/.test(selector)) {
     const issueNumbers = [...new Set(selector.split(/[\s,]+/).filter(Boolean).map(Number))].sort((left, right) => left - right);
-    const issues = await Promise.all(issueNumbers.map((issue) => host.getIssue(issue, repository.repo)));
+    const issues = await mapWithConcurrency(issueNumbers, (issue) => host.getIssue(issue, repository.repo));
     const closed = issues.filter((issue) => issue.state !== "OPEN").map((issue) => issue.number);
     if (closed.length) throw new Error(`Orchestration issues must be open: ${closed.map((issue) => `#${issue}`).join(", ")}`);
     const milestones = [...new Set(issues.map((issue) => issue.milestone?.title))];
@@ -531,7 +536,7 @@ async function observeOpenIssues(
   repo: string,
   host: Pick<OrchestrationScopeResolverHost, "getIssue">,
 ): Promise<OrchestrationScopeIssue[]> {
-  const observed = await Promise.all(issueNumbers.map((issue) => host.getIssue(issue, repo)));
+  const observed = await mapWithConcurrency(issueNumbers, (issue) => host.getIssue(issue, repo));
   const closed = observed.filter((issue) => issue.state !== "OPEN").map((issue) => issue.number);
   if (closed.length) throw new Error(`Orchestration issues must be open: ${closed.map((issue) => `#${issue}`).join(", ")}`);
   const decomposed = observed
@@ -940,7 +945,7 @@ async function materializeVisibleDecomposition(input: {
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
   const selected = new Set([...input.orchestration.issueNumbers, ...children]);
-  const childSnapshots = await Promise.all(children.map((issue) => input.github.getIssue(issue, input.repository)));
+  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
   const childItems: VisibleOrchestrationItem[] = [];
   for (const issue of childSnapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
@@ -1020,14 +1025,25 @@ export interface ControllerTaskSpec {
   args: string[];
   cwd: string;
   env?: Record<string, string>;
+  /** Exact durable identity of the worker launch being requested. */
+  launchIdentity?: OrchestrationTransportIdentity;
+  /** Stable transport idempotency key derived from launchIdentity. */
+  launchKey?: string;
   claimPromotion?: {
     identity: OrchestrationClaimIdentity;
     promoteClaims(claims: readonly string[]): Promise<void>;
   };
 }
 
+export interface OrchestrationTransportIdentity {
+  orchestrationId: string;
+  nodeId: string;
+  attemptId: string;
+}
+
 interface ControllerTaskTransport {
   start(spec: ControllerTaskSpec): Promise<string>;
+  findByLaunchIdentity?(identity: OrchestrationTransportIdentity): Promise<string | undefined> | string | undefined;
   wait(taskId: string): Promise<BackgroundTaskRecord | void>;
   stop?(taskId: string): void;
   list?(): readonly BackgroundTaskRecord[];
@@ -1071,6 +1087,7 @@ interface VisibleDagInput {
   startControllerTask?: (spec: ControllerTaskSpec) => Promise<string>;
   waitControllerTask?: (taskId: string) => Promise<BackgroundTaskRecord | void>;
   stopControllerTask?: (taskId: string) => void;
+  findControllerTask?: (identity: OrchestrationTransportIdentity) => Promise<string | undefined> | string | undefined;
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<ScheduleWorkerResult | void>;
   onComplete: (result: ScheduleResult, orchestrationId: string) => void;
   onEvent?: (event: OrchestrationEvent) => void;
@@ -1109,6 +1126,8 @@ export interface ForgeDockToolRegistrationOptions {
   orchestrationRepository?: OrchestrationRepository;
   orchestrationExecutionAdmission?: OrchestrationExecutionAdmission;
   ensureLeaseWitness?: (cwd: string) => LeaseWitness;
+  /** Explicit test/embedder doctor seam. Production must leave this undefined. */
+  dispatchReadinessCheck?: (input: DispatchReadinessInput) => Promise<void>;
 }
 
 export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolRegistrationOptions = {}): ForgeDockBackgroundTasks {
@@ -1119,6 +1138,71 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
   let orchestrationCwd = process.cwd();
   let orchestrationContext: ExtensionContext | undefined;
   let orchestrationRepository: SqliteRepositories | undefined;
+  let orchestrationWitness: LeaseWitness | undefined;
+  let orchestrationLeaseError: unknown;
+  const assertNativeControllerDispatchReady = async (
+    ctx: ExtensionContext,
+    invocation: NonNullable<DispatchRuntimeResolutionInput["invocation"]> = {},
+    configuration?: { config: ReturnType<typeof readForgeDockConfig>; configError?: unknown },
+    bootstrapWitness = false,
+  ): Promise<void> => {
+    let config = configuration?.config ?? {};
+    let configError = configuration?.configError;
+    if (!configuration) {
+      try {
+        config = readForgeDockConfig(ctx.cwd);
+      } catch (error) {
+        configError = error;
+      }
+    }
+    const activeModel = ctx.model?.provider && ctx.model.id
+      ? `${ctx.model.provider}/${ctx.model.id}`
+      : undefined;
+    const resolved = resolveDispatchRuntime({
+      config,
+      ...(activeModel !== undefined ? { activeModel } : {}),
+      invocation,
+    });
+    let witness = orchestrationWitness;
+    let witnessError = orchestrationLeaseError;
+    if (!witness && witnessError === undefined) {
+      try {
+        witness = (options.ensureLeaseWitness ?? (bootstrapWitness ? createOrBootstrapLocalLeaseWitness : createConfiguredLeaseWitness))(ctx.cwd);
+      } catch (error) {
+        witnessError = error;
+      }
+    }
+    const runtime = new PiAgentRuntime({
+      ...(resolved.worker.provider !== undefined ? { provider: resolved.worker.provider } : {}),
+      ...(resolved.worker.model !== undefined ? { model: resolved.worker.model } : {}),
+      ...(resolved.reviewer.provider !== undefined ? { reviewerProvider: resolved.reviewer.provider } : {}),
+      ...(resolved.reviewer.model !== undefined ? { reviewerModel: resolved.reviewer.model } : {}),
+      ...(resolved.planning.provider !== undefined ? { planningProvider: resolved.planning.provider } : {}),
+      ...(resolved.planning.model !== undefined ? { planningModel: resolved.planning.model } : {}),
+      ...(resolved.planning.thinking !== undefined ? { planningThinking: resolved.planning.thinking } : {}),
+    });
+    try {
+      const readinessInput: DispatchReadinessInput = {
+        checkoutRoot: ctx.cwd,
+        config,
+        ...(configError !== undefined ? { configError } : {}),
+        ...(activeModel !== undefined ? { activeModel } : {}),
+        invocation,
+        requireLeaseWitness: true,
+        ...(witness !== undefined ? { leaseWitness: witness } : {}),
+        ...(witnessError !== undefined ? { leaseError: witnessError } : {}),
+        runtime,
+        githubProbe: async () => await new GitHubClient(ctx.cwd).getRepository(),
+      };
+      await (options.dispatchReadinessCheck
+        ? options.dispatchReadinessCheck(readinessInput)
+        : assertDispatchReady(readinessInput));
+      orchestrationWitness = witness;
+      orchestrationLeaseError = undefined;
+    } finally {
+      await runtime.close();
+    }
+  };
   const dagDelegator = new VisibleDagDelegator(
     pi,
     () => orchestrationRepository ?? options.orchestrationRepository,
@@ -1132,10 +1216,18 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       stop: (taskId) => { try { backgroundTasks.cancel(taskId); } catch { /* task already terminal */ } },
       list: () => backgroundTasks.list(),
       isActive: (taskId) => backgroundTasks.isOperationallyActive(taskId),
+      findByLaunchIdentity: (identity) => backgroundTasks.findByLaunchKey(orchestrationTransportKey(identity))?.id,
     },
     () => options.orchestrationExecutionAdmission
       ?? (orchestrationRepository ? new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository) : undefined),
   );
+  const reapStaleDurableOrchestrations = async (): Promise<void> => {
+    const repository = orchestrationRepository ?? options.orchestrationRepository;
+    const executionAdmission = options.orchestrationExecutionAdmission
+      ?? (orchestrationRepository ? new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository) : undefined);
+    if (!repository || !executionAdmission) return;
+    await reapStaleOrchestrations({ repository, executionAdmission });
+  };
   pi.on("session_shutdown", async () => {
     planningSessions.clear();
     confirmedPlanningPackets.clear();
@@ -1167,9 +1259,20 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         orchestrationCwd = ctx.cwd;
         orchestrationContext = ctx;
         if (ctx.mode === "tui" && !orchestrationRepository && !options.orchestrationRepository) {
-          const witness = createConfiguredLeaseWitness(ctx.cwd);
-          if (!witness) throw new Error("Authenticated lease witness is required before TUI recovery inspection; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
-          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
+          if (!orchestrationWitness && orchestrationLeaseError === undefined) {
+            try {
+              orchestrationWitness = (options.ensureLeaseWitness ?? createConfiguredLeaseWitness)(ctx.cwd);
+            } catch (error) {
+              orchestrationLeaseError = error;
+            }
+          }
+          // The frozen plan is available only through witnessed SQLite. If
+          // witness setup failed, the generic doctor is terminal and can still
+          // aggregate the remaining diagnostics; otherwise defer role checks
+          // until the durable model contract is loaded below.
+          if (!orchestrationWitness) await assertNativeControllerDispatchReady(ctx);
+          if (!orchestrationWitness) throw new Error("Authenticated lease witness is required before TUI recovery inspection");
+          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness: orchestrationWitness });
         }
       }
       const rerunIssueNumbers = [...new Set(params.rerunIssueNumbers ?? [])];
@@ -1184,6 +1287,35 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (overlap.length) throw new Error(`A verification adjudication cannot be combined with fresh rerun authorization: ${overlap.join(", ")}`);
       const conflictOverlap = resolveConflictIssueNumbers.filter((issue) => rerunIssueNumbers.includes(issue) || adjudications.has(issue));
       if (conflictOverlap.length) throw new Error(`Conflict recovery authorization cannot be combined with rerun or verification adjudication: ${conflictOverlap.map((issue) => `#${issue}`).join(", ")}`);
+      if (ctx) {
+        const record = await (orchestrationRepository ?? options.orchestrationRepository)?.loadOrchestration(params.orchestrationId);
+        const workerProvider = record ? orchestrationMetadataString(record.plan, "workerProvider") : undefined;
+        const workerModel = record ? orchestrationMetadataString(record.plan, "workerModel") : undefined;
+        const workerThinking = record ? orchestrationMetadataThinking(record.plan, "workerThinking") : undefined;
+        const reviewerProvider = record ? orchestrationMetadataString(record.plan, "reviewerProvider") : undefined;
+        const reviewerModel = record ? orchestrationMetadataString(record.plan, "reviewerModel") : undefined;
+        const reviewerThinking = record ? orchestrationMetadataThinking(record.plan, "reviewerThinking") : undefined;
+        const planningProvider = record ? orchestrationMetadataString(record.plan, "planningProvider") : undefined;
+        const planningModel = record ? orchestrationMetadataString(record.plan, "planningModel") : undefined;
+        const planningThinking = record ? orchestrationMetadataThinking(record.plan, "planningThinking") : undefined;
+        await assertNativeControllerDispatchReady(ctx, {
+          worker: {
+            ...(workerProvider !== undefined ? { provider: workerProvider } : {}),
+            ...(workerModel !== undefined ? { model: workerModel } : {}),
+            ...(workerThinking !== undefined ? { thinking: workerThinking } : {}),
+          },
+          reviewer: {
+            ...(reviewerProvider !== undefined ? { provider: reviewerProvider } : {}),
+            ...(reviewerModel !== undefined ? { model: reviewerModel } : {}),
+            ...(reviewerThinking !== undefined ? { thinking: reviewerThinking } : {}),
+          },
+          planning: {
+            ...(planningProvider !== undefined ? { provider: planningProvider } : {}),
+            ...(planningModel !== undefined ? { model: planningModel } : {}),
+            ...(planningThinking !== undefined ? { thinking: planningThinking } : {}),
+          },
+        });
+      }
       const resumed = await dagDelegator.resume(params.orchestrationId, { rerunIssueNumbers, adjudications, resolveConflictIssueNumbers });
       return {
         content: [{ type: "text", text: `Resumed ForgeDock DAG ${resumed.id}. Completed nodes were preserved; ${resumed.childRunIds.length} total worker run(s) are now associated with this DAG.${rerunIssueNumbers.length ? ` Fresh rerun authorized for ${rerunIssueNumbers.map((issue) => `#${issue}`).join(", ")}.` : ""}${adjudications.size ? ` Typed verification resume authorized for ${[...adjudications.keys()].map((issue) => `#${issue}`).join(", ")}.` : ""}${resolveConflictIssueNumbers.length ? ` Confirmed target-conflict recovery authorized for ${resolveConflictIssueNumbers.map((issue) => `#${issue}`).join(", ")}; each requires fresh verification and review.` : ""}` }],
@@ -1207,6 +1339,11 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       maxRemediationCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
       maxRemediationDepth: Type.Optional(Type.Integer({ minimum: 0, maximum: 20 })),
       maxRemediationChildren: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      workerModel: Type.Optional(Type.String({ minLength: 1, description: "Frozen provider/model[:thinking] worker contract supplied by orchestration" })),
+      reviewerModel: Type.Optional(Type.String({ minLength: 1, description: "Frozen provider/model reviewer contract supplied by orchestration" })),
+      reviewerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
+      planningModel: Type.Optional(Type.String({ minLength: 1, description: "Frozen provider/model planning contract supplied by orchestration" })),
+      planningThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       resume: Type.Optional(Type.Boolean({ description: "Explicitly resume a controller-supported durable checkpoint instead of creating a new run" })),
       resolveConflict: Type.Optional(Type.Boolean({ description: "Explicitly authorize synchronized target-conflict recovery; requires resume=true and always forces fresh verification/review" })),
@@ -1218,6 +1355,14 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.rerun && params.resume) throw new Error("ForgeDock work-on rerun and resume policies are mutually exclusive");
       if (params.resolveConflict && !params.resume) throw new Error("resolveConflict requires resume=true");
       if (params.resolveConflict && params.rerun) throw new Error("resolveConflict cannot be combined with rerun");
+      const requestedWorker = controllerWorkerSelection(params.workerModel, undefined);
+      const requestedReviewer = controllerWorkerSelection(params.reviewerModel, params.reviewerThinking as ThinkingLevel | undefined);
+      const requestedPlanning = controllerWorkerSelection(params.planningModel, params.planningThinking as ThinkingLevel | undefined);
+      await assertNativeControllerDispatchReady(ctx, {
+        worker: requestedWorker,
+        reviewer: requestedReviewer,
+        planning: requestedPlanning,
+      });
       const args = [String(params.issue)];
       if (params.dependencies?.length) args.push("--depends-on", [...new Set(params.dependencies)].join(","));
       const issueWorker = process.env.PI_SUBAGENT_CHILD_AGENT === "forgedock-issue-worker";
@@ -1238,6 +1383,13 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.maxRemediationCycles !== undefined) args.push("--max-remediation-cycles", String(params.maxRemediationCycles));
       if (params.maxRemediationDepth !== undefined) args.push("--max-remediation-depth", String(params.maxRemediationDepth));
       if (params.maxRemediationChildren !== undefined) args.push("--max-remediation-children", String(params.maxRemediationChildren));
+      if (requestedWorker.provider) args.push("--provider", requestedWorker.provider);
+      if (requestedWorker.model) args.push("--model", requestedWorker.model);
+      if (requestedWorker.thinking) args.push("--thinking", requestedWorker.thinking);
+      if (params.reviewerModel) args.push("--reviewer-model", params.reviewerModel);
+      if (params.reviewerThinking) args.push("--reviewer-thinking", params.reviewerThinking);
+      if (params.planningModel) args.push("--planning-model", params.planningModel);
+      if (params.planningThinking) args.push("--planning-thinking", params.planningThinking);
       if (params.rerun) args.push("--rerun");
       if (params.resume) args.push("--resume");
       if (params.resolveConflict) args.push("--resolve-conflict");
@@ -1512,6 +1664,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (witness) orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
         }
       }
+      // Task/status inspection is also a safe recovery boundary. Reconcile
+      // expired controller leases only when this request can present durable
+      // DAG state; native task output and cancellation are unrelated scopes.
+      const presentsDurableDag = params.action === "list"
+        || (params.action === "output" && params.taskId?.startsWith("dag_") === true);
+      if (presentsDurableDag) await reapStaleDurableOrchestrations();
       if (params.action === "list") {
         const records = backgroundTasks.list();
         const durableOrchestrations = orchestrationRepository ?? options.orchestrationRepository;
@@ -1634,10 +1792,6 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       ctx = { ...ctx, cwd: checkout.checkoutRoot };
       orchestrationCwd = ctx.cwd;
       orchestrationContext = ctx;
-      // The session may have initialized task recovery from the launch
-      // directory before the target was known. Re-scan the canonical checkout
-      // so target-local controller records are visible to this orchestration.
-      backgroundTasks.initialize(ctx);
       if (ctx.mode === "tui") orchestrationBoard.attach(ctx);
       let executionPlan = params.executionPlan ?? replay?.executionPlan as typeof params.executionPlan;
       let issueBriefs = params.issueBriefs ?? replay?.issueBriefs as typeof params.issueBriefs;
@@ -1652,7 +1806,19 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const autoMergeOption = params.autoMerge ?? replay?.policy.autoMerge;
       const rerun = params.rerun ?? replay?.policy.rerun ?? false;
       const workerModelRequest = params.workerModel ?? replay?.policy.workerModelRequest;
-      const config = readForgeDockConfig(ctx.cwd);
+      let config: ReturnType<typeof readForgeDockConfig> = {};
+      let configError: unknown;
+      try {
+        config = readForgeDockConfig(ctx.cwd);
+      } catch (error) {
+        configError = error;
+      }
+      if (configError !== undefined && params.confirmed === true) {
+        await assertNativeControllerDispatchReady(ctx, {
+          ...(workerModelRequest !== undefined ? { workerModel: workerModelRequest } : {}),
+        }, { config, configError });
+      }
+      if (configError !== undefined) throw configError;
       if (!previewCheckpoint && params.maxParallel !== undefined) {
         const explicitlyRequested = orchestrationMaxParallelFromRequest(pending.rawArgs);
         const configuredDefault = resolveOrchestrationConfig(config).maxParallel;
@@ -1676,38 +1842,36 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const activeSessionModel = ctx.model?.provider && ctx.model.id
         ? `${ctx.model.provider}/${ctx.model.id}`
         : undefined;
-      const resolvedWorkerModel = previewCheckpoint?.replay.policy.workerModel ?? modelWithThinking(
-        workerModelRequest ?? config.workerModel ?? process.env.FORGEDOCK_WORKER_MODEL ?? activeSessionModel,
-        config.workerThinking,
-      );
+      const replayWorkerModel = previewCheckpoint?.replay.policy.workerModel ?? workerModelRequest;
+      // A confirmation continuation dispatches with the exact role contract
+      // shown by its preview. In particular, do not re-resolve planning or
+      // reviewer settings from a forge.yaml/environment change made while the
+      // user was deciding whether to confirm.
+      const resolvedDispatchRuntime = previewCheckpoint?.replay.runtime ?? resolveDispatchRuntime({
+        config,
+        ...(activeSessionModel !== undefined ? { activeModel: activeSessionModel } : {}),
+        invocation: {
+          ...(replayWorkerModel !== undefined ? { workerModel: replayWorkerModel } : {}),
+        },
+      });
+      const resolvedWorkerModel = dispatchModelReference(resolvedDispatchRuntime.worker);
+      const resolvedReviewerModel = resolvedDispatchRuntime.reviewer.provider && resolvedDispatchRuntime.reviewer.model
+        ? `${resolvedDispatchRuntime.reviewer.provider}/${resolvedDispatchRuntime.reviewer.model}` : undefined;
+      const resolvedPlanningModel = resolvedDispatchRuntime.planning.provider && resolvedDispatchRuntime.planning.model
+        ? `${resolvedDispatchRuntime.planning.provider}/${resolvedDispatchRuntime.planning.model}` : undefined;
       const dispatchMode = params.confirmed === true ? "authorized" : effective.dispatchMode;
       const dispatchAuthorized = !params.dryRun && (dispatchMode === "authorized" || dispatchMode === "auto");
       const dispatchRequiresWitness = !params.dryRun && dispatchMode !== "preview";
-      // Witnessed durable admission is a prerequisite for every path that can
-      // dispatch. Establish it before GitHub discovery or batch materialization
-      // so a missing/invalid witness cannot leave orphan batch issues behind.
-      if (dispatchRequiresWitness && !orchestrationRepository && !options.orchestrationRepository) {
-        const dispatchCheckout = resolveCheckoutContext(launchCwd, targetRepository);
-        if (dispatchCheckout.checkoutRoot !== ctx.cwd) {
-          ctx = { ...ctx, cwd: dispatchCheckout.checkoutRoot };
-          orchestrationCwd = ctx.cwd;
-          orchestrationContext = ctx;
-        }
-        const witness = (options.ensureLeaseWitness ?? createOrBootstrapLocalLeaseWitness)(ctx.cwd);
-        orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness });
-      }
-      if (dispatchRequiresWitness && orchestrationRepository) {
-        // Prove the complete witnessed SQLite lease path before any GitHub
-        // mutation. Merely opening the witness does not detect an epoch split.
-        const preflightAdmission = new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository);
-        const preflight = await preflightAdmission.acquire(`orchestration-preflight:${crypto.randomUUID()}`);
-        if (!preflight) throw new Error("Authenticated orchestration preflight is already active");
-        try {
-          preflight.assertValid();
-        } finally {
-          await preflight.release();
-        }
-      }
+      let dispatchReadinessChecked = false;
+      // Run after purely local binding validation but before routed GitHub
+      // discovery. Invalid/substituted input must remain side-effect free.
+      const assertEarlyDispatchReadiness = async (): Promise<void> => {
+        if (!dispatchAuthorized || dispatchReadinessChecked) return;
+        await assertNativeControllerDispatchReady(ctx, {
+          ...(replayWorkerModel !== undefined ? { workerModel: replayWorkerModel } : {}),
+        }, { config }, true);
+        dispatchReadinessChecked = true;
+      };
       if (previewCheckpoint && params.dryRun === true) {
         throw new Error("A preview confirmation cannot switch to dry-run; start a fresh preview");
       }
@@ -1730,6 +1894,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         if (params.noMilestone === true && !pending.noMilestone) {
           throw new Error(`Orchestration cannot drop bound milestone '${pending.milestone}'`);
         }
+        await assertEarlyDispatchReadiness();
         issues = [...pending.issueNumbers];
         repository = pending.repository ? { repo: pending.repository, defaultBranch: pending.defaultBranch ?? "" } : undefined;
         milestoneFilter = pending.milestone;
@@ -1739,6 +1904,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         if (!routing) {
           throw new Error("Every /orchestrate invocation requires model intent routing before the typed tool can run");
         }
+        await assertEarlyDispatchReadiness();
         github = new GitHubClient(ctx.cwd, orchestrationRepository);
         const routed = await resolveRoutedOrchestrationScope(
           pending.rawArgs,
@@ -1769,6 +1935,49 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       let authoritativeRoutes = new Map<number, ReturnType<typeof classifyIssueLane>>();
       let authoritativeIssues: Awaited<ReturnType<GitHubClient["getIssue"]>>[] = [];
       let milestoneBranches: Awaited<ReturnType<GitHubClient["listBranches"]>> = [];
+      const ensureDispatchAdmission = async (): Promise<void> => {
+        if (!dispatchRequiresWitness) return;
+        // Tests/embedders may supply the complete durable authority plus an
+        // explicit readiness doctor. That seam must not require a physical
+        // checkout or create production witness files.
+        if (options.dispatchReadinessCheck
+          && options.orchestrationRepository
+          && options.orchestrationExecutionAdmission) return;
+        // Confirmation previews are strictly read-only. Witness bootstrap,
+        // SQLite creation, and lease probes begin only after confirmation and
+        // immediately before the first possible GitHub mutation.
+        if (!orchestrationWitness && orchestrationLeaseError === undefined) {
+          const dispatchCheckout = resolveCheckoutContext(launchCwd, targetRepository);
+          if (dispatchCheckout.checkoutRoot !== ctx.cwd) {
+            ctx = { ...ctx, cwd: dispatchCheckout.checkoutRoot };
+            orchestrationCwd = ctx.cwd;
+            orchestrationContext = ctx;
+          }
+          try {
+            orchestrationWitness = (options.ensureLeaseWitness ?? createOrBootstrapLocalLeaseWitness)(ctx.cwd);
+            if (!options.orchestrationRepository) {
+              orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness: orchestrationWitness });
+            }
+          } catch (error) {
+            orchestrationLeaseError = error;
+          }
+        }
+        if (orchestrationWitness && !orchestrationRepository && !options.orchestrationRepository) {
+          orchestrationRepository = new SqliteRepositories(join(ctx.cwd, ".forgedock", "state.db"), { witness: orchestrationWitness });
+        }
+        if (orchestrationRepository) {
+          // Prove the complete witnessed SQLite lease path before any GitHub
+          // mutation. Merely opening the witness does not detect an epoch split.
+          const preflightAdmission = new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository);
+          const preflight = await preflightAdmission.acquire(`orchestration-preflight:${crypto.randomUUID()}`);
+          if (!preflight) throw new Error("Authenticated orchestration preflight is already active");
+          try {
+            preflight.assertValid();
+          } finally {
+            await preflight.release();
+          }
+        }
+      };
       const classifyAuthoritativeRoutes = (allowMissingMilestoneBranch: boolean): void => {
         authoritativeRoutes = new Map(authoritativeIssues.map((issue) => [
           issue.number,
@@ -1783,10 +1992,48 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           ),
         ] as const));
       };
-      let discoveredItems: VisibleOrchestrationItem[];
+      const assertReadyBeforeMutation = async (): Promise<void> => {
+        await ensureDispatchAdmission();
+        github ??= new GitHubClient(ctx.cwd, orchestrationRepository);
+        repository ??= await github.getRepository();
+        if (dispatchReadinessChecked) return;
+        const readinessRuntime = new PiAgentRuntime({
+          ...(resolvedDispatchRuntime.worker.provider !== undefined ? { provider: resolvedDispatchRuntime.worker.provider } : {}),
+          ...(resolvedDispatchRuntime.worker.model !== undefined ? { model: resolvedDispatchRuntime.worker.model } : {}),
+          ...(resolvedDispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: resolvedDispatchRuntime.reviewer.provider } : {}),
+          ...(resolvedDispatchRuntime.reviewer.model !== undefined ? { reviewerModel: resolvedDispatchRuntime.reviewer.model } : {}),
+          ...(resolvedDispatchRuntime.planning.provider !== undefined ? { planningProvider: resolvedDispatchRuntime.planning.provider } : {}),
+          ...(resolvedDispatchRuntime.planning.model !== undefined ? { planningModel: resolvedDispatchRuntime.planning.model } : {}),
+          ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
+        });
+        try {
+          const readinessInput: DispatchReadinessInput = {
+            checkoutRoot: ctx.cwd,
+            config,
+            ...(activeSessionModel !== undefined ? { activeModel: activeSessionModel } : {}),
+            invocation: resolvedWorkerModel !== undefined ? { workerModel: resolvedWorkerModel } : {},
+            requireLeaseWitness: dispatchRequiresWitness,
+            ...(orchestrationWitness !== undefined ? { leaseWitness: orchestrationWitness } : {}),
+            ...(orchestrationLeaseError !== undefined ? { leaseError: orchestrationLeaseError } : {}),
+            runtime: readinessRuntime,
+            githubProbe: async () => repository ?? await github!.getRepository(),
+          };
+          await (options.dispatchReadinessCheck
+            ? options.dispatchReadinessCheck(readinessInput)
+            : assertDispatchReady(readinessInput));
+          dispatchReadinessChecked = true;
+        } finally {
+          await readinessRuntime.close();
+        }
+      };
+      let discoveredItems!: VisibleOrchestrationItem[];
+      let discoveredSchedule!: ReturnType<typeof materializeClaimDependencies>;
+      let batchPlan!: ReturnType<typeof assembleWorkUnits>;
+      let proposal!: string;
+      let proposalDigest!: string;
       if (repository?.defaultBranch) {
         github ??= new GitHubClient(ctx.cwd, orchestrationRepository);
-        authoritativeIssues = await Promise.all(issues.map((issue) => github!.getIssue(issue, repository!.repo)));
+        authoritativeIssues = await mapWithConcurrency(issues, (issue) => github!.getIssue(issue, repository!.repo));
         const mismatched = milestoneFilter
           ? authoritativeIssues.filter((observed) => observed.milestone?.title !== milestoneFilter).map((observed) => `#${observed.number}`)
           : [];
@@ -1795,76 +2042,91 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           ? await github.listBranches(repository.repo, "milestone/")
           : [];
         if (dispatchAuthorized && authoritativeIssues.some((issue) => issue.milestone)) {
+          await assertReadyBeforeMutation();
           await provisionMissingMilestoneBranches(authoritativeIssues, repository.defaultBranch, github);
           milestoneBranches = await github.listBranches(repository.repo, "milestone/");
         }
-        classifyAuthoritativeRoutes(!dispatchAuthorized);
-        await Promise.all([...new Set([...authoritativeRoutes.values()]
-          .filter((lane) => lane.resolution !== "planned-canonical")
-          .map((lane) => lane.targetBranch))]
-          .map((branch) => github!.getBranchHead(repository!.repo, branch)));
-        discoveredItems = buildVisibleOrchestrationPlan(issues, executionPlan, issueBriefs).map((item) => {
-          const observed = authoritativeIssues.find((issue) => issue.number === item.issue);
-          const lane = authoritativeRoutes.get(item.issue);
-          if (!observed || !lane) throw new Error(`Issue #${item.issue} has no authoritative lane route`);
-          const affectedFiles = affectedFilesFromIssueBody(observed.body);
-          const derivedClaims = [...new Set([...item.claims, ...affectedFiles])];
-          const derivedDependencies = executionPlan
-            ? [...item.dependencies]
-            : dependencyIssueNumbersFromBody(observed.body, new Set(issues)).map((dependency) => `issue-${dependency}`);
-          const sourcePullRequest = item.sourcePullRequest ?? sourcePullRequestFromIssueBody(observed.body);
-          const defectClass = item.defectClass ?? defectClassFromIssueBody(observed.body);
-          return {
-            ...item,
-            repository: repository!.repo,
-            targetBranch: lane.targetBranch,
-            lane: lane.kind,
-            ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
-            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-            ...(observed.milestone ? { milestone: observed.milestone } : {}),
-            title: observed.title,
-            summary: observed.body.slice(0, 4_000),
-            priority: priorityFromIssueLabels(observed.labels ?? []),
-            dependencies: derivedDependencies,
-            labels: observed.labels ?? [],
-            affectedFiles,
-            claims: derivedClaims.length ? derivedClaims : ["component:repository"],
-            ...(sourcePullRequest !== undefined ? { sourcePullRequest } : {}),
-            ...(defectClass !== undefined ? { defectClass } : {}),
-            riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels ?? []),
-          };
-        });
       } else {
-        discoveredItems = buildVisibleOrchestrationPlan(issues, executionPlan, issueBriefs);
+        authoritativeIssues = [];
       }
-      const discoveredSchedule = materializeClaimDependencies(discoveredItems);
-      const assembly = assembleWorkUnits(discoveredItems, {
-        policy: effective.batchingPolicy,
-        maxBatchSize: effective.maxBatchSize,
-        maxSensitiveBatchSize: effective.maxSensitiveBatchSize,
-        ...(priority ? { priorities: priority } : {}),
-        ...(milestoneFilter ? { milestone: milestoneFilter } : {}),
-        ...(noMilestoneFilter ? { noMilestone: true } : {}),
-        scopeExpansion: effective.scopeExpansion,
-        maxRemediationCycles: effective.maxRemediationCycles,
-      });
-      if (!assembly.selected.length) {
-        const reasons = [...new Set(assembly.excluded.map(({ reason }) => reason))].join(", ") || "policy filters";
-        throw new Error(`Orchestration selected no dispatchable issues (${reasons}). Check milestone/priority filters and issue evidence.`);
-      }
-      const batchPlan = assembly;
-      const virtualBase = Math.max(...issues) + 1;
-      const virtualBatches = batchPlan.groups.map((group, index) => ({
-        groupId: group.id,
-        issue: virtualBase + index,
-        title: `Proposed batch ${index + 1}`,
-        summary: `Proposed ${group.kind} batch for validation`,
-      }));
-      // Contract and validate before confirmation or GitHub mutation so a non-convex
-      // group cannot turn an otherwise valid DAG into a cycle after issue creation.
-      materializeClaimDependencies(contractBatchGroups(batchPlan.selected, batchPlan.groups, virtualBatches));
-      const proposal = renderOrchestrationProposal(discoveredSchedule.items as VisibleOrchestrationItem[], discoveredSchedule.edges, batchPlan.groups, maxParallel);
-      const proposalDigest = previewDigest(proposal);
+
+      // Route and schedule construction is deliberately repeatable. A
+      // confirmation-mode dispatch first builds a read-only proposal that may
+      // describe a planned milestone branch; after authorization the branch
+      // is provisioned, the authoritative catalog/routes/heads are refreshed,
+      // and this same function freezes the final schedule used for mutation.
+      const rebuildAuthoritativeSchedule = async (allowMissingMilestoneBranch: boolean): Promise<void> => {
+        if (repository?.defaultBranch) {
+          classifyAuthoritativeRoutes(allowMissingMilestoneBranch);
+          await mapWithConcurrency([...new Set([...authoritativeRoutes.values()]
+            .filter((lane) => lane.resolution !== "planned-canonical")
+            .map((lane) => lane.targetBranch))], (branch) => github!.getBranchHead(repository!.repo, branch));
+          discoveredItems = buildVisibleOrchestrationPlan(issues, executionPlan, issueBriefs).map((item) => {
+            const observed = authoritativeIssues.find((issue) => issue.number === item.issue);
+            const lane = authoritativeRoutes.get(item.issue);
+            if (!observed || !lane) throw new Error(`Issue #${item.issue} has no authoritative lane route`);
+            const affectedFiles = affectedFilesFromIssueBody(observed.body);
+            const derivedClaims = [...new Set([...item.claims, ...affectedFiles])];
+            const derivedDependencies = executionPlan
+              ? [...item.dependencies]
+              : dependencyIssueNumbersFromBody(observed.body, new Set(issues)).map((dependency) => `issue-${dependency}`);
+            const sourcePullRequest = item.sourcePullRequest ?? sourcePullRequestFromIssueBody(observed.body);
+            const defectClass = item.defectClass ?? defectClassFromIssueBody(observed.body);
+            return {
+              ...item,
+              repository: repository!.repo,
+              targetBranch: lane.targetBranch,
+              lane: lane.kind,
+              ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+              ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+              ...(observed.milestone ? { milestone: observed.milestone } : {}),
+              title: observed.title,
+              summary: observed.body.slice(0, 4_000),
+              priority: priorityFromIssueLabels(observed.labels ?? []),
+              dependencies: derivedDependencies,
+              labels: observed.labels ?? [],
+              affectedFiles,
+              claims: derivedClaims.length ? derivedClaims : ["component:repository"],
+              ...(sourcePullRequest !== undefined ? { sourcePullRequest } : {}),
+              ...(defectClass !== undefined ? { defectClass } : {}),
+              riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels ?? []),
+            };
+          });
+        } else {
+          discoveredItems = buildVisibleOrchestrationPlan(issues, executionPlan, issueBriefs);
+        }
+        discoveredSchedule = materializeClaimDependencies(discoveredItems);
+        const assembly = assembleWorkUnits(discoveredItems, {
+          policy: effective.batchingPolicy,
+          maxBatchSize: effective.maxBatchSize,
+          maxSensitiveBatchSize: effective.maxSensitiveBatchSize,
+          ...(priority ? { priorities: priority } : {}),
+          ...(milestoneFilter ? { milestone: milestoneFilter } : {}),
+          ...(noMilestoneFilter ? { noMilestone: true } : {}),
+          scopeExpansion: effective.scopeExpansion,
+          maxRemediationCycles: effective.maxRemediationCycles,
+        });
+        if (!assembly.selected.length) {
+          const reasons = [...new Set(assembly.excluded.map(({ reason }) => reason))].join(", ") || "policy filters";
+          throw new Error(`Orchestration selected no dispatchable issues (${reasons}). Check milestone/priority filters and issue evidence.`);
+        }
+        batchPlan = assembly;
+        const virtualBase = Math.max(...issues) + 1;
+        const virtualBatches = batchPlan.groups.map((group, index) => ({
+          groupId: group.id,
+          issue: virtualBase + index,
+          title: `Proposed batch ${index + 1}`,
+          summary: `Proposed ${group.kind} batch for validation`,
+        }));
+        // Contract and validate before confirmation, and again after the
+        // authorized route refresh, so a final schedule can never materialize
+        // against a stale or non-convex DAG.
+        materializeClaimDependencies(contractBatchGroups(batchPlan.selected, batchPlan.groups, virtualBatches));
+        proposal = renderOrchestrationProposal(discoveredSchedule.items as VisibleOrchestrationItem[], discoveredSchedule.edges, batchPlan.groups, maxParallel);
+        proposalDigest = previewDigest(proposal);
+      };
+
+      await rebuildAuthoritativeSchedule(!dispatchAuthorized);
       if (previewCheckpoint && proposalDigest !== previewCheckpoint.replay.proposalDigest) {
         throw new Error("The orchestration preview changed after confirmation; start a fresh preview");
       }
@@ -1892,6 +2154,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
               ...(resolvedWorkerModel !== undefined ? { workerModel: resolvedWorkerModel } : {}),
             }),
             effective: clonePreviewValue(effective),
+            runtime: clonePreviewValue(resolvedDispatchRuntime),
             proposalDigest,
           };
           orchestrationPreviewCheckpoints.set(pi, { token: previewToken, scope, replay, expiresAt });
@@ -1941,6 +2204,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         };
       }
       clearOrchestrationInvocation(pi);
+      let userAuthorized = params.confirmed === true;
       if (dispatchMode === "confirm" && !params.confirmed) {
         if (!ctx.hasUI) throw new Error("Headless orchestration requires explicit confirmed=true (--auto/--confirm)");
         const confirmationView: OrchestrationToolView = {
@@ -1960,19 +2224,36 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           details: { command: "orchestrate", args: issues.map(String), state: "running", ui: confirmationView } satisfies OrchestrationToolDetails,
         });
         if (!await ctx.ui.confirm("Launch ForgeDock DAG?", proposal)) throw new Error("ForgeDock orchestration cancelled before dispatch");
+        userAuthorized = true;
       }
       if (dispatchMode !== "authorized" && dispatchMode !== "confirm" && dispatchMode !== "auto") {
         throw new Error(`Unsupported orchestration dispatch mode: ${dispatchMode}`);
       }
 
-      github ??= new GitHubClient(ctx.cwd, orchestrationRepository);
-      repository ??= await github.getRepository();
-      const materializedResult = batchPlan.groups.length && repository
+      await assertReadyBeforeMutation();
+      if (dispatchMode === "confirm" && userAuthorized && repository?.defaultBranch
+        && authoritativeIssues.some((issue) => issue.milestone)) {
+        if (!github) throw new Error("ForgeDock dispatch lost its GitHub client before milestone branch provisioning");
+        // Confirmation authorizes the otherwise read-only branch write. Read
+        // the resulting catalog and branch heads again before freezing the
+        // schedule that can create batch issues or launch workers.
+        await provisionMissingMilestoneBranches(authoritativeIssues, repository.defaultBranch, github);
+        milestoneBranches = await github.listBranches(repository.repo, "milestone/");
+        await rebuildAuthoritativeSchedule(false);
+      }
+      // Operational task recovery is authorized only after the dispatch
+      // barrier has passed. Preview/dry-run paths return above without
+      // adopting, blocking, or terminating persisted controller processes.
+      backgroundTasks.initialize(ctx);
+      const readyGithub = github;
+      const readyRepository = repository;
+      if (!readyGithub || !readyRepository) throw new Error("ForgeDock dispatch lost its GitHub repository context before mutation");
+      const materializedResult = batchPlan.groups.length
         ? await materializeBatchGroups({
-          repo: repository.repo,
+          repo: readyRepository.repo,
           groups: batchPlan.groups,
           items: batchPlan.selected,
-          host: github,
+          host: readyGithub,
           expectedRoutes: new Map([...authoritativeRoutes.entries()].map(([issue, lane]) => [issue, {
             targetBranch: lane.targetBranch,
             lane: lane.kind,
@@ -1991,7 +2272,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         schemaVersion: 1,
         phase: "dispatching",
         invocationLabel,
-        repository: repository.repo,
+        repository: readyRepository.repo,
         selectedIssueCount: issues.length,
         workUnitCount: schedule.items.length,
         initialReadyCount: preview.initialReady.length,
@@ -2008,8 +2289,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         details: { command: "orchestrate", args: issues.map(String), state: "running", ui: dispatchingView } satisfies OrchestrationToolDetails,
       });
       const workerModel = resolvedWorkerModel;
-      const nativeWorker = controllerWorkerSelection(workerModel, config.workerThinking);
-      const artifacts = new GitHubArtifactRepository(github);
+      const nativeWorker = controllerWorkerSelection(workerModel, resolvedDispatchRuntime.worker.thinking);
+      const artifacts = new GitHubArtifactRepository(readyGithub);
       orchestrationCwd = ctx.cwd;
       orchestrationContext = ctx;
       const dynamicItems = schedule.items as VisibleOrchestrationItem[];
@@ -2019,7 +2300,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         maxParallel,
         maxDecompositionChildren: effective.maxRemediationChildren,
         maxDecompositionDepth: effective.maxRemediationDepth,
-        repository: repository!.repo,
+        repository: readyRepository.repo,
         autoMerge,
         plan: {
           adapter: "tui",
@@ -2031,8 +2312,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           workerProvider: nativeWorker.provider ?? null,
           workerModel: nativeWorker.model ?? null,
           workerThinking: nativeWorker.thinking ?? null,
-          planningModel: config.planningModel ?? null,
-          planningThinking: config.planningThinking ?? null,
+          reviewerProvider: resolvedDispatchRuntime.reviewer.provider ?? null,
+          reviewerModel: resolvedDispatchRuntime.reviewer.model ?? null,
+          reviewerThinking: resolvedDispatchRuntime.reviewer.thinking ?? null,
+          planningProvider: resolvedDispatchRuntime.planning.provider ?? null,
+          planningModel: resolvedDispatchRuntime.planning.model ?? null,
+          planningThinking: resolvedDispatchRuntime.planning.thinking ?? null,
           routingKind: routing?.kind ?? null,
           routingRationale: routing?.rationale ?? null,
           proposalDigest,
@@ -2040,10 +2325,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         serializationEdges: schedule.edges,
         resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeVisibleDecomposition({
-          github,
+          github: readyGithub,
           artifacts,
-          repository: repository!.repo,
-          defaultBranch: repository!.defaultBranch,
+          repository: readyRepository.repo,
+          defaultBranch: readyRepository.defaultBranch,
           effective,
           orchestration: durable,
           node,
@@ -2068,6 +2353,11 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 resolveConflict: resolveConflict === true,
                 ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
                 dependencies: item.dependencies.map(issueNumberFromId),
+                ...(resolvedWorkerModel !== undefined ? { workerModel: resolvedWorkerModel } : {}),
+                ...(resolvedReviewerModel !== undefined ? { reviewerModel: resolvedReviewerModel } : {}),
+                ...(resolvedDispatchRuntime.reviewer.thinking !== undefined ? { reviewerThinking: resolvedDispatchRuntime.reviewer.thinking } : {}),
+                ...(resolvedPlanningModel !== undefined ? { planningModel: resolvedPlanningModel } : {}),
+                ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
               },
             { issue: item.issue, title: item.title, summary: item.summary },
             ),
@@ -2091,6 +2381,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
                 dependencies: item.dependencies.map(issueNumberFromId),
                 ...nativeWorker,
+                ...(resolvedReviewerModel !== undefined ? { reviewerModel: resolvedReviewerModel } : {}),
+                ...(resolvedDispatchRuntime.reviewer.thinking !== undefined ? { reviewerThinking: resolvedDispatchRuntime.reviewer.thinking } : {}),
+                ...(resolvedPlanningModel !== undefined ? { planningModel: resolvedPlanningModel } : {}),
+                ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
               }),
               cwd: ctx.cwd,
               env: {
@@ -2103,14 +2397,13 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           waitControllerTask: async (taskId: string) => await backgroundTasks.waitForTerminal(taskId),
         } : {}),
         assertCompleted: async (item) => {
-          repository ??= await github.getRepository();
-          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: repository.repo, issue: item.issue }));
+          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: readyRepository.repo, issue: item.issue }));
           if (reconciled.state === "completed") return;
           if (reconciled.state === "invalid") {
             return { status: "invalid", error: `#${item.issue} was classified invalid; no delivery work was performed` };
           }
           if (reconciled.state === "decomposed") {
-            const issueArtifacts = await artifacts.list({ repo: repository.repo, issue: item.issue });
+            const issueArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: item.issue });
             return {
               status: "skipped",
               error: `#${item.issue} decomposed into authoritative child work`,
@@ -2120,7 +2413,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
-          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: repository.repo, issue: item.issue }), reconciled);
+          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: readyRepository.repo, issue: item.issue }), reconciled);
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
         },
@@ -2805,6 +3098,16 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
   const frozenWorkerModel = frozenWorker.provider && frozenWorker.model
     ? modelWithThinking(`${frozenWorker.provider}/${frozenWorker.model}`, frozenWorker.thinking)
     : frozenWorker.model ? modelWithThinking(frozenWorker.model, frozenWorker.thinking) : undefined;
+  const frozenReviewerModel = orchestrationMetadataString(record.plan, "reviewerProvider")
+    && orchestrationMetadataString(record.plan, "reviewerModel")
+    ? `${orchestrationMetadataString(record.plan, "reviewerProvider")}/${orchestrationMetadataString(record.plan, "reviewerModel")}`
+    : undefined;
+  const frozenReviewerThinking = orchestrationMetadataThinking(record.plan, "reviewerThinking");
+  const frozenPlanningModel = orchestrationMetadataString(record.plan, "planningProvider")
+    && orchestrationMetadataString(record.plan, "planningModel")
+    ? `${orchestrationMetadataString(record.plan, "planningProvider")}/${orchestrationMetadataString(record.plan, "planningModel")}`
+    : undefined;
+  const frozenPlanningThinking = orchestrationMetadataThinking(record.plan, "planningThinking");
   const github = new GitHubClient(cwd);
   const checkout = await github.getRepository();
   const artifacts = new GitHubArtifactRepository(github);
@@ -2879,6 +3182,10 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
             ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
             dependencies: item.dependencies.map(issueNumberFromId),
             ...frozenWorker,
+            ...(frozenReviewerModel !== undefined ? { reviewerModel: frozenReviewerModel } : {}),
+            ...(frozenReviewerThinking !== undefined ? { reviewerThinking: frozenReviewerThinking } : {}),
+            ...(frozenPlanningModel !== undefined ? { planningModel: frozenPlanningModel } : {}),
+            ...(frozenPlanningThinking !== undefined ? { planningThinking: frozenPlanningThinking } : {}),
           }),
           cwd,
           env: {
@@ -2904,6 +3211,11 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
           resolveConflict: resolveConflict === true,
           ...(adjudicationReason !== undefined ? { adjudicateVerification: adjudicationReason } : {}),
           dependencies: item.dependencies.map(issueNumberFromId),
+          ...(frozenWorkerModel !== undefined ? { workerModel: frozenWorkerModel } : {}),
+          ...(frozenReviewerModel !== undefined ? { reviewerModel: frozenReviewerModel } : {}),
+          ...(frozenReviewerThinking !== undefined ? { reviewerThinking: frozenReviewerThinking } : {}),
+          ...(frozenPlanningModel !== undefined ? { planningModel: frozenPlanningModel } : {}),
+          ...(frozenPlanningThinking !== undefined ? { planningThinking: frozenPlanningThinking } : {}),
         }, { issue: item.issue, title: item.title ?? `Issue #${item.issue}`, summary: item.summary ?? "Resumed from durable orchestration state" }),
         cwd,
         ...(frozenWorkerModel !== undefined ? { model: frozenWorkerModel } : {}),
@@ -2948,6 +3260,10 @@ function buildIssueWorkerControllerArgs(
     provider?: string;
     model?: string;
     thinking?: ThinkingLevel;
+    reviewerModel?: string;
+    reviewerThinking?: ThinkingLevel;
+    planningModel?: string;
+    planningThinking?: ThinkingLevel;
   },
 ): string[] {
   const args = [String(issue), "--repo", options.repository, options.autoMerge ? "--auto-merge" : "--no-auto-merge", "--scope-expansion", options.scopeExpansion,
@@ -2962,6 +3278,10 @@ function buildIssueWorkerControllerArgs(
   if (options.provider) args.push("--provider", options.provider);
   if (options.model) args.push("--model", options.model);
   if (options.thinking) args.push("--thinking", options.thinking);
+  if (options.reviewerModel) args.push("--reviewer-model", options.reviewerModel);
+  if (options.reviewerThinking) args.push("--reviewer-thinking", options.reviewerThinking);
+  if (options.planningModel) args.push("--planning-model", options.planningModel);
+  if (options.planningThinking) args.push("--planning-thinking", options.planningThinking);
   return args;
 }
 
@@ -3038,6 +3358,11 @@ function buildIssueWorkerTask(
     resolveConflict?: boolean;
     adjudicateVerification?: string;
     dependencies: number[];
+    workerModel?: string;
+    reviewerModel?: string;
+    reviewerThinking?: ThinkingLevel;
+    planningModel?: string;
+    planningThinking?: ThinkingLevel;
   },
   brief: { issue: number; title: string; summary: string } | undefined,
 ): string {
@@ -3046,7 +3371,7 @@ function buildIssueWorkerTask(
     brief ? `Issue brief — ${brief.title}: ${brief.summary}` : "No issue brief was supplied; escalate rather than guessing if the controller request is ambiguous.",
     "If scope, product intent, or a risky decision is genuinely ambiguous, call contact_supervisor with need_decision or interview_request and wait for the reply.",
     `Resolved controller policy (workers cannot override): batching=${options.batching}; scopeExpansion=${options.scopeExpansion}; maxRemediationCycles=${options.maxRemediationCycles}; maxRemediationDepth=${options.maxRemediationDepth}; maxRemediationChildren=${options.maxRemediationChildren}.`,
-    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume, ...(options.resolveConflict ? { resolveConflict: true } : {}), ...(options.adjudicateVerification ? { adjudicateVerification: options.adjudicateVerification } : {}) })}`,
+    `When ready, call forgedock_work_on exactly once with: ${JSON.stringify({ issue, repo: options.repository, dependencies: options.dependencies, autoMerge: options.autoMerge, scopeExpansion: options.scopeExpansion, maxRemediationCycles: options.maxRemediationCycles, maxRemediationDepth: options.maxRemediationDepth, maxRemediationChildren: options.maxRemediationChildren, rerun: Boolean(options.rerun), resume: options.resume, ...(options.resolveConflict ? { resolveConflict: true } : {}), ...(options.adjudicateVerification ? { adjudicateVerification: options.adjudicateVerification } : {}), ...(options.workerModel ? { workerModel: options.workerModel } : {}), ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}), ...(options.reviewerThinking ? { reviewerThinking: options.reviewerThinking } : {}), ...(options.planningModel ? { planningModel: options.planningModel } : {}), ...(options.planningThinking ? { planningThinking: options.planningThinking } : {}) })}`,
     "The native tool is the only mutation path. Do not perform independent edits or GitHub actions. Never launch a lifecycle controller through bash/shell, never impose a wall-clock timeout, and never retry outside the semantic tool. Report its final state and any required human action.",
   ].join("\n");
 }
@@ -3064,6 +3389,13 @@ async function startNativeControllerTask(
 ): Promise<string> {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
+  // The caller has crossed the typed dispatch-readiness barrier. Only now may
+  // persisted native tasks be adopted or terminalized for recovery.
+  tasks.initialize(ctx);
+  if (spec.launchKey) {
+    const existing = tasks.findByLaunchKey(spec.launchKey);
+    if (existing) return existing.id;
+  }
   const nestedBridge = await startNestedAgentBridge(pi);
   let claimPromotionServer: OrchestrationClaimPromotionServer | undefined;
   try {
@@ -3103,6 +3435,7 @@ async function startNativeControllerTask(
       env,
       restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
       resumeScope: "orchestration",
+      ...(spec.launchKey !== undefined ? { launchKey: spec.launchKey } : {}),
       cleanup: async () => {
         await Promise.all([
           nestedBridge.close(),
@@ -3150,6 +3483,10 @@ async function runControllerToolBackground(
     ...(config.maxReviewSpecialists ? { FORGEDOCK_MAX_REVIEW_SPECIALISTS: String(config.maxReviewSpecialists) } : {}),
   };
   try {
+    // Background workflow invocation is an explicit dispatch boundary. Keep
+    // startup/preview/dry-run paths read-only and perform operational recovery
+    // only immediately before launching an authorized controller.
+    if (!args.includes("--dry-run")) tasks.initialize(ctx);
     const record = tasks.start({
       command: process.execPath,
       args: [entry, command, ...args, ...modelArgs],
@@ -3290,10 +3627,29 @@ function normalizedModelTokens(value: string): string[] {
   return [...new Set(value.toLowerCase().match(/[a-z]+|\d+/g) ?? [])];
 }
 
+/**
+ * Transport identity is deliberately derived from the durable attempt rather
+ * than from a random child/run id.  This lets a restarted supervisor ask the
+ * transport for the exact launch that may have escaped before recordTask().
+ */
+export function orchestrationTransportKey(identity: OrchestrationTransportIdentity): string {
+  return [identity.orchestrationId, identity.nodeId, identity.attemptId]
+    .map((value) => encodeURIComponent(value))
+    .join("/");
+}
+
+function piLaunchOutputPath(cwd: string, launchKey: string): string {
+  const digest = createHash("sha256").update(launchKey).digest("hex").slice(0, 24);
+  return join(cwd, ".forgedock", `orchestration-worker-${digest}.log`);
+}
+
 export class VisibleDagDelegator {
   private readonly waiting = new Map<string, { resolve: (event: unknown) => void }>();
   private readonly completedAsyncRuns = new Set<string>();
   private readonly active = new Set<string>();
+  private readonly shutdownController = new AbortController();
+  /** In-process Pi fallback receipt; durable transport records cover native tasks. */
+  private readonly piLaunches = new Map<string, string>();
   private readonly runs = new Map<string, StoredDagRun>();
   private readonly unsubscribe: (() => void) | undefined;
 
@@ -3429,6 +3785,7 @@ export class VisibleDagDelegator {
   }
 
   async shutdown(): Promise<boolean> {
+    this.shutdownController.abort(new Error("ForgeDock TUI shutdown"));
     const active = [...this.active];
     await Promise.allSettled(active.map((id) => callSubagentRpc(this.pi, "stop", { id })));
     for (const id of active) {
@@ -3468,6 +3825,7 @@ export class VisibleDagDelegator {
       repository: this.repository(),
       executionAdmission: this.admission(),
       transportCapacity: () => this.transportCapacity(getStored()),
+      signal: this.shutdownController.signal,
       ...(input.maxDecompositionChildren !== undefined ? { maxDecompositionChildren: input.maxDecompositionChildren } : {}),
       ...(input.maxDecompositionDepth !== undefined ? { maxDecompositionDepth: input.maxDecompositionDepth } : {}),
       ...(input.revalidateRoute ? {
@@ -3503,13 +3861,27 @@ export class VisibleDagDelegator {
         const recovery: DagRecoveryMode = explicitlyRerun
           ? "rerun"
           : context.recovery === "initial" ? "initial" : "resume";
+        const launchIdentity: OrchestrationTransportIdentity = {
+          orchestrationId: stored.id,
+          nodeId: item.id,
+          attemptId: context.attemptId,
+        };
+        const launchKey = orchestrationTransportKey(launchIdentity);
         const startControllerTask = input.startControllerTask ?? this.directControllerTransport?.start;
         const waitControllerTask = input.waitControllerTask ?? this.directControllerTransport?.wait;
         if (input.controllerTaskFor && startControllerTask && waitControllerTask) {
           const spec = input.controllerTaskFor(item, recovery, adjudication, explicitlyResolveConflict);
-          const taskId = await startControllerTask({
+          const controllerSpec: ControllerTaskSpec = {
             ...spec,
-            env: { ...(spec.env ?? {}), FORGEDOCK_ORCHESTRATION_ID: stored.id },
+            launchIdentity,
+            launchKey,
+            env: {
+              ...(spec.env ?? {}),
+              FORGEDOCK_ORCHESTRATION_ID: stored.id,
+              FORGEDOCK_ORCHESTRATION_NODE: item.id,
+              FORGEDOCK_ORCHESTRATION_ATTEMPT: context.attemptId,
+              FORGEDOCK_ORCHESTRATION_LAUNCH_KEY: launchKey,
+            },
             claimPromotion: {
               identity: {
                 orchestrationId: stored.id,
@@ -3525,7 +3897,15 @@ export class VisibleDagDelegator {
                 }
               },
             },
-          });
+          };
+          const findControllerTask = input.findControllerTask
+            ?? (this.directControllerTransport?.findByLaunchIdentity
+              ? (identity: OrchestrationTransportIdentity) => this.directControllerTransport!.findByLaunchIdentity!(identity)
+              : undefined);
+          const existingTaskId = findControllerTask
+            ? await findControllerTask(launchIdentity)
+            : undefined;
+          const taskId = existingTaskId ?? await startControllerTask(controllerSpec);
           stored.directChildRunIds.add(taskId);
           if (!stored.childRunIds.includes(taskId)) stored.childRunIds.push(taskId);
           await context.recordTask({ taskId, controllerTaskId: taskId });
@@ -3554,17 +3934,23 @@ export class VisibleDagDelegator {
           }
         }
 
-        const response = await callSubagentRpc(this.pi, "spawn", {
-          ...input.taskFor(item, recovery, adjudication, explicitlyResolveConflict),
-          async: true,
-          context: "fresh",
-          artifacts: true,
-        });
-        const runId = asyncRunId(response);
+        const rememberedRunId = this.piLaunches.get(launchKey);
+        const runId = rememberedRunId ?? await this.launchPiWorker(
+          input,
+          item,
+          recovery,
+          adjudication,
+          explicitlyResolveConflict,
+          launchKey,
+        );
+        this.piLaunches.set(launchKey, runId);
+        // Mark the receipt before recordTask(). A supervisor can lose the
+        // durable acknowledgement at exactly this boundary; recovery must
+        // still wait on the one Pi run rather than launching a replacement.
+        this.active.add(runId);
         if (!stored.childRunIds.includes(runId)) stored.childRunIds.push(runId);
         await context.recordTask({ agentTaskId: runId, runId });
         stored.notifyFirstDispatch();
-        this.active.add(runId);
         const heartbeat = startDagWorkerHeartbeat(context, () => {
           void callSubagentRpc(this.pi, "stop", { id: runId }).catch(() => undefined);
         });
@@ -3591,11 +3977,39 @@ export class VisibleDagDelegator {
     });
   }
 
+  private async launchPiWorker(
+    input: VisibleDagInput,
+    item: VisibleOrchestrationItem,
+    recovery: DagRecoveryMode,
+    adjudication: string | undefined,
+    resolveConflict: boolean,
+    launchKey: string,
+  ): Promise<string> {
+    const task = input.taskFor(item, recovery, adjudication, resolveConflict);
+    // pi-subagents generates its own run id and does not expose a caller
+    // supplied idempotency field.  Keep the exact launch key in the persisted
+    // output path (and in the worker prompt) so a recovery query can identify
+    // the already-running fallback run without starting another one.
+    const response = await callSubagentRpc(this.pi, "spawn", {
+      ...task,
+      task: `${task.task}\n\nForgeDock launch identity (opaque; do not change): ${launchKey}`,
+      output: piLaunchOutputPath(task.cwd, launchKey),
+      outputMode: "file-only",
+      async: true,
+      context: "fresh",
+      artifacts: true,
+    });
+    return asyncRunId(response);
+  }
+
   private transportCapacity(stored: StoredDagRun | undefined): number {
     const records = this.directControllerTransport?.list?.();
     if (!records) return 4;
-    const owned = new Set((stored?.durableRecord.nodes ?? []).flatMap((node) =>
-      (node.attempts ?? []).flatMap((attempt) => attempt.taskId ? [attempt.taskId] : [])));
+    const owned = new Set([
+      ...(stored?.directChildRunIds ?? []),
+      ...(stored?.durableRecord.nodes ?? []).flatMap((node) =>
+        (node.attempts ?? []).flatMap((attempt) => attempt.taskId ? [attempt.taskId] : [])),
+    ]);
     const externalActive = records.filter((record) =>
       (record.status === "running" || record.status === "detached")
       && (this.directControllerTransport?.isActive?.(record.id) ?? true)
@@ -3605,19 +4019,77 @@ export class VisibleDagDelegator {
     return available;
   }
 
+  private async findPiRunByLaunchKey(cwd: string, launchKey: string): Promise<string | undefined> {
+    const outputName = piLaunchOutputPath(cwd, launchKey).split(/[\\/]/).pop();
+    if (!outputName) return undefined;
+    try {
+      // The bundled Pi bridge has no caller-selected run id. Its status list
+      // does expose the deterministic output path, which is enough to adopt a
+      // live run after the supervisor lost the recordTask acknowledgement.
+      const response = await callSubagentRpc(this.pi, "status", undefined, undefined, 500);
+      const text = typeof response === "object" && response !== null && "text" in response
+        ? String((response as { text?: unknown }).text ?? "")
+        : "";
+      const lines = text.split(/\r?\n/);
+      let candidate: string | undefined;
+      for (const line of lines) {
+        const header = /^-\s+([^\s|]+)\s+\|/.exec(line);
+        if (header) candidate = header[1];
+        if (candidate && line.includes(outputName)) return candidate;
+      }
+    } catch {
+      // A child-safe/older Pi bridge may not implement status listing. The
+      // native transport and the in-process receipt remain authoritative.
+    }
+    return undefined;
+  }
+
   private async reconcileWorker(
     stored: StoredDagRun,
     item: VisibleOrchestrationItem,
     attempt: Readonly<OrchestrationWorkerAttemptRecord> | undefined,
   ): Promise<OrchestrationWorkerReconciliation> {
-    const taskId = attempt?.taskId ?? attempt?.controllerTaskId;
+    const launchIdentity = attempt ? {
+      orchestrationId: stored.id,
+      nodeId: item.id,
+      attemptId: attempt.attemptId,
+    } satisfies OrchestrationTransportIdentity : undefined;
+    const launchKey = launchIdentity ? orchestrationTransportKey(launchIdentity) : undefined;
+    const transport = stored.input.waitControllerTask && this.directControllerTransport
+      ? { ...this.directControllerTransport, wait: stored.input.waitControllerTask }
+      : this.directControllerTransport;
+    const findControllerTask = stored.input.findControllerTask
+      ?? (transport?.findByLaunchIdentity
+        ? (identity: OrchestrationTransportIdentity) => transport!.findByLaunchIdentity!(identity)
+        : undefined);
+    const taskId = attempt?.taskId
+      ?? attempt?.controllerTaskId
+      ?? (launchIdentity && findControllerTask ? await findControllerTask(launchIdentity) : undefined);
     if (taskId) {
-      const transport = stored.input.waitControllerTask && this.directControllerTransport
-        ? { ...this.directControllerTransport, wait: stored.input.waitControllerTask }
-        : this.directControllerTransport;
       const record = transport?.list?.().find((candidate) => candidate.id === taskId);
       if ((record?.status === "running" || record?.status === "detached")
         && (transport?.isActive?.(taskId) ?? true)) {
+        return {
+          disposition: "live",
+          ...(attempt?.attemptId !== undefined ? { attemptId: attempt.attemptId } : {}),
+          identity: { taskId, controllerTaskId: taskId },
+          wait: async () => {
+            const taskRecord = await transport!.wait(taskId);
+            try {
+              return await stored.input.assertCompleted(item);
+            } catch (error) {
+              if (taskRecord?.status === "blocked") {
+                return {
+                  status: "suspended",
+                  error: `Native controller task ${taskId} stopped at a resumable checkpoint: ${error instanceof Error ? error.message : String(error)}`,
+                };
+              }
+              throw error;
+            }
+          },
+        };
+      }
+      if (!record && (transport?.list === undefined || (transport.isActive?.(taskId) ?? true))) {
         return {
           disposition: "live",
           ...(attempt?.attemptId !== undefined ? { attemptId: attempt.attemptId } : {}),
@@ -3646,8 +4118,16 @@ export class VisibleDagDelegator {
       }
     }
 
-    const runId = attempt?.agentTaskId ?? attempt?.runId;
-    if (runId && this.active.has(runId)) {
+    const persistedRunId = attempt?.agentTaskId ?? attempt?.runId;
+    const discoveredPiRunId = persistedRunId === undefined && launchKey
+      ? await this.findPiRunByLaunchKey(stored.input.taskFor(item, "resume").cwd, launchKey)
+      : undefined;
+    const runId = persistedRunId
+      ?? (launchKey ? this.piLaunches.get(launchKey) : undefined)
+      ?? discoveredPiRunId;
+    if (runId && (this.active.has(runId) || discoveredPiRunId === runId)) {
+      if (launchKey) this.piLaunches.set(launchKey, runId);
+      this.active.add(runId);
       return {
         disposition: "live",
         ...(attempt?.attemptId !== undefined ? { attemptId: attempt.attemptId } : {}),
@@ -3785,6 +4265,7 @@ async function callSubagentRpc(
   method: "ping" | "spawn" | "status" | "steer" | "stop" | "resume",
   params: unknown,
   signal?: AbortSignal,
+  timeoutMs = 30_000,
 ): Promise<unknown> {
   const requestId = crypto.randomUUID();
   const replyEvent = `subagents:rpc:v1:reply:${requestId}`;
@@ -3803,7 +4284,7 @@ async function callSubagentRpc(
       finish(() => reply.success ? resolve(reply.data) : reject(new Error(reply.error?.message ?? "Subagent RPC failed")));
     });
     const abort = () => finish(() => reject(new Error("Subagent delegation cancelled")));
-    const timer = setTimeout(() => finish(() => reject(new Error("Timed out waiting for bundled subagent runtime"))), 30_000);
+    const timer = setTimeout(() => finish(() => reject(new Error("Timed out waiting for bundled subagent runtime"))), timeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     pi.events.emit("subagents:rpc:v1:request", {
       version: 1,

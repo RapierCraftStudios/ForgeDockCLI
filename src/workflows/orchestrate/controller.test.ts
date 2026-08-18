@@ -808,6 +808,95 @@ describe("OrchestrationController", () => {
     assert.equal(result.record.effectiveMaxParallel, 2);
   });
 
+  it("keeps queued nodes durable when live transport capacity drops and later recovers", async () => {
+    const repository = new InMemoryOrchestrationRepository();
+    const gates = new Map(["a", "b", "c"].map((id) => [id, deferred<void>()] as const));
+    const started: string[] = [];
+    let available = 2;
+    let active = 0;
+    let maximumActive = 0;
+    const service = controller(repository, async (scheduled) => {
+      started.push(scheduled.id);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await gates.get(scheduled.id)!.promise;
+      active -= 1;
+    }, {
+      transportCapacity: () => available,
+    });
+    const execution = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 4,
+      items: [item("a", 1), item("b", 2), item("c", 3)],
+    });
+
+    await waitUntil(() => started.length === 2, "live transport capacity was not filled");
+    available = 0;
+    gates.get("a")!.resolve();
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    assert.deepEqual(started, ["a", "b"], "queued work must wait while transport capacity is unavailable");
+
+    available = 2;
+    gates.get("b")!.resolve();
+    await waitUntil(() => started.length === 3, "queued work did not resume after transport capacity recovered");
+    gates.get("c")!.resolve();
+
+    const result = await execution;
+    assert.equal(result.record.status, "completed");
+    assert.deepEqual(result.schedule.startOrder, ["a", "b", "c"]);
+    assert.equal(maximumActive, 2);
+    assert.equal(active, 0);
+    assert.equal(result.record.transportCapacity, 2);
+    assert.equal(result.record.effectiveMaxParallel, 2);
+  });
+
+  it("persists a terminally complete 500-node controller fleet with exactly one attempt per node", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const launches = new Map<string, number>();
+    let active = 0;
+    let maximumActive = 0;
+    const service = controller(repository, async (scheduled) => {
+      launches.set(scheduled.id, (launches.get(scheduled.id) ?? 0) + 1);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active -= 1;
+    }, { transportCapacity: 20 });
+    const items = Array.from({ length: 500 }, (_, index) => ({
+      ...item(
+        `fleet-${index + 1}`,
+        20_000 + index,
+        index >= 100 && index % 5 === 0 ? [`fleet-${index - 99}`] : [],
+      ),
+      // Keep a representative mix of concrete claims in the persistence
+      // accounting without turning this correctness test into a dense graph.
+      ...(index % 10 === 0 ? { claims: [`src/components/${index % 8}/file.ts`] } : {}),
+    }));
+
+    const result = await service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 20,
+      items,
+    });
+    const durable = await repository.loadOrchestration(result.orchestrationId);
+
+    assert.equal(result.record.status, "completed");
+    assert.equal(durable?.status, "completed");
+    assert.equal(durable?.nodes.length, 500);
+    assert.equal(launches.size, 500);
+    assert.ok([...launches.values()].every((count) => count === 1));
+    assert.ok(durable?.nodes.every((node) => node.status === "completed"));
+    assert.ok(durable?.nodes.every((node) => node.activeAttemptId === undefined));
+    assert.ok(durable?.nodes.every((node) => node.attempts?.length === 1 && node.attempts[0]?.status === "completed"));
+    assert.ok(maximumActive > 1);
+    assert.ok(maximumActive <= 20);
+    assert.equal(active, 0);
+
+    const serializedBytes = repository.saves.reduce((total, record) => total + JSON.stringify(record).length, 0);
+    assert.ok(repository.saves.length <= 1_200, `scheduler persistence amplification: ${repository.saves.length} full saves`);
+    assert.ok(serializedBytes <= 170_000_000, `scheduler serialization amplification: ${serializedBytes} bytes`);
+  });
+
   it("admits only one controller execution for the same orchestration", async () => {
     const repository = new InMemoryOrchestrationRepository();
     const admission = new TestExecutionAdmission();

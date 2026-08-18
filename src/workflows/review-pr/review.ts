@@ -6,8 +6,9 @@ import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import { AgentRunError } from "../../runtime/agent-runtime.js";
-import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
+import { AgentExecutionInterruptedError, AgentRunError } from "../../runtime/agent-runtime.js";
+import { scopeManifestFor, type AgentEvent, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
+import { SemanticIdleWatchdog } from "../../runtime/semantic-idle.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
@@ -82,16 +83,15 @@ class ReviewWaveIncompleteError extends Error {
   }
 }
 
-export class ReviewerAttemptTimeoutError extends AgentRunError {
+export class ReviewerAttemptTimeoutError extends AgentExecutionInterruptedError {
   readonly taskId: string;
   readonly timeoutMs: number;
-  readonly drainExpired: boolean;
 
   constructor(
     taskId: string,
     timeoutMs: number,
     sessionRef?: string,
-    options: { drainExpired?: boolean; drainMs?: number; resumable?: boolean; cause?: unknown } = {},
+    options: { drainExpired?: boolean; drainMs?: number; resumable?: boolean; cause?: unknown; lastProgressAt?: number } = {},
   ) {
     const drainExpired = options.drainExpired === true;
     const sessionIdentity = sessionRef ? ` (session ${sessionRef})` : "";
@@ -99,13 +99,17 @@ export class ReviewerAttemptTimeoutError extends AgentRunError {
       ? `; abort was requested but the attempt did not settle within the ${options.drainMs ?? 0}ms drain window`
       : "";
     super(`Reviewer attempt ${taskId}${sessionIdentity} timed out after ${timeoutMs}ms${drainDetail}`, {
+      reason: "semantic-idle",
+      idleMs: timeoutMs,
+      drainExpired,
+      ...(options.drainMs !== undefined ? { drainMs: options.drainMs } : {}),
+      ...(options.lastProgressAt !== undefined ? { lastProgressAt: options.lastProgressAt } : {}),
       ...(sessionRef !== undefined ? { sessionRef, resumable: !drainExpired && options.resumable !== false } : {}),
       ...(options.cause !== undefined ? { cause: options.cause } : {}),
     });
     this.name = "ReviewerAttemptTimeoutError";
     this.taskId = taskId;
     this.timeoutMs = timeoutMs;
-    this.drainExpired = drainExpired;
   }
 }
 
@@ -120,7 +124,7 @@ export function resolveReviewerAttemptTimeoutMs(explicit?: number): number | und
 }
 
 async function withReviewerAttemptTimeout<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
+  operation: (signal: AbortSignal, markProgress: (event?: AgentEvent) => void) => Promise<T>,
   input: {
     externalSignal?: AbortSignal;
     timeoutMs?: number;
@@ -133,41 +137,83 @@ async function withReviewerAttemptTimeout<T>(
 ): Promise<T> {
   const controller = new AbortController();
   let timeoutError: ReviewerAttemptTimeoutError | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
-  const abortFromCaller = () => controller.abort(input.externalSignal?.reason);
+  let watchdog: SemanticIdleWatchdog | undefined;
+  let resolveTimeout!: (lastProgressAt: number) => void;
+  let rejectExternal!: (reason: unknown) => void;
+  const externalAbort = new Promise<{ status: "external-abort"; reason: unknown }>((resolve) => {
+    rejectExternal = (reason) => resolve({ status: "external-abort", reason });
+  });
+  const abortFromCaller = () => {
+    const reason = input.externalSignal?.reason ?? new Error("Reviewer attempt aborted");
+    controller.abort(reason);
+    rejectExternal(reason);
+  };
   if (input.externalSignal) {
     input.externalSignal.addEventListener("abort", abortFromCaller, { once: true });
     if (input.externalSignal.aborted) abortFromCaller();
   }
   try {
     type Settlement = { status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown };
+    const markProgress = (event?: AgentEvent) => watchdog?.markProgress(event);
     const operationResult: Promise<Settlement> = Promise.resolve()
-      .then(() => operation(controller.signal))
+      .then(() => operation(controller.signal, markProgress))
       .then(
         (value) => ({ status: "fulfilled" as const, value }),
         (reason: unknown) => ({ status: "rejected" as const, reason }),
       );
     if (input.timeoutMs === undefined) {
-      const settlement = await operationResult;
+      const settlement = await Promise.race([operationResult, externalAbort]);
+      if (settlement.status === "external-abort") {
+        const drainExpired = new Promise<{ status: "drain-expired" }>((resolve) => {
+          drainTimer = setTimeout(() => resolve({ status: "drain-expired" }), DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS);
+        });
+        const drained = await Promise.race([operationResult, drainExpired]);
+        if (drained.status === "drain-expired") {
+          input.onDrainExpired?.();
+          void operationResult.catch(() => undefined);
+        }
+        throw settlement.reason;
+      }
       if (settlement.status === "fulfilled") return settlement.value;
       throw settlement.reason;
     }
     const timeoutMs = input.timeoutMs;
     const timeoutResult = new Promise<{ status: "timed-out" }>((resolve) => {
-      timer = setTimeout(() => {
+      resolveTimeout = (lastProgressAt) => {
         timeoutError = new ReviewerAttemptTimeoutError(
           input.taskId,
           timeoutMs,
           input.getSessionRef?.() ?? input.sessionRef,
+          { lastProgressAt },
         );
         controller.abort(timeoutError);
         resolve({ status: "timed-out" });
-      }, timeoutMs);
+      };
     });
-    const first = await Promise.race([operationResult, timeoutResult]);
+    watchdog = new SemanticIdleWatchdog({ idleMs: timeoutMs, onIdle: (lastProgressAt) => resolveTimeout(lastProgressAt) });
+    const first = await Promise.race([operationResult, timeoutResult, externalAbort]);
+    if (first.status === "external-abort") {
+      const drainMs = reviewerCancellationDrainMs(timeoutMs);
+      const drainExpired = new Promise<{ status: "drain-expired" }>((resolve) => {
+        drainTimer = setTimeout(() => resolve({ status: "drain-expired" }), drainMs);
+      });
+      const drained = await Promise.race([operationResult, drainExpired]);
+      if (drained.status === "drain-expired") {
+        input.onDrainExpired?.();
+        void operationResult.catch(() => undefined);
+      }
+      // Explicit caller cancellation remains authoritative even when the
+      // provider eventually returns a value; the settlement is consumed so a
+      // replacement workflow cannot overlap the owned reviewer attempt.
+      throw first.reason;
+    }
     if (first.status === "fulfilled") return first.value;
     if (first.status === "rejected") throw first.reason;
+
+    // Freeze the semantic-idle deadline while the already-aborted provider
+    // attempt is reconciled. A replacement is never started concurrently.
+    watchdog.stop();
 
     // A timeout is an abort request, not proof that the provider-backed
     // attempt stopped. Reconcile the same in-flight operation before deciding
@@ -207,8 +253,8 @@ async function withReviewerAttemptTimeout<T>(
       { drainExpired: true, drainMs },
     );
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
     if (drainTimer !== undefined) clearTimeout(drainTimer);
+    watchdog?.stop();
     input.externalSignal?.removeEventListener("abort", abortFromCaller);
   }
 }
@@ -218,6 +264,10 @@ function reviewerAttemptDrainMs(timeoutMs: number): number {
     DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS,
     Math.max(MIN_REVIEWER_ATTEMPT_DRAIN_MS, Math.ceil(timeoutMs / 10)),
   );
+}
+
+function reviewerCancellationDrainMs(timeoutMs: number | undefined): number {
+  return timeoutMs === undefined ? DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS : reviewerAttemptDrainMs(timeoutMs);
 }
 
 export async function reviewPullRequest(
@@ -478,10 +528,11 @@ export async function reviewPullRequest(
           const attemptKind = shouldResume ? "resume" : attempt === 1 ? "initial" : "fresh retry";
           await recordReviewProgress(`${taskId} · ${attemptKind} attempt ${attempt}/${reviewPlan.budget.maxAttemptsPerExecutionGroup} started`);
           const result = await withReviewerAttemptTimeout<AgentRunResult<ReviewerSubmission>>(
-            (signal) => {
+            (signal, markProgress) => {
               const runOptions = {
                 signal,
                 onEvent: ((event) => {
+                  markProgress(event);
                   if (event.type === "session.started" && event.taskId === task.id) {
                     const identityArrivedLate = drainExpired && observedSessionRef === undefined;
                     observedSessionRef = event.sessionRef;
@@ -548,7 +599,7 @@ export async function reviewPullRequest(
             await recordReviewProgress(`${taskId} · retry suppressed because the frozen read/search evidence budget was exhausted`);
             throw error;
           }
-          if (error instanceof ReviewerAttemptTimeoutError && error.drainExpired) {
+          if (error instanceof AgentExecutionInterruptedError && error.drainExpired) {
             if (drainExpired && !observedSessionRef) {
               await recordReviewProgress(`${taskId} · bounded drain expired before a session identity was observable`);
             }
@@ -802,10 +853,11 @@ export async function reviewPullRequest(
   } catch (error) {
     const rawReason = error instanceof Error ? error.message : String(error);
     const reason = projectionCheckpointStarted ? `review-finding publication failed: ${rawReason}` : rawReason;
-    const event = error instanceof ReviewWaveIncompleteError ? "REVIEW_BLOCKED" as const : "FAIL" as const;
+    const interrupted = error instanceof AgentExecutionInterruptedError;
+    const event = error instanceof ReviewWaveIncompleteError || interrupted ? "REVIEW_BLOCKED" as const : "FAIL" as const;
     const failed = transition(run, event, { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
-    throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+    throw new WorkflowExecutionError(reason, failed.state, { cause: error, ...(interrupted ? { recoverable: true } : {}) });
   }
 }
 
@@ -1047,9 +1099,10 @@ async function adjudicateFindingScope(
       let observedSessionRef: string | undefined;
       let drainExpired = false;
       const result = await withReviewerAttemptTimeout<AgentRunResult<ScopeAdjudication>>(
-        (signal) => dependencies.runtime.run(task, {
+        (signal, markProgress) => dependencies.runtime.run(task, {
           signal,
           onEvent: (event) => {
+            markProgress(event);
             if (event.type === "session.started" && event.taskId === task.id) {
               const identityArrivedLate = drainExpired && observedSessionRef === undefined;
               observedSessionRef = event.sessionRef;

@@ -44,6 +44,12 @@ const WORKFLOW_LABELS = [
 const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
+// One branch per issue is enough for a 500-issue orchestration. Keep room for
+// pre-existing and integration branches without allowing an unbounded
+// matching-refs response into the controller.
+const GITHUB_BRANCH_PAGE_SIZE = 100;
+const MAX_GITHUB_BRANCHES = 5_000;
+const MAX_GITHUB_BRANCH_PAGES = Math.ceil(MAX_GITHUB_BRANCHES / GITHUB_BRANCH_PAGE_SIZE);
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
 const MAX_READ_ATTEMPTS = 6;
 const READ_RETRY_DELAY_MS = 50;
@@ -1157,8 +1163,26 @@ export class GitHubClient implements ForgeHost {
       throw new Error(`Invalid Git branch prefix: '${prefix}'`);
     }
     const encodedPrefix = prefix.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-    const result = await this.gh(["api", `repos/${repo}/git/matching-refs/heads/${encodedPrefix}`]);
-    const values = JSON.parse(result) as Array<{ ref?: string; object?: { sha?: string } }>;
+    const result = await this.gh([
+      "api", `repos/${repo}/git/matching-refs/heads/${encodedPrefix}?per_page=${GITHUB_BRANCH_PAGE_SIZE}`,
+      "--paginate", "--slurp",
+    ]);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(result);
+    } catch (error) {
+      throw new Error("GitHub returned malformed paginated matching-refs JSON", { cause: error });
+    }
+    if (!Array.isArray(decoded) || decoded.some((page) => !Array.isArray(page))) {
+      throw new Error("GitHub returned an invalid paginated matching-refs response");
+    }
+    if (decoded.length > MAX_GITHUB_BRANCH_PAGES) {
+      throw new Error(`GitHub branch catalog exceeds the safe bound of ${MAX_GITHUB_BRANCHES} branches`);
+    }
+    const values = decoded.flat() as Array<{ ref?: string; object?: { sha?: string } }>;
+    if (values.length > MAX_GITHUB_BRANCHES) {
+      throw new Error(`GitHub branch catalog exceeds the safe bound of ${MAX_GITHUB_BRANCHES} branches`);
+    }
     const refPrefix = "refs/heads/";
     return values.flatMap((value) => {
       if (!value.ref?.startsWith(refPrefix) || !value.object?.sha) return [];

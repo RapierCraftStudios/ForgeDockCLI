@@ -84,12 +84,37 @@ export interface OrchestrationExecutionClaim {
   /** Non-secret audit identity. Never expose a lease token or credential. */
   claimId: string;
   assertValid(): void;
+  /** Persist through the claim's atomic lease fence when the repository supports it. */
+  persist?(repository: OrchestrationRepository, record: OrchestrationRecord): Promise<void>;
   release(): void | Promise<void>;
+}
+
+/** Ephemeral fencing evidence; the token never belongs in durable records or diagnostics. */
+export interface OrchestrationExecutionFence {
+  itemId: string;
+  token: string;
+  epoch: number;
+  now: () => number;
+}
+
+export interface OrchestrationListCursor {
+  updatedAt: string;
+  orchestrationId: string;
+}
+
+/** Non-secret diagnostics for one orchestration execution lease. */
+export interface OrchestrationExecutionLeaseStatus {
+  state: "active" | "expired" | "absent" | "unknown";
+  owner?: string;
+  heartbeatAt?: number;
+  expiresAt?: number;
 }
 
 /** Cross-process admission stays behind a caller-owned operational port. */
 export interface OrchestrationExecutionAdmission {
   acquire(orchestrationId: string): Promise<OrchestrationExecutionClaim | undefined>;
+  /** Read-only lease diagnostics; implementations must never expose holder tokens. */
+  describe?(orchestrationId: string): Promise<OrchestrationExecutionLeaseStatus>;
 }
 
 /** Serializable scheduler input retained so a controller can rebuild its DAG after restart. */
@@ -168,5 +193,11 @@ export interface OrchestrationRepository {
   createOrchestration(record: OrchestrationRecord): Promise<void>;
   loadOrchestration(orchestrationId: string): Promise<OrchestrationRecord | undefined>;
   saveOrchestration(record: OrchestrationRecord): Promise<void>;
+  /** Validate lease evidence and write the record in one repository transaction. */
+  saveOrchestrationFenced?(record: OrchestrationRecord, fence: OrchestrationExecutionFence): Promise<void>;
   listOrchestrations(limit?: number): Promise<OrchestrationRecord[]>;
+  /** Enumerate only running records in bounded keyset pages. */
+  listRunningOrchestrations(limit?: number, before?: OrchestrationListCursor): Promise<OrchestrationRecord[]>;
 }
+
+export const MAX_ORCHESTRATION_PAGE_SIZE = 100;

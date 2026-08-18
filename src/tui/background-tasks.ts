@@ -47,6 +47,8 @@ export interface BackgroundTaskRecord {
   restartRequired?: BackgroundTaskRestartRequirement;
   /** Non-secret routing hint for the durable recovery handoff. */
   resumeScope?: BackgroundTaskResumeScope;
+  /** Stable orchestration transport key; it is safe to persist and never contains credentials. */
+  launchKey?: string;
 }
 
 const MAX_BACKGROUND_TASKS = 4;
@@ -81,6 +83,32 @@ export class ForgeDockBackgroundTasks {
     for (const live of this.#live.values()) {
       if (live.adopted) this.#observationAdapter.adopted(live.record.id, live.record.pid);
     }
+  }
+
+  /**
+   * Bind the supervisor to a checkout without adopting any persisted task.
+   *
+   * Session startup and read-only previews may need the task directory for
+   * presentation, but initialize() is deliberately reserved for an
+   * authorized controller dispatch: it can adopt a live process or
+   * terminalize a bridge-bound task from a previous session.
+   */
+  bindContext(ctx: ExtensionContext): void {
+    this.#ctx = ctx;
+    this.#directories.add(join(ctx.cwd, ".forgedock", "tasks"));
+  }
+
+  /** Return restart-bound records without changing their durable state. */
+  pendingRestartRecords(ctx: ExtensionContext): BackgroundTaskRecord[] {
+    this.bindContext(ctx);
+    return [...this.recordsFromDisk().values()].filter((record) =>
+      (record.status === "running" || record.status === "detached")
+      && record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED);
+  }
+
+  /** Present a pending restart warning without adopting or terminalizing it. */
+  announceRestartRequired(record: BackgroundTaskRecord): void {
+    this.notifyRestartRequired(record);
   }
 
   initialize(ctx: ExtensionContext): void {
@@ -144,8 +172,13 @@ export class ForgeDockBackgroundTasks {
     cleanup?: () => Promise<void>;
     restartRequired?: BackgroundTaskRestartRequirement;
     resumeScope?: BackgroundTaskResumeScope;
+    launchKey?: string;
     ctx: ExtensionContext;
   }): BackgroundTaskRecord {
+    if (input.launchKey) {
+      const existing = this.findByLaunchKey(input.launchKey);
+      if (existing) return existing;
+    }
     if (this.#live.size >= MAX_BACKGROUND_TASKS) {
       throw new Error(`ForgeDock background task limit (${MAX_BACKGROUND_TASKS}) reached; wait for or cancel an existing task`);
     }
@@ -186,6 +219,7 @@ export class ForgeDockBackgroundTasks {
       startedAt: new Date().toISOString(),
       ...(input.restartRequired !== undefined ? { restartRequired: input.restartRequired } : {}),
       ...(input.resumeScope !== undefined ? { resumeScope: input.resumeScope } : {}),
+      ...(input.launchKey !== undefined ? { launchKey: input.launchKey } : {}),
     };
     this.#ctx = input.ctx;
     const live: LiveTask = { record, child, stderrLogPath, stdoutOffset: 0, stderrOffset: 0, adopted: false, ...(input.cleanup ? { cleanup: input.cleanup } : {}) };
@@ -216,6 +250,17 @@ export class ForgeDockBackgroundTasks {
     return [...this.recordsFromDisk().values()]
       .sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt))
       .map((record) => ({ ...record, args: [...record.args] }));
+  }
+
+  /**
+   * Reconcile a launch that may have completed before its orchestration
+   * attempt could record the returned task id.  The key is the exact
+   * orchestration/node/attempt identity, so a later retry cannot adopt it.
+   */
+  findByLaunchKey(launchKey: string): BackgroundTaskRecord | undefined {
+    if (!launchKey.trim()) return undefined;
+    this.recordsFromDisk();
+    return [...this.#records.values()].find((record) => record.launchKey === launchKey);
   }
 
   /**
@@ -471,6 +516,7 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && typeof record.startedAt === "string"
     && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
     && (record.resumeScope === undefined || ["orchestration", "work-on", "review-pr-rerun", "promote", "workflow"].includes(record.resumeScope))
+    && (record.launchKey === undefined || (typeof record.launchKey === "string" && record.launchKey.length > 0 && record.launchKey.length <= 512))
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
 }
 

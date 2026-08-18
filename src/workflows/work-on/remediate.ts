@@ -5,7 +5,7 @@ import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import {
-  AgentExecutionBudgetExceededError,
+  isRecoverableAgentExecutionError,
   scopeDiscoveryRoots,
   scopeManifestFor,
   STANDARD_SCOPE_METADATA_ROOTS,
@@ -99,7 +99,7 @@ export async function remediateReview(
     return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    if (error instanceof AgentExecutionBudgetExceededError) {
+    if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_REMEDIATION", { reason });
       await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
       throw new WorkflowExecutionError(reason, checkpoint.state, { cause: error, recoverable: true });

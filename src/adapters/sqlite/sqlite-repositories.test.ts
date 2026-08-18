@@ -10,6 +10,7 @@ import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
 interface ChildOutputState {
@@ -201,6 +202,51 @@ describe("SQLite operational repositories", () => {
       const completed = { ...record, status: "completed" as const, updatedAt: "2026-01-01T00:01:00.000Z" };
       await store.saveOrchestration(completed);
       assert.equal((await store.listOrchestrations())[0]?.status, "completed");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("atomically fences orchestration saves to the current lease and claim identity", async () => {
+    const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
+    let now = 1_000;
+    const admission = new LeaseBackedOrchestrationExecutionAdmission(store, {
+      owner: "atomic-test",
+      ttlMs: 100,
+      heartbeatMs: 50,
+      now: () => now,
+    });
+    const record: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_atomic_fence",
+      repository: "a/b",
+      issueNumbers: [9],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{ id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: [], status: "running", childRunIds: [] }],
+    };
+    try {
+      await store.createOrchestration(record);
+      const claim = await admission.acquire(record.orchestrationId);
+      assert.ok(claim);
+      const owned = { ...record, executionAttempt: 1, executionClaimId: claim.claimId, updatedAt: "2026-01-01T00:00:01.000Z" };
+      assert.ok(claim.persist);
+      await claim.persist(store, owned);
+      now = 1_101;
+      await assert.rejects(
+        claim.persist(store, { ...owned, status: "completed", updatedAt: "2026-01-01T00:00:02.000Z" }),
+        /expired|current/i,
+      );
+      assert.equal((await store.loadOrchestration(record.orchestrationId))?.status, "running");
+      await claim.release();
+
+      await assert.rejects(
+        store.saveOrchestration({ ...owned, executionClaimId: "different-claim", status: "completed" }),
+        /Conflicting orchestration claim/,
+      );
     } finally {
       store.close();
     }

@@ -162,7 +162,13 @@ export default function forgedockExtension(
     }
     harnessMode = "assistant";
     activeWorkflow = undefined;
-    backgroundTasks.initialize(ctx);
+    // Startup is presentation-only. initialize() may adopt a live controller
+    // or terminalize a bridge-bound task, so operational recovery is deferred
+    // until an authorized controller dispatch. Keep the restart warning
+    // visible through a read-only task-directory inspection.
+    for (const record of backgroundTasks.pendingRestartRecords(ctx)) {
+      backgroundTasks.announceRestartRequired(record);
+    }
     deactivateWorkflowTools(pi);
     activateOnly(pi, [CONFIG_TOOL, MEMORY_TOOL, MEMORY_SEARCH_TOOL, BACKGROUND_TASK_TOOL, DEEP_PLAN_TOOL, WORKFLOW_TOOLS.status, ORCHESTRATION_RESUME_TOOL]);
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
