@@ -9,6 +9,7 @@
 
 - Failed Node test verification now retains a bounded, redacted failing-test name, location, and assertion excerpt instead of collapsing actionable diagnostics to a generic `ERR_ASSERTION` signature.
 - Verification descendants now run without inherited controller, orchestration, task, or Pi-agent mode markers, so the repository's own tests cannot accidentally take a native controller path while preserving the sealed verification toolchain and ordinary provider/model configuration.
+- GitHub merge admission now preserves confirmed conflicts separately from transient UNKNOWN or unavailable mergeability, performs a bounded UNKNOWN refresh only for auto-merge, and records transport/computation blockers without presenting them as an awaiting-human merge.
 - Build-checkpoint orchestration resumes now carry exact preflighted Build Packet claim evidence into the typed `RESUME_BUILD` boundary, preventing duplicate arbitration from suspending overlapping resumed workers symmetrically while preserving the preflight fence before retained-workspace recovery.
 - Same-DAG orchestration retries now resume retained work-on checkpoints even when the initial dispatch used an explicit rerun admission override, preventing suspended workers from being relaunched as conflicting fresh runs.
 - Retained lease-witness verification now serializes with SQLite lease mutations, preventing concurrent workers from treating the intentional checkpoint-before-commit interval as permanent divergence while keeping exact witness-first re-enrollment retries idempotent.

@@ -441,6 +441,10 @@ export const OutcomePayloadSchema = Type.Object({
     headSha: Sha,
     baseBranch: NonEmptyString,
     mergeable: Type.Boolean(),
+    mergeability: Type.Optional(Type.Union([
+      Type.Literal("mergeable"), Type.Literal("conflicting"), Type.Literal("unknown"), Type.Literal("unavailable"),
+    ])),
+    mergeabilityReason: Type.Optional(Type.String({ maxLength: 500 })),
     observedAt: IsoDateTime,
     requiredChecks: Type.Array(Type.Object({
       name: NonEmptyString,

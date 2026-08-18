@@ -314,6 +314,8 @@ describe("merge and close authority", () => {
       headSha: sha,
       baseBranch: "main",
       mergeable: false,
+      mergeability: "unavailable",
+      mergeabilityReason: "default setup authority unavailable",
       observedAt: result.outcome?.payload.mergeGate?.observedAt,
       requiredChecks: [{
         name: "merge-admission-query",
@@ -321,6 +323,41 @@ describe("merge and close authority", () => {
         detailsUrl: "default setup authority unavailable",
       }],
     });
+    assert.equal(result.awaitingHuman, false);
+    assert.equal(host.merges, 0);
+  });
+
+  it("does not label transient UNKNOWN mergeability as awaiting human merge", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeGate = {
+      ...host.mergeGate,
+      mergeable: false,
+      mergeability: "unknown",
+      mergeabilityReason: "GitHub mergeability remained UNKNOWN after bounded reads",
+    };
+    const artifacts = new InMemoryArtifactRepository();
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.awaitingHuman, false);
+    assert.equal(result.outcome?.payload.mergeGate?.mergeability, "unknown");
+    assert.equal(result.outcome?.payload.mergeGate?.mergeable, false);
+    assert.equal(host.merges, 0);
+  });
+
+  it("retains confirmed conflicts as human-actionable merge blockers", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeGate = { ...host.mergeGate, mergeable: false, mergeability: "conflicting" };
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.awaitingHuman, true);
+    assert.equal(result.outcome?.payload.mergeGate?.mergeability, "conflicting");
     assert.equal(host.merges, 0);
   });
 

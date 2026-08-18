@@ -40,6 +40,44 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
   });
 
+  it("keeps UNKNOWN distinct from a confirmed conflict and refreshes UNKNOWN only when requested", async () => {
+    const client = new GitHubClient();
+    let mergeabilityReads = 0;
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) {
+        mergeabilityReads += 1;
+        return JSON.stringify({ mergeable: mergeabilityReads < 3 ? "UNKNOWN" : "MERGEABLE", mergeStateStatus: "UNKNOWN" });
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return "[]";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const unknown = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(unknown.mergeability, "unknown");
+    assert.equal(unknown.mergeable, false);
+    assert.equal(mergeabilityReads, 1);
+
+    const refreshed = await client.getPullRequestMergeGate("a/b", 8, sha, "main", { refreshUnknown: true });
+    assert.equal(refreshed.mergeability, "mergeable");
+    assert.equal(refreshed.mergeable, true);
+    assert.equal(mergeabilityReads, 3);
+  });
+
+  it("preserves an unavailable mergeability query as transport evidence", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) throw new Error("mergeability service unavailable");
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return "[]";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.mergeability, "unavailable");
+    assert.equal(gate.mergeable, false);
+    assert.match(gate.mergeabilityReason ?? "", /service unavailable/);
+  });
+
   it("does not merge when legacy CodeQL remains pending beside a passing default-setup replacement", async () => {
     const client = new GitHubClient();
     const calls: string[][] = [];

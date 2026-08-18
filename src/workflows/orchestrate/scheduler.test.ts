@@ -309,6 +309,19 @@ describe("lean orchestration scheduler", () => {
     assert.ok(events.includes("suspended"));
   });
 
+  it("keeps a merge-admission blocker distinct from an awaiting-human suspension", async () => {
+    const result = await runSchedule([
+      { id: "merge-gate", issue: 1, priority: 1, dependencies: [], claims: [] },
+      { id: "dependent", issue: 2, priority: 1, dependencies: ["merge-gate"], claims: [] },
+    ], 1, async (item) => item.id === "merge-gate"
+      ? { status: "blocked", error: "GitHub mergeability query is unavailable" }
+      : undefined);
+    assert.equal(result.status.get("merge-gate"), "blocked");
+    assert.equal(result.status.get("dependent"), "blocked");
+    assert.equal(result.errors.get("merge-gate")?.message, "GitHub mergeability query is unavailable");
+    assert.equal(result.errors.get("dependent")?.message.includes("merge-gate"), true);
+  });
+
   it("blocks on any failed dependency even when an earlier dependency is suspended", async () => {
     const result = await runSchedule([
       { id: "suspended", issue: 1, priority: 1, dependencies: [], claims: [] },

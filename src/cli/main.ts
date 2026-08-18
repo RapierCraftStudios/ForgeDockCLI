@@ -1784,6 +1784,8 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `Recursive remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey} is active` };
           }
+          const reason = result.outcome?.payload.reason ?? result.run.blockedReason ?? "durable recovery details are required";
+          return { status: "blocked", error: reason };
         }
         if (result.run.state === "decomposed") {
           const issueArtifacts = await artifacts.list(subject);
