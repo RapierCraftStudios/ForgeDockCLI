@@ -72,7 +72,7 @@ import {
 } from "../runtime/orchestration-claim-transport.js";
 import { startNestedAgentBridge } from "./nested-agent-bridge.js";
 import { runDecisionFlow, validateDecisionFlow, type DecisionFlowInput, type DecisionFlowResult } from "./decision-flow.js";
-import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, renderRecord, terminateProcessTree, type BackgroundTaskRecord } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, renderRecord, terminateProcessTree, type BackgroundTaskRecord, type BackgroundTaskResumeScope } from "./background-tasks.js";
 import { classifyIssueLane, provisionMissingMilestoneBranches, resolveIssueLane } from "../workflows/work-on/lane.js";
 import {
   OrchestrationBoardController,
@@ -1206,7 +1206,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       rerun: Type.Optional(Type.Boolean({ description: "Explicitly override duplicate-run admission" })),
       resume: Type.Optional(Type.Boolean({ description: "Explicitly resume a controller-supported durable checkpoint instead of creating a new run" })),
       adjudicateVerification: Type.Optional(Type.String({ minLength: 1, description: "Human rationale authorizing resume after repairing/adjudicating an exhausted verification baseline; requires resume=true" })),
-      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
+      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children. Foreground background=false runs are owned by this terminal and cannot be recovered after a TUI restart; use background=true for restart-safe task handling." })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -1253,7 +1253,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       pullRequest: Type.Integer({ minimum: 1, description: "Resolved pull-request number" }),
       issue: Type.Optional(Type.Integer({ minimum: 1, description: "Original issue number when known" })),
       repo: Type.Optional(Type.String({ description: "Optional owner/repo; defaults to the current checkout" })),
-      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children" })),
+      background: Type.Optional(Type.Boolean({ description: "Run without blocking the supervising agent turn; defaults true outside issue-worker children. Foreground background=false runs are owned by this terminal and cannot be recovered after a TUI restart; use background=true for restart-safe task handling." })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -1283,7 +1283,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       cancellationReason: Type.Optional(Type.String({ minLength: 1 })),
       provider: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
-      background: Type.Optional(Type.Boolean({ description: "Run the lifecycle controller as a native background task" })),
+      background: Type.Optional(Type.Boolean({ description: "Run the lifecycle controller as a native background task. Foreground background=false runs are owned by this terminal and cannot be recovered after a TUI restart; use background=true for restart-safe task handling." })),
     }),
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
@@ -3117,6 +3117,9 @@ async function runControllerToolBackground(
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   const config = readForgeDockConfig(ctx.cwd);
   const modelArgs = controllerInvocationModelArgs(command, args, ctx, config);
+  const resumeScope: BackgroundTaskResumeScope = command === "review-pr"
+    ? "review-pr-rerun"
+    : command === "promote" ? "promote" : "work-on";
   const nestedBridge = await startNestedAgentBridge(pi);
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
@@ -3138,7 +3141,7 @@ async function runControllerToolBackground(
       cwd: ctx.cwd,
       env,
       restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
-      resumeScope: "workflow",
+      resumeScope,
       cleanup: () => nestedBridge.close(),
       ctx,
     });

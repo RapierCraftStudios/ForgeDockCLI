@@ -219,6 +219,37 @@ test("older bridge-bound records without a resume scope remain parseable", async
   await tasks.shutdown();
 });
 
+test("restart guidance matches each controller recovery contract", async () => {
+  const cases = [
+    { scope: "work-on" as const, expected: /work-on checkpoint/, forbidden: /not resumable|promotion checkpoint/ },
+    { scope: "review-pr-rerun" as const, expected: /not resumable.*\/review-pr/, forbidden: /checkpoint is preserved/ },
+    { scope: "promote" as const, expected: /promotion checkpoint.*promotionId/i, forbidden: /not resumable|work-on checkpoint/ },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const { cwd, messages, tasks, ctx } = fixture();
+    const directory = join(cwd, ".forgedock", "tasks");
+    mkdirSync(directory, { recursive: true });
+    const id = `task_scope_${index}`;
+    writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+      id,
+      command: process.execPath,
+      args: ["controller"],
+      cwd,
+      pid: 999_999_999,
+      logPath: join(directory, `${id}.log`),
+      status: "detached",
+      startedAt: new Date().toISOString(),
+      restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+      resumeScope: scenario.scope,
+    }));
+    tasks.initialize(ctx);
+    const message = messages.at(-1) ?? "";
+    assert.match(message, scenario.expected);
+    assert.doesNotMatch(message, scenario.forbidden);
+    await tasks.shutdown();
+  }
+});
+
 test("an adopter preserves the original supervisor's durable completion result", async () => {
   const first = fixture();
   const record = first.tasks.start({

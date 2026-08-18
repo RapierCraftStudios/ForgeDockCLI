@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -1325,6 +1325,8 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     assert.equal(details.state, "delegated");
     assert.ok(details.args?.includes("--auto-merge"));
     assert.match(details.taskId ?? "", /^task_/);
+    const persisted = JSON.parse(readFileSync(join(root, ".forgedock", "tasks", `${details.taskId}.json`), "utf8")) as { resumeScope?: string };
+    assert.equal(persisted.resumeScope, "work-on");
     const tasks = state.tools.get("forgedock_tasks");
     assert.ok(tasks);
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -1335,6 +1337,45 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     }
     const listed = await tasks.execute("list-final", { action: "list" }, undefined, undefined, ctx);
     assert.equal((listed.details as { records: Array<{ id: string; status: string }> }).records.find((record) => record.id === details.taskId)?.status, "completed");
+  } finally {
+    await state.handlers.get("session_shutdown")?.[0]?.({}, ctx);
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+  }
+});
+
+test("background review and promotion tasks persist truthful restart scopes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-tool-recovery-scope-"));
+  const entry = join(root, "controller.mjs");
+  writeFileSync(entry, "setTimeout(() => process.exit(0), 50);\n");
+  const state = fakePi();
+  const ctx = { ...commandContext(), cwd: root, mode: "rpc" } as any;
+  await state.handlers.get("session_start")?.[0]?.({}, ctx);
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  process.env.FORGEDOCK_CONTROLLER_ENTRY = entry;
+  const taskIds: string[] = [];
+  try {
+    for (const [toolName, params, expectedScope] of [
+      ["forgedock_review_pr", { pullRequest: 21 }, "review-pr-rerun"],
+      ["forgedock_promote", { production: true }, "promote"],
+    ] as const) {
+      const tool = state.tools.get(toolName);
+      assert.ok(tool);
+      const result = await tool.execute(`background-${toolName}`, params, undefined, undefined, ctx);
+      const taskId = (result.details as { taskId?: string }).taskId;
+      assert.ok(taskId);
+      taskIds.push(taskId);
+      const persisted = JSON.parse(readFileSync(join(root, ".forgedock", "tasks", `${taskId}.json`), "utf8")) as { resumeScope?: string };
+      assert.equal(persisted.resumeScope, expectedScope);
+    }
+    const tasks = state.tools.get("forgedock_tasks");
+    assert.ok(tasks);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const listed = await tasks.execute("recovery-scope-list", { action: "list" }, undefined, undefined, ctx);
+      const records = (listed.details as { records: Array<{ id: string; status: string }> }).records;
+      if (taskIds.every((id) => records.find((record) => record.id === id)?.status === "completed")) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   } finally {
     await state.handlers.get("session_shutdown")?.[0]?.({}, ctx);
     if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;

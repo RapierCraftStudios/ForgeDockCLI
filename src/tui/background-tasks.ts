@@ -18,11 +18,17 @@ export type BackgroundTaskStatus = "running" | "detached" | "completed" | "block
  */
 export const NESTED_AGENT_BRIDGE_RESTART_REQUIRED = "nested-agent-bridge" as const;
 export type BackgroundTaskRestartRequirement = typeof NESTED_AGENT_BRIDGE_RESTART_REQUIRED;
-export type BackgroundTaskResumeScope = "orchestration" | "workflow";
+export type BackgroundTaskResumeScope = "orchestration" | "work-on" | "review-pr-rerun" | "promote" | "workflow";
 
 const ORCHESTRATION_RESUME_MESSAGE =
   "The owning orchestration checkpoint is preserved; resume it explicitly with forgedock_resume_orchestration.";
-const WORKFLOW_RESUME_MESSAGE =
+const WORK_ON_RESUME_MESSAGE =
+  "The work-on checkpoint is preserved; invoke ForgeDock work-on again with resume=true for the same issue.";
+const REVIEW_PR_RERUN_MESSAGE =
+  "Review checkpoints are not resumable; rerun the ForgeDock review workflow after restart with /review-pr.";
+const PROMOTE_RESUME_MESSAGE =
+  "The promotion checkpoint is preserved; invoke ForgeDock promote again with its promotionId to resume.";
+const LEGACY_WORKFLOW_RESUME_MESSAGE =
   "The owning workflow checkpoint is preserved; resume that ForgeDock workflow explicitly from its durable checkpoint.";
 
 export interface BackgroundTaskRecord {
@@ -433,7 +439,15 @@ export class ForgeDockBackgroundTasks {
   }
 
   private notifyRestartRequired(record: BackgroundTaskRecord): void {
-    const resumeMessage = record.resumeScope === "orchestration" ? ORCHESTRATION_RESUME_MESSAGE : WORKFLOW_RESUME_MESSAGE;
+    const resumeMessage = record.resumeScope === "orchestration"
+      ? ORCHESTRATION_RESUME_MESSAGE
+      : record.resumeScope === "work-on"
+        ? WORK_ON_RESUME_MESSAGE
+        : record.resumeScope === "review-pr-rerun"
+          ? REVIEW_PR_RERUN_MESSAGE
+          : record.resumeScope === "promote"
+            ? PROMOTE_RESUME_MESSAGE
+            : LEGACY_WORKFLOW_RESUME_MESSAGE;
     const message = `${renderRecord(record)} — interrupted during terminal restart because its ephemeral nested-agent bridge cannot be reattached. ${resumeMessage}`;
     this.#ctx?.ui.notify(message, "warning");
     try {
@@ -456,7 +470,7 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && typeof record.logPath === "string" && Boolean(record.logPath)
     && typeof record.startedAt === "string"
     && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
-    && (record.resumeScope === undefined || ["orchestration", "workflow"].includes(record.resumeScope))
+    && (record.resumeScope === undefined || ["orchestration", "work-on", "review-pr-rerun", "promote", "workflow"].includes(record.resumeScope))
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
 }
 
