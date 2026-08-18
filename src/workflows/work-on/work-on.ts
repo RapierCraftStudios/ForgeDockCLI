@@ -191,6 +191,8 @@ export async function workOn(
         run,
         investigation: investigated.investigation,
         outcome: investigated.outcome,
+        ...(input.batchMembers !== undefined ? { childIssues: input.batchMembers } : {}),
+        ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       }, dependencies);
     }
     if (run.state === "decomposed") return { run };
@@ -351,6 +353,8 @@ export async function resumeEarlyWorkOn(
           run,
           investigation,
           outcome: investigated.outcome,
+          ...(input.batchMembers !== undefined ? { childIssues: input.batchMembers } : {}),
+          ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
         }, dependencies);
       }
       if (run.state === "decomposed") {

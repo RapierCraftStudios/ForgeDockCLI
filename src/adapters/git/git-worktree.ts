@@ -3,7 +3,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitWorkspace, GitWorkspaceManager, PullRequestRepairWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
@@ -419,6 +419,8 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       } catch (error) {
         await rm(stampPath, { force: true });
         throw error;
+      } finally {
+        await this.restoreTrackedDependencyBinModes(worktreePath);
       }
     }
 
@@ -445,6 +447,12 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
     }
 
+    // npm links package executables by chmod'ing their source files. A file
+    // dependency in this repository (the vendored Pi runtime) is therefore
+    // able to dirty a tracked delivery path even though npm only prepared
+    // operational dependencies. Restore the index's verified mode for those
+    // package bin targets before any delivery-scope check observes the tree.
+    await this.restoreTrackedDependencyBinModes(worktreePath);
     await this.assertInstalledDependencies(worktreePath);
     await this.applyPinnedDependencyPatch(worktreePath);
     await this.assertInstalledDependencies(worktreePath);
@@ -455,6 +463,55 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       installedAt: new Date().toISOString(),
     };
     await writeFile(stampPath, `${JSON.stringify(stamp)}\n`, "utf8");
+  }
+
+  private async restoreTrackedDependencyBinModes(worktreePath: string): Promise<void> {
+    const packagePaths = (await this.git(["ls-files", "-z"], worktreePath))
+      .split("\0")
+      .filter((path) => path.endsWith("package.json"));
+    const binTargets = new Set<string>();
+    for (const packagePath of packagePaths) {
+      let manifest: { bin?: unknown };
+      try {
+        manifest = JSON.parse(await readFile(join(worktreePath, packagePath), "utf8")) as { bin?: unknown };
+      } catch {
+        continue;
+      }
+      const bins = typeof manifest.bin === "string"
+        ? [manifest.bin]
+        : manifest.bin && typeof manifest.bin === "object"
+          ? Object.values(manifest.bin as Record<string, unknown>)
+          : [];
+      for (const bin of bins) {
+        if (typeof bin !== "string" || !bin) continue;
+        const target = resolve(worktreePath, dirname(packagePath), bin.replaceAll("\\", "/"));
+        const targetRelative = relative(worktreePath, target).replaceAll("\\", "/");
+        if (!targetRelative || targetRelative.startsWith("../") || targetRelative === "..") continue;
+        binTargets.add(targetRelative);
+      }
+    }
+    if (!binTargets.size) return;
+
+    const entries = (await this.git(["ls-files", "-s", "-z", "--", ...binTargets], worktreePath))
+      .split("\0")
+      .filter(Boolean);
+    for (const entry of entries) {
+      const parsed = /^(100644|100755)\s+[0-9a-f]+\s+\d+\t([\s\S]+)$/.exec(entry);
+      if (!parsed) continue;
+      const target = join(worktreePath, parsed[2]!);
+      let current;
+      try {
+        current = await lstat(target);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (!current.isFile()) continue;
+      const executable = (current.mode & 0o111) !== 0;
+      const expectedExecutable = parsed[1] === "100755";
+      if (executable === expectedExecutable) continue;
+      await chmod(target, expectedExecutable ? 0o755 : 0o644);
+    }
   }
 
   private async withDependencyInstallLock<T>(worktreePath: string, operation: () => Promise<T>): Promise<T> {

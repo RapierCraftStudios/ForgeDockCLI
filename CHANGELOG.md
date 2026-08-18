@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Invalid orchestration batches now authoritatively close and emit terminal Outcomes for every original member issue, and managed dependency preparation restores only tracked package-bin modes so npm cannot create false dirty-worktree failures.
 - Native review-finding publication now persists a durable projection plan and receipt, separates semantic identity from GitHub Markdown transport drift, records canonical issue numbers, and resumes unfinished publication without replaying reviewer sessions.
 - Native agent and observer output now carries terminal/parser and credential-masking state across chunks, quarantines streams after backpressure drops, preserves state across identity refreshes, and omits raw dropped payloads.
 - Streaming observation masking now retains long split credentials and private-key bodies until a safe delimiter or bounded fail-closed quarantine; review findings can also be adopted by semantic identity when a legacy root marker was lost.

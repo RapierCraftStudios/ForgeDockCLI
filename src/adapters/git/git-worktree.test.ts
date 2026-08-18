@@ -155,6 +155,56 @@ describe("isolated Git worktrees", () => {
     }
   });
 
+  it("restores npm bin modes without hiding real tracked mode changes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-git-bin-mode-"));
+    const repo = join(root, "repo");
+    try {
+      execFileSync("git", ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.name", "ForgeDock Test");
+      git(repo, "config", "user.email", "forgedock@example.invalid");
+      writeFileSync(join(repo, "README.md"), "base\n");
+      writeFileSync(join(repo, "package.json"), JSON.stringify({
+        name: "bin-mode-fixture",
+        version: "1.0.0",
+        bin: { launcher: "bin/launcher.js" },
+        dependencies: { "bin-fixture": "file:vendor/bin-fixture" },
+      }));
+      mkdirSync(join(repo, "bin"), { recursive: true });
+      writeFileSync(join(repo, "bin", "launcher.js"), "#!/usr/bin/env node\n");
+      chmodSync(join(repo, "bin", "launcher.js"), 0o755);
+      mkdirSync(join(repo, "vendor", "bin-fixture", "bin"), { recursive: true });
+      writeFileSync(join(repo, "vendor", "bin-fixture", "package.json"), JSON.stringify({
+        name: "bin-fixture", version: "1.0.0", bin: { "bin-fixture": "bin/cli.js" },
+      }));
+      writeFileSync(join(repo, "vendor", "bin-fixture", "bin", "cli.js"), "#!/usr/bin/env node\n");
+      // npm ci makes this file executable because it is a package bin target.
+      // Keep the committed mode non-executable to prove the side effect is
+      // restored to Git's verified delivery mode.
+      chmodSync(join(repo, "vendor", "bin-fixture", "bin", "cli.js"), 0o644);
+      writeFileSync(join(repo, "src.js"), "export {};\n");
+      execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: repo, stdio: "ignore", shell: process.platform === "win32" });
+      git(repo, "add", "README.md", "package.json", "package-lock.json", "bin", "vendor", "src.js");
+      git(repo, "commit", "-m", "base");
+
+      const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+      const workspace = await manager.create({ runId: "run_bin_mode", issue: 17, baseRef: "HEAD" });
+      const dependencyBin = join(workspace.path, "vendor", "bin-fixture", "bin", "cli.js");
+      const launcher = join(workspace.path, "bin", "launcher.js");
+      assert.equal(lstatSync(dependencyBin).mode & 0o111, 0, "npm's dependency bin chmod must not dirty the tracked source");
+      assert.notEqual(lstatSync(launcher).mode & 0o111, 0, "an intended executable launcher must remain executable");
+      assert.deepEqual(await manager.changedPaths(workspace), []);
+
+      chmodSync(join(workspace.path, "src.js"), 0o755);
+      await manager.prepareWorkspaceDependencies(workspace);
+      assert.notEqual(lstatSync(launcher).mode & 0o111, 0);
+      assert.notEqual(lstatSync(join(workspace.path, "src.js")).mode & 0o111, 0, "real tracked mode changes remain visible");
+      assert.deepEqual(await manager.changedPaths(workspace), ["src.js"]);
+      await manager.remove(workspace);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("detects clean-filter transformations between verified bytes and committed blobs", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-filter-"));
     const repo = join(root, "repo");

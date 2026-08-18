@@ -76,10 +76,10 @@ async function mergingRun(runs: InMemoryRunRepository, runId = `run_complete_${c
   return run;
 }
 
-async function invalidRun(runs: InMemoryRunRepository): Promise<RunState> {
+async function invalidRun(runs: InMemoryRunRepository, issue = 2): Promise<RunState> {
   let run = createRun({
     workflow: "work-on",
-    subject: { repo: "a/b", issue: 2 },
+    subject: { repo: "a/b", issue },
     runId: `run_invalid_${crypto.randomUUID()}`,
     target: { lane: "fast", targetBranch: "main" },
   });
@@ -187,6 +187,45 @@ describe("merge and close authority", () => {
     const result = await completeInvalidWorkItem({ run, investigation, outcome: provisional }, { host, artifacts });
     assert.equal(result.outcome.payload.issueClosure?.status, "completed");
     assert.deepEqual(host.closes, [2]);
+  });
+
+  it("closes every invalid batch member and projects idempotent terminal outcomes", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await invalidRun(runs, 100);
+    const investigation = invalidInvestigation(run);
+    const provisional = invalidOutcome(run);
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(provisional);
+    const host = new CompletionHost();
+
+    const first = await completeInvalidWorkItem({
+      run,
+      investigation,
+      outcome: provisional,
+      childIssues: [2, 3, 2, 100],
+    }, { host, artifacts });
+
+    assert.deepEqual(host.closes, [2, 3, 100]);
+    assert.deepEqual(first.outcome.payload.childIssues, ["issue-2", "issue-3"]);
+    for (const issue of [2, 3]) {
+      const outcomes = (await artifacts.list({ repo: "a/b", issue }, "Outcome"))
+        .filter((artifact): artifact is import("../../core/artifacts/schema.js").DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+      assert.equal(outcomes.length, 1);
+      assert.equal(outcomes[0]?.payload.status, "invalid");
+      assert.equal(outcomes[0]?.payload.batchParent, 100);
+      assert.equal(outcomes[0]?.payload.issueClosure?.status, "completed");
+    }
+
+    const retried = await completeInvalidWorkItem({
+      run,
+      investigation,
+      outcome: provisional,
+      childIssues: [2, 3],
+    }, { host, artifacts });
+    assert.equal(retried.outcome.id, first.outcome.id);
+    assert.deepEqual(host.closes, [2, 3, 100]);
+    assert.equal((await artifacts.list({ repo: "a/b", issue: 2 }, "Outcome")).length, 1);
+    assert.equal((await artifacts.list({ repo: "a/b", issue: 3 }, "Outcome")).length, 1);
   });
 
   it("defaults to a human merge checkpoint without changing state", async () => {

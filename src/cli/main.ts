@@ -697,7 +697,13 @@ async function workOn(
         } else {
           assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
         }
-        const finalized = await completeInvalidWorkItem({ run, investigation, outcome: invalidOutcome }, { host: github, artifacts });
+        const finalized = await completeInvalidWorkItem({
+          run,
+          investigation,
+          outcome: invalidOutcome,
+          ...(batchMembers.length ? { childIssues: batchMembers } : {}),
+          ...(batchMemberContracts.length ? { memberContracts: batchMemberContracts } : {}),
+        }, { host: github, artifacts });
         process.stdout.write(`${statusGlyph("passed", mode)} Resumed invalid run ${finalized.run.runId} · issue #${issue.number} is authoritatively closed\n`);
         return;
       }
@@ -1083,7 +1089,13 @@ async function workOn(
         onAgentEvent,
       });
       const finalized = !dryRun && result.run.state === "invalid" && result.outcome?.payload.status === "invalid"
-        ? await completeInvalidWorkItem({ run: result.run, investigation: result.investigation, outcome: result.outcome }, { host: github, artifacts })
+        ? await completeInvalidWorkItem({
+          run: result.run,
+          investigation: result.investigation,
+          outcome: result.outcome,
+          ...(batchMembers.length ? { childIssues: batchMembers } : {}),
+          ...(batchMemberContracts.length ? { memberContracts: batchMemberContracts } : {}),
+        }, { host: github, artifacts })
         : result;
       process.stdout.write(`\n${renderArtifactMarkdown(result.investigation)}\n\n`);
       const presentation = runStatePresentation(finalized.run.state);
