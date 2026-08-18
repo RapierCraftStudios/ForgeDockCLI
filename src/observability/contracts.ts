@@ -197,17 +197,75 @@ const STREAM_SECRET_PREFIXES = ["bearer", "authorization", "ghp_", "gho_", "ghu_
 
 type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
 
+interface CredentialStreamResult {
+  value: string;
+  redacted: boolean;
+}
+
+/**
+ * Holds only a trailing sensitive assignment whose value has not reached a
+ * delimiter yet. This is deliberately per stream: output chunks from two
+ * identities or channels must never complete one another's assignment.
+ */
+class StreamingCredentialAssignments {
+  #holdback = "";
+
+  push(value: string): CredentialStreamResult {
+    if (!value) return { value: "", redacted: false };
+    if (this.#holdback) {
+      const candidate = this.#holdback + value;
+      this.#holdback = "";
+      const trailing = trailingCredentialAssignmentStart(candidate);
+      if (trailing !== undefined && trailing > 0) {
+        this.#holdback = candidate.slice(trailing);
+        const prefix = candidate.slice(0, trailing);
+        const masked = maskCredentialContinuation(prefix);
+        return { value: masked, redacted: true };
+      }
+      if (!isCredentialValueDelimiter(value[0] ?? "")) {
+        return { value: maskCredentialContinuation(candidate), redacted: true };
+      }
+      const masked = maskCredentialAssignments(candidate);
+      return { value: masked.value, redacted: masked.redacted };
+    }
+
+    const pendingStart = trailingCredentialAssignmentStart(value);
+    if (pendingStart !== undefined) {
+      this.#holdback = value.slice(pendingStart);
+      const prefix = value.slice(0, pendingStart);
+      const masked = maskCredentialAssignments(prefix);
+      return { value: masked.value, redacted: true };
+    }
+    const masked = maskCredentialAssignments(value);
+    return { value: masked.value, redacted: masked.redacted };
+  }
+
+  finish(): CredentialStreamResult {
+    if (!this.#holdback) return { value: "", redacted: false };
+    const pending = this.#holdback;
+    this.#holdback = "";
+    return { value: maskCredentialContinuation(pending), redacted: true };
+  }
+
+  reset(): void {
+    this.#holdback = "";
+  }
+}
+
 /** Stateful, fail-closed sanitizer for output that arrives in arbitrary chunks. */
 export class StreamingObservationText {
   #state: TerminalParserState = "ground";
   #holdback = "";
   #quarantined = false;
+  #credentialAssignments = new StreamingCredentialAssignments();
 
   push(value: string): string {
     if (!value || this.#quarantined) return "";
     const visible = this.consumeTerminal(value);
     if (!visible) return "";
-    return this.flushSafe(visible);
+    const assignments = this.#credentialAssignments.push(visible);
+    if (!assignments.value) return "";
+    return this.flushSafe(assignments.value);
   }
 
   /** Backpressure may discard an incomplete control/secret sequence. */
@@ -215,11 +273,13 @@ export class StreamingObservationText {
     this.#quarantined = true;
     this.#state = "ground";
     this.#holdback = "";
+    this.#credentialAssignments.reset();
   }
 
   reset(): void {
     this.#state = "ground";
     this.#holdback = "";
+    this.#credentialAssignments.reset();
     this.#quarantined = false;
   }
 
@@ -228,12 +288,14 @@ export class StreamingObservationText {
       this.reset();
       return "";
     }
+    const assignmentTail = this.#credentialAssignments.finish();
+    const emitted = assignmentTail.value ? this.flushSafe(assignmentTail.value) : "";
     const tail = streamingSecretSuffixStart(this.#holdback) === undefined
       ? redactStreamingSecrets(this.#holdback)
       : "[REDACTED]";
     this.#holdback = "";
     this.#state = "ground";
-    return tail;
+    return emitted + tail;
   }
 
   get quarantined(): boolean { return this.#quarantined; }
@@ -348,6 +410,24 @@ export function observationStreamKey(identity: ObservationIdentity, channel: "st
   ].join("|");
 }
 
+interface ControllerCredentialStreamState {
+  sanitizer: StreamingCredentialAssignments;
+  chunkSequence: number;
+  output: string;
+  redacted: boolean;
+}
+
+const controllerCredentialStreams = new Map<string, ControllerCredentialStreamState>();
+
+function controllerCredentialStreamKey(draft: ObservationDraft): string | undefined {
+  if (draft.source !== "controller" || !draft.output || draft.output.chunkSequence === undefined) return undefined;
+  return `${observationStreamKey(draft.identity ?? {}, draft.output.channel)}|${draft.producer.processInstanceId}`;
+}
+
+function isObservationStreamTerminal(kind: string): boolean {
+  return /(?:session\.(?:completed|failed|cancelled)|process\.(?:exited|failed)|controller\.(?:completed|failed))$/i.test(kind);
+}
+
 export function observationEntityId(identity: ObservationIdentity, producer: ObservationProducer): string {
   return identity.agentTaskId
     ?? identity.workUnitId
@@ -439,9 +519,33 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
 export function normalizeObservationDraft(draft: ObservationDraft, policy: ObservationRedactionPolicy = {}): ObservationDraft {
   const identity = { ...(draft.identity ?? {}) };
   const payload = redactObservationValue(draft.payload ?? {}, policy);
-  const output = draft.output
+  const outputValue = draft.output
     ? redactObservationValue(draft.output.text, { ...policy, maxPayloadBytes: policy.maxOutputBytes ?? DEFAULT_OBSERVATION_MAX_OUTPUT_BYTES })
     : undefined;
+  const controllerStreamKey = controllerCredentialStreamKey(draft);
+  let output = outputValue;
+  if (isObservationStreamTerminal(draft.kind) && draft.source === "controller") {
+    for (const channel of ["stdout", "stderr"] as const) {
+      controllerCredentialStreams.delete(`${observationStreamKey(identity, channel)}|${draft.producer.processInstanceId}`);
+    }
+  }
+  if (outputValue && controllerStreamKey && !outputValue.redacted && draft.security?.redacted !== true) {
+    const prior = controllerCredentialStreams.get(controllerStreamKey);
+    if (prior && prior.chunkSequence === draft.output!.chunkSequence) {
+      output = { ...outputValue, value: prior.output, redacted: prior.redacted || outputValue.redacted };
+    } else {
+      const sanitizer = prior?.sanitizer ?? new StreamingCredentialAssignments();
+      const streamed = sanitizer.push(String(outputValue.value));
+      const state = {
+        sanitizer,
+        chunkSequence: draft.output!.chunkSequence!,
+        output: streamed.value,
+        redacted: outputValue.redacted || streamed.redacted,
+      };
+      controllerCredentialStreams.set(controllerStreamKey, state);
+      output = { ...outputValue, value: streamed.value, redacted: state.redacted };
+    }
+  }
   const delivery: ObservationDelivery = {
     ...(draft.delivery ?? {}),
     ...(payload.truncated || output?.truncated ? { truncated: true } : {}),
@@ -481,6 +585,95 @@ function maskCredentialAssignments(value: string): { value: string; redacted: bo
   result = maskDelimitedAssignments(result);
   result = maskCommandLineAssignments(result);
   return { value: result, redacted: result !== value };
+}
+
+interface SensitiveAssignmentMatch {
+  index: number;
+  valueStart: number;
+}
+
+function sensitiveAssignments(value: string): SensitiveAssignmentMatch[] {
+  const patterns = [
+    /(^|[^\w-])((?:["']?)(?:--)?[A-Za-z][A-Za-z0-9_.-]*(?:["']?))\s*([:=])\s*/g,
+    /(^|[^\w-])(--[A-Za-z][A-Za-z0-9_.-]*)[ \t]+/g,
+  ];
+  const matches: SensitiveAssignmentMatch[] = [];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(value)) !== null) {
+      const rawKey = match[2];
+      const key = rawKey?.replace(/["']/g, "").replace(/^-+/, "");
+      if (key && SENSITIVE_KEY.test(key)) matches.push({ index: match.index, valueStart: match.index + match[0].length });
+    }
+  }
+  return matches.sort((left, right) => left.index - right.index);
+}
+
+function firstSensitiveAssignment(value: string): SensitiveAssignmentMatch | undefined {
+  return sensitiveAssignments(value)[0];
+}
+
+function assignmentValueEndsAt(value: string, start: number): number {
+  const opening = value[start];
+  if (opening === "\"" || opening === "'") {
+    let escaped = false;
+    for (let index = start + 1; index < value.length; index += 1) {
+      const character = value[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (character === opening) {
+        let end = index + 1;
+        while (end < value.length && !isCredentialValueDelimiter(value[end]!)) end += 1;
+        return end;
+      }
+    }
+    return value.length;
+  }
+  let end = start;
+  while (end < value.length) {
+    if (value[start] === "[" && value[end] === "]") {
+      end += 1;
+      continue;
+    }
+    if (isCredentialValueDelimiter(value[end]!)) break;
+    end += 1;
+  }
+  return end;
+}
+
+function trailingCredentialAssignmentStart(value: string): number | undefined {
+  const matches = sensitiveAssignments(value);
+  for (const match of matches.reverse()) {
+    const end = assignmentValueEndsAt(value, match.valueStart);
+    if (end !== value.length) continue;
+    const raw = value.slice(match.valueStart, end);
+    if (!raw) return match.index;
+    if (value[match.valueStart] === "\"" || value[match.valueStart] === "'") {
+      const closing = raw.lastIndexOf(value[match.valueStart]!);
+      if (closing < 0) return match.index;
+      if (closing + 1 === raw.length && isCompleteRedactionMarker(raw.slice(1, -1))) return match.index;
+      continue;
+    }
+    if (isCompleteRedactionMarker(raw)) return match.index;
+  }
+  return undefined;
+}
+
+/** Mask a value that was continued by a later chunk, including quoted marker suffixes. */
+function maskCredentialContinuation(value: string): string {
+  const match = firstSensitiveAssignment(value);
+  if (!match) return maskCredentialAssignments(value).value;
+  const end = assignmentValueEndsAt(value, match.valueStart);
+  const opening = value[match.valueStart];
+  const replacement = opening === "\"" || opening === "'" ? `${opening}[REDACTED]${opening}` : "[REDACTED]";
+  const masked = `${value.slice(0, match.valueStart)}${replacement}${value.slice(end)}`;
+  return maskCredentialAssignments(masked).value;
 }
 
 function maskUrlUserinfo(value: string): string {

@@ -78,6 +78,47 @@ test("controller adapter output uses the central assignment redaction boundary",
   observer.close();
 });
 
+test("stateful assignment redaction carries controller, agent, and background chunks", async () => {
+  const controllerObserver = observerWithStore();
+  const controller = new ControllerObservationAdapter(controllerObserver, { identity: { forgeRunId: "run-controller-split" }, producer });
+  controller.output("stdout", "password=");
+  controller.output("stdout", "controller-split-secret");
+  controller.output("stdout", "password=[REDACTED]");
+  controller.output("stdout", "controller-marker-suffix");
+  controller.completed(0);
+  await controllerObserver.flush();
+  const controllerEvents = await controllerObserver.query({ forgeRunId: "run-controller-split" });
+  assert.doesNotMatch(JSON.stringify(controllerEvents), /controller-split-secret|controller-marker-suffix/);
+  assert.equal(controllerEvents.filter((event) => event.output).map((event) => event.output?.text).join(""), "password=[REDACTED]password=[REDACTED]");
+  controllerObserver.close();
+
+  const agentObserver = observerWithStore();
+  const agent = createAgentEventObservationSink(agentObserver, { identity: { forgeRunId: "run-agent-split" }, producer });
+  agent({ type: "text.delta", taskId: "agent-split", text: "password=" });
+  agent({ type: "text.delta", taskId: "agent-split", text: "agent-split-secret" });
+  agent({ type: "text.delta", taskId: "agent-split", text: "password=[REDACTED]" });
+  agent({ type: "text.delta", taskId: "agent-split", text: "agent-marker-suffix" });
+  agent({ type: "session.completed", taskId: "agent-split", sessionRef: "pi-split" });
+  await agentObserver.flush();
+  const agentEvents = await agentObserver.query({ forgeRunId: "run-agent-split" });
+  assert.doesNotMatch(JSON.stringify(agentEvents), /agent-split-secret|agent-marker-suffix/);
+  assert.match(agentEvents.map((event) => event.output?.text ?? "").join(""), /password=\[REDACTED\]/);
+  agentObserver.close();
+
+  const backgroundObserver = observerWithStore();
+  const background = new BackgroundTaskObservationAdapter(backgroundObserver, producer);
+  await background.output("task-split", "stdout", "password=", 1);
+  await background.output("task-split", "stdout", "background-split-secret", 2);
+  await background.output("task-split", "stdout", "password=[REDACTED]", 3);
+  await background.output("task-split", "stdout", "background-marker-suffix", 4);
+  await background.finished("task-split", "completed", 0);
+  await backgroundObserver.flush();
+  const backgroundEvents = await backgroundObserver.query({ source: "process" });
+  assert.doesNotMatch(JSON.stringify(backgroundEvents), /background-split-secret|background-marker-suffix/);
+  assert.match(backgroundEvents.map((event) => event.output?.text ?? "").join(""), /password=\[REDACTED\]/);
+  backgroundObserver.close();
+});
+
 test("journal assigns per-run sequences, preserves channels, and redacts sensitive payloads", async () => {
   const observer = observerWithStore();
   await observer.emit({
