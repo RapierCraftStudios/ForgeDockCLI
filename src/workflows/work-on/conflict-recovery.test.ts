@@ -50,9 +50,15 @@ class FakeGit implements GitWorkspaceManager {
   onPush?: () => void;
   alreadyCommitted = false;
   throwAfterCommit = false;
-  constructor(readonly conflictPaths: string[], readonly target: string) {}
+  stagedResolutions = false;
+  stageCalls = 0;
+  constructor(
+    readonly conflictPaths: string[],
+    readonly target: string,
+    readonly incomingPaths: string[] = [],
+  ) {}
   async create(): Promise<GitWorkspace> { return workspace; }
-  async changedPaths(): Promise<string[]> { return this.commitCalls ? [] : this.conflictPaths; }
+  async changedPaths(): Promise<string[]> { return this.commitCalls ? [] : [...this.conflictPaths, ...this.incomingPaths]; }
   async revisionChangedPaths(): Promise<string[]> { return ["src/allowed.ts"]; }
   async syncToRemoteHead(): Promise<void> {}
   async integrateRemoteBase(received: GitWorkspace, input: { expectedHeadSha: string; expectedBaseSha: string }): Promise<{ workspace: GitWorkspace; conflictPaths: string[]; mergeCommitExists: boolean }> {
@@ -64,6 +70,12 @@ class FakeGit implements GitWorkspaceManager {
       conflictPaths: this.alreadyCommitted ? [] : [...this.conflictPaths],
       mergeCommitExists: this.alreadyCommitted,
     };
+  }
+  async unmergedPaths(): Promise<string[]> { return this.stagedResolutions ? [] : [...this.conflictPaths]; }
+  async stageConflictResolutions(_workspace: GitWorkspace, paths: readonly string[]): Promise<void> {
+    this.stageCalls += 1;
+    assert.deepEqual(paths, this.conflictPaths);
+    this.stagedResolutions = true;
   }
   async isAncestor(): Promise<boolean> { return true; }
   async prepareWorkspaceDependencies(): Promise<void> {}
@@ -162,19 +174,21 @@ function fixture(run: RunState, expectedPaths: string[] = ["src/allowed.ts"]): {
   return { intent, investigation, packet, buildResult, verdict, mergeGate };
 }
 
-async function recoverFixture(options: { target?: string; conflicts: string[]; expectedPaths?: string[] }) {
+async function recoverFixture(options: { target?: string; conflicts: string[]; expectedPaths?: string[]; incomingPaths?: string[]; reportedPaths?: string[] }) {
   const runs = new InMemoryRunRepository();
   const artifacts = new InMemoryArtifactRepository();
   const run = await blockedRun(runs);
   const values = fixture(run, options.expectedPaths ?? ["src/allowed.ts"]);
-  const git = new FakeGit(options.conflicts, options.target ?? targetSha);
+  const git = new FakeGit(options.conflicts, options.target ?? targetSha, options.incomingPaths ?? []);
   const runtime = new FakeAgentRuntime([{
     summary: "resolved",
-    changedPaths: options.conflicts,
+    changedPaths: options.reportedPaths ?? options.conflicts,
     criterionCoverage: [{ criterion: "works", implementation: "resolved" }],
     decisions: [],
     residualRisks: [],
   }]);
+  let current = { ...pullRequest };
+  git.onPush = () => { current = { ...current, headSha: newSha }; };
   const verifier: VerificationRunner = { async run() { return [passed]; } };
   const result = await recoverConflictingRevision({
     run,
@@ -189,7 +203,10 @@ async function recoverFixture(options: { target?: string; conflicts: string[]; e
     runs,
     git,
     verifier,
-    host: hostFor(options.target ?? targetSha),
+    host: {
+      getPullRequest: async () => ({ ...current }),
+      getBranchHead: async () => options.target ?? targetSha,
+    } as unknown as ForgeHost,
   });
   return { result, git, runtime, artifacts };
 }
@@ -293,6 +310,28 @@ describe("approved target-conflict recovery", () => {
     assert.equal(runtime.tasks.length, 1);
     assert.equal(runtime.tasks[0]?.role, "remediator");
     assert.match(runtime.tasks[0]?.instructions ?? "", /Do not invoke GitHub, run git commands, commit, push, merge/);
+  });
+
+  it("does not treat unrelated incoming target paths as resolver edits", async () => {
+    const { result, git, runtime } = await recoverFixture({
+      conflicts: ["src/allowed.ts"],
+      incomingPaths: ["docs/staging-release-notes.md", "src/unrelated-target-change.ts"],
+    });
+    assert.equal(result.run.state, "reviewing");
+    assert.equal(git.commitCalls, 1);
+    assert.equal(git.pushCalls, 1);
+    assert.equal(runtime.tasks.length, 1);
+  });
+
+  it("does not stage or consume the merge checkpoint when the resolver reports the wrong paths", async () => {
+    const { result, git } = await recoverFixture({
+      conflicts: ["src/allowed.ts"],
+      reportedPaths: [],
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(git.stageCalls, 0);
+    assert.equal(git.stagedResolutions, false);
+    assert.deepEqual(await git.unmergedPaths(), ["src/allowed.ts"]);
   });
 
   it("re-enters after a local merge commit fault without creating a duplicate commit", async () => {

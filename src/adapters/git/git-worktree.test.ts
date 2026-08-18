@@ -443,6 +443,7 @@ describe("isolated Git worktrees", () => {
       assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
       assert.equal(readFileSync(join(fixture.workspace.path, "base.txt"), "utf8"), "base update\n");
       assert.equal(readFileSync(join(fixture.workspace.path, "feature.txt"), "utf8"), "delivery\n");
+      assert.deepEqual(await fixture.manager.unmergedPaths(fixture.workspace), []);
     } finally {
       await removeRemoteBaseIntegrationFixture(fixture);
     }
@@ -461,6 +462,32 @@ describe("isolated Git worktrees", () => {
       assert.equal(result.workspace.baseSha, fixture.updatedBaseSha);
       assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
       assert.match(git(fixture.workspace.path, "status", "--porcelain"), /UU README\.md/);
+      assert.deepEqual(await fixture.manager.unmergedPaths(fixture.workspace), ["README.md"]);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("reports only unresolved index paths after resolution, excluding staged target paths", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+
+      assert.deepEqual(await fixture.manager.unmergedPaths(fixture.workspace), ["README.md"]);
+      await assert.rejects(
+        fixture.manager.stageConflictResolutions(fixture.workspace, ["README.md"]),
+        /git --literal-pathspecs failed/,
+      );
+      assert.deepEqual(await fixture.manager.unmergedPaths(fixture.workspace), ["README.md"]);
+
+      writeFileSync(join(fixture.workspace.path, "README.md"), "resolved delivery and base\n");
+      await fixture.manager.stageConflictResolutions(fixture.workspace, ["README.md"]);
+
+      assert.deepEqual(await fixture.manager.unmergedPaths(fixture.workspace), []);
+      assert.deepEqual(await fixture.manager.changedPaths(fixture.workspace), ["README.md"]);
     } finally {
       await removeRemoteBaseIntegrationFixture(fixture);
     }

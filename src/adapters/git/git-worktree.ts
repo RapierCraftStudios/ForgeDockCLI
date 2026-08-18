@@ -378,9 +378,45 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
-  private async unmergedPaths(workspace: GitWorkspace): Promise<string[]> {
+  async unmergedPaths(workspace: GitWorkspace): Promise<string[]> {
     const output = await this.git(["diff", "--name-only", "--diff-filter=U", "-z", "--"], workspace.path);
     return [...new Set(output.split("\0").filter(Boolean))].sort();
+  }
+
+  async stageConflictResolutions(workspace: GitWorkspace, paths: readonly string[]): Promise<void> {
+    const authorized = [...new Set(paths)].sort();
+    if (!authorized.length) throw new Error("Conflict resolution staging requires at least one authorized path");
+    const entries = (await this.git([
+      "--literal-pathspecs", "ls-files", "-u", "-z", "--", ...authorized,
+    ], workspace.path)).split("\0").filter(Boolean);
+    const stages = new Map<string, Set<number>>();
+    for (const entry of entries) {
+      const parsed = /^(\d+)\s+[0-9a-f]+\s+([123])\t([\s\S]+)$/.exec(entry);
+      if (!parsed || (parsed[1] !== "100644" && parsed[1] !== "100755")) {
+        throw new Error("Automatic conflict resolution supports only ordinary regular-file conflicts");
+      }
+      const pathStages = stages.get(parsed[3]!) ?? new Set<number>();
+      pathStages.add(Number(parsed[2]));
+      stages.set(parsed[3]!, pathStages);
+    }
+    for (const path of authorized) {
+      const pathStages = stages.get(path);
+      if (!pathStages || ![1, 2, 3].every((stage) => pathStages.has(stage))) {
+        throw new Error(`Automatic conflict resolution requires a three-stage regular-file conflict: ${path}`);
+      }
+      const candidate = resolve(workspace.path, path);
+      assertInside(workspace.path, candidate);
+      const metadata = await lstat(candidate);
+      if (!metadata.isFile() || (await readFile(candidate)).includes(0)) {
+        throw new Error(`Automatic conflict resolution requires text file content: ${path}`);
+      }
+    }
+    await this.assertNoCleanFilters(workspace, authorized);
+    // Validate the worktree before mutating the index. Git's check rejects
+    // leftover conflict-marker lines, so a no-op resolver cannot convert a
+    // text conflict into a durable "resolved" checkpoint merely by naming it.
+    await this.git(["--literal-pathspecs", "diff", "--check", "--", ...authorized], workspace.path);
+    await this.git(["--literal-pathspecs", "add", "--all", "--", ...authorized], workspace.path);
   }
 
   private async isCompletedRemoteBaseMerge(

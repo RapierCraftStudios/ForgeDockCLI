@@ -34,6 +34,10 @@ export interface GitWorkspaceManager {
     workspace: GitWorkspace,
     input: { expectedHeadSha: string; expectedBaseSha: string },
   ): Promise<{ workspace: GitWorkspace; conflictPaths: string[]; mergeCommitExists: boolean }>;
+  /** Read the currently unmerged index paths from a retained merge workspace. */
+  unmergedPaths?(workspace: GitWorkspace): Promise<string[]>;
+  /** Stage only controller-authorized conflict paths so Git can prove they are resolved. */
+  stageConflictResolutions?(workspace: GitWorkspace, paths: readonly string[]): Promise<void>;
   /** Prove one fetched commit is contained in a descendant revision. */
   isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean>;
   /** Install lockfile dependencies without executing repository lifecycle scripts. */

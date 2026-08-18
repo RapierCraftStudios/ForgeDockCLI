@@ -7,7 +7,7 @@
 
 ### Fixed
 
-- Confirmed target-branch conflicts now enter an explicit typed recovery checkpoint that exact-SHA fences the PR and target, resolves only frozen Build Packet paths, reruns full verification and review, publishes a normal descendant merge, and safely re-enters an exact two-parent local merge after a controller crash.
+- Confirmed target-branch conflicts now enter an explicit typed recovery checkpoint that exact-SHA fences the PR and target, resolves only frozen Build Packet paths, proves completion from Git's unmerged index rather than the full incoming target delta, reruns full verification and review, publishes a normal descendant merge, and safely re-enters an exact two-parent local merge after a controller crash.
 - SQLite repository and observation-store startup now retries transient WAL/schema initialization contention across simultaneous processes, preventing a cross-process constructor race from surfacing as `database is locked`.
 - Native controller tasks bound to the TUI's ephemeral nested-agent bridge are no longer adopted as healthy after a terminal restart; they are terminated, durably marked blocked with a non-secret recovery marker, and report workflow-specific guidance for orchestration/work-on/promotion checkpoint resume or `/review-pr` rerun.
 - Failed Node test verification now retains a bounded, redacted failing-test name, location, and assertion excerpt instead of collapsing actionable diagnostics to a generic `ERR_ASSERTION` signature.

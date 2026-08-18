@@ -182,18 +182,26 @@ export async function recoverConflictingRevision(
         conflictPaths,
         dependencies,
       });
-      const observed = canonicalizeConcreteScopePaths(await dependencies.git.changedPaths(workspace)).sort();
-      const unexpected = observed.filter((path) => !conflictPaths.includes(path));
-      const omitted = conflictPaths.filter((path) => !observed.includes(path));
-      if (unexpected.length || omitted.length) {
-        return block(
-          `Conflict resolver changed paths outside the unmerged packet paths:${unexpected.length ? ` unexpected ${unexpected.join(", ")}` : ""}${omitted.length ? ` unresolved ${omitted.join(", ")}` : ""}`,
-          [],
-          observed,
-        );
-      }
       if (canonicalPathSet(resolution.changedPaths) !== canonicalPathSet(conflictPaths)) {
-        return block("Conflict resolver did not report exactly the controller-authorized unmerged paths", [], observed);
+        return block("Conflict resolver did not report exactly the controller-authorized unmerged paths", [], resolution.changedPaths);
+      }
+      if (!dependencies.git.stageConflictResolutions) {
+        return block("Conflict resolver completion cannot be proven because the Git adapter cannot stage authorized conflict paths", [], resolution.changedPaths);
+      }
+      await dependencies.git.stageConflictResolutions(workspace, conflictPaths);
+      const unmergedPaths = (dependencies.git as GitWorkspaceManager & {
+        unmergedPaths?: (workspace: GitWorkspace) => Promise<string[]>;
+      }).unmergedPaths;
+      if (!unmergedPaths) {
+        return block("Conflict resolver completion cannot be proven because the Git adapter does not expose unmerged paths", [], resolution.changedPaths);
+      }
+      const unresolved = canonicalizeConcreteScopePaths(await unmergedPaths.call(dependencies.git, workspace)).sort();
+      if (unresolved.length) {
+        return block(
+          `Conflict resolver left unmerged paths: ${unresolved.join(", ")}`,
+          [],
+          unresolved,
+        );
       }
     }
 
