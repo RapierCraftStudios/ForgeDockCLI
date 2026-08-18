@@ -69,6 +69,15 @@ async function removeRemoteBaseIntegrationFixture(fixture: Awaited<ReturnType<ty
   }
 }
 
+function advanceRemoteBase(fixture: Awaited<ReturnType<typeof remoteBaseIntegrationFixture>>, contents: string): string {
+  const repo = join(fixture.root, "repo");
+  writeFileSync(join(repo, "README.md"), contents);
+  git(repo, "add", "--all");
+  git(repo, "commit", "-m", "advance base again");
+  git(repo, "push", "origin", "main");
+  return git(repo, "rev-parse", "HEAD");
+}
+
 describe("isolated Git worktrees", () => {
   it("reclaims a repository metadata lock immediately when its owner is dead", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-dead-owner-"));
@@ -542,6 +551,101 @@ describe("isolated Git worktrees", () => {
       assert.equal(second.workspace.baseSha, fixture.updatedBaseSha);
       assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.headSha);
       assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("supersedes an ancestor merge checkpoint only after proving the reviewed head and retained base", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      const first = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      const newerBaseSha = advanceRemoteBase(fixture, "base update newer\n");
+
+      const superseded = await fixture.manager.integrateRemoteBase(first.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: newerBaseSha,
+      });
+
+      assert.deepEqual(superseded.conflictPaths, ["README.md"]);
+      assert.equal(superseded.mergeCommitExists, false);
+      assert.equal(superseded.workspace.baseSha, newerBaseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), newerBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("rejects merge supersession when the retained base or target ancestry is stale", async () => {
+    const mismatched = await remoteBaseIntegrationFixture(true);
+    try {
+      const first = await mismatched.manager.integrateRemoteBase(mismatched.workspace, {
+        expectedHeadSha: mismatched.headSha,
+        expectedBaseSha: mismatched.updatedBaseSha,
+      });
+      const newerBaseSha = advanceRemoteBase(mismatched, "base update newer\n");
+
+      await assert.rejects(
+        mismatched.manager.integrateRemoteBase({ ...first.workspace, baseSha: mismatched.baseSha }, {
+          expectedHeadSha: mismatched.headSha,
+          expectedBaseSha: newerBaseSha,
+        }),
+        /frozen base .* does not match merge checkpoint .*supersession/,
+      );
+      assert.equal(git(mismatched.workspace.path, "rev-parse", "MERGE_HEAD"), mismatched.updatedBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(mismatched);
+    }
+
+    const diverged = await remoteBaseIntegrationFixture(true);
+    try {
+      const first = await diverged.manager.integrateRemoteBase(diverged.workspace, {
+        expectedHeadSha: diverged.headSha,
+        expectedBaseSha: diverged.updatedBaseSha,
+      });
+      const repo = join(diverged.root, "repo");
+      const tree = git(repo, "rev-parse", "HEAD^{tree}");
+      const unrelatedBaseSha = gitWithInput(repo, "diverged base\n", "commit-tree", tree, "-p", diverged.baseSha);
+      git(repo, "update-ref", "refs/heads/main", unrelatedBaseSha);
+      git(repo, "push", "--force", "origin", "main");
+
+      await assert.rejects(
+        diverged.manager.integrateRemoteBase(first.workspace, {
+          expectedHeadSha: diverged.headSha,
+          expectedBaseSha: unrelatedBaseSha,
+        }),
+        /not an ancestor of requested remote base .*supersession/,
+      );
+      assert.equal(git(diverged.workspace.path, "rev-parse", "MERGE_HEAD"), diverged.updatedBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(diverged);
+    }
+  });
+
+  it("rejects unrelated dirty paths before aborting a stale merge checkpoint", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      const first = await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      const newerBaseSha = advanceRemoteBase(fixture, "base update newer\n");
+      writeFileSync(join(fixture.workspace.path, "unrelated.txt"), "do not discard\n");
+
+      await assert.rejects(
+        fixture.manager.integrateRemoteBase(first.workspace, {
+          expectedHeadSha: fixture.headSha,
+          expectedBaseSha: newerBaseSha,
+        }),
+        /unrelated dirty paths: unrelated\.txt/,
+      );
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), fixture.updatedBaseSha);
+      assert.equal(readFileSync(join(fixture.workspace.path, "unrelated.txt"), "utf8"), "do not discard\n");
     } finally {
       await removeRemoteBaseIntegrationFixture(fixture);
     }

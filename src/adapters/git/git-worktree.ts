@@ -167,10 +167,6 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const expectedHeadSha = input.expectedHeadSha.toLowerCase();
     const expectedBaseSha = input.expectedBaseSha.toLowerCase();
     const existingMergeHead = await this.readMergeHead(workspace);
-    if (existingMergeHead && existingMergeHead.toLowerCase() !== expectedBaseSha) {
-      throw new Error(`Retained workspace has an unrelated merge in progress at ${existingMergeHead}; refusing remote base integration`);
-    }
-
     const localHead = await this.head(workspace);
     if (existingMergeHead && localHead.toLowerCase() !== expectedHeadSha) {
       throw new Error(`Retained workspace head ${localHead} does not match expected delivery head ${input.expectedHeadSha} while merge ${existingMergeHead} is in progress`);
@@ -179,12 +175,40 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     if (fetchedBase.toLowerCase() !== expectedBaseSha) {
       throw new Error(`Remote base ${workspace.baseRef} resolved to ${fetchedBase}, expected ${input.expectedBaseSha}`);
     }
-    if (!await this.isAncestor(workspace, workspace.baseSha, input.expectedBaseSha)) {
+    const supersedingMerge = existingMergeHead !== undefined && existingMergeHead.toLowerCase() !== expectedBaseSha;
+    if (!supersedingMerge && !await this.isAncestor(workspace, workspace.baseSha, input.expectedBaseSha)) {
       throw new Error(`Frozen workspace base ${workspace.baseSha} is not an ancestor of remote base ${input.expectedBaseSha}`);
     }
 
     const integratedWorkspace = { ...workspace, baseSha: input.expectedBaseSha };
-    if (existingMergeHead) {
+    let mergeHead = existingMergeHead;
+    if (mergeHead && mergeHead.toLowerCase() !== expectedBaseSha) {
+      if (workspace.baseSha.toLowerCase() !== mergeHead.toLowerCase()) {
+        throw new Error(`Retained workspace frozen base ${workspace.baseSha} does not match merge checkpoint ${mergeHead}; refusing remote base supersession`);
+      }
+      if (!await this.isAncestor(workspace, mergeHead, expectedBaseSha)) {
+        throw new Error(`Retained merge checkpoint ${mergeHead} is not an ancestor of requested remote base ${input.expectedBaseSha}; refusing remote base supersession`);
+      }
+      await this.assertSupersedingMergeIsClean(workspace, expectedHeadSha, mergeHead);
+      try {
+        await this.git(["merge", "--abort"], workspace.path);
+      } catch (error) {
+        throw new Error(`Unable to abort stale remote base merge ${mergeHead} safely`, { cause: error });
+      }
+      mergeHead = await this.readMergeHead(workspace);
+      if (mergeHead) {
+        throw new Error(`Stale remote base merge ${mergeHead} remained in progress after abort`);
+      }
+      const abortedHead = await this.head(workspace);
+      if (abortedHead.toLowerCase() !== expectedHeadSha) {
+        throw new Error(`Aborted remote base merge restored ${abortedHead}, expected reviewed delivery head ${input.expectedHeadSha}`);
+      }
+      const dirtyAfterAbort = await this.changedPaths(workspace);
+      if (dirtyAfterAbort.length) {
+        throw new Error(`Aborting stale remote base merge left a dirty workspace: ${dirtyAfterAbort.join(", ")}`);
+      }
+    }
+    if (mergeHead) {
       return { workspace: integratedWorkspace, conflictPaths: await this.unmergedPaths(workspace), mergeCommitExists: false };
     }
 
@@ -217,7 +241,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       throw new Error("Remote base integration failed without a recoverable conflict; merge was aborted", { cause: error });
     }
 
-    const mergeHead = await this.readMergeHead(workspace);
+    mergeHead = await this.readMergeHead(workspace);
     if (mergeHead && mergeHead.toLowerCase() !== expectedBaseSha) {
       throw new Error(`Remote base integration created an unexpected merge state at ${mergeHead}`);
     }
@@ -226,6 +250,23 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       conflictPaths: mergeHead ? await this.unmergedPaths(workspace) : [],
       mergeCommitExists: false,
     };
+  }
+
+  private async assertSupersedingMergeIsClean(
+    workspace: GitWorkspace,
+    expectedHeadSha: string,
+    mergeHead: string,
+  ): Promise<void> {
+    const dirty = await this.changedPaths(workspace);
+    if (!dirty.length) return;
+    const mergePathsOutput = await this.git([
+      "diff", "--no-renames", "--name-only", "-z", expectedHeadSha, mergeHead,
+    ], workspace.path);
+    const mergePaths = new Set(mergePathsOutput.split("\0").filter((path) => path && !isOperationalPath(path)));
+    const unrelated = dirty.filter((path) => !mergePaths.has(path));
+    if (unrelated.length) {
+      throw new Error(`Cannot supersede stale remote base merge with unrelated dirty paths: ${unrelated.join(", ")}`);
+    }
   }
 
   async isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean> {
