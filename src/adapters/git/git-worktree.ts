@@ -183,8 +183,13 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const integratedWorkspace = { ...workspace, baseSha: input.expectedBaseSha };
     let mergeHead = existingMergeHead;
     if (mergeHead && mergeHead.toLowerCase() !== expectedBaseSha) {
-      if (workspace.baseSha.toLowerCase() !== mergeHead.toLowerCase()) {
-        throw new Error(`Retained workspace frozen base ${workspace.baseSha} does not match merge checkpoint ${mergeHead}; refusing remote base supersession`);
+      // `workspace.baseSha` is the immutable delivery baseline recovered from
+      // the BuildResult. `MERGE_HEAD` is the adapter-owned checkpoint for the
+      // target used by an earlier, interrupted synchronization. They are
+      // intentionally different after a crash; prove the checkpoint belongs
+      // to this frozen delivery lineage instead of requiring object equality.
+      if (!await this.isAncestor(workspace, workspace.baseSha, mergeHead)) {
+        throw new Error(`Retained merge checkpoint ${mergeHead} is not a descendant of frozen workspace base ${workspace.baseSha}; refusing remote base supersession`);
       }
       if (!await this.isAncestor(workspace, mergeHead, expectedBaseSha)) {
         throw new Error(`Retained merge checkpoint ${mergeHead} is not an ancestor of requested remote base ${input.expectedBaseSha}; refusing remote base supersession`);

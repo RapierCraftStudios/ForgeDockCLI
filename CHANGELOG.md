@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Retained conflict-recovery merges now survive a controller restart with the immutable delivery baseline by proving the prior merge checkpoint is a descendant of that baseline and an ancestor of the current target, instead of incorrectly requiring the baseline and checkpoint SHAs to be identical.
 - Confirmed target-branch conflicts now enter an explicit typed recovery checkpoint that exact-SHA fences the PR and target, resolves only frozen Build Packet paths, proves completion from Git's unmerged index rather than the full incoming target delta, reruns full verification and review, publishes a normal descendant merge, and safely re-enters an exact two-parent local merge after a controller crash.
 - Retained conflict-recovery merges can safely supersede an older target checkpoint when staging advances again, but only after proving the reviewed head, persisted prior target, target ancestry, and absence of unrelated dirty paths before aborting and restarting the merge.
 - SQLite repository and observation-store startup now retries transient WAL/schema initialization contention across simultaneous processes, preventing a cross-process constructor race from surfacing as `database is locked`.

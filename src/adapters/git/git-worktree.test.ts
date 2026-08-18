@@ -580,7 +580,43 @@ describe("isolated Git worktrees", () => {
     }
   });
 
-  it("rejects merge supersession when the retained base or target ancestry is stale", async () => {
+  it("supersedes a stale merge after restart with the immutable frozen base", async () => {
+    const fixture = await remoteBaseIntegrationFixture(true);
+    try {
+      await fixture.manager.integrateRemoteBase(fixture.workspace, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: fixture.updatedBaseSha,
+      });
+      const newerBaseSha = advanceRemoteBase(fixture, "base update newer\n");
+
+      // A new controller reconstructs the workspace from the durable
+      // BuildResult base while MERGE_HEAD retains the prior target checkpoint.
+      const restartedManager = new GitWorktreeManager(
+        join(fixture.root, "repo"),
+        join(fixture.root, "worktrees"),
+      );
+      const recovered = await restartedManager.recover({
+        runId: "run_integrate_base",
+        issue: 22,
+        baseRef: "origin/main",
+        baseSha: fixture.baseSha,
+      });
+      const superseded = await restartedManager.integrateRemoteBase(recovered, {
+        expectedHeadSha: fixture.headSha,
+        expectedBaseSha: newerBaseSha,
+      });
+
+      assert.deepEqual(superseded.conflictPaths, ["README.md"]);
+      assert.equal(superseded.mergeCommitExists, false);
+      assert.equal(superseded.workspace.baseSha, newerBaseSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "HEAD"), fixture.headSha);
+      assert.equal(git(fixture.workspace.path, "rev-parse", "MERGE_HEAD"), newerBaseSha);
+    } finally {
+      await removeRemoteBaseIntegrationFixture(fixture);
+    }
+  });
+
+  it("rejects merge supersession when the retained checkpoint lineage or target ancestry is stale", async () => {
     const mismatched = await remoteBaseIntegrationFixture(true);
     try {
       const first = await mismatched.manager.integrateRemoteBase(mismatched.workspace, {
@@ -588,13 +624,16 @@ describe("isolated Git worktrees", () => {
         expectedBaseSha: mismatched.updatedBaseSha,
       });
       const newerBaseSha = advanceRemoteBase(mismatched, "base update newer\n");
+      const repo = join(mismatched.root, "repo");
+      const tree = git(repo, "rev-parse", "HEAD^{tree}");
+      const unrelatedFrozenBaseSha = gitWithInput(repo, "unrelated frozen base\n", "commit-tree", tree, "-p", mismatched.baseSha);
 
       await assert.rejects(
-        mismatched.manager.integrateRemoteBase({ ...first.workspace, baseSha: mismatched.baseSha }, {
+        mismatched.manager.integrateRemoteBase({ ...first.workspace, baseSha: unrelatedFrozenBaseSha }, {
           expectedHeadSha: mismatched.headSha,
           expectedBaseSha: newerBaseSha,
         }),
-        /frozen base .* does not match merge checkpoint .*supersession/,
+        /merge checkpoint .* is not a descendant of frozen workspace base .*supersession/,
       );
       assert.equal(git(mismatched.workspace.path, "rev-parse", "MERGE_HEAD"), mismatched.updatedBaseSha);
     } finally {
