@@ -33,8 +33,91 @@ import type {
 } from "./agent-runtime.js";
 import { createSandboxedTools } from "./sandboxed-tools.js";
 import { assertRuntimeInstallAsync } from "./runtime-install.js";
+import { DEFAULT_SEMANTIC_IDLE_MS, validateSemanticIdleMs } from "./semantic-idle.js";
 
 export const MAX_NESTED_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Verification commands have their own process-level timeout. Emit a
+ * heartbeat well before the generic 120s semantic-idle window so a legitimate
+ * long-running command is not mistaken for an idle provider session.
+ */
+export const DEFAULT_VERIFY_TOOL_HEARTBEAT_MS = 30_000;
+
+export function verificationHeartbeatIntervalMs(timeoutMs: number, semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS): number | undefined {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) return undefined;
+  if (!Number.isSafeInteger(semanticIdleMs) || semanticIdleMs < 1) return undefined;
+  return Math.max(1, Math.min(DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, Math.floor(timeoutMs / 2), Math.floor(semanticIdleMs / 2)));
+}
+
+/**
+ * Build the controller-approved verification tool used by production Pi
+ * sessions. Exported so its liveness contract can be exercised without a live
+ * provider session.
+ */
+export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSink, semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS) {
+  if (!task.tools.includes("verify")) return undefined;
+  return defineTool({
+    name: "verify",
+    label: "Run approved verification",
+    description: "Run exactly one controller-approved verification command by its frozen ID in the assigned worktree.",
+    promptSnippet: "Run a frozen verification command for implementation feedback",
+    promptGuidelines: ["Pass only a command ID from the approved verification list; never invent commands or arguments."],
+    parameters: Type.Object({ commandId: Type.String({ minLength: 1 }) }),
+    async execute(toolCallId, params, signal) {
+      if (!task.verification) throw new Error("This builder was not granted a verification plan");
+      const commandId = String((params as { commandId: string }).commandId);
+      const command = task.verification.commands.find((candidate) => candidate.id === commandId);
+      if (!command) throw new Error(`Verification command '${commandId}' is not in the frozen controller-approved plan`);
+      if (resolve(command.cwd) !== resolve(task.workspace.cwd)) {
+        throw new Error(`Verification command '${commandId}' is bound to a different worktree`);
+      }
+      const heartbeatIntervalMs = verificationHeartbeatIntervalMs(command.timeoutMs, semanticIdleMs);
+      const startedAt = Date.now();
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      let heartbeatStopTimer: ReturnType<typeof setTimeout> | undefined;
+      const stopHeartbeat = () => {
+        if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+        if (heartbeatStopTimer !== undefined) clearTimeout(heartbeatStopTimer);
+        heartbeatTimer = undefined;
+        heartbeatStopTimer = undefined;
+      };
+      if (heartbeatIntervalMs !== undefined) {
+        heartbeatTimer = setInterval(() => {
+          const elapsedMs = Math.max(0, Date.now() - startedAt);
+          if (elapsedMs >= command.timeoutMs) {
+            stopHeartbeat();
+            return;
+          }
+          emit({
+            type: "tool.progress",
+            taskId: task.id,
+            toolCallId,
+            tool: "verify",
+            elapsedMs,
+            timeoutMs: command.timeoutMs,
+            ...(task.observability ? { observability: task.observability } : {}),
+          });
+        }, heartbeatIntervalMs);
+        // The command runner owns timeout enforcement. Stop producing
+        // liveness evidence at that bound so a broken runner still reaches the
+        // generic fail-closed watchdog instead of living forever on synthetic
+        // heartbeats.
+        heartbeatStopTimer = setTimeout(stopHeartbeat, command.timeoutMs);
+      }
+      try {
+        const result = (await task.verification.runner.run([command], signal))[0];
+        if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ id: commandId, ...result }) }],
+          details: result,
+        };
+      } finally {
+        stopHeartbeat();
+      }
+    },
+  });
+}
 
 /**
  * Validate every frozen provider/model target without starting an agent
@@ -78,6 +161,8 @@ export interface PiRuntimeOptions {
   planningProvider?: string;
   planningModel?: string;
   planningThinking?: ModelPolicy["thinking"];
+  /** Generic semantic-idle bound used by the outer CLI runtime wrapper. */
+  semanticIdleMs?: number;
   runtimeApiKeys?: Record<string, string>;
 }
 
@@ -99,6 +184,7 @@ interface LocalExecutionBudgetState {
 
 export class PiAgentRuntime implements AgentRuntime {
   readonly #options: PiRuntimeOptions;
+  readonly #semanticIdleMs: number;
   readonly #activeExecutions = new Set<ActiveExecution>();
   readonly #activeSessions = new Set<PiSession>();
   #modelRuntime?: Promise<ModelRuntime>;
@@ -106,6 +192,9 @@ export class PiAgentRuntime implements AgentRuntime {
 
   constructor(options: PiRuntimeOptions = {}) {
     this.#options = options;
+    this.#semanticIdleMs = options.semanticIdleMs === undefined
+      ? DEFAULT_SEMANTIC_IDLE_MS
+      : validateSemanticIdleMs(options.semanticIdleMs);
   }
 
   async capabilities(): Promise<RuntimeCapabilities> {
@@ -219,31 +308,8 @@ export class PiAgentRuntime implements AgentRuntime {
     const resourceLoader = createTaskResourceLoader(task);
     const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope);
     throwIfAborted(execution.controller.signal);
-    const verificationTool = task.tools.includes("verify")
-      ? defineTool({
-        name: "verify",
-        label: "Run approved verification",
-        description: "Run exactly one controller-approved verification command by its frozen ID in the assigned worktree.",
-        promptSnippet: "Run a frozen verification command for implementation feedback",
-        promptGuidelines: ["Pass only a command ID from the approved verification list; never invent commands or arguments."],
-        parameters: Type.Object({ commandId: Type.String({ minLength: 1 }) }),
-        async execute(_toolCallId, params, signal) {
-          if (!task.verification) throw new Error("This builder was not granted a verification plan");
-          const commandId = String((params as { commandId: string }).commandId);
-          const command = task.verification.commands.find((candidate) => candidate.id === commandId);
-          if (!command) throw new Error(`Verification command '${commandId}' is not in the frozen controller-approved plan`);
-          if (resolve(command.cwd) !== resolve(task.workspace.cwd)) {
-            throw new Error(`Verification command '${commandId}' is bound to a different worktree`);
-          }
-          const result = (await task.verification.runner.run([command], signal))[0];
-          if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify({ id: commandId, ...result }) }],
-            details: result,
-          };
-        },
-      })
-      : undefined;
+    const semanticIdleMs = this.#semanticIdleMs;
+    const verificationTool = createVerificationTool(task, emit, semanticIdleMs);
     const agentDir = this.#options.agentDir ?? getAgentDir();
     const { session } = await createAgentSession({
       cwd: task.workspace.cwd,

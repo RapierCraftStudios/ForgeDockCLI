@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy } from "./pi-adapter.js";
+import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -160,6 +160,71 @@ test("tool-call budget reserves parallel beforeToolCall slots without overshoot"
   assert.equal(state.toolCalls, 20);
   assert.deepEqual(reserveToolCallBudget(state, 20), { limit: "maxToolCalls", value: 20, maximum: 20 });
   assert.equal(state.toolCalls, 20);
+});
+
+test("verification heartbeat stays inside the command bound and generic idle window", () => {
+  assert.equal(verificationHeartbeatIntervalMs(300_000), DEFAULT_VERIFY_TOOL_HEARTBEAT_MS);
+  assert.equal(verificationHeartbeatIntervalMs(20_000), 10_000);
+  assert.equal(verificationHeartbeatIntervalMs(300_000, 10_000), 5_000);
+  assert.equal(verificationHeartbeatIntervalMs(1), 1);
+  assert.equal(verificationHeartbeatIntervalMs(0), undefined);
+  assert.equal(verificationHeartbeatIntervalMs(Number.POSITIVE_INFINITY), undefined);
+});
+
+test("production verify tool emits progress while its runner is pending and stops after settlement", async () => {
+  let completeVerification!: (results: Array<{ command: string; status: "passed"; exitCode: number; durationMs: number }>) => void;
+  const pendingVerification = new Promise<Array<{ command: string; status: "passed"; exitCode: number; durationMs: number }>>((resolve) => {
+    completeVerification = resolve;
+  });
+  const events: AgentEvent[] = [];
+  let observeProgress!: () => void;
+  const progressObserved = new Promise<void>((resolve) => { observeProgress = resolve; });
+  const task = {
+    id: "run:builder:verify-heartbeat",
+    role: "builder" as const,
+    objective: "Verify the production heartbeat wiring",
+    instructions: "Run the approved check",
+    context: [],
+    workspace: { cwd: process.cwd(), mode: "write" as const, scope: scopeManifestFor("build-packet", { affectedFiles: ["src/runtime/pi-adapter.ts"] }) },
+    tools: ["verify" as const],
+    verification: {
+      commands: [{ id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 500, required: true }],
+      runner: { run: async () => pendingVerification },
+    },
+    outputSchema: Type.Object({ summary: Type.String() }),
+    modelPolicy: {},
+  };
+  const tool = createVerificationTool(task, (event) => {
+    events.push(event);
+    if (event.type === "tool.progress") observeProgress();
+  }, 20);
+  assert.ok(tool);
+
+  const execution = tool.execute("verify-call", { commandId: "test" }, undefined, undefined, {} as any);
+  await Promise.race([
+    progressObserved,
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("verify progress heartbeat was not emitted")), 250)),
+  ]);
+  const progress = events.find((event) => event.type === "tool.progress");
+  assert.deepEqual(progress && {
+    type: progress.type,
+    taskId: progress.taskId,
+    toolCallId: progress.toolCallId,
+    tool: progress.tool,
+    timeoutMs: progress.timeoutMs,
+  }, {
+    type: "tool.progress",
+    taskId: task.id,
+    toolCallId: "verify-call",
+    tool: "verify",
+    timeoutMs: 500,
+  });
+
+  completeVerification([{ command: "npm test", status: "passed", exitCode: 0, durationMs: 15 }]);
+  await execution;
+  const progressAtSettlement = events.filter((event) => event.type === "tool.progress").length;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(events.filter((event) => event.type === "tool.progress").length, progressAtSettlement);
 });
 
 test("nested reviewer transport does not depend on fetch or an implicit wall-clock timeout", async () => {

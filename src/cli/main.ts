@@ -712,7 +712,7 @@ async function workOn(
   }, store);
   const onAgentEvent = (event: AgentEvent) => {
     writeAgentEvent(event);
-    if (event.type === "thinking.delta" || event.type === "text.delta" || event.type === "session.progress") return;
+    if (event.type === "thinking.delta" || event.type === "text.delta" || event.type === "session.progress" || event.type === "tool.progress") return;
     const observability = event.observability;
     const activity = event.type === "tool.started"
       ? `last tool ${event.tool} started`
@@ -2709,6 +2709,7 @@ function configuredMaxReviewSpecialists(
 }
 
 function createCliRuntime(options: { provider?: string; model?: string; thinking?: ThinkingLevel; reviewerProvider?: string; reviewerModel?: string; reviewerThinking?: ThinkingLevel; planningProvider?: string; planningModel?: string; planningThinking?: ThinkingLevel }, telemetry: TelemetryRepository): AgentRuntime {
+  const idleMs = configuredSemanticIdleMs();
   const inner = new PiAgentRuntime({
     ...(options.provider !== undefined ? { provider: options.provider } : {}),
     ...(options.model !== undefined ? { model: options.model } : {}),
@@ -2719,8 +2720,8 @@ function createCliRuntime(options: { provider?: string; model?: string; thinking
     ...(options.planningProvider !== undefined ? { planningProvider: options.planningProvider } : {}),
     ...(options.planningModel !== undefined ? { planningModel: options.planningModel } : {}),
     ...(options.planningThinking !== undefined ? { planningThinking: options.planningThinking } : {}),
+    semanticIdleMs: idleMs,
   });
-  const idleMs = configuredSemanticIdleMs();
   const telemetryRuntime = new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
   return new LivenessRecoveringAgentRuntime(telemetryRuntime, { idleMs, retryLimit: 1 });
 }

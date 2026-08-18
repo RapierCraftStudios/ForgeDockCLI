@@ -34,6 +34,7 @@ export function isSemanticProgressEvent(event: AgentEvent): boolean {
     || event.type === "thinking.delta"
     || event.type === "text.delta"
     || event.type === "tool.started"
+    || event.type === "tool.progress"
     || event.type === "tool.completed"
     || event.type === "artifact.submitted";
 }

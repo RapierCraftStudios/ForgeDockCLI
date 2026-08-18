@@ -285,6 +285,8 @@ export type AgentEvent =
   | { type: "thinking.delta"; taskId: string; text: string; observability?: AgentObservability }
   | { type: "text.delta"; taskId: string; text: string; observability?: AgentObservability }
   | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown; observability?: AgentObservability }
+  /** A bounded tool is still running; this is liveness evidence, not a new tool call. */
+  | { type: "tool.progress"; taskId: string; toolCallId: string; tool: string; elapsedMs: number; timeoutMs: number; observability?: AgentObservability }
   | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string; observability?: AgentObservability }
   | { type: "artifact.submitted"; taskId: string; observability?: AgentObservability }
   | { type: "session.completed"; taskId: string; sessionRef: string; observability?: AgentObservability }

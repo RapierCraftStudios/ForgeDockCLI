@@ -73,6 +73,10 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       void observer.emit({ ...base, channel: "tool", kind: "tool.started", payload: { tool: event.tool, toolCallId: event.toolCallId, args: safeToolArgs(event.args), ...observabilityPayload(event) } });
       return;
     }
+    if (event.type === "tool.progress") {
+      void observer.emit({ ...base, channel: "tool", kind: "tool.progress", severity: "debug", payload: { tool: event.tool, toolCallId: event.toolCallId, elapsedMs: event.elapsedMs, timeoutMs: event.timeoutMs, ...observabilityPayload(event) } });
+      return;
+    }
     if (event.type === "tool.completed") {
       void observer.emit({ ...base, channel: "tool", kind: "tool.completed", severity: event.isError ? "error" : "info", payload: { tool: event.tool, toolCallId: event.toolCallId, isError: event.isError, ...(event.errorSummary ? { summary: event.errorSummary } : {}), ...observabilityPayload(event) } });
       return;

@@ -161,6 +161,61 @@ test("periodic semantic progress survives repeated idle windows", async () => {
   assert.deepEqual(result.output, { ok: true });
 });
 
+test("in-flight bounded verification heartbeat survives the generic idle window", async () => {
+  const clock = new FakeClock();
+  let emit: AgentEventSink | undefined;
+  let finish!: () => void;
+  let interruptCalls = 0;
+  const inner: AgentRuntime = {
+    capabilities: async () => capabilities,
+    async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+      emit = options.onEvent;
+      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: "verify-live", provider: "fake", model: "test" });
+      options.onEvent?.({ type: "tool.started", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
+      return new Promise<AgentRunResult<T>>((resolve) => {
+        finish = () => resolve({ output: { ok: true } as T, sessionRef: "verify-live", provider: "fake", model: "test" });
+      });
+    },
+    interrupt: () => { interruptCalls += 1; },
+    close: async () => undefined,
+  };
+  const runtime = new LivenessRecoveringAgentRuntime(inner, { idleMs: 10, retryLimit: 0, clock });
+  const pending = runtime.run(task);
+  await flush();
+  for (let index = 0; index < 20; index += 1) {
+    clock.advance(9);
+    emit?.({ type: "tool.progress", taskId: task.id, toolCallId: "verify-1", tool: "verify", elapsedMs: (index + 1) * 9, timeoutMs: 300 });
+  }
+  assert.equal(interruptCalls, 0);
+  finish();
+  const result = await pending;
+  assert.deepEqual(result.output, { ok: true });
+});
+
+test("a verify call without heartbeats still reaches the generic fail-closed bound", async () => {
+  const clock = new FakeClock();
+  let interruptCalls = 0;
+  const inner: AgentRuntime = {
+    capabilities: async () => capabilities,
+    async run<T>(suppliedTask: AgentTask<T>, options: { signal?: AbortSignal; onEvent?: AgentEventSink } = {}): Promise<AgentRunResult<T>> {
+      options.onEvent?.({ type: "session.started", taskId: suppliedTask.id, sessionRef: "verify-hung", provider: "fake", model: "test" });
+      options.onEvent?.({ type: "tool.started", taskId: suppliedTask.id, toolCallId: "verify-1", tool: "verify", args: { commandId: "tests" } });
+      return new Promise<AgentRunResult<T>>((_, reject) => {
+        options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+      });
+    },
+    interrupt: () => { interruptCalls += 1; },
+    close: async () => undefined,
+  };
+  const runtime = new LivenessRecoveringAgentRuntime(inner, { idleMs: 10, retryLimit: 0, clock });
+  const pending = runtime.run(task);
+  await flush();
+  clock.advance(10);
+  await flush();
+  await assert.rejects(pending, (error: unknown) => error instanceof AgentExecutionInterruptedError);
+  assert.equal(interruptCalls, 1);
+});
+
 test("does not retry while an interrupted provider remains in flight", async () => {
   const clock = new FakeClock();
   let runCalls = 0;
