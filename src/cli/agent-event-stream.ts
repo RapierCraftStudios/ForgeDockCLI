@@ -25,7 +25,11 @@ export function setAgentEventObservationSink(observer: ObservationSink | undefin
 }
 
 export function setAgentEventObservationIdentity(identity: ObservationIdentity): void {
-  agentObservationIdentity = { ...identity };
+  const stableLogicalStreamId = agentObservationIdentityRef?.current.logicalStreamId;
+  agentObservationIdentity = {
+    ...identity,
+    ...(stableLogicalStreamId && !identity.logicalStreamId ? { logicalStreamId: stableLogicalStreamId } : {}),
+  };
   if (agentObservationIdentityRef) agentObservationIdentityRef.current = agentObservationIdentity;
 }
 

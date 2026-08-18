@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, observationStreamKey, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -56,6 +56,38 @@ test("observer backpressure emits an explicit dropped-output marker", async () =
   const events = await observer.query({ forgeRunId: "run-pressure" });
   assert.equal(events.at(-1)?.kind, "output.dropped");
   assert.equal(events.at(-1)?.delivery.droppedEvents, 1);
+  observer.close();
+});
+
+test("logical stream IDs are collision-free and survive identity enrichment in SQLite", async () => {
+  const first = { logicalStreamId: "stream|one", forgeRunId: "run", agentTaskId: "shared" };
+  const refreshed = { ...first, workUnitId: "unit|enriched" };
+  const second = { logicalStreamId: "stream|two", forgeRunId: "run", agentTaskId: "shared" };
+  assert.equal(observationStreamKey(first, "stdout"), observationStreamKey(refreshed, "stdout"));
+  assert.notEqual(observationStreamKey(first, "stdout"), observationStreamKey(second, "stdout"));
+
+  const store = new SqliteObservationStore(":memory:");
+  const observer = observerWithStore(store);
+  await observer.emit({ producer, identity: first, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "visible" }, output: { channel: "stdout", text: "visible", chunkSequence: 1 } });
+  const event = (await observer.query({}))[0];
+  assert.equal(event?.identity.logicalStreamId, "stream|one");
+  observer.close();
+});
+
+test("identity refresh cannot release one quarantined stream or reset its neighbor", async () => {
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 });
+  const firstIdentity = { forgeRunId: "run-interleaved", logicalStreamId: "stream|one", controllerTaskId: "shared" };
+  const secondIdentity = { forgeRunId: "run-interleaved", logicalStreamId: "stream|two", controllerTaskId: "shared" };
+  const first = observer.emit({ producer, identity: firstIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity: firstIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "dropped-secret" } });
+  await Promise.all([first, dropped]);
+  await observer.emit({ producer, identity: { ...firstIdentity, workUnitId: "refreshed" }, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "continuation-secret" } });
+  await observer.emit({ producer, identity: secondIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "independent" } });
+  await observer.emit({ producer, identity: secondIdentity, source: "process", channel: "lifecycle", kind: "process.exited", payload: { status: "completed" } });
+  const events = await observer.query({ forgeRunId: "run-interleaved" });
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /dropped-secret|continuation-secret/);
+  assert.match(serialized, /independent/);
   observer.close();
 });
 

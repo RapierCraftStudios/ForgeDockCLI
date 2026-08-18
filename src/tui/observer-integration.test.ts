@@ -47,6 +47,8 @@ test("background task supervisor persists sanitized split channels before its te
     assert.ok(outputEvents.every((event) => events.indexOf(event) < lifecycleIndex));
     assert.deepEqual(outputEvents.map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
     const serialized = JSON.stringify(outputEvents);
+    assert.ok(outputEvents.every((event) => event.identity.logicalStreamId));
+    assert.equal(new Set(outputEvents.map((event) => event.identity.logicalStreamId)).size, 1);
     assert.match(serialized, /stdout/);
     assert.match(serialized, /stderr visible/);
     assert.match(serialized, /\[REDACTED\]/);
@@ -83,5 +85,8 @@ test("controller adapter preserves stdout and stderr as separate observation cha
   assert.ok(channels.some((value) => value.startsWith("stdout:")));
   assert.ok(channels.some((value) => value.startsWith("stderr:")));
   assert.deepEqual(events.filter((event) => event.output).map((event) => event.output?.channel).sort(), ["stderr", "stdout"]);
+  const controllerEvents = events.filter((event) => event.identity.controllerTaskId === "controller-1");
+  assert.ok(controllerEvents.every((event) => event.identity.logicalStreamId));
+  assert.equal(new Set(controllerEvents.map((event) => event.identity.logicalStreamId)).size, 1);
   observer.close();
 });

@@ -1,25 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AgentEvent, AgentEventSink } from "../runtime/agent-runtime.js";
-import { createObservationProducer, createStreamingObservationText, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity, type StreamingObservationText } from "./contracts.js";
+import { createObservationLogicalStreamId, createObservationProducer, createStreamingObservationText, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity, type StreamingObservationText } from "./contracts.js";
 
 export interface ObservationAdapterContext {
   identity?: ObservationIdentity;
-  /** Mutable identity holder so refreshes do not recreate stream state. */
+  /** Mutable identity holder; enrichment never reallocates stream identity. */
   identityRef?: { current: ObservationIdentity };
+  /** Optional ID for callers that own exactly one logical stream. */
+  logicalStreamId?: string;
   producer?: ReturnType<typeof createObservationProducer>;
 }
 
 export function createAgentEventObservationSink(observer: ObservationSink, context: ObservationAdapterContext = {}): AgentEventSink {
   let outputSequence = 0;
   const producer = context.producer ?? createObservationProducer("agent-runtime");
+  const underlyingObserver = observer;
+  observer = { emit: (draft) => underlyingObserver.emit(draft).catch(() => undefined as never) };
   const streams = new Map<string, StreamingObservationText>();
+  const logicalStreamIds = new Map<string, string>();
+  const logicalStreamIdFor = (event: AgentEvent): string => {
+    const existing = logicalStreamIds.get(event.taskId);
+    if (existing) return existing;
+    const supplied = context.logicalStreamId ?? context.identityRef?.current.logicalStreamId ?? context.identity?.logicalStreamId;
+    const logicalStreamId = supplied && logicalStreamIds.size === 0 ? supplied : createObservationLogicalStreamId();
+    logicalStreamIds.set(event.taskId, logicalStreamId);
+    return logicalStreamId;
+  };
   const identityFor = (event: AgentEvent): ObservationIdentity => ({
     ...(context.identityRef?.current ?? context.identity ?? {}),
+    logicalStreamId: logicalStreamIdFor(event),
     agentTaskId: event.taskId,
     ...(event.observability?.activeChild ? { parentAgentId: event.observability.activeChild } : {}),
   });
-  const streamKey = (event: AgentEvent): string => `${event.taskId}:stdout`;
+  const streamKey = (event: AgentEvent): string => logicalStreamIdFor(event);
   const emitOutput = (event: AgentEvent, text: string): void => {
     if (!text) return;
     outputSequence += 1;
@@ -98,17 +112,23 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       severity: terminal.severity,
       payload: terminal.payload,
     });
+    logicalStreamIds.delete(event.taskId);
   };
 }
 
 export class ControllerObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #context: ObservationAdapterContext;
+  readonly #logicalStreamId: string;
   #outputSequence = 0;
 
   constructor(observer: ObservationSink, context: ObservationAdapterContext = {}) {
     this.#observer = observer;
     this.#context = context;
+    this.#logicalStreamId = context.logicalStreamId
+      ?? context.identity?.logicalStreamId
+      ?? context.identityRef?.current.logicalStreamId
+      ?? createObservationLogicalStreamId();
   }
 
   started(command: string, args: readonly string[]): void {
@@ -136,7 +156,10 @@ export class ControllerObservationAdapter {
   private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"]): void {
     void this.#observer.emit({
       producer: this.#context.producer ?? createObservationProducer("forgedock-controller"),
-      ...(this.#context.identity ? { identity: this.#context.identity } : {}),
+      identity: {
+        ...(this.#context.identityRef?.current ?? this.#context.identity ?? {}),
+        logicalStreamId: this.#logicalStreamId,
+      },
       source: "controller",
       channel,
       kind,
@@ -144,7 +167,7 @@ export class ControllerObservationAdapter {
       payload,
       ...(output ? { output } : {}),
       ...(delivery ? { delivery } : {}),
-    });
+    }).catch(() => undefined);
   }
 }
 
@@ -152,6 +175,7 @@ export class BackgroundTaskObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #producer: ReturnType<typeof createObservationProducer>;
   readonly #streams = new Map<string, Map<"stdout" | "stderr", StreamingObservationText>>();
+  readonly #logicalStreamIds = new Map<string, string>();
   readonly #queues = new Map<string, Promise<void>>();
   readonly #finished = new Map<string, Promise<void>>();
 
@@ -161,6 +185,7 @@ export class BackgroundTaskObservationAdapter {
   }
 
   started(task: { id: string; command: string; args: readonly string[]; cwd: string; pid: number }): void {
+    this.streamIdFor(task.id);
     this.emit(task.id, "process.started", "info", { command: task.command, args: safeArgs(task.args), cwd: task.cwd, pid: task.pid });
   }
 
@@ -182,8 +207,9 @@ export class BackgroundTaskObservationAdapter {
     const existing = this.#finished.get(taskId);
     if (existing) return existing;
     const completion = this.enqueue(taskId, async () => {
+      const logicalStreamId = this.streamIdFor(taskId);
       try {
-        const streams = this.#streams.get(taskId);
+        const streams = this.#streams.get(logicalStreamId);
         if (streams) {
           for (const channel of ["stdout", "stderr"] as const) {
             const stream = streams.get(channel);
@@ -194,7 +220,8 @@ export class BackgroundTaskObservationAdapter {
         }
         await this.emitLifecycle(taskId, status === "completed" ? "process.exited" : "process.failed", status === "completed" ? "info" : "error", { status, ...(exitCode !== undefined ? { exitCode } : {}) });
       } finally {
-        this.#streams.delete(taskId);
+        this.#streams.delete(logicalStreamId);
+        this.#logicalStreamIds.delete(taskId);
         this.#queues.delete(taskId);
       }
     });
@@ -207,18 +234,28 @@ export class BackgroundTaskObservationAdapter {
     const existing = this.#finished.get(taskId);
     if (existing) return existing;
     const completion = this.enqueue(taskId, async () => {
-      this.#streams.delete(taskId);
+      this.#streams.delete(this.streamIdFor(taskId));
+      this.#logicalStreamIds.delete(taskId);
       this.#queues.delete(taskId);
     });
     this.#finished.set(taskId, completion);
     return completion;
   }
 
+  private streamIdFor(taskId: string): string {
+    const existing = this.#logicalStreamIds.get(taskId);
+    if (existing) return existing;
+    const logicalStreamId = createObservationLogicalStreamId();
+    this.#logicalStreamIds.set(taskId, logicalStreamId);
+    return logicalStreamId;
+  }
+
   private streamFor(taskId: string, channel: "stdout" | "stderr"): StreamingObservationText {
-    let streams = this.#streams.get(taskId);
+    const logicalStreamId = this.streamIdFor(taskId);
+    let streams = this.#streams.get(logicalStreamId);
     if (!streams) {
       streams = new Map();
-      this.#streams.set(taskId, streams);
+      this.#streams.set(logicalStreamId, streams);
     }
     let stream = streams.get(channel);
     if (!stream) {
@@ -239,7 +276,7 @@ export class BackgroundTaskObservationAdapter {
     try {
       const result = await this.#observer.emit({
         producer: this.#producer,
-        identity: { controllerTaskId: taskId },
+        identity: { logicalStreamId: this.streamIdFor(taskId), controllerTaskId: taskId },
         source: "process",
         channel,
         kind: channel === "stdout" ? "output.stdout" : "output.stderr",
@@ -254,7 +291,7 @@ export class BackgroundTaskObservationAdapter {
 
   private async emitLifecycle(taskId: string, kind: string, severity: ObservationSeverity, payload: unknown): Promise<void> {
     try {
-      await this.#observer.emit({ producer: this.#producer, identity: { controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
+      await this.#observer.emit({ producer: this.#producer, identity: { logicalStreamId: this.streamIdFor(taskId), controllerTaskId: taskId }, source: "process", channel: "lifecycle", kind, severity, payload });
     } catch {
       // Lifecycle delivery failures must not retain parser state or block task cleanup.
     }
