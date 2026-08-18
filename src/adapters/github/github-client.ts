@@ -19,36 +19,11 @@ import type {
   ReviewFindingInput,
 } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository } from "../../core/ports/repositories.js";
+import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 
-export function repositoryFromRemote(remote: string): string | undefined {
-  const trimmed = remote.trim().replace(/\/+$/, "");
-  let hostname: string;
-  let pathname: string;
-  const scp = /^[^/\s@]+@([^/\s:]+):(.+)$/.exec(trimmed);
-  if (scp?.[1] && scp[2]) {
-    hostname = scp[1];
-    pathname = scp[2];
-  } else {
-    let url: URL;
-    try {
-      url = new URL(trimmed.includes("://") ? trimmed : `https://${trimmed}`);
-    } catch {
-      return undefined;
-    }
-    if (url.username || url.password || url.search || url.hash) return undefined;
-    hostname = url.hostname;
-    pathname = url.pathname;
-  }
-  if (hostname.toLowerCase() !== "github.com") return undefined;
-  const segments = pathname.replace(/^\/+|\/+$/g, "").split("/");
-  if (segments.length !== 2) return undefined;
-  const owner = segments[0];
-  const repository = segments[1]?.replace(/\.git$/i, "");
-  if (!owner || !repository || !/^[^\s/:]+$/.test(owner) || !/^[^\s/:]+$/.test(repository)) return undefined;
-  return `${owner}/${repository}`;
-}
+export const repositoryFromRemote = parseRepositoryFromRemote;
 
 const WORKFLOW_LABELS = [
   { name: "workflow:investigating", color: "1D76DB", description: "ForgeDock investigation is active" },
@@ -248,12 +223,35 @@ export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
   private authRefreshAttempted = false;
+  private commandCwd: string;
+  private checkoutContext: CheckoutContext | undefined;
 
   constructor(
     readonly cwd = process.cwd(),
     readonly remediationAdmissions: RemediationAdmissionRepository = new InMemoryRemediationAdmissionRepository(),
     readonly refreshAuth?: () => Promise<boolean>,
-  ) {}
+  ) {
+    this.commandCwd = cwd;
+  }
+
+  /**
+   * Resolve and retain the checkout used by subsequent git/gh operations.
+   * Explicit remote-only GitHub clients retain their historical read-only
+   * fallback, while dispatch callers resolve the target strictly before they
+   * create checkout-scoped state or acquire a lease witness.
+   */
+  resolveCheckout(targetRepository?: string, strict = false): CheckoutContext {
+    const context = resolveCheckoutContext(this.commandCwd, targetRepository, {
+      allowUnresolvedTarget: !strict && targetRepository !== undefined,
+    });
+    this.checkoutContext = context;
+    this.commandCwd = context.checkoutRoot;
+    return context;
+  }
+
+  get resolvedCheckoutRoot(): string {
+    return this.checkoutContext?.checkoutRoot ?? this.commandCwd;
+  }
 
   async resolveRepository(): Promise<string> {
     return (await this.getRepository()).repo;
@@ -262,7 +260,9 @@ export class GitHubClient implements ForgeHost {
   async getRepository(repo?: string): Promise<{ repo: string; defaultBranch: string }> {
     // gh defaults to the first remote, which can be `upstream` in a staging
     // worktree. ForgeDock targets the checkout's origin, not the source fork.
-    const originRepo = repo ?? await this.resolveOriginRepository();
+    const context = this.resolveCheckout(repo);
+    const originRepo = repo ?? context.repository ?? await this.resolveOriginRepository();
+    if (!originRepo) throw new Error(`Unable to resolve GitHub repository from checkout ${context.checkoutRoot}`);
     const result = await this.gh(["repo", "view", ...(originRepo ? [originRepo] : []), "--json", "nameWithOwner,defaultBranchRef"]);
     const parsed = JSON.parse(result) as { nameWithOwner?: string; defaultBranchRef?: { name?: string } };
     if (!parsed.nameWithOwner || !parsed.defaultBranchRef?.name) throw new Error("Unable to resolve GitHub repository and default branch");
@@ -1342,7 +1342,7 @@ export class GitHubClient implements ForgeHost {
   private git(args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn("git", args, {
-        cwd: this.cwd,
+        cwd: this.commandCwd,
         env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
@@ -1372,7 +1372,7 @@ export class GitHubClient implements ForgeHost {
       } catch (error) {
         if (!this.authRefreshAttempted && isGitHubAuthenticationFailure(error)) {
           this.authRefreshAttempted = true;
-          const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.cwd)))();
+          const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))();
           if (!refreshed) throw error;
           continue;
         }
@@ -1386,7 +1386,7 @@ export class GitHubClient implements ForgeHost {
   private runGh(args: string[], input?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn("gh", args, {
-        cwd: this.cwd,
+        cwd: this.commandCwd,
         env: process.env,
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,

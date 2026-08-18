@@ -116,6 +116,19 @@ interface LocalLeaseWitnessOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
+export function leaseWitnessRequirementMessage(phase: string, checkoutRoot: string): string {
+  return [
+    `Authenticated lease witness is required ${phase}.`,
+    "ForgeDock checkout lease-witness preflight (not GitHub authentication) resolved this checkout:",
+    `  ${checkoutRoot}`,
+    "",
+    "No valid lease witness is configured for this checkout.",
+    "Bootstrap one from the resolved checkout with:",
+    "  forgedock-next lease-witness-bootstrap",
+    "or configure all FORGEDOCK_LEASE_WITNESS_* variables.",
+  ].join("\n");
+}
+
 /**
  * Resolve an explicitly configured witness first, then the per-checkout local
  * bootstrap reference. Partial environment configuration and any corrupt local
@@ -159,6 +172,34 @@ export function createConfiguredLeaseWitness(
     privateKey: configuredPrivateKey,
     keyId: reference.keyId,
   });
+}
+
+/**
+ * Return the checkout's configured witness, creating the local single-machine
+ * witness on first use. Explicit environment configuration and any existing
+ * local state are still validated before bootstrap, so partial, corrupt, or
+ * cross-checkout state continues to fail closed.
+ */
+export function createOrBootstrapLocalLeaseWitness(
+  cwd: string,
+  options: LocalLeaseWitnessOptions = {},
+): RetainedCheckpointWitness {
+  const configured = createConfiguredLeaseWitness(cwd, options);
+  if (configured) return configured;
+
+  try {
+    bootstrapLocalLeaseWitness(cwd, options);
+  } catch (error) {
+    // A concurrent first-use process may have completed bootstrap after our
+    // initial lookup. Adopt it only if the complete witness now verifies.
+    const raced = createConfiguredLeaseWitness(cwd, options);
+    if (raced) return raced;
+    throw error;
+  }
+
+  const created = createConfiguredLeaseWitness(cwd, options);
+  if (!created) throw new LeaseContinuityError("local lease witness bootstrap did not produce a configured witness");
+  return created;
 }
 
 /**

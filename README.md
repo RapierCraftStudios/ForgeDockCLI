@@ -84,7 +84,10 @@ Verification is serialized across ForgeDock runs on the machine, Node test fanou
 
 ### ForgeDock Next local safety bootstrap
 
-Mutating Next controllers require an authenticated retained lease witness. From the canonical checkout, build once and bootstrap it once:
+Mutating Next controllers require an authenticated retained lease witness. The
+interactive terminal creates the single-machine, single-checkout witness on
+first dispatch. Headless and direct CLI use remains explicit; from the canonical
+checkout, build once and bootstrap it once:
 
 ```bash
 npm run build

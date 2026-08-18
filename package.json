@@ -1,11 +1,17 @@
 {
   "name": "forgedockcli",
-  "version": "1.8.1",
+  "version": "1.8.3",
   "description": "Provider-neutral software delivery workflows with GitHub as durable institutional memory.",
   "pi": {
-    "extensions": ["./vendor/pi/.pi/extensions"],
-    "skills": ["./vendor/pi/.pi/skills"],
-    "prompts": ["./vendor/pi/.pi/prompts"]
+    "extensions": [
+      "./vendor/pi/.pi/extensions"
+    ],
+    "skills": [
+      "./vendor/pi/.pi/skills"
+    ],
+    "prompts": [
+      "./vendor/pi/.pi/prompts"
+    ]
   },
   "type": "module",
   "bin": {

@@ -11,7 +11,9 @@ import { SqliteRepositories } from "./sqlite-repositories.js";
 import {
   bootstrapLocalLeaseWitness,
   createConfiguredLeaseWitness,
+  createOrBootstrapLocalLeaseWitness,
   createSignedLeaseCheckpoint,
+  leaseWitnessRequirementMessage,
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
 
@@ -87,6 +89,28 @@ describe("retained lease checkpoint witness", () => {
         assert.equal(lease?.epoch, 1);
         assert.equal(store.continuity().state, "verified");
       } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("creates the local witness on first use without weakening corrupt-state checks", () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-first-use-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const witness = createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.equal(witness.verify().state, "verified");
+      assert.equal(witness.verify().epoch, 0);
+
+      const configured = createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.equal(configured.verify().state, "verified");
+
+      const referencePath = join(checkout, ".forgedock", "lease-witness.json");
+      writeFileSync(referencePath, "not-json");
+      assert.throws(
+        () => createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} }),
+        /malformed|continuity/i,
+      );
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -203,5 +227,15 @@ describe("retained lease checkpoint witness", () => {
         /must be configured together|continuity/i,
       );
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("distinguishes checkout preflight from GitHub authentication and names the resolved root", () => {
+    const message = leaseWitnessRequirementMessage(
+      "before orchestration planning can authorize dispatch",
+      "/home/dev/Projects/ForgeDockCLI",
+    );
+    assert.match(message, /not GitHub authentication/);
+    assert.match(message, /\/home\/dev\/Projects\/ForgeDockCLI/);
+    assert.match(message, /forgedock-next lease-witness-bootstrap/);
   });
 });

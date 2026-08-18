@@ -153,6 +153,7 @@ Remove `--dry-run` only in a designated test repository; it publishes Intent and
 - [x] Native orchestration does not implicitly resume stale DAGs; durable DAG IDs are shown separately from background task IDs, and DAG output requests resolve through orchestration status
 - [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, route metadata, and per-node errors for CLI/status restart inspection
 - [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
+- [x] Native orchestration resolves a routed repository to one canonical local checkout before reading checkout configuration, opening witnessed SQLite state, or dispatching workers; dispatch paths fail closed for ambiguous, missing, and duplicate target checkouts
 - [x] CLI and TUI use one shared orchestration controller for frozen DAG creation, execution attempts, event projection, persistence, reconciliation, and resume; CLI numeric selection and TUI routed preview remain caller adapters
 - [x] Caller-supplied execution admission is mandatory and backed by a witnessed SQLite lease with heartbeat/fencing; persisted execution claim identities are non-secret token digests
 - [x] `orchestrate --resume <dag-id>`, native status/resume tools, frozen provider/model/thinking metadata, and transport-capacity capping are wired through restart recovery
@@ -222,7 +223,8 @@ workflow mutations. Explicit signed higher-epoch re-enrollment is required after
 restore; ordinary expiry recovery is not a continuity recovery. CLI/TUI factories
 must configure a retained witness outside the operational-store backup scope.
 
-For single-checkout dogfooding, run `forgedock-next lease-witness-bootstrap`
+Interactive single-checkout dogfooding bootstraps its local witness on first
+dispatch. For headless or direct CLI use, run `forgedock-next lease-witness-bootstrap`
 once from the canonical checkout. It creates non-overwriting Ed25519 material and
 the retained checkpoint under OS-local user data, then stores only path references
 in the ignored `.forgedock/lease-witness.json`. Complete `FORGEDOCK_LEASE_WITNESS_*`

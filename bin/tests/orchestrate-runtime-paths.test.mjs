@@ -73,7 +73,7 @@ describe("orchestrate runtime helper paths", () => {
       readme,
       /ForgeDock Next is distributed as the `forgedockcli` npm package\.[\s\S]*npm install -g forgedockcli[\s\S]*forgedockcli/,
     );
-    assert.match(readme, /legacy command\/spec trees are intentionally excluded from the npm tarball/);
+    assert.match(readme, /legacy command\/spec trees are intentionally excluded\s+from the npm tarball/);
     assert.doesNotMatch(readme, /npx forgedock opencode install/);
   });
 

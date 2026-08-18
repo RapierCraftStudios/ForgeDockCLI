@@ -20,8 +20,9 @@ import {
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
 import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
+import { resolveCheckoutContext } from "../adapters/git/repository-context.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
-import { bootstrapLocalLeaseWitness, createConfiguredLeaseWitness } from "../adapters/sqlite/lease-witness.js";
+import { bootstrapLocalLeaseWitness, createConfiguredLeaseWitness, leaseWitnessRequirementMessage } from "../adapters/sqlite/lease-witness.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import {
   scopeManifestForBuildPacket,
@@ -1392,8 +1393,15 @@ async function orchestrate(argv: string[]): Promise<void> {
     await resumeCliOrchestration(argv, orchestrationResumeId);
     return;
   }
-  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun] | forgedock-next orchestrate --resume <dag-id>");
-  const config = readForgeDockConfig(process.cwd());
+  if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--repo owner/repo] [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun] | forgedock-next orchestrate --resume <dag-id>");
+  const launchCwd = process.cwd();
+  const targetRepository = option(argv, "--repo");
+  const provisionalCheckout = resolveCheckoutContext(launchCwd, targetRepository, {
+    allowAmbiguous: true,
+    allowUnresolvedTarget: true,
+  });
+  let checkoutRoot = provisionalCheckout.checkoutRoot;
+  const config = readForgeDockConfig(checkoutRoot);
   const maxParallelValue = option(argv, "--max-parallel");
   const remediationDepthValue = option(argv, "--max-remediation-depth");
   const remediationChildrenValue = option(argv, "--max-remediation-children");
@@ -1413,9 +1421,10 @@ async function orchestrate(argv: string[]): Promise<void> {
   const autoMerge = commandAutoMerge(argv);
   const dispatchMode = argv.includes("--confirm") || argv.includes("--auto") ? "authorized" : effective.dispatchMode;
   const dispatchAuthorized = !argv.includes("--dry-run") && (dispatchMode === "authorized" || dispatchMode === "auto");
+  if (dispatchAuthorized) checkoutRoot = resolveCheckoutContext(launchCwd, targetRepository).checkoutRoot;
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
-  let github = new GitHubClient(process.cwd());
-  const repository = await github.getRepository();
+  let github = new GitHubClient(checkoutRoot);
+  const repository = await github.getRepository(targetRepository);
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
   const readAuthoritativeItems = async (allowMissingMilestoneBranch = !dispatchAuthorized) => {
     const issueSnapshots = await Promise.all(baseItems.map((item) => github.getIssue(item.issue, repository.repo)));
@@ -1507,10 +1516,10 @@ async function orchestrate(argv: string[]): Promise<void> {
   const thinking = configuredWorkerThinking(argv);
   const planning = configuredPlanningOptions(argv);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
-  const orchestrationWitness = createConfiguredLeaseWitness(process.cwd());
-  if (!orchestrationWitness) throw new Error("Authenticated lease witness is required before orchestrate dispatch; run `forgedock-next lease-witness-bootstrap` once in this checkout or configure all FORGEDOCK_LEASE_WITNESS_* variables");
-  const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: orchestrationWitness });
-  github = new GitHubClient(process.cwd(), store);
+  const orchestrationWitness = createConfiguredLeaseWitness(checkoutRoot);
+  if (!orchestrationWitness) throw new Error(leaseWitnessRequirementMessage("before orchestrate dispatch", checkoutRoot));
+  const store = new SqliteRepositories(join(checkoutRoot, ".forgedock", "state.db"), { witness: orchestrationWitness });
+  github = new GitHubClient(checkoutRoot, store);
   const runtime = createCliRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -1522,7 +1531,7 @@ async function orchestrate(argv: string[]): Promise<void> {
     ? observeArtifactRepository(baseArtifacts, activeObserver, { repository: repository.repo })
     : baseArtifacts;
   const baseRuns = projectRunsToGitHub(store, github);
-  const git = new GitWorktreeManager(process.cwd());
+  const git = new GitWorktreeManager(checkoutRoot);
   const verifier = new ProcessVerificationRunner();
   try {
     await preflightRuntime(runtime, {
@@ -1531,7 +1540,7 @@ async function orchestrate(argv: string[]): Promise<void> {
     });
     // Validate the frozen verification policy for every authoritative lane before any batch issue is created.
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
-      discoverVerificationCommands(process.cwd(), `origin/${targetBranch}`);
+      discoverVerificationCommands(checkoutRoot, `origin/${targetBranch}`);
     }
     const materializedResult = assembly.groups.length
       ? await materializeBatchGroups({
@@ -1690,12 +1699,12 @@ async function orchestrate(argv: string[]): Promise<void> {
           ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
         });
         const baseRef = `origin/${parentRemediation?.parentBranch ?? lane.targetBranch}`;
-        const verification = discoverVerificationCommands(process.cwd(), baseRef);
+        const verification = discoverVerificationCommands(checkoutRoot, baseRef);
         process.stdout.write(`${statusGlyph("active", mode)} ${item.id} started · ${lane.kind} → ${lane.targetBranch}\n`);
         let result;
         try {
           result = await executeWorkOn({
-            intent, repoPath: process.cwd(), lane,
+            intent, repoPath: checkoutRoot, lane,
             verification, autoMerge,
             ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
             signal: workerAbort.signal,
@@ -2413,7 +2422,7 @@ function printHelp(): void {
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number] [--provider NAME] [--model NAME] [--thinking LEVEL]\n");
   process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");
   process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
-  process.stdout.write("  forgedock-next orchestrate <issues> [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun]\n");
+  process.stdout.write("  forgedock-next orchestrate <issues> [--repo owner/repo] [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun]\n");
   process.stdout.write("  forgedock-next orchestrate --resume <dag-id>\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID | --promotions]\n\n");
   process.stdout.write("Local safety bootstrap\n");

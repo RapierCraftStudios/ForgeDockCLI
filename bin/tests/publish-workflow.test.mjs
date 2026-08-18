@@ -43,14 +43,15 @@ describe("npm publish workflow recovery", () => {
   it("queries both exact registry versions and fails closed on uncertain responses", () => {
     const bump = stepBlock("Bump version");
 
-    assert.match(bump, /query_registry_version[\s\\\n]+"forgedock@\$NEXT_VERSION"/);
+    assert.match(bump, /query_registry_version[\s\\\n]+"forgedockcli@\$NEXT_VERSION"/);
     assert.match(bump, /"https:\/\/registry\.npmjs\.org"/);
-    assert.match(bump, /query_registry_version[\s\\\n]+"@rapiercraftstudios\/forgedock@\$NEXT_VERSION"/);
+    assert.match(bump, /query_registry_version[\s\\\n]+"@rapiercraftstudios\/forgedockcli@\$NEXT_VERSION"/);
     assert.match(bump, /"https:\/\/npm\.pkg\.github\.com"/);
     assert.match(bump, /GITHUB_PACKAGES_NPMRC=.*forgedock-github-packages\.npmrc/);
     assert.match(bump, /_authToken=\$\{GH_TOKEN\}/);
     assert.match(bump, /@rapiercraftstudios:registry=https:\/\/npm\.pkg\.github\.com/);
-    assert.match(bump, /npm_args=\(show "\$package_spec" version --silent "--registry=\$registry"\)/);
+    assert.match(bump, /npm_args=\(show "\$package_spec" version "--registry=\$registry"\)/);
+    assert.doesNotMatch(bump, /npm_args=.*--silent/);
     assert.match(bump, /npm_args\+=\(--userconfig "\$userconfig"\)/);
     assert.match(bump, /if \[ "\$output" = "\$NEXT_VERSION" \]/);
     assert.match(bump, /Ambiguous .*refusing to publish or finalize/);
@@ -61,7 +62,7 @@ describe("npm publish workflow recovery", () => {
     assert.match(bump, /GITHUB_PACKAGES_ALREADY_PUBLISHED=\$\(query_registry_version/);
     assert.match(bump, /npm version "\$NEXT_VERSION" --no-git-tag-version --allow-same-version/);
     assert.match(bump, /echo "VERSION=\$NEXT_VERSION" >> "\$GITHUB_ENV"/);
-    assert.doesNotMatch(bump, /npm show forgedock@"\$NEXT_VERSION" version --silent 2>\/dev\/null/);
+    assert.doesNotMatch(bump, /npm show forgedockcli@"\$NEXT_VERSION" version --silent 2>\/dev\/null/);
   });
 
   it("implements the independent four-state publication matrix", () => {
@@ -78,7 +79,7 @@ describe("npm publish workflow recovery", () => {
     assert.doesNotMatch(savePackage, /NPM_ALREADY_PUBLISHED/);
     assert.match(githubPublish, /if: env\.SKIP_PUBLISH != 'true' && env\.GITHUB_PACKAGES_ALREADY_PUBLISHED != 'true'/);
     assert.doesNotMatch(githubPublish, /NPM_ALREADY_PUBLISHED/);
-    assert.match(githubPublish, /npm pkg set name="@rapiercraftstudios\/forgedock"/);
+    assert.match(githubPublish, /npm pkg set name="@rapiercraftstudios\/forgedockcli"/);
     assert.match(githubPublish, /npm publish --access public --userconfig "\$NPMRC"/);
     assert.match(githubPublish, /GITHUB_PACKAGES_ALREADY_PUBLISHED=true/);
     assert.match(githubPublish, /GH_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/);
@@ -139,7 +140,7 @@ describe("npm publish workflow recovery", () => {
     assert.match(verify, /GITHUB_PACKAGES_ALREADY_PUBLISHED:-false/);
     assert.match(verify, /Both registries must be reconciled before finalization/);
     assert.match(verify, /PACKAGE_NAME=.*require\('\.\/package\.json'\)\.name/);
-    assert.match(verify, /\[ "\$PACKAGE_NAME" != "forgedock" \]/);
+    assert.match(verify, /\[ "\$PACKAGE_NAME" != "forgedockcli" \]/);
     assert.match(verify, /REGISTRIES_RECONCILED=true/);
 
     for (const finalization of finalizationSteps) {

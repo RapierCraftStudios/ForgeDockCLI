@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -12,6 +13,7 @@ import { readForgeDockConfig } from "../core/config/forgedock-config.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
+import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import {
@@ -122,8 +124,17 @@ function commandContext(idle = true): ExtensionCommandContext {
       confirm: async () => true,
       notify: () => undefined,
       setStatus: () => undefined,
+      setWidget: () => undefined,
     },
   } as unknown as ExtensionCommandContext;
+}
+
+function createGitCheckout(parent: string, name: string, remote: string): string {
+  const checkout = join(parent, name);
+  mkdirSync(checkout, { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: checkout, stdio: "ignore" });
+  execFileSync("git", ["remote", "add", "origin", remote], { cwd: checkout, stdio: "ignore" });
+  return checkout;
 }
 
 test("commands lazily activate separate semantic native tools without loading Markdown specs", async () => {
@@ -278,9 +289,13 @@ test("keeps native workflow tools active through a transient provider retry", as
   assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
 });
 
-test("dispatch-capable orchestration fails witness preflight before GitHub or durable mutations", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "forgedock-orchestrate-witness-"));
-  const state = fakePi(undefined, {});
+test("dispatch-capable orchestration bootstraps its first-use witness before durable admission", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-orchestrate-witness-"));
+  const cwd = createGitCheckout(root, "target", "https://github.com/a/b.git");
+  const localDataRoot = join(root, "local-data");
+  const state = fakePi(undefined, {
+    ensureLeaseWitness: (checkout) => createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} }),
+  });
   try {
     const tool = state.tools.get("forgedock_orchestrate");
     assert.ok(tool);
@@ -294,15 +309,71 @@ test("dispatch-capable orchestration fails witness preflight before GitHub or du
 
     await assert.rejects(
       () => tool.execute("missing-witness", {
-        issueNumbers: [7],
+        issueNumbers: [8],
         executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
         confirmed: true,
       }, undefined, undefined, { ...commandContext(), cwd, mode: "tui" } as any),
-      /Authenticated lease witness is required before orchestration planning can authorize dispatch/,
+      /issue substitution rejected/,
     );
-    assert.equal(existsSync(join(cwd, ".forgedock", "state.db")), false);
+    assert.equal(existsSync(join(cwd, ".forgedock", "lease-witness.json")), true);
+    assert.equal(existsSync(join(cwd, ".forgedock", "state.db")), true);
+    assert.equal(existsSync(join(root, ".forgedock", "state.db")), false);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("parent-launched orchestration carries the resolved checkout into DAG workers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-orchestrate-parent-"));
+  const target = createGitCheckout(root, "ForgeDockCLI", "https://github.com/example/target.git");
+  const state = fakePi();
+  const spawnRequests: any[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  const previousControllerEntry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      spawnRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { text: "started", details: { asyncId: `parent-run-${spawnRequests.length}` } },
+      }));
+    } else if (name === "subagents:rpc:v1:request" && data.method === "stop") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { stopped: true },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  try {
+    const tool = state.tools.get("forgedock_orchestrate");
+    assert.ok(tool);
+    bindOrchestrationInvocation(state.pi, {
+      rawArgs: "7 --confirm",
+      issueNumbers: [7],
+      repository: "example/target",
+      noMilestone: true,
+    });
+
+    const result = await tool.execute("parent-launch", {
+      issueNumbers: [7],
+      executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
+      confirmed: true,
+    }, undefined, undefined, { ...commandContext(), cwd: root, mode: "tui" } as any);
+
+    assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
+    assert.equal(spawnRequests.length, 1);
+    assert.equal(spawnRequests[0]?.params.cwd, target);
+  } finally {
+    await state.handlers.get("session_shutdown")?.[0]?.({}, commandContext());
+    if (previousControllerEntry === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previousControllerEntry;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
