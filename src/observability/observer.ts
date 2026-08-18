@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { join } from "node:path";
-import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, observationStreamKey, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
+import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, observationStreamKey, retainObservationLogicalStreamId, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
 import { ObservationProjector, type ObservationProjectionSnapshot } from "./projections.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
@@ -53,12 +53,26 @@ export class ForgeDockObserver implements ObservationSink {
 
   emit(input: ObservationDraft): Promise<ObservationEnvelopeV1> {
     if (this.#closed) return Promise.reject(new Error("ForgeDock observer is closed"));
-    const streamKey = input.output ? observationStreamKey(input.identity ?? {}, input.output.channel) : undefined;
+
+    // Resolve and retain the output identity before queue accounting. The
+    // same object is then carried into normalization, quarantine, and markers.
+    let resolvedInput = input;
+    let streamKey: string | undefined;
+    if (input.output) {
+      try {
+        const identity = retainObservationLogicalStreamId(input.identity);
+        resolvedInput = { ...input, identity };
+        streamKey = observationStreamKey(identity, input.output.channel);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+
     if (this.#pending >= this.#maxQueueDepth) {
       this.#droppedEvents += 1;
       if (streamKey) this.#quarantinedStreams.add(streamKey);
       if (!this.#droppedInput) {
-        const { output: _output, ...withoutOutput } = input;
+        const { output: _output, ...withoutOutput } = resolvedInput;
         this.#droppedInput = {
           ...withoutOutput,
           payload: { reason: "Output payload omitted after observer backpressure" },
@@ -71,8 +85,8 @@ export class ForgeDockObserver implements ObservationSink {
     this.#pending += 1;
     const quarantined = streamKey !== undefined && this.#quarantinedStreams.has(streamKey);
     const draft = normalizeObservationDraft({
-      ...quarantined ? quarantinedDraft(input) : input,
-      producer: input.producer ?? this.#producer,
+      ...quarantined ? quarantinedDraft(resolvedInput) : resolvedInput,
+      producer: resolvedInput.producer ?? this.#producer,
     }, this.#redaction);
     const result = this.#queue.then(async () => this.appendAndProject(draft)).finally(() => {
       this.#pending -= 1;
@@ -129,7 +143,9 @@ export class ForgeDockObserver implements ObservationSink {
   private appendAndProject(draft: ObservationDraft): Promise<ObservationEnvelopeV1> {
     return this.#store.append(draft).then((event) => {
       this.#projector.apply(event);
-      if (isObservationStreamReset(event.kind)) {
+      if (isObservationStreamReset(event.kind) && event.identity.logicalStreamId) {
+        // Reset/terminal events use the ID retained at the output boundary;
+        // mutable labels are never consulted for lifecycle cleanup.
         this.#quarantinedStreams.delete(observationStreamKey(event.identity, "stdout"));
         this.#quarantinedStreams.delete(observationStreamKey(event.identity, "stderr"));
       }
@@ -143,32 +159,49 @@ export class ForgeDockObserver implements ObservationSink {
   private scheduleDropMarker(): void {
     if (this.#dropScheduled) return;
     this.#dropScheduled = true;
+    let markerStarted = false;
+    let markerWaiters: Array<{ resolve: (event: ObservationEnvelopeV1) => void; reject: (error: unknown) => void }> = [];
     const result = this.#queue.then(async () => {
+      markerStarted = true;
+      // Capture this batch before appending. Drops arriving while the marker
+      // is in flight belong to the next marker, not to this one's waiters.
+      markerWaiters = this.#dropWaiters.splice(0);
       const input = this.#droppedInput;
       const droppedEvents = this.#droppedEvents;
       this.#droppedInput = undefined;
       this.#droppedEvents = 0;
-      this.#dropScheduled = false;
-      if (!input) throw new Error("Observer backpressure marker lost its source context");
-      const { output: _output, ...inputWithoutOutput } = input;
-      const marker = normalizeObservationDraft({
-        ...inputWithoutOutput,
-        producer: input.producer ?? this.#producer,
-        channel: "diagnostic",
-        kind: "output.dropped",
-        severity: "warning",
-        payload: { reason: "Observer queue depth exceeded its bounded capacity", droppedEvents },
-        delivery: { ...(input.delivery ?? {}), droppedEvents },
-      }, this.#redaction);
-      const event = await this.appendAndProject(marker);
-      const waiters = this.#dropWaiters.splice(0);
-      for (const waiter of waiters) waiter.resolve(event);
-      return event;
+      try {
+        if (!input) throw new Error("Observer backpressure marker lost its source context");
+        const { output: _output, ...inputWithoutOutput } = input;
+        const marker = normalizeObservationDraft({
+          ...inputWithoutOutput,
+          producer: input.producer ?? this.#producer,
+          channel: "diagnostic",
+          kind: "output.dropped",
+          severity: "warning",
+          payload: { reason: "Observer queue depth exceeded its bounded capacity", droppedEvents },
+          delivery: { ...(input.delivery ?? {}), droppedEvents },
+        }, this.#redaction);
+        const event = await this.appendAndProject(marker);
+        for (const waiter of markerWaiters) waiter.resolve(event);
+        return event;
+      } catch (error) {
+        for (const waiter of markerWaiters) waiter.reject(error);
+        throw error;
+      } finally {
+        this.#dropScheduled = false;
+        if (this.#droppedInput) this.scheduleDropMarker();
+      }
     });
     this.#queue = result.catch((error) => {
-      this.#dropScheduled = false;
-      const waiters = this.#dropWaiters.splice(0);
-      for (const waiter of waiters) waiter.reject(error);
+      // If the queue rejected before the marker callback could capture its
+      // batch, reject those waiters here; otherwise the callback already did.
+      if (!markerStarted) {
+        this.#dropScheduled = false;
+        const waiters = this.#dropWaiters.splice(0);
+        for (const waiter of waiters) waiter.reject(error);
+        if (this.#droppedInput) this.scheduleDropMarker();
+      }
       return undefined;
     });
   }

@@ -40,7 +40,7 @@ export type ObservationSensitivity = "public" | "internal" | "sensitive";
 
 /** Canonical cross-process identity. Every adapter should populate all fields it knows. */
 export interface ObservationIdentity {
-  /** Allocated once by the adapter owning a logical output/lifecycle stream. */
+  /** Allocated once by the adapter or output sink owning a logical stream. */
   logicalStreamId?: string;
   repository?: string;
   issueNumber?: number;
@@ -343,18 +343,37 @@ export function createObservationLogicalStreamId(): string {
   return randomUUID();
 }
 
+/**
+ * Retain the identity of an output stream at its sink boundary.
+ *
+ * Output callers may reuse and enrich one mutable identity object. Allocating
+ * here, before queueing, means that every later snapshot can carry the same
+ * opaque stream ID without inferring identity from mutable labels.
+ */
+export function retainObservationLogicalStreamId(identity: ObservationIdentity | undefined): ObservationIdentity {
+  if (!identity) throw new Error("Observation output requires a retainable identity");
+  if (Object.isFrozen(identity)) throw new Error("Observation output identity must be mutable to retain logicalStreamId");
+  const existing = identity.logicalStreamId;
+  if (existing !== undefined) {
+    if (typeof existing !== "string" || existing.length === 0) throw new Error("Observation output requires a non-empty logicalStreamId");
+    return identity;
+  }
+  if (!Object.isExtensible(identity)) throw new Error("Observation output identity must be mutable to retain logicalStreamId");
+  const logicalStreamId = createObservationLogicalStreamId();
+  try {
+    identity.logicalStreamId = logicalStreamId;
+  } catch {
+    throw new Error("Observation output identity must be mutable to retain logicalStreamId");
+  }
+  if (identity.logicalStreamId !== logicalStreamId) throw new Error("Observation output identity could not retain logicalStreamId");
+  return identity;
+}
+
 export function observationStreamKey(identity: ObservationIdentity, channel: "stdout" | "stderr"): string {
-  // Adapter-owned IDs are the authoritative identity. The canonical fallback
-  // keeps direct ObservationSink callers compatible without delimiter aliases;
-  // adapters must populate logicalStreamId before emitting stream output.
-  const streamId = identity.logicalStreamId ?? JSON.stringify([
-    identity.forgeRunId ?? null,
-    identity.orchestrationId ?? null,
-    identity.workUnitId ?? null,
-    identity.agentTaskId ?? null,
-    identity.controllerTaskId ?? null,
-    identity.piAsyncId ?? null,
-  ]);
+  const streamId = identity.logicalStreamId;
+  if (typeof streamId !== "string" || streamId.length === 0) {
+    throw new Error("Observation output stream key requires logicalStreamId");
+  }
   return JSON.stringify([streamId, channel]);
 }
 
@@ -445,7 +464,11 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
 }
 
 export function normalizeObservationDraft(draft: ObservationDraft, policy: ObservationRedactionPolicy = {}): ObservationDraft {
-  const identity = { ...(draft.identity ?? {}) };
+  // Keep the output contract fail-closed even for stores or other normalizers
+  // used below the observer boundary. Non-output observations retain optional
+  // identity as before.
+  const outputIdentity = draft.output ? retainObservationLogicalStreamId(draft.identity) : draft.identity;
+  const identity = { ...(outputIdentity ?? {}) };
   const payload = redactObservationValue(draft.payload ?? {}, policy);
   const output = draft.output
     ? redactObservationValue(draft.output.text, { ...policy, maxPayloadBytes: policy.maxOutputBytes ?? DEFAULT_OBSERVATION_MAX_OUTPUT_BYTES })
