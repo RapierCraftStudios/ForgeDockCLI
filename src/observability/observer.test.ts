@@ -272,6 +272,9 @@ test("central redaction masks assignment forms and enforces marker boundaries", 
     ["--token secret --verbose", "--token [REDACTED] --verbose", true],
     ['{"password":"secret","message":"visible"}', '{"password":"[REDACTED]","message":"visible"}', true],
     ["https://user:secret@example.test/path", "https://user:[REDACTED]@example.test/path", true],
+    ["ftp://user:secret@example.test/path", "ftp://user:[REDACTED]@example.test/path", true],
+    ["ssh://user:secret@example.test/path", "ssh://user:[REDACTED]@example.test/path", true],
+    ["git+ssh://user:secret@example.test/path", "git+ssh://user:[REDACTED]@example.test/path", true],
     ["token=[REDACTED] password=secret", "token=[REDACTED] password=[REDACTED]", true],
     ['password="[REDACTED]"suffix', 'password="[REDACTED]"', true],
     ['password="[REDACTED_2]" tail', 'password="[REDACTED_2]" tail', false],
@@ -312,6 +315,16 @@ test("streaming sanitizer quarantines split JSON, URL-userinfo, and sensitive-ke
   const urlOutput = `${url.push("https://user:")}${url.push("url-secret@example.test")}${url.finish()}`;
   assert.match(urlOutput, /https:\/\/user:\[REDACTED\]@example\.test/);
   assert.doesNotMatch(urlOutput, /url-secret/);
+
+  const nonHttpUrl = createStreamingObservationText();
+  const nonHttpUrlOutput = `${nonHttpUrl.push("ftp://user:")}${nonHttpUrl.push("ftp-secret@example.test")}${nonHttpUrl.finish()}`;
+  assert.match(nonHttpUrlOutput, /ftp:\/\/user:\[REDACTED\]@example\.test/);
+  assert.doesNotMatch(nonHttpUrlOutput, /ftp-secret/);
+
+  const sshUrl = createStreamingObservationText();
+  const sshUrlOutput = `${sshUrl.push("git+ssh://user:")}${sshUrl.push("ssh-secret@example.test")}${sshUrl.finish()}`;
+  assert.match(sshUrlOutput, /git\+ssh:\/\/user:\[REDACTED\]@example\.test/);
+  assert.doesNotMatch(sshUrlOutput, /ssh-secret/);
 
   const key = createStreamingObservationText();
   const keyOutput = `${key.push("pass")}${key.push("word=key-secret tail")}${key.finish()}`;

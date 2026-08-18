@@ -211,8 +211,10 @@ const SENSITIVE_CLI_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:--)(?:authorization|api[-_]
 // present so the next callback is joined to the same redaction decision.
 const SENSITIVE_JSON_ASSIGNMENT_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:["'])(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)(?:["'])\s*:\s*(?:(?:"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*\'?|[^\s,;}&)\]]*))?)$/i;
 // Hold a possible URL userinfo prefix after its colon. Without this, a
-// callback ending in `https://user:` is emitted before the `@` arrives.
-const SENSITIVE_URL_USERINFO_SUFFIX = /(?:^|[^A-Za-z0-9_])(https?:\/\/[^\s\/:@]+:[^@\s\/]*)$/i;
+// callback ending in `ftp://user:` is emitted before the `@` arrives. The
+// scheme grammar follows RFC 3986, so credentials are covered for HTTP(S),
+// SSH, FTP, and other hierarchical URL schemes without enumerating protocols.
+const SENSITIVE_URL_USERINFO_SUFFIX = /(?:^|[^A-Za-z0-9_])([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s\/:@]+:[^@\s\/]*)$/i;
 const REDACTION_MARKER = /^\[REDACTED(?:[ _:-][A-Za-z0-9_-]+)?\]$/i;
 
 type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
@@ -325,7 +327,7 @@ export function redactStreamingSecrets(value: string): string {
   let result = value;
   for (const pattern of STREAM_SECRET_PATTERNS) result = result.replace(pattern, "[REDACTED]");
   result = redactSensitiveAssignments(result);
-  result = result.replace(/(\bhttps?:\/\/[^\s/:@]+):([^@\s/]+)@/gi, "$1:[REDACTED]@");
+  result = result.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/:@]+):([^@\s/]+)@/gi, "$1:[REDACTED]@");
   return result;
 }
 

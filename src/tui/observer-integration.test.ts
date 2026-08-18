@@ -69,6 +69,10 @@ test("controller default path persists only sanitized split and quoted output", 
   adapter.output("stdout", '"json-secret"}');
   adapter.output("stderr", "https://user:");
   adapter.output("stderr", "url-secret@example.test");
+  adapter.output("stdout", "ftp://alice:");
+  adapter.output("stdout", "ftp-secret@example.test/path");
+  adapter.output("stderr", "git+ssh://bob:");
+  adapter.output("stderr", "ssh-secret@example.test/path");
   adapter.output("stderr", 'password="[REDACTED]"suffix');
   adapter.completed(0);
   await observer.flush();
@@ -76,7 +80,7 @@ test("controller default path persists only sanitized split and quoted output", 
   const events = await observer.query({ forgeRunId: "run-controller-redaction" });
   const outputs = events.filter((event) => event.output);
   const serialized = JSON.stringify(outputs);
-  assert.doesNotMatch(serialized, /split-secret|json-secret|url-secret|suffix/);
+  assert.doesNotMatch(serialized, /split-secret|json-secret|url-secret|ftp-secret|ssh-secret|suffix/);
   assert.match(serialized, /visible/);
   assert.match(serialized, /\[REDACTED\]/);
   assert.deepEqual([...new Set(outputs.map((event) => event.output?.channel))].sort(), ["stderr", "stdout"]);
