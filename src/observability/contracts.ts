@@ -195,13 +195,24 @@ const STREAM_SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----/g,
 ] as const;
 const STREAM_HOLDBACK_LIMIT_BYTES = 16 * 1024;
-const STREAM_SECRET_PREFIXES = ["bearer", "authorization", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-", "-----BEGIN "];
+const STREAM_SECRET_PREFIXES = [
+  "bearer", "authorization", "api-key", "api_key", "apikey", "credential", "cookie", "jwt",
+  "password", "private-key", "private_key", "secret", "token",
+  "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-", "-----BEGIN ",
+];
 // Match only credential-shaped keys. Matching arbitrary key/value pairs here can
 // consume the `password=...` part of prose such as `prefix password=secret`
 // before the replacement callback gets a chance to inspect it.
 const SENSITIVE_ASSIGNMENT = /(^|[^A-Za-z0-9_])((?:--)?["']?(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)["']?)(\s*(?:=|:)\s*|\s+)(?:"((?:\\.|[^"\\])*)"([^\s,;}&)\]]*)|'((?:\\.|[^'\\])*)'([^\s,;}&)\]]*)|([^\s,;}&)]*))/gi;
 const SENSITIVE_ASSIGNMENT_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:--)?(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)\s*(?:=|:)\s*[^\s,;}&)\]]*)$/i;
 const SENSITIVE_CLI_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:--)(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)(?:\s+[^\s,;}&)]*)?)$/i;
+// A quoted JSON key and its value can be divided at any point, including
+// immediately after the colon. Keep the key prefix until a value delimiter is
+// present so the next callback is joined to the same redaction decision.
+const SENSITIVE_JSON_ASSIGNMENT_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:["'])(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)(?:["'])\s*:\s*(?:(?:"(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*\'?|[^\s,;}&)\]]*))?)$/i;
+// Hold a possible URL userinfo prefix after its colon. Without this, a
+// callback ending in `https://user:` is emitted before the `@` arrives.
+const SENSITIVE_URL_USERINFO_SUFFIX = /(?:^|[^A-Za-z0-9_])(https?:\/\/[^\s\/:@]+:[^@\s\/]*)$/i;
 const REDACTION_MARKER = /^\[REDACTED(?:[ _:-][A-Za-z0-9_-]+)?\]$/i;
 
 type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
@@ -364,7 +375,9 @@ function streamingSecretSuffixStart(value: string): number | undefined {
     /(?:^|[^A-Za-z0-9_])(bearer\s+[A-Za-z0-9._~+/=-]*)$/i,
     /(?:^|[^A-Za-z0-9_])(authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]*)$/i,
     SENSITIVE_ASSIGNMENT_SUFFIX,
+    SENSITIVE_JSON_ASSIGNMENT_SUFFIX,
     SENSITIVE_CLI_SUFFIX,
+    SENSITIVE_URL_USERINFO_SUFFIX,
     /(?:^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]*)$/i,
     /(?:^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]*)$/i,
   ];

@@ -302,6 +302,23 @@ test("streaming sanitizer carries split terminal and credential state across chu
   assert.doesNotMatch(output, /https:\/\/example\.test/);
 });
 
+test("streaming sanitizer quarantines split JSON, URL-userinfo, and sensitive-key prefixes", () => {
+  const json = createStreamingObservationText();
+  const jsonOutput = `${json.push('{"password":')}${json.push('"json-secret"}')}${json.finish()}`;
+  assert.match(jsonOutput, /\"password\":\"\[REDACTED\]\"/);
+  assert.doesNotMatch(jsonOutput, /json-secret/);
+
+  const url = createStreamingObservationText();
+  const urlOutput = `${url.push("https://user:")}${url.push("url-secret@example.test")}${url.finish()}`;
+  assert.match(urlOutput, /https:\/\/user:\[REDACTED\]@example\.test/);
+  assert.doesNotMatch(urlOutput, /url-secret/);
+
+  const key = createStreamingObservationText();
+  const keyOutput = `${key.push("pass")}${key.push("word=key-secret tail")}${key.finish()}`;
+  assert.match(keyOutput, /password=\[REDACTED\] tail/);
+  assert.doesNotMatch(keyOutput, /key-secret/);
+});
+
 test("controller adapter quarantines split assignments with its default producer and isolated owners", async () => {
   const observer = observerWithStore();
   const first = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller", nodeId: "node-a", piSessionRef: "session-a" } });
