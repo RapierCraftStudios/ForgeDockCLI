@@ -40,6 +40,8 @@ export type ObservationSensitivity = "public" | "internal" | "sensitive";
 
 /** Canonical cross-process identity. Every adapter should populate all fields it knows. */
 export interface ObservationIdentity {
+  /** Allocated once by the adapter owning a logical output/lifecycle stream. */
+  logicalStreamId?: string;
   repository?: string;
   issueNumber?: number;
   forgeRunId?: string;
@@ -336,16 +338,24 @@ export function observationScopeKey(identity: ObservationIdentity): string {
     ?? "global";
 }
 
+/** Allocate an opaque ID at an adapter-owned logical stream boundary. */
+export function createObservationLogicalStreamId(): string {
+  return randomUUID();
+}
+
 export function observationStreamKey(identity: ObservationIdentity, channel: "stdout" | "stderr"): string {
-  return [
-    identity.forgeRunId ?? "",
-    identity.orchestrationId ?? "",
-    identity.workUnitId ?? "",
-    identity.agentTaskId ?? "",
-    identity.controllerTaskId ?? "",
-    identity.piAsyncId ?? "",
-    channel,
-  ].join("|");
+  // Adapter-owned IDs are the authoritative identity. The canonical fallback
+  // keeps direct ObservationSink callers compatible without delimiter aliases;
+  // adapters must populate logicalStreamId before emitting stream output.
+  const streamId = identity.logicalStreamId ?? JSON.stringify([
+    identity.forgeRunId ?? null,
+    identity.orchestrationId ?? null,
+    identity.workUnitId ?? null,
+    identity.agentTaskId ?? null,
+    identity.controllerTaskId ?? null,
+    identity.piAsyncId ?? null,
+  ]);
+  return JSON.stringify([streamId, channel]);
 }
 
 export function observationEntityId(identity: ObservationIdentity, producer: ObservationProducer): string {

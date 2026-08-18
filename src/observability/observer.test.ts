@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, observationStreamKey, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -59,6 +59,38 @@ test("observer backpressure emits an explicit dropped-output marker", async () =
   observer.close();
 });
 
+test("logical stream IDs are collision-free and survive identity enrichment in SQLite", async () => {
+  const first = { logicalStreamId: "stream|one", forgeRunId: "run", agentTaskId: "shared" };
+  const refreshed = { ...first, workUnitId: "unit|enriched" };
+  const second = { logicalStreamId: "stream|two", forgeRunId: "run", agentTaskId: "shared" };
+  assert.equal(observationStreamKey(first, "stdout"), observationStreamKey(refreshed, "stdout"));
+  assert.notEqual(observationStreamKey(first, "stdout"), observationStreamKey(second, "stdout"));
+
+  const store = new SqliteObservationStore(":memory:");
+  const observer = observerWithStore(store);
+  await observer.emit({ producer, identity: first, source: "agent", channel: "activity", kind: "output.delta", payload: { text: "visible" }, output: { channel: "stdout", text: "visible", chunkSequence: 1 } });
+  const event = (await observer.query({}))[0];
+  assert.equal(event?.identity.logicalStreamId, "stream|one");
+  observer.close();
+});
+
+test("identity refresh cannot release one quarantined stream or reset its neighbor", async () => {
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), producer, maxQueueDepth: 1 });
+  const firstIdentity = { forgeRunId: "run-interleaved", logicalStreamId: "stream|one", controllerTaskId: "shared" };
+  const secondIdentity = { forgeRunId: "run-interleaved", logicalStreamId: "stream|two", controllerTaskId: "shared" };
+  const first = observer.emit({ producer, identity: firstIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "first" } });
+  const dropped = observer.emit({ producer, identity: firstIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "dropped-secret" } });
+  await Promise.all([first, dropped]);
+  await observer.emit({ producer, identity: { ...firstIdentity, workUnitId: "refreshed" }, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "continuation-secret" } });
+  await observer.emit({ producer, identity: secondIdentity, source: "process", channel: "stdout", kind: "output.stdout", payload: {}, output: { channel: "stdout", text: "independent" } });
+  await observer.emit({ producer, identity: secondIdentity, source: "process", channel: "lifecycle", kind: "process.exited", payload: { status: "completed" } });
+  const events = await observer.query({ forgeRunId: "run-interleaved" });
+  const serialized = JSON.stringify(events);
+  assert.doesNotMatch(serialized, /dropped-secret|continuation-secret/);
+  assert.match(serialized, /independent/);
+  observer.close();
+});
+
 test("journal hydrates projections after observer restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-observer-test-"));
   const path = join(root, "observations.db");
@@ -105,6 +137,28 @@ test("agent adapter preserves user-visible events but discards private thinking 
   assert.equal(events.some((event) => JSON.stringify(event.payload).includes("visible progress")), true);
   const tool = events.find((event) => event.kind === "tool.started");
   assert.deepEqual((tool?.payload as { args?: Record<string, unknown> }).args, { path: "src/a.ts" });
+  observer.close();
+});
+
+test("agent adapter isolates concurrent sessions that reuse one task ID", async () => {
+  const observer = observerWithStore();
+  const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-agent-concurrent" }, producer });
+  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-one", provider: "test", model: "model" });
+  sink({ type: "text.delta", taskId: "shared-task", text: "Bearer first-" });
+  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-two", provider: "test", model: "model" });
+  sink({ type: "text.delta", taskId: "shared-task", text: "second visible" });
+  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-one" });
+  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-two" });
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-agent-concurrent" });
+  const lifecycle = events.filter((event) => event.kind === "agent.session.started" || event.kind === "agent.session.completed");
+  assert.equal(new Set(lifecycle.map((event) => event.identity.logicalStreamId)).size, 2);
+  const outputs = events.filter((event) => event.kind === "output.delta");
+  assert.equal(outputs.length, 2);
+  assert.equal(new Set(outputs.map((event) => event.identity.logicalStreamId)).size, 2);
+  assert.match(JSON.stringify(outputs), /\[REDACTED\]/);
+  assert.match(JSON.stringify(outputs), /second visible/);
   observer.close();
 });
 
