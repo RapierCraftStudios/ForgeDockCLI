@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { DurableArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import type { RunRepository } from "../../core/ports/repositories.js";
+import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 
 export function assertParentRemediationPullRequestTarget(input: {
@@ -28,7 +28,7 @@ export async function publishPullRequest(
     workspace: GitWorkspace;
     parentRemediation?: { parentBranch: string; parentPullRequest: number };
   },
-  dependencies: { git: GitWorkspaceManager; host: ForgeHost; runs: RunRepository },
+  dependencies: { git: GitWorkspaceManager; host: ForgeHost; runs: RunRepository; artifacts?: ArtifactRepository },
 ): Promise<{ run: RunState; pullRequest: PullRequestSnapshot }> {
   if (input.run.state !== "publishing") throw new Error(`Publication requires publishing state, found ${input.run.state}`);
   let run = input.run;
@@ -73,9 +73,64 @@ export async function publishPullRequest(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const failed = transition(run, "FAIL", { reason });
-    await dependencies.runs.commit(run.version, failed.state, failed.record);
-    throw new WorkflowExecutionError(reason, failed.state, { cause: error });
+    const next = error instanceof TargetBranchAdvancedError ? transition(run, "BLOCK", { reason }) : transition(run, "FAIL", { reason });
+    if (error instanceof TargetBranchAdvancedError && dependencies.artifacts) {
+      await recordTargetFenceOutcome(run, reason, dependencies.artifacts);
+    }
+    await dependencies.runs.commit(run.version, next.state, next.record);
+    throw new WorkflowExecutionError(reason, next.state, { cause: error });
+  }
+}
+
+export class TargetBranchAdvancedError extends Error {
+  constructor(readonly targetBranch: string, readonly expectedBaseSha: string, readonly observedBaseSha: string) {
+    super(`Target branch ${targetBranch} advanced before publication: expected ${expectedBaseSha}, observed ${observedBaseSha}`);
+    this.name = "TargetBranchAdvancedError";
+  }
+}
+
+export async function recordTargetFenceOutcome(
+  run: RunState,
+  reason: string,
+  artifacts: ArtifactRepository,
+  pullRequestUrl?: string,
+): Promise<void> {
+  await artifacts.append(createArtifact({
+    kind: "Outcome",
+    runId: run.runId,
+    subject: run.subject,
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      status: "blocked",
+      reason,
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+      ...(pullRequestUrl ? { prUrl: pullRequestUrl } : {}),
+      childIssues: [],
+    },
+  }, {
+    id: deterministicOutcomeId(run.runId, run.subject, `blocked:target-fence:${reason}`),
+  }));
+}
+
+/**
+ * Fence the target branch immediately before a delivery push. Older durable
+ * BuildResults may not carry a base SHA, so those legacy checkpoints retain
+ * their existing compatibility behavior; every current controller build has
+ * one through GitWorkspace/BuildResult.
+ */
+export async function assertTargetHeadUnchanged(
+  host: ForgeHost,
+  repo: string,
+  targetBranch: string,
+  expectedBaseSha?: string,
+): Promise<void> {
+  if (expectedBaseSha === undefined) return;
+  if (!host.getBranchHead) throw new Error(`Publication requires an authoritative target branch head reader for ${targetBranch}`);
+  const observed = await host.getBranchHead(repo, targetBranch);
+  if (observed.toLowerCase() !== expectedBaseSha.toLowerCase()) {
+    throw new TargetBranchAdvancedError(targetBranch, expectedBaseSha, observed);
   }
 }
 
