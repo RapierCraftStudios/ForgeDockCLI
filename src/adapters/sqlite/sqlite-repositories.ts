@@ -2,7 +2,6 @@
 
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot } from "../../core/ports/forge-host.js";
@@ -12,9 +11,7 @@ import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRep
 import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
-
-const SQLITE_BUSY_TIMEOUT_MS = 10_000;
-const SQLITE_BUSY_RETRY_DELAYS_MS = [50, 100, 200, 400, 800] as const;
+import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
 
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
@@ -26,16 +23,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#witness = options.witness;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
-    // WAL permits concurrent readers, but SQLite still has one writer. Wait for
-    // short cross-process controller transactions instead of turning contention
-    // into a terminal workflow failure. Set it before WAL initialization so a
-    // concurrent constructor is covered too.
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    // Setting journal mode may replace SQLite's busy handler, so configure the
-    // timeout after WAL is enabled.
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec(`
+    initializeSqliteDatabase(this.#database, `
       CREATE TABLE IF NOT EXISTS runs (
         run_id TEXT PRIMARY KEY,
         version INTEGER NOT NULL,
@@ -498,22 +486,6 @@ function sameCheckpoint(left: AuthenticatedLeaseCheckpoint | undefined, right: A
   return left?.epoch === right.epoch
     && left.signature === right.signature
     && left.keyId === right.keyId;
-}
-
-async function withSqliteBusyRetry<T>(operation: () => T | Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (!isSqliteBusyError(error) || attempt >= SQLITE_BUSY_RETRY_DELAYS_MS.length) throw error;
-      await sleep(SQLITE_BUSY_RETRY_DELAYS_MS[attempt]);
-    }
-  }
-}
-
-function isSqliteBusyError(error: unknown): boolean {
-  const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
-  return /database is locked|database is busy|SQLITE_(?:BUSY|LOCKED)/i.test(message);
 }
 
 function subjectKey(subject: Subject): string {

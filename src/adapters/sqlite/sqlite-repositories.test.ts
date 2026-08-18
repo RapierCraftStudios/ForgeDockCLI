@@ -57,7 +57,46 @@ function resolveChildOutput(state: ChildOutputState): void {
   resolve(output);
 }
 
+async function assertConcurrentConstructors(moduleUrl: string, className: string, databasePath: string, root: string): Promise<void> {
+  const goPath = join(root, `${className}.go`);
+  const childSource = [
+    'const fs = require("node:fs");',
+    'const [databasePath, goPath, moduleUrl, className] = process.argv.slice(1);',
+    'const waitArray = new Int32Array(new SharedArrayBuffer(4));',
+    'const timer = setInterval(() => {',
+    '  if (!fs.existsSync(goPath)) return;',
+    '  clearInterval(timer);',
+    '  import(moduleUrl).then(({ [className]: Store }) => {',
+    '    const store = new Store(databasePath);',
+    '    process.stdout.write("ready\\n");',
+    '    setTimeout(() => store.close(), 100);',
+    '  }).catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });',
+    '}, 1);',
+  ].join("\n");
+  const children = Array.from({ length: 8 }, () => spawn(process.execPath, [
+    "-e", childSource, databasePath, goPath, moduleUrl, className,
+  ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }));
+  try {
+    const ready = children.map((child) => waitForChildOutput(child, "ready\n"));
+    writeFileSync(goPath, "go");
+    await Promise.all(ready);
+  } finally {
+    writeFileSync(goPath, "go");
+    for (const child of children) child.kill();
+  }
+}
+
 describe("SQLite operational repositories", () => {
+  it("waits for simultaneous repository and observation-store constructors", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-constructor-race-"));
+    try {
+      await assertConcurrentConstructors(new URL("./sqlite-repositories.js", import.meta.url).href, "SqliteRepositories", join(root, "state.db"), root);
+      await assertConcurrentConstructors(new URL("../../observability/sqlite-store.js", import.meta.url).href, "SqliteObservationStore", join(root, "observations.db"), root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("waits for a concurrent writer before recording operational progress", async () => {
     const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-lock-"));
     const path = join(root, "state.db");

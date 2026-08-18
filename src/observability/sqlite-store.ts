@@ -16,9 +16,9 @@ import {
   normalizeObservationDraft,
   observationScopeKey,
 } from "./contracts.js";
+import { initializeSqliteDatabase } from "../core/sqlite-retry.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
 
-const SQLITE_BUSY_TIMEOUT_MS = 10_000;
 const DEFAULT_QUERY_LIMIT = 500;
 const MAX_QUERY_LIMIT = 5_000;
 
@@ -29,10 +29,7 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path);
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-    this.#database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
-    this.#database.exec(`
+    initializeSqliteDatabase(this.#database, `
       CREATE TABLE IF NOT EXISTS observation_events (
         event_id TEXT PRIMARY KEY,
         scope_key TEXT NOT NULL,
