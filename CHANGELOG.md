@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Build-checkpoint orchestration resumes now carry exact preflighted Build Packet claim evidence into the typed `RESUME_BUILD` boundary, preventing duplicate arbitration from suspending overlapping resumed workers symmetrically while preserving the preflight fence before retained-workspace recovery.
 - Same-DAG orchestration retries now resume retained work-on checkpoints even when the initial dispatch used an explicit rerun admission override, preventing suspended workers from being relaunched as conflicting fresh runs.
 - Retained lease-witness verification now serializes with SQLite lease mutations, preventing concurrent workers from treating the intentional checkpoint-before-commit interval as permanent divergence while keeping exact witness-first re-enrollment retries idempotent.
 - Invalid orchestration batches now authoritatively close and emit terminal Outcomes for every original member issue, and managed dependency preparation restores only tracked package-bin modes so npm cannot create false dirty-worktree failures.

@@ -520,6 +520,8 @@ export async function resumeBuildWorkOn(
     parentRemediation?: ParentRemediationTarget;
     /** Re-register the frozen packet paths with the owning scheduler before builder dispatch. */
     onClaimsPromoted?: (paths: readonly string[]) => void | Promise<void>;
+    /** Exact packet paths already promoted before retained-workspace recovery. */
+    preflightedPacketClaims?: readonly string[];
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
@@ -560,9 +562,13 @@ export async function resumeBuildWorkOn(
     const resumed = transition(run, "RESUME_BUILD", { reason: `Resuming frozen Build Packet in retained workspace ${input.workspace.path}` });
     await dependencies.runs.commit(run.version, resumed.state, resumed.record);
     run = resumed.state;
-    claimPromotionPending = true;
-    await input.onClaimsPromoted?.(input.packet.payload.expectedPaths);
-    claimPromotionPending = false;
+    if (input.preflightedPacketClaims === undefined) {
+      claimPromotionPending = true;
+      await input.onClaimsPromoted?.(input.packet.payload.expectedPaths);
+      claimPromotionPending = false;
+    } else {
+      assertExactPacketClaims(input.packet.payload.expectedPaths, input.preflightedPacketClaims);
+    }
     const result = await continueBuildDelivery({
       ...input,
       run,
@@ -1619,6 +1625,13 @@ function blockingFindingOutsidePacket(
 
 function normalizeRepoPath(path: string): string {
   return path.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function assertExactPacketClaims(expected: readonly string[], preflighted: readonly string[]): void {
+  const canonical = (paths: readonly string[]): string[] => [...new Set(paths.map((path) => path.trim()).filter(Boolean))].sort();
+  if (JSON.stringify(canonical(expected)) !== JSON.stringify(canonical(preflighted))) {
+    throw new Error("Preflighted Build Packet claims do not match the retained packet; refusing to skip typed claim arbitration");
+  }
 }
 
 function pathMatchesExpectation(path: string, expected: string): boolean {

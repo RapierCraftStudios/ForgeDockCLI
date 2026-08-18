@@ -909,8 +909,10 @@ async function workOn(
       }
 
       // A crash can leave a durable Build Packet immediately before its first
-      // parent-scheduler promotion. Re-arbitrate every retained packet before
-      // any resume path can edit, publish, remediate, or complete delivery.
+      // parent-scheduler promotion. Re-arbitrate retained packets before any
+      // resume path can recover a worktree or perform a mutation. Build resume
+      // receives exact evidence of this promotion below so its typed
+      // RESUME_BUILD boundary does not submit the same packet a second time.
       await promoteOrchestrationClaims(packet.payload.expectedPaths, {
         ...(orchestration?.promoteClaims ? { local: orchestration.promoteClaims } : {}),
       });
@@ -1013,8 +1015,9 @@ async function workOn(
         }, dependencies)
         : admission.checkpoint === "build"
           ? await resumeBuildWorkOn({
-            ...common,
-          }, dependencies)
+              ...common,
+              preflightedPacketClaims: packet.payload.expectedPaths,
+            }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({
               ...common,
