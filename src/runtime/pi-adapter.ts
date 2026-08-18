@@ -55,7 +55,7 @@ export function verificationHeartbeatIntervalMs(timeoutMs: number, semanticIdleM
  * sessions. Exported so its liveness contract can be exercised without a live
  * provider session.
  */
-export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSink, semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS) {
+export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSink, semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS, logicalStreamId = crypto.randomUUID()) {
   if (!task.tools.includes("verify")) return undefined;
   return defineTool({
     name: "verify",
@@ -91,6 +91,7 @@ export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSi
           }
           emit({
             type: "tool.progress",
+            logicalStreamId,
             taskId: task.id,
             toolCallId,
             tool: "verify",
@@ -263,6 +264,9 @@ export class PiAgentRuntime implements AgentRuntime {
     const execution = this.beginExecution(options.signal, task.id);
     try {
     const emit = options.onEvent ?? (() => undefined);
+    // One immutable stream origin covers provider sessionRef refreshes and all
+    // callbacks belonging to this runtime attempt.
+    const logicalStreamId = crypto.randomUUID();
     const startedAt = Date.now();
     const { provider, model: modelId, thinking } = resolvePiModelPolicy(task, this.#options);
     if (!provider || !modelId) {
@@ -273,6 +277,7 @@ export class PiAgentRuntime implements AgentRuntime {
         provider,
         model: modelId,
         emit,
+        logicalStreamId,
         ...(thinking !== undefined ? { thinking } : {}),
         signal: execution.controller.signal,
       });
@@ -296,7 +301,7 @@ export class PiAgentRuntime implements AgentRuntime {
       async execute(_toolCallId, params) {
         if (submitted !== undefined) throw new Error("Artifact was already submitted");
         submitted = params as T;
-        emit({ type: "artifact.submitted", taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
+        emit({ type: "artifact.submitted", logicalStreamId, taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
         return {
           content: [{ type: "text" as const, text: "ForgeDock accepted the structured artifact." }],
           details: params,
@@ -309,7 +314,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope);
     throwIfAborted(execution.controller.signal);
     const semanticIdleMs = this.#semanticIdleMs;
-    const verificationTool = createVerificationTool(task, emit, semanticIdleMs);
+    const verificationTool = createVerificationTool(task, emit, semanticIdleMs, logicalStreamId);
     const agentDir = this.#options.agentDir ?? getAgentDir();
     const { session } = await createAgentSession({
       cwd: task.workspace.cwd,
@@ -335,7 +340,7 @@ export class PiAgentRuntime implements AgentRuntime {
       if (event.type === "agent_end") usageMessages.push(...event.messages);
       if (event.type === "auto_retry_start") retryCount += 1;
       if (event.type === "turn_start") budgetState.turns += 1;
-      mapEvent(task.id, event, emit, task.observability);
+      mapEvent(task.id, logicalStreamId, event, emit, task.observability);
     });
     const previousBeforeToolCall = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
@@ -363,7 +368,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const abort = () => void session.abort().catch(() => undefined);
     execution.controller.signal.addEventListener("abort", abort, { once: true });
     if (execution.controller.signal.aborted) abort();
-    emit({ type: "session.started", taskId: task.id, sessionRef, provider, model: modelId, ...(task.observability ? { observability: task.observability } : {}) });
+    emit({ type: "session.started", logicalStreamId, taskId: task.id, sessionRef, provider, model: modelId, ...(task.observability ? { observability: task.observability } : {}) });
 
     try {
       throwIfAborted(execution.controller.signal);
@@ -389,7 +394,7 @@ export class PiAgentRuntime implements AgentRuntime {
         }
         throw new Error(`Agent ${task.id} ended without calling submit_artifact`);
       }
-      emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
+      emit({ type: "session.completed", logicalStreamId, taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
       const result = { output: submitted, sessionRef, provider, model: modelId };
       return { ...result, receipt: createAgentReceipt(task, result, startedAt, usageFromMessages(usageMessages), retryCount, undefined, localExecutionUsage(task, budgetState)) };
     } catch (error) {
@@ -404,6 +409,7 @@ export class PiAgentRuntime implements AgentRuntime {
         : error;
       emit({
         type: cancelled ? "session.cancelled" : "session.failed",
+        logicalStreamId,
         taskId: task.id,
         sessionRef,
         errorSummary: terminalErrorSummary(effectiveError, cancelled),
@@ -663,7 +669,7 @@ function parsePiModelSource(source: PiModelSource): ParsedPiModelSource {
 
 async function runNestedReviewer<T>(
   task: AgentTask<T>,
-  input: { provider: string; model: string; thinking?: ThinkingLevel; emit: AgentEventSink; resumeSessionRef?: string; signal?: AbortSignal },
+  input: { provider: string; model: string; thinking?: ThinkingLevel; emit: AgentEventSink; logicalStreamId: string; resumeSessionRef?: string; signal?: AbortSignal },
 ): Promise<AgentRunResult<T>> {
   throwIfAborted(input.signal);
   const url = process.env.FORGEDOCK_NESTED_AGENT_URL;
@@ -678,7 +684,7 @@ async function runNestedReviewer<T>(
   const provisionalSessionRef = input.resumeSessionRef ?? `nested_pending_${crypto.randomUUID()}`;
   let observedSessionRef = input.resumeSessionRef;
   const scopeReceipt = createScopeManifestReceipt(task.workspace.scope);
-  input.emit({ type: "session.started", taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
+  input.emit({ type: "session.started", logicalStreamId: input.logicalStreamId, taskId: task.id, sessionRef: provisionalSessionRef, provider: input.provider, model: input.model, ...(task.observability ? { observability: task.observability } : {}) });
   let response: { status: number; payload: { output?: T; sessionRef?: string; provider?: string; model?: string; error?: string; resumable?: boolean; scopeVersion?: number; scopeDigest?: string } };
   try {
     response = await postNestedAgentRequest({
@@ -710,6 +716,7 @@ async function runNestedReviewer<T>(
         observedSessionRef = sessionRef;
         input.emit({
           type: "session.started",
+          logicalStreamId: input.logicalStreamId,
           taskId: task.id,
           sessionRef,
           provider: input.provider,
@@ -720,6 +727,7 @@ async function runNestedReviewer<T>(
       onProgress: () => {
         input.emit({
           type: "session.progress",
+          logicalStreamId: input.logicalStreamId,
           taskId: task.id,
           sessionRef: observedSessionRef ?? provisionalSessionRef,
           ...(task.observability ? { observability: task.observability } : {}),
@@ -756,8 +764,8 @@ async function runNestedReviewer<T>(
     emitNestedTerminal(task, input, "session.failed", sessionRef, error);
     throw error;
   }
-  input.emit({ type: "artifact.submitted", taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
-  input.emit({ type: "session.completed", taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
+  input.emit({ type: "artifact.submitted", logicalStreamId: input.logicalStreamId, taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
+  input.emit({ type: "session.completed", logicalStreamId: input.logicalStreamId, taskId: task.id, sessionRef, ...(task.observability ? { observability: task.observability } : {}) });
   return {
     output: payload.output,
     sessionRef,
@@ -769,13 +777,14 @@ async function runNestedReviewer<T>(
 
 function emitNestedTerminal<T>(
   task: AgentTask<T>,
-  input: { emit: AgentEventSink },
+  input: { emit: AgentEventSink; logicalStreamId: string },
   type: "session.failed" | "session.cancelled",
   sessionRef: string,
   error: unknown,
 ): void {
   input.emit({
     type,
+    logicalStreamId: input.logicalStreamId,
     taskId: task.id,
     sessionRef,
     errorSummary: terminalErrorSummary(error, type === "session.cancelled"),
@@ -1039,18 +1048,19 @@ export function boundedToolErrorSummary(result: unknown): string | undefined {
     ?? "Tool execution failed; inspect the scoped arguments and retry";
 }
 
-function mapEvent(taskId: string, event: AgentSessionEvent, emit: AgentEventSink, observability?: AgentTask<unknown>["observability"]): void {
+function mapEvent(taskId: string, logicalStreamId: string, event: AgentSessionEvent, emit: AgentEventSink, observability?: AgentTask<unknown>["observability"]): void {
   const context = observability ? { observability } : {};
   if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") {
-    emit({ type: "thinking.delta", taskId, text: event.assistantMessageEvent.delta, ...context });
+    emit({ type: "thinking.delta", logicalStreamId, taskId, text: event.assistantMessageEvent.delta, ...context });
   } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-    emit({ type: "text.delta", taskId, text: event.assistantMessageEvent.delta, ...context });
+    emit({ type: "text.delta", logicalStreamId, taskId, text: event.assistantMessageEvent.delta, ...context });
   } else if (event.type === "tool_execution_start") {
-    emit({ type: "tool.started", taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args, ...context });
+    emit({ type: "tool.started", logicalStreamId, taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args, ...context });
   } else if (event.type === "tool_execution_end") {
     const errorSummary = event.isError ? boundedToolErrorSummary(event.result) : undefined;
     emit({
       type: "tool.completed",
+      logicalStreamId,
       taskId,
       toolCallId: event.toolCallId,
       tool: event.toolName,

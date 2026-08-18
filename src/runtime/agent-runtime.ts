@@ -279,19 +279,19 @@ export interface AgentObservability {
 }
 
 export type AgentEvent =
-  | { type: "session.started"; taskId: string; sessionRef: string; provider: string; model: string; observability?: AgentObservability }
+  | { readonly type: "session.started"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly provider: string; readonly model: string; readonly observability?: AgentObservability }
   /** A semantic progress snapshot relayed from an owned nested session. */
-  | { type: "session.progress"; taskId: string; sessionRef: string; observability?: AgentObservability }
-  | { type: "thinking.delta"; taskId: string; text: string; observability?: AgentObservability }
-  | { type: "text.delta"; taskId: string; text: string; observability?: AgentObservability }
-  | { type: "tool.started"; taskId: string; toolCallId: string; tool: string; args?: unknown; observability?: AgentObservability }
+  | { readonly type: "session.progress"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly observability?: AgentObservability }
+  | { readonly type: "thinking.delta"; readonly logicalStreamId: string; readonly taskId: string; readonly text: string; readonly observability?: AgentObservability }
+  | { readonly type: "text.delta"; readonly logicalStreamId: string; readonly taskId: string; readonly text: string; readonly observability?: AgentObservability }
+  | { readonly type: "tool.started"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly args?: unknown; readonly observability?: AgentObservability }
   /** A bounded tool is still running; this is liveness evidence, not a new tool call. */
-  | { type: "tool.progress"; taskId: string; toolCallId: string; tool: string; elapsedMs: number; timeoutMs: number; observability?: AgentObservability }
-  | { type: "tool.completed"; taskId: string; toolCallId: string; tool: string; isError: boolean; errorSummary?: string; observability?: AgentObservability }
-  | { type: "artifact.submitted"; taskId: string; observability?: AgentObservability }
-  | { type: "session.completed"; taskId: string; sessionRef: string; observability?: AgentObservability }
-  | { type: "session.failed"; taskId: string; sessionRef: string; errorSummary: string; observability?: AgentObservability }
-  | { type: "session.cancelled"; taskId: string; sessionRef: string; errorSummary: string; observability?: AgentObservability };
+  | { readonly type: "tool.progress"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly elapsedMs: number; readonly timeoutMs: number; readonly observability?: AgentObservability }
+  | { readonly type: "tool.completed"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly isError: boolean; readonly errorSummary?: string; readonly observability?: AgentObservability }
+  | { readonly type: "artifact.submitted"; readonly logicalStreamId: string; readonly taskId: string; readonly observability?: AgentObservability }
+  | { readonly type: "session.completed"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly observability?: AgentObservability }
+  | { readonly type: "session.failed"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly errorSummary: string; readonly observability?: AgentObservability }
+  | { readonly type: "session.cancelled"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly errorSummary: string; readonly observability?: AgentObservability };
 
 export interface AgentRunResult<T> {
   output: T;

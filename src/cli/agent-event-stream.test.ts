@@ -14,10 +14,10 @@ function capture() {
 
 test("streams user-visible assistant deltas with task context", () => {
   const stream = capture();
-  stream.writer.write({ type: "session.started", taskId: "build:1", sessionRef: "pi_1", provider: "openai-codex", model: "gpt-test" });
-  stream.writer.write({ type: "thinking.delta", taskId: "build:1", text: "Inspecting the packet" });
-  stream.writer.write({ type: "thinking.delta", taskId: "build:1", text: " and repository.\nNext step." });
-  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "I will update the scoped file." });
+  stream.writer.write({ type: "session.started", logicalStreamId: "stream-build-1", taskId: "build:1", sessionRef: "pi_1", provider: "openai-codex", model: "gpt-test" });
+  stream.writer.write({ type: "thinking.delta", logicalStreamId: "stream-build-1", taskId: "build:1", text: "Inspecting the packet" });
+  stream.writer.write({ type: "thinking.delta", logicalStreamId: "stream-build-1", taskId: "build:1", text: " and repository.\nNext step." });
+  stream.writer.write({ type: "text.delta", logicalStreamId: "stream-build-1", taskId: "build:1", text: "I will update the scoped file." });
   stream.writer.finish();
 
   assert.match(stream.output(), /◆ build:1 · openai-codex\/gpt-test/);
@@ -29,7 +29,7 @@ test("removes terminal control sequences from untrusted streamed text", () => {
   const stream = capture();
   const escape = String.fromCharCode(0x1b);
   const bell = String.fromCharCode(0x07);
-  stream.writer.write({ type: "text.delta", taskId: "build:1", text: `${escape}]8;;https://example.test${bell}visible${escape}[31m warning` });
+  stream.writer.write({ type: "text.delta", logicalStreamId: "stream-build-1", taskId: "build:1", text: `${escape}]8;;https://example.test${bell}visible${escape}[31m warning` });
   stream.writer.finish();
 
   assert.match(stream.output(), /visible warning/);
@@ -40,7 +40,7 @@ test("removes terminal control sequences from untrusted streamed text", () => {
 test("shows typed review milestones and artifact timestamps in the live stream", () => {
   const stream = capture();
   stream.writer.write({
-    type: "tool.started", taskId: "review:3", toolCallId: "call-grep", tool: "grep",
+    type: "tool.started", logicalStreamId: "stream-review-3", taskId: "review:3", toolCallId: "call-grep", tool: "grep",
     observability: {
       phase: "review", cycle: { current: 3, total: 3 }, activeChild: "concurrency",
       reviewerRoles: ["correctness", "concurrency"],
@@ -58,14 +58,15 @@ test("shows bounded tool arguments and completion in the live stream", () => {
   const stream = capture();
   stream.writer.write({
     type: "tool.started",
+    logicalStreamId: "stream-build-1",
     taskId: "build:1",
     toolCallId: "call-read-1234567890",
     tool: "read",
     args: { path: "src/example.ts", offset: 10, secretPayload: "must-not-render" },
   });
-  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-read-1234567890", tool: "read", isError: false });
+  stream.writer.write({ type: "tool.completed", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-read-1234567890", tool: "read", isError: false });
   stream.writer.write({
-    type: "tool.started", taskId: "build:1", toolCallId: "call-submit-1", tool: "submit_artifact", args: { huge: "must-not-render" },
+    type: "tool.started", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-submit-1", tool: "submit_artifact", args: { huge: "must-not-render" },
   });
 
   assert.match(stream.output(), /◆ build:1 · read\[d-1234567890\] · path="src\/example\.ts" offset=10/);
@@ -75,10 +76,10 @@ test("shows bounded tool arguments and completion in the live stream", () => {
 
 test("attributes concurrent tool failures by call id and renders bounded evidence", () => {
   const stream = capture();
-  stream.writer.write({ type: "tool.started", taskId: "build:1", toolCallId: "call-a", tool: "edit", args: { path: "src/a.ts" } });
-  stream.writer.write({ type: "tool.started", taskId: "build:1", toolCallId: "call-b", tool: "edit", args: { path: "src/b.ts" } });
-  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-b", tool: "edit", isError: true, errorSummary: "oldText was not unique" });
-  stream.writer.write({ type: "tool.completed", taskId: "build:1", toolCallId: "call-a", tool: "edit", isError: false });
+  stream.writer.write({ type: "tool.started", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-a", tool: "edit", args: { path: "src/a.ts" } });
+  stream.writer.write({ type: "tool.started", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-b", tool: "edit", args: { path: "src/b.ts" } });
+  stream.writer.write({ type: "tool.completed", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-b", tool: "edit", isError: true, errorSummary: "oldText was not unique" });
+  stream.writer.write({ type: "tool.completed", logicalStreamId: "stream-build-1", taskId: "build:1", toolCallId: "call-a", tool: "edit", isError: false });
 
   assert.match(stream.output(), /edit\[call-b\] failed · oldText was not unique/);
   assert.match(stream.output(), /edit\[call-a\] complete/);
@@ -86,8 +87,8 @@ test("attributes concurrent tool failures by call id and renders bounded evidenc
 
 test("keeps concurrent task streams readable instead of interleaving open lines", () => {
   const stream = capture();
-  stream.writer.write({ type: "text.delta", taskId: "review:1", text: "First" }, "review");
-  stream.writer.write({ type: "text.delta", taskId: "review:2", text: "Second" }, "review");
+  stream.writer.write({ type: "text.delta", logicalStreamId: "stream-review-1", taskId: "review:1", text: "First" }, "review");
+  stream.writer.write({ type: "text.delta", logicalStreamId: "stream-review-2", taskId: "review:2", text: "Second" }, "review");
 
   assert.match(stream.output(), /review · review:1 · assistant\n      │ First\n/);
   assert.match(stream.output(), /review · review:2 · assistant\n      │ Second/);
@@ -95,13 +96,13 @@ test("keeps concurrent task streams readable instead of interleaving open lines"
 
 test("renders failed and cancelled sessions as distinct terminal outcomes", () => {
   const stream = capture();
-  stream.writer.write({ type: "text.delta", taskId: "build:1", text: "partial output" });
+  stream.writer.write({ type: "text.delta", logicalStreamId: "stream-build-1", taskId: "build:1", text: "partial output" });
   stream.writer.write({
-    type: "session.failed", taskId: "build:1", sessionRef: "pi-failed",
+    type: "session.failed", logicalStreamId: "stream-build-1", taskId: "build:1", sessionRef: "pi-failed",
     errorSummary: "provider unavailable",
   });
   stream.writer.write({
-    type: "session.cancelled", taskId: "review:1", sessionRef: "pi-cancelled",
+    type: "session.cancelled", logicalStreamId: "stream-review-1", taskId: "review:1", sessionRef: "pi-cancelled",
     errorSummary: "operator cancelled",
   });
 

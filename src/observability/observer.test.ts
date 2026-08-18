@@ -127,10 +127,10 @@ test("journal hydrates projections after observer restart", async () => {
 test("agent adapter preserves user-visible events but discards private thinking text", async () => {
   const observer = observerWithStore();
   const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-agent" }, producer });
-  sink({ type: "session.started", taskId: "agent-1", sessionRef: "pi-1", provider: "test", model: "model" });
-  sink({ type: "thinking.delta", taskId: "agent-1", text: "private chain of thought" });
-  sink({ type: "text.delta", taskId: "agent-1", text: "visible progress" });
-  sink({ type: "tool.started", taskId: "agent-1", toolCallId: "call-1", tool: "read", args: { path: "src/a.ts", secret: "hide" } });
+  sink({ type: "session.started", logicalStreamId: "stream-agent-1", taskId: "agent-1", sessionRef: "pi-1", provider: "test", model: "model" });
+  sink({ type: "thinking.delta", logicalStreamId: "stream-agent-1", taskId: "agent-1", text: "private chain of thought" });
+  sink({ type: "text.delta", logicalStreamId: "stream-agent-1", taskId: "agent-1", text: "visible progress" });
+  sink({ type: "tool.started", logicalStreamId: "stream-agent-1", taskId: "agent-1", toolCallId: "call-1", tool: "read", args: { path: "src/a.ts", secret: "hide" } });
   await observer.flush();
   const events = await observer.query({ forgeRunId: "run-agent" });
   assert.equal(events.some((event) => JSON.stringify(event.payload).includes("private chain")), false);
@@ -143,12 +143,12 @@ test("agent adapter preserves user-visible events but discards private thinking 
 test("agent adapter isolates concurrent sessions that reuse one task ID", async () => {
   const observer = observerWithStore();
   const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-agent-concurrent" }, producer });
-  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-one", provider: "test", model: "model" });
-  sink({ type: "text.delta", taskId: "shared-task", text: "Bearer first-" });
-  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-two", provider: "test", model: "model" });
-  sink({ type: "text.delta", taskId: "shared-task", text: "second visible" });
-  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-one" });
-  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-two" });
+  sink({ type: "session.started", logicalStreamId: "stream-one", taskId: "shared-task", sessionRef: "session-one", provider: "test", model: "model" });
+  sink({ type: "text.delta", logicalStreamId: "stream-one", taskId: "shared-task", text: "Bearer first-" });
+  sink({ type: "session.started", logicalStreamId: "stream-two", taskId: "shared-task", sessionRef: "session-two", provider: "test", model: "model" });
+  sink({ type: "text.delta", logicalStreamId: "stream-two", taskId: "shared-task", text: "second visible" });
+  sink({ type: "session.completed", logicalStreamId: "stream-one", taskId: "shared-task", sessionRef: "session-one" });
+  sink({ type: "session.completed", logicalStreamId: "stream-two", taskId: "shared-task", sessionRef: "session-two" });
   await observer.flush();
 
   const events = await observer.query({ forgeRunId: "run-agent-concurrent" });
@@ -165,8 +165,8 @@ test("agent adapter isolates concurrent sessions that reuse one task ID", async 
 test("agent adapter preserves failed and cancelled terminal semantics", async () => {
   const observer = observerWithStore();
   const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-terminal" }, producer });
-  sink({ type: "session.failed", taskId: "agent-failed", sessionRef: "pi-failed", errorSummary: "provider unavailable" });
-  sink({ type: "session.cancelled", taskId: "agent-cancelled", sessionRef: "pi-cancelled", errorSummary: "operator cancelled" });
+  sink({ type: "session.failed", logicalStreamId: "stream-failed", taskId: "agent-failed", sessionRef: "pi-failed", errorSummary: "provider unavailable" });
+  sink({ type: "session.cancelled", logicalStreamId: "stream-cancelled", taskId: "agent-cancelled", sessionRef: "pi-cancelled", errorSummary: "operator cancelled" });
   await observer.flush();
 
   const events = await observer.query({ forgeRunId: "run-terminal" });
@@ -185,10 +185,10 @@ test("agent adapter preserves failed and cancelled terminal semantics", async ()
 test("agent identity refresh does not reset streaming redaction state", async () => {
   const observer = observerWithStore();
   setAgentEventObservationSink(observer, { forgeRunId: "run-refresh" });
-  observeAgentEvent({ type: "text.delta", taskId: "agent-refresh", text: "Bearer split" });
+  observeAgentEvent({ type: "text.delta", logicalStreamId: "stream-refresh", taskId: "agent-refresh", text: "Bearer split" });
   setAgentEventObservationIdentity({ forgeRunId: "run-refresh", workUnitId: "unit-refresh" });
-  observeAgentEvent({ type: "text.delta", taskId: "agent-refresh", text: "-secret-value" });
-  observeAgentEvent({ type: "session.completed", taskId: "agent-refresh", sessionRef: "pi-refresh" });
+  observeAgentEvent({ type: "text.delta", logicalStreamId: "stream-refresh", taskId: "agent-refresh", text: "-secret-value" });
+  observeAgentEvent({ type: "session.completed", logicalStreamId: "stream-refresh", taskId: "agent-refresh", sessionRef: "pi-refresh" });
   await observer.flush();
   const events = await observer.query({ forgeRunId: "run-refresh" });
   const output = events.find((event) => event.kind === "output.delta");

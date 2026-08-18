@@ -35,8 +35,9 @@ export class FakeAgentRuntime implements AgentRuntime {
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("Agent task aborted");
     this.tasks.push(task as AgentTask<unknown>);
     const sessionRef = `fake_${crypto.randomUUID()}`;
+    const logicalStreamId = crypto.randomUUID();
     const emit = options.onEvent ?? (() => undefined);
-    emit({ type: "session.started", taskId: task.id, sessionRef, provider: "fake", model: "scripted" });
+    emit({ type: "session.started", logicalStreamId, taskId: task.id, sessionRef, provider: "fake", model: "scripted" });
 
     const response = this.#responses.shift();
     if (response === undefined) throw new Error(`No fake response queued for ${task.id}`);
@@ -46,8 +47,8 @@ export class FakeAgentRuntime implements AgentRuntime {
       const details = [...Errors(task.outputSchema, value)].slice(0, 5).map((error) => error.message);
       throw new Error(`Fake response does not match task schema: ${details.join("; ")}`);
     }
-    emit({ type: "artifact.submitted", taskId: task.id });
-    emit({ type: "session.completed", taskId: task.id, sessionRef });
+    emit({ type: "artifact.submitted", logicalStreamId, taskId: task.id });
+    emit({ type: "session.completed", logicalStreamId, taskId: task.id, sessionRef });
     return { output: value as T, sessionRef, provider: "fake", model: "scripted" };
   }
 

@@ -13,53 +13,25 @@ export interface ObservationAdapterContext {
 }
 
 export function createAgentEventObservationSink(observer: ObservationSink, context: ObservationAdapterContext = {}): AgentEventSink {
-  let outputSequence = 0;
+  const outputSequences = new Map<string, number>();
   const producer = context.producer ?? createObservationProducer("agent-runtime");
   const underlyingObserver = observer;
   observer = { emit: (draft) => underlyingObserver.emit(draft).catch(() => undefined as never) };
   const streams = new Map<string, StreamingObservationText>();
-  // A task ID is a workflow label, not an agent session identity. A runtime
-  // may reuse it for concurrent attempts, so retain the session boundary
-  // reported by lifecycle events and only use the task's active session for
-  // events whose legacy shape has no sessionRef.
-  const logicalStreamIds = new Map<string, string>();
-  const activeSessionByTask = new Map<string, string>();
-  let suppliedLogicalStreamIdConsumed = false;
-  const sessionKeyFor = (event: AgentEvent): string => {
-    const sessionRef = agentSessionRef(event);
-    if (sessionRef !== undefined) return JSON.stringify([event.taskId, sessionRef]);
-    return activeSessionByTask.get(event.taskId) ?? JSON.stringify([event.taskId, null]);
-  };
-  const logicalStreamIdFor = (event: AgentEvent): string => {
-    const sessionKey = sessionKeyFor(event);
-    const existing = logicalStreamIds.get(sessionKey);
-    if (existing) return existing;
-
-    const sessionRef = agentSessionRef(event);
-    const provisionalKey = JSON.stringify([event.taskId, null]);
-    const provisional = sessionRef === undefined ? undefined : logicalStreamIds.get(provisionalKey);
-    const supplied = suppliedLogicalStreamIdConsumed
-      ? undefined
-      : context.logicalStreamId ?? context.identityRef?.current.logicalStreamId ?? context.identity?.logicalStreamId;
-    const useSupplied = supplied !== undefined && logicalStreamIds.size === 0;
-    const logicalStreamId = provisional
-      ?? (useSupplied ? supplied : createObservationLogicalStreamId());
-    if (useSupplied) suppliedLogicalStreamIdConsumed = true;
-    if (provisional) logicalStreamIds.delete(provisionalKey);
-    logicalStreamIds.set(sessionKey, logicalStreamId);
-    if (sessionRef !== undefined) activeSessionByTask.set(event.taskId, sessionKey);
-    return logicalStreamId;
-  };
+  const hasLogicalStreamId = (event: AgentEvent): boolean => typeof (event as { logicalStreamId?: unknown }).logicalStreamId === "string"
+    && (event as { logicalStreamId: string }).logicalStreamId.length > 0;
   const identityFor = (event: AgentEvent): ObservationIdentity => ({
     ...(context.identityRef?.current ?? context.identity ?? {}),
-    logicalStreamId: logicalStreamIdFor(event),
+    logicalStreamId: event.logicalStreamId,
     agentTaskId: event.taskId,
     ...(event.observability?.activeChild ? { parentAgentId: event.observability.activeChild } : {}),
   });
-  const streamKey = (event: AgentEvent): string => logicalStreamIdFor(event);
+  const streamKey = (event: AgentEvent): string => event.logicalStreamId;
   const emitOutput = (event: AgentEvent, text: string): void => {
     if (!text) return;
-    outputSequence += 1;
+    const key = streamKey(event);
+    const outputSequence = (outputSequences.get(key) ?? 0) + 1;
+    outputSequences.set(key, outputSequence);
     const identity = identityFor(event);
     void observer.emit({
       producer,
@@ -79,6 +51,9 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
     streams.delete(key);
   };
   return (event: AgentEvent) => {
+    // Runtime-shaped legacy objects are ignored before identity, parser, or
+    // terminal state can be touched. Event-owned identity is authoritative.
+    if (!hasLogicalStreamId(event)) return;
     const identity = identityFor(event);
     const base = {
       producer,
@@ -135,9 +110,8 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       severity: terminal.severity,
       payload: terminal.payload,
     });
-    const sessionKey = sessionKeyFor(event);
-    logicalStreamIds.delete(sessionKey);
-    if (activeSessionByTask.get(event.taskId) === sessionKey) activeSessionByTask.delete(event.taskId);
+    streams.delete(event.logicalStreamId);
+    outputSequences.delete(event.logicalStreamId);
   };
 }
 
@@ -418,10 +392,6 @@ export function createArtifactObservation(observer: ObservationSink, identity: O
     kind: "artifact.submitted",
     payload: { artifactId, kind },
   });
-}
-
-function agentSessionRef(event: AgentEvent): string | undefined {
-  return "sessionRef" in event ? event.sessionRef : undefined;
 }
 
 function observabilityPayload(event: AgentEvent): Record<string, unknown> {
