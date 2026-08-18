@@ -6,6 +6,15 @@ ForgeDock workflows are opt-in. A terminal session starts in normal assistant mo
 
 Typed controller authority applies only after explicit `/work-on`, `/review-pr`, `/orchestrate`, `/promote`, direct `forgedock_*` workflow-tool invocation, or an explicit request to use a named ForgeDock workflow. Any restriction against raw GitHub mutations is scoped to the active workflow’s own mutation. Protection, required checks, exact-SHA approval, and review gate merging; they do not prevent publishing a reviewable PR after route and SHA validation. Workflow mode ends after completion, failure, cancellation, or native background-task handoff.
 
+## Branch publication
+
+Completed code or documentation changes must be committed and pushed to the
+matching branch on `origin` as part of normal task completion, including work on
+`staging`. Verify the current branch, remote, and exact outgoing commits before
+pushing. Never force-push, and do not push when the user explicitly requests
+local-only work. A branch push does not authorize opening or merging a pull
+request, publishing a release, or performing any other deployment mutation.
+
 ## ForgeDock Next (active development)
 
 The provider-neutral rewrite lives in `src/` and is specified by:
