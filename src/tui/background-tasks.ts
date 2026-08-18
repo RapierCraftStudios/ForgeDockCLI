@@ -45,6 +45,7 @@ export class ForgeDockBackgroundTasks {
   #ticker: NodeJS.Timeout | undefined;
   #ctx: ExtensionContext | undefined;
   #observationAdapter: BackgroundTaskObservationAdapter | undefined;
+  readonly #finishing = new Set<string>();
 
   constructor(pi: ExtensionAPI) {
     this.#pi = pi;
@@ -270,25 +271,31 @@ export class ForgeDockBackgroundTasks {
 
   private async finish(id: string, status: BackgroundTaskStatus, exitCode?: number, detail?: string): Promise<void> {
     const live = this.#live.get(id);
-    if (!live) return;
-    if (live.record.status !== "cancelled") live.record.status = status;
-    live.record.completedAt ??= new Date().toISOString();
-    if (exitCode !== undefined) live.record.exitCode = exitCode;
-    this.captureLogDeltas(live);
-    this.persist(live.record);
-    this.#observationAdapter?.finished(id, live.record.status, exitCode);
-    this.#live.delete(id);
-    await live.cleanup?.().catch(() => undefined);
-    const terminalDetail = detail ?? (live.record.status === "completed" ? undefined : boundedTerminalError(live.record.stderrLogPath));
-    const message = [`${renderRecord(live.record)}${terminalDetail ? ` — ${terminalDetail}` : ""}`, `Log: ${live.record.logPath}`, ...(live.record.stderrLogPath ? [`Error log: ${live.record.stderrLogPath}`] : [])].join("\n");
-    this.#ctx?.ui.notify(message, live.record.status === "completed" ? "info" : "warning");
+    const observationAdapter = this.#observationAdapter;
+    if (!live || (observationAdapter && this.#finishing.has(id))) return;
+    if (observationAdapter) this.#finishing.add(id);
     try {
-      this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
-    } catch {
-      // Session teardown can race completion; the persisted record and GitHub artifacts remain available.
+      if (live.record.status !== "cancelled") live.record.status = status;
+      live.record.completedAt ??= new Date().toISOString();
+      if (exitCode !== undefined) live.record.exitCode = exitCode;
+      this.captureLogDeltas(live);
+      this.persist(live.record);
+      if (observationAdapter) await observationAdapter.finished(id, live.record.status, exitCode);
+      this.#live.delete(id);
+      await live.cleanup?.().catch(() => undefined);
+      const terminalDetail = detail ?? (live.record.status === "completed" ? undefined : boundedTerminalError(live.record.stderrLogPath));
+      const message = [`${renderRecord(live.record)}${terminalDetail ? ` — ${terminalDetail}` : ""}`, `Log: ${live.record.logPath}`, ...(live.record.stderrLogPath ? [`Error log: ${live.record.stderrLogPath}`] : [])].join("\n");
+      this.#ctx?.ui.notify(message, live.record.status === "completed" ? "info" : "warning");
+      try {
+        this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
+      } catch {
+        // Session teardown can race completion; the persisted record and GitHub artifacts remain available.
+      }
+      this.renderStatus();
+      if (!this.#live.size) this.stopTicker();
+    } finally {
+      if (observationAdapter) this.#finishing.delete(id);
     }
-    this.renderStatus();
-    if (!this.#live.size) this.stopTicker();
   }
 
   private captureLogDeltas(live: LiveTask): void {
@@ -336,7 +343,7 @@ export class ForgeDockBackgroundTasks {
     if (this.#ticker) return;
     this.#ticker = setInterval(() => {
       for (const task of this.#live.values()) this.captureLogDeltas(task);
-      this.reconcileAdoptedTasks();
+      void this.reconcileAdoptedTasks();
       this.renderStatus();
     }, 1_000);
     this.#ticker.unref();
@@ -358,6 +365,7 @@ export class ForgeDockBackgroundTasks {
       if (task.record.status !== "detached") continue;
       if (isProcessAlive(task.record.pid)) continue;
       this.captureLogDeltas(task);
+      void this.#observationAdapter?.discarded(task.record.id);
       this.#live.delete(task.record.id);
       const message = `${renderRecord(task.record)} — detached controller exited without an observable exit result; durable workflow state remains authoritative\nLog: ${task.record.logPath}`;
       this.#ctx?.ui.notify(message, "warning");
