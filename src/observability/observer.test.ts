@@ -140,6 +140,28 @@ test("agent adapter preserves user-visible events but discards private thinking 
   observer.close();
 });
 
+test("agent adapter isolates concurrent sessions that reuse one task ID", async () => {
+  const observer = observerWithStore();
+  const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-agent-concurrent" }, producer });
+  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-one", provider: "test", model: "model" });
+  sink({ type: "text.delta", taskId: "shared-task", text: "Bearer first-" });
+  sink({ type: "session.started", taskId: "shared-task", sessionRef: "session-two", provider: "test", model: "model" });
+  sink({ type: "text.delta", taskId: "shared-task", text: "second visible" });
+  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-one" });
+  sink({ type: "session.completed", taskId: "shared-task", sessionRef: "session-two" });
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-agent-concurrent" });
+  const lifecycle = events.filter((event) => event.kind === "agent.session.started" || event.kind === "agent.session.completed");
+  assert.equal(new Set(lifecycle.map((event) => event.identity.logicalStreamId)).size, 2);
+  const outputs = events.filter((event) => event.kind === "output.delta");
+  assert.equal(outputs.length, 2);
+  assert.equal(new Set(outputs.map((event) => event.identity.logicalStreamId)).size, 2);
+  assert.match(JSON.stringify(outputs), /\[REDACTED\]/);
+  assert.match(JSON.stringify(outputs), /second visible/);
+  observer.close();
+});
+
 test("agent adapter preserves failed and cancelled terminal semantics", async () => {
   const observer = observerWithStore();
   const sink = createAgentEventObservationSink(observer, { identity: { forgeRunId: "run-terminal" }, producer });

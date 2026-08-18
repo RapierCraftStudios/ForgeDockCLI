@@ -18,13 +18,36 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
   const underlyingObserver = observer;
   observer = { emit: (draft) => underlyingObserver.emit(draft).catch(() => undefined as never) };
   const streams = new Map<string, StreamingObservationText>();
+  // A task ID is a workflow label, not an agent session identity. A runtime
+  // may reuse it for concurrent attempts, so retain the session boundary
+  // reported by lifecycle events and only use the task's active session for
+  // events whose legacy shape has no sessionRef.
   const logicalStreamIds = new Map<string, string>();
+  const activeSessionByTask = new Map<string, string>();
+  let suppliedLogicalStreamIdConsumed = false;
+  const sessionKeyFor = (event: AgentEvent): string => {
+    const sessionRef = agentSessionRef(event);
+    if (sessionRef !== undefined) return JSON.stringify([event.taskId, sessionRef]);
+    return activeSessionByTask.get(event.taskId) ?? JSON.stringify([event.taskId, null]);
+  };
   const logicalStreamIdFor = (event: AgentEvent): string => {
-    const existing = logicalStreamIds.get(event.taskId);
+    const sessionKey = sessionKeyFor(event);
+    const existing = logicalStreamIds.get(sessionKey);
     if (existing) return existing;
-    const supplied = context.logicalStreamId ?? context.identityRef?.current.logicalStreamId ?? context.identity?.logicalStreamId;
-    const logicalStreamId = supplied && logicalStreamIds.size === 0 ? supplied : createObservationLogicalStreamId();
-    logicalStreamIds.set(event.taskId, logicalStreamId);
+
+    const sessionRef = agentSessionRef(event);
+    const provisionalKey = JSON.stringify([event.taskId, null]);
+    const provisional = sessionRef === undefined ? undefined : logicalStreamIds.get(provisionalKey);
+    const supplied = suppliedLogicalStreamIdConsumed
+      ? undefined
+      : context.logicalStreamId ?? context.identityRef?.current.logicalStreamId ?? context.identity?.logicalStreamId;
+    const useSupplied = supplied !== undefined && logicalStreamIds.size === 0;
+    const logicalStreamId = provisional
+      ?? (useSupplied ? supplied : createObservationLogicalStreamId());
+    if (useSupplied) suppliedLogicalStreamIdConsumed = true;
+    if (provisional) logicalStreamIds.delete(provisionalKey);
+    logicalStreamIds.set(sessionKey, logicalStreamId);
+    if (sessionRef !== undefined) activeSessionByTask.set(event.taskId, sessionKey);
     return logicalStreamId;
   };
   const identityFor = (event: AgentEvent): ObservationIdentity => ({
@@ -112,7 +135,9 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       severity: terminal.severity,
       payload: terminal.payload,
     });
-    logicalStreamIds.delete(event.taskId);
+    const sessionKey = sessionKeyFor(event);
+    logicalStreamIds.delete(sessionKey);
+    if (activeSessionByTask.get(event.taskId) === sessionKey) activeSessionByTask.delete(event.taskId);
   };
 }
 
@@ -393,6 +418,10 @@ export function createArtifactObservation(observer: ObservationSink, identity: O
     kind: "artifact.submitted",
     payload: { artifactId, kind },
   });
+}
+
+function agentSessionRef(event: AgentEvent): string | undefined {
+  return "sessionRef" in event ? event.sessionRef : undefined;
 }
 
 function observabilityPayload(event: AgentEvent): Record<string, unknown> {
