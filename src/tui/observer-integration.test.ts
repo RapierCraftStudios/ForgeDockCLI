@@ -59,6 +59,29 @@ test("background task supervisor persists sanitized split channels before its te
   }
 });
 
+test("controller default path persists only sanitized split and quoted output", async () => {
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:") });
+  const adapter = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller-redaction", controllerTaskId: "controller-redaction" } });
+  adapter.output("stdout", "visible password=");
+  adapter.output("stderr", "visible token=");
+  adapter.output("stdout", "split-secret after");
+  adapter.output("stderr", 'password="[REDACTED]"suffix');
+  adapter.completed(0);
+  await observer.flush();
+
+  const events = await observer.query({ forgeRunId: "run-controller-redaction" });
+  const outputs = events.filter((event) => event.output);
+  const serialized = JSON.stringify(outputs);
+  assert.doesNotMatch(serialized, /split-secret|suffix/);
+  assert.match(serialized, /visible/);
+  assert.match(serialized, /\[REDACTED\]/);
+  assert.deepEqual([...new Set(outputs.map((event) => event.output?.channel))].sort(), ["stderr", "stdout"]);
+  assert.ok(events.find((event) => event.kind === "controller.completed"));
+  assert.ok(outputs.every((event) => event.identity.logicalStreamId));
+  assert.equal(new Set(outputs.map((event) => event.identity.logicalStreamId)).size, 1);
+  observer.close();
+});
+
 test("controller adapter preserves stdout and stderr as separate observation channels", async () => {
   const observer = new ForgeDockObserver({
     store: new SqliteObservationStore(":memory:"),

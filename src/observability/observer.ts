@@ -109,7 +109,20 @@ export class ForgeDockObserver implements ObservationSink {
   }
 
   async flush(): Promise<void> {
-    await this.#queue;
+    // Adapters enqueue their work independently of the observer. Waiting only
+    // for the queue captured at entry can return between adapter operations:
+    // an adapter may start its next emit after the current append resolves.
+    // Re-check after yielding so flush is a real quiescence barrier for both
+    // queued appends and a drop-marker batch.
+    for (;;) {
+      const queue = this.#queue;
+      await queue;
+      // A controller adapter may chain its next operation from the promise
+      // just settled above. Let that microtask chain start before declaring
+      // the observer idle.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (queue === this.#queue && this.#pending === 0 && !this.#dropScheduled) return;
+    }
   }
 
   async prune(scopeKey: string | undefined, policy: Parameters<ObservationStore["prune"]>[1]): Promise<Awaited<ReturnType<ObservationStore["prune"]>>> {

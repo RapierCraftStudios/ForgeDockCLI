@@ -118,12 +118,17 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
 export class ControllerObservationAdapter {
   readonly #observer: ObservationSink;
   readonly #context: ObservationAdapterContext;
+  readonly #producer: ReturnType<typeof createObservationProducer>;
   readonly #logicalStreamId: string;
+  readonly #streams = new Map<"stdout" | "stderr", StreamingObservationText>();
+  #queue: Promise<void> = Promise.resolve();
   #outputSequence = 0;
+  #terminal = false;
 
   constructor(observer: ObservationSink, context: ObservationAdapterContext = {}) {
     this.#observer = observer;
     this.#context = context;
+    this.#producer = context.producer ?? createObservationProducer("forgedock-controller");
     this.#logicalStreamId = context.logicalStreamId
       ?? context.identity?.logicalStreamId
       ?? context.identityRef?.current.logicalStreamId
@@ -131,42 +136,114 @@ export class ControllerObservationAdapter {
   }
 
   started(command: string, args: readonly string[]): void {
-    this.emit("lifecycle", "controller.started", { command, args: safeArgs(args) });
+    this.enqueue(() => this.emitLifecycle("lifecycle", "controller.started", { command, args: safeArgs(args) }));
   }
 
   output(channel: "stdout" | "stderr", text: string): void {
+    if (this.#terminal || !text) return;
     this.#outputSequence += 1;
-    this.emit(channel, channel === "stdout" ? "output.stdout" : "output.stderr", { bytes: Buffer.byteLength(text, "utf8") }, "info", {
-      channel,
-      text,
-      chunkSequence: this.#outputSequence,
+    const chunkSequence = this.#outputSequence;
+    this.enqueue(async () => {
+      if (this.#terminal) return;
+      const stream = this.streamFor(channel);
+      const sanitized = stream.push(text);
+      if (!sanitized) return;
+      await this.emitOutput(channel, sanitized, text, chunkSequence, stream);
     });
   }
 
   completed(code: number, truncated = false): void {
-    if (truncated) this.emit("diagnostic", "output.truncated", { summary: "Controller output was bounded to the retained tail" }, "warning", undefined, { truncated: true });
-    this.emit("lifecycle", "controller.completed", { code }, code === 0 ? "info" : "error", undefined, truncated ? { truncated: true } : undefined);
+    this.finishTerminal(async () => {
+      if (truncated) await this.emitLifecycle("diagnostic", "output.truncated", { summary: "Controller output was bounded to the retained tail" }, "warning", { truncated: true });
+      await this.flushStreams();
+      await this.emitLifecycle("lifecycle", "controller.completed", { code }, code === 0 ? "info" : "error", truncated ? { truncated: true } : undefined);
+    });
   }
 
   failed(error: unknown): void {
-    this.emit("lifecycle", "controller.failed", { summary: error instanceof Error ? error.message : String(error) }, "error");
+    this.finishTerminal(async () => {
+      await this.flushStreams();
+      await this.emitLifecycle("lifecycle", "controller.failed", { summary: error instanceof Error ? error.message : String(error) }, "error");
+    });
   }
 
-  private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"]): void {
-    void this.#observer.emit({
-      producer: this.#context.producer ?? createObservationProducer("forgedock-controller"),
-      identity: {
-        ...(this.#context.identityRef?.current ?? this.#context.identity ?? {}),
-        logicalStreamId: this.#logicalStreamId,
-      },
-      source: "controller",
-      channel,
-      kind,
-      severity,
-      payload,
-      ...(output ? { output } : {}),
-      ...(delivery ? { delivery } : {}),
-    }).catch(() => undefined);
+  private streamFor(channel: "stdout" | "stderr"): StreamingObservationText {
+    let stream = this.#streams.get(channel);
+    if (!stream) {
+      stream = createStreamingObservationText();
+      this.#streams.set(channel, stream);
+    }
+    return stream;
+  }
+
+  private flushStreams(): Promise<void> {
+    return (async () => {
+      for (const channel of ["stdout", "stderr"] as const) {
+        const stream = this.#streams.get(channel);
+        if (!stream) continue;
+        const tail = stream.finish();
+        if (tail) await this.emitOutput(channel, tail, tail, undefined, stream);
+      }
+    })();
+  }
+
+  private finishTerminal(operation: () => Promise<void>): void {
+    if (this.#terminal) return;
+    this.enqueue(async () => {
+      this.#terminal = true;
+      try {
+        await operation();
+      } finally {
+        this.#streams.clear();
+      }
+    });
+  }
+
+  private enqueue(operation: () => Promise<void>): void {
+    const current = this.#queue.catch(() => undefined).then(operation);
+    this.#queue = current;
+  }
+
+  private async emitOutput(channel: "stdout" | "stderr", text: string, sourceText: string, chunkSequence: number | undefined, stream: StreamingObservationText): Promise<void> {
+    try {
+      const result = await this.#observer.emit({
+        producer: this.#producer,
+        identity: this.identity(),
+        source: "controller",
+        channel,
+        kind: channel === "stdout" ? "output.stdout" : "output.stderr",
+        payload: { bytes: Buffer.byteLength(sourceText, "utf8") },
+        output: { channel, text, ...(chunkSequence === undefined ? {} : { chunkSequence }) },
+        ...(stream.redacted ? { security: { redacted: true } } : {}),
+      });
+      if (result.kind === "output.dropped") stream.markDropped();
+    } catch {
+      stream.markDropped();
+    }
+  }
+
+  private async emitLifecycle(channel: "lifecycle" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", delivery?: ObservationDraft["delivery"]): Promise<void> {
+    try {
+      await this.#observer.emit({
+        producer: this.#producer,
+        identity: this.identity(),
+        source: "controller",
+        channel,
+        kind,
+        severity,
+        payload,
+        ...(delivery ? { delivery } : {}),
+      });
+    } catch {
+      // Lifecycle delivery failures still release the adapter-owned parser state.
+    }
+  }
+
+  private identity(): ObservationIdentity {
+    return {
+      ...(this.#context.identityRef?.current ?? this.#context.identity ?? {}),
+      logicalStreamId: this.#logicalStreamId,
+    };
   }
 }
 

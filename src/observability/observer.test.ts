@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
-import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
+import { BackgroundTaskObservationAdapter, ControllerObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
-import { createObservationProducer, createStreamingObservationText, observationStreamKey, retainObservationLogicalStreamId, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationIdentity, type ObservationSink } from "./contracts.js";
+import { createObservationProducer, createStreamingObservationText, observationStreamKey, redactObservationValue, retainObservationLogicalStreamId, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationIdentity, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
 import { DEFAULT_WORKSPACE_LAYOUT } from "./workspace-layout.js";
@@ -266,6 +266,27 @@ test("terminal sanitization removes executable control sequences while preservin
   assert.equal(value, "visible warning");
 });
 
+test("central redaction masks assignment forms and enforces marker boundaries", () => {
+  const cases = [
+    ["prefix password=secret tail", "prefix password=[REDACTED] tail", true],
+    ["--token secret --verbose", "--token [REDACTED] --verbose", true],
+    ['{"password":"secret","message":"visible"}', '{"password":"[REDACTED]","message":"visible"}', true],
+    ["https://user:secret@example.test/path", "https://user:[REDACTED]@example.test/path", true],
+    ["token=[REDACTED] password=secret", "token=[REDACTED] password=[REDACTED]", true],
+    ['password="[REDACTED]"suffix', 'password="[REDACTED]"', true],
+    ['password="[REDACTED_2]" tail', 'password="[REDACTED_2]" tail', false],
+    ["password=[REDACTED], next=visible", "password=[REDACTED], next=visible", false],
+  ] as const;
+  for (const [input, expected, redacted] of cases) {
+    const result = redactObservationValue(input);
+    assert.equal(result.value, expected, input);
+    assert.equal(result.redacted, redacted, input);
+  }
+  const nested = redactObservationValue({ outer: "visible token=embedded-secret", output: { text: "password=payload-secret" } });
+  assert.deepEqual(nested.value, { outer: "visible token=[REDACTED]", output: { text: "password=[REDACTED]" } });
+  assert.equal(nested.redacted, true);
+});
+
 test("streaming sanitizer carries split terminal and credential state across chunks", () => {
   const stream = createStreamingObservationText();
   const output = [
@@ -279,6 +300,45 @@ test("streaming sanitizer carries split terminal and credential state across chu
   assert.match(output, /after/);
   assert.doesNotMatch(output, /super-secret-value/);
   assert.doesNotMatch(output, /https:\/\/example\.test/);
+});
+
+test("controller adapter quarantines split assignments with its default producer and isolated owners", async () => {
+  const observer = observerWithStore();
+  const first = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller", nodeId: "node-a", piSessionRef: "session-a" } });
+  const second = new ControllerObservationAdapter(observer, { identity: { forgeRunId: "run-controller", nodeId: "node-b", piSessionRef: "session-b" } });
+  first.output("stdout", "visible password=");
+  second.output("stderr", "visible token=");
+  first.output("stdout", "first-secret after");
+  second.output("stderr", "second-secret after");
+  first.completed(0);
+  second.failed(new Error("cancelled"));
+  await observer.flush();
+  const events = await observer.query({ forgeRunId: "run-controller" });
+  const outputs = events.filter((event) => event.output);
+  assert.equal(new Set(outputs.map((event) => event.identity.logicalStreamId)).size, 2);
+  assert.equal(new Set(events.map((event) => event.producer.processInstanceId)).size, 2);
+  assert.doesNotMatch(JSON.stringify(events), /first-secret|second-secret/);
+  assert.match(JSON.stringify(outputs), /\[REDACTED\]/);
+  assert.ok(events.some((event) => event.kind === "controller.completed"));
+  assert.ok(events.some((event) => event.kind === "controller.failed"));
+  observer.close();
+});
+
+test("controller adapter drops parser state after observer rejection", async () => {
+  const drafts: ObservationDraft[] = [];
+  const sink: ObservationSink = {
+    emit: async (draft) => {
+      drafts.push(draft);
+      if (draft.output?.text === "reject-me") throw new Error("sink unavailable");
+      return {} as ObservationEnvelopeV1;
+    },
+  };
+  const adapter = new ControllerObservationAdapter(sink);
+  adapter.output("stdout", "reject-me");
+  adapter.output("stdout", "password=must-not-escape");
+  adapter.completed(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.doesNotMatch(JSON.stringify(drafts), /must-not-escape/);
 });
 
 test("background task adapter isolates colon-containing task streams and drains before lifecycle", async () => {

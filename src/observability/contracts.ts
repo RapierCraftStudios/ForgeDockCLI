@@ -196,6 +196,13 @@ const STREAM_SECRET_PATTERNS = [
 ] as const;
 const STREAM_HOLDBACK_LIMIT_BYTES = 16 * 1024;
 const STREAM_SECRET_PREFIXES = ["bearer", "authorization", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "sk-", "-----BEGIN "];
+// Match only credential-shaped keys. Matching arbitrary key/value pairs here can
+// consume the `password=...` part of prose such as `prefix password=secret`
+// before the replacement callback gets a chance to inspect it.
+const SENSITIVE_ASSIGNMENT = /(^|[^A-Za-z0-9_])((?:--)?["']?(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)["']?)(\s*(?:=|:)\s*|\s+)(?:"((?:\\.|[^"\\])*)"([^\s,;}&)\]]*)|'((?:\\.|[^'\\])*)'([^\s,;}&)\]]*)|([^\s,;}&)]*))/gi;
+const SENSITIVE_ASSIGNMENT_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:--)?(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)\s*(?:=|:)\s*[^\s,;}&)\]]*)$/i;
+const SENSITIVE_CLI_SUFFIX = /(?:^|[^A-Za-z0-9_])((?:--)(?:authorization|api[-_]?key|credential|cookie|jwt|password|private[-_]?key|secret|token)(?:\s+[^\s,;}&)]*)?)$/i;
+const REDACTION_MARKER = /^\[REDACTED(?:[ _:-][A-Za-z0-9_-]+)?\]$/i;
 
 type TerminalParserState = "ground" | "escape" | "csi" | "osc" | "osc-escape" | "ss3";
 
@@ -204,6 +211,7 @@ export class StreamingObservationText {
   #state: TerminalParserState = "ground";
   #holdback = "";
   #quarantined = false;
+  #redacted = false;
 
   push(value: string): string {
     if (!value || this.#quarantined) return "";
@@ -223,6 +231,7 @@ export class StreamingObservationText {
     this.#state = "ground";
     this.#holdback = "";
     this.#quarantined = false;
+    this.#redacted = false;
   }
 
   finish(): string {
@@ -230,15 +239,18 @@ export class StreamingObservationText {
       this.reset();
       return "";
     }
-    const tail = streamingSecretSuffixStart(this.#holdback) === undefined
-      ? redactStreamingSecrets(this.#holdback)
+    const original = this.#holdback;
+    const tail = streamingSecretSuffixStart(original) === undefined
+      ? redactStreamingSecrets(original)
       : "[REDACTED]";
+    this.#redacted ||= tail !== original || tail === "[REDACTED]";
     this.#holdback = "";
     this.#state = "ground";
     return tail;
   }
 
   get quarantined(): boolean { return this.#quarantined; }
+  get redacted(): boolean { return this.#redacted; }
 
   private flushSafe(value: string): string {
     const candidate = this.#holdback + value;
@@ -250,10 +262,14 @@ export class StreamingObservationText {
         return "";
       }
       this.#holdback = holdback;
-      return redactStreamingSecrets(candidate.slice(0, secretStart));
+      const safe = redactStreamingSecrets(candidate.slice(0, secretStart));
+      this.#redacted ||= safe !== candidate.slice(0, secretStart);
+      return safe;
     }
     this.#holdback = "";
-    return redactStreamingSecrets(candidate);
+    const safe = redactStreamingSecrets(candidate);
+    this.#redacted ||= safe !== candidate;
+    return safe;
   }
 
   private consumeTerminal(value: string): string {
@@ -297,7 +313,49 @@ export function createStreamingObservationText(): StreamingObservationText {
 export function redactStreamingSecrets(value: string): string {
   let result = value;
   for (const pattern of STREAM_SECRET_PATTERNS) result = result.replace(pattern, "[REDACTED]");
+  result = redactSensitiveAssignments(result);
+  result = result.replace(/(\bhttps?:\/\/[^\s/:@]+):([^@\s/]+)@/gi, "$1:[REDACTED]@");
   return result;
+}
+
+function redactSensitiveAssignments(value: string): string {
+  return value.replace(
+    SENSITIVE_ASSIGNMENT,
+    (
+      match,
+      prefix: string,
+      key: string,
+      separator: string,
+      doubleQuoted: string | undefined,
+      doubleSuffix: string | undefined,
+      singleQuoted: string | undefined,
+      singleSuffix: string | undefined,
+      bareToken: string | undefined,
+    ) => {
+      // A whitespace-delimited assignment is intentionally accepted only for
+      // command-line options (`--token value`). The regex already limits the
+      // key to the sensitive vocabulary, while the separator check preserves
+      // ordinary prose containing a sensitive word.
+      if (!/[=:]/.test(separator) && !key.startsWith("--")) return match;
+
+      if (doubleQuoted !== undefined) {
+        if (isCompleteRedactionMarker(doubleQuoted) && !doubleSuffix) return match;
+        return `${prefix}${key}${separator}"[REDACTED]"`;
+      }
+      if (singleQuoted !== undefined) {
+        if (isCompleteRedactionMarker(singleQuoted) && !singleSuffix) return match;
+        return `${prefix}${key}${separator}'[REDACTED]'`;
+      }
+
+      const token = bareToken ?? "";
+      if (isCompleteRedactionMarker(token)) return match;
+      return `${prefix}${key}${separator}[REDACTED]`;
+    },
+  );
+}
+
+function isCompleteRedactionMarker(value: string): boolean {
+  return REDACTION_MARKER.test(value.trim());
 }
 
 function streamingSecretSuffixStart(value: string): number | undefined {
@@ -305,6 +363,8 @@ function streamingSecretSuffixStart(value: string): number | undefined {
   const suffixPatterns = [
     /(?:^|[^A-Za-z0-9_])(bearer\s+[A-Za-z0-9._~+/=-]*)$/i,
     /(?:^|[^A-Za-z0-9_])(authorization\s*[:=]\s*[A-Za-z0-9._~+/=-]*)$/i,
+    SENSITIVE_ASSIGNMENT_SUFFIX,
+    SENSITIVE_CLI_SUFFIX,
     /(?:^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9_]*)$/i,
     /(?:^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]*)$/i,
   ];
@@ -409,13 +469,13 @@ export function redactObservationValue(value: unknown, policy: ObservationRedact
   if (typeof value === "string") {
     const sanitized = sanitizeTerminalText(value);
     const masked = redactStreamingSecrets(sanitized);
-    if (masked !== sanitized || SENSITIVE_VALUE.test(sanitized)) {
+    if (SENSITIVE_VALUE.test(sanitized) && masked === sanitized) {
       return { value: "[REDACTED]", redacted: true, originalBytes, outputBytes: 11, truncated: false };
     }
     const terminalSequencesRemoved = sanitized !== value;
-    const bytes = Buffer.byteLength(sanitized, "utf8");
-    if (bytes <= maxStringBytes) return { value: sanitized, redacted: terminalSequencesRemoved, originalBytes, outputBytes: bytes, truncated: false };
-    const clipped = clipUtf8(sanitized, maxStringBytes);
+    const bytes = Buffer.byteLength(masked, "utf8");
+    if (bytes <= maxStringBytes) return { value: masked, redacted: terminalSequencesRemoved || masked !== sanitized, originalBytes, outputBytes: bytes, truncated: false };
+    const clipped = clipUtf8(masked, maxStringBytes);
     return {
       value: `${clipped}… [truncated]`,
       redacted: true,
