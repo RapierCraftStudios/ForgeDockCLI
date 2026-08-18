@@ -47,8 +47,8 @@ function formatGrepResult(result, options, theme, showImages, isError = false) {
     if (output) {
         const lines = output.split("\n");
         if (!options.expanded && !isError) {
-            const count = lines.filter((line) => line.trim()).length;
-            text += `\n${theme.fg("muted", `↳ ${count} ${count === 1 ? "match" : "matches"} ·`)} ${keyHint("app.tools.expand", "to preview")}`;
+            const count = result.details?.matchCount;
+            if (typeof count === "number") text += `\n${theme.fg("muted", `↳ ${count} ${count === 1 ? "match" : "matches"} ·`)} ${keyHint("app.tools.expand", "to preview")}`;
         }
         else {
             const maxLines = options.expanded ? lines.length : 15;
@@ -173,7 +173,7 @@ export function createGrepToolDefinition(cwd, options) {
                             if (signal?.aborted)
                                 throw new Error("Operation aborted");
                             if (matches.length === 0) {
-                                settle(() => resolve({ content: [{ type: "text", text: "No matches found" }], details: undefined }));
+                                settle(() => resolve({ content: [{ type: "text", text: "No matches found" }], details: { matchCount: 0 } }));
                                 return;
                             }
                             const outputLines = [];
@@ -199,7 +199,7 @@ export function createGrepToolDefinition(cwd, options) {
                             const rawOutput = outputLines.join("\n");
                             const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
                             let output = truncation.content;
-                            const details = {};
+                            const details = { matchCount: matches.length };
                             const notices = [];
                             if (matchLimitReached) {
                                 notices.push(`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`);
