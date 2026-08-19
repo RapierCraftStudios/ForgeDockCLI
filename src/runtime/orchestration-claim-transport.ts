@@ -243,7 +243,7 @@ async function handlePromotionRequest(
         error: error.message,
       });
     }
-    send(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    send(response, 500, { error: "Claim promotion failed" });
   }
 }
 

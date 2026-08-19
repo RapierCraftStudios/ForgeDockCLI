@@ -75,6 +75,23 @@ test("parent claim conflicts are reconstructed in the child controller", async (
   }
 });
 
+test("unexpected promotion failures do not expose internal error details", async () => {
+  const server = await startOrchestrationClaimPromotionServer({
+    identity,
+    promoteClaims: async () => { throw new Error("secret stack detail"); },
+  });
+  try {
+    await assert.rejects(
+      () => promoteOrchestrationClaimsFromEnvironment(["src/a.ts"], server.env),
+      (error: unknown) => error instanceof Error
+        && error.message.includes("Claim promotion failed")
+        && !error.message.includes("secret stack detail"),
+    );
+  } finally {
+    await server.close();
+  }
+});
+
 test("claim promotion rejects stale attempt identity and partial transport configuration", async () => {
   const server = await startOrchestrationClaimPromotionServer({
     identity,
