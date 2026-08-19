@@ -328,6 +328,62 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
+  it("admits an initially merged PR only after an exact passing gate, even without auto-merge", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.snapshot.state = "MERGED";
+    const artifacts = new InMemoryArtifactRepository();
+
+    const result = await completeWorkItem({
+      run,
+      pullRequest: { ...openPr, state: "MERGED" },
+      verdict: verdict(run),
+      autoMerge: false,
+    }, { host, artifacts, runs });
+
+    assert.equal(result.run.state, "completed");
+    assert.equal(result.outcome?.payload.status, "merged");
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, [2]);
+  });
+
+  it("blocks initially merged PRs for every non-authoritative or non-passing gate", async () => {
+    const cases = [
+      { name: "pending checks", update: (host: CompletionHost) => { host.mergeGate.requiredChecks = [{ name: "CI", state: "pending" }]; } },
+      { name: "failed checks", update: (host: CompletionHost) => { host.mergeGate.requiredChecks = [{ name: "CI", state: "failed" }]; } },
+      { name: "cancelled checks", update: (host: CompletionHost) => { host.mergeGate.requiredChecks = [{ name: "CI", state: "cancelled" }]; } },
+      { name: "unavailable checks", update: (host: CompletionHost) => { host.mergeGate.requiredChecks = [{ name: "CI", state: "unavailable" }]; } },
+      { name: "empty checks", update: (host: CompletionHost) => { host.mergeGate.requiredChecks = []; } },
+      { name: "missing provenance", update: (host: CompletionHost) => { delete host.mergeGate.requiredChecksProvenance; } },
+      { name: "unknown mergeability", update: (host: CompletionHost) => { host.mergeGate.mergeable = false; host.mergeGate.mergeability = "unknown"; } },
+      { name: "unavailable mergeability", update: (host: CompletionHost) => { host.mergeGate.mergeable = false; host.mergeGate.mergeability = "unavailable"; } },
+      { name: "conflicting mergeability", update: (host: CompletionHost) => { host.mergeGate.mergeable = false; host.mergeGate.mergeability = "conflicting"; } },
+    ] as const;
+
+    for (const testCase of cases) {
+      const runs = new InMemoryRunRepository();
+      const run = await mergingRun(runs);
+      const host = new CompletionHost();
+      host.snapshot.state = "MERGED";
+      testCase.update(host);
+      const artifacts = new InMemoryArtifactRepository();
+      const result = await completeWorkItem({
+        run,
+        pullRequest: { ...openPr, state: "MERGED" },
+        verdict: verdict(run),
+        autoMerge: false,
+      }, { host, artifacts, runs });
+
+      assert.equal(result.run.state, "blocked", testCase.name);
+      assert.equal(result.outcome?.payload.status, "blocked", testCase.name);
+      assert.deepEqual(host.closes, [], testCase.name);
+      assert.equal(host.merges, 0, testCase.name);
+      const outcomes = await artifacts.list(run.subject, "Outcome");
+      assert.deepEqual(outcomes.filter((outcome) => outcome.kind === "Outcome").map((outcome) => outcome.payload.status), ["blocked"], testCase.name);
+    }
+  });
+
   it("blocks auto-merge and durably preserves every terminal non-passing required state", async () => {
     for (const state of ["cancelled", "failed", "unavailable"] as const) {
       const runs = new InMemoryRunRepository();
@@ -483,6 +539,34 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 1);
   });
 
+  it("propagates cancellation during merged admission without blocking or publishing", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.snapshot.state = "MERGED";
+    const artifacts = new InMemoryArtifactRepository();
+    const controller = new AbortController();
+    host.getPullRequestMergeGate = async () => {
+      controller.abort(new Error("ownership cancelled during merged admission"));
+      return { ...host.mergeGate, requiredChecks: [...host.mergeGate.requiredChecks] };
+    };
+
+    await assert.rejects(
+      completeWorkItem({
+        run,
+        pullRequest: { ...openPr, state: "MERGED" },
+        verdict: verdict(run),
+        autoMerge: false,
+        signal: controller.signal,
+      }, { host, artifacts, runs }),
+      /ownership cancelled during merged admission/,
+    );
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, []);
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+    assert.equal((await runs.load(run.runId))?.state, "merging");
+  });
+
   it("aborts a live pending-check poll without blocking or merging", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
@@ -568,6 +652,32 @@ describe("merge and close authority", () => {
     assert.equal(result.run.state, "completed");
     assert.equal(host.merges, 0);
     assert.deepEqual(host.closes, [2]);
+  });
+
+  it("blocks a concurrent merge when the post-query gate is non-passing", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.getPullRequestMergeGate = async () => {
+      host.snapshot.state = "MERGED";
+      return {
+        ...host.mergeGate,
+        requiredChecks: [{ name: "CI", state: "failed" }],
+      };
+    };
+    const artifacts = new InMemoryArtifactRepository();
+
+    const result = await completeWorkItem({
+      run,
+      pullRequest: openPr,
+      verdict: verdict(run),
+      autoMerge: true,
+    }, { host, artifacts, runs });
+
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.outcome?.payload.status, "blocked");
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, []);
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {

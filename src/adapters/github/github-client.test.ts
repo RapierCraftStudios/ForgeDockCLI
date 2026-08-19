@@ -393,7 +393,31 @@ describe("GitHub pull request admission", () => {
     assert.equal(state, "MERGED");
   });
 
-  it("requires the initial pull request to be open before reading its merge gate", async () => {
+  it("reads an exact merged pull request gate and revalidates its final merged identity", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")) {
+        return JSON.stringify(pullRequestProjection(186, "MERGED"));
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Required CI", state: "SUCCESS" }]);
+      if (args[0] === "api" && args[1]?.includes("/check-runs")) return JSON.stringify([{ check_runs: [
+        { name: "Required CI", head_sha: headSha, status: "completed", conclusion: "success" },
+      ] }]);
+      if (args[0] === "api" && args[1]?.includes("/status?")) return JSON.stringify({ sha: headSha, statuses: [] });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 186, headSha, "staging");
+    assert.equal(gate.requiredChecksProvenance, "github-required");
+    assert.equal(gate.requiredChecksHeadSha, headSha);
+    assert.deepEqual(gate.requiredChecks, [{ name: "Required CI", state: "passed" }]);
+    assert.equal(calls.filter((args) => args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")).length, 2);
+  });
+
+  it("continues to reject a closed pull request before reading its merge gate", async () => {
     const client = new GitHubClient();
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
       if (args[0] === "pr" && args[1] === "view") return JSON.stringify(pullRequestProjection(186, "CLOSED"));
@@ -401,7 +425,7 @@ describe("GitHub pull request admission", () => {
     } });
     await assert.rejects(
       client.getPullRequestMergeGate("a/b", 186, headSha, "staging"),
-      /is not open \(GitHub state: CLOSED\)/,
+      /neither open nor merged \(GitHub state: CLOSED\)/,
     );
   });
 });
