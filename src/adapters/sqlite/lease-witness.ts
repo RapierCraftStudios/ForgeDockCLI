@@ -89,6 +89,11 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+// EEXIST is the only bootstrap error that can represent another process
+// between atomic directory installation and reference publication. Keep the
+// synchronous retry window finite so admission remains fail-closed.
+const LOCAL_WITNESS_CONTENTION_RETRY_DELAY_MS = 10;
+const LOCAL_WITNESS_CONTENTION_RETRY_ATTEMPTS = 80;
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -114,6 +119,12 @@ interface LocalLeaseWitnessOptions {
   localDataRoot?: string;
   /** Test/embedded override. Production defaults to process.env. */
   environment?: NodeJS.ProcessEnv;
+  /** @internal Deterministic bootstrap publication-window test seam. */
+  beforeWitnessInstall?: (witnessDirectory: string) => void;
+  /** @internal Deterministic bootstrap contention test seam. */
+  onBootstrapContention?: () => void;
+  /** @internal Deterministic bootstrap publication-window test seam. */
+  onWitnessInstalledBeforeReference?: () => void;
 }
 
 export function leaseWitnessRequirementMessage(phase: string, checkoutRoot: string): string {
@@ -190,10 +201,21 @@ export function createOrBootstrapLocalLeaseWitness(
   try {
     bootstrapLocalLeaseWitness(cwd, options);
   } catch (error) {
-    // A concurrent first-use process may have completed bootstrap after our
-    // initial lookup. Adopt it only if the complete witness now verifies.
+    // Preserve the existing immediate adoption check for every bootstrap
+    // failure, but only EEXIST can justify waiting for a racing publisher.
     const raced = createConfiguredLeaseWitness(cwd, options);
     if (raced) return raced;
+    if (!isNodeEexist(error)) throw error;
+
+    options.onBootstrapContention?.();
+    for (let attempt = 0; attempt < LOCAL_WITNESS_CONTENTION_RETRY_ATTEMPTS; attempt += 1) {
+      sleepForLocalWitnessContention();
+      const retried = createConfiguredLeaseWitness(cwd, options);
+      if (retried) return retried;
+    }
+    // Never turn directory visibility or an incomplete reference into an
+    // admission result. The original contention error is the fail-closed
+    // result after the documented, sub-second retry window.
     throw error;
   }
 
@@ -208,7 +230,7 @@ export function createOrBootstrapLocalLeaseWitness(
  */
 export function bootstrapLocalLeaseWitness(
   cwd: string,
-  options: Pick<LocalLeaseWitnessOptions, "localDataRoot"> = {},
+  options: Pick<LocalLeaseWitnessOptions, "localDataRoot" | "beforeWitnessInstall" | "onWitnessInstalledBeforeReference"> = {},
 ): LocalLeaseWitnessBootstrap {
   const paths = localWitnessPaths(cwd, options.localDataRoot);
   if (existsSync(paths.configPath)) throw new Error(`Lease witness bootstrap already exists at ${paths.configPath}`);
@@ -239,9 +261,11 @@ export function bootstrapLocalLeaseWitness(
     // retained witness one epoch newer before the database has any history.
     writeCheckpoint(temporaryCheckpoint, createSignedLeaseCheckpoint(0, privateKey, paths.keyId));
     if (witness.verify().state !== "verified") throw new LeaseContinuityError("newly seeded local witness could not be verified");
+    options.beforeWitnessInstall?.(paths.witnessDirectory);
     renameSync(temporaryDirectory, paths.witnessDirectory);
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
+    options.onWitnessInstalledBeforeReference?.();
 
     const reference = localWitnessReference(paths);
     writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -327,6 +351,14 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function isNodeEexist(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function sleepForLocalWitnessContention(): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCAL_WITNESS_CONTENTION_RETRY_DELAY_MS);
 }
 
 function payload(epoch: number, keyId: string): Buffer {

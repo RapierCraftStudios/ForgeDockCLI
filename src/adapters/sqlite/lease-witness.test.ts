@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -111,6 +112,144 @@ describe("retained lease checkpoint witness", () => {
         () => createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} }),
         /malformed|continuity/i,
       );
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("adopts the verified witness across the deterministic rename/reference publication window", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const winnerBefore = join(root, "winner-before");
+    const competitorBefore = join(root, "competitor-before");
+    const winnerInstall = join(root, "winner-install");
+    const competitorInstall = join(root, "competitor-install");
+    const winnerInstalled = join(root, "winner-installed");
+    const winnerPublish = join(root, "winner-publish");
+    const contention = join(root, "contention");
+    const winnerResult = join(root, "winner-result.json");
+    const competitorResult = join(root, "competitor-result.json");
+    mkdirSync(checkout);
+
+    const childSource = [
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+      'const { createOrBootstrapLocalLeaseWitness } = await import(process.env.MODULE_URL);',
+      'const waitArray = new Int32Array(new SharedArrayBuffer(4));',
+      'const waitFor = (path) => { while (!existsSync(path)) Atomics.wait(waitArray, 0, 0, 5); };',
+      'const role = process.env.ROLE;',
+      'const options = { localDataRoot: process.env.LOCAL_DATA_ROOT, environment: {} };',
+      'if (role === "winner") {',
+      '  options.beforeWitnessInstall = () => { writeFileSync(process.env.BEFORE, "ready"); waitFor(process.env.INSTALL); };',
+      '  options.onWitnessInstalledBeforeReference = () => { writeFileSync(process.env.INSTALLED, "ready"); waitFor(process.env.PUBLISH); };',
+      '} else {',
+      '  options.beforeWitnessInstall = () => { writeFileSync(process.env.BEFORE, "ready"); waitFor(process.env.INSTALL); const error = new Error("simulated EEXIST at atomic witness install"); error.code = "EEXIST"; throw error; };',
+      '  options.onBootstrapContention = () => writeFileSync(process.env.CONTENTION, "ready");',
+      '}',
+      'try {',
+      '  const witness = createOrBootstrapLocalLeaseWitness(process.env.CHECKOUT, options);',
+      '  const reference = JSON.parse(readFileSync(`${process.env.CHECKOUT}/.forgedock/lease-witness.json`, "utf8"));',
+      '  writeFileSync(process.env.RESULT, JSON.stringify({ state: witness.verify().state, epoch: witness.verify().epoch, checkpoint: readFileSync(reference.checkpointPath, "utf8"), publicKey: readFileSync(reference.publicKeyPath, "utf8"), privateKey: readFileSync(reference.privateKeyPath, "utf8") }));',
+      '} catch (error) {',
+      '  writeFileSync(process.env.RESULT, JSON.stringify({ error: String(error), code: error?.code }));',
+      '  process.exitCode = 1;',
+      '}',
+    ].join("\n");
+    const moduleUrl = new URL("./lease-witness.js", import.meta.url).href;
+    const start = (role: "winner" | "competitor", before: string, install: string, result: string) => spawn(process.execPath, ["--input-type=module", "-e", childSource], {
+      env: {
+        ...process.env,
+        MODULE_URL: moduleUrl,
+        ROLE: role,
+        CHECKOUT: checkout,
+        LOCAL_DATA_ROOT: localDataRoot,
+        BEFORE: before,
+        INSTALL: install,
+        RESULT: result,
+        ...(role === "winner"
+          ? { INSTALLED: winnerInstalled, PUBLISH: winnerPublish }
+          : { CONTENTION: contention }),
+      },
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    const waitForPath = async (path: string): Promise<void> => {
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(path)) {
+        if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+    };
+    const waitForExit = (child: ReturnType<typeof spawn>): Promise<void> => new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`witness child exited with ${code}`)));
+    });
+    let winner: ReturnType<typeof spawn> | undefined;
+    let competitor: ReturnType<typeof spawn> | undefined;
+    try {
+      winner = start("winner", winnerBefore, winnerInstall, winnerResult);
+      await waitForPath(winnerBefore);
+      competitor = start("competitor", competitorBefore, competitorInstall, competitorResult);
+      await waitForPath(competitorBefore);
+
+      // Both callers passed their initial directory checks before either can
+      // rename. The winner publishes the directory, then pauses before the
+      // checkout reference; the competitor is forced to observe EEXIST.
+      writeFileSync(winnerInstall, "go");
+      await waitForPath(winnerInstalled);
+      writeFileSync(competitorInstall, "go");
+      await waitForPath(contention);
+      writeFileSync(winnerPublish, "go");
+      await Promise.all([waitForExit(winner), waitForExit(competitor)]);
+
+      const winnerState = JSON.parse(readFileSync(winnerResult, "utf8")) as { state?: string; epoch?: number; checkpoint?: string; publicKey?: string; privateKey?: string; error?: string };
+      const competitorState = JSON.parse(readFileSync(competitorResult, "utf8")) as { state?: string; epoch?: number; checkpoint?: string; publicKey?: string; privateKey?: string; error?: string };
+      assert.equal(winnerState.state, "verified");
+      assert.equal(winnerState.epoch, 0);
+      assert.deepEqual(competitorState, winnerState);
+      const referencePath = join(checkout, ".forgedock", "lease-witness.json");
+      const reference = JSON.parse(readFileSync(referencePath, "utf8")) as {
+        checkoutDigest: string;
+        checkpointPath: string;
+        publicKeyPath: string;
+        privateKeyPath: string;
+      };
+      assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().state, "verified");
+      assert.equal(readFileSync(reference.checkpointPath, "utf8"), winnerState.checkpoint);
+      assert.equal(readFileSync(reference.publicKeyPath, "utf8"), winnerState.publicKey);
+      assert.equal(readFileSync(reference.privateKeyPath, "utf8"), winnerState.privateKey);
+      const installedRoot = join(localDataRoot, "ForgeDock", "lease-witnesses");
+      assert.deepEqual(readdirSync(installedRoot), [reference.checkoutDigest]);
+      assert.deepEqual(readdirSync(join(installedRoot, reference.checkoutDigest)).sort(), ["checkpoint.json", "private.pem", "public.pem"]);
+    } finally {
+      writeFileSync(winnerInstall, "go");
+      writeFileSync(competitorInstall, "go");
+      writeFileSync(winnerPublish, "go");
+      winner?.kill();
+      competitor?.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the original EEXIST after the bounded verified-adoption window", () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-contention-bound-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const started = Date.now();
+      assert.throws(
+        () => createOrBootstrapLocalLeaseWitness(checkout, {
+          localDataRoot,
+          environment: {},
+          beforeWitnessInstall: () => {
+            const error = new Error("simulated EEXIST contention");
+            (error as NodeJS.ErrnoException).code = "EEXIST";
+            throw error;
+          },
+        }),
+        (error: unknown) => (error as NodeJS.ErrnoException).code === "EEXIST",
+      );
+      assert.ok(Date.now() - started < 2_000, "contention retry must remain bounded");
+      assert.equal(existsSync(join(checkout, ".forgedock", "lease-witness.json")), false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
