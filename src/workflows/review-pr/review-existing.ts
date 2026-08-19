@@ -2,7 +2,7 @@
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
-import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun } from "../../core/state/machine.js";
@@ -170,10 +170,22 @@ function assertDeploymentMergeGateAuthority(gate: PullRequestMergeGate, pullRequ
       + `, received ${gate.repo}#${gate.pullRequest} ${gate.headSha} -> ${gate.baseBranch}`,
     );
   }
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || gate.requiredChecks.length === 0) {
+    throw new Error(`Deployment merge-gate checks are not immutably bound to ${pullRequest.headSha}`);
+  }
 }
 
 function assertDeploymentMergeGate(gate: PullRequestMergeGate): void {
-  if (!gate.mergeable) throw new Error(`Deployment PR #${gate.pullRequest} is not currently mergeable`);
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
+    throw new Error(`Deployment PR #${gate.pullRequest} lacks immutable commit-bound required-check provenance`);
+  }
+  if (gate.requiredChecks.length === 0) throw new Error(`Deployment PR #${gate.pullRequest} has no authoritative required checks`);
+  if (pullRequestMergeability(gate) !== "mergeable") {
+    throw new Error(`Deployment PR #${gate.pullRequest} is not currently mergeable`);
+  }
   const blocked = gate.requiredChecks.filter((check) => check.state !== "passed");
   if (blocked.length) {
     throw new Error(`Deployment PR checks are not green: ${blocked.map((check) => `${check.name}=${check.state}`).join(", ")}`);

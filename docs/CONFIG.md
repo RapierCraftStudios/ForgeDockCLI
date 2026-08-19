@@ -1,6 +1,9 @@
 # forge.yaml Configuration Reference
 
-`forge.yaml` is placed at your project root and tells ForgeDock commands how to interact with your specific project. Without it, commands cannot resolve your GitHub repository, paths, or branches.
+> ForgeDock Next behavior synchronized 2026-08-18. Certification remains open;
+> configuration documentation is not a dogfood-readiness claim.
+
+`forge.yaml` is placed at the project root and tells ForgeDock how to resolve repositories, paths, branches, and policy. Legacy commands expect it to be initialized explicitly. ForgeDock Next creates a minimal file on normal parent-terminal launch when absent and owns only its marker-bounded `next` block; repository identity must still be resolvable before a mutating controller can dispatch.
 
 ## Quick Start
 
@@ -48,7 +51,8 @@ If you have both a local `claude` CLI and `ANTHROPIC_API_KEY` set and want to pi
 | [`agents`](#agents-optional) | No | Default model for pipeline agents |
 | [`repos`](#repos-optional) | No | Multi-repository routing |
 | [`project_board`](#project_board-optional) | No | GitHub Projects v2 integration |
-| [`orchestration`](#orchestration-optional) | No | `/orchestrate` concurrency and cascade admission policy |
+| [`next`](#forgedock-next-managed-block) | No | Marker-managed ForgeDock Next controller policy |
+| [`orchestration`](#orchestration-optional) | No | Legacy `/orchestrate` cascade policy; not the Next scheduler block |
 | [`pipeline`](#pipeline-optional) | No | `/orchestrate` batch-engine tuning (stall detection, token budget, narration) |
 | [`services`](#services-optional) | No | External service URLs and IDs |
 | [`review`](#review-optional) | No | Context injected into review agents |
@@ -56,6 +60,118 @@ If you have both a local `claude` CLI and `ANTHROPIC_API_KEY` set and want to pi
 | [`verification`](#verification-optional) | No | Health-check patterns |
 | [`billing`](#billing-optional) | No | Enable financial integrity audit phase |
 | [`adaptive_scripts`](#adaptive_scripts-optional) | No | Per-repo script override configuration |
+
+---
+
+## ForgeDock Next managed block
+
+A normal ForgeDock Next terminal launch creates a minimal `forge.yaml` when one is
+missing. `/forgedock-config` updates only the marker-bounded `next` block and
+preserves unrelated user-authored YAML. Invocation overrides take precedence over
+managed values; managed values take precedence over built-in defaults.
+
+The orchestration portion is:
+
+```yaml
+next:
+  orchestration:
+    batching:
+      # none (default), conservative, or aggressive
+      policy: "none"
+      max_batch_size: 8
+      # Config default is 3; sensitive assembly has a hard safety cap of 2.
+      max_sensitive_batch_size: 3
+    scope_expansion: "scope-locked"
+    max_remediation_cycles: 2
+    max_remediation_depth: 2
+    max_remediation_children: 8
+    # 1-20. TypeScript/status name: maxParallel.
+    max_parallel: 4
+    auto_merge: true
+    # Optional route examples; omit fast_lane_target to use repository default.
+    fast_lane_target: "staging"
+    feature_promotion_target: "staging"
+    production_target: "main"
+    # preview (default), confirm, or auto
+    dispatch_mode: "preview"
+  review:
+    ci:
+      # ask (default) or auto-fix
+      failure_action: "ask"
+      max_fix_attempts: 2
+      delivery_checks: ["*"]
+      promotion_checks: ["*"]
+      deployment_checks: ["*"]
+      repair_paths: []
+```
+
+| Field | Type | Built-in default | Behavior |
+| --- | --- | --- | --- |
+| `batching.policy` | `none` \| `conservative` \| `aggressive` | `none` | `none` preserves one selected issue per visible node and pipeline. Contraction requires an explicit invocation or repository-policy opt-in. |
+| `batching.max_batch_size` | positive integer | `8` | Maximum ordinary opt-in batch size after typed compatibility. |
+| `batching.max_sensitive_batch_size` | positive integer | `3` | Configured sensitive ceiling. Current security/auth assembly is deny-by-default and hard-clamps this to `2`; exactly two members also need the same causal family/risk partition and secondary capability, domain, or symbol proof. |
+| `scope_expansion` | `scope-locked` \| `recursive` | `scope-locked` | Whether controller-authorized recursive remediation may expand beyond the original frozen packet. |
+| `max_remediation_cycles` | positive integer | `2` | Bounded parent remediation cycles. |
+| `max_remediation_depth` | positive integer | `2` | Maximum recursive remediation depth. |
+| `max_remediation_children` | positive integer | `8` | Maximum controller-authorized children. |
+| `max_parallel` | integer, `1`–`20` | `4` | Issue-slot budget (`maxParallel` in typed status), not a node count. A contracted node consumes one slot per unique member; transport capacity may lower the effective cap. |
+| `auto_merge` | boolean | `true` | Allows merge only after all typed verification, exact-SHA review/CI, route, and merge-admission checks pass. |
+| `fast_lane_target` | branch | unset → repository default | Explicit ordinary delivery target. |
+| `feature_promotion_target` | branch | unset | Required integration target for feature/production promotion; promotion fails closed when absent. |
+| `production_target` | branch | unset | Required protected production target for production promotion. |
+| `dispatch_mode` | `preview` \| `confirm` \| `auto` | `preview` | `preview` is mutation-free; `confirm` requires explicit confirmation; `auto` permits configured dispatch. |
+| `review.ci.failure_action` | `ask` \| `auto-fix` | `ask` | Standalone review hands failed CI to the user by default; `auto-fix` permits bounded same-repository exact-head repairs. |
+| `review.ci.max_fix_attempts` | positive integer | `2` | Maximum standalone CI auto-fix attempts. |
+| `review.ci.delivery_checks` | string array | `["*"]` | Configured standalone delivery check selection. |
+| `review.ci.promotion_checks` | string array | `["*"]` | Configured standalone promotion check selection. |
+| `review.ci.deployment_checks` | string array | `["*"]` | Configured standalone deployment check selection. |
+| `review.ci.repair_paths` | path array | `[]` | Additional bounded paths authorized for configured CI repair. |
+
+CLI overrides include `--batching aggressive|conservative|none`,
+`--max-parallel N`, and `--dry-run|--confirm|--auto`. Preview reports selected and
+initially runnable **issue slots** plus the requested cap. Active status reports
+requested, sampled transport, and effective caps. An explicit batch is one visible
+node/pipeline but still charges one issue slot per member; an indivisible batch
+larger than the cap may run alone to avoid deadlock.
+
+Review CI lists and `failure_action` control standalone review selection/repair only.
+They do not create merge authority. ForgeDock-triggered auto-merge still requires a
+fresh nonempty GitHub-required check set with `github-required` provenance, every
+observation passing at the exact reviewed SHA, and a mergeable exact route. A
+repository with no required checks is unavailable authority, not implicit success.
+
+Batching authorization is not inferred from a model-proposed plan. With `none`, an
+already-contracted multi-member node is rejected. `conservative` remains limited to
+eligible P2/P3 review findings. `aggressive` may also group eligible ordinary issues,
+but only across compatible repository, exact target, lane, promotion route,
+urgency/risk partition, milestone, semantic-dependency shape, concern, and delivery
+surface. Billing is never grouped. A shared file or source PR alone is insufficient
+for sensitive security/auth grouping.
+
+Natural-language orchestration selection uses the one-shot typed
+`forgedock_discover_orchestration` tool before preview or dispatch. It binds one
+exact issue set, milestone, GitHub query, or no-milestone scope (at most 100
+candidates), preserves authorized ordering/count, and is authoritatively re-read
+before mutation. Shell, `gh`, and Python do not provide a second membership path
+while fresh discovery is bound.
+
+Scheduler relations remain distinct regardless of configuration. Semantic
+`dependencies` require a completed predecessor. Path/component claims create
+release-only serialization edges only where complete repository and exact target
+evidence match. Complete differing route evidence proves isolation; missing legacy
+repository/target evidence remains conservatively conflicting. A failed, blocked,
+skipped, invalid, or completed predecessor releases the claim, while suspended
+durable work does not. Frozen Build Packet paths can promote live
+claims. A promoted-claim conflict defers and automatically retries the worker; after
+admission, the controller re-reads and fast-forwards to the exact target before the
+builder starts.
+
+Required local verification is selected from the exact-base
+`forgedock.verification/v2` catalog: `git diff --check`, at most one safe direct
+TypeScript compile/type-integrity command, and packet-targeted `node --test` when
+supported. It does not automatically inherit lint, docs, broad `npm test`, or nested
+coverage from script prose. Required hosted CI is separate live authority and must
+be observed passing at the exact PR SHA.
 
 ---
 
@@ -104,7 +220,7 @@ paths:
 
 **Commands that use this section**: `work-on` (Phase 3E), `quality-gate`, `deploy-info`
 
-ForgeDock Next mirrors this repository model in its managed `forge.yaml` block. Set `fast_lane_target` for ordinary delivery, `feature_promotion_target` for the integration branch receiving milestone work, and `production_target` for the protected promotion target. `dispatch_mode` controls orchestration admission: `preview` (default) renders the complete DAG without dispatch, `confirm` requires explicit plan confirmation, and `auto` permits configured dispatch. A confirmed orchestration automatically provisions a missing canonical `milestone/{slug}` branch from the repository default before dispatch; preview only reports the planned lane and performs no branch mutation. The controller never silently falls back to `staging` for a milestone issue.
+ForgeDock Next uses the managed [`next.orchestration`](#forgedock-next-managed-block) route fields. `dispatch_mode` defaults to mutation-free preview. A confirmed orchestration may provision a missing canonical `milestone/{slug}` branch from the repository default before dispatch; preview only reports the planned lane and performs no branch mutation. The controller never silently falls back to `staging` for a milestone issue.
 
 Promotion is a separate controller, never an implicit issue-delivery merge: `forgedock-next promote --from milestone/<slug> --to staging --confirm` creates and verifies a feature-lane promotion PR; `forgedock-next promote --production --confirm` proposes staging → the configured `production_target`. Merge authorization is separate (`--authorize-merge`, or `--resume <promotion-id> --authorize-merge`) and production promotion fails closed unless the target's branch protection is proven.
 
@@ -298,7 +414,7 @@ gh project field-list <project_number> --owner <owner> --format json \
 
 ## `orchestration` (OPTIONAL)
 
-Concurrency limits and cascade admission policy for `/orchestrate`'s batch engine. Previously read at runtime (`orchestration.max_concurrent`) but undocumented; this section is the first place it — and the newer `cascade` sub-section (forge#2234) — are formally specified.
+Legacy command-spec concurrency and cascade admission policy. These root-level keys do **not** configure the ForgeDock Next typed scheduler; use [`next.orchestration`](#forgedock-next-managed-block) for Next. Previously read at runtime (`orchestration.max_concurrent`) but undocumented, this section also records the legacy `cascade` subsection (forge#2234).
 
 ```yaml
 orchestration:

@@ -82,15 +82,134 @@ function item(id: string, issue: number, dependencies: readonly string[] = []): 
   return { id, issue, priority: 1, dependencies, claims: [] };
 }
 
-async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, message: string): Promise<void> {
   const deadline = Date.now() + 2_000;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() >= deadline) throw new Error(message);
     await new Promise<void>((resolve) => setTimeout(resolve, 2));
   }
 }
 
 describe("OrchestrationController", () => {
+  it("persists and restores per-node repository identity, defaulting new legacy-shaped input", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const observed: Array<[string, string | undefined]> = [];
+    const service = controller(repository, async (scheduled) => {
+      observed.push([scheduled.id, scheduled.repository]);
+    });
+    const created = await service.create({
+      repository: "owner/control",
+      maxParallel: 2,
+      items: [
+        { ...item("explicit", 1), repository: "owner/work", targetBranch: "main" },
+        { ...item("defaulted", 2), targetBranch: "release" },
+      ],
+    });
+    assert.equal(created.nodes.find((node) => node.id === "explicit")?.repository, "owner/work");
+    assert.equal(created.nodes.find((node) => node.id === "defaulted")?.repository, "owner/control");
+    assert.deepEqual(created.requestedIssueNumbers, [2]);
+    assert.deepEqual(created.issueNumbers, [2]);
+
+    const result = await service.run(created.orchestrationId);
+    assert.deepEqual(observed.sort(), [["defaulted", "owner/control"], ["explicit", "owner/work"]]);
+    assert.equal(result.record.nodes.find((node) => node.id === "explicit")?.repository, "owner/work");
+  });
+
+  it("preflights every initial frozen route before dispatch and preserves distinct routes", async () => {
+    const frozenItems: ScheduledWorkItem[] = [
+      {
+        ...item("route-a", 1),
+        repository: "owner/a",
+        targetBranch: "staging",
+        lane: "fast",
+        promotionTarget: "main",
+        productionTarget: "main",
+      },
+      {
+        ...item("route-b", 2),
+        repository: "owner/b",
+        targetBranch: "milestone/x",
+        lane: "feature",
+        promotionTarget: "release",
+        productionTarget: "main",
+      },
+    ];
+    const driftRepository = new RecordingOrchestrationRepository();
+    const revalidated: string[] = [];
+    let driftWorkerCalls = 0;
+    const drifting = controller(driftRepository, async () => { driftWorkerCalls++; }, {
+      revalidateRoute: async ({ item: scheduled }) => {
+        revalidated.push(`${scheduled.repository}:${scheduled.lane}:${scheduled.targetBranch}`);
+        return scheduled.id === "route-a"
+          ? { repository: "OWNER/A", targetBranch: "staging", lane: "fast", promotionTarget: "main", productionTarget: "main" }
+          : { repository: "owner/a", targetBranch: "staging", lane: "fast", promotionTarget: "main", productionTarget: "main" };
+      },
+    });
+    await assert.rejects(() => drifting.createAndRun({
+      repository: "owner/control",
+      productionTarget: "main",
+      items: frozenItems,
+      maxParallel: 2,
+    }), /Initial route drift for route-b.*refusing to dispatch any worker/);
+    assert.deepEqual(revalidated, ["owner/a:fast:staging", "owner/b:feature:milestone/x"]);
+    assert.equal(driftWorkerCalls, 0);
+
+    const matchingRepository = new RecordingOrchestrationRepository();
+    const dispatched: string[] = [];
+    const matching = controller(matchingRepository, async (scheduled) => {
+      dispatched.push(`${scheduled.repository}:${scheduled.lane}:${scheduled.targetBranch}`);
+    }, {
+      revalidateRoute: async ({ item: scheduled }) => ({
+        repository: scheduled.id === "route-a" ? "OWNER/A" : scheduled.repository!,
+        targetBranch: scheduled.targetBranch!,
+        lane: scheduled.lane!,
+        ...(scheduled.promotionTarget !== undefined ? { promotionTarget: scheduled.promotionTarget } : {}),
+        ...(scheduled.productionTarget !== undefined ? { productionTarget: scheduled.productionTarget } : {}),
+      }),
+    });
+    const result = await matching.createAndRun({
+      repository: "owner/control",
+      productionTarget: "main",
+      items: frozenItems,
+      maxParallel: 2,
+    });
+    assert.equal(result.record.status, "completed");
+    assert.deepEqual(dispatched.sort(), ["owner/a:fast:staging", "owner/b:feature:milestone/x"]);
+  });
+
+  it("preflights remote node ownership against that node's repository", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    await repository.createOrchestration({
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag-remote-owner",
+      repository: "owner/work",
+      requestedIssueNumbers: [7],
+      issueNumbers: [7],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{
+        id: "remote-7",
+        issue: 7,
+        priority: 1,
+        dependencies: [],
+        claims: [],
+        repository: "owner/work",
+        status: "running",
+        childRunIds: [],
+      }],
+    });
+    const service = controller(repository, async () => undefined);
+    await assert.rejects(() => service.create({
+      repository: "owner/control",
+      maxParallel: 1,
+      items: [{ ...item("mixed-remote-7", 7), repository: "OWNER/WORK" }],
+    }), /owner\/work#7.*dag-remote-owner/);
+    assert.equal(await repository.loadOrchestration("dag-test"), undefined);
+  });
+
   it("rejects a new DAG node that directly targets protected production", async () => {
     const repository = new RecordingOrchestrationRepository();
     const service = controller(repository, async () => undefined);
@@ -108,7 +227,7 @@ describe("OrchestrationController", () => {
     const service = controller(repository, async (scheduled) => {
       launchedTargets.push(scheduled.targetBranch ?? "unset");
     }, {
-      revalidateRoute: async () => ({ targetBranch: "staging", lane: "fast", productionTarget: "main" }),
+      revalidateRoute: async () => ({ repository: "owner/repo", targetBranch: "staging", lane: "fast", productionTarget: "main" }),
       reconcileWorker: async () => ({ disposition: "interrupted", reason: "controller wrapper ended before child run creation" }),
     });
     const created = await service.create({
@@ -153,7 +272,7 @@ describe("OrchestrationController", () => {
   it("fails closed instead of retargeting a node with durable attempt evidence", async () => {
     const repository = new RecordingOrchestrationRepository();
     const service = controller(repository, async () => undefined, {
-      revalidateRoute: async () => ({ targetBranch: "release", lane: "fast", productionTarget: "main" }),
+      revalidateRoute: async () => ({ repository: "owner/repo", targetBranch: "release", lane: "fast", productionTarget: "main" }),
     });
     const created = await service.create({
       repository: "owner/repo",
@@ -184,6 +303,30 @@ describe("OrchestrationController", () => {
       () => service.resume(created.orchestrationId),
       /Durable route drift.*refusing to retarget started work/,
     );
+  });
+
+  it("refuses to change a frozen repository during resume route validation", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let workerCalls = 0;
+    const service = controller(repository, async () => { workerCalls++; }, {
+      revalidateRoute: async () => ({
+        repository: "owner/other",
+        targetBranch: "staging",
+        lane: "fast",
+        productionTarget: "main",
+      }),
+    });
+    const created = await service.create({
+      repository: "owner/repo",
+      maxParallel: 1,
+      productionTarget: "main",
+      items: [{ ...item("issue-1", 1), targetBranch: "staging", lane: "fast", productionTarget: "main" }],
+    });
+    await assert.rejects(
+      () => service.resume(created.orchestrationId),
+      /reports repository owner\/other.*frozen to owner\/repo/,
+    );
+    assert.equal(workerCalls, 0);
   });
 
   it("marks a newly created DAG failed when execution admission throws", async () => {
@@ -297,9 +440,12 @@ describe("OrchestrationController", () => {
     });
 
     const result = await service.createAndRun({
-      repository: "owner/repo",
+      repository: "owner/control",
       maxParallel: 2,
-      items: [item("parent", 1), item("dependent", 2, ["parent"])],
+      items: [
+        { ...item("parent", 1), repository: "owner/work" },
+        { ...item("dependent", 2, ["parent"]), repository: "owner/control" },
+      ],
     });
 
     assert.deepEqual(started, ["parent", "child-11", "child-12", "dependent"]);
@@ -309,8 +455,10 @@ describe("OrchestrationController", () => {
     assert.deepEqual(result.record.nodes.find((node) => node.id === "parent")?.attempts?.at(-1)?.decompositionChildren, [11, 12]);
     assert.deepEqual(result.record.nodes.find((node) => node.id === "dependent")?.dependencies, ["child-11", "child-12"]);
     assert.equal(result.record.nodes.find((node) => node.id === "child-11")?.status, "completed");
+    assert.equal(result.record.nodes.find((node) => node.id === "child-11")?.repository, "owner/work");
     assert.equal(result.record.nodes.find((node) => node.id === "child-12")?.status, "completed");
-    assert.deepEqual(result.record.issueNumbers, [1, 2, 11, 12]);
+    assert.equal(result.record.nodes.find((node) => node.id === "child-12")?.repository, "owner/work");
+    assert.deepEqual(result.record.issueNumbers, [2]);
     assert.deepEqual((await repository.loadOrchestration(result.orchestrationId))?.nodes, result.record.nodes);
   });
 
@@ -430,8 +578,32 @@ describe("OrchestrationController", () => {
         items: [{ ...item("batch-100", 100), memberIssues: [1, 2] }, item("parent", 10)],
         maxParallel: 2,
       }),
-      /existing issue #1 owned by batch-100/i,
+      /existing issue owner\/repo#1 owned by batch-100/i,
     );
+  });
+
+  it("allows equal decomposition issue numbers in different repositories", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const service = controller(repository, async (scheduled) => scheduled.id === "remote-parent"
+      ? { status: "skipped", childIssues: [7] }
+      : undefined, {
+      resolveDecomposition: async ({ childIssues }) => ({
+        childIssues: childIssues ?? [],
+        items: [item("remote-child-7", 7)],
+      }),
+    });
+
+    const result = await service.createAndRun({
+      repository: "owner/control",
+      items: [
+        { ...item("root-7", 7), repository: "owner/control" },
+        { ...item("remote-parent", 1), repository: "owner/work" },
+      ],
+      maxParallel: 2,
+    });
+    assert.equal(result.record.status, "completed");
+    assert.equal(result.record.nodes.find((node) => node.id === "remote-child-7")?.repository, "owner/work");
+    assert.deepEqual(result.record.issueNumbers, [7]);
   });
 
   it("rejects an over-limit decomposition before dispatching child work", async () => {
@@ -941,6 +1113,7 @@ describe("OrchestrationController", () => {
     let available = 2;
     let active = 0;
     let maximumActive = 0;
+    const deliveredCapacityReasons: Array<unknown> = [];
     const service = controller(repository, async (scheduled) => {
       started.push(scheduled.id);
       active += 1;
@@ -949,6 +1122,12 @@ describe("OrchestrationController", () => {
       active -= 1;
     }, {
       transportCapacity: () => available,
+      onEvent: (event) => {
+        const reason = event.snapshot.nodes.find((node) => node.id === "c")?.waitReason;
+        if (event.name === "queued" && event.itemId === "c" && reason?.kind === "capacity") {
+          deliveredCapacityReasons.push(structuredClone(reason));
+        }
+      },
     });
     const execution = service.createAndRun({
       repository: "owner/repo",
@@ -956,24 +1135,77 @@ describe("OrchestrationController", () => {
       items: [item("a", 1), item("b", 2), item("c", 3)],
     });
 
-    await waitUntil(() => started.length === 2, "live transport capacity was not filled");
-    available = 0;
-    gates.get("a")!.resolve();
-    await new Promise<void>((resolve) => setTimeout(resolve, 60));
-    assert.deepEqual(started, ["a", "b"], "queued work must wait while transport capacity is unavailable");
+    try {
+      await waitUntil(() => started.length === 2, "live transport capacity was not filled");
+      available = 0;
+      gates.get("a")!.resolve();
+      await waitUntil(async () => {
+        const durable = await repository.loadOrchestration("dag-test");
+        const reason = durable?.nodes.find((node) => node.id === "c")?.waitReason;
+        return reason?.kind === "capacity" && reason.maxParallel === 0;
+      }, "capacity wait reason was not persisted");
+      assert.deepEqual(started, ["a", "b"], "queued work must wait while transport capacity is unavailable");
+      const waiting = await repository.loadOrchestration("dag-test");
+      assert.deepEqual(waiting?.nodes.find((node) => node.id === "c")?.waitReason, { kind: "capacity", maxParallel: 0 });
+      assert.equal(waiting?.transportCapacity, 0);
+      assert.equal(waiting?.effectiveMaxParallel, 0);
+      assert.deepEqual(deliveredCapacityReasons, [
+        { kind: "capacity", maxParallel: 2 },
+        { kind: "capacity", maxParallel: 0 },
+      ]);
 
-    available = 2;
-    gates.get("b")!.resolve();
-    await waitUntil(() => started.length === 3, "queued work did not resume after transport capacity recovered");
-    gates.get("c")!.resolve();
+      available = 2;
+      gates.get("b")!.resolve();
+      await waitUntil(() => started.length === 3, "queued work did not resume after transport capacity recovered");
+      gates.get("c")!.resolve();
 
+      const result = await execution;
+      assert.equal(result.record.status, "completed");
+      assert.deepEqual(result.schedule.startOrder, ["a", "b", "c"]);
+      assert.equal(maximumActive, 2);
+      assert.equal(active, 0);
+      assert.equal(result.record.transportCapacity, 2);
+      assert.equal(result.record.effectiveMaxParallel, 2);
+      assert.equal(result.record.nodes.find((node) => node.id === "c")?.waitReason, undefined);
+    } finally {
+      available = 2;
+      for (const gate of gates.values()) gate.resolve();
+      await execution.catch(() => undefined);
+    }
+  });
+
+  it("persists active-claim waits while another worker owns the overlapping scope", async () => {
+    const repository = new InMemoryOrchestrationRepository();
+    const firstGate = deferred<void>();
+    const started: string[] = [];
+    const service = controller(repository, async (scheduled) => {
+      started.push(scheduled.id);
+      if (scheduled.id === "first") await firstGate.promise;
+    });
+    const execution = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 2,
+      serializationEdges: [],
+      items: [
+        { ...item("first", 1), claims: ["src/shared"] },
+        { ...item("second", 2), claims: ["src/shared/file.ts"] },
+      ],
+    });
+
+    await waitUntil(async () => {
+      const durable = await repository.loadOrchestration("dag-test");
+      return durable?.nodes.find((node) => node.id === "second")?.waitReason?.kind === "active-claim-conflict";
+    }, "active claim wait reason was not persisted");
+    assert.deepEqual(started, ["first"]);
+    assert.deepEqual((await repository.loadOrchestration("dag-test"))?.nodes.find((node) => node.id === "second")?.waitReason, {
+      kind: "active-claim-conflict",
+      node: "first",
+      claims: ["src/shared/file.ts ↔ src/shared"],
+    });
+    firstGate.resolve();
     const result = await execution;
-    assert.equal(result.record.status, "completed");
-    assert.deepEqual(result.schedule.startOrder, ["a", "b", "c"]);
-    assert.equal(maximumActive, 2);
-    assert.equal(active, 0);
-    assert.equal(result.record.transportCapacity, 2);
-    assert.equal(result.record.effectiveMaxParallel, 2);
+    assert.deepEqual(started, ["first", "second"]);
+    assert.equal(result.record.nodes.find((node) => node.id === "second")?.waitReason, undefined);
   });
 
   it("persists a terminally complete 500-node controller fleet with exactly one attempt per node", async () => {

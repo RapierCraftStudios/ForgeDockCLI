@@ -126,6 +126,8 @@ export interface OrchestrationItemRecord {
   priority: number;
   dependencies: string[];
   claims: string[];
+  /** Optional for records written before repository identity was stored per node. */
+  repository?: string;
   targetBranch?: string;
   lane?: "fast" | "feature";
   promotionTarget?: string;
@@ -190,9 +192,15 @@ export interface OrchestrationRecord {
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
 }
 
+/** Canonical repository-qualified identity for issue ownership. */
+export interface OrchestrationIssueIdentity {
+  repository: string;
+  issue: number;
+}
+
 /**
  * Durable ownership overlap discovered while admitting a new orchestration.
- * The issue list includes only the overlap with the proposed scope; the
+ * One conflict groups the overlap for one owning DAG and repository; the
  * owning record remains the authoritative source for the complete DAG.
  */
 export interface OrchestrationIssueOwnershipConflict {
@@ -201,49 +209,105 @@ export interface OrchestrationIssueOwnershipConflict {
   issueNumbers: number[];
 }
 
-/**
- * Return every issue identity owned by a durable orchestration record.
- *
- * `requestedIssueNumbers` covers the operator's original scope, while node
- * issues/memberIssues cover contracted work and generated batch projections.
- * Decomposition children are included so a still-running parent DAG cannot be
- * raced by a fresh orchestration after its authoritative replacement appears.
- */
-export function orchestrationRecordIssueNumbers(record: OrchestrationRecord): number[] {
-  const values = [
-    ...(record.requestedIssueNumbers ?? []),
-    ...record.issueNumbers,
-    ...record.nodes.flatMap((node) => [
-      node.issue,
-      ...(node.memberIssues ?? []),
-      ...(node.decompositionChildren ?? []),
-      ...(node.attempts ?? []).flatMap((attempt) => attempt.decompositionChildren ?? []),
-    ]),
-  ];
-  return [...new Set(values)].sort((left, right) => left - right);
+/** Normalize repository identity consistently across durable ownership checks. */
+export function normalizeOrchestrationRepository(repository: string): string {
+  return repository.trim().toLowerCase();
+}
+
+/** Stable key for one repository-qualified issue identity. */
+export function orchestrationIssueIdentityKey(identity: OrchestrationIssueIdentity): string {
+  return JSON.stringify([normalizeOrchestrationRepository(identity.repository), identity.issue]);
+}
+
+/** Effective repository for a node, including records written before per-node identity existed. */
+export function orchestrationNodeRepository(
+  record: Pick<OrchestrationRecord, "repository">,
+  node: Pick<OrchestrationItemRecord, "repository">,
+): string {
+  return normalizeOrchestrationRepository(node.repository?.trim() ? node.repository : record.repository);
 }
 
 /**
- * Find overlaps with running durable DAGs in one repository. This is a pure
- * helper so both read-only previews and repository insert admission use the
- * exact same ownership semantics.
+ * Return every canonical issue identity owned by a durable orchestration.
+ *
+ * Root scope fields belong to the record repository. A node and all of its
+ * members/decomposition children belong to its effective repository. Missing
+ * per-node repository identity is a legacy record and falls back to the root.
  */
+export function orchestrationRecordIssueIdentities(record: OrchestrationRecord): OrchestrationIssueIdentity[] {
+  const rootRepository = normalizeOrchestrationRepository(record.repository);
+  const values: OrchestrationIssueIdentity[] = [
+    ...(record.requestedIssueNumbers ?? []).map((issue) => ({ repository: rootRepository, issue })),
+    ...record.issueNumbers.map((issue) => ({ repository: rootRepository, issue })),
+    ...record.nodes.flatMap((node) => {
+      const repository = orchestrationNodeRepository(record, node);
+      return [
+        { repository, issue: node.issue },
+        ...(node.memberIssues ?? []).map((issue) => ({ repository, issue })),
+        ...(node.decompositionChildren ?? []).map((issue) => ({ repository, issue })),
+        ...(node.attempts ?? []).flatMap((attempt) =>
+          (attempt.decompositionChildren ?? []).map((issue) => ({ repository, issue })),
+        ),
+      ];
+    }),
+  ];
+  return [...new Map(values.map((identity) => [orchestrationIssueIdentityKey(identity), identity])).values()]
+    .sort((left, right) => left.repository.localeCompare(right.repository) || left.issue - right.issue);
+}
+
+/** Backward-compatible unqualified view for callers that only support root-repository scope. */
+export function orchestrationRecordIssueNumbers(record: OrchestrationRecord): number[] {
+  return [...new Set(orchestrationRecordIssueIdentities(record).map((identity) => identity.issue))]
+    .sort((left, right) => left - right);
+}
+
+/**
+ * Find overlaps with running durable DAGs. Qualified callers may submit a
+ * mixed-repository scope; the legacy three-argument form remains root-only.
+ */
+export function findRunningOrchestrationIssueConflicts(
+  records: readonly OrchestrationRecord[],
+  identities: readonly OrchestrationIssueIdentity[],
+): OrchestrationIssueOwnershipConflict[];
 export function findRunningOrchestrationIssueConflicts(
   records: readonly OrchestrationRecord[],
   repository: string,
   issueNumbers: readonly number[],
+): OrchestrationIssueOwnershipConflict[];
+export function findRunningOrchestrationIssueConflicts(
+  records: readonly OrchestrationRecord[],
+  repositoryOrIdentities: string | readonly OrchestrationIssueIdentity[],
+  issueNumbers: readonly number[] = [],
 ): OrchestrationIssueOwnershipConflict[] {
-  const requested = new Set(issueNumbers);
-  const normalizedRepository = repository.trim().toLowerCase();
-  return records
-    .filter((record) => record.status === "running" && record.repository.trim().toLowerCase() === normalizedRepository)
-    .map((record) => ({
-      orchestrationId: record.orchestrationId,
-      repository: record.repository,
-      issueNumbers: orchestrationRecordIssueNumbers(record).filter((issue) => requested.has(issue)),
-    }))
-    .filter((conflict) => conflict.issueNumbers.length > 0)
-    .sort((left, right) => left.orchestrationId.localeCompare(right.orchestrationId));
+  const identities = typeof repositoryOrIdentities === "string"
+    ? issueNumbers.map((issue) => ({ repository: normalizeOrchestrationRepository(repositoryOrIdentities), issue }))
+    : repositoryOrIdentities.map((identity) => ({
+      repository: normalizeOrchestrationRepository(identity.repository),
+      issue: identity.issue,
+    }));
+  const requested = new Set(identities.map(orchestrationIssueIdentityKey));
+  const conflicts: OrchestrationIssueOwnershipConflict[] = [];
+  for (const record of records) {
+    if (record.status !== "running") continue;
+    const byRepository = new Map<string, number[]>();
+    for (const identity of orchestrationRecordIssueIdentities(record)) {
+      if (!requested.has(orchestrationIssueIdentityKey(identity))) continue;
+      const owned = byRepository.get(identity.repository) ?? [];
+      owned.push(identity.issue);
+      byRepository.set(identity.repository, owned);
+    }
+    for (const [repository, issues] of byRepository) {
+      conflicts.push({
+        orchestrationId: record.orchestrationId,
+        repository,
+        issueNumbers: [...new Set(issues)].sort((left, right) => left - right),
+      });
+    }
+  }
+  return conflicts.sort((left, right) =>
+    left.orchestrationId.localeCompare(right.orchestrationId)
+      || left.repository.localeCompare(right.repository),
+  );
 }
 
 /**
@@ -254,7 +318,7 @@ export function findRunningOrchestrationIssueConflicts(
 export class OrchestrationIssueOwnershipConflictError extends Error {
   constructor(readonly conflicts: readonly OrchestrationIssueOwnershipConflict[]) {
     const details = conflicts.map((conflict) =>
-      `${conflict.issueNumbers.map((issue) => `#${issue}`).join(", ")} → ${conflict.orchestrationId}`,
+      `${conflict.issueNumbers.map((issue) => `${conflict.repository}#${issue}`).join(", ")} → ${conflict.orchestrationId}`,
     ).join("; ");
     super(
       `Orchestration scope conflicts with active durable DAG ownership: ${details}. `
@@ -283,10 +347,19 @@ export const MAX_ORCHESTRATION_PAGE_SIZE = 100;
  * stores are allowed to retain more records than one status page, so callers
  * must not treat the first page as an exhaustive ownership index.
  */
-export async function findDurableOrchestrationIssueConflicts(
+export function findDurableOrchestrationIssueConflicts(
+  repository: OrchestrationRepository,
+  identities: readonly OrchestrationIssueIdentity[],
+): Promise<OrchestrationIssueOwnershipConflict[]>;
+export function findDurableOrchestrationIssueConflicts(
   repository: OrchestrationRepository,
   repositoryName: string,
   issueNumbers: readonly number[],
+): Promise<OrchestrationIssueOwnershipConflict[]>;
+export async function findDurableOrchestrationIssueConflicts(
+  repository: OrchestrationRepository,
+  repositoryOrIdentities: string | readonly OrchestrationIssueIdentity[],
+  issueNumbers: readonly number[] = [],
 ): Promise<OrchestrationIssueOwnershipConflict[]> {
   const records: OrchestrationRecord[] = [];
   let before: OrchestrationListCursor | undefined;
@@ -306,5 +379,7 @@ export async function findDurableOrchestrationIssueConflicts(
     previousCursor = cursorKey;
     before = cursor;
   }
-  return findRunningOrchestrationIssueConflicts(records, repositoryName, issueNumbers);
+  return typeof repositoryOrIdentities === "string"
+    ? findRunningOrchestrationIssueConflicts(records, repositoryOrIdentities, issueNumbers)
+    : findRunningOrchestrationIssueConflicts(records, repositoryOrIdentities);
 }

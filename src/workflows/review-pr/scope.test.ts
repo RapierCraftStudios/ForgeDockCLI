@@ -76,23 +76,46 @@ describe("review finding scope policy", () => {
     });
     const locationlessIntroduced = finding({ id: "false-introduced", introducedByRemediation: true });
     delete locationlessIntroduced.location;
-    const [newConcern, continued, falseIntroduced, cumulativeOnly, provenRegression] = applyFindingScopePolicy([
+    assert.throws(() => applyFindingScopePolicy([locationlessIntroduced], packet, prior, {
+      remediationDeltaPaths: ["src/unrelated.ts"],
+    }), /without exact current-head hunk authority/);
+    assert.throws(() => applyFindingScopePolicy([
+      finding({ id: "cumulative", introducedByRemediation: true, location: "src/a.ts:25" }),
+    ], packet, prior, { remediationDeltaPaths: ["src/a.ts"] }), /without exact current-head hunk authority/);
+
+    const [newConcern, continued] = applyFindingScopePolicy([
       finding({ id: "new", matchedPriorFindingIds: [] }),
       finding({ id: "continued", matchedPriorFindingIds: ["review-prior"] }),
-      locationlessIntroduced,
-      finding({ id: "cumulative", introducedByRemediation: true, location: "src/a.ts:25" }),
-      finding({ id: "regression", introducedByRemediation: true, location: "src/a.ts:30" }),
-    ], packet, prior, { remediationDeltaPaths: ["src/unrelated.ts"] });
+    ], packet, prior, { remediationDeltaPaths: ["src/unrelated.ts"], remediationDeltaHunks: ["src/unrelated.ts:L1-L1"] });
     assert.equal(newConcern?.blocking, false);
     assert.equal(newConcern?.scopeDisposition, "follow_up");
     assert.equal(continued?.blocking, true);
-    assert.equal(falseIntroduced?.blocking, false);
-    assert.match(falseIntroduced?.scopeRationale ?? "", /without an exact prior-SHA remediation delta/);
-    assert.equal(cumulativeOnly?.blocking, false, "a cumulative BuildResult path must not prove remediation introduction");
-    assert.equal(provenRegression?.blocking, false);
+    const priorMustFix = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 2 }, producer: { role: "controller" },
+      payload: {
+        headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [finding({ id: "review-medium", blocking: false, mustFix: true, rootId: "root-medium" })], checks: [],
+      },
+    });
+    const [rootContinuation] = applyFindingScopePolicy([
+      finding({ id: "continued-root", blocking: false, mustFix: true, matchedPriorFindingIds: ["root-medium"] }),
+    ], packet, priorMustFix, { remediationDeltaPaths: ["src/a.ts"], remediationDeltaHunks: ["src/a.ts:L1-L1"] });
+    assert.equal(rootContinuation?.scopeDisposition, "in_scope");
+    assert.equal(rootContinuation?.mustFix, true);
     const [exactDelta] = applyFindingScopePolicy([
-      finding({ id: "exact-regression", introducedByRemediation: true, location: "src/a.ts:30" }),
-    ], packet, prior, { remediationDeltaPaths: ["src/a.ts"] });
+      finding({
+        id: "exact-regression", introducedByRemediation: true, location: "src/a.ts:30",
+        introductionEvidence: {
+          priorReproducer: "guard returns true",
+          currentReproducer: "guard returns false",
+          causalSymbols: ["guard"],
+          hunkReferences: ["src/a.ts:L30-L30:guard"],
+        },
+      }),
+    ], packet, prior, {
+      remediationDeltaPaths: ["src/a.ts"],
+      remediationDeltaHunks: ["src/a.ts:L30-L30:guard"],
+    });
     assert.equal(exactDelta?.blocking, true);
 
     const currentOnly = finding({
@@ -108,6 +131,13 @@ describe("review finding scope policy", () => {
     const changedAuthorityFinding = finding({
       id: "changed-route", introducedByRemediation: true,
       evidenceAnchor: { kind: "delivery-authority", reference: changedFact },
+      introductionEvidence: {
+        priorReproducer: "baseBranch=release",
+        currentReproducer: "baseBranch=main",
+        causalSymbols: ["baseBranch"],
+        hunkReferences: ["authority:baseBranch"],
+        authorityReferences: [changedFact],
+      },
     });
     delete changedAuthorityFinding.location;
     const [explicitAuthorityChange] = applyFindingScopePolicy(

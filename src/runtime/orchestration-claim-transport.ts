@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { ClaimPromotionConflictError } from "../workflows/orchestrate/scheduler.js";
@@ -8,6 +9,7 @@ const CLAIM_PROMOTION_PATH = "/v1/orchestration/claims";
 const MAX_REQUEST_BYTES = 256 * 1024;
 const MAX_CLAIMS = 2_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_ATTEMPTS = 2;
 
 const ENVIRONMENT_KEYS = {
   url: "FORGEDOCK_CLAIM_PROMOTION_URL",
@@ -21,6 +23,34 @@ export interface OrchestrationClaimIdentity {
   orchestrationId: string;
   nodeId: string;
   attemptId: string;
+}
+
+interface ClaimPromotionOperation {
+  operationId: string;
+  claimsDigest: string;
+}
+
+interface ClaimPromotionReceipt extends ClaimPromotionOperation {
+  status: "promoted";
+}
+
+/**
+ * The parent may have durably accepted a promotion even when its HTTP ACK is
+ * lost. Treat that uncertainty as a resumable handoff, never as evidence that
+ * the workflow itself failed.
+ */
+export class ClaimPromotionRecoveryError extends Error {
+  readonly recoverable = true;
+
+  constructor(
+    message: string,
+    readonly operationId: string,
+    readonly claimsDigest: string,
+    options: ErrorOptions = {},
+  ) {
+    super(message, options);
+    this.name = "ClaimPromotionRecoveryError";
+  }
 }
 
 export interface OrchestrationClaimPromotionServer {
@@ -54,6 +84,7 @@ export async function startOrchestrationClaimPromotionServer(input: {
   const identity = validateIdentity(input.identity);
   const token = crypto.randomUUID();
   const pending = new Set<AbortController>();
+  const receipts = new Map<string, { claimsDigest: string; receipt: Promise<ClaimPromotionReceipt> }>();
   const server = createServer((request, response) => {
     const controller = new AbortController();
     pending.add(controller);
@@ -61,7 +92,7 @@ export async function startOrchestrationClaimPromotionServer(input: {
     response.once("close", () => {
       if (!response.writableEnded) controller.abort(new Error("Claim-promotion response disconnected"));
     });
-    void handlePromotionRequest(input.promoteClaims, identity, token, request, response, controller.signal)
+    void handlePromotionRequest(input.promoteClaims, receipts, identity, token, request, response, controller.signal)
       .finally(() => pending.delete(controller));
   });
   await new Promise<void>((resolve, reject) => {
@@ -109,36 +140,51 @@ export async function promoteOrchestrationClaimsFromEnvironment(
     attemptId: configured.attemptId!,
   });
   const normalizedClaims = validateClaims(claims);
-  let response: Response;
-  try {
-    response = await fetch(configured.url!, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${configured.token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ ...identity, claims: normalizedClaims }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-  } catch (error) {
-    throw new Error(
-      `Parent orchestration claim arbiter is unavailable; refusing to start the builder: ${error instanceof Error ? error.message : String(error)}`,
-      { cause: error },
-    );
+  const operation = claimPromotionOperation(identity, normalizedClaims);
+  let lastTransportError: unknown;
+  for (let attempt = 1; attempt <= REQUEST_ATTEMPTS; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(configured.url!, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${configured.token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ ...identity, ...operation, claims: normalizedClaims }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      lastTransportError = error;
+      continue;
+    }
+    const payload = await readResponse(response);
+    if (response.ok) {
+      if (payload.status === "promoted"
+        && payload.operationId === operation.operationId
+        && payload.claimsDigest === operation.claimsDigest) return "promoted";
+      lastTransportError = new Error("Parent orchestration returned an unverifiable claim-promotion receipt");
+      continue;
+    }
+    if (response.status === 409 && payload.code === "claim-conflict") {
+      throw new ClaimPromotionConflictError(
+        typeof payload.itemId === "string" ? payload.itemId : identity.nodeId,
+        Array.isArray(payload.conflicts) ? payload.conflicts.filter((value): value is string => typeof value === "string") : [],
+      );
+    }
+    throw new Error(`Parent orchestration rejected claim promotion (${response.status}): ${typeof payload.error === "string" ? payload.error : response.statusText}`);
   }
-  const payload = await readResponse(response);
-  if (response.ok) return "promoted";
-  if (response.status === 409 && payload.code === "claim-conflict") {
-    throw new ClaimPromotionConflictError(
-      typeof payload.itemId === "string" ? payload.itemId : identity.nodeId,
-      Array.isArray(payload.conflicts) ? payload.conflicts.filter((value): value is string => typeof value === "string") : [],
-    );
-  }
-  throw new Error(`Parent orchestration rejected claim promotion (${response.status}): ${typeof payload.error === "string" ? payload.error : response.statusText}`);
+  throw new ClaimPromotionRecoveryError(
+    `Parent orchestration claim receipt is unavailable after an idempotent replay; the promotion may already be durable: ${lastTransportError instanceof Error ? lastTransportError.message : String(lastTransportError)}`,
+    operation.operationId,
+    operation.claimsDigest,
+    { cause: lastTransportError },
+  );
 }
 
 async function handlePromotionRequest(
   promoteClaims: (claims: readonly string[]) => Promise<void>,
+  receipts: Map<string, { claimsDigest: string; receipt: Promise<ClaimPromotionReceipt> }>,
   expectedIdentity: OrchestrationClaimIdentity,
   token: string,
   request: IncomingMessage,
@@ -161,8 +207,33 @@ async function handlePromotionRequest(
       return send(response, 409, { code: "identity-mismatch", error: "Claim-promotion identity does not match the active worker attempt" });
     }
     const claims = validateClaims(payload.claims);
-    await promoteClaims(claims);
-    send(response, 200, { status: "promoted" });
+    const operation = claimPromotionOperation(receivedIdentity, claims);
+    if (payload.operationId !== operation.operationId || payload.claimsDigest !== operation.claimsDigest) {
+      return send(response, 409, {
+        code: "operation-mismatch",
+        error: "Claim-promotion operation identity or claims digest is invalid",
+      });
+    }
+    const existing = receipts.get(operation.operationId);
+    if (existing && existing.claimsDigest !== operation.claimsDigest) {
+      return send(response, 409, {
+        code: "operation-mismatch",
+        error: "Claim-promotion operation was already bound to different claims",
+      });
+    }
+    const receiptPromise = existing?.receipt ?? (async (): Promise<ClaimPromotionReceipt> => {
+      await promoteClaims(claims);
+      return { status: "promoted", ...operation };
+    })();
+    if (!existing) receipts.set(operation.operationId, { claimsDigest: operation.claimsDigest, receipt: receiptPromise });
+    let receipt: ClaimPromotionReceipt;
+    try {
+      receipt = await receiptPromise;
+    } catch (error) {
+      if (receipts.get(operation.operationId)?.receipt === receiptPromise) receipts.delete(operation.operationId);
+      throw error;
+    }
+    send(response, 200, { ...receipt });
   } catch (error) {
     if (error instanceof ClaimPromotionConflictError) {
       return send(response, 409, {
@@ -174,6 +245,18 @@ async function handlePromotionRequest(
     }
     send(response, 500, { error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+function claimPromotionOperation(
+  identity: OrchestrationClaimIdentity,
+  claims: readonly string[],
+): ClaimPromotionOperation {
+  const canonicalClaims = [...claims].sort();
+  const claimsDigest = createHash("sha256").update(JSON.stringify(canonicalClaims)).digest("hex");
+  const operationId = createHash("sha256")
+    .update(JSON.stringify([identity.orchestrationId, identity.nodeId, identity.attemptId, claimsDigest]))
+    .digest("hex");
+  return { operationId, claimsDigest };
 }
 
 function validateIdentity(value: { orchestrationId: unknown; nodeId: unknown; attemptId: unknown }): OrchestrationClaimIdentity {

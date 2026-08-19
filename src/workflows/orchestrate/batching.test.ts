@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   affectedFilesFromIssueBody,
+  chunkBatchCandidates,
   contractBatchGroups,
+  pairSensitiveBatchCandidates,
+  parseBatchContract,
   parseBatchMemberIssues,
   planIssueBatches,
   renderBatchIssueBody,
@@ -19,10 +22,24 @@ function item(issue: number, overrides: Partial<BatchableWorkItem> = {}): Batcha
     priority: 30,
     dependencies: [],
     claims: ["src/core/a.ts"],
+    repository: "owner/repo",
+    targetBranch: "main",
     labels: ["review-finding", "priority:P3"],
     affectedFiles: ["src/core/a.ts"],
     ...overrides,
   };
+}
+
+function sensitiveItem(issue: number, overrides: Partial<BatchableWorkItem> = {}): BatchableWorkItem {
+  return item(issue, {
+    riskClass: "auth",
+    causalFamily: "session-validation",
+    riskCapabilities: ["session-integrity"],
+    primaryDomain: "identity/session",
+    sharedSymbols: ["validateSession"],
+    acceptanceCriteria: [`Validate session case ${issue}`],
+    ...overrides,
+  });
 }
 
 describe("orchestration work-unit batching", () => {
@@ -46,6 +63,59 @@ describe("orchestration work-unit batching", () => {
     assert.deepEqual(plan.excluded.map(({ reason }) => reason), ["high-blast-radius", "high-blast-radius", "billing"]);
   });
 
+  it("requires explicit semantic evidence and caps sensitive planner groups at two", () => {
+    const hintsOnly = planIssueBatches([
+      item(10, { riskClass: "auth", causalFamily: "session-validation", acceptanceCriteria: ["Reject invalid session"], sourcePullRequest: 9 }),
+      item(11, { riskClass: "auth", causalFamily: "session-validation", acceptanceCriteria: ["Reject invalid session"], sourcePullRequest: 9 }),
+    ]);
+    assert.equal(hintsOnly.groups.length, 0);
+
+    const compatible = planIssueBatches([sensitiveItem(12), sensitiveItem(13), sensitiveItem(14)]);
+    assert.deepEqual(compatible.groups.map((group) => group.members.map((member) => member.issue)), [[12, 13]]);
+    assert.deepEqual(compatible.ungrouped.map((member) => member.issue), [14]);
+  });
+
+  it("pairs sensitive candidates in stable order and shares bounded chunking", () => {
+    const candidates = [
+      sensitiveItem(10, { causalFamily: "unmatched-family" }),
+      sensitiveItem(11, { causalFamily: " SESSION-VALIDATION ", riskCapabilities: [" SESSION-INTEGRITY "] }),
+      sensitiveItem(12),
+      sensitiveItem(13, { causalFamily: "other-family" }),
+    ];
+    const originalOrder = [...candidates];
+
+    const pairs = pairSensitiveBatchCandidates(candidates);
+
+    assert.deepEqual(pairs.map((pair) => pair.map((member) => member.issue)), [[11, 12]]);
+    assert.deepEqual(candidates, originalOrder);
+    assert.equal(new Set(pairs.flat()).size, pairs.flat().length);
+    assert.deepEqual(chunkBatchCandidates([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+    assert.throws(() => chunkBatchCandidates([1], 0), /chunk size must be a positive integer/);
+  });
+
+  it("round-trips sensitive compatibility evidence in the member contract", () => {
+    const group = planIssueBatches([sensitiveItem(20), sensitiveItem(21)]).groups[0]!;
+    const body = renderBatchIssueBody(group);
+    const contracts = parseBatchContract(body);
+    assert.deepEqual(contracts[0], {
+      issue: 20,
+      repository: "owner/repo",
+      title: "Finding 20",
+      acceptanceCriteria: ["Validate session case 20"],
+      affectedFiles: ["src/core/a.ts"],
+      claims: ["src/core/a.ts"],
+      riskClass: "auth",
+      causalFamily: "session-validation",
+      riskCapabilities: ["session-integrity"],
+      primaryDomain: "identity/session",
+      sharedSymbols: ["validateSession"],
+    });
+    assert.throws(
+      () => parseBatchContract(body.replaceAll('"causalFamily":"session-validation",', "")),
+      /Sensitive batch contract lacks explicit compatible cause/,
+    );
+  });
+
   it("contracts members into one DAG node and lifts incoming and outgoing dependencies", () => {
     const members = [
       item(2, { dependencies: ["issue-1"] }),
@@ -62,6 +132,8 @@ describe("orchestration work-unit batching", () => {
     }]);
     const batch = contracted.find((value) => value.issue === 20)!;
     assert.deepEqual(batch.memberIssues, [2, 3]);
+    assert.equal(batch.repository, "owner/repo");
+    assert.equal(batch.targetBranch, "main");
     assert.deepEqual(batch.dependencies, ["issue-1"]);
     assert.deepEqual(contracted.find((value) => value.issue === 4)?.dependencies, ["issue-20"]);
     assert.ok(!contracted.some((value) => value.issue === 2 || value.issue === 3));

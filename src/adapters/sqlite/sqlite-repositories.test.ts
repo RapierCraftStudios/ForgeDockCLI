@@ -189,6 +189,7 @@ describe("SQLite operational repositories", () => {
       }],
       nodes: [{
         id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: ["src/**/*.ts"],
+        repository: "a/b", targetBranch: "main",
         status: "running", childRunIds: ["run_9"],
       }, {
         id: "issue-10", issue: 10, priority: 2, dependencies: [], claims: ["src/foo.ts"],
@@ -243,12 +244,12 @@ describe("SQLite operational repositories", () => {
     }
   });
 
-  it("atomically rejects a running DAG update that acquires another DAG's issue", async () => {
+  it("atomically qualifies mixed-repository DAG ownership without same-number false positives", async () => {
     const store = new SqliteRepositories(":memory:");
-    const parent: OrchestrationRecord = {
+    const mixed: OrchestrationRecord = {
       schema: "forgedock.orchestration/v1",
-      orchestrationId: "dag_parent",
-      repository: "a/b",
+      orchestrationId: "dag_mixed",
+      repository: "owner/control",
       requestedIssueNumbers: [1],
       issueNumbers: [1],
       maxParallel: 1,
@@ -256,11 +257,65 @@ describe("SQLite operational repositories", () => {
       status: "running",
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
-      nodes: [{ id: "issue-1", issue: 1, priority: 1, dependencies: [], claims: [], status: "skipped", childRunIds: [] }],
+      nodes: [{
+        id: "remote-7",
+        repository: "owner/work",
+        issue: 7,
+        priority: 1,
+        dependencies: [],
+        claims: [],
+        status: "running",
+        childRunIds: [],
+      }],
+    };
+    const proposal = (orchestrationId: string, repository: string, issue: number): OrchestrationRecord => ({
+      ...mixed,
+      orchestrationId,
+      repository,
+      requestedIssueNumbers: [issue],
+      issueNumbers: [issue],
+      nodes: [{ ...mixed.nodes[0]!, id: `${repository}-${issue}`, repository, issue }],
+    });
+    try {
+      await store.createOrchestration(mixed);
+      await assert.rejects(
+        store.createOrchestration(proposal("dag_remote_duplicate", "OWNER/WORK", 7)),
+        /owner\/work#7.*dag_mixed/,
+      );
+      await assert.doesNotReject(store.createOrchestration(proposal("dag_root_same_number", "owner/control", 7)));
+    } finally {
+      store.close();
+    }
+  });
+
+  it("atomically rejects a running DAG update that acquires another DAG's issue", async () => {
+    const store = new SqliteRepositories(":memory:");
+    const parent: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_parent",
+      repository: "owner/control",
+      requestedIssueNumbers: [1],
+      issueNumbers: [1],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{
+        id: "issue-1",
+        repository: "owner/work",
+        issue: 1,
+        priority: 1,
+        dependencies: [],
+        claims: [],
+        status: "skipped",
+        childRunIds: [],
+      }],
     };
     const childOwner: OrchestrationRecord = {
       ...parent,
       orchestrationId: "dag_child_owner",
+      repository: "owner/work",
       requestedIssueNumbers: [2],
       issueNumbers: [2],
       nodes: [{ ...parent.nodes[0]!, id: "issue-2", issue: 2, status: "running" }],
@@ -600,6 +655,29 @@ describe("SQLite operational repositories", () => {
       assert.deepEqual(await first.claim(key), { status: "materialized", snapshot });
       assert.equal(await second.invalidateMaterialized(key, snapshot.number), true);
       assert.deepEqual(await Promise.all([first.claim(key), second.claim(key)]).then((claims) => claims.map(({ status }) => status).sort()), ["claimed", "pending"]);
+    } finally {
+      first.close();
+      second.close();
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("persists a monotonic per-PR review publication fence across instances", async () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-review-fence-"));
+    const path = join(root, "state.db");
+    const first = new SqliteRepositories(path);
+    const second = new SqliteRepositories(path);
+    const route = {
+      repo: "Owner/Repo", pullRequest: 9, runId: "run-old", headSha: "a".repeat(40),
+      headBranch: "fix", baseBranch: "main",
+    };
+    try {
+      const older = await first.beginReviewFindingPublication(route);
+      await second.assertReviewFindingPublication(older);
+      const newer = await second.beginReviewFindingPublication({ ...route, runId: "run-new", headSha: "b".repeat(40) });
+      assert.equal(newer.generation, older.generation + 1);
+      await assert.rejects(first.assertReviewFindingPublication(older), /publication fence is stale/);
+      await first.assertReviewFindingPublication(newer);
     } finally {
       first.close();
       second.close();

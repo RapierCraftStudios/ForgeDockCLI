@@ -90,6 +90,60 @@ test("orchestration handoff renders delegated instead of active", () => {
   assert.match(rendered, /Live progress is shown in the ForgeDock orchestration board/);
 });
 
+test("orchestration tool display keeps five nodes and explicit batch members visible when collapsed", () => {
+  const presentation = forgeDockOrchestrateToolPresentation();
+  const nodes = [1, 2, 3, 4, 5].map((issue) => ({
+    id: `issue-${issue}`,
+    issue,
+    memberIssues: issue === 5 ? [5, 6] : [issue],
+    status: "queued" as const,
+    dependencies: issue > 1 ? [`issue-${issue - 1}`] : [],
+    claims: [`src/${issue}.ts`],
+    title: `Issue title ${issue}`,
+    route: { repository: "owner/repo", targetBranch: "main", lane: "fast" as const },
+    ...(issue === 5 ? { waitReason: { kind: "active-claim-conflict" as const, node: "issue-4", claims: ["src/5.ts"] } } : {}),
+  }));
+  const snapshot = {
+    orchestrationId: "dag_visible",
+    nodes,
+    readyNodes: ["issue-1"],
+    blockedNodes: [],
+    invalidNodes: [],
+    suspendedNodes: [],
+    activeLeases: [],
+    remediationCheckpoints: [],
+    selectedIssueNumbers: [1, 2, 3, 4, 5, 6],
+    issueSlots: { selected: 6, runnableNow: 1, requestedCap: 4, transportCap: 2, effectiveCap: 2 },
+    serializationEdges: [{ predecessor: "issue-1", successor: "issue-2", paths: ["src/shared.ts"], route: { repository: "owner/repo", targetBranch: "main", lane: "fast" as const } }],
+    serializationChains: [{ nodes: ["issue-1", "issue-2"], edges: [{ predecessor: "issue-1", successor: "issue-2", paths: ["src/shared.ts"], route: { repository: "owner/repo", targetBranch: "main", lane: "fast" as const } }], route: { repository: "owner/repo", targetBranch: "main", lane: "fast" as const } }],
+    updatedAt: "2030-01-01T00:00:00.000Z",
+  };
+  const result = {
+    content: [{ type: "text" as const, text: "Validated orchestration schedule." }],
+    details: {
+      ui: {
+        schemaVersion: 1 as const,
+        phase: "delegated" as const,
+        invocationLabel: "/orchestrate #1 #2 #3 #4 #5 #6",
+        selectedIssueCount: 6,
+        workUnitCount: 5,
+        issueSlots: snapshot.issueSlots,
+        snapshot,
+      },
+    },
+  };
+  const rendered = presentation.renderResult?.(result, { expanded: false, isPartial: false }, theme, context({ isPartial: false })).render(300).join("\n") ?? "";
+  for (const issue of [1, 2, 3, 4, 5]) assert.match(rendered, new RegExp(`#${issue}`));
+  assert.match(rendered, /members=#5,#6/);
+  assert.match(rendered, /6 selected · 1 runnable now/);
+  assert.match(rendered, /requested cap 4 · transport cap 2 · effective cap 2/);
+  assert.equal(rendered.match(/Issue slots:/g)?.length, 1);
+  assert.match(rendered, /semantic-deps=issue-4/);
+  assert.match(rendered, /scheduler retries automatically/);
+  assert.match(rendered, /paths src\/shared\.ts/);
+  assert.doesNotMatch(rendered, /Ctrl\+O to expand/);
+});
+
 test("semantic tool results preserve a bounded live tail and expand on demand", () => {
   const presentation = forgeDockToolPresentation("ForgeDock work on");
   const output = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`).join("\n");

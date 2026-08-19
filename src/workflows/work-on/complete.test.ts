@@ -39,7 +39,9 @@ class CompletionHost implements ForgeHost {
   mergeBase?: string;
   mergeGate: PullRequestMergeGate = {
     repo: "a/b", pullRequest: 9, headSha: sha, baseBranch: "main", mergeable: true,
-    requiredChecks: [], observedAt: new Date().toISOString(),
+    requiredChecksProvenance: "github-required",
+    requiredChecksHeadSha: sha,
+    requiredChecks: [{ name: "CI", state: "passed" }], observedAt: new Date().toISOString(),
   };
   closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
@@ -326,8 +328,8 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
-  it("blocks auto-merge and durably preserves every non-passing required state", async () => {
-    for (const state of ["pending", "cancelled", "failed", "unavailable"] as const) {
+  it("blocks auto-merge and durably preserves every terminal non-passing required state", async () => {
+    for (const state of ["cancelled", "failed", "unavailable"] as const) {
       const runs = new InMemoryRunRepository();
       const run = await mergingRun(runs);
       const host = new CompletionHost();
@@ -347,6 +349,8 @@ describe("merge and close authority", () => {
         headSha: sha,
         baseBranch: "main",
         mergeable: true,
+        requiredChecksProvenance: "github-required",
+    requiredChecksHeadSha: sha,
         observedAt,
         requiredChecks: [
           { name: "Analyze (javascript-typescript)", state, detailsUrl: "https://github.test/actions/runs/legacy" },
@@ -357,32 +361,65 @@ describe("merge and close authority", () => {
     }
   });
 
-  it("persists the exact pending legacy CodeQL gate beside a passing replacement", async () => {
+  it("polls pending required checks live until authoritative checks pass", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
     const host = new CompletionHost();
-    const observedAt = host.mergeGate.observedAt;
-    host.mergeGate.requiredChecks = [
-      { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
-      { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
-    ];
-    const artifacts = new InMemoryArtifactRepository();
-    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    let gateReads = 0;
+    const progress: string[] = [];
+    const pollDelays: number[] = [];
+    Object.defineProperty(host, "getPullRequestMergeGate", { value: async () => {
+      gateReads += 1;
+      return {
+        ...host.mergeGate,
+        requiredChecks: [
+          { name: "Analyze (javascript-typescript)", state: gateReads < 4 ? "pending" as const : "passed" as const, detailsUrl: "https://github.test/actions/runs/legacy" },
+          { name: "CodeQL default setup", state: "passed" as const, detailsUrl: "https://github.test/actions/runs/default" },
+        ],
+      };
+    } });
+    const result = await completeWorkItem({
+      run,
+      pullRequest: openPr,
+      verdict: verdict(run),
+      autoMerge: true,
+      mergeGatePollIntervalMs: 1,
+      onMergeGatePoll: ({ reason, nextPollInMs }) => {
+        progress.push(reason);
+        pollDelays.push(nextPollInMs);
+      },
+    }, { host, artifacts: new InMemoryArtifactRepository(), runs });
 
-    assert.equal(result.run.state, "blocked");
-    assert.deepEqual(result.outcome?.payload.mergeGate, {
-      repo: "a/b",
-      pullRequest: 9,
-      headSha: sha,
-      baseBranch: "main",
-      mergeable: true,
-      observedAt,
-      requiredChecks: [
-        { name: "Analyze (javascript-typescript)", state: "pending", detailsUrl: "https://github.test/actions/runs/legacy" },
-        { name: "CodeQL default setup", state: "passed", detailsUrl: "https://github.test/actions/runs/default" },
-      ],
-    });
-    assert.equal(host.merges, 0);
+    assert.equal(result.run.state, "completed");
+    assert.equal(result.awaitingHuman, false);
+    assert.equal(gateReads, 4);
+    assert.deepEqual(progress, ["required-checks-pending", "required-checks-pending", "required-checks-pending"]);
+    assert.deepEqual(pollDelays, [10, 20, 40]);
+    assert.equal((await runs.listProgress(run.runId)).some((entry) => entry.phase === "merge-gate.poll"), true);
+    assert.equal(host.merges, 1);
+  });
+
+  it("returns to live polling when merge-time revalidation becomes pending", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    let mergeAttempts = 0;
+    Object.defineProperty(host, "mergePullRequest", { value: async () => {
+      mergeAttempts += 1;
+      if (mergeAttempts === 1) throw new Error("Required GitHub checks are not all passing for PR #9: CI=pending");
+      host.merges += 1;
+      host.snapshot.state = "MERGED";
+    } });
+    const result = await completeWorkItem({
+      run,
+      pullRequest: openPr,
+      verdict: verdict(run),
+      autoMerge: true,
+      mergeGatePollIntervalMs: 1,
+    }, { host, artifacts: new InMemoryArtifactRepository(), runs });
+    assert.equal(result.run.state, "completed");
+    assert.equal(mergeAttempts, 2);
+    assert.equal(host.merges, 1);
   });
 
   it("persists unavailable merge-gate authority without retrying into a merge", async () => {
@@ -405,6 +442,7 @@ describe("merge and close authority", () => {
       mergeable: false,
       mergeability: "unavailable",
       mergeabilityReason: "default setup authority unavailable",
+      requiredChecksProvenance: "unavailable",
       observedAt: result.outcome?.payload.mergeGate?.observedAt,
       requiredChecks: [{
         name: "merge-admission-query",
@@ -416,23 +454,89 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
-  it("does not label transient UNKNOWN mergeability as awaiting human merge", async () => {
+  it("polls transient UNKNOWN mergeability until GitHub confirms mergeable", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
     const host = new CompletionHost();
-    host.mergeGate = {
-      ...host.mergeGate,
-      mergeable: false,
-      mergeability: "unknown",
-      mergeabilityReason: "GitHub mergeability remained UNKNOWN after bounded reads",
-    };
-    const artifacts = new InMemoryArtifactRepository();
-    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    let gateReads = 0;
+    Object.defineProperty(host, "getPullRequestMergeGate", { value: async () => {
+      gateReads += 1;
+      return gateReads === 1
+        ? {
+            ...host.mergeGate,
+            mergeable: false,
+            mergeability: "unknown" as const,
+            mergeabilityReason: "GitHub mergeability is still computing",
+          }
+        : { ...host.mergeGate, mergeable: true, mergeability: "mergeable" as const };
+    } });
+    const result = await completeWorkItem({
+      run,
+      pullRequest: openPr,
+      verdict: verdict(run),
+      autoMerge: true,
+      mergeGatePollIntervalMs: 1,
+    }, { host, artifacts: new InMemoryArtifactRepository(), runs });
 
+    assert.equal(result.run.state, "completed");
+    assert.equal(gateReads, 2);
+    assert.equal(host.merges, 1);
+  });
+
+  it("aborts a live pending-check poll without blocking or merging", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeGate.requiredChecks = [{ name: "CI", state: "pending" }];
+    const artifacts = new InMemoryArtifactRepository();
+    const controller = new AbortController();
+    await assert.rejects(
+      completeWorkItem({
+        run,
+        pullRequest: openPr,
+        verdict: verdict(run),
+        autoMerge: true,
+        signal: controller.signal,
+        mergeGatePollIntervalMs: 30_000,
+        onMergeGatePoll: () => { controller.abort(new Error("ownership cancelled")); },
+      }, { host, artifacts, runs }),
+      /ownership cancelled/,
+    );
+    assert.equal(host.merges, 0);
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+    assert.equal((await runs.load(run.runId))?.state, "merging");
+  });
+
+  it("does not authorize passing checks when required-check provenance is missing", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    delete host.mergeGate.requiredChecksProvenance;
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
     assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /not immutably bound/);
+    assert.equal(result.outcome?.payload.mergeGate?.requiredChecksProvenance, undefined);
     assert.equal(result.awaitingHuman, false);
-    assert.equal(result.outcome?.payload.mergeGate?.mergeability, "unknown");
-    assert.equal(result.outcome?.payload.mergeGate?.mergeable, false);
+    assert.equal(host.merges, 0);
+  });
+
+  it("fails closed when the exact PR head changes after the gate query", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    let reads = 0;
+    Object.defineProperty(host, "getPullRequest", { value: async () => {
+      reads += 1;
+      return { ...host.snapshot, headSha: reads >= 2 ? "d".repeat(40) : sha };
+    } });
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+        host, artifacts: new InMemoryArtifactRepository(), runs,
+      }),
+      /Approved SHA .* is stale/,
+    );
     assert.equal(host.merges, 0);
   });
 
@@ -448,6 +552,22 @@ describe("merge and close authority", () => {
     assert.equal(result.awaitingHuman, true);
     assert.equal(result.outcome?.payload.mergeGate?.mergeability, "conflicting");
     assert.equal(host.merges, 0);
+  });
+
+  it("accepts an exact concurrent merge after the authoritative gate query", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const artifacts = new InMemoryArtifactRepository();
+    const host = new CompletionHost();
+    host.getPullRequestMergeGate = async () => {
+      host.snapshot.state = "MERGED";
+      return { ...host.mergeGate, requiredChecks: [...host.mergeGate.requiredChecks] };
+    };
+
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    assert.equal(result.run.state, "completed");
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, [2]);
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {

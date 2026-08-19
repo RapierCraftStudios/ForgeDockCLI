@@ -8,6 +8,7 @@ import { scopeManifestFor, type AgentEventSink, type AgentRuntime } from "../../
 import { WORK_ON_EXECUTION_BUDGETS } from "../work-on/execution-budgets.js";
 import { assessPullRequestCi, assertPullRequestCiReady } from "./ci-policy.js";
 import { parseDiffPaths } from "./planner.js";
+import { abortablePollDelay } from "./polling.js";
 const SubmissionSchema = Type.Object({ summary: Type.String({ minLength: 1 }), diagnosis: Type.String({ minLength: 1 }), changedPaths: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }) });
 type Submission = Static<typeof SubmissionSchema>;
 export async function makePullRequestCiGreen(input: { repo: string; pullRequest: number; policy: EffectiveReviewCiConfig; featurePromotionTarget?: string; productionTarget?: string; provider?: string; model?: string; signal?: AbortSignal }, deps: { runtime: AgentRuntime; host: ForgeHost; workspaces: PullRequestRepairWorkspaceManager; verifier: VerificationRunner; verificationCommands(cwd: string, baseRef?: string): readonly Omit<VerificationCommand, "cwd">[]; onAgentEvent?: AgentEventSink; wait?: (signal?: AbortSignal) => Promise<void> }): Promise<{ pullRequest: PullRequestSnapshot; attempts: number; fixes: readonly string[] }> {
@@ -50,4 +51,6 @@ export async function makePullRequestCiGreen(input: { repo: string; pullRequest:
     } finally { await deps.workspaces.remove(workspace); }
   }
 }
-async function waitForCi(signal?: AbortSignal): Promise<void> { await new Promise<void>((resolve, reject) => { const abort = () => { clearTimeout(timer); reject(signal?.reason ?? new Error("CI repair cancelled")); }; const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, 15_000); signal?.addEventListener("abort", abort, { once: true }); }); }
+async function waitForCi(signal?: AbortSignal): Promise<void> {
+  await abortablePollDelay(15_000, signal, (aborted) => aborted.reason ?? new Error("CI repair cancelled"));
+}

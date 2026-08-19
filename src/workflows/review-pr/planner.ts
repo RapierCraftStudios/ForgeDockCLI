@@ -64,12 +64,18 @@ export interface ReviewPlanContext {
   buildResultBranch: string;
   targetBranch: string;
   baseSha?: string;
+  reviewedHeadSha?: string;
+  phase?: "initial" | "closure";
+  parentPlanId?: string;
+  parentVerdictId?: string;
+  deltaPaths?: string[];
+  openRootIds?: string[];
 }
 
 export interface ReviewPlan {
   /** Stable canonical identity over every authority-bearing plan field. */
   planId: string;
-  schemaVersion: 3;
+  schemaVersion: 4;
   context: ReviewPlanContext;
   generation: number;
   frozen: true;
@@ -99,7 +105,7 @@ interface DiffSection {
   added: string;
 }
 
-const ROLE_ORDER: ReviewerRole[] = [
+export const ROLE_ORDER: readonly ReviewerRole[] = [
   "correctness", "security", "data", "api-compatibility", "frontend", "infrastructure", "concurrency",
 ];
 const SPECIALISTS = ROLE_ORDER.filter((role): role is SpecialistReviewerRole => role !== "correctness");
@@ -147,6 +153,10 @@ export function planReviewPanel(input: {
   context?: Omit<ReviewPlanContext, "packetId" | "packetDigest">;
   repositoryPolicy?: readonly { path: string; content: string }[];
   maxSpecialists?: number;
+  generation?: number;
+  /** Closure reviews retain only owners of open roots plus newly touched capabilities. */
+  requiredOwners?: readonly { role: ReviewerRole; scope: readonly string[] }[];
+  budgetPolicy?: Partial<Pick<ReviewBudget, "maxParallelSessions" | "maxReviewerAttempts" | "maxScopeAdjudicationAttempts" | "maxModelCalls">>;
 }): ReviewPlan {
   const sections = parseDiffSections(input.diff);
   const allPaths = unique([...input.changedPaths, ...sections.map((section) => section.path)].map(normalizePath).filter(Boolean)).sort();
@@ -158,6 +168,16 @@ export function planReviewPanel(input: {
   }]));
 
   for (const candidate of candidates.values()) addRepositoryPolicyEvidence(candidate, input.repositoryPolicy ?? []);
+  for (const owner of input.requiredOwners ?? []) {
+    if (owner.role === "correctness") continue;
+    const candidate = candidates.get(owner.role);
+    if (!candidate) continue;
+    candidate.score = Math.max(candidate.score, 1_000);
+    candidate.policyRequired = true;
+    candidate.concrete = true;
+    candidate.reasons.push("owns an open durable finding root in closure review");
+    for (const path of owner.scope.map(normalizePath).filter(Boolean)) candidate.scope.add(path);
+  }
 
   addPathEvidence(candidates.get("security")!, allPaths, PATH_SECURITY, 120, "security-sensitive path");
   addTextEvidence(candidates.get("security")!, riskText, SECURITY, 75, "Build Packet declares a security/trust risk");
@@ -250,33 +270,47 @@ export function planReviewPanel(input: {
     };
   });
   const maxLogicalReviewerSessions = executionGroups.length;
+  const policy = input.budgetPolicy;
+  const maxReviewerAttempts = Math.max(maxLogicalReviewerSessions, Math.min(
+    policy?.maxReviewerAttempts ?? 2 * maxLogicalReviewerSessions,
+    2 * maxLogicalReviewerSessions,
+  ));
+  const maxScopeAdjudicationAttempts = Math.max(1, Math.min(policy?.maxScopeAdjudicationAttempts ?? 2, 2));
   const budget: ReviewBudget = {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
-    maxParallelSessions: Math.min(MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions),
+    maxParallelSessions: Math.max(1, Math.min(policy?.maxParallelSessions ?? MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions)),
     maxToolCallsPerExecutionGroup: MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP,
     maxAttemptsPerExecutionGroup: 2,
-    maxReviewerAttempts: 2 * maxLogicalReviewerSessions,
-    maxScopeAdjudicationAttempts: 2,
-    maxModelCalls: 2 * maxLogicalReviewerSessions + 2,
+    maxReviewerAttempts,
+    maxScopeAdjudicationAttempts,
+    maxModelCalls: Math.max(maxLogicalReviewerSessions, Math.min(
+      policy?.maxModelCalls ?? maxReviewerAttempts + maxScopeAdjudicationAttempts,
+      maxReviewerAttempts + maxScopeAdjudicationAttempts,
+    )),
+  };
+  const suppliedContext = input.context ?? {
+    runId: input.packet.runId,
+    repo: input.packet.subject.repo,
+    ...(input.packet.subject.issue !== undefined ? { issue: input.packet.subject.issue } : {}),
+    pullRequest: 0,
+    deliveryRunId: input.packet.runId,
+    buildResultBranch: "selection-only",
+    targetBranch: "selection-only",
   };
   const context: ReviewPlanContext = {
-    ...(input.context ?? {
-      runId: input.packet.runId,
-      repo: input.packet.subject.repo,
-      ...(input.packet.subject.issue !== undefined ? { issue: input.packet.subject.issue } : {}),
-      pullRequest: 0,
-      deliveryRunId: input.packet.runId,
-      buildResultBranch: "selection-only",
-      targetBranch: "selection-only",
-    }),
+    ...suppliedContext,
+    reviewedHeadSha: suppliedContext.reviewedHeadSha ?? suppliedContext.baseSha ?? "0000000",
+    phase: suppliedContext.phase ?? "initial",
+    deltaPaths: [...(suppliedContext.deltaPaths ?? allPaths)].sort(),
+    openRootIds: [...(suppliedContext.openRootIds ?? [])].sort(),
     packetId: input.packet.id,
     packetDigest: canonicalReviewDigest(input.packet.payload),
   };
   const identity: Omit<ReviewPlan, "planId"> = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     context,
-    generation: 1,
+    generation: input.generation ?? 1,
     frozen: true,
     riskTier: riskTier(capabilities.slice(1)),
     budget,
@@ -318,13 +352,16 @@ export function freezeReviewPlan(plan: ReviewPlan): ReviewPlan {
 }
 
 export function assertReviewPlan(plan: ReviewPlan): void {
-  if (!plan.frozen || plan.schemaVersion !== 3 || !Number.isSafeInteger(plan.generation) || plan.generation < 1
+  if (!plan.frozen || plan.schemaVersion !== 4 || !Number.isSafeInteger(plan.generation) || plan.generation < 1
     || !/^review-plan-[a-f0-9]{20}$/.test(plan.planId)) {
     throw new Error("Review Plan must have current immutable identity, context, generation, and frozen status");
   }
   if (!plan.context?.runId || !plan.context.repo || !Number.isSafeInteger(plan.context.pullRequest)
     || plan.context.pullRequest < 0 || !plan.context.packetId || !/^[a-f0-9]{64}$/.test(plan.context.packetDigest)
-    || !plan.context.deliveryRunId || !plan.context.buildResultBranch || !plan.context.targetBranch) {
+    || !plan.context.deliveryRunId || !plan.context.buildResultBranch || !plan.context.targetBranch
+    || typeof plan.context.reviewedHeadSha !== "string" || !/^[0-9a-f]{7,64}$/i.test(plan.context.reviewedHeadSha)
+    || (plan.context.phase !== "initial" && plan.context.phase !== "closure")
+    || !Array.isArray(plan.context.deltaPaths) || !Array.isArray(plan.context.openRootIds)) {
     throw new Error("Review Plan authority context is incomplete");
   }
   const budget = plan.budget as Partial<ReviewBudget> | undefined;

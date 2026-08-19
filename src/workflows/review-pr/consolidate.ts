@@ -156,6 +156,7 @@ function consolidateCluster(
     severity,
     confidence,
     blocking: false,
+    mustFix: qualifying.length > 0 && scopeDisposition === "in_scope",
     evidence: combineSourceText(attestations, (source) => source.finding.evidence, 12_000),
     intentRelevance: combineSourceText(attestations, (source) => source.finding.intentRelevance, 8_000),
     remediation: combineSourceText(attestations, (source) => source.finding.remediation, 8_000),

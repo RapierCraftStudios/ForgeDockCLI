@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import { pullRequestMergeability, type ForgeHost, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type {
   PromotionMode,
@@ -19,6 +19,13 @@ import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.j
 import { reviewPullRequest } from "../review-pr/review.js";
 import { parseDiffPaths } from "../review-pr/planner.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
+import {
+  abortablePollDelay,
+  controllerPollDelay,
+  controllerPollInterval,
+  pollingAbortError,
+  throwIfPollingAborted,
+} from "../review-pr/polling.js";
 
 const BRANCH_NAME = /^[A-Za-z0-9._/-]+$/u;
 const SHA = /^[0-9a-f]{7,64}$/i;
@@ -50,6 +57,13 @@ export interface PromotionDependencies {
   maxReviewSpecialists?: number;
 }
 
+export interface PromotionMergeGatePollProgress {
+  attempt: number;
+  reason: "required-checks-pending" | "mergeability-unknown";
+  gate: PullRequestMergeGate;
+  nextPollInMs: number;
+}
+
 export interface PromotionInput {
   repository: string;
   mode: PromotionMode;
@@ -65,6 +79,9 @@ export interface PromotionInput {
   provider?: string;
   model?: string;
   signal?: AbortSignal;
+  /** Poll cadence is bounded; authoritative pending CI is polled without an attempt cap. */
+  mergeGatePollIntervalMs?: number;
+  onMergeGatePoll?: (progress: PromotionMergeGatePollProgress) => void | Promise<void>;
   cancel?: boolean;
   cancellationReason?: string;
 }
@@ -188,13 +205,16 @@ export async function promoteBranch(
     assertFrozenVerificationPlan(record, input.verification);
   }
 
-  if (record.phase === "completed") return record;
+  if (record.phase === "completed" || record.phase === "blocked") return record;
   if (record.phase === "cancelled") return record;
   if (input.cancel) {
     const reason = input.cancellationReason?.trim() || "Promotion cancelled by explicit user request";
     return advance(record, { phase: "cancelled", cancelledAt: new Date().toISOString(), cancellationReason: reason }, dependencies.promotions);
   }
   try {
+    const recovered = await recoverMergedPromotion(record, dependencies);
+    if (recovered) return recovered;
+    throwIfPollingAborted(input.signal, "Promotion merge-gate polling aborted");
     await assertFrozenRefs(record, dependencies.host);
 
     if (input.authorizeCreation && !record.authorized) {
@@ -232,10 +252,18 @@ export async function promoteBranch(
     }
     if (record.phase === "awaiting-merge" && !record.mergeAuthorized) return record;
     if (record.phase === "awaiting-merge") {
-      record = await mergePromotion(record, dependencies);
+      record = await mergePromotion(record, input, dependencies);
     }
     return record;
   } catch (error) {
+    if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) {
+      const reason = cancellationReason(error, input.signal);
+      return advance(record, {
+        phase: "cancelled",
+        cancelledAt: new Date().toISOString(),
+        cancellationReason: reason,
+      }, dependencies.promotions);
+    }
     const reason = error instanceof Error ? error.message : String(error);
     const failed = await failPromotion(record, resumePhaseFor(record.phase), reason, dependencies.promotions);
     throw new PromotionExecutionError(failed, reason, { cause: error });
@@ -489,46 +517,247 @@ function promotionArtifacts(
   return [intent, investigation, packet, buildResult];
 }
 
-async function mergePromotion(record: PromotionRecord, dependencies: PromotionDependencies): Promise<PromotionRecord> {
+type PromotionMergeObservation =
+  | { status: "ready"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate }
+  | { status: "pending"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate; reason: PromotionMergeGatePollProgress["reason"] }
+  | { status: "blocked"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate; reason: string }
+  | { status: "merged"; pullRequest: PullRequestSnapshot };
+
+async function mergePromotion(
+  record: PromotionRecord,
+  input: PromotionInput,
+  dependencies: PromotionDependencies,
+): Promise<PromotionRecord> {
+  assertPromotionReviewCheckpoint(record);
+  const pollIntervalMs = controllerPollInterval(input.mergeGatePollIntervalMs);
+  let attempt = 0;
+  while (true) {
+    const observation = await observePromotionMergeGate(record, dependencies.host, input.signal);
+    if (observation.status === "merged") return completeMergedPromotion(record, observation.pullRequest, dependencies);
+    if (observation.status === "blocked") {
+      return blockPromotion(record, observation.reason, dependencies.promotions);
+    }
+    if (observation.status === "pending") {
+      attempt += 1;
+      await pollPromotionMergeGate(input, observation.gate, observation.reason, attempt, pollIntervalMs);
+      continue;
+    }
+
+    throwIfPollingAborted(input.signal, "Promotion merge-gate polling aborted");
+    await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
+    await assertPromotionMutationBoundary(record, dependencies.host);
+    try {
+      await dependencies.host.mergePullRequest(
+        record.repository,
+        record.pullRequest!.number,
+        record.review!.headSha,
+        record.targetBranch,
+      );
+    } catch (error) {
+      // A transport can report failure after GitHub accepted the merge. Re-read
+      // the exact PR first so crash/error recovery never mistakes target drift
+      // caused by this PR's merge for stale authority.
+      const afterCommand = await readExactPromotionPullRequest(record, dependencies.host);
+      if (afterCommand.state === "MERGED") return completeMergedPromotion(record, afterCommand, dependencies);
+
+      // Never classify a merge-command error from its text. Only a fresh typed
+      // gate may turn it into pending/unknown or a terminal authority blocker.
+      const afterFailure = await observePromotionMergeGate(record, dependencies.host, input.signal);
+      if (afterFailure.status === "merged") return completeMergedPromotion(record, afterFailure.pullRequest, dependencies);
+      if (afterFailure.status === "blocked") {
+        if (promotionMergeGateAuthorityUnavailable(afterFailure.gate)) throw error;
+        return blockPromotion(record, afterFailure.reason, dependencies.promotions);
+      }
+      if (afterFailure.status === "pending") {
+        attempt += 1;
+        await pollPromotionMergeGate(input, afterFailure.gate, afterFailure.reason, attempt, pollIntervalMs);
+        continue;
+      }
+      // The authoritative gate still admits the merge, so this was not a typed
+      // conflict/check transition. Preserve transport/authentication failure.
+      throw error;
+    }
+
+    const merged = await readExactPromotionPullRequest(record, dependencies.host);
+    if (merged.state !== "MERGED") throw new Error("Promotion merge command completed but the pull request is not merged");
+    return completeMergedPromotion(record, merged, dependencies);
+  }
+}
+
+async function observePromotionMergeGate(
+  record: PromotionRecord,
+  host: ForgeHost,
+  signal?: AbortSignal,
+): Promise<PromotionMergeObservation> {
+  throwIfPollingAborted(signal, "Promotion merge-gate polling aborted");
+  const pullRequest = await readExactPromotionPullRequest(record, host);
+  if (pullRequest.state === "MERGED") return { status: "merged", pullRequest };
+  if (pullRequest.state !== "OPEN") {
+    throw new Error(`Promotion pull request #${pullRequest.number} is ${pullRequest.state}, expected OPEN`);
+  }
+  await assertFrozenRefs(record, host);
+  if (!host.getPullRequestMergeGate) throw new Error("Promotion merge requires authoritative GitHub merge-admission support");
+  const gate = await host.getPullRequestMergeGate(
+    record.repository,
+    pullRequest.number,
+    record.review!.headSha,
+    record.targetBranch,
+  );
+  assertPromotionMergeGateIdentity(record, gate);
+
+  // Bind every gate observation to a fresh exact PR/ref observation. This also
+  // prevents a pending check result for one head from being stamped onto a
+  // later incarnation of the same branch name.
+  const revalidated = await readExactPromotionPullRequest(record, host);
+  if (revalidated.state === "MERGED") return { status: "merged", pullRequest: revalidated };
+  if (revalidated.state !== "OPEN") {
+    throw new Error(`Promotion pull request #${revalidated.number} changed state while reading merge admission: ${revalidated.state}`);
+  }
+  await assertFrozenRefs(record, host);
+
+  const terminalReason = promotionMergeGateBlocker(gate);
+  if (terminalReason) return { status: "blocked", pullRequest: revalidated, gate, reason: terminalReason };
+  const transientReason = promotionMergeGatePendingReason(gate);
+  if (transientReason) return { status: "pending", pullRequest: revalidated, gate, reason: transientReason };
+  return { status: "ready", pullRequest: revalidated, gate };
+}
+
+async function pollPromotionMergeGate(
+  input: PromotionInput,
+  gate: PullRequestMergeGate,
+  reason: PromotionMergeGatePollProgress["reason"],
+  attempt: number,
+  baseIntervalMs: number,
+): Promise<void> {
+  const nextPollInMs = controllerPollDelay(baseIntervalMs, attempt);
+  await input.onMergeGatePoll?.({ attempt, reason, gate, nextPollInMs });
+  await abortablePollDelay(
+    nextPollInMs,
+    input.signal,
+    (signal) => pollingAbortError(signal, "Promotion merge-gate polling aborted"),
+  );
+}
+
+function promotionMergeGateBlocker(gate: PullRequestMergeGate): string | undefined {
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
+    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: required checks are not immutably bound to ${gate.headSha}`;
+  }
+  if (gate.requiredChecks.length === 0) {
+    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: required-checks=unavailable`;
+  }
+  const mergeability = pullRequestMergeability(gate);
+  if (mergeability === "conflicting") {
+    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: mergeability=conflicting${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  }
+  if (mergeability === "unavailable") {
+    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: mergeability=unavailable${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  }
+  const terminalChecks = gate.requiredChecks.filter((check) => ["failed", "cancelled", "unavailable"].includes(check.state));
+  if (terminalChecks.length) {
+    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: ${terminalChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+  }
+  return undefined;
+}
+
+function promotionMergeGateAuthorityUnavailable(gate: PullRequestMergeGate): boolean {
+  return gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()
+    || gate.requiredChecks.some((check) => check.state === "unavailable")
+    || pullRequestMergeability(gate) === "unavailable";
+}
+
+function promotionMergeGatePendingReason(gate: PullRequestMergeGate): PromotionMergeGatePollProgress["reason"] | undefined {
+  if (gate.requiredChecks.some((check) => check.state === "pending")) return "required-checks-pending";
+  if (pullRequestMergeability(gate) === "unknown") return "mergeability-unknown";
+  return undefined;
+}
+
+function assertPromotionMergeGateIdentity(record: PromotionRecord, gate: PullRequestMergeGate): void {
+  if (!record.pullRequest || !record.review) throw new Error("Promotion merge gate requires PR and review checkpoints");
+  if (gate.repo.toLowerCase() !== record.repository.toLowerCase() || gate.pullRequest !== record.pullRequest.number) {
+    throw new Error(`Promotion merge admission identified ${gate.repo}#${gate.pullRequest}, expected ${record.repository}#${record.pullRequest.number}`);
+  }
+  if (gate.headSha !== record.review.headSha || gate.headSha !== record.sourceHeadSha) {
+    throw new Error(`Promotion merge admission is stale: reviewed ${record.review.headSha}, gate observed ${gate.headSha}`);
+  }
+  if (gate.baseBranch !== record.targetBranch || gate.baseBranch !== record.review.baseBranch) {
+    throw new Error(`Promotion merge admission target changed: expected ${record.targetBranch}, gate observed ${gate.baseBranch}`);
+  }
+}
+
+async function assertPromotionMutationBoundary(record: PromotionRecord, host: ForgeHost): Promise<void> {
+  await assertFrozenRefs(record, host);
+  const pullRequest = await readExactPromotionPullRequest(record, host);
+  if (pullRequest.state !== "OPEN") throw new Error(`Promotion pull request #${pullRequest.number} is ${pullRequest.state}, expected OPEN at merge boundary`);
+}
+
+async function readExactPromotionPullRequest(record: PromotionRecord, host: ForgeHost): Promise<PullRequestSnapshot> {
+  if (!record.pullRequest) throw new Error("Promotion requires a pull request checkpoint");
+  const pullRequest = await host.getPullRequest(record.repository, record.pullRequest.number);
+  assertPromotionPullRequest(record, pullRequest);
+  assertPromotionReviewIdentity(record, pullRequest);
+  return pullRequest;
+}
+
+function assertPromotionReviewCheckpoint(record: PromotionRecord): asserts record is PromotionRecord & {
+  pullRequest: PromotionPullRequestRecord;
+  review: PromotionReviewRecord;
+} {
   if (!record.pullRequest || !record.review) throw new Error("Promotion merge requires PR and approving review checkpoints");
   if (record.review.disposition !== "approve") throw new Error("Promotion merge requires an approving review");
-  const [sourceHead, targetHead] = await readRefs(dependencies.host, record.repository, record.sourceBranch, record.targetBranch);
-  if (sourceHead !== record.sourceHeadSha || targetHead !== record.targetHeadSha) {
-    throw new Error(`Promotion refs changed after review: expected ${record.sourceBranch}@${record.sourceHeadSha} and ${record.targetBranch}@${record.targetHeadSha}, found ${sourceHead} and ${targetHead}`);
-  }
-  const pullRequest = await dependencies.host.getPullRequest(record.repository, record.pullRequest.number);
-  assertPromotionPullRequest(record, pullRequest);
+}
+
+function assertPromotionReviewIdentity(record: PromotionRecord, pullRequest: PullRequestSnapshot): void {
+  if (!record.review) return;
+  if (record.review.disposition !== "approve") throw new Error("Promotion merge requires an approving review");
   if (pullRequest.headSha !== record.review.headSha || pullRequest.headSha !== record.sourceHeadSha) {
-    throw new Error(`Promotion reviewed SHA ${record.review.headSha} is stale; current PR/source head is ${pullRequest.headSha}/${sourceHead}`);
+    throw new Error(`Promotion reviewed SHA ${record.review.headSha} is stale; current PR/source head is ${pullRequest.headSha}/${record.sourceHeadSha}`);
   }
   if (pullRequest.baseBranch !== record.review.baseBranch) throw new Error("Promotion reviewed target changed before merge");
-  // Protection is a promotion-completion gate, not a PR-publication gate. Check
-  // it even when the host reports an externally merged PR so ForgeDock never
-  // records an unprotected production promotion as successfully completed.
+}
+
+async function completeMergedPromotion(
+  record: PromotionRecord,
+  pullRequest: PullRequestSnapshot,
+  dependencies: PromotionDependencies,
+): Promise<PromotionRecord> {
+  assertPromotionReviewCheckpoint(record);
+  if (pullRequest.state !== "MERGED") throw new Error(`Promotion PR #${pullRequest.number} is not merged`);
+  assertPromotionPullRequest(record, pullRequest);
+  assertPromotionReviewIdentity(record, pullRequest);
   await assertProductionProtection(record.mode, record.repository, record.targetBranch, dependencies.host);
-  if (pullRequest.state !== "MERGED") {
-    if (!dependencies.host.getPullRequestMergeGate) throw new Error("Promotion merge requires authoritative GitHub merge-admission support");
-    const gate = await dependencies.host.getPullRequestMergeGate(
-      record.repository,
-      pullRequest.number,
-      record.review.headSha,
-      record.targetBranch,
-      { refreshUnknown: true },
-    );
-    const mergeability = pullRequestMergeability(gate);
-    const failedChecks = gate.requiredChecks.filter((check) => check.state !== "passed");
-    if (mergeability !== "mergeable" || failedChecks.length) {
-      const blockers = [
-        ...(mergeability !== "mergeable" ? [`mergeability=${mergeability}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`] : []),
-        ...failedChecks.map((check) => `${check.name}=${check.state}`),
-      ];
-      throw new Error(`Promotion merge admission is blocked for PR #${pullRequest.number}: ${blockers.join(", ")}`);
-    }
-    await dependencies.host.mergePullRequest(record.repository, pullRequest.number, record.review.headSha, record.targetBranch);
-  }
-  const merged = await dependencies.host.getPullRequest(record.repository, pullRequest.number);
-  if (merged.state !== "MERGED") throw new Error("Promotion merge command completed but the pull request is not merged");
-  return advance(record, { phase: "completed", pullRequest: { ...record.pullRequest, headSha: merged.headSha, baseBranch: merged.baseBranch } }, dependencies.promotions);
+  const completed: PromotionRecord = {
+    ...record,
+    phase: "completed",
+    pullRequest: { ...record.pullRequest, headSha: pullRequest.headSha, baseBranch: pullRequest.baseBranch },
+    version: record.version + 1,
+    updatedAt: new Date().toISOString(),
+  };
+  delete completed.failure;
+  delete completed.resumePhase;
+  await dependencies.promotions.savePromotion(record.version, completed);
+  return completed;
+}
+
+async function recoverMergedPromotion(
+  record: PromotionRecord,
+  dependencies: PromotionDependencies,
+): Promise<PromotionRecord | undefined> {
+  const awaitingMerge = record.phase === "awaiting-merge"
+    || (record.phase === "failed" && record.resumePhase === "awaiting-merge");
+  if (!awaitingMerge || !record.pullRequest || !record.review) return undefined;
+  const pullRequest = await readExactPromotionPullRequest(record, dependencies.host);
+  if (pullRequest.state !== "MERGED") return undefined;
+  return completeMergedPromotion(record, pullRequest, dependencies);
+}
+
+async function blockPromotion(
+  record: PromotionRecord,
+  reason: string,
+  repository: PromotionRepository,
+): Promise<PromotionRecord> {
+  return advance(record, { phase: "blocked", failure: reason }, repository);
 }
 
 async function assertFrozenRefs(record: PromotionRecord, host: ForgeHost): Promise<void> {
@@ -558,6 +787,9 @@ async function assertProductionProtection(mode: PromotionMode, repository: strin
 
 function assertPromotionPullRequest(record: PromotionRecord, pullRequest: PullRequestSnapshot): void {
   if (pullRequest.repo.toLowerCase() !== record.repository.toLowerCase()) throw new Error("Promotion pull request repository changed");
+  if (record.pullRequest && pullRequest.number !== record.pullRequest.number) {
+    throw new Error(`Promotion pull request identity changed: expected #${record.pullRequest.number}, found #${pullRequest.number}`);
+  }
   if (pullRequest.headBranch !== record.sourceBranch) throw new Error(`Promotion PR source changed: expected ${record.sourceBranch}, found ${pullRequest.headBranch}`);
   if (pullRequest.baseBranch !== record.targetBranch) throw new Error(`Promotion PR target changed: expected ${record.targetBranch}, found ${pullRequest.baseBranch}`);
   if (pullRequest.headSha !== record.sourceHeadSha) throw new Error(`Promotion PR head ${pullRequest.headSha} does not match frozen source ${record.sourceHeadSha}`);
@@ -612,7 +844,7 @@ async function advance(
 
 async function resumeCheckpoint(
   record: PromotionRecord,
-  phase: Exclude<PromotionPhase, "completed" | "failed" | "cancelled">,
+  phase: Exclude<PromotionPhase, "completed" | "blocked" | "failed" | "cancelled">,
   repository: PromotionRepository,
 ): Promise<PromotionRecord> {
   const next: PromotionRecord = {
@@ -631,11 +863,11 @@ async function resumeCheckpoint(
 
 async function failPromotion(
   record: PromotionRecord,
-  resumePhase: Exclude<PromotionPhase, "completed" | "failed" | "cancelled">,
+  resumePhase: Exclude<PromotionPhase, "completed" | "blocked" | "failed" | "cancelled">,
   reason: string,
   repository: PromotionRepository,
 ): Promise<PromotionRecord> {
-  if (record.phase === "completed" || record.phase === "failed") return record;
+  if (record.phase === "completed" || record.phase === "blocked" || record.phase === "failed") return record;
   try {
     return await advance(record, { phase: "failed", resumePhase, failure: reason }, repository);
   } catch {
@@ -643,9 +875,16 @@ async function failPromotion(
   }
 }
 
-function resumePhaseFor(phase: PromotionPhase): Exclude<PromotionPhase, "completed" | "failed" | "cancelled"> {
+function resumePhaseFor(phase: PromotionPhase): Exclude<PromotionPhase, "completed" | "blocked" | "failed" | "cancelled"> {
   if (phase === "planned" || phase === "pr-created" || phase === "verifying" || phase === "reviewing" || phase === "awaiting-merge") return phase;
   return "planned";
+}
+
+function cancellationReason(error: unknown, signal?: AbortSignal): string {
+  const reason = signal?.reason ?? error;
+  if (reason instanceof Error && reason.message.trim()) return reason.message;
+  if (typeof reason === "string" && reason.trim()) return reason.trim();
+  return "Promotion cancelled while polling merge admission";
 }
 
 function deterministicPromotionId(repository: string, mode: PromotionMode, sourceBranch: string, targetBranch: string): string {

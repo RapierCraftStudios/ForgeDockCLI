@@ -17,6 +17,7 @@ import {
   HUMAN_DECISION_TOOL,
   MEMORY_SEARCH_TOOL,
   MEMORY_TOOL,
+  ORCHESTRATION_DISCOVERY_TOOL,
   ORCHESTRATION_RESUME_TOOL,
   WORKFLOW_TOOLS,
   activateOnly,
@@ -87,6 +88,7 @@ export default function forgedockExtension(
   let harnessMode: HarnessMode = "assistant";
   let activeWorkflow: Workflow | undefined;
   let orchestrationPromptStarted = false;
+  let orchestrationShellWasActive = false;
   const ensureObserver = async (cwd: string): Promise<ForgeDockObserver> => {
     if (!observer) {
       observer = await createForgeDockObserver(cwd, { component: "forgedock-extension" });
@@ -130,6 +132,7 @@ export default function forgedockExtension(
     clearOrchestrationInvocation(pi);
     deactivateWorkflowTools(pi);
     activateOnly(pi, [
+      ...(orchestrationShellWasActive ? ["bash"] : []),
       CONFIG_TOOL,
       MEMORY_TOOL,
       MEMORY_SEARCH_TOOL,
@@ -139,6 +142,7 @@ export default function forgedockExtension(
       ORCHESTRATION_RESUME_TOOL,
       ...(hasOrchestrationPreview(pi) ? [WORKFLOW_TOOLS.orchestrate, HUMAN_DECISION_TOOL] : []),
     ]);
+    orchestrationShellWasActive = false;
   };
 
   pi.events.on("subagent:async-started", (raw) => {
@@ -169,8 +173,8 @@ export default function forgedockExtension(
     activeWorkflow = undefined;
     // Startup is presentation-only. initialize() may adopt a live controller
     // or terminalize a bridge-bound task, so operational recovery is deferred
-    // until an authorized controller dispatch. Keep the restart warning
-    // visible through a read-only task-directory inspection.
+    // until an authorized controller dispatch. Only records already assigned a
+    // durable TUI-restart terminal cause can produce restart guidance here.
     for (const record of backgroundTasks.pendingRestartRecords(ctx)) {
       backgroundTasks.announceRestartRequired(record);
     }
@@ -223,6 +227,12 @@ export default function forgedockExtension(
     }
     const deepPlanReason = deepPlanToolBlockReason(event.toolName);
     if (deepPlanReason) return { block: true, reason: deepPlanReason };
+    if (event.toolName === "bash" && activeWorkflow === "orchestrate") {
+      return {
+        block: true,
+        reason: "Fresh ForgeDock orchestration membership must use forgedock_discover_orchestration; shell, gh, and Python discovery are unavailable in the active orchestration path.",
+      };
+    }
     if (event.toolName !== "bash") return;
     const command = (event.input as { command?: unknown }).command;
     if (typeof command !== "string" || !isLifecycleControllerShellCommand(command)) return;
@@ -286,7 +296,10 @@ export default function forgedockExtension(
       () => {
         harnessMode = "forgedock-workflow";
         activeWorkflow = workflow;
-        if (workflow === "orchestrate") orchestrationPromptStarted = false;
+        if (workflow === "orchestrate") {
+          orchestrationPromptStarted = false;
+          orchestrationShellWasActive = pi.getActiveTools().includes("bash");
+        }
       },
       restoreAssistantMode,
     );
@@ -464,8 +477,9 @@ async function queueNativeWorkflow(
   const tool = WORKFLOW_TOOLS[command];
   const resumeOrchestrationId = command === "orchestrate" ? explicitOrchestrationResumeId(rawArgs) : undefined;
   activateOnly(pi, command === "orchestrate"
-    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [tool, HUMAN_DECISION_TOOL]
-    : [tool]);
+    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [ORCHESTRATION_DISCOVERY_TOOL, tool, HUMAN_DECISION_TOOL]
+    : [tool],
+  command === "orchestrate" && !resumeOrchestrationId ? ["bash"] : []);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);
   const prompt = buildNativeCommandPrompt(command, rawArgs);
   // Slash-command dispatch itself occupies Pi's prompt pipeline, so deliverAs

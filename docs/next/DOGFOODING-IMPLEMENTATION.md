@@ -1,69 +1,106 @@
-# ForgeDock CLI dogfooding implementation
+# ForgeDock CLI dogfood-readiness certification
 
-Scope: native ForgeDock Next on the `staging` branch only. This checklist is the
-implementation ledger for the GitHub projection, resumability, observation
-security, review policy, and live dogfooding work. It deliberately excludes the
-legacy ForgeDock system.
+**Updated:** 2026-08-18
+**Status:** implementation present; certification open; no readiness claim
 
-## Baseline
+This ledger covers the current ForgeDock Next dogfood-readiness behavior. Checked
+items describe implemented contracts, not live certification. Certification runs in
+the ordered waves below. The word *wave* here refers only to certification order;
+DAG execution itself continuously streams ready nodes and has no topological wave
+barrier.
 
-- [x] Confirm the checkout is `staging` and preserve unrelated untracked files.
-- [x] Confirm the native build and test baseline (`npm run build`, `npm run test:next`).
-- [x] Capture the current live evidence in `.forgedock/orchestrate-watch.md`.
-- [x] Re-run the full gate after the implementation slices; final gate is recorded below.
+## Implemented contract
 
-## P0 — durable review-finding projection
+- [x] Default to one selected issue per visible DAG node and top-level `work-on`
+  slot; treat `maxParallel` as a 1–20 issue-slot budget. Explicit batches consume
+  one slot per member, and available transport may lower dispatch.
+- [x] Keep semantic dependencies separate from release-only conflict claims.
+  Dependencies require an authoritative successful predecessor Outcome. Claims
+  serialize overlapping work only within the same repository and delivery target
+  and release when the predecessor is terminal.
+- [x] Refine predicted claims from frozen Build Packet paths, expose claim waits,
+  and refresh the exact target before dispatch after a claim deferral.
+- [x] Require explicit batching opt-in. Apply typed compatibility to eligible
+  ordinary issues and review findings. Sensitive security/auth groups require
+  exactly two members, shared causal-family evidence, and secondary proof, and are
+  effectively hard-capped at two even though managed config currently defaults the
+  sensitive size to three; priority labels alone do not define compatibility.
+- [x] Convert natural-language selection into typed discovery evidence before the
+  controller validates and freezes membership, routes, dependencies, priorities,
+  and claims.
+- [x] Report selected and runnable-now issue demand plus requested, sampled-
+  transport, and effective caps without labeling runnable demand as active. Show
+  typed semantic-dependency, claim, capacity, suspended-recovery, and decomposition
+  waits. Use controller-observed semantic activity for idle decisions rather than
+  treating raw log-file growth as progress.
+- [x] Use the bounded packet-selected `forgedock.verification/v2` catalog and typed
+  criterion anchors. Require nonempty `github-required` provenance and live passing
+  hosted CI at the exact reviewed SHA for auto-merge.
+- [x] Allow at most two fresh bounded builder repairs. Preserve prior submission/
+  session continuity within one process and durable Outcome continuity after
+  restart; prohibit repair scope expansion and generic-green criterion evidence.
+- [x] Persist exact-head `FindingRootLedger` epochs and schema-v4 closure plans.
+  Omission is not closure. Keep controller-owned `mustFix` separate from final
+  `blocking`; either obligation can force bounded remediation, re-verification, and
+  fresh closure review.
 
-- [x] Define versioned semantic finding identity separately from rendered Markdown.
-- [x] Add durable projection-plan and projection-receipt artifacts.
-- [x] Persist candidate/adopted/drift outcomes in the durable projection receipt and authoritative issue snapshot; retain the generic pending/materialized admission lease for other projections.
-- [x] Reconcile an existing GitHub issue by semantic marker after create/readback drift.
-- [x] Return and persist canonical issue numbers from finding materialization.
-- [x] Make stale-finding cleanup run before the completed receipt; the verdict cannot commit until that receipt exists, and cleanup remains idempotent.
-- [x] Cover create/readback, concurrency/adoption, drift, duplicate/stale cleanup, and publication crash/resume paths.
+## Certification wave 0 — documentation and deterministic gate
 
-## P0 — publication-only resume
+- [x] Synchronize the operator docs with the implemented contracts above.
+- [ ] Pass `npm run build` from the exact candidate checkout.
+- [ ] Pass `npm run test:next` and all focused dogfood-readiness regression tests.
+- [ ] Pass `npm run certify:orchestration`; retain its exact-file command audit and
+  deterministic diagnostics. Use `npm run certify:orchestration:dry-run` to review
+  the mutation-free plan first.
+- [ ] Pass `npm run docs:build`, conformance checks, and available Markdown/link
+  checks.
+- [ ] Record the exact candidate commit and retain the complete command receipts.
 
-- [x] Add an explicit finding-publication checkpoint.
-- [x] Resume unfinished projections without starting another reviewer/model wave.
-- [x] Persist final Review Verdict only after required projection receipts exist.
-- [ ] Add restart tests for every remaining GitHub side-effect boundary; the review-finding publication boundary is covered.
+## Certification wave 1 — focused invariant probes
 
-## P0 — stateful observation security
+- [ ] Prove default one-node/one-slot behavior and `maxParallel` enforcement under
+  lower transport capacity.
+- [ ] Prove semantic dependency success admission separately from terminal claim
+  release, including cross-repository and cross-target non-conflicts.
+- [ ] Prove dynamic Build Packet claim refinement, truthful wait projection, and
+  exact-target refresh after a deferred claim clears.
+- [ ] Prove batching is absent by default and that explicit batching accepts only
+  typed-compatible members, including sensitive compatibility and size limits.
+- [ ] Prove observation-backed activity prevents false idle cancellation without
+  allowing output noise to keep a stalled controller alive.
 
-- [x] Add per-stream terminal parser state across output chunks.
-- [x] Fail closed after dropped chunks until an explicit lifecycle reset.
-- [x] Preserve parser/masking state across identity refreshes and isolate sibling streams.
-- [x] Add streaming credential masking with bounded holdback.
-- [x] Remove raw dropped payload retention.
-- [x] Add split-sequence, split-secret, dropped-stream, reset, and boundary tests.
+## Certification wave 2 — controlled lifecycle and fault injection
 
-## P1 — review quality and platform reliability
+- [ ] Prove packet-scoped local verification, criterion-evidence binding, retained
+  builder repair, and scope refusal on a failing fixture.
+- [ ] Prove required CI is re-read live for the exact SHA and that stale, pending,
+  failed, contradictory, or unavailable observations block.
+- [ ] Prove durable finding-root continuity, delta classification, `mustFix`
+  remediation, fresh exact-SHA review, and crash/resume at each durable boundary.
+- [ ] Prove no duplicate issue, worker, PR, finding root, publication, or closure
+  across interruption and resume.
 
-- [ ] Run the impact policy in shadow mode against real staging PRs.
-- [ ] Enforce impact-gated issue projection only after the canary passes.
-- [ ] Verify exact turn/tool budget accounting and truthful phase telemetry.
-- [ ] Add deterministic context/index caching after correctness is stable.
-- [ ] Exercise Windows/WSL, worktree cleanup, and process-family recovery.
+## Certification wave 3 — small live staging DAGs
 
-## Live dogfood gate
+- [ ] Use fresh, controlled staging issues rather than a noisy backlog.
+- [ ] Run independent, semantic-dependency, same-target claim-conflict, and
+  non-conflicting cross-target cases with batching disabled.
+- [ ] Repeat with explicit compatible batching, including a sensitive rejection.
+- [ ] Exercise no-finding, advisory-only, nonblocking-`mustFix`, blocking,
+  builder-repair, pending-CI, failed-CI, and successful completion paths.
+- [ ] Verify the board, task output, GitHub artifacts, exact SHAs, merges, issue
+  closures, and cleanup against live authority.
 
-- [ ] Use a fresh small native staging DAG, not the existing noisy batch as the success fixture.
-- [ ] Exercise no-finding, blocking-finding, advisory-only, partial-publication, remediation, and crash/resume cases.
-- [ ] Prove one canonical issue per logical finding and zero duplicate or premature closures.
-- [ ] Prove publication resume performs no duplicate reviewer work.
-- [ ] Prove final verdict, PR SHA, remediation, merge, parent closure, and cleanup.
-- [ ] Complete three to five successful native staging runs.
+## Certification wave 4 — repeated canary and release decision
 
-## Release
+- [ ] Complete three to five fresh native staging runs with no unexplained manual
+  repair, duplicate side effect, false activity, false slot occupancy, or stale-SHA
+  approval.
+- [ ] Review failures and rerun any affected earlier wave after a code or policy
+  change.
+- [ ] Record an explicit maintainer certification decision against one immutable
+  candidate SHA.
 
-- [x] Update the native implementation checklist and changelog.
-- [x] Commit the complete staging change set (`ec8abbcc`).
-- [x] Push `staging` and open staging -> main PR #320.
-- [x] Pass CI and review the exact merge candidate (hosted checks all passed).
-- [x] Merge to `main` and verify the resulting remote state (`69bf65e1`).
-- [x] Publish the merged release to npm as `forgedockcli@1.8.1` and verify the registry tarball (GitHub Actions OIDC run `32041554350`; `latest` and `https://registry.npmjs.org/forgedockcli/-/forgedockcli-1.8.1.tgz` verified).
-
-The live canary section remains intentionally open: local and hosted regression
-gates prove the implementation, but they do not substitute for three to five
-fresh native staging runs against a controlled small DAG.
+Until every required wave is complete, documentation may say the behavior is
+implemented, but must not call the candidate dogfood-ready, certified, or ready for
+release.

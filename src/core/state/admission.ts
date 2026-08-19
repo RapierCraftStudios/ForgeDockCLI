@@ -60,7 +60,9 @@ export function isRepairableVerificationFailure(
   const noChanges = /^Builder produced no repository changes$/i.test(reason);
   const dispatchedRepair = evidence.repairAttempt !== undefined;
   const legacyBuilderEvidence = evidence.criterionCoverage === undefined;
-  const recognizedFailure = dispatchedRepair
+  const recognizedFailure = evidence.failureKind === "builder-semantic-evidence"
+    || evidence.failureKind === "builder-report"
+    || dispatchedRepair
     || legacyBuilderEvidence
     || noChanges
     || /^Required verification failed(?::|$)/i.test(reason)

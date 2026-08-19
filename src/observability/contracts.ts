@@ -128,10 +128,13 @@ export interface ObservationQuery {
   scopeKey?: string;
   forgeRunId?: string;
   orchestrationId?: string;
+  controllerTaskId?: string;
   source?: ObservationSource;
   channel?: ObservationChannel;
   kinds?: readonly string[];
   sinceRunSequence?: number;
+  /** Event ID returned by a previous query. Only later journal entries are returned; unknown IDs are rejected. */
+  cursor?: string;
   limit?: number;
   newestFirst?: boolean;
 }
@@ -148,9 +151,12 @@ export interface ObservationRetentionResult {
   remainingEvents: number;
 }
 
-export interface ObservationStore {
-  append(draft: ObservationDraft): Promise<ObservationEnvelopeV1>;
+export interface ObservationQuerySource {
   query(query?: ObservationQuery): Promise<ObservationEnvelopeV1[]>;
+}
+
+export interface ObservationStore extends ObservationQuerySource {
+  append(draft: ObservationDraft): Promise<ObservationEnvelopeV1>;
   prune(scopeKey: string | undefined, policy: ObservationRetentionPolicy): Promise<ObservationRetentionResult>;
   close(): void;
 }

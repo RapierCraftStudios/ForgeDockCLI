@@ -218,7 +218,7 @@ describe("evidence-backed review planning", () => {
     const diff = paths.map((path) => `diff --git a/${path} b/${path}\n+export const changed = true;`).join("\n");
     const plan = planReviewPanel({ changedPaths: paths, diff, packet: packet() });
     const correctness = plan.executionGroups.filter(({ role }) => role === "correctness");
-    assert.equal(plan.schemaVersion, 3);
+    assert.equal(plan.schemaVersion, 4);
     assert.equal(correctness.length, 3);
     assert.ok(correctness.every(({ scope }) => scope.length > 0 && scope.length <= 24));
     assert.deepEqual(correctness[0]?.scope, paths.slice(0, 24));

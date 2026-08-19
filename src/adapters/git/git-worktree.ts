@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { GitWorkspace, GitWorkspaceManager, PullRequestRepairWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -173,6 +173,18 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
+  async assertPristineAtHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
+    assertSha(expectedHeadSha, "expected pristine workspace HEAD");
+    const mergeHead = await this.readMergeHead(workspace);
+    if (mergeHead) throw new Error(`Workspace has merge ${mergeHead} in progress`);
+    const observedHead = await this.head(workspace);
+    if (observedHead.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      throw new Error(`Workspace HEAD ${observedHead} does not match expected pristine head ${expectedHeadSha}`);
+    }
+    const changed = await this.changedPaths(workspace);
+    if (changed.length) throw new Error(`Workspace has changed delivery paths: ${changed.join(", ")}`);
+  }
+
   async changedPaths(workspace: GitWorkspace): Promise<string[]> {
     const output = await this.git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], workspace.path);
     const paths = new Set<string>();
@@ -199,26 +211,91 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     return [...new Set(output.split("\0").filter((path) => path && !isOperationalPath(path)))].sort();
   }
 
+  async fastForwardToRemoteTarget(workspace: GitWorkspace, advertisedHeadSha: string): Promise<GitWorkspace> {
+    assertSha(advertisedHeadSha, "advertised remote target SHA");
+    if (!workspace.baseSha) throw new Error("Target refresh requires a frozen workspace base SHA");
+    assertSha(workspace.baseSha, "frozen workspace base SHA");
+
+    const fetchedHead = await this.fastForwardCleanRemoteRef(workspace, {
+      purpose: "target-refresh",
+      remoteRef: this.remoteBaseRef(workspace.baseRef),
+      expectedHeadSha: advertisedHeadSha,
+      expectedCurrentSha: workspace.baseSha,
+    });
+    await this.git(["config", `branch.${workspace.branch}.forgedockBaseSha`, fetchedHead], this.#repo);
+    return { ...workspace, baseSha: fetchedHead };
+  }
+
   async syncToRemoteHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
+    await this.fastForwardCleanRemoteRef(workspace, {
+      purpose: "retained-sync",
+      remoteRef: `refs/heads/${workspace.branch}`,
+      expectedHeadSha,
+    });
+  }
+
+  private async fastForwardCleanRemoteRef(
+    workspace: GitWorkspace,
+    input: {
+      purpose: "target-refresh" | "retained-sync";
+      remoteRef: string;
+      expectedHeadSha: string;
+      expectedCurrentSha?: string;
+    },
+  ): Promise<string> {
+    const targetRefresh = input.purpose === "target-refresh";
+    assertSha(input.expectedHeadSha, targetRefresh ? "advertised remote target SHA" : "authoritative PR head SHA");
+
+    const mergeHead = await this.readMergeHead(workspace);
+    if (mergeHead) {
+      throw new Error(targetRefresh
+        ? `Cannot refresh workspace while merge ${mergeHead} is in progress`
+        : `Cannot synchronize retained workspace while merge ${mergeHead} is in progress`);
+    }
     const dirty = await this.changedPaths(workspace);
-    if (dirty.length) throw new Error(`Cannot synchronize dirty retained workspace: ${dirty.join(", ")}`);
-    const fetched = await this.fetchRemoteCommit(`refs/heads/${workspace.branch}`, workspace.path);
-    if (fetched.toLowerCase() !== expectedHeadSha.toLowerCase()) {
-      throw new Error(`Fetched parent branch head ${fetched} does not match authoritative PR head ${expectedHeadSha}`);
+    if (dirty.length) {
+      throw new Error(targetRefresh
+        ? `Cannot refresh dirty workspace: ${dirty.join(", ")}`
+        : `Cannot synchronize dirty retained workspace: ${dirty.join(", ")}`);
     }
-    const current = await this.head(workspace);
-    if (current.toLowerCase() !== expectedHeadSha.toLowerCase()) {
-      try {
-        await this.git(["merge-base", "--is-ancestor", current, expectedHeadSha], workspace.path);
-      } catch (error) {
-        throw new Error(`Retained workspace ${current} cannot fast-forward to parent head ${expectedHeadSha}`, { cause: error });
+
+    const currentHead = await this.head(workspace);
+    if (input.expectedCurrentSha && currentHead.toLowerCase() !== input.expectedCurrentSha.toLowerCase()) {
+      throw new Error(`Workspace head ${currentHead} has advanced beyond frozen base ${input.expectedCurrentSha}; refusing to refresh a partially built revision`);
+    }
+
+    const fetchedHead = await this.fetchRemoteCommit(input.remoteRef, workspace.path);
+    if (fetchedHead.toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+      if (targetRefresh) throw new AdvertisedRemoteHeadMismatchError(input.expectedHeadSha, fetchedHead);
+      throw new Error(`Fetched parent branch head ${fetchedHead} does not match authoritative PR head ${input.expectedHeadSha}`);
+    }
+    if (currentHead.toLowerCase() !== fetchedHead.toLowerCase()) {
+      if (!await this.isAncestor(workspace, currentHead, fetchedHead)) {
+        throw new Error(targetRefresh
+          ? `Frozen workspace base ${currentHead} is not an ancestor of advertised target ${fetchedHead}`
+          : `Retained workspace ${currentHead} cannot fast-forward to parent head ${fetchedHead}`);
       }
-      await this.git(["merge", "--ff-only", expectedHeadSha], workspace.path);
+      await this.git(["merge", "--ff-only", fetchedHead], workspace.path);
     }
-    const synchronized = await this.head(workspace);
-    if (synchronized.toLowerCase() !== expectedHeadSha.toLowerCase()) {
-      throw new Error(`Retained workspace synchronized to ${synchronized}, expected ${expectedHeadSha}`);
+
+    const synchronizedHead = await this.head(workspace);
+    if (synchronizedHead.toLowerCase() !== fetchedHead.toLowerCase()) {
+      throw new Error(targetRefresh
+        ? `Workspace refreshed to ${synchronizedHead}, expected exact target ${fetchedHead}`
+        : `Retained workspace synchronized to ${synchronizedHead}, expected ${fetchedHead}`);
     }
+    if (await this.readMergeHead(workspace)) {
+      throw new Error(targetRefresh
+        ? "Fast-forward target refresh unexpectedly left a merge in progress"
+        : "Fast-forward retained workspace synchronization unexpectedly left a merge in progress");
+    }
+    const dirtyAfter = await this.changedPaths(workspace);
+    if (dirtyAfter.length) {
+      throw new Error(targetRefresh
+        ? `Fast-forward target refresh left a dirty workspace: ${dirtyAfter.join(", ")}`
+        : `Fast-forward retained workspace synchronization left a dirty workspace: ${dirtyAfter.join(", ")}`);
+    }
+    return fetchedHead;
   }
 
   async integrateRemoteBase(
@@ -571,7 +648,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       && parents[1]!.toLowerCase() === expectedBaseSha;
   }
 
-  private async commitParents(workspace: GitWorkspace): Promise<string[]> {
+  async commitParents(workspace: GitWorkspace): Promise<string[]> {
     const output = (await this.git(["rev-list", "--parents", "-n", "1", "HEAD"], workspace.path)).trim();
     const values = output.split(/\s+/u).filter(Boolean);
     if (!values[0] || !isSha(values[0]) || values.slice(1).some((value) => !isSha(value))) {
@@ -580,7 +657,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     return values.slice(1);
   }
 
-  /** Fetch an advertised commit without mutating shared tracking refs or FETCH_HEAD. */
+  /** Fetch an advertised commit through a unique private ref, then delete it. */
   private async fetchRemoteCommit(remoteRef: string, cwd: string): Promise<string> {
     const advertised = await this.git(["ls-remote", "--exit-code", "origin", remoteRef], cwd);
     const matches = advertised.split(/\r?\n/)
@@ -589,14 +666,22 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     if (matches.length !== 1 || !/^[0-9a-f]{40,64}$/i.test(matches[0]?.[0] ?? "")) {
       throw new Error(`Remote ref ${remoteRef} did not resolve to exactly one commit`);
     }
-    const sha = matches[0]![0]!;
-    await this.git(["fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", remoteRef], cwd);
+    const advertisedSha = matches[0]![0]!;
+    const privateRef = `refs/forgedock/fetch/${randomUUID()}`;
     try {
-      await this.git(["cat-file", "-e", `${sha}^{commit}`], cwd);
-    } catch (error) {
-      throw new Error(`Remote ref ${remoteRef} changed while fetching advertised commit ${sha}`, { cause: error });
+      await this.git([
+        "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin",
+        `+${remoteRef}:${privateRef}`,
+      ], cwd);
+      const fetchedSha = (await this.git(["rev-parse", "--verify", `${privateRef}^{commit}`], cwd)).trim();
+      if (!isSha(fetchedSha)) throw new Error(`Fetched private ref ${privateRef} did not resolve to a commit`);
+      if (fetchedSha.toLowerCase() !== advertisedSha.toLowerCase()) {
+        throw new AdvertisedRemoteHeadMismatchError(advertisedSha, fetchedSha);
+      }
+      return fetchedSha;
+    } finally {
+      await this.git(["update-ref", "-d", privateRef], cwd);
     }
-    return sha;
   }
 
   private async withRepositoryMetadataLock<T>(operation: () => Promise<T>): Promise<T> {

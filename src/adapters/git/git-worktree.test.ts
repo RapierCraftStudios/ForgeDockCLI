@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
+import { AdvertisedRemoteHeadMismatchError } from "../../core/ports/git-workspace.js";
 import { GitWorktreeManager } from "./git-worktree.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -102,6 +103,43 @@ function advanceRemoteBase(fixture: Awaited<ReturnType<typeof remoteBaseIntegrat
   git(repo, "commit", "-m", "advance base again");
   git(repo, "push", "origin", "main");
   return git(repo, "rev-parse", "HEAD");
+}
+
+async function targetRefreshFixture(): Promise<{
+  root: string;
+  repo: string;
+  manager: GitWorktreeManager;
+  workspace: Awaited<ReturnType<GitWorktreeManager["create"]>>;
+  baseSha: string;
+  targetSha: string;
+}> {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-git-target-refresh-"));
+  const repo = join(root, "repo");
+  const remote = join(root, "remote.git");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "ForgeDock Test");
+  git(repo, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(repo, "README.md"), "base\n");
+  git(repo, "add", "README.md");
+  git(repo, "commit", "-m", "base");
+  git(repo, "branch", "-M", "main");
+  git(repo, "remote", "add", "origin", remote);
+  git(repo, "push", "-u", "origin", "main");
+  const baseSha = git(repo, "rev-parse", "HEAD");
+  const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
+  const workspace = await manager.create({ runId: "run_target_refresh", issue: 24, baseRef: "origin/main" });
+  writeFileSync(join(repo, "target.txt"), "new target\n");
+  git(repo, "add", "target.txt");
+  git(repo, "commit", "-m", "advance target");
+  git(repo, "push", "origin", "main");
+  const targetSha = git(repo, "rev-parse", "HEAD");
+  return { root, repo, manager, workspace, baseSha, targetSha };
+}
+
+async function removeTargetRefreshFixture(fixture: Awaited<ReturnType<typeof targetRefreshFixture>>): Promise<void> {
+  try { await fixture.manager.remove(fixture.workspace); }
+  finally { rmSync(fixture.root, { recursive: true, force: true }); }
 }
 
 describe("isolated Git worktrees", () => {
@@ -586,6 +624,11 @@ describe("isolated Git worktrees", () => {
     assert.deepEqual(processWorkspaces.map((candidate) => candidate.baseSha), [fetchedSha, fetchedSha, fetchedSha, fetchedSha]);
     assert.equal(git(repo, "rev-parse", "refs/remotes/origin/main"), baseSha);
     assert.equal(
+      git(repo, "for-each-ref", "--format=%(refname)", "refs/forgedock/fetch"),
+      "",
+      "each private fetch receipt ref must be deleted",
+    );
+    assert.equal(
       readFileSync(join(workspace.path, "README.md"), "utf8").replaceAll("\r\n", "\n"),
       "fetched\n",
     );
@@ -595,6 +638,141 @@ describe("isolated Git worktrees", () => {
     for (const candidate of processWorkspaces) await manager.remove(candidate);
     for (const candidate of parallel) await manager.remove(candidate);
     await manager.remove(workspace);
+  });
+
+  it("fast-forwards an untouched workspace to the exact advertised target and updates base metadata", async () => {
+    const fixture = await targetRefreshFixture();
+    try {
+      const refreshed = await fixture.manager.fastForwardToRemoteTarget(fixture.workspace, fixture.targetSha);
+      assert.equal(refreshed.baseSha, fixture.targetSha);
+      assert.equal(await fixture.manager.head(refreshed), fixture.targetSha);
+      assert.equal(git(fixture.repo, "config", `branch.${fixture.workspace.branch}.forgedockBaseSha`), fixture.targetSha);
+      assert.equal(readFileSync(join(refreshed.path, "target.txt"), "utf8"), "new target\n");
+      assert.deepEqual(await fixture.manager.changedPaths(refreshed), []);
+      await fixture.manager.assertPristineAtHead(refreshed, fixture.targetSha);
+      await assert.rejects(
+        fixture.manager.assertPristineAtHead(refreshed, fixture.baseSha),
+        /does not match expected pristine head/i,
+      );
+      writeFileSync(join(refreshed.path, "unexpected.txt"), "dirty\n");
+      await assert.rejects(
+        fixture.manager.assertPristineAtHead(refreshed, fixture.targetSha),
+        /changed delivery paths/i,
+      );
+      unlinkSync(join(refreshed.path, "unexpected.txt"));
+      const mergeHeadPath = git(refreshed.path, "rev-parse", "--git-path", "MERGE_HEAD");
+      writeFileSync(resolve(refreshed.path, mergeHeadPath), `${fixture.targetSha}\n`);
+      await assert.rejects(
+        fixture.manager.assertPristineAtHead(refreshed, fixture.targetSha),
+        /merge .* in progress/i,
+      );
+      unlinkSync(resolve(refreshed.path, mergeHeadPath));
+    } finally {
+      await removeTargetRefreshFixture(fixture);
+    }
+  });
+
+  it("rejects stale advertised, dirty, merging, and divergent target refreshes without reset", async () => {
+    const stale = await targetRefreshFixture();
+    try {
+      await assert.rejects(
+        stale.manager.fastForwardToRemoteTarget(stale.workspace, stale.baseSha),
+        AdvertisedRemoteHeadMismatchError,
+      );
+      assert.equal(await stale.manager.head(stale.workspace), stale.baseSha);
+    } finally {
+      await removeTargetRefreshFixture(stale);
+    }
+
+    const dirty = await targetRefreshFixture();
+    try {
+      writeFileSync(join(dirty.workspace.path, "partial.txt"), "partial\n");
+      await assert.rejects(
+        dirty.manager.fastForwardToRemoteTarget(dirty.workspace, dirty.targetSha),
+        /Cannot refresh dirty workspace/,
+      );
+      assert.equal(await dirty.manager.head(dirty.workspace), dirty.baseSha);
+      assert.equal(readFileSync(join(dirty.workspace.path, "partial.txt"), "utf8"), "partial\n");
+    } finally {
+      await removeTargetRefreshFixture(dirty);
+    }
+
+    const merging = await targetRefreshFixture();
+    try {
+      restoreMergeHead(merging.workspace.path, merging.targetSha);
+      await assert.rejects(
+        merging.manager.fastForwardToRemoteTarget(merging.workspace, merging.targetSha),
+        /merge .* is in progress/,
+      );
+      assert.equal(await merging.manager.head(merging.workspace), merging.baseSha);
+    } finally {
+      await removeTargetRefreshFixture(merging);
+    }
+
+    const divergent = await targetRefreshFixture();
+    try {
+      writeFileSync(join(divergent.workspace.path, "delivery.txt"), "delivery\n");
+      git(divergent.workspace.path, "add", "delivery.txt");
+      git(divergent.workspace.path, "commit", "-m", "partial delivery");
+      const deliveryHead = git(divergent.workspace.path, "rev-parse", "HEAD");
+      await assert.rejects(
+        divergent.manager.fastForwardToRemoteTarget(divergent.workspace, divergent.targetSha),
+        /advanced beyond frozen base/,
+      );
+      assert.equal(await divergent.manager.head(divergent.workspace), deliveryHead);
+      assert.equal(existsSync(join(divergent.workspace.path, "delivery.txt")), true);
+    } finally {
+      await removeTargetRefreshFixture(divergent);
+    }
+  });
+
+  it("synchronizes a clean retained workspace to the exact fetched parent head", async () => {
+    const fixture = await targetRefreshFixture();
+    try {
+      writeFileSync(join(fixture.workspace.path, "parent.txt"), "parent update\n");
+      git(fixture.workspace.path, "add", "parent.txt");
+      git(fixture.workspace.path, "commit", "-m", "advance parent branch");
+      const parentHead = git(fixture.workspace.path, "rev-parse", "HEAD");
+      git(fixture.workspace.path, "push", "origin", `HEAD:refs/heads/${fixture.workspace.branch}`);
+      git(fixture.workspace.path, "reset", "--hard", fixture.baseSha);
+
+      await fixture.manager.syncToRemoteHead(fixture.workspace, parentHead);
+
+      assert.equal(await fixture.manager.head(fixture.workspace), parentHead);
+      assert.equal(readFileSync(join(fixture.workspace.path, "parent.txt"), "utf8"), "parent update\n");
+      assert.deepEqual(await fixture.manager.changedPaths(fixture.workspace), []);
+      assert.throws(() => git(fixture.workspace.path, "rev-parse", "--verify", "MERGE_HEAD"));
+    } finally {
+      await removeTargetRefreshFixture(fixture);
+    }
+  });
+
+  it("rejects dirty and merging retained workspace synchronization before mutation", async () => {
+    const dirty = await targetRefreshFixture();
+    try {
+      git(dirty.workspace.path, "push", "origin", `HEAD:refs/heads/${dirty.workspace.branch}`);
+      writeFileSync(join(dirty.workspace.path, "partial.txt"), "partial\n");
+      await assert.rejects(
+        dirty.manager.syncToRemoteHead(dirty.workspace, dirty.baseSha),
+        /Cannot synchronize dirty retained workspace/,
+      );
+      assert.equal(await dirty.manager.head(dirty.workspace), dirty.baseSha);
+    } finally {
+      await removeTargetRefreshFixture(dirty);
+    }
+
+    const merging = await targetRefreshFixture();
+    try {
+      git(merging.workspace.path, "push", "origin", `HEAD:refs/heads/${merging.workspace.branch}`);
+      restoreMergeHead(merging.workspace.path, merging.baseSha);
+      await assert.rejects(
+        merging.manager.syncToRemoteHead(merging.workspace, merging.baseSha),
+        /Cannot synchronize retained workspace while merge .* is in progress/,
+      );
+      assert.equal(await merging.manager.head(merging.workspace), merging.baseSha);
+    } finally {
+      await removeTargetRefreshFixture(merging);
+    }
   });
 
   it("rejects recovery when the frozen workspace base does not belong to the requested lane", async () => {

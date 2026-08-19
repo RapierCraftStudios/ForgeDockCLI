@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type ControllerVerificationGate, type DurableArtifact, type VerificationRequirement } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand } from "../../core/ports/verification.js";
@@ -21,9 +22,13 @@ import {
 } from "../../runtime/agent-runtime.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
+import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
+
+type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
+  & Partial<Omit<VerificationCommand, "cwd" | "id" | "command" | "args">>;
 
 export interface VerificationCatalog {
-  commands: readonly Pick<VerificationCommand, "id" | "command" | "args">[];
+  commands: readonly VerificationCatalogEntry[];
   controllerGates: readonly ControllerVerificationGate[];
 }
 
@@ -81,7 +86,10 @@ export async function prepareBuildPacket(
         "Map verificationPlan to the acceptance criteria through typed verificationRequirements. Each requirement must use exactly one allowed command ID or controller-gate ID from the supplied catalog, include one or more criterion-N IDs, and explain its rationale. Do not invent command IDs or shell strings.",
         "The legacy verificationPlan field is retained only for compatibility; emit one exact controller-gate:<id> token or one fenced executable command per typed requirement. Never encode controller-owned lifecycle evidence as prose.",
         "Allowed command IDs and controller gate IDs are supplied below. Unknown IDs, unfenced executable prose, and requirements that do not cover every acceptance criterion are rejected before the builder starts.",
-        `Verification catalog: ${JSON.stringify(input.verificationCatalog ?? { commands: [], controllerGates: CONTROLLER_VERIFICATION_GATES })}`,
+        `Verification catalog: ${JSON.stringify({
+          commands: (input.verificationCatalog?.commands ?? []).map(({ id, command, args }) => ({ id, command, args })),
+          controllerGates: input.verificationCatalog?.controllerGates ?? CONTROLLER_VERIFICATION_GATES,
+        })}`,
         "State exclusions explicitly. Do not modify the repository.",
       ].join("\n"),
       context: [input.intent, input.investigation, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
@@ -127,12 +135,27 @@ export async function prepareBuildPacket(
     )
       ? canonicalizePacketVerification(result.output, input.verificationCatalog)
       : result.output;
+    const {
+      verificationPolicyVersion: _untrustedPolicyVersion,
+      verificationCommandTargets: _untrustedCommandTargets,
+      invariantMatrices: _untrustedInvariantMatrices,
+      ...controllerVerifiedOutput
+    } = verifiedOutput;
+    const policyMetadata = input.verificationCatalog
+      ? packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, input.verificationCatalog.commands)
+      : {};
+    const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
       subject: run.subject,
       producer: { role: "packet-author", runtime: "pi-compatible", provider: result.provider, model: result.model },
-      payload: { ...verifiedOutput, expectedPaths },
+      payload: {
+        ...controllerVerifiedOutput,
+        expectedPaths,
+        ...policyMetadata,
+        ...(invariantMatrices.length ? { invariantMatrices } : {}),
+      },
     });
     await dependencies.artifacts.append(packet);
     run = attachArtifact(run, "BuildPacket", packet.id);
@@ -223,7 +246,7 @@ function canonicalizePacketVerification(
 function matchLegacyCommand(
   entry: string,
   commands: VerificationCatalog["commands"],
-): Pick<VerificationCommand, "id" | "command" | "args"> | undefined {
+): VerificationCatalogEntry | undefined {
   const normalizedEntry = entry.trim().toLowerCase();
   const exactCommand = commands.find((command) => {
     const invocation = [command.command, ...command.args].join(" ").trim().toLowerCase();
@@ -237,6 +260,143 @@ function matchLegacyCommand(
     const script = command.args.at(-1)?.toLowerCase();
     return value.includes(command.id.toLowerCase()) || (script !== undefined && value.includes(script));
   }));
+}
+
+function packetVerificationPolicyMetadata(
+  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements">,
+  catalog: readonly VerificationCatalogEntry[],
+): Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets"> {
+  const selectedIds = packet.verificationRequirements?.length
+    ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
+    : new Set(catalog.map((command) => command.id));
+  for (const command of catalog) if (command.selection === "always") selectedIds.add(command.id);
+  const selected = catalog.filter((command) => selectedIds.has(command.id));
+  const policyVersions = [...new Set(selected.map((command) => command.policyVersion).filter((value): value is string => Boolean(value)))];
+  const [policyVersion, ...additionalPolicyVersions] = policyVersions;
+  if (!policyVersion) return {};
+  if (additionalPolicyVersions.length) throw new Error("Selected verification catalog mixes incompatible policy versions");
+  const targeted = selected.filter((command) => command.targeting === "expected-test-paths");
+  const layout = targeted[0]?.typescriptLayout;
+  if (targeted.length && targeted.some((command) => JSON.stringify(command.typescriptLayout) !== JSON.stringify(layout))) {
+    throw new Error("Selected targeted verification commands disagree on source/output layout");
+  }
+  const expectedTestPaths = targeted.length
+    ? canonicalizeConcreteScopePaths(packet.expectedPaths)
+      .filter(isNodeTestPath)
+      .map((path) => compiledTestTarget(path, layout))
+    : [];
+  return {
+    verificationPolicyVersion: policyVersion,
+    verificationCommandTargets: selected.map((command) => ({
+      id: command.id,
+      targets: command.targeting === "expected-test-paths" ? expectedTestPaths : [],
+    })),
+  };
+}
+
+/** Materialize the exact bounded command plan selected by one frozen packet. */
+export function selectPacketVerificationCommands(
+  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements" | "verificationPolicyVersion" | "verificationCommandTargets">,
+  catalog: readonly Omit<VerificationCommand, "cwd">[],
+  baseSha: string,
+): Array<Omit<VerificationCommand, "cwd">> {
+  if (!/^[0-9a-f]{7,64}$/i.test(baseSha)) throw new Error(`Cannot freeze verification plan for invalid base SHA ${baseSha}`);
+  const commandById = new Map<string, Omit<VerificationCommand, "cwd">>();
+  for (const command of catalog) {
+    if (commandById.has(command.id)) throw new Error(`Verification catalog contains duplicate command ID '${command.id}'`);
+    commandById.set(command.id, command);
+  }
+
+  for (const requirement of packet.verificationRequirements ?? []) {
+    if (requirement.kind === "command" && !commandById.has(requirement.id)) {
+      throw new Error(`Frozen Build Packet references unavailable verification command '${requirement.id}'`);
+    }
+  }
+  const typedRequirements = packet.verificationRequirements;
+  const selectedIds = typedRequirements?.length
+    ? new Set(typedRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
+    : new Set(catalog.map((command) => command.id));
+  for (const id of selectedIds) {
+    if (!commandById.has(id)) throw new Error(`Frozen Build Packet references unavailable verification command '${id}'`);
+  }
+  for (const command of catalog) {
+    if (command.selection === "always" || command.id === "diff-check") selectedIds.add(command.id);
+  }
+
+  const targetedCommands = catalog.filter((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
+  const layouts = targetedCommands.flatMap((command) => command.typescriptLayout ? [command.typescriptLayout] : []);
+  if (targetedCommands.length && layouts.length !== targetedCommands.length) {
+    throw new Error("Targeted verification command has no controller-proven source/output layout");
+  }
+  const layout = layouts[0];
+  if (layouts.some((candidate) => JSON.stringify(candidate) !== JSON.stringify(layout))) {
+    throw new Error("Targeted verification commands disagree on source/output layout");
+  }
+  const expectedTestPaths = canonicalizeConcreteScopePaths(packet.expectedPaths)
+    .filter(isNodeTestPath)
+    .map((path) => compiledTestTarget(path, layout));
+  if (expectedTestPaths.length > 32) {
+    throw new Error(`Build Packet selects ${expectedTestPaths.length} test paths; targeted verification is bounded to 32`);
+  }
+  const targetedSelected = catalog.some((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
+  if (typedRequirements?.length && expectedTestPaths.length && !targetedSelected) {
+    throw new Error("Build Packet declares expected test paths without selecting the targeted test command");
+  }
+
+  const selected = catalog.filter((command) => selectedIds.has(command.id)).map((command) => {
+    if (command.targeting === undefined) return { ...command };
+    if (command.targeting !== "expected-test-paths") {
+      throw new Error(`Verification command '${command.id}' has unsupported targeting policy`);
+    }
+    if (!expectedTestPaths.length && typedRequirements?.length) {
+      throw new Error(`Verification command '${command.id}' requires at least one expected test path`);
+    }
+    return {
+      ...command,
+      args: [...command.args, ...expectedTestPaths],
+      targets: expectedTestPaths,
+    };
+  });
+  if (packet.verificationPolicyVersion) {
+    const mismatched = selected.filter((command) => command.policyVersion !== packet.verificationPolicyVersion);
+    if (mismatched.length) {
+      throw new Error(`Frozen verification policy ${packet.verificationPolicyVersion} does not match command(s): ${mismatched.map((command) => command.id).join(", ")}`);
+    }
+  }
+  if (packet.verificationCommandTargets) {
+    const actualTargets = selected.map((command) => ({ id: command.id, targets: [...(command.targets ?? [])] }));
+    if (JSON.stringify(actualTargets) !== JSON.stringify(packet.verificationCommandTargets)) {
+      throw new Error("Frozen verification command targets do not match the executable packet-selected plan");
+    }
+  }
+  if (selected.length && !selected.some((command) => command.required)) throw new Error("Selected verification plan has no required command");
+  const planId = createHash("sha256").update(JSON.stringify({
+    baseSha: baseSha.toLowerCase(),
+    commands: selected.map(({ id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot }) => ({
+      id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot,
+    })),
+  })).digest("hex").slice(0, 16);
+  return selected.map((command) => ({ ...command, planId }));
+}
+
+function isNodeTestPath(path: string): boolean {
+  return /(?:^|\/)\S+\.test\.(?:[cm]?[jt]sx?)$/i.test(path);
+}
+
+function compiledTestTarget(
+  path: string,
+  layout: VerificationCommand["typescriptLayout"] | undefined,
+): string {
+  if (!layout) throw new Error(`Cannot target compiled test '${path}' without a controller-proven TypeScript layout`);
+  const normalized = path.replaceAll("\\", "/");
+  const sourcePrefix = `${layout.sourceRoot.replace(/\/$/, "")}/`;
+  if (!normalized.startsWith(sourcePrefix)) {
+    throw new Error(`Targeted test '${path}' is outside the frozen TypeScript source root ${layout.sourceRoot}`);
+  }
+  const extension = /\.(tsx?|mts|cts)$/i.exec(normalized)?.[1]?.toLowerCase();
+  const compiledExtension = extension === "mts" ? "mjs" : extension === "cts" ? "cjs" : extension ? "js" : undefined;
+  if (!compiledExtension) throw new Error(`Targeted test '${path}' has no supported TypeScript output extension`);
+  return `${layout.outputRoot.replace(/\/$/, "")}/${normalized.slice(sourcePrefix.length).replace(/\.(?:tsx?|mts|cts)$/i, `.${compiledExtension}`)}`;
 }
 
 async function runPacketAuthorWithRecovery(

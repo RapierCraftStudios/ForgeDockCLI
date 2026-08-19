@@ -73,6 +73,8 @@ describe("Build Packet preparation", () => {
         verificationPlan: ["free-form lifecycle prose"],
         controllerGates: [{ id: "staging-review", description: "Validate staging" }],
         verificationRequirements: [{ kind: "controller-gate", id: "staging-review", criterionIds: ["criterion-1"], rationale: "The controller owns staging validation." }],
+        verificationPolicyVersion: "forged-policy",
+        verificationCommandTargets: [{ id: "forged", targets: ["everything"] }],
       },
     ]);
     const artifacts = new InMemoryArtifactRepository();
@@ -85,12 +87,17 @@ describe("Build Packet preparation", () => {
     const prepared = await prepareBuildPacket({
       run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
       verificationCatalog: {
-        commands: [{ id: "test", command: "npm", args: ["test"] }],
+        commands: [{
+          id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 1_000, required: true,
+          selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+        }],
         controllerGates: [{ id: "staging-review", description: "Validate staging" }],
       },
     }, { runtime, artifacts, runs });
     assert.deepEqual(prepared.packet.payload.verificationPlan, ["controller-gate:staging-review"]);
     assert.deepEqual(prepared.packet.payload.verificationRequirements?.map((requirement) => requirement.id), ["staging-review"]);
+    assert.equal(prepared.packet.payload.verificationPolicyVersion, "forgedock.verification/v2");
+    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "diff-check", targets: [] }]);
   });
 
   it("rejects controller-owned verification prose before the builder can start", async () => {

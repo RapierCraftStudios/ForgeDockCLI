@@ -128,6 +128,7 @@ export function materializedPlanToScheduledWorkItems(
 		return {
 			id: planNodeWorkItemId(packet.sessionId, packet.revision, node.id),
 			issue: result.issue.number,
+			repository: materialization.repo,
 			priority: node.priority,
 			dependencies: [...node.dependsOn]
 				.sort()

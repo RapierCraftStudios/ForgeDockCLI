@@ -5,6 +5,14 @@ import { buildSchedulePreview, ClaimPromotionConflictError, claimsConflict, InMe
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for scheduler state");
+    await sleep(2);
+  }
+}
+
 function deferredSignal(): { promise: Promise<void>; resolve(): void } {
   let resolve!: () => void;
   const promise = new Promise<void>((accept) => { resolve = accept; });
@@ -18,6 +26,78 @@ function deferredGate(): { promise: Promise<void>; release: () => void } {
 }
 
 describe("lean orchestration scheduler", () => {
+  it("treats maxParallel as issue slots for contracted nodes", async () => {
+    const gates = new Map(["batch-a", "single", "batch-b"].map((id) => [id, deferredGate()] as const));
+    const started: string[] = [];
+    const activeSlots = new Map<string, number>();
+    let maximumSlots = 0;
+    const execution = runSchedule([
+      { id: "batch-a", issue: 10, priority: 1, dependencies: [], claims: [], memberIssues: [1, 2] },
+      { id: "single", issue: 20, priority: 1, dependencies: [], claims: [], memberIssues: [3] },
+      { id: "batch-b", issue: 30, priority: 1, dependencies: [], claims: [], memberIssues: [4, 5] },
+    ], 3, async (scheduled) => {
+      const slots = scheduled.memberIssues?.length ?? 1;
+      started.push(scheduled.id);
+      activeSlots.set(scheduled.id, slots);
+      maximumSlots = Math.max(maximumSlots, [...activeSlots.values()].reduce((sum, value) => sum + value, 0));
+      await gates.get(scheduled.id)!.promise;
+      activeSlots.delete(scheduled.id);
+    });
+
+    await waitFor(() => started.length === 2);
+    assert.deepEqual(started, ["batch-a", "single"]);
+    gates.get("single")!.release();
+    await sleep(10);
+    assert.deepEqual(started, ["batch-a", "single"], "two occupied issue slots leave no room for another two-member batch");
+    gates.get("batch-a")!.release();
+    await waitFor(() => started.length === 3);
+    assert.deepEqual(started, ["batch-a", "single", "batch-b"]);
+    gates.get("batch-b")!.release();
+    const result = await execution;
+    assert.equal(maximumSlots, 3);
+    assert.ok([...result.status.values()].every((status) => status === "completed"));
+  });
+
+  it("precomputes issue-slot weights while polling queued work", async () => {
+    const reads = new Map<string, number>();
+    const weightedItem = (id: string, issue: number, memberIssues: readonly number[]): ScheduledWorkItem => {
+      const value: ScheduledWorkItem = { id, issue, priority: issue, dependencies: [], claims: [] };
+      Object.defineProperty(value, "memberIssues", {
+        enumerable: true,
+        get() {
+          reads.set(id, (reads.get(id) ?? 0) + 1);
+          return memberIssues;
+        },
+      });
+      return value;
+    };
+    const firstGate = deferredGate();
+    let capacitySamples = 0;
+    const execution = runSchedule([
+      weightedItem("first", 1, [1, 2]),
+      weightedItem("second", 2, [3, 4]),
+    ], 2, async (scheduled) => {
+      if (scheduled.id === "first") await firstGate.promise;
+    }, {
+      capacity: () => { capacitySamples++; return 2; },
+      capacityPollMs: 2,
+    });
+
+    try {
+      await waitFor(() => capacitySamples >= 4);
+      const readsAfterAdmission = [...reads.values()].reduce((sum, count) => sum + count, 0);
+      await waitFor(() => capacitySamples >= 8);
+      assert.equal(
+        [...reads.values()].reduce((sum, count) => sum + count, 0),
+        readsAfterAdmission,
+        "capacity polling must use the validated slot index rather than rescan active and queued items",
+      );
+    } finally {
+      firstGate.release();
+    }
+    assert.ok([...(await execution).status.values()].every((status) => status === "completed"));
+  });
+
   it("backpressures a live capacity drop and resumes queued work when slots return", async () => {
     let available = 2;
     const gates = new Map(["a", "b", "c", "d"].map((id) => [id, deferredGate()] as const));
@@ -58,6 +138,31 @@ describe("lean orchestration scheduler", () => {
     assert.deepEqual(result.startOrder, ["a", "b", "c", "d"]);
     assert.ok([...result.status.values()].every((status) => status === "completed"));
     assert.equal(maximumActive, 2);
+  });
+
+  it("emits and deduplicates dynamic capacity wait reasons before dispatch", async () => {
+    let available = 0;
+    let capacitySamples = 0;
+    const events: Array<{ type: string; reason: import("./scheduler.js").WaitReason | undefined }> = [];
+    const execution = runSchedule(
+      [{ id: "waiting", issue: 1, priority: 1, dependencies: [], claims: [] }],
+      1,
+      async () => undefined,
+      {
+        capacity: () => { capacitySamples++; return available; },
+        capacityPollMs: 2,
+        onEvent: (event) => events.push({ type: event.type, reason: event.waitReasons?.get("waiting") }),
+      },
+    );
+
+    await waitFor(() => capacitySamples >= 4);
+    assert.equal(events.filter(({ reason }) => reason?.kind === "capacity").length, 1);
+    assert.deepEqual(events.find(({ reason }) => reason?.kind === "capacity")?.reason, { kind: "capacity", maxParallel: 0 });
+    available = 1;
+    await execution;
+    const capacityIndex = events.findIndex(({ reason }) => reason?.kind === "capacity");
+    const startedIndex = events.findIndex(({ type, reason }) => type === "started" && reason === undefined);
+    assert.ok(capacityIndex >= 0 && startedIndex > capacityIndex);
   });
 
   it("allows a permanently unavailable transport queue to be cancelled", async () => {
@@ -189,6 +294,102 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("second"), "completed");
   });
 
+  it("emits and clears a dispatch-time active claim wait reason", async () => {
+    const firstGate = deferredGate();
+    const events: Array<{ type: string; itemId: string | undefined; reason: import("./scheduler.js").WaitReason | undefined }> = [];
+    const schedule = runSchedule([
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"] },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: ["src/shared/file.ts"] },
+    ], 2, async (scheduled) => {
+      if (scheduled.id === "first") await firstGate.promise;
+    }, {
+      serializationEdges: [],
+      onEvent: (event) => events.push({
+        type: event.type,
+        itemId: event.itemId,
+        reason: event.waitReasons?.get("second"),
+      }),
+    });
+
+    await waitFor(() => events.some(({ reason }) => reason?.kind === "active-claim-conflict"));
+    assert.equal(events.filter(({ reason }) => reason?.kind === "active-claim-conflict").length, 1);
+    assert.deepEqual(events.find(({ reason }) => reason?.kind === "active-claim-conflict")?.reason, {
+      kind: "active-claim-conflict",
+      node: "first",
+      claims: ["src/shared/file.ts ↔ src/shared"],
+    });
+    firstGate.release();
+    await schedule;
+    const waitingIndex = events.findIndex(({ reason }) => reason?.kind === "active-claim-conflict");
+    const startedIndex = events.findIndex(({ type, itemId, reason }) =>
+      type === "started" && itemId === "second" && reason === undefined,
+    );
+    assert.ok(waitingIndex >= 0 && startedIndex > waitingIndex);
+  });
+
+  it("serializes overlapping claims only on the same known repository and target route", () => {
+    const sameRoute = materializeClaimDependencies([
+      { id: "same-a", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"], repository: "Owner/Repo", targetBranch: "main" },
+      { id: "same-b", issue: 2, priority: 1, dependencies: [], claims: ["src/shared/file.ts"], repository: "owner/repo", targetBranch: "main" },
+    ]);
+    assert.deepEqual(sameRoute.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["same-a", "same-b"]]);
+    assert.deepEqual(sameRoute.items.map((item) => item.dependencies), [[], []], "claim ordering must remain release-only");
+
+    const isolatedRoutes = materializeClaimDependencies([
+      { id: "repo-a", issue: 3, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/repo-a", targetBranch: "main" },
+      { id: "repo-b", issue: 4, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/repo-b", targetBranch: "main" },
+      { id: "target-b", issue: 5, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/repo-a", targetBranch: "release" },
+    ]);
+    assert.deepEqual(isolatedRoutes.edges, []);
+  });
+
+  it("keeps missing legacy repository or target evidence conservative", () => {
+    const materialized = materializeClaimDependencies([
+      { id: "known", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/repo", targetBranch: "main" },
+      { id: "missing-repository", issue: 2, priority: 1, dependencies: [], claims: ["src/shared"], targetBranch: "other" },
+      { id: "missing-target", issue: 3, priority: 1, dependencies: [], claims: ["src/shared"], repository: "other/repo" },
+    ]);
+    assert.deepEqual(materialized.edges.map(({ predecessor, successor }) => [predecessor, successor]), [
+      ["known", "missing-repository"],
+      ["missing-repository", "missing-target"],
+    ]);
+  });
+
+  it("keeps known unrelated routes streaming while same-route overlap waits", async () => {
+    const firstGate = deferredGate();
+    const otherGate = deferredGate();
+    const started: string[] = [];
+    const schedule = runSchedule([
+      { id: "same-first", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/repo", targetBranch: "main" },
+      { id: "same-second", issue: 2, priority: 1, dependencies: [], claims: ["src/shared/file.ts"], repository: "owner/repo", targetBranch: "main" },
+      { id: "other-repo", issue: 3, priority: 1, dependencies: [], claims: ["src/shared"], repository: "owner/other", targetBranch: "main" },
+    ], 3, async (scheduled) => {
+      started.push(scheduled.id);
+      if (scheduled.id === "same-first") await firstGate.promise;
+      if (scheduled.id === "other-repo") await otherGate.promise;
+    });
+
+    await waitFor(() => started.length === 2);
+    assert.deepEqual(started, ["same-first", "other-repo"]);
+    firstGate.release();
+    await waitFor(() => started.length === 3);
+    assert.deepEqual(started, ["same-first", "other-repo", "same-second"]);
+    otherGate.release();
+    await schedule;
+  });
+
+  it("allows promoted overlapping claims on different known targets", async () => {
+    const promoted: string[] = [];
+    const result = await runSchedule([
+      { id: "main", issue: 1, priority: 1, dependencies: [], claims: [], repository: "owner/repo", targetBranch: "main" },
+      { id: "release", issue: 2, priority: 1, dependencies: [], claims: [], repository: "owner/repo", targetBranch: "release" },
+    ], 2, async (_scheduled, scheduler) => {
+      await scheduler.promoteClaims(["src/shared"]);
+    }, { onClaimsPromoted: (id) => { promoted.push(id); } });
+    assert.deepEqual(promoted.sort(), ["main", "release"]);
+    assert.ok([...result.status.values()].every((status) => status === "completed"));
+  });
+
   it("materializes claim conflicts as stable DAG edges instead of static batches", () => {
     const materialized = materializeClaimDependencies([
       { id: "a", issue: 1, priority: 2, dependencies: [], claims: ["src/core"] },
@@ -201,6 +402,24 @@ describe("lean orchestration scheduler", () => {
     assert.deepEqual(preview.initialReady.map((item) => item.id), ["c", "a"]);
     assert.equal(preview.criticalPath.length, 2);
     assert.equal(preview.criticalPath[0]?.id, "a");
+    assert.deepEqual(preview.issueSlots, { total: 4, initialReady: 2 });
+  });
+
+  it("keeps unrelated known route partitions off the claim frontier", () => {
+    const count = 500;
+    const diagnostics = { conflictCandidates: 0, reachabilityChecks: 0, reachabilityNodeVisits: 0, frontierUpdates: 0 };
+    const materialized = materializeClaimDependencies(Array.from({ length: count }, (_, index) => ({
+      id: `route-${index}`,
+      issue: index + 1,
+      priority: 1,
+      dependencies: [],
+      claims: ["src/shared"],
+      repository: `owner/repo-${index}`,
+      targetBranch: "main",
+    })), diagnostics);
+    assert.deepEqual(materialized.edges, []);
+    assert.equal(diagnostics.conflictCandidates, 0);
+    assert.equal(diagnostics.reachabilityChecks, 0);
   });
 
   it("keeps dense shared fallback claims sparse and dispatches every node exactly once", async () => {
@@ -371,8 +590,8 @@ describe("lean orchestration scheduler", () => {
     let releaseFirst!: () => void;
     const promoted: Array<[string, string[]]> = [];
     const resultPromise = runSchedule([
-      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
-      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [] },
+      { id: "first", issue: 1, priority: 1, dependencies: [], claims: [], repository: "owner/repo", targetBranch: "main" },
+      { id: "second", issue: 2, priority: 1, dependencies: [], claims: [], repository: "owner/repo", targetBranch: "main" },
     ], 2, async (item, scheduler) => {
       await scheduler.promoteClaims([item.id === "first" ? "src/**/*.ts" : "src/foo.ts"]);
       if (item.id === "first") await new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -451,6 +670,7 @@ describe("lean orchestration scheduler", () => {
     const releaseFirst = deferredSignal();
     const attempts = new Map<string, number>();
     const events: Array<{ type: string; itemId?: string }> = [];
+    let deferredMessage = "";
 
     const schedule = runSchedule([
       { id: "first", issue: 1, priority: 1, dependencies: [], claims: [] },
@@ -468,6 +688,7 @@ describe("lean orchestration scheduler", () => {
         await scheduler.promoteClaims(["src/shared/file.ts"]);
       } catch (error) {
         if (!(error instanceof ClaimPromotionConflictError)) throw error;
+        deferredMessage = error.message;
         secondSuspended.resolve();
         return { status: "suspended", error };
       }
@@ -483,6 +704,8 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.errors.has("second"), false);
     assert.equal(attempts.get("first"), 1);
     assert.equal(attempts.get("second"), 2);
+    assert.match(deferredMessage, /deferred.*scheduler will retry automatically after release/);
+    assert.doesNotMatch(deferredMessage, /explicit.*resume|resume required/i);
     assert.deepEqual(result.startOrder, ["first", "second", "second"]);
     assert.ok(events.some((event) => event.type === "suspended" && event.itemId === "second"));
     assert.ok(events.some((event) => event.type === "resumed" && event.itemId === "second"));

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ClaimPromotionConflictError } from "../workflows/orchestrate/scheduler.js";
 import {
+  ClaimPromotionRecoveryError,
   promoteOrchestrationClaims,
   promoteOrchestrationClaimsFromEnvironment,
   startOrchestrationClaimPromotionServer,
@@ -96,4 +97,59 @@ test("claim promotion rejects stale attempt identity and partial transport confi
   } finally {
     await server.close();
   }
+});
+
+test("deterministic receipts make repeated promotion delivery idempotent", async () => {
+  let promotions = 0;
+  const server = await startOrchestrationClaimPromotionServer({
+    identity,
+    promoteClaims: async () => { promotions++; },
+  });
+  try {
+    assert.equal(await promoteOrchestrationClaimsFromEnvironment(["src/b.ts", "src/a.ts"], server.env), "promoted");
+    assert.equal(await promoteOrchestrationClaimsFromEnvironment(["src/a.ts", "src/b.ts"], server.env), "promoted");
+    assert.equal(promotions, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a lost success receipt is reconciled by idempotent replay", async () => {
+  let promotions = 0;
+  const server = await startOrchestrationClaimPromotionServer({
+    identity,
+    promoteClaims: async () => { promotions++; },
+  });
+  const originalFetch = globalThis.fetch;
+  let discardFirstReceipt = true;
+  globalThis.fetch = async (resource, init) => {
+    const response = await originalFetch(resource, init);
+    if (!discardFirstReceipt) return response;
+    discardFirstReceipt = false;
+    await response.arrayBuffer();
+    return new Response(null, { status: 200 });
+  };
+  try {
+    assert.equal(await promoteOrchestrationClaimsFromEnvironment(["src/a.ts"], server.env), "promoted");
+    assert.equal(promotions, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await server.close();
+  }
+});
+
+test("an unavailable receipt is a recoverable ambiguous promotion", async () => {
+  await assert.rejects(
+    () => promoteOrchestrationClaimsFromEnvironment(["src/a.ts"], {
+      FORGEDOCK_CLAIM_PROMOTION_URL: "http://127.0.0.1:1/v1/orchestration/claims",
+      FORGEDOCK_CLAIM_PROMOTION_TOKEN: "token",
+      FORGEDOCK_ORCHESTRATION_ID: identity.orchestrationId,
+      FORGEDOCK_ORCHESTRATION_NODE: identity.nodeId,
+      FORGEDOCK_ORCHESTRATION_ATTEMPT: identity.attemptId,
+    }),
+    (error: unknown) => error instanceof ClaimPromotionRecoveryError
+      && error.recoverable
+      && error.operationId.length === 64
+      && error.claimsDigest.length === 64,
+  );
 });

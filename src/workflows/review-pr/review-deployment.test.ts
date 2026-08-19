@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DEFAULT_REVIEW_CI } from "../../core/config/forgedock-config.js";
-import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { GitWorkspace } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
@@ -33,6 +33,17 @@ class DeploymentHost implements ForgeHost {
   pullRequestSnapshots: PullRequestSnapshot[] = [];
   requiredChecks: PullRequestMergeGate["requiredChecks"] = [{ name: "CI", state: "passed" }];
   mergeGateIdentity: Partial<Pick<PullRequestMergeGate, "repo" | "pullRequest" | "headSha" | "baseBranch">> = {};
+  publicationFence: ReviewFindingPublicationFence | undefined;
+  async beginReviewFindingPublication(input: { repo: string; pullRequest: PullRequestSnapshot; runId: string }) {
+    this.publicationFence = {
+      repo: input.repo, pullRequest: input.pullRequest.number,
+      generation: (this.publicationFence?.generation ?? 0) + 1,
+      runId: input.runId, headSha: input.pullRequest.headSha,
+      headBranch: input.pullRequest.headBranch, baseBranch: input.pullRequest.baseBranch,
+    };
+    return { ...this.publicationFence };
+  }
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence) { assert.deepEqual(fence, this.publicationFence); }
 
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.pullRequest; }
@@ -49,6 +60,8 @@ class DeploymentHost implements ForgeHost {
       baseBranch,
       ...this.mergeGateIdentity,
       mergeable: true,
+      requiredChecksProvenance: "github-required",
+      requiredChecksHeadSha: headSha,
       requiredChecks: [...this.requiredChecks],
       observedAt: new Date().toISOString(),
     };
@@ -107,7 +120,7 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual(result.verdict.payload.checks, [{ command: "GitHub required check: CI", status: "passed", durationMs: 0 }]);
     assert.ok(runtime.tasks.length > 0);
     assert.ok(runtime.tasks.every((task) => !task.context.some((artifact) => artifact.kind === "BuildResult")));
-    assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict"]);
+    assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["FindingRootLedger", "ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict"]);
     assertNoDeploymentGate(host.publications);
     assert.equal(workspaces.removed, true);
   });

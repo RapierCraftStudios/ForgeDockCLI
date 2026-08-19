@@ -223,6 +223,7 @@ describe("confirmed Deep Plan handoff", () => {
 			first.map((item) => item.issue),
 			[101, 103, 102],
 		);
+		assert.ok(first.every((item) => item.repository === REPO));
 		assert.deepEqual(first[1]?.dependencies, [
 			planNodeWorkItemId("plan-stable", 3, "build"),
 		]);

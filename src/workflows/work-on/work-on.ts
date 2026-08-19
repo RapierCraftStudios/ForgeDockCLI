@@ -2,7 +2,7 @@
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
-import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
@@ -13,6 +13,7 @@ import {
 } from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
+import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { buildWorkItem, type BuilderSubmission } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 import {
@@ -21,12 +22,12 @@ import {
   resumeInvestigationWorkItem,
   WorkflowExecutionError,
 } from "./investigate.js";
-import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket } from "./prepare.js";
+import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
-import { verifyAndCommit, type VerificationResult } from "./verify.js";
+import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, type VerificationResult } from "./verify.js";
 import { recoverConflictingRevision } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
@@ -57,6 +58,10 @@ export interface WorkOnResult {
   awaitingHuman?: boolean;
 }
 
+type VerificationCatalogResolver = (
+  baseSha: string,
+) => readonly Omit<VerificationCommand, "cwd">[] | Promise<readonly Omit<VerificationCommand, "cwd">[]>;
+
 interface ScopeExpansionOptions {
   scopeExpansion?: "scope-locked" | "recursive";
   parentRemediation?: ParentRemediationTarget;
@@ -64,6 +69,116 @@ interface ScopeExpansionOptions {
   maxRemediationChildren?: number;
   remediationDepth?: number;
   approvedPaths?: readonly string[];
+}
+
+async function prepareCleanPreBuilderExecution(
+  input: {
+    run: RunState;
+    packet: DurableArtifact<"BuildPacket">;
+    workspace: GitWorkspace;
+    baseBranch: string;
+    verification: readonly Omit<VerificationCommand, "cwd">[];
+    resolveVerificationCatalog?: VerificationCatalogResolver;
+    baselineChecks?: readonly CheckResult[];
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<{
+  workspace: GitWorkspace;
+  verification: readonly Omit<VerificationCommand, "cwd">[];
+  baselineChecks: readonly CheckResult[];
+}> {
+  if (!dependencies.git.fastForwardToRemoteTarget) {
+    throw new Error("Git workspace manager cannot perform an exact target fast-forward");
+  }
+  const fastForwardToRemoteTarget = dependencies.git.fastForwardToRemoteTarget.bind(dependencies.git);
+  if (!dependencies.host.getBranchHead) {
+    throw new Error("Host cannot advertise an authoritative target branch SHA for pre-builder refresh");
+  }
+  await dependencies.runs.recordProgress({
+    runId: input.run.runId,
+    phase: "workspace.target-refresh.started",
+    message: `Refreshing clean workspace to the authoritative ${input.baseBranch} head`,
+    occurredAt: new Date().toISOString(),
+  });
+
+  let refreshed: GitWorkspace | undefined;
+  let lastMismatch: AdvertisedRemoteHeadMismatchError | undefined;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const advertised = await dependencies.host.getBranchHead(input.run.subject.repo, input.baseBranch);
+    if (!/^[0-9a-f]{7,64}$/i.test(advertised)) {
+      throw new Error(`Host advertised invalid target SHA '${advertised}' for ${input.baseBranch}`);
+    }
+    try {
+      refreshed = await fastForwardToRemoteTarget(input.workspace, advertised);
+      break;
+    } catch (error) {
+      if (!(error instanceof AdvertisedRemoteHeadMismatchError)) throw error;
+      lastMismatch = error;
+    }
+  }
+  if (!refreshed) {
+    throw new Error("Authoritative target advanced repeatedly while refreshing the build workspace", { cause: lastMismatch });
+  }
+  if (!refreshed.baseSha) throw new Error("Target refresh did not return a frozen base SHA");
+
+  const catalog = input.resolveVerificationCatalog
+    ? await input.resolveVerificationCatalog(refreshed.baseSha)
+    : input.verification;
+  const verification = selectPacketVerificationCommands(input.packet.payload, catalog, refreshed.baseSha);
+  const commands = verification.map((command) => ({ ...command, cwd: refreshed.path }));
+  await dependencies.git.prepareWorkspaceDependencies(refreshed);
+  await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after dependency preparation");
+  const baselineChecks = input.baselineChecks
+    ? [...input.baselineChecks]
+    : await dependencies.verifier.run(
+      commands,
+      input.signal,
+      verificationProgressRecorder(input.run.runId, "baseline", dependencies.runs),
+    );
+  await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after baseline verification");
+  await dependencies.runs.recordProgress({
+    runId: input.run.runId,
+    phase: "workspace.target-refresh.completed",
+    message: `Workspace and ${verification.length} selected verification command(s) are frozen at ${refreshed.baseSha}`,
+    occurredAt: new Date().toISOString(),
+  });
+  return { workspace: refreshed, verification, baselineChecks };
+}
+
+async function assertPristineWorkspace(
+  workspace: GitWorkspace,
+  expectedHeadSha: string,
+  dependencies: WorkOnDependencies,
+  phase: string,
+): Promise<void> {
+  if (dependencies.git.assertPristineAtHead) {
+    try {
+      await dependencies.git.assertPristineAtHead(workspace, expectedHeadSha);
+      return;
+    } catch (error) {
+      throw new Error(`Workspace pristine assertion failed ${phase}`, { cause: error });
+    }
+  }
+  // Compatibility fallback for legacy/in-memory workspace managers. Production
+  // adapters implement the stronger assertion, including MERGE_HEAD evidence.
+  const [head, changed] = await Promise.all([
+    dependencies.git.head(workspace),
+    dependencies.git.changedPaths(workspace),
+  ]);
+  if (head.toLowerCase() !== expectedHeadSha.toLowerCase() || changed.length) {
+    throw new Error(`Workspace pristine assertion failed ${phase}: expected ${expectedHeadSha}, observed ${head}${changed.length ? ` with changed paths ${changed.join(", ")}` : ""}`);
+  }
+}
+
+function frozenPacketCommands(
+  packet: DurableArtifact<"BuildPacket">,
+  catalog: readonly Omit<VerificationCommand, "cwd">[],
+  workspace: GitWorkspace,
+): VerificationCommand[] {
+  if (!workspace.baseSha) throw new Error("Frozen packet verification requires an exact workspace base SHA");
+  return selectPacketVerificationCommands(packet.payload, catalog, workspace.baseSha)
+    .map((command) => ({ ...command, cwd: workspace.path }));
 }
 
 export async function workOn(
@@ -74,6 +189,8 @@ export async function workOn(
     lane: IssueLane;
     scopeHints?: ScopeHints;
     verification: readonly Omit<VerificationCommand, "cwd">[];
+    /** Re-read the controller catalog from the exact post-admission base SHA. */
+    resolveVerificationCatalog?: VerificationCatalogResolver;
     baselineChecks?: readonly CheckResult[];
     provider?: string;
     model?: string;
@@ -208,7 +325,7 @@ export async function workOn(
       ...runtimeOptions,
       ...planningOptions,
       verificationCatalog: {
-        commands: input.verification.map(({ id, command, args }) => ({ id, command, args })),
+        commands: input.verification.map((command) => ({ ...command })),
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
@@ -218,11 +335,22 @@ export async function workOn(
     claimPromotionPending = true;
     await input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     claimPromotionPending = false;
+    const preBuilder = await prepareCleanPreBuilderExecution({
+      run,
+      packet: prepared.packet,
+      workspace,
+      baseBranch: deliveryBranch,
+      verification: input.verification,
+      ...(input.resolveVerificationCatalog !== undefined ? { resolveVerificationCatalog: input.resolveVerificationCatalog } : {}),
+      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, dependencies);
+    workspace = preBuilder.workspace;
     const continued = await continueBuildDelivery({
       run, intent: input.intent, investigation: investigated.investigation, packet: prepared.packet, workspace,
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
-      baseBranch: deliveryBranch, verification: input.verification,
-      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      baseBranch: deliveryBranch, verification: preBuilder.verification,
+      baselineChecks: preBuilder.baselineChecks,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.autoMerge !== undefined ? { autoMerge: input.autoMerge } : {}),
@@ -251,7 +379,9 @@ export async function workOn(
       }
       throw error;
     }
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
@@ -281,6 +411,8 @@ export interface EarlyWorkOnResumeInput extends ScopeExpansionOptions {
   baseBranch: string;
   scopeHints?: ScopeHints;
   verification: readonly Omit<VerificationCommand, "cwd">[];
+  /** Re-read the controller catalog from the exact post-admission base SHA. */
+  resolveVerificationCatalog?: VerificationCatalogResolver;
   baselineChecks?: readonly CheckResult[];
   provider?: string;
   model?: string;
@@ -312,7 +444,7 @@ export async function resumeEarlyWorkOn(
   dependencies = guardMutationBoundaries(dependencies);
   let run = input.run;
   let investigation = input.investigation;
-  const workspace = input.workspace;
+  let workspace = input.workspace;
   let claimPromotionSuspended = false;
   let claimPromotionPending = false;
   let retainWorkspaceForRecovery = false;
@@ -390,7 +522,7 @@ export async function resumeEarlyWorkOn(
       ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       verificationCatalog: {
-        commands: input.verification.map(({ id, command, args }) => ({ id, command, args })),
+        commands: input.verification.map((command) => ({ ...command })),
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
@@ -400,16 +532,27 @@ export async function resumeEarlyWorkOn(
     claimPromotionPending = true;
     await input.onClaimsPromoted?.(prepared.packet.payload.expectedPaths);
     claimPromotionPending = false;
+    const preBuilder = await prepareCleanPreBuilderExecution({
+      run,
+      packet: prepared.packet,
+      workspace,
+      baseBranch: input.baseBranch,
+      verification: input.verification,
+      ...(input.resolveVerificationCatalog !== undefined ? { resolveVerificationCatalog: input.resolveVerificationCatalog } : {}),
+      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, dependencies);
+    workspace = preBuilder.workspace;
     const continued = await continueBuildDelivery({
       run,
       intent: input.intent,
       investigation,
       packet: prepared.packet,
       workspace,
-      baseBranch: input.baseBranch,
-      verification: input.verification,
       ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
-      ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+      baseBranch: input.baseBranch,
+      verification: preBuilder.verification,
+      baselineChecks: preBuilder.baselineChecks,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.autoMerge !== undefined ? { autoMerge: input.autoMerge } : {}),
@@ -439,7 +582,9 @@ export async function resumeEarlyWorkOn(
       }
       throw error;
     }
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
@@ -498,12 +643,15 @@ export async function resumeBuildWorkOn(
     intent: DurableArtifact<"Intent">;
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
+    verificationCheckpoint?: DurableArtifact<"VerificationCheckpoint">;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
     priorVerificationRepairAttempts?: number;
     repairContext?: readonly DurableArtifact[];
     workspace: GitWorkspace;
     baseBranch: string;
     verification: readonly Omit<VerificationCommand, "cwd">[];
+    /** Re-read the controller catalog from the exact post-admission base SHA. */
+    resolveVerificationCatalog?: VerificationCatalogResolver;
     baselineChecks?: readonly CheckResult[];
     provider?: string;
     model?: string;
@@ -570,8 +718,65 @@ export async function resumeBuildWorkOn(
     } else {
       assertExactPacketClaims(input.packet.payload.expectedPaths, input.preflightedPacketClaims);
     }
+
+    if (input.verificationCheckpoint) {
+      const recovered = await recoverVerificationCheckpoint({
+        run,
+        checkpoint: input.verificationCheckpoint,
+        workspace: input.workspace,
+      }, {
+        git: dependencies.git,
+        artifacts: dependencies.artifacts,
+        runs: dependencies.runs,
+      });
+      if (!recovered.buildResult) throw new Error("Verified commit recovery did not reconstruct a Build Result");
+      run = recovered.run;
+      const result = await resumePublicationWorkOn({
+        ...input,
+        run,
+        buildResult: recovered.buildResult,
+      }, dependencies);
+      run = result.run;
+      return result;
+    }
+
+    let executionWorkspace = input.workspace;
+    let executionVerification = input.verification;
+    let executionBaseline = input.baselineChecks;
+    const pristinePaths = await dependencies.git.changedPaths(input.workspace);
+    const currentHead = await dependencies.git.head(input.workspace);
+    const pristinePreBuilder = pristinePaths.length === 0
+      && input.workspace.baseSha !== undefined
+      && currentHead.toLowerCase() === input.workspace.baseSha.toLowerCase()
+      && input.priorVerificationFailure === undefined;
+    if (pristinePreBuilder) {
+      const preBuilder = await prepareCleanPreBuilderExecution({
+        run,
+        packet: input.packet,
+        workspace: input.workspace,
+        baseBranch: input.baseBranch,
+        verification: input.verification,
+        ...(input.resolveVerificationCatalog !== undefined ? { resolveVerificationCatalog: input.resolveVerificationCatalog } : {}),
+        ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      }, dependencies);
+      executionWorkspace = preBuilder.workspace;
+      executionVerification = preBuilder.verification;
+      executionBaseline = preBuilder.baselineChecks;
+    } else if (input.packet.payload.verificationRequirements?.length && input.workspace.baseSha) {
+      // A partially built revision stays on its frozen base. Selection is pure;
+      // target refresh and baseline execution must never touch retained edits.
+      executionVerification = selectPacketVerificationCommands(
+        input.packet.payload,
+        input.verification,
+        input.workspace.baseSha,
+      );
+    }
     const result = await continueBuildDelivery({
       ...input,
+      workspace: executionWorkspace,
+      verification: executionVerification,
+      ...(executionBaseline !== undefined ? { baselineChecks: executionBaseline } : {}),
       run,
       priorVerificationRepairAttempts: repairAttempts,
       ...(priorVerificationFailure ? { priorVerificationFailure } : {}),
@@ -585,7 +790,9 @@ export async function resumeBuildWorkOn(
       retainWorkspaceForRecovery = true;
       throw error;
     }
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
@@ -611,6 +818,7 @@ async function verifyWithBuilderRepairs(
     investigation: DurableArtifact<"Investigation">;
     packet: DurableArtifact<"BuildPacket">;
     submission: BuilderSubmission;
+    builderSessionRef?: string;
     repairContext?: readonly DurableArtifact[];
     priorVerificationRepairAttempts?: number;
     workspace: GitWorkspace;
@@ -625,6 +833,7 @@ async function verifyWithBuilderRepairs(
 ): Promise<VerificationResult> {
   let run = input.run;
   let submission = input.submission;
+  let builderSessionRef = input.builderSessionRef;
   let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -677,16 +886,22 @@ async function verifyWithBuilderRepairs(
       investigation: input.investigation,
       packet: input.packet,
       priorVerificationFailure: checkpoint.outcome,
+      priorSubmission: submission,
+      ...(builderSessionRef !== undefined ? { priorBuilderSessionRef: builderSessionRef } : {}),
       ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
       worktree: input.workspace.path,
+      verification: input.commands,
+      verificationRunner: dependencies.verifier,
       ...runtimeOptions,
     }, {
       runtime: dependencies.runtime,
       runs: dependencies.runs,
+      verifier: dependencies.verifier,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
     run = repaired.run;
     submission = repaired.submission;
+    builderSessionRef = repaired.sessionRef;
   }
 }
 
@@ -732,6 +947,10 @@ async function continueBuildDelivery(
   };
   let run = input.run;
   const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  if (input.priorVerificationFailure === undefined) {
+    if (!input.workspace.baseSha) throw new Error("Builder dispatch requires an exact frozen workspace base SHA");
+    await assertPristineWorkspace(input.workspace, input.workspace.baseSha, dependencies, "immediately before builder dispatch");
+  }
   const built = await buildWorkItem({
     run, intent: input.intent, investigation: input.investigation, packet: input.packet,
     ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
@@ -754,6 +973,7 @@ async function continueBuildDelivery(
     investigation: input.investigation,
     packet: input.packet,
     submission: built.submission,
+    builderSessionRef: built.sessionRef,
     ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
     priorVerificationRepairAttempts: input.priorVerificationRepairAttempts ?? 0,
     workspace: input.workspace,
@@ -826,6 +1046,7 @@ async function continueBuildDelivery(
       investigation: input.investigation,
       packet: input.packet,
       submission: remediated.submission,
+      builderSessionRef: remediated.sessionRef,
       repairContext: [buildResult, verdict],
       workspace: input.workspace,
       commands,
@@ -848,6 +1069,7 @@ async function continueBuildDelivery(
     run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
     ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
     ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
   }, dependencies);
   return { run: completed.run, pullRequest, awaitingHuman: completed.awaitingHuman };
 }
@@ -909,7 +1131,7 @@ export async function resumeWorkOn(
     decisions: evidence.decisions ?? [],
     residualRisks: evidence.residualRisks ?? [],
   };
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const commands = frozenPacketCommands(input.packet, input.verification, input.workspace);
   try {
     let verified = await verifyWithBuilderRepairs({
       run,
@@ -969,9 +1191,10 @@ export async function resumeWorkOn(
       }
       const remediated = await remediateReview({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path, ...runtimeOptions,
+        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path,
+        verification: commands, verificationRunner: dependencies.verifier, ...runtimeOptions,
       }, {
-        runtime: dependencies.runtime, runs: dependencies.runs,
+        runtime: dependencies.runtime, runs: dependencies.runs, verifier: dependencies.verifier,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       });
       run = remediated.run;
@@ -981,6 +1204,7 @@ export async function resumeWorkOn(
         investigation: input.investigation,
         packet: input.packet,
         submission: remediated.submission,
+        builderSessionRef: remediated.sessionRef,
         repairContext: [buildResult, verdict],
         workspace: input.workspace,
         commands,
@@ -1001,12 +1225,15 @@ export async function resumeWorkOn(
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
@@ -1084,7 +1311,7 @@ export async function resumeReviewWorkOn(
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   };
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const commands = frozenPacketCommands(input.packet, input.verification, input.workspace);
   let buildResult = input.buildResult;
   let pullRequest = input.pullRequest;
   let verdict = input.priorVerdict;
@@ -1098,6 +1325,7 @@ export async function resumeReviewWorkOn(
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
         findingIssuePolicy: "all",
+        allowSameHeadReassessment: true,
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
         reviewCycle: { current: cycle + 1, total: remediationLimit + 1 },
@@ -1122,6 +1350,7 @@ export async function resumeReviewWorkOn(
           run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
           ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
           ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
         }, dependencies);
         run = completed.run;
         return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
@@ -1141,9 +1370,10 @@ export async function resumeReviewWorkOn(
 
     const firstRemediation = await remediateReview({
       run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-      buildResult, verdict, reviewCycle: { current: cycle, total: remediationLimit + 1 }, worktree: input.workspace.path, ...runtimeOptions,
+      buildResult, verdict, reviewCycle: { current: cycle, total: remediationLimit + 1 }, worktree: input.workspace.path,
+      verification: commands, verificationRunner: dependencies.verifier, ...runtimeOptions,
     }, {
-      runtime: dependencies.runtime, runs: dependencies.runs,
+      runtime: dependencies.runtime, runs: dependencies.runs, verifier: dependencies.verifier,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
     });
     run = firstRemediation.run;
@@ -1153,6 +1383,7 @@ export async function resumeReviewWorkOn(
       investigation: input.investigation,
       packet: input.packet,
       submission: firstRemediation.submission,
+      builderSessionRef: firstRemediation.sessionRef,
       repairContext: [buildResult, verdict],
       workspace: input.workspace,
       commands,
@@ -1213,6 +1444,7 @@ export async function resumeReviewWorkOn(
         investigation: input.investigation,
         packet: input.packet,
         submission: remediated.submission,
+        builderSessionRef: remediated.sessionRef,
         repairContext: [buildResult, verdict],
         workspace: input.workspace,
         commands,
@@ -1234,12 +1466,15 @@ export async function resumeReviewWorkOn(
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
@@ -1293,7 +1528,7 @@ export async function resumeExpandedReviewWorkOn(
   if (input.run.state !== "blocked") throw new Error(`Expanded review resume requires blocked state, found ${input.run.state}`);
   if (input.checkpoint.payload.status !== "ready-to-resume") throw new Error("Expanded review resume requires a ready remediation checkpoint");
   assertRunTargetsBranch(input.run, input.baseBranch);
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const commands = frozenPacketCommands(input.packet, input.verification, input.workspace);
   const proof = await verifyParentRevision({
     run: input.run,
     packet: input.packet,
@@ -1361,6 +1596,7 @@ export async function resumeExpandedReviewWorkOn(
     autoMerge: input.autoMerge ?? false,
     ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
     ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
   }, dependencies);
   return { run: completed.run, pullRequest: { ...input.pullRequest, headSha: proof.buildResult.payload.headSha }, awaitingHuman: completed.awaitingHuman };
 }
@@ -1425,7 +1661,7 @@ export async function resumePublicationWorkOn(
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   };
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const commands = frozenPacketCommands(input.packet, input.verification, input.workspace);
   let buildResult = input.buildResult;
   try {
     const published = await publishPullRequest({
@@ -1496,9 +1732,10 @@ export async function resumePublicationWorkOn(
       }
       const remediated = await remediateReview({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path, ...runtimeOptions,
+        buildResult, verdict, reviewCycle: { current: cycle, total: (input.maxRemediationCycles ?? 2) + 1 }, worktree: input.workspace.path,
+        verification: commands, verificationRunner: dependencies.verifier, ...runtimeOptions,
       }, {
-        runtime: dependencies.runtime, runs: dependencies.runs,
+        runtime: dependencies.runtime, runs: dependencies.runs, verifier: dependencies.verifier,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       });
       run = remediated.run;
@@ -1508,6 +1745,7 @@ export async function resumePublicationWorkOn(
         investigation: input.investigation,
         packet: input.packet,
         submission: remediated.submission,
+        builderSessionRef: remediated.sessionRef,
         repairContext: [buildResult, verdict],
         workspace: input.workspace,
         commands,
@@ -1528,12 +1766,15 @@ export async function resumePublicationWorkOn(
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const recoverable = error instanceof WorkflowExecutionError && error.recoverable;
+    const recoverable = input.signal?.aborted === true
+      || error instanceof ClaimPromotionRecoveryError
+      || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
@@ -1560,6 +1801,7 @@ export async function resumeCompletionWorkOn(
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
     workspace?: GitWorkspace;
+    signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
@@ -1584,10 +1826,12 @@ export async function resumeCompletionWorkOn(
       autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
     run = completed.run;
     return { run, pullRequest: input.pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
+    if (input.signal?.aborted) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (run.state !== "failed" && run.state !== "blocked") {
@@ -1598,7 +1842,7 @@ export async function resumeCompletionWorkOn(
     if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    if (input.workspace && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
+    if (input.workspace && !input.signal?.aborted && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
       try { await dependencies.git.remove(input.workspace); } catch { /* stale worktree reconciliation is operational */ }
     }
   }
@@ -1656,7 +1900,7 @@ export async function resumeConflictRecoveryWorkOn(
   }
   let run = input.run;
   let retainWorkspaceForRecovery = true;
-  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const commands = frozenPacketCommands(input.packet, input.verification, input.workspace);
   try {
     const synchronized = await recoverConflictingRevision({
       run,
@@ -1765,6 +2009,7 @@ export async function resumeConflictRecoveryWorkOn(
         investigation: input.investigation,
         packet: input.packet,
         submission: remediated.submission,
+        builderSessionRef: remediated.sessionRef,
         repairContext: [buildResult, verdict],
         workspace: input.workspace,
         commands,
@@ -1790,11 +2035,16 @@ export async function resumeConflictRecoveryWorkOn(
       autoMerge: input.autoMerge ?? false,
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, dependencies);
     run = completed.run;
     retainWorkspaceForRecovery = false;
     return { run, pullRequest, awaitingHuman: completed.awaitingHuman };
   } catch (error) {
+    if (input.signal?.aborted) {
+      retainWorkspaceForRecovery = true;
+      throw error;
+    }
     const reason = error instanceof Error ? error.message : String(error);
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (run.state !== "failed" && run.state !== "blocked") {
@@ -1915,7 +2165,7 @@ function guardMutationBoundaries(dependencies: WorkOnDependencies): WorkOnDepend
     ...dependencies,
     artifacts: guarded(dependencies.artifacts, ["append"]),
     runs: guarded(dependencies.runs, ["create", "commit", "recordProgress"]),
-    git: guarded(dependencies.git, ["create", "syncToRemoteHead", "integrateRemoteBase", "prepareWorkspaceDependencies", "commit", "push"]),
+    git: guarded(dependencies.git, ["create", "fastForwardToRemoteTarget", "syncToRemoteHead", "integrateRemoteBase", "prepareWorkspaceDependencies", "commit", "push"]),
     host: guarded(dependencies.host, [
       "materializeBatchIssue", "publishIssueComment", "materializeRemediationChildren",
       "materializeDecomposition", "createPullRequest", "publishPullRequestComment",

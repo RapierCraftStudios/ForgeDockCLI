@@ -20,10 +20,15 @@ class PromotionHost implements ForgeHost {
   protected = true;
   merged = false;
   stagingIsSource = false;
-  requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
+  requiredChecks: PullRequestMergeGate["requiredChecks"] = [{ name: "CI", state: "passed" }];
+  requiredChecksSequence: Array<PullRequestMergeGate["requiredChecks"]> = [];
+  requiredChecksProvenance: PullRequestMergeGate["requiredChecksProvenance"] = "github-required";
   mergeabilitySequence: PullRequestMergeability[] = ["mergeable"];
   mergeGateReads = 0;
   mergeGateOptions: PullRequestMergeGateOptions[] = [];
+  mergeAttempts = 0;
+  mergeErrorOnce: Error | undefined;
+  mergeGateErrorAtRead: number | undefined;
   pullRequest: PullRequestSnapshot | undefined;
   async getBranchHead(_repo: string, branch: string): Promise<string> {
     return branch === "milestone/feature" || (branch === "staging" && this.stagingIsSource) ? this.sourceSha : this.targetSha;
@@ -48,10 +53,12 @@ class PromotionHost implements ForgeHost {
   }
   async getPullRequestMergeGate(_repo: string, _number: number, _headSha: string, _baseBranch: string, options?: PullRequestMergeGateOptions) {
     this.mergeGateOptions.push(options ?? {});
-    let mergeability: PullRequestMergeability = "unavailable";
-    do {
-      mergeability = this.mergeabilitySequence[Math.min(this.mergeGateReads++, this.mergeabilitySequence.length - 1)] ?? "unavailable";
-    } while (options?.refreshUnknown === true && mergeability === "unknown" && this.mergeGateReads < this.mergeabilitySequence.length);
+    const read = this.mergeGateReads++;
+    if (this.mergeGateErrorAtRead === read) throw new Error("GitHub authentication failed");
+    const mergeability = this.mergeabilitySequence[Math.min(read, this.mergeabilitySequence.length - 1)] ?? "unavailable";
+    const requiredChecks = this.requiredChecksSequence.length
+      ? this.requiredChecksSequence[Math.min(read, this.requiredChecksSequence.length - 1)] ?? []
+      : this.requiredChecks;
     return {
       repo: "a/b",
       pullRequest: this.pullRequest?.number ?? 7,
@@ -59,11 +66,21 @@ class PromotionHost implements ForgeHost {
       baseBranch: this.pullRequest?.baseBranch ?? "staging",
       mergeable: mergeability === "mergeable",
       mergeability,
-      requiredChecks: [...this.requiredChecks],
+      ...(this.requiredChecksProvenance ? { requiredChecksProvenance: this.requiredChecksProvenance } : {}),
+      requiredChecksHeadSha: this.sourceSha,
+      requiredChecks: [...requiredChecks],
       observedAt: new Date().toISOString(),
     };
   }
-  async mergePullRequest(): Promise<void> { this.merged = true; }
+  async mergePullRequest(): Promise<void> {
+    this.mergeAttempts += 1;
+    if (this.mergeErrorOnce) {
+      const error = this.mergeErrorOnce;
+      this.mergeErrorOnce = undefined;
+      throw error;
+    }
+    this.merged = true;
+  }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.ts b/src/a.ts\n+change"; }
   async closeIssue(): Promise<void> {}
   async publishPullRequestComment(): Promise<void> {}
@@ -145,12 +162,12 @@ describe("explicit branch promotion", () => {
     const result = await promoteBranch({
       repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
       configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
-      authorizeCreation: true, authorizeMerge: true,
+      authorizeCreation: true, authorizeMerge: true, mergeGatePollIntervalMs: 1,
     }, deps);
     assert.equal(result.phase, "completed");
     assert.equal(host.merged, true);
     assert.equal(host.mergeGateReads, 3);
-    assert.deepEqual(host.mergeGateOptions.map((options) => options.refreshUnknown), [true]);
+    assert.deepEqual(host.mergeGateOptions, [{}, {}, {}]);
   });
 
   it("fails closed on malformed mergeability projections", () => {
@@ -246,8 +263,8 @@ describe("explicit branch promotion", () => {
     assert.equal(host.merged, false);
   });
 
-  it("blocks production promotion when legacy CodeQL is pending beside a passing replacement", async () => {
-    for (const state of ["pending", "cancelled", "failed", "unavailable"] as const) {
+  it("blocks production promotion when legacy CodeQL fails beside a passing replacement", async () => {
+    for (const state of ["cancelled", "failed", "unavailable"] as const) {
       const host = new PromotionHost();
       host.stagingIsSource = true;
       host.requiredChecks = [
@@ -262,13 +279,147 @@ describe("explicit branch promotion", () => {
       }, deps);
       assert.equal(published.phase, "awaiting-merge");
 
-      await assert.rejects(() => promoteBranch({
+      const blocked = await promoteBranch({
         repository: "a/b", mode: "production", sourceBranch: published.sourceBranch, targetBranch: published.targetBranch,
         configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(),
         verification: [command], promotionId: published.promotionId, authorizeMerge: true,
-      }, deps), new RegExp(`Promotion merge admission is blocked.*Analyze \\(javascript-typescript\\)=${state}`));
+      }, deps);
+      assert.equal(blocked.phase, "blocked");
+      assert.match(blocked.failure ?? "", new RegExp(`Promotion merge admission is blocked.*Analyze \\(javascript-typescript\\)=${state}`));
       assert.equal(host.merged, false);
     }
+  });
+
+  it("polls pending required CI and preserves exact promotion authority", async () => {
+    const host = new PromotionHost();
+    host.requiredChecksSequence = [
+      [{ name: "CI", state: "pending" }],
+      [{ name: "CI", state: "passed" }],
+    ];
+    const deps = dependencies(host);
+    const polls: string[] = [];
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true, mergeGatePollIntervalMs: 1,
+      onMergeGatePoll: ({ reason, gate }) => { polls.push(`${reason}:${gate.headSha}:${gate.baseBranch}`); },
+    }, deps);
+
+    assert.equal(result.phase, "completed");
+    assert.deepEqual(polls, [`required-checks-pending:${sourceSha}:staging`]);
+    assert.equal(host.mergeAttempts, 1);
+  });
+
+  it("records polling cancellation separately from promotion failure", async () => {
+    const host = new PromotionHost();
+    host.requiredChecks = [{ name: "CI", state: "pending" }];
+    const deps = dependencies(host);
+    const controller = new AbortController();
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true, mergeGatePollIntervalMs: 1, signal: controller.signal,
+      onMergeGatePoll: () => controller.abort("operator cancelled pending CI"),
+    }, deps);
+
+    assert.equal(result.phase, "cancelled");
+    assert.equal(result.cancellationReason, "operator cancelled pending CI");
+    assert.equal(result.failure, undefined);
+    assert.equal(host.mergeAttempts, 0);
+  });
+
+  it("reclassifies merge command failure only from a fresh typed gate", async () => {
+    const host = new PromotionHost();
+    host.mergeErrorOnce = new Error("merge rejected");
+    host.requiredChecksSequence = [
+      [{ name: "CI", state: "passed" }],
+      [{ name: "CI", state: "pending" }],
+      [{ name: "CI", state: "passed" }],
+    ];
+    const deps = dependencies(host);
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true, mergeGatePollIntervalMs: 1,
+    }, deps);
+
+    assert.equal(result.phase, "completed");
+    assert.equal(host.mergeAttempts, 2);
+    assert.equal(host.mergeGateReads, 3);
+  });
+
+  it("routes terminal merge conflict to blocked after command failure", async () => {
+    const host = new PromotionHost();
+    host.mergeErrorOnce = new Error("merge rejected");
+    host.mergeabilitySequence = ["mergeable", "conflicting"];
+    const deps = dependencies(host);
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+    }, deps);
+
+    assert.equal(result.phase, "blocked");
+    assert.match(result.failure ?? "", /mergeability=conflicting/);
+    assert.equal(host.mergeAttempts, 1);
+  });
+
+  it("does not turn typed transport unavailability after merge failure into a blocker", async () => {
+    const host = new PromotionHost();
+    host.mergeErrorOnce = new Error("merge transport failed");
+    const readGate = host.getPullRequestMergeGate.bind(host);
+    host.getPullRequestMergeGate = async (...args) => {
+      const gate = await readGate(...args);
+      return host.mergeGateReads > 1
+        ? { ...gate, requiredChecksProvenance: "unavailable" as const,
+          requiredChecks: [{ name: "required-checks-query", state: "unavailable" as const }] }
+        : gate;
+    };
+    const deps = dependencies(host);
+    await assert.rejects(() => promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+    }, deps), /merge transport failed/);
+    assert.equal((await deps.promotions.listPromotions())[0]?.phase, "failed");
+  });
+
+  it("preserves transport and authentication errors as failed promotion execution", async () => {
+    const host = new PromotionHost();
+    host.mergeErrorOnce = new Error("merge transport failed");
+    host.mergeGateErrorAtRead = 1;
+    const deps = dependencies(host);
+    await assert.rejects(() => promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+    }, deps), /GitHub authentication failed/);
+
+    const checkpoint = (await deps.promotions.listPromotions())[0];
+    assert.equal(checkpoint?.phase, "failed");
+    assert.match(checkpoint?.failure ?? "", /authentication failed/);
+  });
+
+  it("recovers an exact already-merged PR before post-merge target ref drift", async () => {
+    const host = new PromotionHost();
+    const deps = dependencies(host);
+    const awaiting = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true,
+    }, deps);
+    assert.equal(awaiting.phase, "awaiting-merge");
+
+    host.merged = true;
+    host.targetSha = "c".repeat(40);
+    const recovered = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: awaiting.sourceBranch, targetBranch: awaiting.targetBranch,
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      promotionId: awaiting.promotionId,
+    }, deps);
+    assert.equal(recovered.phase, "completed");
+    assert.equal(recovered.pullRequest?.number, 7);
+    assert.equal(recovered.pullRequest?.headSha, sourceSha);
   });
 
   it("refuses to record an externally merged unprotected production PR as completed", async () => {

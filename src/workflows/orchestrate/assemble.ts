@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { contractBatchGroups, type BatchableWorkItem, type IssueBatchGroup } from "./batching.js";
+import {
+  chunkBatchCandidates,
+  contractBatchGroups,
+  MAX_SENSITIVE_MEMBERS,
+  pairSensitiveBatchCandidates,
+  type BatchableWorkItem,
+  type IssueBatchGroup,
+} from "./batching.js";
 import { validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 export type BatchingPolicy = "aggressive" | "conservative" | "none";
@@ -25,9 +32,9 @@ export interface WorkUnitAssembly {
 }
 
 export const DEFAULT_BATCHING_OPTIONS: BatchingOptions = {
-  policy: "aggressive",
+  policy: "none",
   maxBatchSize: 8,
-  maxSensitiveBatchSize: 3,
+  maxSensitiveBatchSize: MAX_SENSITIVE_MEMBERS,
 };
 
 /**
@@ -72,6 +79,12 @@ export function assembleWorkUnits(
     return true;
   });
   if (policy.policy === "none") {
+    for (const item of orderedSelected) {
+      const represented = item.memberIssues?.length ? [...item.memberIssues] : [item.issue];
+      if (represented.length !== 1 || represented[0] !== item.issue) {
+        throw new Error(`Batching policy none requires one selected issue per node; ${item.id} represents ${represented.map((issue) => `#${issue}`).join(", ")}`);
+      }
+    }
     return { selected: orderedSelected, groups: [], ungrouped: orderedSelected, excluded, policy };
   }
 
@@ -118,7 +131,7 @@ export function assembleWorkUnits(
       const uniqueCandidates = [...new Map(candidates.map((item) => [item.id, item])).values()]
         .filter((item) => !claimed.has(item.id))
         .sort(compareItems);
-      if (kind === "source-pr" && !hasSharedDeliverySurface(uniqueCandidates)) {
+      if (kind === "source-pr" && !isSensitiveRiskClass(riskClass) && !hasSharedDeliverySurface(uniqueCandidates)) {
         // A common source PR is historical context, not an implementation
         // boundary. Keep unrelated members as independent work units unless
         // their frozen claims/paths actually overlap.
@@ -126,10 +139,13 @@ export function assembleWorkUnits(
         for (const member of uniqueCandidates) claimed.add(member.id);
         continue;
       }
-      const cap = riskClass === "routine" ? policy.maxBatchSize : policy.maxSensitiveBatchSize;
-      for (let offset = 0; offset + 1 < uniqueCandidates.length; offset += cap) {
-        const members = uniqueCandidates.slice(offset, offset + cap);
-        if (members.length < 2) break;
+      const cap = riskClass === "routine"
+        ? policy.maxBatchSize
+        : Math.min(policy.maxSensitiveBatchSize, MAX_SENSITIVE_MEMBERS);
+      const candidateGroups = isSensitiveRiskClass(riskClass)
+        ? cap >= MAX_SENSITIVE_MEMBERS ? pairSensitiveBatchCandidates(uniqueCandidates) : []
+        : chunkBatchCandidates(uniqueCandidates, cap).filter((members) => members.length >= 2);
+      for (const members of candidateGroups) {
         if (!isConvexGroup(orderedSelected, members)) {
           ungrouped.push(...members);
           for (const member of members) claimed.add(member.id);
@@ -193,20 +209,27 @@ function conservativeGroups(items: readonly BatchableWorkItem[], options: Batchi
     for (const item of remaining.values()) {
       const key = groupingKeys(item, kind)[0];
       if (!key) continue;
-      keyed.set(`${item.riskClass ?? "routine"}\u0000${key}`, [...(keyed.get(`${item.riskClass ?? "routine"}\u0000${key}`) ?? []), item]);
+      const context = compatibilityKey(item, key);
+      if (!context) continue;
+      keyed.set(`${context}\u0000${key}`, [...(keyed.get(`${context}\u0000${key}`) ?? []), item]);
     }
     for (const [compound, candidates] of [...keyed.entries()].sort(([a], [b]) => a.localeCompare(b))) {
       if (candidates.length < 2) continue;
       const [, key] = compound.split("\u0000");
       if (!key) continue;
       candidates.sort(compareItems);
-      if (kind === "source-pr" && !hasSharedDeliverySurface(candidates)) continue;
-      const cap = (candidates[0]?.riskClass ?? "routine") === "routine" ? options.maxBatchSize : options.maxSensitiveBatchSize;
-      const members = candidates.slice(0, cap);
+      const riskClass = candidates[0]?.riskClass ?? "routine";
+      if (kind === "source-pr" && !isSensitiveRiskClass(riskClass) && !hasSharedDeliverySurface(candidates)) continue;
+      const cap = riskClass === "routine"
+        ? options.maxBatchSize
+        : Math.min(options.maxSensitiveBatchSize, MAX_SENSITIVE_MEMBERS);
+      const members = isSensitiveRiskClass(riskClass)
+        ? cap >= MAX_SENSITIVE_MEMBERS ? pairSensitiveBatchCandidates(candidates, 1)[0] ?? [] : []
+        : candidates.slice(0, cap);
       if (members.length < 2 || !isConvexGroup(items, members)) continue;
       const group: IssueBatchGroup = {
         id: `batch:${kind}:${key}:${members.map((member) => member.issue).join("-")}`,
-        kind, key, riskClass: members[0]?.riskClass ?? "routine", members,
+        kind, key, riskClass, members,
       };
       groups.push(group);
       members.forEach((member) => remaining.delete(member.id));
@@ -264,6 +287,10 @@ function compatibilityKey(item: BatchableWorkItem, groupingKey: string): string 
   const milestone = milestoneValue(item.milestone);
   const promotionTarget = item.promotionTarget ?? "none";
   return [repository, targetBranch, lane, promotionTarget, item.productionTarget ?? "none", urgency, risk, milestone ?? "none"].join("\u0001");
+}
+
+function isSensitiveRiskClass(risk: IssueBatchGroup["riskClass"]): boolean {
+  return risk === "security" || risk === "auth";
 }
 
 function hasSharedDeliverySurface(items: readonly BatchableWorkItem[]): boolean {
@@ -324,6 +351,9 @@ function cloneItem(item: BatchableWorkItem): BatchableWorkItem {
     claims: [...item.claims],
     labels: [...item.labels],
     affectedFiles: [...item.affectedFiles],
+    ...(item.acceptanceCriteria ? { acceptanceCriteria: [...item.acceptanceCriteria] } : {}),
+    ...(item.riskCapabilities ? { riskCapabilities: [...item.riskCapabilities] } : {}),
+    ...(item.sharedSymbols ? { sharedSymbols: [...item.sharedSymbols] } : {}),
     ...(item.memberIssues ? { memberIssues: [...item.memberIssues] } : {}),
   };
 }

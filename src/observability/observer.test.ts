@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
@@ -17,6 +19,17 @@ const producer = createObservationProducer("observer-test", 1);
 
 function observerWithStore(store = new SqliteObservationStore(":memory:")): ForgeDockObserver {
   return new ForgeDockObserver({ store, producer });
+}
+
+function runNodeModule(source: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", source], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Observation subprocess exited ${code}: ${stderr}`)));
+  });
 }
 
 test("journal assigns per-run sequences, preserves channels, and redacts sensitive payloads", async () => {
@@ -45,6 +58,85 @@ test("journal assigns per-run sequences, preserves channels, and redacts sensiti
   assert.equal(events[1]?.output?.channel, "stderr");
   assert.equal(events[1]?.output?.text, "warning");
   observer.close();
+});
+
+test("controller-task queries follow a cross-process cursor without replay", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-observer-cursor-"));
+  const path = join(root, "observations.db");
+  const store = new SqliteObservationStore(path);
+  const initial = await store.append({
+    producer,
+    identity: { forgeRunId: "run-parent", controllerTaskId: "controller-a" },
+    source: "workflow",
+    channel: "activity",
+    kind: "workflow.progress",
+    payload: { phase: "started" },
+  });
+  const moduleUrl = new URL("./sqlite-store.js", import.meta.url).href;
+  await runNodeModule(`
+    import { SqliteObservationStore } from ${JSON.stringify(moduleUrl)};
+    const store = new SqliteObservationStore(${JSON.stringify(path)});
+    const producer = { component: "cursor-child", processInstanceId: "cursor-child:1", pid: process.pid };
+    await store.append({ producer, identity: { forgeRunId: "run-child", controllerTaskId: "controller-b" }, source: "workflow", channel: "activity", kind: "workflow.progress", payload: { phase: "unrelated" } });
+    await store.append({ producer, identity: { forgeRunId: "run-child", controllerTaskId: "controller-a" }, source: "agent", channel: "tool", kind: "tool.progress", payload: { tool: "test" } });
+    store.close();
+  `);
+
+  const fresh = await store.query({ controllerTaskId: "controller-a", cursor: initial.eventId });
+  assert.deepEqual(fresh.map((event) => event.kind), ["tool.progress"]);
+  assert.equal(fresh[0]?.identity.forgeRunId, "run-child");
+  assert.deepEqual(await store.query({ controllerTaskId: "controller-a", cursor: fresh[0]!.eventId }), []);
+  await assert.rejects(store.query({ controllerTaskId: "controller-a", cursor: "missing-event" }), /Unknown observation cursor/);
+  store.close();
+  const database = new DatabaseSync(path);
+  const indexes = database.prepare("PRAGMA index_list(observation_events)").all() as Array<{ name: string }>;
+  assert.equal(indexes.some((index) => index.name === "observation_events_controller_task"), true);
+  database.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("observation cursors survive retention and do not exhaust later queries", async () => {
+  const store = new SqliteObservationStore(":memory:");
+  const identity = { forgeRunId: "run-retained-cursor", controllerTaskId: "controller-retained" };
+  const first = await store.append({
+    producer,
+    identity,
+    source: "workflow",
+    channel: "activity",
+    kind: "workflow.progress",
+    payload: { phase: "first" },
+  });
+
+  await store.prune(undefined, { maxEventsPerScope: 0 });
+  assert.deepEqual(await store.query({ controllerTaskId: identity.controllerTaskId, cursor: first.eventId }), []);
+
+  const second = await store.append({
+    producer,
+    identity,
+    source: "workflow",
+    channel: "activity",
+    kind: "workflow.progress",
+    payload: { phase: "second" },
+  });
+  assert.deepEqual(
+    (await store.query({ controllerTaskId: identity.controllerTaskId, cursor: first.eventId })).map((event) => event.eventId),
+    [second.eventId],
+  );
+
+  await store.prune(undefined, { maxEventsPerScope: 0 });
+  const third = await store.append({
+    producer,
+    identity,
+    source: "workflow",
+    channel: "activity",
+    kind: "workflow.progress",
+    payload: { phase: "third" },
+  });
+  assert.deepEqual(
+    (await store.query({ controllerTaskId: identity.controllerTaskId, cursor: second.eventId })).map((event) => event.eventId),
+    [third.eventId],
+  );
+  store.close();
 });
 
 test("observer backpressure emits an explicit dropped-output marker", async () => {

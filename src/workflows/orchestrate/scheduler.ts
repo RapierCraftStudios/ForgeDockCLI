@@ -13,6 +13,8 @@ export interface ScheduledWorkItem {
   priority: number;
   dependencies: readonly string[];
   claims: readonly string[];
+  /** Optional for legacy records; new work retains its repository identity per node. */
+  repository?: string;
   /** Frozen repository delivery route retained through scheduling and durable recovery. */
   targetBranch?: string;
   lane?: "fast" | "feature";
@@ -84,7 +86,7 @@ export interface RunScheduleOptions {
 
 export class ClaimPromotionConflictError extends Error {
   constructor(readonly itemId: string, readonly conflicts: readonly string[]) {
-    super(`Promoted scheduler claims for ${itemId} conflict with active work: ${conflicts.join(", ")}`);
+    super(`Promoted scheduler claims for ${itemId} are deferred while active work holds overlapping scope (${conflicts.join(", ")}); the scheduler will retry automatically after release`);
     this.name = "ClaimPromotionConflictError";
   }
 }
@@ -98,6 +100,11 @@ export interface ClaimSerializationEdge {
 export interface SchedulePreview {
   initialReady: ScheduledWorkItem[];
   criticalPath: ScheduledWorkItem[];
+  /** Issue-weighted demand; one contracted node can occupy several issue slots. */
+  issueSlots: {
+    total: number;
+    initialReady: number;
+  };
 }
 
 export interface ClaimMaterializationDiagnostics {
@@ -139,16 +146,15 @@ export function materializeClaimDependencies(
   const edges: ClaimSerializationEdge[] = [];
 
   // Claims are canonical repository scopes (or exact component resources),
-  // so an item only conflicts with equal/ancestor/descendant path scopes. Keep
-  // an index of scopes already seen instead of comparing every pair of items.
-  // The index may still return several candidates for a broad scope, but the
-  // frontier below emits only the irreducible predecessors needed to retain
-  // the same happens-before relation.
-  const claimIndex = createClaimScopeIndex(diagnostics);
+  // so an item only conflicts with equal/ancestor/descendant path scopes on a
+  // route that can touch the same checkout. Partition known repository/target
+  // routes before indexing scopes; legacy items without complete route evidence
+  // remain in a conservative cross-route frontier.
+  const claimIndex = createRoutedClaimScopeIndex(diagnostics);
   const order = new Map(ordered.map((item, index) => [item.id, index]));
 
   for (const right of ordered) {
-    const conflictingItemIds = claimIndex.conflictingItemIds(right.claims);
+    const conflictingItemIds = claimIndex.conflictingItemIds(right);
     if (diagnostics) diagnostics.conflictCandidates += conflictingItemIds.length;
     const reaches = (itemId: string, dependencyId: string): boolean => {
       if (diagnostics) diagnostics.reachabilityChecks += 1;
@@ -160,7 +166,7 @@ export function materializeClaimDependencies(
       .flatMap((id) => {
         const left = graph.get(id);
         if (!left
-          || !claimsConflict(left.claims, right.claims)
+          || !scheduledClaimsConflict(left, right)
           || reaches(right.id, left.id)) return [];
         // `ordered` is a topological order of the semantic graph, and every
         // derived edge added in this loop points from an already-visited item
@@ -208,7 +214,7 @@ export function buildSchedulePreview(
   items: readonly ScheduledWorkItem[],
   serializationEdges: readonly ClaimSerializationEdge[] = [],
 ): SchedulePreview {
-  validateGraph(items, serializationEdges);
+  const issueSlotsById = validateGraphAndIndexIssueSlots(items, serializationEdges);
   const byId = new Map(items.map((item) => [item.id, item]));
   const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
   const predecessorsFor = (item: ScheduledWorkItem): string[] => [
@@ -235,7 +241,14 @@ export function buildSchedulePreview(
   const criticalPath = items
     .map(pathTo)
     .sort((left, right) => right.length - left.length || comparePaths(left, right))[0] ?? [];
-  return { initialReady, criticalPath };
+  return {
+    initialReady,
+    criticalPath,
+    issueSlots: {
+      total: items.reduce((sum, item) => sum + issueSlotsById.get(item.id)!, 0),
+      initialReady: initialReady.reduce((sum, item) => sum + issueSlotsById.get(item.id)!, 0),
+    },
+  };
 }
 
 export async function runSchedule(
@@ -295,7 +308,7 @@ export async function runSchedule(
     return observedCapacity;
   };
   const serializationEdges = options.serializationEdges ?? [];
-  validateGraph(items, serializationEdges);
+  const issueSlotsById = validateGraphAndIndexIssueSlots(items, serializationEdges);
   const orderedItems = [...items].sort((left, right) => left.priority - right.priority || left.issue - right.issue);
   const byId = new Map(items.map((item) => [item.id, item]));
   const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
@@ -306,14 +319,33 @@ export async function runSchedule(
   let queuedCount = items.length;
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
+  let occupiedIssueSlots = 0;
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
-  const emit = (type: ScheduleEvent["type"], itemId?: string) => options.onEvent?.({
-    type,
-    ...(itemId ? { itemId } : {}),
-    status: new Map(status),
-    errors: new Map(errors),
-    ...(waitReasons.size ? { waitReasons: new Map(waitReasons) } : {}),
-  });
+  const queuedWaitReasonChanges = new Set<string>();
+  const emit = (type: ScheduleEvent["type"], itemId?: string) => {
+    queuedWaitReasonChanges.clear();
+    options.onEvent?.({
+      type,
+      ...(itemId ? { itemId } : {}),
+      status: new Map(status),
+      errors: new Map(errors),
+      ...(waitReasons.size ? { waitReasons: new Map(waitReasons) } : {}),
+    });
+  };
+  const updateQueuedWaitReason = (itemId: string, next: WaitReason | undefined, announce = true): void => {
+    const previous = waitReasons.get(itemId);
+    if (sameWaitReason(previous, next)) return;
+    if (next === undefined) waitReasons.delete(itemId);
+    else waitReasons.set(itemId, next);
+    if (announce) queuedWaitReasonChanges.add(itemId);
+    else queuedWaitReasonChanges.delete(itemId);
+  };
+  const emitQueuedWaitReasonChanges = (): void => {
+    const itemId = queuedWaitReasonChanges.values().next().value as string | undefined;
+    if (itemId === undefined) return;
+    queuedWaitReasonChanges.clear();
+    emit("queued", itemId);
+  };
   for (const item of items) emit("queued", item.id);
   for (const itemId of options.resumedItemIds ?? []) {
     if (!byId.has(itemId)) throw new Error(`Cannot resume unknown scheduled item ${itemId}`);
@@ -379,22 +411,34 @@ export async function runSchedule(
         || !(predecessorsBySuccessor.get(item.id) ?? []).every((id) => isTerminal(status.get(id)))) continue;
       const capacity = await readCapacity();
       if (options.signal?.aborted) break;
-      if (running.size >= capacity) {
-        waitReasons.set(item.id, { kind: "capacity", maxParallel: capacity });
+      const requiredIssueSlots = issueSlotsById.get(item.id)!;
+      // An indivisible explicit batch larger than the configured cap runs alone
+      // rather than deadlocking forever. Otherwise maxParallel is an issue-slot
+      // budget, not a count of contracted scheduler nodes.
+      const hasIssueSlotCapacity = occupiedIssueSlots === 0
+        ? capacity > 0
+        : occupiedIssueSlots + requiredIssueSlots <= capacity;
+      if (!hasIssueSlotCapacity) {
+        updateQueuedWaitReason(item.id, { kind: "capacity", maxParallel: capacity });
         waitingForCapacity ||= capacity === 0;
         continue;
       }
       const activeItems = [...running.keys()].map((id) => byId.get(id)).filter((value): value is ScheduledWorkItem => Boolean(value));
-      const conflicting = activeItems.find((active) => claimsConflict(currentClaims.get(item.id) ?? [], currentClaims.get(active.id) ?? []));
+      const conflicting = activeItems.find((active) => scheduledClaimsConflict(
+        item,
+        active,
+        currentClaims.get(item.id) ?? [],
+        currentClaims.get(active.id) ?? [],
+      ));
       if (conflicting) {
-        waitReasons.set(item.id, {
+        updateQueuedWaitReason(item.id, {
           kind: "active-claim-conflict",
           node: conflicting.id,
           claims: overlappingClaims(currentClaims.get(item.id) ?? [], currentClaims.get(conflicting.id) ?? []),
         });
         continue;
       }
-      waitReasons.delete(item.id);
+      updateQueuedWaitReason(item.id, undefined, false);
       status.set(item.id, "running");
       queuedCount--;
       startOrder.push(item.id);
@@ -407,7 +451,12 @@ export async function runSchedule(
           // `activeItems` snapshot is insufficient for promotion safety.
           const conflicts = [...running.keys()]
             .filter((activeId) => activeId !== item.id)
-            .filter((activeId) => claimsConflict(merged, currentClaims.get(activeId) ?? []));
+            .filter((activeId) => scheduledClaimsConflict(
+              item,
+              byId.get(activeId)!,
+              merged,
+              currentClaims.get(activeId) ?? [],
+            ));
           if (conflicts.length) {
             // A worker may only publish claims after the scheduler has
             // admitted them. Keep the durable projection at its last admitted
@@ -505,9 +554,14 @@ export async function runSchedule(
             emit("failed", item.id);
           }
         })
-        .finally(() => { running.delete(item.id); });
+        .finally(() => {
+          running.delete(item.id);
+          occupiedIssueSlots -= requiredIssueSlots;
+        });
+      occupiedIssueSlots += requiredIssueSlots;
       running.set(item.id, promise);
     }
+    emitQueuedWaitReasonChanges();
 
     if (running.size) {
       // A live capacity source can increase while existing work is still
@@ -545,6 +599,12 @@ export async function runSchedule(
   };
 }
 
+function sameWaitReason(left: WaitReason | undefined, right: WaitReason | undefined): boolean {
+  if (left === right) return true;
+  if (left === undefined || right === undefined || left.kind !== right.kind) return false;
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function normalizeChildIssues(values: readonly number[], parentIssue: number): number[] {
   if (!Array.isArray(values)) throw new Error(`Decomposition children for #${parentIssue} must be an array`);
   const seen = new Set<number>();
@@ -578,8 +638,48 @@ function claimPromotionConflict(value: unknown): ClaimPromotionConflictError | u
   return value instanceof ClaimPromotionConflictError ? value : undefined;
 }
 
+export function scheduledWorkItemIssueSlots(item: ScheduledWorkItem): number {
+  if (!item.memberIssues?.length) return 1;
+  const issues = new Set<number>();
+  for (const issue of item.memberIssues) {
+    if (!Number.isSafeInteger(issue) || issue < 1) {
+      throw new Error(`Work item ${item.id} contains an invalid member issue: ${String(issue)}`);
+    }
+    if (issues.has(issue)) throw new Error(`Work item ${item.id} contains duplicate member issue #${issue}`);
+    issues.add(issue);
+  }
+  return issues.size;
+}
+
 export function claimsConflict(left: readonly string[], right: readonly string[]): boolean {
   return left.some((a) => right.some((b) => claimOverlaps(a, b)));
+}
+
+/**
+ * Claim scopes are checkout-local. Complete repository and target-branch
+ * evidence can prove two nodes do not share a route; a missing field on either
+ * legacy node cannot prove isolation and therefore remains conservative.
+ */
+export function scheduledClaimsConflict(
+  left: ScheduledWorkItem,
+  right: ScheduledWorkItem,
+  leftClaims: readonly string[] = left.claims,
+  rightClaims: readonly string[] = right.claims,
+): boolean {
+  if (!claimRoutesMayConflict(left, right)) return false;
+  return claimsConflict(leftClaims, rightClaims);
+}
+
+function claimRouteKey(item: ScheduledWorkItem): string | undefined {
+  const repository = item.repository?.trim().toLowerCase();
+  const targetBranch = item.targetBranch?.trim();
+  return repository && targetBranch ? JSON.stringify([repository, targetBranch]) : undefined;
+}
+
+function claimRoutesMayConflict(left: ScheduledWorkItem, right: ScheduledWorkItem): boolean {
+  const leftRoute = claimRouteKey(left);
+  const rightRoute = claimRouteKey(right);
+  return leftRoute === undefined || rightRoute === undefined || leftRoute === rightRoute;
 }
 
 /**
@@ -632,6 +732,49 @@ function scopesOverlap(left: string, right: string): boolean {
 
 function overlappingClaims(left: readonly string[], right: readonly string[]): string[] {
   return [...new Set(left.flatMap((a) => right.filter((b) => claimOverlaps(a, b)).map((b) => `${a} ↔ ${b}`)))];
+}
+
+interface RoutedClaimScopeIndex {
+  add(item: ScheduledWorkItem, dominatedItemIds: ReadonlySet<string>): void;
+  conflictingItemIds(item: ScheduledWorkItem): string[];
+}
+
+/**
+ * Preserve the sparse per-scope frontier while isolating repositories and
+ * delivery targets. Unknown legacy routes use one universal frontier: every
+ * known route queries it, and an unknown query inspects each known partition.
+ */
+function createRoutedClaimScopeIndex(diagnostics?: ClaimMaterializationDiagnostics): RoutedClaimScopeIndex {
+  const byRoute = new Map<string, ClaimScopeIndex>();
+  const legacy = createClaimScopeIndex(diagnostics);
+  const routeIndex = (key: string): ClaimScopeIndex => {
+    let index = byRoute.get(key);
+    if (!index) {
+      index = createClaimScopeIndex(diagnostics);
+      byRoute.set(key, index);
+    }
+    return index;
+  };
+
+  return {
+    add(item, dominatedItemIds) {
+      const route = claimRouteKey(item);
+      if (route === undefined) legacy.add(item, dominatedItemIds);
+      else routeIndex(route).add(item, dominatedItemIds);
+    },
+    conflictingItemIds(item) {
+      const route = claimRouteKey(item);
+      const ids = new Set(legacy.conflictingItemIds(item.claims));
+      if (route === undefined) {
+        for (const index of byRoute.values()) {
+          for (const id of index.conflictingItemIds(item.claims)) ids.add(id);
+        }
+      } else {
+        for (const id of routeIndex(route).conflictingItemIds(item.claims)) ids.add(id);
+      }
+      return [...ids];
+    },
+  };
 }
 
 interface ClaimScopeIndex {
@@ -886,9 +1029,18 @@ export function validateGraph(
   items: readonly ScheduledWorkItem[],
   serializationEdges: readonly ClaimSerializationEdge[] = [],
 ): void {
+  validateGraphAndIndexIssueSlots(items, serializationEdges);
+}
+
+function validateGraphAndIndexIssueSlots(
+  items: readonly ScheduledWorkItem[],
+  serializationEdges: readonly ClaimSerializationEdge[] = [],
+): Map<string, number> {
   const ids = new Set<string>();
+  const issueSlotsById = new Map<string, number>();
   for (const item of items) {
     if (ids.has(item.id)) throw new Error(`Duplicate work item id: ${item.id}`);
+    issueSlotsById.set(item.id, scheduledWorkItemIssueSlots(item));
     ids.add(item.id);
   }
   const predecessorsBySuccessor = indexSerializationEdges(serializationEdges);
@@ -920,4 +1072,5 @@ export function validateGraph(
     visited.add(id);
   };
   for (const item of items) visit(item.id, []);
+  return issueSlotsById;
 }

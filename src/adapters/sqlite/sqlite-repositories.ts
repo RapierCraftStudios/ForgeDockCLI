@@ -4,16 +4,16 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
-import type { IssueSnapshot } from "../../core/ports/forge-host.js";
+import type { IssueSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
-import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueNumbers, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
-import { ConcurrentRunUpdateError, remediationAdmissionKey, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
+import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, OrchestrationRepository, PromotionRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
   readonly #witness: LeaseWitness | undefined;
   #recoveryEpoch: number | undefined;
@@ -85,6 +85,13 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         marker TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending', 'materialized')),
         issue_json TEXT
+      );
+      CREATE TABLE IF NOT EXISTS review_finding_publication_fences (
+        fence_key TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        pull_request INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        fence_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS orchestrations (
         orchestration_id TEXT PRIMARY KEY,
@@ -160,8 +167,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         const existing = rows.map((row) => JSON.parse(row.record_json) as OrchestrationRecord);
         const conflicts = findRunningOrchestrationIssueConflicts(
           existing,
-          record.repository,
-          orchestrationRecordIssueNumbers(record),
+          orchestrationRecordIssueIdentities(record),
         );
         if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
       }
@@ -251,6 +257,48 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   async listPromotions(limit = 50): Promise<PromotionRecord[]> {
     const rows = this.#database.prepare("SELECT record_json FROM promotion_records ORDER BY updated_at DESC LIMIT ?").all(limit);
     return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as PromotionRecord);
+  }
+
+  async beginReviewFindingPublication(input: Omit<ReviewFindingPublicationFence, "generation">): Promise<ReviewFindingPublicationFence> {
+    const key = reviewFindingPublicationFenceKey(input.repo, input.pullRequest);
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      const current = this.#database.prepare(`
+        SELECT generation FROM review_finding_publication_fences WHERE fence_key = ?
+      `).get(key) as { generation: number } | undefined;
+      const fence: ReviewFindingPublicationFence = {
+        ...structuredClone(input),
+        generation: (current?.generation ?? 0) + 1,
+      };
+      this.#database.prepare(`
+        INSERT INTO review_finding_publication_fences
+          (fence_key, repository, pull_request, generation, fence_json)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(fence_key) DO UPDATE SET
+          generation = excluded.generation,
+          fence_json = excluded.fence_json
+        WHERE review_finding_publication_fences.generation = excluded.generation - 1
+      `).run(key, input.repo.trim().toLowerCase(), input.pullRequest, fence.generation, JSON.stringify(fence));
+      const installed = this.#database.prepare(`
+        SELECT generation, fence_json FROM review_finding_publication_fences WHERE fence_key = ?
+      `).get(key) as { generation: number; fence_json: string } | undefined;
+      if (!installed || installed.generation !== fence.generation || installed.fence_json !== JSON.stringify(fence)) {
+        throw new Error(`Review-finding publication fence CAS failed for ${input.repo}#${input.pullRequest}`);
+      }
+      return fence;
+    }));
+  }
+
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void> {
+    const key = reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest);
+    await withSqliteBusyRetry(() => {
+      const current = this.#database.prepare(`
+        SELECT generation, fence_json FROM review_finding_publication_fences WHERE fence_key = ?
+      `).get(key) as { generation: number; fence_json: string } | undefined;
+      const decoded = current ? JSON.parse(current.fence_json) as ReviewFindingPublicationFence : undefined;
+      if (!current || current.generation !== fence.generation || !decoded || !sameReviewFindingPublicationFence(decoded, fence)) {
+        throw new Error(`Review-finding publication fence is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
+      }
+    });
   }
 
   async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
@@ -534,8 +582,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       ).all(record.orchestrationId) as Array<{ record_json: string }>;
       const conflicts = findRunningOrchestrationIssueConflicts(
         rows.map((row) => JSON.parse(row.record_json) as OrchestrationRecord),
-        record.repository,
-        orchestrationRecordIssueNumbers(record),
+        orchestrationRecordIssueIdentities(record),
       );
       if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     }

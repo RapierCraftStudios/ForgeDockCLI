@@ -2,8 +2,9 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { OrchestrationEvent, OrchestrationSnapshot } from "../workflows/orchestrate/events.js";
+import type { OrchestrationEvent, OrchestrationIssueSlots, OrchestrationNode, OrchestrationRoute, OrchestrationSnapshot } from "../workflows/orchestrate/events.js";
 import type { ScheduledStatus } from "../workflows/orchestrate/scheduler.js";
+import { renderSerializationLines, renderWaitReason } from "../workflows/orchestrate/view-model.js";
 
 export const FORGEDOCK_ORCHESTRATION_WIDGET_KEY = "forgedock-orchestration-board";
 
@@ -29,6 +30,9 @@ export interface OrchestrationPreviewView {
   selectedIssueNumbers: readonly number[];
   workUnitCount: number;
   maxParallel: number;
+  /** Structured proposal projection; absent in legacy extension results. */
+  snapshot?: OrchestrationSnapshot;
+  issueSlots?: OrchestrationIssueSlots;
   batching: "aggressive" | "conservative" | "none";
   scopeExpansion: "scope-locked" | "recursive";
   autoMerge: boolean;
@@ -40,9 +44,11 @@ export interface OrchestrationToolView {
   invocationLabel: string;
   repository?: string;
   selectedIssueCount?: number;
+  selectedIssueNumbers?: readonly number[];
   workUnitCount?: number;
   initialReadyCount?: number;
   maxParallel?: number;
+  issueSlots?: OrchestrationIssueSlots;
   batching?: "aggressive" | "conservative" | "none";
   scopeExpansion?: "scope-locked" | "recursive";
   autoMerge?: boolean;
@@ -68,7 +74,6 @@ type BoardTui = { requestRender(): void };
 type Theme = ExtensionContext["ui"]["theme"];
 
 const REFRESH_MS = 1_000;
-const MAX_NODE_ROWS_PER_DAG = 4;
 const MAX_DAG_ROWS = 8;
 
 export function formatOrchestrationInvocationLabel(command: string, rawArgs: string): string {
@@ -220,9 +225,14 @@ export class OrchestrationBoardController {
     const lines: string[] = [theme.fg("toolTitle", theme.bold("ForgeDock orchestrations"))];
     if (this.preview) {
       const { invocationLabel, view } = this.preview;
-      const expiry = view.expiresAt ? formatPreviewDeadline(view.expiresAt) : "no checkpoint";
+      const expiry = view.expiresAt ? formatPreviewDeadline(view.expiresAt) : "no confirmation checkpoint";
       lines.push(truncateToWidth(`◇ ${invocationLabel} · preview · ${expiry}`, width));
-      lines.push(truncateToWidth(`  ${view.selectedIssueNumbers.length} issue(s) → ${view.workUnitCount} work unit(s) · max parallel ${view.maxParallel}`, width));
+      const slots = view.issueSlots ?? view.snapshot?.issueSlots;
+      lines.push(truncateToWidth(`  ${formatOrchestrationIssueSlots(slots, view.selectedIssueNumbers.length, view.maxParallel)}`, width));
+      if (view.snapshot) {
+        for (const node of view.snapshot.nodes) lines.push(truncateToWidth(`  ${renderNodeRow(node, theme)}`, width));
+        for (const line of renderSerializationLines(view.snapshot)) lines.push(truncateToWidth(`  ${line}`, width));
+      }
     }
 
     const records = [...this.records.values()]
@@ -235,14 +245,9 @@ export class OrchestrationBoardController {
       const total = record.snapshot.nodes.length;
       const progress = record.phase === "completed" ? `${completed}/${total} complete` : `${terminal}/${total} terminal`;
       lines.push(truncateToWidth(`${phaseGlyph(record.phase, theme)} ${record.orchestrationId} · ${record.phase} · ${progress}${active ? ` · ${active} active` : ""}`, width));
-      for (const node of record.snapshot.nodes.slice(0, MAX_NODE_ROWS_PER_DAG)) {
-        const dependencies = node.dependencies.length ? ` · deps=${node.dependencies.join(",")}` : "";
-        const error = node.error ? ` · ${safeInline(node.error)}` : "";
-        lines.push(truncateToWidth(`  ${statusGlyph(node.status, theme)} #${node.issue} ${node.status}${dependencies}${error}`, width));
-      }
-      if (record.snapshot.nodes.length > MAX_NODE_ROWS_PER_DAG) {
-        lines.push(truncateToWidth(`  … ${record.snapshot.nodes.length - MAX_NODE_ROWS_PER_DAG} more node(s)`, width));
-      }
+      lines.push(truncateToWidth(`  ${formatOrchestrationIssueSlots(record.snapshot.issueSlots, selectedIssueCount(record.snapshot), undefined)}`, width));
+      for (const node of record.snapshot.nodes) lines.push(truncateToWidth(`  ${renderNodeRow(node, theme)}`, width));
+      for (const line of renderSerializationLines(record.snapshot)) lines.push(truncateToWidth(`  ${line}`, width));
     }
     return lines.map((line) => truncateToWidth(line, width));
   }
@@ -255,12 +260,17 @@ export class OrchestrationBoardController {
         label: this.preview.invocationLabel,
         view: this.preview.view,
       } : undefined,
-      records: [...this.records.values()].map((record) => [
-        record.orchestrationId,
-        record.phase,
-        record.updatedAt,
-        record.snapshot.nodes.map((node) => [node.id, node.status, node.error]),
-      ]),
+      records: [...this.records.values()].map((record) => ({
+        orchestrationId: record.orchestrationId,
+        phase: record.phase,
+        repository: record.repository,
+        summary: record.summary,
+        updatedAt: record.updatedAt,
+        // Include every rendered scheduling fact. In particular, capacity and
+        // wait reasons may change at the same durable timestamp in test/adaptor
+        // projections and must still invalidate the widget.
+        snapshot: record.snapshot,
+      })),
     });
   }
 
@@ -301,12 +311,55 @@ export class OrchestrationBoardController {
 }
 
 export function formatPreviewDeadline(expiresAt: string): string {
-  const remaining = Date.parse(expiresAt) - Date.now();
-  if (!Number.isFinite(remaining)) return "checkpoint deadline unknown";
-  if (remaining <= 0) return "deadline reached";
+  const deadlineMs = Date.parse(expiresAt);
+  if (!Number.isFinite(deadlineMs)) return "confirmation window unavailable · fresh preview required · deadline unknown";
+  const deadline = new Date(deadlineMs).toISOString();
+  const remaining = deadlineMs - Date.now();
+  if (remaining <= 0) {
+    const elapsedSeconds = Math.floor(Math.abs(remaining) / 1_000);
+    const minutes = Math.floor(elapsedSeconds / 60);
+    const elapsed = `${minutes}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+    return `confirmation window elapsed ${elapsed} ago · fresh preview required · deadline ${deadline}`;
+  }
   const seconds = Math.ceil(remaining / 1_000);
   const minutes = Math.floor(seconds / 60);
-  return `expires in ${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+  return `confirmation window ${minutes}:${String(seconds % 60).padStart(2, "0")} remaining · deadline ${deadline}`;
+}
+
+export function formatOrchestrationIssueSlots(
+  slots: OrchestrationIssueSlots | undefined,
+  selectedFallback: number,
+  requestedFallback: number | undefined,
+): string {
+  const selected = slots?.selected ?? selectedFallback;
+  const runnable = slots?.runnableNow ?? "unknown";
+  const requested = slots?.requestedCap ?? requestedFallback ?? "unknown";
+  const transport = slots?.transportCap ?? "not sampled";
+  const effective = slots?.effectiveCap ?? requested;
+  return `Issue slots: ${selected} selected · ${runnable} runnable now · requested cap ${requested} · transport cap ${transport} · effective cap ${effective}`;
+}
+
+export function formatOrchestrationRoute(route: OrchestrationRoute): string {
+  return `${route.repository ?? "repository?"}@${route.targetBranch ?? "target?"}${route.lane ? `(${route.lane})` : ""}`;
+}
+
+function renderNodeRow(node: OrchestrationNode, theme: Theme): string {
+  const members = (node.memberIssues?.length ?? 0) > 1
+    ? ` · members=${node.memberIssues.map((issue) => `#${issue}`).join(",")}`
+    : "";
+  const title = node.title ? ` · ${safeInline(node.title)}` : "";
+  const dependencies = ` · semantic-deps=${node.dependencies?.length ? node.dependencies.join(",") : "none"}`;
+  const route = node.route
+    ? ` · route=${formatOrchestrationRoute(node.route)}`
+    : "";
+  const wait = node.waitReason ? ` · wait=${renderWaitReason(node.waitReason)}` : "";
+  const error = node.error ? ` · ${safeInline(node.error)}` : "";
+  return `${statusGlyph(node.status, theme)} #${node.issue} ${node.status}${members}${title}${dependencies}${route}${wait}${error}`;
+}
+
+function selectedIssueCount(snapshot: OrchestrationSnapshot): number {
+  return snapshot.selectedIssueNumbers?.length
+    ?? new Set(snapshot.nodes.flatMap((node) => node.memberIssues?.length ? [...node.memberIssues] : [node.issue])).size;
 }
 
 function phaseGlyph(phase: OrchestrationBoardPhase, theme: Theme): string {

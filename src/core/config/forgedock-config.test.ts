@@ -94,6 +94,15 @@ describe("ForgeDock Next project configuration", () => {
     assert.equal(resolveAutoMerge(true, false), true);
   });
 
+  it("defaults orchestration to no batching while preserving configured and invocation policy", () => {
+    assert.equal(resolveOrchestrationConfig().batchingPolicy, "none");
+    assert.equal(resolveOrchestrationConfig({ batchingPolicy: "aggressive" }).batchingPolicy, "aggressive");
+    assert.equal(resolveOrchestrationConfig(
+      { batchingPolicy: "aggressive" },
+      { batchingPolicy: "conservative" },
+    ).batchingPolicy, "conservative");
+  });
+
   it("round-trips nested orchestration policy and applies invocation precedence", () => {
     const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
     try {

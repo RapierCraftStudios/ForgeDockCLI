@@ -2,7 +2,8 @@
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { formatPreviewDeadline, type OrchestrationToolView } from "./orchestration-board.js";
+import { formatOrchestrationIssueSlots, formatPreviewDeadline, type OrchestrationToolView } from "./orchestration-board.js";
+import { renderOrchestrationBoard } from "../workflows/orchestrate/view-model.js";
 
 const ARG_KEYS = [
   "action",
@@ -53,17 +54,23 @@ export function forgeDockOrchestrateToolPresentation(label = "ForgeDock orchestr
       const view = orchestrationView(details);
       const output = sanitizeOrchestrationOutput(collectText(result), details);
       const summary = view ? renderOrchestrationSummary(view) : "";
-      return renderToolResultText(summary ? `${summary}${output ? `\n${output}` : ""}` : output, options, theme, context);
+      return renderToolResultText(summary ? `${summary}${output ? `\n${output}` : ""}` : output, options, theme, context, view !== undefined);
     },
   };
 }
 
-function renderToolResultText(output: string, options: ToolResultOptions, theme: ToolTheme, context: ToolContext): Text {
+function renderToolResultText(
+  output: string,
+  options: ToolResultOptions,
+  theme: ToolTheme,
+  context: ToolContext,
+  preserveAllLines = false,
+): Text {
   if (!output) return new Text("", 0, 0);
 
   const allLines = output.split(/\r?\n/);
   const live = options.isPartial;
-  const limit = options.expanded ? allLines.length : live ? LIVE_RESULT_LINES : COLLAPSED_RESULT_LINES;
+  const limit = preserveAllLines || options.expanded ? allLines.length : live ? LIVE_RESULT_LINES : COLLAPSED_RESULT_LINES;
   const lines = live ? allLines.slice(-limit) : allLines.slice(0, limit);
   const omitted = Math.max(0, allLines.length - lines.length);
   const color = context.isError ? "error" : live ? "toolOutput" : "muted";
@@ -116,18 +123,25 @@ function renderOrchestrationSummary(view: OrchestrationToolView): string {
     if (view.selectedIssueCount !== undefined || view.workUnitCount !== undefined) {
       lines.push(`${view.selectedIssueCount ?? "?"} issue(s) → ${view.workUnitCount ?? "?"} work unit(s)`);
     }
-    if (view.maxParallel !== undefined) lines.push(`Max parallel: ${view.maxParallel}`);
-    if (view.preview?.expiresAt) lines.push(`Checkpoint: ${formatPreviewDeadline(view.preview.expiresAt)}`);
-    return lines.join("\n");
+    if (view.preview?.expiresAt) lines.push(`Confirmation: ${formatPreviewDeadline(view.preview.expiresAt)}`);
+  } else {
+    if (view.phase === "dispatching") lines.push("ForgeDock orchestration dispatching");
+    if (view.phase === "delegated") lines.push(`ForgeDock orchestration delegated${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
+    if (view.phase === "active") lines.push(`ForgeDock orchestration active${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
+    if (view.phase === "completed") lines.push(`ForgeDock orchestration complete${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
+    if (view.phase === "failed" || view.phase === "blocked" || view.phase === "suspended" || view.phase === "invalid") {
+      lines.push(`ForgeDock orchestration ${view.phase}${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
+    }
+    if (view.phase === "detached") lines.push("Live DAG display detached; durable state remains authoritative.");
   }
-  if (view.phase === "dispatching") lines.push("ForgeDock orchestration dispatching");
-  if (view.phase === "delegated") lines.push(`ForgeDock orchestration delegated${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
-  if (view.phase === "active") lines.push(`ForgeDock orchestration active${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
-  if (view.phase === "completed") lines.push(`ForgeDock orchestration complete${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
-  if (view.phase === "failed" || view.phase === "blocked" || view.phase === "suspended" || view.phase === "invalid") {
-    lines.push(`ForgeDock orchestration ${view.phase}${view.orchestrationId ? `: ${view.orchestrationId}` : ""}`);
+  const snapshot = view.snapshot ?? view.preview?.snapshot;
+  const slots = view.issueSlots ?? snapshot?.issueSlots ?? view.preview?.issueSlots;
+  if (!snapshot && slots) {
+    lines.push(formatOrchestrationIssueSlots(slots, slots.selected, view.maxParallel ?? view.preview?.maxParallel));
+  } else if (!snapshot && view.maxParallel !== undefined) {
+    lines.push(formatOrchestrationIssueSlots(undefined, view.selectedIssueCount ?? 0, view.maxParallel));
   }
-  if (view.phase === "detached") lines.push("Live DAG display detached; durable state remains authoritative.");
+  if (snapshot) lines.push(renderOrchestrationBoard(snapshot));
   if (view.summary) lines.push(view.summary);
   return lines.join("\n");
 }

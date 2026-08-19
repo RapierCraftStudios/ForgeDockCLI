@@ -2,10 +2,10 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
+import type { CheckResult, VerificationCommand, VerificationProgressCallback, VerificationRunner } from "../../core/ports/verification.js";
 import { sealVerificationEnvironment, verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const DEFAULT_LOCK_PATH = join(tmpdir(), "forgedock-verification.lock");
@@ -19,20 +19,90 @@ export class ProcessVerificationRunner implements VerificationRunner {
     this.#environment = sealVerificationEnvironment(options.environment ?? process.env);
   }
 
-  async run(commands: readonly VerificationCommand[], signal?: AbortSignal): Promise<CheckResult[]> {
-    const release = await acquireVerificationLock(this.#lockPath, signal);
+  async run(
+    commands: readonly VerificationCommand[],
+    signal?: AbortSignal,
+    onProgress?: VerificationProgressCallback,
+  ): Promise<CheckResult[]> {
+    const results: CheckResult[] = [];
+    const bufferedGlobalProgress: Parameters<VerificationProgressCallback>[0][] = [];
+    let releaseGlobal: (() => void) | undefined;
+    const flushGlobalProgress = async () => {
+      for (const progress of bufferedGlobalProgress.splice(0)) {
+        await emitProgress(onProgress, progress);
+      }
+    };
+    const releaseGlobalLock = async () => {
+      if (!releaseGlobal) return;
+      releaseGlobal();
+      releaseGlobal = undefined;
+      bufferedGlobalProgress.push({ phase: "lock-released", lockScope: "machine-global" });
+      await flushGlobalProgress();
+    };
+    const reportCommandProgress = async (progress: Parameters<VerificationProgressCallback>[0]) => {
+      if (releaseGlobal) bufferedGlobalProgress.push(progress);
+      else await emitProgress(onProgress, progress);
+    };
     try {
-      const results: CheckResult[] = [];
-      for (const command of commands) {
+      for (const [index, command] of commands.entries()) {
         if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted");
+        const lockScope = command.lockScope ?? "machine-global";
+        if (lockScope === "machine-global" && !releaseGlobal) {
+          await emitProgress(onProgress, { phase: "lock-waiting", lockScope });
+          releaseGlobal = await acquireVerificationLock(this.#lockPath, signal);
+          bufferedGlobalProgress.push({ phase: "lock-acquired", lockScope });
+        } else if (lockScope === "workspace") {
+          await releaseGlobalLock();
+        }
+        await reportCommandProgress({
+          phase: "command-started",
+          commandId: command.id,
+          index,
+          total: commands.length,
+        });
+        cleanOperationalOutput(command);
         const result = await runOne(command, this.#environment, signal);
         results.push(result);
+        await reportCommandProgress({
+          phase: "command-completed",
+          commandId: command.id,
+          index,
+          total: commands.length,
+          status: result.status,
+          durationMs: result.durationMs,
+        });
       }
       return results;
     } finally {
-      release();
+      await releaseGlobalLock();
     }
   }
+}
+
+function cleanOperationalOutput(command: VerificationCommand): void {
+  if (command.typescriptLayout) {
+    const configPath = resolve(command.cwd, command.typescriptLayout.project);
+    const digest = createHash("sha256").update(readFileSync(configPath)).digest("hex").slice(0, 16);
+    if (digest !== command.typescriptLayout.configDigest) {
+      throw new Error(`Frozen TypeScript configuration changed before verification: ${command.typescriptLayout.project}`);
+    }
+  }
+  if (!command.cleanOutputRoot) return;
+  const workspace = resolve(command.cwd);
+  const output = resolve(workspace, command.cleanOutputRoot);
+  const relativeOutput = relative(workspace, output).replaceAll("\\", "/");
+  if (!relativeOutput.startsWith(".forgedock/verification-") || relativeOutput.includes("..")) {
+    throw new Error(`Unsafe verification output cleanup path: ${command.cleanOutputRoot}`);
+  }
+  rmSync(output, { recursive: true, force: true });
+}
+
+async function emitProgress(
+  callback: VerificationProgressCallback | undefined,
+  progress: Parameters<VerificationProgressCallback>[0],
+): Promise<void> {
+  if (!callback) return;
+  try { await callback(progress); } catch { /* progress is operational evidence, never command authority */ }
 }
 
 async function acquireVerificationLock(path: string, signal?: AbortSignal): Promise<() => void> {
@@ -92,13 +162,32 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
       reject(signal?.reason ?? new Error("Verification aborted"));
     };
     signal?.addEventListener("abort", abort, { once: true });
+    // Cancellation can win between the caller's pre-check and listener
+    // registration. AbortSignal does not replay an already-fired event.
+    if (signal?.aborted) abort();
   });
 }
 
+function verificationResultMetadata(spec: VerificationCommand): Pick<
+  CheckResult,
+  "command" | "commandId" | "policyVersion" | "commandTargets" | "coveredBy" | "planId"
+> {
+  return {
+    command: [spec.command, ...spec.args].join(" "),
+    commandId: spec.id,
+    ...(spec.policyVersion !== undefined ? { policyVersion: spec.policyVersion } : {}),
+    ...(spec.targets !== undefined ? { commandTargets: [...spec.targets] } : {}),
+    ...(spec.coveredBy !== undefined ? { coveredBy: [...spec.coveredBy] } : {}),
+    ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
+  };
+}
+
 function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CheckResult> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const started = performance.now();
     let settled = false;
+    let cancelled = false;
+    let abortReason: unknown;
     const child = spawn(spec.command, [...spec.args], {
       cwd: spec.cwd,
       env: verificationEnvironment(environment),
@@ -122,19 +211,32 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       timedOut = true;
       terminate();
     }, spec.timeoutMs);
-    const abort = terminate;
+    const abort = () => {
+      if (!cancelled) {
+        cancelled = true;
+        abortReason = signal?.reason ?? new Error("Verification aborted");
+      }
+      terminate();
+    };
     signal?.addEventListener("abort", abort, { once: true });
+    // Do not miss cancellation fired after the run-loop pre-check but before
+    // this listener was installed. Termination still settles through the child
+    // event so no process is left behind when the promise rejects.
+    if (signal?.aborted) abort();
     child.on("error", (error: NodeJS.ErrnoException) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      if (cancelled) {
+        reject(abortReason);
+        return;
+      }
       const durationMs = Math.max(0, Math.round(performance.now() - started));
       const errorCode = error.code ?? error.name ?? "spawn-error";
       const summary = `Failed to start verification command (${errorCode})`;
       resolve({
-        command: [spec.command, ...spec.args].join(" "),
-        ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
+        ...verificationResultMetadata(spec),
         status: "failed",
         failureClass: "infrastructure",
         durationMs,
@@ -148,14 +250,17 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      if (cancelled) {
+        reject(abortReason);
+        return;
+      }
       const output = redactVerificationOutput(Buffer.concat(chunks).toString("utf8"));
       const durationMs = Math.max(0, Math.round(performance.now() - started));
       const status = code === 0 && !timedOut ? "passed" as const : "failed" as const;
       const summary = summarize(output, timedOut, status);
       const failureSignatures = status === "failed" ? extractFailureSignatures(output, timedOut) : [];
       resolve({
-        command: [spec.command, ...spec.args].join(" "),
-        ...(spec.planId !== undefined ? { planId: spec.planId } : {}),
+        ...verificationResultMetadata(spec),
         status,
         ...(status === "failed" ? {
           failureClass: timedOut ? ("timeout" as const) : ("command" as const),

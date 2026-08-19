@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Check } from "typebox/value";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
@@ -18,9 +18,26 @@ class FakeHost implements ForgeHost {
   comments: Array<{ marker: string; body: string }> = [];
   findingIssues: Array<{ finding: { id: string }; reviewerRoles: readonly string[] }> = [];
   reconciliations: Array<{ activeFindings: readonly { id: string }[] }> = [];
-  remediationDeltaPaths: readonly string[] = [];
+  remediationDeltaPaths: readonly string[] = ["src/lock.ts"];
+  remediationDeltaHunks: readonly string[] = ["src/lock.ts:L1-L1"];
   remediationDeltaRequests: Array<{ baseSha: string; headSha: string }> = [];
+  publicationFence: ReviewFindingPublicationFence | undefined;
   constructor(readonly events?: string[]) {}
+  async beginReviewFindingPublication(input: { repo: string; pullRequest: PullRequestSnapshot; runId: string }) {
+    this.publicationFence = {
+      repo: input.repo,
+      pullRequest: input.pullRequest.number,
+      generation: (this.publicationFence?.generation ?? 0) + 1,
+      runId: input.runId,
+      headSha: input.pullRequest.headSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+    };
+    return { ...this.publicationFence };
+  }
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void> {
+    assert.deepEqual(fence, this.publicationFence);
+  }
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { return pr; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return this.snapshots.shift() ?? pr; }
@@ -29,6 +46,7 @@ class FakeHost implements ForgeHost {
     this.remediationDeltaRequests.push({ baseSha, headSha });
     return this.remediationDeltaPaths;
   }
+  async getChangedHunksBetween(): Promise<readonly string[]> { return this.remediationDeltaHunks; }
   async publishPullRequestComment(input: { marker: string; body: string }): Promise<void> {
     this.comments.push(input);
     this.events?.push(`comment:${input.body.includes("ForgeDock Review Evidence") ? "wave" : "other"}`);
@@ -58,7 +76,7 @@ async function reviewingRun(runs: InMemoryRunRepository): Promise<RunState> {
   return run;
 }
 
-function reviewPlanContext(run: RunState): Omit<ReviewPlanContext, "packetId" | "packetDigest"> {
+function reviewPlanContext(run: RunState, reviewedHeadSha = "b".repeat(40)): Omit<ReviewPlanContext, "packetId" | "packetDigest"> {
   return {
     runId: run.runId,
     repo: run.subject.repo,
@@ -67,6 +85,10 @@ function reviewPlanContext(run: RunState): Omit<ReviewPlanContext, "packetId" | 
     deliveryRunId: run.runId,
     buildResultBranch: "fix",
     targetBranch: "main",
+    reviewedHeadSha,
+    phase: "initial",
+    deltaPaths: ["src/lock.ts"],
+    openRootIds: [],
   };
 }
 
@@ -356,7 +378,7 @@ describe("fresh-context PR review", () => {
     assert.ok(runtime.tasks.some((task) => task.role === "adjudicator"));
   });
 
-  it("reuses the exact frozen topology after remediation instead of broadening it", async () => {
+  it("rebinds a bounded closure topology to the exact remediation SHA and parent verdict", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -372,13 +394,41 @@ describe("fresh-context PR review", () => {
       kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
       payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: priorPlan },
     });
-    const runtime = new FakeAgentRuntime([clean]);
+    const runtime = new FakeAgentRuntime([clean, clean]);
     const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet: neutralPacket, priorVerdict, workspace: process.cwd() }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
-    assert.equal(result.reviewPlan.planId, priorPlan.planId);
-    assert.deepEqual(result.reviewPlan.executionGroups.map(({ role }) => role), ["correctness"]);
-    assert.equal(runtime.tasks.filter(({ role }) => role === "reviewer").length, 1);
+    assert.notEqual(result.reviewPlan.planId, priorPlan.planId);
+    assert.equal(result.reviewPlan.context.reviewedHeadSha, sha);
+    assert.equal(result.reviewPlan.context.parentPlanId, priorPlan.planId);
+    assert.equal(result.reviewPlan.context.parentVerdictId, priorVerdict.id);
+    assert.equal(result.reviewPlan.context.phase, "closure");
+    assert.deepEqual(result.reviewPlan.executionGroups.map(({ role }) => role), ["correctness", "concurrency"]);
+    assert.equal(runtime.tasks.filter(({ role }) => role === "reviewer").length, 2);
+  });
+
+  it("rejects same-SHA closure before invoking reviewers or projection", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const priorPlan = planReviewPanel({
+      changedPaths: ["src/lock.ts"], diff: "+work();", packet: context.packet,
+      context: reviewPlanContext(run, sha),
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+      payload: {
+        headSha: sha, headBranch: "fix", baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: priorPlan,
+      },
+    });
+    const runtime = new FakeAgentRuntime([clean]);
+    const host = new FakeHost();
+    await assert.rejects(reviewPullRequest({
+      run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(),
+    }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }), /newly pushed pull-request revision/);
+    assert.equal(runtime.tasks.length, 0);
+    assert.equal(host.findingIssues.length, 0);
   });
 
   it("threads an exact host-observed prior-SHA remediation delta into continuity policy", async () => {
@@ -402,6 +452,12 @@ describe("fresh-context PR review", () => {
       ...inScope,
       id: "introduced-delta",
       introducedByRemediation: true,
+      introductionEvidence: {
+        priorReproducer: "guarded write succeeds",
+        currentReproducer: "lock returns before guarded write",
+        causalSymbols: ["lock.run"],
+        hunkReferences: ["src/lock.ts:L20-L20:lock.run"],
+      },
       severity: "high" as const,
       confidence: "high" as const,
       blocking: true,
@@ -413,6 +469,7 @@ describe("fresh-context PR review", () => {
     };
     const host = new FakeHost();
     host.remediationDeltaPaths = ["src/lock.ts"];
+    host.remediationDeltaHunks = ["src/lock.ts:L20-L20:lock.run"];
     const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
       runtime: new FakeAgentRuntime([{ summary: "introduced regression", findings: [introduced] }, clean, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
@@ -481,7 +538,7 @@ describe("fresh-context PR review", () => {
     }
   });
 
-  it("replans compatibility budgets missing new fields and cannot approve with zero reviewers", async () => {
+  it("rejects compatibility plans missing exact-head and current budget authority", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -500,13 +557,10 @@ describe("fresh-context PR review", () => {
       },
     });
     const runtime = new FakeAgentRuntime([clean, clean]);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+    await assert.rejects(reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
-    });
-    assert.equal(result.verdict.payload.disposition, "approve");
-    assert.notEqual(result.reviewPlan.planId, compatibilityPlan.planId);
-    assert.equal(runtime.tasks.filter(({ role }) => role === "reviewer").length, result.reviewPlan.executionGroups.length);
-    assert.ok(runtime.tasks.some(({ role }) => role === "reviewer"));
+    }), /Cannot use prior Review Verdict/);
+    assert.equal(runtime.tasks.length, 0);
   });
 
   it("retries one operationally failed reviewer in fresh context without discarding successful peers", async () => {
@@ -1176,8 +1230,9 @@ describe("fresh-context PR review", () => {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
       });
       const expectedBlocking = severity === "high";
-      assert.equal(result.run.state, expectedBlocking ? "remediating" : "merging");
+      assert.equal(result.run.state, "remediating");
       assert.equal(result.verdict.payload.findings[0]?.blocking, expectedBlocking);
+      assert.equal(result.verdict.payload.findings[0]?.mustFix, true);
       assert.deepEqual(result.verdict.payload.findings[0]?.reviewerRoles, ["correctness"]);
       assert.deepEqual(result.verdict.payload.findings[0]?.sourceFindingIds, ["correctness:f1"]);
       assert.equal(result.verdict.payload.findings[0]?.sourceSessionRefs?.length, 1);

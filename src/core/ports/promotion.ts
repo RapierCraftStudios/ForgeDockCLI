@@ -11,6 +11,7 @@ export type PromotionPhase =
   | "reviewing"
   | "awaiting-merge"
   | "completed"
+  | "blocked"
   | "failed"
   | "cancelled";
 
@@ -61,7 +62,7 @@ export interface PromotionRecord {
   mergeAuthorized: boolean;
   phase: PromotionPhase;
   /** Phase to retry after a transient controller failure. */
-  resumePhase?: Exclude<PromotionPhase, "completed" | "failed" | "cancelled">;
+  resumePhase?: Exclude<PromotionPhase, "completed" | "blocked" | "failed" | "cancelled">;
   cancelledAt?: string;
   cancellationReason?: string;
   version: number;

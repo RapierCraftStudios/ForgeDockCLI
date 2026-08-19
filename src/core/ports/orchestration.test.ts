@@ -6,6 +6,7 @@ import {
   findDurableOrchestrationIssueConflicts,
   findRunningOrchestrationIssueConflicts,
   OrchestrationIssueOwnershipConflictError,
+  orchestrationRecordIssueIdentities,
   orchestrationRecordIssueNumbers,
   type OrchestrationNodeRecord,
   type OrchestrationRecord,
@@ -42,40 +43,59 @@ function record(overrides: Partial<OrchestrationRecord> = {}): OrchestrationReco
   };
 }
 
-test("durable orchestration ownership includes requested, contracted, batch, and decomposition issues", () => {
+test("durable orchestration ownership qualifies nodes, members, and decomposition by repository", () => {
   const active = record({
     requestedIssueNumbers: [10],
     issueNumbers: [10],
-    nodes: [node({
-      issue: 900,
-      memberIssues: [20, 21],
-      decompositionChildren: [30],
-      attempts: [{
-        attemptId: "attempt-crash-window",
-        attempt: 1,
-        recovery: "initial",
-        status: "skipped",
-        startedAt: "2026-08-18T00:00:00.000Z",
-        updatedAt: "2026-08-18T00:00:01.000Z",
-        completedAt: "2026-08-18T00:00:01.000Z",
-        decompositionChildren: [31],
-      }],
-    })],
+    nodes: [
+      node({ id: "legacy-root", issue: 11 }),
+      node({
+        id: "remote-work",
+        repository: "C/D",
+        issue: 900,
+        memberIssues: [20, 21],
+        decompositionChildren: [30],
+        attempts: [{
+          attemptId: "attempt-crash-window",
+          attempt: 1,
+          recovery: "initial",
+          status: "skipped",
+          startedAt: "2026-08-18T00:00:00.000Z",
+          updatedAt: "2026-08-18T00:00:01.000Z",
+          completedAt: "2026-08-18T00:00:01.000Z",
+          decompositionChildren: [31],
+        }],
+      }),
+    ],
   });
 
-  assert.deepEqual(orchestrationRecordIssueNumbers(active), [10, 20, 21, 30, 31, 900]);
-  assert.deepEqual(findRunningOrchestrationIssueConflicts([active], "A/B", [21, 900, 999]), [{
+  assert.deepEqual(orchestrationRecordIssueIdentities(active), [
+    { repository: "a/b", issue: 10 },
+    { repository: "a/b", issue: 11 },
+    { repository: "c/d", issue: 20 },
+    { repository: "c/d", issue: 21 },
+    { repository: "c/d", issue: 30 },
+    { repository: "c/d", issue: 31 },
+    { repository: "c/d", issue: 900 },
+  ]);
+  assert.deepEqual(orchestrationRecordIssueNumbers(active), [10, 11, 20, 21, 30, 31, 900]);
+  assert.deepEqual(findRunningOrchestrationIssueConflicts([active], [
+    { repository: "c/d", issue: 21 },
+    { repository: "C/D", issue: 900 },
+    { repository: "a/b", issue: 900 },
+  ]), [{
     orchestrationId: "dag_active",
-    repository: "a/b",
+    repository: "c/d",
     issueNumbers: [21, 900],
   }]);
+  assert.deepEqual(findRunningOrchestrationIssueConflicts([active], "a/b", [900]), []);
   assert.deepEqual(findRunningOrchestrationIssueConflicts([
     active,
-    record({ orchestrationId: "dag_complete", status: "completed", requestedIssueNumbers: [21] }),
-    record({ orchestrationId: "dag_other_repo", repository: "c/d", requestedIssueNumbers: [21] }),
-  ], "a/b", [21]), [{
+    record({ orchestrationId: "dag_complete", status: "completed", repository: "c/d", requestedIssueNumbers: [21] }),
+    record({ orchestrationId: "dag_other_repo", repository: "e/f", requestedIssueNumbers: [21] }),
+  ], "c/d", [21]), [{
     orchestrationId: "dag_active",
-    repository: "a/b",
+    repository: "c/d",
     issueNumbers: [21],
   }]);
 });

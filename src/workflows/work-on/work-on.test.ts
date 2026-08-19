@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { decideSubjectAdmission } from "../../core/state/admission.js";
 import { reconcileArtifacts } from "../../core/state/reconcile.js";
 import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
-import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
+import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
@@ -20,7 +21,7 @@ import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
 const runTarget = { lane: "fast", targetBranch: "main" } as const;
-const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main" };
+const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main", baseSha: sha };
 
 describe("durable workspace identity", () => {
   it("treats Windows and WSL spellings as the same retained workspace", () => {
@@ -37,8 +38,15 @@ describe("durable workspace identity", () => {
 
 class EndToEndGit implements GitWorkspaceManager {
   removed = false;
+  refreshes = 0;
+  pristineAssertions = 0;
   createdFrom?: string;
   async create(input: { baseRef: string }): Promise<GitWorkspace> { this.createdFrom = input.baseRef; return workspace; }
+  async fastForwardToRemoteTarget(current: GitWorkspace, advertisedHeadSha: string): Promise<GitWorkspace> {
+    this.refreshes += 1;
+    return { ...current, baseSha: advertisedHeadSha };
+  }
+  async assertPristineAtHead(): Promise<void> { this.pristineAssertions += 1; }
   async changedPaths(): Promise<string[]> { return ["src/a.js"]; }
   async revisionChangedPaths(): Promise<string[]> { return ["src/a.js"]; }
   async syncToRemoteHead(): Promise<void> {}
@@ -60,7 +68,7 @@ class SequencedEndToEndGit extends EndToEndGit {
   }
 }
 class EndToEndVerifier implements VerificationRunner {
-  async run(): Promise<CheckResult[]> { return [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 10, outputDigest: "f".repeat(64) }]; }
+  async run(): Promise<CheckResult[]> { return [{ command: "npm test", commandId: "test", status: "passed", exitCode: 0, durationMs: 10, outputDigest: "f".repeat(64) }]; }
 }
 class EndToEndHost implements ForgeHost {
   async materializeDecomposition() { return []; }
@@ -69,16 +77,38 @@ class EndToEndHost implements ForgeHost {
   findingIssues = 0;
   findingReconciliations: number[] = [];
   remediationChildDepths: number[] = [];
+  publicationFence: ReviewFindingPublicationFence | undefined;
+  async beginReviewFindingPublication(input: { repo: string; pullRequest: PullRequestSnapshot; runId: string }) {
+    this.publicationFence = {
+      repo: input.repo, pullRequest: input.pullRequest.number,
+      generation: (this.publicationFence?.generation ?? 0) + 1,
+      runId: input.runId, headSha: input.pullRequest.headSha,
+      headBranch: input.pullRequest.headBranch, baseBranch: input.pullRequest.baseBranch,
+    };
+    return { ...this.publicationFence };
+  }
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence) { assert.deepEqual(fence, this.publicationFence); }
   async createPullRequest(input: { baseBranch: string }): Promise<PullRequestSnapshot> {
     this.snapshot.baseBranch = input.baseBranch;
     return { ...this.snapshot };
   }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
-  async getPullRequestMergeGate() {
-    return { repo: "a/b", pullRequest: this.snapshot.number, headSha: this.snapshot.headSha, baseBranch: this.snapshot.baseBranch, mergeable: true, requiredChecks: [], observedAt: new Date().toISOString() };
+  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> {
+    return {
+      repo: "a/b",
+      pullRequest: this.snapshot.number,
+      headSha: this.snapshot.headSha,
+      baseBranch: this.snapshot.baseBranch,
+      mergeable: true,
+      requiredChecksProvenance: "github-required" as const,
+      requiredChecksHeadSha: this.snapshot.headSha,
+      requiredChecks: [{ name: "CI", state: "passed" as const }],
+      observedAt: new Date().toISOString(),
+    };
   }
   async getPullRequestDiff(): Promise<string> { return "diff --git a/src/a.js b/src/a.js\n+guard();"; }
   async getChangedPathsBetween(): Promise<readonly string[]> { return ["src/a.js"]; }
+  async getChangedHunksBetween(): Promise<readonly string[]> { return ["src/a.js:L1-L1:guard"]; }
   async getBranchHead(): Promise<string> { return sha; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() {
@@ -94,7 +124,7 @@ class EndToEndHost implements ForgeHost {
     return [{ repo: "a/b", number: 30, title: "child", body: "", url: "https://github.test/a/b/issues/30", state: "OPEN" as const }];
   }
   async mergePullRequest(_repo: string, _number: number, expected: string, expectedBase: string): Promise<void> {
-    assert.equal(expected, sha);
+    assert.equal(expected, this.snapshot.headSha);
     assert.equal(expectedBase, this.snapshot.baseBranch);
     this.snapshot.state = "MERGED";
   }
@@ -114,7 +144,7 @@ const packet: BuildPacketPayload = {
   expectedPaths: ["src/a.js"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
 };
 
-function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>) {
+function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>, reviewedHeadSha = sha) {
   return planReviewPanel({
     changedPaths: ["src/a.js"], diff: "diff --git a/src/a.js b/src/a.js\n+guard();", packet: packetArtifact,
     context: {
@@ -125,12 +155,27 @@ function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"Bui
       deliveryRunId: packetArtifact.runId,
       buildResultBranch: workspace.branch,
       targetBranch: "main",
+      reviewedHeadSha,
+      phase: "initial",
+      deltaPaths: ["src/a.js"],
+      openRootIds: [],
     },
   });
 }
 const submission: BuilderSubmission = {
-  summary: "Added guard", changedPaths: ["src/a.js"], criterionCoverage: [{ criterion: "Guard runs", implementation: "guard() is called" }], decisions: [], residualRisks: [],
+  summary: "Added guard", changedPaths: ["src/a.js"], criterionCoverage: [{
+    criterionId: "criterion-1", criterion: "Guard runs", implementation: "guard() is called",
+    anchors: { paths: ["src/a.js"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["test"] },
+  }], decisions: [], residualRisks: [],
 };
+
+const fixOpenRoots = (task: AgentTask<unknown>) => ({
+  summary: "All assigned durable roots are fixed at the current head",
+  findings: [],
+  rootAssessments: [...new Set(task.objective.match(/root-[a-f0-9]{20}/g) ?? [])].map((rootId) => ({
+    rootId, status: "fixed" as const, evidence: "Focused current-head reproducer and frozen checks pass.",
+  })),
+});
 
 function createWorkOnIntent(runId: string) {
   return createArtifact({
@@ -289,6 +334,29 @@ describe("complete work-on trajectory", () => {
     assert.equal((await artifacts.list(intent.subject, "Outcome")).length, 0);
   });
 
+  it("retains the packet without a failed Outcome when the parent receipt is ambiguous", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createWorkOnIntent("run_claim_receipt_ambiguous");
+    const ambiguity = new ClaimPromotionRecoveryError("receipt lost", "a".repeat(64), "b".repeat(64));
+
+    await assert.rejects(() => workOn({
+      intent,
+      repoPath: process.cwd(),
+      lane: fastLane,
+      verification: [],
+      onClaimsPromoted: async () => { throw ambiguity; },
+    }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }), (error: unknown) => error === ambiguity);
+
+    assert.equal((await runs.load(intent.runId))?.state, "building");
+    assert.equal(git.removed, false);
+    assert.equal((await artifacts.list(intent.subject, "Outcome")).length, 0);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author"]);
+  });
+
   it("resumes preparation from a durable Investigation without replaying the investigator", async () => {
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
@@ -443,6 +511,43 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(runtime.tasks, []);
   });
 
+  it("refreshes and recomputes baseline for a clean pre-builder build resume", async () => {
+    const fixture = await createBuildCheckpointFixture("run_build_clean_refresh");
+    const git = new SequencedEndToEndGit([[], ["src/a.js"]]);
+    const runtime = new FakeAgentRuntime([submission, { summary: "Approved", findings: [] }]);
+    let claimsPromoted = false;
+    let verifierRuns = 0;
+    const verifier: VerificationRunner = {
+      async run() {
+        verifierRuns += 1;
+        assert.equal(claimsPromoted, true);
+        if (verifierRuns === 1) assert.deepEqual(runtime.tasks, []);
+        return [{ command: "npm test", commandId: "test", status: "passed", exitCode: 0, durationMs: 1 }];
+      },
+    };
+
+    const resumed = await resumeBuildWorkOn({
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      packet: fixture.packetArtifact,
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      onClaimsPromoted: () => { claimsPromoted = true; },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git,
+      verifier, host: fixture.host,
+    });
+
+    assert.equal(resumed.run.state, "completed");
+    assert.equal(git.refreshes, 1);
+    assert.equal(git.pristineAssertions, 3);
+    assert.equal(verifierRuns, 2);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
+  });
+
   it("refuses to trust mismatched build-resume preflight evidence", async () => {
     const fixture = await createBuildCheckpointFixture("run_build_claim_preflight_mismatch");
     const runtime = new FakeAgentRuntime([]);
@@ -565,6 +670,101 @@ describe("complete work-on trajectory", () => {
     assert.equal(fixture.git.removed, true);
   });
 
+  it("refreshes after late claim admission, retries the newest target, and baselines only selected local commands", async () => {
+    const fixture = await createPreparationCheckpointFixture("run_preparation_target_refresh");
+    const targetAfterPredecessor = "a".repeat(40);
+    const newestTarget = "b".repeat(40);
+    const typedPacket: BuildPacketPayload = {
+      ...packet,
+      expectedPaths: ["src/a.js", "src/a.test.ts"],
+      verificationRequirements: [{
+        kind: "command", id: "test", criterionIds: ["criterion-1"], rationale: "Run the expected regression test",
+      }],
+    };
+    const runtime = new FakeAgentRuntime([typedPacket, submission, { summary: "Approved", findings: [] }]);
+    let admitted = false;
+    let authoritativeTarget = sha;
+    const advertised: string[] = [];
+    fixture.host.getBranchHead = async (_repo?: string, branch?: string) => branch === "main" ? authoritativeTarget : sha;
+    fixture.git.fastForwardToRemoteTarget = async (current, expected) => {
+      assert.equal(admitted, true, "target refresh must follow claim admission");
+      advertised.push(expected);
+      if (advertised.length === 1) {
+        authoritativeTarget = newestTarget;
+        throw new AdvertisedRemoteHeadMismatchError(expected, newestTarget);
+      }
+      return { ...current, baseSha: expected };
+    };
+    let verificationRuns = 0;
+    const verifier: VerificationRunner = {
+      async run(commands, _signal, onProgress) {
+        verificationRuns += 1;
+        if (verificationRuns === 1) {
+          assert.equal(admitted, true, "baseline must not run before claim admission");
+          assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
+        }
+        assert.deepEqual(commands.map((command) => command.id), ["diff-check", "build", "test"]);
+        assert.deepEqual(commands.find((command) => command.id === "test")?.targets, [".forgedock/verification-dist/a.test.js"]);
+        for (const [index, command] of commands.entries()) {
+          await onProgress?.({ phase: "command-started", commandId: command.id, index, total: commands.length });
+        }
+        const results = commands.map((command) => ({
+          command: [command.command, ...command.args].join(" "),
+          commandId: command.id,
+          ...(command.policyVersion !== undefined ? { policyVersion: command.policyVersion } : {}),
+          ...(command.targets !== undefined ? { commandTargets: [...command.targets] } : {}),
+          ...(command.planId !== undefined ? { planId: command.planId } : {}),
+          status: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+        }));
+        for (const [index, command] of commands.entries()) {
+          await onProgress?.({
+            phase: "command-completed", commandId: command.id, index, total: commands.length,
+            status: "passed", durationMs: 1,
+          });
+        }
+        return results;
+      },
+    };
+
+    const result = await resumeEarlyWorkOn({
+      checkpoint: "preparation",
+      run: fixture.run,
+      intent: fixture.intent,
+      investigation: fixture.investigationArtifact,
+      priorArtifacts: [fixture.intent, fixture.investigationArtifact],
+      workspace,
+      baseBranch: "main",
+      autoMerge: true,
+      verification: [{
+        id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 1_000, required: true,
+        selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+      }, {
+        id: "build", command: "npm", args: ["run", "build"], timeoutMs: 1_000, required: true,
+        selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+      }, {
+        id: "test", command: process.execPath, args: ["--test"], timeoutMs: 1_000, required: true,
+        selection: "packet", targeting: "expected-test-paths", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+        typescriptLayout: { sourceRoot: "src", outputRoot: ".forgedock/verification-dist", project: "tsconfig.json", configDigest: "fixture" },
+      }],
+      onClaimsPromoted: () => {
+        admitted = true;
+        authoritativeTarget = targetAfterPredecessor;
+      },
+    }, {
+      runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
+      verifier, host: fixture.host,
+    });
+
+    assert.equal(result.run.state, "completed");
+    assert.deepEqual(advertised, [targetAfterPredecessor, newestTarget]);
+    assert.equal(verificationRuns, 2, "one post-refresh baseline and one changed-revision run are expected");
+    const progressPhases = (await fixture.runs.listProgress(fixture.intent.runId)).map((progress) => progress.phase);
+    assert.ok(progressPhases.includes("verification.baseline.command-started"));
+    assert.ok(progressPhases.includes("verification.changed.command-completed"));
+  });
+
   it("distinguishes durable artifact fields from dotted and extensionless repository paths", () => {
     assert.equal(repositoryPathFromLocation("BuildResult art_f1b0.payload.changedPaths/checks"), undefined);
     assert.equal(repositoryPathFromLocation("Evidence at .github/workflows/publish.yml:20"), ".github/workflows/publish.yml");
@@ -594,7 +794,7 @@ describe("complete work-on trajectory", () => {
       payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
     });
     const verifier: VerificationRunner = {
-      async run() { return [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 10, summary: "test failed" }]; },
+      async run() { return [{ command: "npm test", commandId: "test", status: "failed", exitCode: 1, durationMs: 10, summary: "test failed" }]; },
     };
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
@@ -650,9 +850,9 @@ describe("complete work-on trajectory", () => {
     const verifier: VerificationRunner = {
       async run() {
         verificationCalls += 1;
-        return verificationCalls === 1
-          ? [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 10, summary: "test failed" }]
-          : [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 10 }];
+        return verificationCalls === 2
+          ? [{ command: "npm test", commandId: "test", status: "failed", exitCode: 1, durationMs: 10, summary: "test failed" }]
+          : [{ command: "npm test", commandId: "test", status: "passed", exitCode: 0, durationMs: 10 }];
       },
     };
     const result = await workOn({
@@ -660,9 +860,16 @@ describe("complete work-on trajectory", () => {
       verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
     }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(result.run.state, "completed");
-    assert.equal(verificationCalls, 2);
+    assert.equal(verificationCalls, 3);
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "builder", "reviewer"]);
-    assert.match(runtime.tasks[3]?.objective ?? "", /controller verification failed/);
+    const repairTask = runtime.tasks[3];
+    assert.match(repairTask?.objective ?? "", /controller verification failed/);
+    assert.ok(repairTask?.tools.includes("verify"));
+    assert.deepEqual(repairTask?.verification?.commands.map(({ id }) => id), ["test"]);
+    assert.match(repairTask?.instructions ?? "", /reproduce every controller-recorded failed check/i);
+    assert.match(repairTask?.instructions ?? "", /neighboring frozen check/i);
+    assert.match(repairTask?.instructions ?? "", /re-audit every still-open frozen criterion/i);
+    assert.match(repairTask?.instructions ?? "", /prior builder checklist\/submission/i);
     assert.ok((await runs.history(intent.runId)).some((record) => record.event === "VERIFICATION_REPAIR_REQUESTED"));
   });
 
@@ -701,7 +908,7 @@ describe("complete work-on trajectory", () => {
         status: "blocked", reason: "Required verification failed: npm test (exit 1)", childIssues: [],
         failureEvidence: {
           branch: workspace.branch, workspacePath: workspace.path, builderSummary: "first attempt",
-          changedPaths: ["src/a.js"], checks: [{ command: "npm test", status: "failed", durationMs: 1 }],
+          changedPaths: ["src/a.js"], checks: [{ command: "npm test", commandId: "test", status: "failed", durationMs: 1 }],
         },
       },
     });
@@ -713,6 +920,7 @@ describe("complete work-on trajectory", () => {
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
+    assert.equal(git.refreshes, 0, "a retained partially built revision must not be fast-forwarded");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
     assert.match(runtime.tasks[0]?.objective ?? "", /controller verification failed/);
     assert.ok(runtime.tasks[0]?.context.some((artifact) => artifact.kind === "Outcome"));
@@ -743,7 +951,7 @@ describe("complete work-on trajectory", () => {
         failureEvidence: {
           branch: workspace.branch, workspacePath: workspace.path, builderSummary: "first attempt",
           changedPaths: ["src/a.js"], repairAttempt: 1,
-          checks: [{ command: "npm test", status: "failed", failureClass: "command", durationMs: 1 }],
+          checks: [{ command: "npm test", commandId: "test", status: "failed", failureClass: "command", durationMs: 1 }],
         },
       },
     });
@@ -798,7 +1006,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     });
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
@@ -837,7 +1045,7 @@ describe("complete work-on trajectory", () => {
       kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
       payload: {
         headSha: oldSha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
-        reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
+        reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: currentReviewPlan(packetArtifact, oldSha),
       },
     }, { createdAt: "2026-01-01T00:01:00.000Z" });
     const buildResult = createArtifact({
@@ -845,7 +1053,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Remediated guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     }, { createdAt: "2026-01-01T00:02:00.000Z" });
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
@@ -877,6 +1085,14 @@ describe("complete work-on trajectory", () => {
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
     const host = new EndToEndHost();
+    const remediatedSha = "f".repeat(40);
+    let currentHead = sha;
+    git.commit = async () => {
+      currentHead = remediatedSha;
+      host.snapshot.headSha = remediatedSha;
+      return remediatedSha;
+    };
+    git.head = async () => currentHead;
     const intent = createArtifact({
       kind: "Intent", runId: "run_publish_remediate", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
       payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
@@ -888,7 +1104,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     });
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
@@ -909,7 +1125,7 @@ describe("complete work-on trajectory", () => {
       { summary: "Changes required", findings: [finding] },
       acceptAdjudication,
       submission,
-      { summary: "Approved after remediation", findings: [] },
+      fixOpenRoots,
     ]);
     const resumed = await resumePublicationWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
@@ -935,6 +1151,14 @@ describe("complete work-on trajectory", () => {
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
     const host = new EndToEndHost();
+    const remediatedSha = "f".repeat(40);
+    let currentHead = sha;
+    git.commit = async () => {
+      currentHead = remediatedSha;
+      host.snapshot.headSha = remediatedSha;
+      return remediatedSha;
+    };
+    git.head = async () => currentHead;
     const intent = createArtifact({
       kind: "Intent", runId: "run_remediation_repair", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
       payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
@@ -946,7 +1170,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     });
     const finding = {
@@ -968,15 +1192,15 @@ describe("complete work-on trajectory", () => {
       acceptAdjudication,
       submission,
       submission,
-      { summary: "Approved after verification repair", findings: [] },
+      fixOpenRoots,
     ]);
     let checks = 0;
     const verifier: VerificationRunner = {
       async run() {
         checks += 1;
         return checks === 1
-          ? [{ command: "npm test", status: "failed", exitCode: 1, durationMs: 1, summary: "whitespace" }]
-          : [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }];
+          ? [{ command: "npm test", commandId: "test", status: "failed", exitCode: 1, durationMs: 1, summary: "whitespace" }]
+          : [{ command: "npm test", commandId: "test", status: "passed", exitCode: 0, durationMs: 1 }];
       },
     };
     const resumed = await resumePublicationWorkOn({
@@ -1011,7 +1235,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     });
     const finding = {
@@ -1066,7 +1290,7 @@ describe("complete work-on trajectory", () => {
       payload: {
         branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
-        checks: [{ command: "npm test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
     });
     const finding = {
@@ -1142,6 +1366,50 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual((await runs.history(verdict.runId)).map((record) => record.event).slice(-3), [
       "RESUME_COMPLETION", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("keeps required-CI polling cancellation at the resumable merging checkpoint", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const controller = new AbortController();
+    const reason = new Error("orchestration lease cancelled CI polling");
+    const subject = { repo: "a/b", issue: 8 };
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_completion_cancelled", subject: { ...subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: { headSha: sha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    let run = createRun({ workflow: "work-on", subject, runId: verdict.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED",
+    ] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    host.getPullRequestMergeGate = async () => {
+      controller.abort(reason);
+      return {
+        repo: "a/b", pullRequest: host.snapshot.number, headSha: sha, baseBranch: "main",
+        mergeable: true, requiredChecksProvenance: "github-required" as const, requiredChecksHeadSha: sha,
+        requiredChecks: [{ name: "CI", state: "pending" as const }], observedAt: new Date().toISOString(),
+      };
+    };
+
+    await assert.rejects(resumeCompletionWorkOn({
+      run, verdict, pullRequest: host.snapshot, autoMerge: true, workspace, signal: controller.signal,
+    }, {
+      runtime: new FakeAgentRuntime([]), artifacts, runs, git,
+      verifier: new EndToEndVerifier(), host,
+    }), (error: unknown) => error === reason);
+
+    assert.equal((await runs.load(verdict.runId))?.state, "merging");
+    assert.equal(git.removed, false);
+    assert.equal((await artifacts.list(subject, "Outcome")).length, 0);
+    assert.equal((await runs.history(verdict.runId)).at(-1)?.event, "RESUME_COMPLETION");
   });
 
   it("denies completion mutations after lease continuity is lost", async () => {
@@ -1404,7 +1672,7 @@ describe("complete work-on trajectory", () => {
     assert.equal(host.issueClosed, true);
     assert.equal(git.removed, true);
     assert.deepEqual(artifacts.artifacts.map((artifact) => artifact.kind), [
-      "Intent", "Investigation", "BuildPacket", "BuildResult", "ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict", "Outcome",
+      "Intent", "Investigation", "BuildPacket", "VerificationCheckpoint", "BuildResult", "FindingRootLedger", "ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict", "Outcome",
     ]);
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator", "packet-author", "builder", "reviewer"]);
     assert.equal(new Set(runtime.tasks.map((task) => task.id)).size, 4);

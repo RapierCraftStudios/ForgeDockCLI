@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { createArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import type { BuilderSubmission } from "./build.js";
-import { uncoveredVerificationCommands, verifyAndCommit } from "./verify.js";
+import { recoverVerificationCheckpoint, uncoveredVerificationCommands, verifyAndCommit } from "./verify.js";
 
 const workspace: GitWorkspace = { path: "/tmp/worktree", branch: "forgedock/issue-1", baseRef: "main", baseSha: "0".repeat(40) };
 const submission: BuilderSubmission = {
@@ -20,6 +20,7 @@ const submission: BuilderSubmission = {
 
 class FakeGit implements GitWorkspaceManager {
   committed = false;
+  commitCalls = 0;
   dependenciesPrepared = false;
   pushed = false;
   constructor(
@@ -28,7 +29,7 @@ class FakeGit implements GitWorkspaceManager {
     readonly committedRevisionPaths = [...new Set([...revisionPaths, ...paths])],
   ) {}
   async create(): Promise<GitWorkspace> { return workspace; }
-  async changedPaths(): Promise<string[]> { return this.paths; }
+  async changedPaths(): Promise<string[]> { return this.committed ? [] : this.paths; }
   async revisionChangedPaths(): Promise<string[]> {
     return this.committed ? this.committedRevisionPaths : this.revisionPaths;
   }
@@ -36,9 +37,11 @@ class FakeGit implements GitWorkspaceManager {
   async isAncestor(): Promise<boolean> { return true; }
   async prepareWorkspaceDependencies(): Promise<void> { this.dependenciesPrepared = true; }
   async committedContentMatches(): Promise<boolean> { return true; }
-  async commit(): Promise<string> { this.committed = true; return "a".repeat(40); }
+  async commit(): Promise<string> { this.commitCalls += 1; this.committed = true; return "a".repeat(40); }
+  async commitParents(): Promise<string[]> { return [workspace.baseSha!]; }
+  async assertPristineAtHead(): Promise<void> {}
   async push(): Promise<void> { this.pushed = true; }
-  async head(): Promise<string> { return "a".repeat(40); }
+  async head(): Promise<string> { return this.committed ? "a".repeat(40) : workspace.baseSha!; }
   async remove(): Promise<void> {}
 }
 class FakeVerifier implements VerificationRunner {
@@ -46,11 +49,11 @@ class FakeVerifier implements VerificationRunner {
   async run(): Promise<CheckResult[]> { return this.results; }
 }
 
-async function verifyingRun(runs: InMemoryRunRepository): Promise<RunState> {
+async function verifyingRun(runs: InMemoryRunRepository, runId = `run_verify_${crypto.randomUUID()}`): Promise<RunState> {
   let run = createRun({
     workflow: "work-on",
     subject: { repo: "a/b", issue: 1 },
-    runId: `run_verify_${crypto.randomUUID()}`,
+    runId,
     target: { lane: "fast", targetBranch: "main" },
   });
   await runs.create(run);
@@ -100,6 +103,57 @@ describe("verification and commit barrier", () => {
     assert.equal(result.buildResult?.payload.baseSha, workspace.baseSha);
     assert.equal(result.buildResult?.payload.checks[0]?.status, "passed");
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
+  });
+
+  it("reconstructs BuildResult from the exact retained commit without rerunning verification or commit", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-recovery-"));
+    mkdirSync(join(directory, "src"), { recursive: true });
+    writeFileSync(join(directory, "src", "a.ts"), "export const recovered = true;\n");
+    try {
+      const firstRuns = new InMemoryRunRepository();
+      const run = await verifyingRun(firstRuns);
+      const retainedArtifacts = new InMemoryArtifactRepository();
+      const crashAfterCommit = {
+        append: async (artifact: DurableArtifact) => {
+          if (artifact.kind === "BuildResult") throw new Error("simulated crash before BuildResult");
+          await retainedArtifacts.append(artifact);
+        },
+        list: retainedArtifacts.list.bind(retainedArtifacts),
+      };
+      const git = new FakeGit(["src/a.ts"]);
+      await assert.rejects(verifyAndCommit({
+        run,
+        packet: packet(run),
+        submission,
+        workspace: { ...workspace, path: directory },
+        commands: [command],
+      }, {
+        verifier: new FakeVerifier([passed]),
+        git,
+        artifacts: crashAfterCommit,
+        runs: firstRuns,
+      }), /simulated crash before BuildResult/);
+      assert.equal(git.commitCalls, 1);
+      const checkpoint = retainedArtifacts.artifacts.find(
+        (artifact): artifact is DurableArtifact<"VerificationCheckpoint"> => artifact.kind === "VerificationCheckpoint",
+      );
+      assert.ok(checkpoint);
+
+      const recoveredRuns = new InMemoryRunRepository();
+      const recoveredRun = await verifyingRun(recoveredRuns, run.runId);
+      const recovered = await recoverVerificationCheckpoint({
+        run: recoveredRun,
+        checkpoint,
+        workspace: { ...workspace, path: directory },
+      }, { git, artifacts: retainedArtifacts, runs: recoveredRuns });
+
+      assert.equal(recovered.run.state, "publishing");
+      assert.equal(recovered.buildResult?.payload.headSha, "a".repeat(40));
+      assert.equal(git.commitCalls, 1, "exact retained commit must not be committed again");
+      assert.equal(retainedArtifacts.artifacts.filter((artifact) => artifact.kind === "BuildResult").length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("keeps a real regular-file delivery on the publishing path", async () => {
@@ -415,6 +469,49 @@ describe("verification and commit barrier", () => {
     assert.equal(result.outcome?.payload.failureEvidence?.checks[0]?.regression, false);
   });
 
+  it("matches reordered baselines by command identity and persists policy targets", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const commands = [{
+      id: "diff-check", command: "git", args: ["diff", "--check"], cwd: workspace.path,
+      timeoutMs: 1_000, required: true, policyVersion: "forgedock.verification/v2", planId: "plan-1",
+    }, {
+      id: "test", command: process.execPath, args: ["--test", "dist/a.test.js"], cwd: workspace.path,
+      timeoutMs: 1_000, required: true, policyVersion: "forgedock.verification/v2", targets: ["dist/a.test.js"], planId: "plan-1",
+    }];
+    const existingTestFailure: CheckResult = {
+      command: `${process.execPath} --test dist/a.test.js`, commandId: "test",
+      policyVersion: "forgedock.verification/v2", commandTargets: ["dist/a.test.js"], planId: "plan-1",
+      status: "failed", exitCode: 1, durationMs: 2, failureSignatures: ["not ok - retained failure"],
+    };
+    const diffPass: CheckResult = {
+      command: "git diff --check", commandId: "diff-check", policyVersion: "forgedock.verification/v2", planId: "plan-1",
+      status: "passed", exitCode: 0, durationMs: 1,
+    };
+    const typedPacket = packet(run);
+    typedPacket.payload.verificationRequirements = [{
+      kind: "command", id: "test", criterionIds: ["criterion-1"], rationale: "Targeted regression",
+    }];
+    const result = await verifyAndCommit({
+      run,
+      packet: typedPacket,
+      submission,
+      workspace,
+      commands,
+      baselineChecks: [diffPass, existingTestFailure],
+    }, {
+      verifier: new FakeVerifier([{ ...existingTestFailure, durationMs: 3 }, diffPass]),
+      git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    const testCheck = result.outcome?.payload.failureEvidence?.checks.find((check) => check.commandId === "test");
+    assert.equal(testCheck?.baselineStatus, "failed");
+    assert.equal(testCheck?.regression, false);
+    assert.equal(testCheck?.policyVersion, "forgedock.verification/v2");
+    assert.deepEqual(testCheck?.commandTargets, ["dist/a.test.js"]);
+  });
+
   it("retains check-level evidence and recovery workspace when verification fails", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
@@ -435,6 +532,7 @@ describe("verification and commit barrier", () => {
       targetBranch: "main",
       baseSha: workspace.baseSha,
       builderSummary: submission.summary,
+      failureKind: "required-check",
       changedPaths: ["src/a.ts"],
       criterionCoverage: submission.criterionCoverage,
       decisions: submission.decisions,
@@ -537,6 +635,31 @@ describe("verification and commit barrier", () => {
     assert.equal(result.run.state, "blocked");
     assert.match(result.outcome?.payload.reason ?? "", /outside the Build Packet/);
     assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
+  });
+
+  it("does not let a green generic check fabricate semantic criterion evidence", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const typedPacket = packet(run);
+    typedPacket.payload.verificationPolicyVersion = "forgedock.verification/v2";
+    typedPacket.payload.verificationRequirements = [{
+      kind: "command", id: "build-check", criterionIds: ["criterion-1"], rationale: "Generic build health",
+    }];
+    const genericCommand = { id: "build-check", command: "npm", args: ["run", "build"], cwd: workspace.path, timeoutMs: 1_000, required: true } as const;
+    const anchored: BuilderSubmission = {
+      ...submission,
+      criterionCoverage: [{
+        criterionId: "criterion-1", criterion: "Preserves state", implementation: "Guard exists",
+        anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["build-check"] },
+      }],
+    };
+    const result = await verifyAndCommit({ run, packet: typedPacket, submission: anchored, workspace, commands: [genericCommand] }, {
+      verifier: new FakeVerifier([{ command: "npm run build", commandId: "build-check", status: "passed", exitCode: 0, durationMs: 1 }]),
+      git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /generic checks.*targeted test/i);
   });
 
   it("blocks incomplete criterion coverage instead of manufacturing passed evidence", async () => {

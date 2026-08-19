@@ -39,7 +39,6 @@ import { DEFAULT_SEMANTIC_IDLE_MS, LivenessRecoveringAgentRuntime, validateSeman
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import { persistControllerTaskTerminal } from "../runtime/controller-task-record.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../core/ports/telemetry.js";
-import type { CheckResult, VerificationCommand } from "../core/ports/verification.js";
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
@@ -54,9 +53,9 @@ import { promoteBranch, PromotionExecutionError } from "../workflows/promotion/p
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
-import { ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
+import { buildSchedulePreview, ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
-import { promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
+import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController } from "../workflows/orchestrate/controller.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
@@ -67,7 +66,7 @@ import { AgentEventStreamWriter, observeAgentEvent, setAgentEventObservationIden
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
 import type { RunState } from "../core/state/machine.js";
-import { discoverVerificationCommands } from "./verification-policy.js";
+import { discoverLegacyVerificationCommands, discoverVerificationCommands, VERIFICATION_POLICY_VERSION } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
 import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
@@ -197,6 +196,7 @@ async function materializeCliDecomposition(input: {
       priority,
       dependencies: mapDecompositionDependencies(issue.number, issue.body, dependencyNodes),
       claims: affectedFiles.length ? [...affectedFiles] : [`component:${input.repository}`],
+      repository: input.repository,
       targetBranch: lane.targetBranch,
       lane: lane.kind,
       ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -217,6 +217,11 @@ async function materializeCliDecomposition(input: {
     priority: candidate.priority,
     dependencies: candidate.dependencies.filter((dependency) => dependency !== input.node.id),
     claims: [...candidate.claims],
+    ...(candidate.repository !== undefined ? { repository: candidate.repository } : {}),
+    ...(candidate.targetBranch !== undefined ? { targetBranch: candidate.targetBranch } : {}),
+    ...(candidate.lane !== undefined ? { lane: candidate.lane } : {}),
+    ...(candidate.promotionTarget !== undefined ? { promotionTarget: candidate.promotionTarget } : {}),
+    ...(candidate.productionTarget !== undefined ? { productionTarget: candidate.productionTarget } : {}),
   }));
   const claimGraph = materializeClaimDependencies([...existingItems, ...childItems]);
   const serializationEdges = claimGraph.edges.filter((edge) =>
@@ -572,7 +577,6 @@ async function workOn(
   const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
   const dependencyIssues = parseIssueNumbers(option(argv, "--depends-on"));
   const batchMembers = parseBatchMemberIssues(issue.body).filter((member) => member !== issue.number);
-  const parsedBatchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
   const subjectEvidence = issueSubjectEvidence(issue);
   subjectEvidence.push(laneEvidence(lane));
   if (batchMembers.length) subjectEvidence.push(`Batch issue #${issue.number} authoritatively represents member issues: ${batchMembers.map((member) => `#${member}`).join(", ")}`);
@@ -595,7 +599,8 @@ async function workOn(
   const persistedBatchMemberContracts = !argv.includes("--rerun")
     ? latestArtifactOfKind(priorArtifacts, "Intent")?.payload.batchMemberContracts
     : undefined;
-  const batchMemberContracts = persistedBatchMemberContracts ?? parsedBatchMemberContracts;
+  const batchMemberContracts = persistedBatchMemberContracts
+    ?? (batchMembers.length ? parseBatchContract(issue.body) : []);
   if (adjudicationReason !== undefined) {
     const latestDelivery = latestDeliveryRunArtifacts(priorArtifacts);
     const latestOutcome = latestDelivery ? latestArtifactOfKind(latestDelivery.artifacts, "Outcome") : undefined;
@@ -879,8 +884,8 @@ async function workOn(
         const git = new GitWorktreeManager(process.cwd());
         const verifier = new ProcessVerificationRunner();
         const workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef: `origin/${deliveryTargetBranch}` });
-        const verification = discoverVerificationCommands(process.cwd(), workspace.baseRef);
-        const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef: workspace.baseRef });
+        if (!workspace.baseSha) throw new Error("Early recovery requires an exact workspace base SHA");
+        const verification = discoverVerificationCommands(process.cwd(), workspace.baseSha);
         process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
         const result = await resumeEarlyWorkOn({
           checkpoint: admission.checkpoint,
@@ -892,7 +897,7 @@ async function workOn(
           baseBranch: deliveryTargetBranch,
           scopeHints: { affectedFiles: earlyAffectedFiles, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
           verification,
-          baselineChecks,
+          resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(process.cwd(), baseSha),
           scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
           maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
           maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
@@ -929,6 +934,14 @@ async function workOn(
       const remediationCheckpoint = latestArtifactOfKind(runArtifacts, "RemediationBlocked");
       const latestOutcome = latestArtifactOfKind(runArtifacts, "Outcome");
       const verificationAdjudication = latestArtifactOfKind(runArtifacts, "VerificationAdjudication");
+      const verificationCheckpointCandidate = latestArtifactOfKind(runArtifacts, "VerificationCheckpoint");
+      const verificationCheckpoint = verificationCheckpointCandidate
+        && runArtifacts.findLastIndex((artifact) => artifact.id === verificationCheckpointCandidate.id) > Math.max(
+          runArtifacts.findLastIndex((artifact) => artifact.kind === "BuildResult"),
+          runArtifacts.findLastIndex((artifact) => artifact.kind === "Outcome"),
+        )
+        ? verificationCheckpointCandidate
+        : undefined;
       const checkpointArtifact = admission.checkpoint === "verification"
         ? latestOutcome
         : admission.checkpoint === "publication"
@@ -1081,10 +1094,18 @@ async function workOn(
         }
         workspace = recoveredWorkspace;
       }
-      const verification = admission.checkpoint === "completion" ? [] : discoverVerificationCommands(process.cwd(), recoveryBaseRef);
-      const baselineChecks = admission.checkpoint === "publication" || admission.checkpoint === "completion"
-        ? undefined
-        : await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId: resumeRunId, baseRef: recoveryBaseRef });
+      const packetPolicyVersion = packet.payload.verificationPolicyVersion;
+      if (packetPolicyVersion !== undefined && packetPolicyVersion !== VERIFICATION_POLICY_VERSION) {
+        throw new Error(`Durable Build Packet uses unsupported verification policy ${packetPolicyVersion}`);
+      }
+      const discoverDurableVerification = packetPolicyVersion === VERIFICATION_POLICY_VERSION
+        ? discoverVerificationCommands
+        : discoverLegacyVerificationCommands;
+      let verification: readonly Omit<import("../core/ports/verification.js").VerificationCommand, "cwd">[] = [];
+      if (admission.checkpoint !== "completion") {
+        if (!workspace?.baseSha) throw new Error("Durable verification recovery requires an exact workspace base SHA");
+        verification = discoverDurableVerification(process.cwd(), workspace.baseSha);
+      }
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace: workspace!,
@@ -1098,7 +1119,6 @@ async function workOn(
             ? { priorVerificationRepairAttempts }
             : {}),
         baseBranch: durableTargetBranch, verification,
-        ...(baselineChecks !== undefined ? { baselineChecks } : {}),
         priorRemediationCycles,
         scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
         maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
@@ -1159,12 +1179,15 @@ async function workOn(
           ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
           ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
           autoMerge,
+          signal: leaseController.signal,
           ...(effectiveOrchestration.productionTarget !== undefined ? { productionTarget: effectiveOrchestration.productionTarget } : {}),
         }, dependencies)
         : admission.checkpoint === "build"
           ? await resumeBuildWorkOn({
               ...common,
+              resolveVerificationCatalog: (baseSha: string) => discoverDurableVerification(process.cwd(), baseSha),
               preflightedPacketClaims: packet.payload.expectedPaths,
+              ...(verificationCheckpoint !== undefined ? { verificationCheckpoint } : {}),
             }, dependencies)
           : admission.checkpoint === "publication"
             ? await resumePublicationWorkOn({
@@ -1257,7 +1280,6 @@ async function workOn(
     const verification = verificationPolicy ?? discoverVerificationCommands(process.cwd(), baseRef);
     const git = new GitWorktreeManager(process.cwd());
     const verifier = new ProcessVerificationRunner();
-    const baselineChecks = await collectBaselineChecks({ git, verifier, verification, issue: issue.number, runId, baseRef });
     process.stdout.write(`${statusGlyph("active", mode)} Running full workflow for ${issue.repo}#${issue.number}\n`);
     const result = await executeWorkOn({
       intent,
@@ -1269,7 +1291,7 @@ async function workOn(
         metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
       },
       verification,
-      baselineChecks,
+      resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(process.cwd(), baseSha),
       subjectEvidence,
       ...(batchMembers.length ? { batchMembers } : {}),
       ...(batchMemberContracts.length ? { batchMemberContracts } : {}),
@@ -1309,6 +1331,11 @@ async function workOn(
       if (orchestration) resolveClaimPromotionConflictAtBoundary(error, "nested-work-on");
       const resolution = resolveClaimPromotionConflictAtBoundary(error, "standalone-work-on");
       process.stdout.write(`${statusGlyph("active", mode)} ${process.env.FORGEDOCK_ORCHESTRATION_NODE ?? `issue-${issueArg}`} suspended · Build Packet claims conflict with ${resolution.conflict.conflicts.join(", ")}; retained for explicit orchestration resume\n`);
+      process.exitCode = 2;
+      return;
+    }
+    if (error instanceof ClaimPromotionRecoveryError) {
+      process.stdout.write(`${statusGlyph("active", mode)} ${process.env.FORGEDOCK_ORCHESTRATION_NODE ?? `issue-${issueArg}`} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
       process.exitCode = 2;
       return;
     }
@@ -1766,6 +1793,8 @@ async function orchestrate(argv: string[]): Promise<void> {
       process.stdout.write(`${item.id} · ${item.lane ?? lane?.kind ?? "unknown-lane"} → ${target} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
     }
     process.stdout.write(`batching=${assembly.policy.policy} groups=${assembly.groups.length} ungrouped=${assembly.ungrouped.length} excluded=${assembly.excluded.length}\n`);
+    const preview = buildSchedulePreview(proposed.items, proposed.edges);
+    process.stdout.write(`issue-slots=${preview.issueSlots.total} ready=${preview.issueSlots.initialReady} cap=${effective.maxParallel}\n`);
     process.stdout.write("Dispatch is disabled in preview mode. Re-run with --confirm/--auto or configure dispatch_mode: confirm|auto.\n");
     return;
   }
@@ -1979,7 +2008,9 @@ async function orchestrate(argv: string[]): Promise<void> {
         try {
           result = await executeWorkOn({
             intent, repoPath: checkoutRoot, lane,
-            verification, autoMerge,
+            verification,
+            resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(checkoutRoot, baseSha),
+            autoMerge,
             ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
             signal: workerAbort.signal,
             scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
@@ -2013,6 +2044,10 @@ async function orchestrate(argv: string[]): Promise<void> {
           if (workerAbort.signal.aborted || error instanceof LeaseContinuityError) {
             workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
+          }
+          if (error instanceof ClaimPromotionRecoveryError) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
+            return { status: "suspended", error };
           }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
@@ -2368,6 +2403,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
           configuredOrchestration.productionTarget,
         );
         return {
+          repository: issue.repo,
           targetBranch: lane.targetBranch,
           lane: lane.kind,
           ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2462,6 +2498,10 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         } catch (error) {
           if (workerAbort.signal.aborted) {
             return { status: "suspended", error: "Orchestration worker lost liveness; worker aborted and dependents remain queued" };
+          }
+          if (error instanceof ClaimPromotionRecoveryError) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
+            return { status: "suspended", error };
           }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
@@ -2583,6 +2623,7 @@ function loadOrchestrationItems(issueNumbers: number[], repo: string): Scheduled
     return {
       id: `issue-${issue}`,
       issue,
+      repository: repo,
       priority: config?.priority ?? 100,
       dependencies,
       // Claims are completed from the authoritative issue body below. Do not
@@ -2599,30 +2640,6 @@ function issueSubjectEvidence(issue: { number: number; body: string; labels: rea
     `GitHub issue #${issue.number} labels: ${issue.labels.length ? issue.labels.join(", ") : "none"}`,
     `GitHub issue #${issue.number} body: ${compactBody || "(empty)"}`,
   ];
-}
-
-async function collectBaselineChecks(input: {
-  git: GitWorktreeManager;
-  verifier: ProcessVerificationRunner;
-  verification: readonly Omit<VerificationCommand, "cwd">[];
-  issue: number;
-  runId: string;
-  baseRef: string;
-}): Promise<CheckResult[]> {
-  const identity = { runId: `${input.runId}-baseline`, issue: input.issue, baseRef: input.baseRef };
-  let workspace;
-  try {
-    workspace = await input.git.create(identity);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    if (!/branch named .+ already exists|already checked out|path .+ already exists/i.test(reason)) throw error;
-    workspace = await input.git.recover(identity);
-  }
-  try {
-    return await input.verifier.run(input.verification.map((command) => ({ ...command, cwd: workspace.path })));
-  } finally {
-    await input.git.remove(workspace);
-  }
 }
 
 function writeAgentEvent(event: AgentEvent, prefix?: string): void {

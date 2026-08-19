@@ -20,8 +20,9 @@ import type {
   PullRequestMergeGateOptions,
   PullRequestSnapshot,
   ReviewFindingInput,
+  ReviewFindingPublicationFence,
 } from "../../core/ports/forge-host.js";
-import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository } from "../../core/ports/repositories.js";
+import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository } from "../../core/ports/repositories.js";
 import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
@@ -44,6 +45,8 @@ const WORKFLOW_LABELS = [
 const WORKFLOW_LABEL_NAMES = WORKFLOW_LABELS.map((label) => label.name);
 const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
+const MAX_GITHUB_COMPARE_FILES = 300;
+const GITHUB_COMMIT_SHA = /^[0-9a-f]{40}$/i;
 // One branch per issue is enough for a 500-issue orchestration. Keep room for
 // pre-existing and integration branches without allowing an unbounded
 // matching-refs response into the controller.
@@ -133,6 +136,7 @@ interface ReviewFindingMaterializationInput {
   runId: string;
   reviewedHeadSha: string;
   reviewerRoles: readonly string[];
+  publicationFence?: ReviewFindingPublicationFence;
   finding: ReviewFindingInput;
 }
 
@@ -166,6 +170,39 @@ interface GitHubPullRequestFile {
   patch?: unknown;
 }
 
+interface GitHubComparisonFile {
+  filename?: unknown;
+  patch?: unknown;
+}
+
+interface GitHubComparison {
+  status?: unknown;
+  ahead_by?: unknown;
+  base_commit?: { sha?: unknown };
+  merge_base_commit?: { sha?: unknown };
+  commits?: Array<{ sha?: unknown }>;
+  files?: GitHubComparisonFile[];
+}
+
+interface GitHubComparisonProjection {
+  paths: readonly string[];
+  hunks: readonly string[];
+}
+
+interface GitHubCommitCheckRun {
+  name?: unknown;
+  head_sha?: unknown;
+  status?: unknown;
+  conclusion?: unknown;
+  html_url?: unknown;
+}
+
+interface GitHubCommitStatus {
+  context?: unknown;
+  state?: unknown;
+  target_url?: unknown;
+}
+
 function isOversizedPullRequestDiffError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /HTTP 406/i.test(message)
@@ -187,6 +224,156 @@ function pullRequestDiffPath(value: unknown, field: string): string {
 
 function pullRequestFileCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function parseListedOpenIssueNumbers(
+  raw: string,
+  predicate: (issue: { milestone?: { title?: string } | null }) => boolean = () => true,
+): number[] {
+  const issues = JSON.parse(raw) as Array<{
+    number?: number;
+    state?: string;
+    milestone?: { title?: string } | null;
+  }>;
+  return issues
+    .filter((issue) => issue.state?.toUpperCase() === "OPEN"
+      && Number.isSafeInteger(issue.number)
+      && predicate(issue))
+    .map((issue) => issue.number!);
+}
+
+function comparisonPath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replaceAll("\\", "/");
+  return normalized || undefined;
+}
+
+function projectGitHubComparison(
+  comparison: GitHubComparison,
+  expectedBaseSha: string,
+  expectedHeadSha: string,
+): GitHubComparisonProjection {
+  if (!GITHUB_COMMIT_SHA.test(expectedBaseSha) || !GITHUB_COMMIT_SHA.test(expectedHeadSha)) {
+    throw new Error("GitHub comparison requires full 40-character commit SHAs");
+  }
+  const baseSha = typeof comparison.base_commit?.sha === "string" ? comparison.base_commit.sha : "";
+  const mergeBaseSha = typeof comparison.merge_base_commit?.sha === "string" ? comparison.merge_base_commit.sha : "";
+  const commits = Array.isArray(comparison.commits) ? comparison.commits : undefined;
+  const files = Array.isArray(comparison.files) ? comparison.files : undefined;
+  if (comparison.status !== "ahead" || !Number.isSafeInteger(comparison.ahead_by) || Number(comparison.ahead_by) < 1) {
+    throw new Error(`GitHub comparison does not prove the reviewed head is a strict descendant (status=${String(comparison.status)})`);
+  }
+  if (baseSha.toLowerCase() !== expectedBaseSha.toLowerCase()
+    || mergeBaseSha.toLowerCase() !== expectedBaseSha.toLowerCase()) {
+    throw new Error("GitHub comparison base or merge-base identity does not match the prior reviewed commit");
+  }
+  const returnedHeadSha = commits?.at(-1)?.sha;
+  if (typeof returnedHeadSha !== "string" || returnedHeadSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+    throw new Error("GitHub comparison head identity does not match the current reviewed commit");
+  }
+  if (!files) throw new Error("GitHub comparison omitted its changed-file projection");
+  if (files.length >= MAX_GITHUB_COMPARE_FILES) {
+    throw new Error(`GitHub comparison returned at least ${MAX_GITHUB_COMPARE_FILES} files; the compare API cannot prove completeness`);
+  }
+
+  const paths = new Set<string>();
+  const hunks = new Set<string>();
+  for (const file of files) {
+    const path = comparisonPath(file.filename);
+    if (!path) throw new Error("GitHub comparison contains a file without a valid path");
+    if (typeof file.patch !== "string" || !file.patch.trim()) {
+      throw new Error(`GitHub comparison omitted the patch for ${path}; exact hunk authority is unavailable`);
+    }
+    paths.add(path);
+    let fileHunks = 0;
+    for (const line of file.patch.split(/\r?\n/)) {
+      const hunk = /^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@\s*(.*)$/.exec(line);
+      if (!hunk?.[1]) continue;
+      const start = Number(hunk[1]);
+      const length = Number(hunk[2] ?? "1");
+      const symbol = hunk[3]?.trim().replace(/\s+/g, " ");
+      hunks.add(`${path}:L${start}-L${Math.max(start, start + length - 1)}${symbol ? `:${symbol}` : ""}`);
+      fileHunks += 1;
+    }
+    if (fileHunks === 0) throw new Error(`GitHub comparison patch for ${path} contains no authoritative hunks`);
+  }
+  return { paths: [...paths].sort(), hunks: [...hunks].sort() };
+}
+
+function commitCheckRunState(run: GitHubCommitCheckRun): PullRequestMergeGate["requiredChecks"][number]["state"] {
+  if (typeof run.status !== "string") return "unavailable";
+  if (run.status.toLowerCase() !== "completed") return "pending";
+  if (typeof run.conclusion !== "string") return "unavailable";
+  const conclusion = run.conclusion.toLowerCase();
+  if (["success", "neutral", "skipped"].includes(conclusion)) return "passed";
+  if (conclusion === "cancelled") return "cancelled";
+  if (["failure", "timed_out", "action_required", "startup_failure", "stale"].includes(conclusion)) return "failed";
+  return "unavailable";
+}
+
+function commitStatusState(value: unknown): PullRequestMergeGate["requiredChecks"][number]["state"] {
+  if (typeof value !== "string") return "unavailable";
+  if (value.toLowerCase() === "success") return "passed";
+  if (value.toLowerCase() === "pending") return "pending";
+  if (["failure", "error"].includes(value.toLowerCase())) return "failed";
+  return "unavailable";
+}
+
+function projectImmutableCommitChecks(
+  checkRunsRaw: string,
+  statusesRaw: string,
+  expectedHeadSha: string,
+  requiredNames: readonly string[],
+): PullRequestMergeGate["requiredChecks"] {
+  const checkPages: unknown = JSON.parse(checkRunsRaw);
+  const combinedStatus: unknown = JSON.parse(statusesRaw);
+  if (!Array.isArray(checkPages) || checkPages.some((page) => !page || typeof page !== "object" || !Array.isArray((page as { check_runs?: unknown }).check_runs))) {
+    throw new Error("GitHub immutable commit check-runs response is malformed");
+  }
+  if (!combinedStatus || typeof combinedStatus !== "object"
+    || typeof (combinedStatus as { sha?: unknown }).sha !== "string"
+    || (combinedStatus as { sha: string }).sha.toLowerCase() !== expectedHeadSha.toLowerCase()
+    || !Array.isArray((combinedStatus as { statuses?: unknown }).statuses)) {
+    throw new Error("GitHub immutable commit status response does not identify the expected head SHA");
+  }
+  const observations: PullRequestMergeGate["requiredChecks"] = [];
+  for (const page of checkPages as Array<{ check_runs: GitHubCommitCheckRun[] }>) {
+    for (const run of page.check_runs) {
+      if (!run || typeof run !== "object" || typeof run.name !== "string" || !run.name.trim()) {
+        throw new Error("GitHub immutable commit check-runs response contains an invalid check");
+      }
+      if (typeof run.head_sha !== "string" || run.head_sha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+        throw new Error(`GitHub check run '${run.name}' is not bound to the expected head SHA`);
+      }
+      if (!requiredNames.includes(run.name.trim())) continue;
+      const state = commitCheckRunState(run);
+      if (state === "unavailable") throw new Error(`GitHub check run '${run.name}' has an unrecognized state`);
+      observations.push({
+        name: run.name.trim(),
+        state,
+        ...(typeof run.html_url === "string" && run.html_url.trim() ? { detailsUrl: run.html_url } : {}),
+      });
+    }
+  }
+  for (const status of (combinedStatus as { statuses: GitHubCommitStatus[] }).statuses) {
+    if (!status || typeof status !== "object" || typeof status.context !== "string" || !status.context.trim()) {
+      throw new Error("GitHub immutable commit status response contains an invalid status");
+    }
+    if (!requiredNames.includes(status.context.trim())) continue;
+    const state = commitStatusState(status.state);
+    if (state === "unavailable") throw new Error(`GitHub commit status '${status.context}' has an unrecognized state`);
+    observations.push({
+      name: status.context.trim(),
+      state,
+      ...(typeof status.target_url === "string" && status.target_url.trim() ? { detailsUrl: status.target_url } : {}),
+    });
+  }
+  for (const name of requiredNames) {
+    if (!observations.some((check) => check.name === name)) {
+      throw new Error(`GitHub required check '${name}' has no observation on immutable commit ${expectedHeadSha}`);
+    }
+  }
+  return observations;
 }
 
 export function renderPaginatedPullRequestDiff(raw: string): string {
@@ -248,13 +435,15 @@ export function renderPaginatedPullRequestDiff(raw: string): string {
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
+  /** Immutable SHA comparisons are shared only within this client/request lifetime. */
+  private readonly comparisonReads = new Map<string, Promise<GitHubComparisonProjection>>();
   private authRefreshAttempted = false;
   private commandCwd: string;
   private checkoutContext: CheckoutContext | undefined;
 
   constructor(
     readonly cwd = process.cwd(),
-    readonly remediationAdmissions: RemediationAdmissionRepository = new InMemoryRemediationAdmissionRepository(),
+    readonly remediationAdmissions: RemediationAdmissionRepository & Partial<ReviewFindingPublicationFenceRepository> = new InMemoryRemediationAdmissionRepository(),
     readonly refreshAuth?: () => Promise<boolean>,
   ) {
     this.commandCwd = cwd;
@@ -309,13 +498,18 @@ export class GitHubClient implements ForgeHost {
     const resolvedRepo = repo ?? await this.resolveRepository();
     const result = await this.gh([
       "issue", "list", "--repo", resolvedRepo, "--state", "open",
-      "--milestone", title, "--limit", "1000", "--json", "number,milestone",
+      "--milestone", title, "--limit", "1000", "--json", "number,state,milestone",
     ]);
-    const issues = JSON.parse(result) as Array<{ number?: number; milestone?: { title?: string } | null }>;
-    return issues
-      .filter((issue) => issue.milestone?.title === title && Number.isSafeInteger(issue.number))
-      .map((issue) => issue.number!)
-      .sort((left, right) => left - right);
+    return parseListedOpenIssueNumbers(result, (issue) => issue.milestone?.title === title);
+  }
+
+  async listOpenIssueNumbersWithoutMilestone(repo?: string): Promise<number[]> {
+    const resolvedRepo = repo ?? await this.resolveRepository();
+    const result = await this.gh([
+      "issue", "list", "--repo", resolvedRepo, "--state", "open",
+      "--limit", "1000", "--json", "number,state,milestone",
+    ]);
+    return parseListedOpenIssueNumbers(result, (issue) => issue.milestone == null);
   }
 
   async listOpenIssueNumbersForSearch(query: string, repo?: string): Promise<number[]> {
@@ -327,11 +521,7 @@ export class GitHubClient implements ForgeHost {
       "issue", "list", "--repo", resolvedRepo, "--state", "open",
       "--search", normalizedQuery, "--limit", "1000", "--json", "number,state,milestone",
     ]);
-    const issues = JSON.parse(result) as Array<{ number?: number; state?: string; milestone?: { title?: string } | null }>;
-    return issues
-      .filter((issue) => issue.state?.toUpperCase() === "OPEN" && Number.isSafeInteger(issue.number))
-      .map((issue) => issue.number!)
-      .sort((left, right) => left - right);
+    return parseListedOpenIssueNumbers(result);
   }
 
   async getIssue(number: number, repo?: string): Promise<GitHubIssue> {
@@ -421,7 +611,73 @@ export class GitHubClient implements ForgeHost {
     await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
   }
 
+  async beginReviewFindingPublication(input: {
+    repo: string;
+    pullRequest: PullRequestSnapshot;
+    runId: string;
+  }): Promise<ReviewFindingPublicationFence> {
+    if (!this.remediationAdmissions.beginReviewFindingPublication
+      || !this.remediationAdmissions.assertReviewFindingPublication) {
+      throw new Error("Durable review-finding publication fencing is unavailable");
+    }
+    const live = await this.getPullRequest(input.repo, input.pullRequest.number);
+    assertExactReviewPublicationRoute(input.pullRequest, live, "before publication fence allocation");
+    const fence = await this.remediationAdmissions.beginReviewFindingPublication({
+      repo: input.repo.trim().toLowerCase(),
+      pullRequest: live.number,
+      runId: input.runId,
+      headSha: live.headSha,
+      headBranch: live.headBranch,
+      baseBranch: live.baseBranch,
+    });
+    await this.assertReviewFindingPublicationBoundary(fence, live);
+    return fence;
+  }
+
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void> {
+    if (!this.remediationAdmissions.assertReviewFindingPublication) {
+      throw new Error("Durable review-finding publication fencing is unavailable");
+    }
+    await this.remediationAdmissions.assertReviewFindingPublication(fence);
+    const live = await this.getPullRequest(fence.repo, fence.pullRequest);
+    if (fence.repo.trim().toLowerCase() !== live.repo.trim().toLowerCase()
+      || fence.pullRequest !== live.number
+      || fence.headSha.toLowerCase() !== live.headSha.toLowerCase()
+      || fence.headBranch !== live.headBranch
+      || fence.baseBranch !== live.baseBranch
+      || live.state !== "OPEN") {
+      throw new Error(`Review-finding publication fence generation ${fence.generation} does not match the exact live PR route`);
+    }
+    await this.remediationAdmissions.assertReviewFindingPublication(fence);
+  }
+
+  private async assertReviewFindingPublicationBoundary(
+    fence: ReviewFindingPublicationFence,
+    expected: PullRequestSnapshot,
+  ): Promise<void> {
+    if (!this.remediationAdmissions.assertReviewFindingPublication) {
+      throw new Error("Durable review-finding publication fencing is unavailable");
+    }
+    await this.remediationAdmissions.assertReviewFindingPublication(fence);
+    const live = await this.getPullRequest(fence.repo, fence.pullRequest);
+    assertExactReviewPublicationRoute(expected, live, "at review-finding mutation boundary");
+    if (fence.repo.trim().toLowerCase() !== live.repo.trim().toLowerCase()
+      || fence.pullRequest !== live.number
+      || fence.headSha.toLowerCase() !== live.headSha.toLowerCase()
+      || fence.headBranch !== live.headBranch
+      || fence.baseBranch !== live.baseBranch) {
+      throw new Error(`Review-finding publication fence generation ${fence.generation} does not match the exact live PR route`);
+    }
+    await this.remediationAdmissions.assertReviewFindingPublication(fence);
+  }
+
   async materializeReviewFinding(input: ReviewFindingMaterializationInput): Promise<IssueSnapshot> {
+    input.publicationFence ??= await this.beginReviewFindingPublication({
+      repo: input.repo,
+      pullRequest: input.pullRequest,
+      runId: input.runId,
+    });
+    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
@@ -484,6 +740,7 @@ export class GitHubClient implements ForgeHost {
       "--label", "review-finding", "--label", "needs-validation", "--label", priority,
     ];
     if (milestoneTitle) args.push("--milestone", milestoneTitle);
+    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
     const url = (await this.gh(args, body)).trim();
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
@@ -509,7 +766,9 @@ export class GitHubClient implements ForgeHost {
     laneMarker: string,
     adoptionStatus: "materialized" | "adopted" = "materialized",
   ): Promise<IssueSnapshot> {
-    await this.publishReviewFindingRecurrence(input, issue, marker);
+    const publicationFence = input.publicationFence;
+    if (!publicationFence) throw new Error("Review-finding refresh has no current publication fence");
+    await this.publishReviewFindingRecurrence({ ...input, publicationFence }, issue, marker);
     const priority = reviewFindingPriority(input.finding.severity);
     const milestoneTitle = await this.resolveReviewFindingMilestone(input);
     const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
@@ -527,6 +786,7 @@ export class GitHubClient implements ForgeHost {
       if (obsoletePriorities.length) args.push("--remove-label", obsoletePriorities.join(","));
       if (milestoneTitle) args.push("--milestone", milestoneTitle);
       else if (issue.milestone) args.push("--remove-milestone");
+      await this.assertReviewFindingPublicationBoundary(publicationFence, input.pullRequest);
       await this.gh(args, body);
       authoritative = await this.authoritativeIssueSnapshot(issue);
     }
@@ -544,13 +804,14 @@ export class GitHubClient implements ForgeHost {
   }
 
   private async publishReviewFindingRecurrence(
-    input: { repo: string; pullRequest: PullRequestSnapshot; runId: string; reviewedHeadSha: string; finding: ReviewFindingInput },
+    input: { repo: string; pullRequest: PullRequestSnapshot; runId: string; reviewedHeadSha: string; publicationFence: ReviewFindingPublicationFence; finding: ReviewFindingInput },
     issue: IssueSnapshot,
     marker: string,
   ): Promise<void> {
     const priorHeadSha = reviewedShaFromFindingBody(issue.body);
     if (priorHeadSha === input.reviewedHeadSha.toLowerCase()) return;
     const recurrenceMarker = reviewFindingRecurrenceMarker(input.repo, input.pullRequest.number, issue.number, input.reviewedHeadSha, marker);
+    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
     await this.publishIssueComment({
       repo: input.repo,
       issue: issue.number,
@@ -611,10 +872,18 @@ export class GitHubClient implements ForgeHost {
     repo: string;
     pullRequest: PullRequestSnapshot;
     runId: string;
+    publicationFence?: ReviewFindingPublicationFence;
     activeFindings: readonly ReviewFindingInput[];
   }): Promise<readonly number[]> {
+    input.publicationFence ??= await this.beginReviewFindingPublication({
+      repo: input.repo,
+      pullRequest: input.pullRequest,
+      runId: input.runId,
+    });
+    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
     const stale = reviewFindingReconciliationCandidates(await this.listAllIssues(input.repo), input);
     for (const issue of stale) {
+      await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
       await this.gh([
         "issue", "close", String(issue.number), "--repo", input.repo, "--reason", "completed",
         "--comment", `Superseded by the authoritative Review Verdict for PR #${input.pullRequest.number} at ${input.pullRequest.headSha}; this finding is no longer active.`,
@@ -932,35 +1201,32 @@ export class GitHubClient implements ForgeHost {
     return materialized;
   }
 
-  private async reconcilePlanNodeProjection(repo: string, prepared: PreparedPlanNode): Promise<PlanNodeProjection | undefined> {
-    const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
-    for (let attempt = 0; attempt < delays.length; attempt += 1) {
-      if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
-      const indexed = indexPlanNodeProjections(await this.listAllIssues(repo));
-      const visible = selectPlanNodeProjection(prepared, indexed.get(prepared.identityDigest) ?? []);
-      if (visible) return visible;
-    }
-    return undefined;
+  private reconcilePlanNodeProjection(repo: string, prepared: PreparedPlanNode): Promise<PlanNodeProjection | undefined> {
+    return this.pollIssueProjection(repo, (issues) => {
+      const indexed = indexPlanNodeProjections(issues);
+      return selectPlanNodeProjection(prepared, indexed.get(prepared.identityDigest) ?? []);
+    });
   }
 
-  private async reconcileRemediationMarker(repo: string, marker: string, openOnly = false): Promise<IssueSnapshot | undefined> {
-    const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
-    for (let attempt = 0; attempt < delays.length; attempt += 1) {
-      if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
-      const issue = (await this.listAllIssues(repo)).find((candidate) => hasCanonicalMarker(candidate.body, marker)
-        && (!openOnly || candidate.state === "OPEN"));
-      if (issue) return issue;
-    }
-    return undefined;
+  private reconcileRemediationMarker(repo: string, marker: string, openOnly = false): Promise<IssueSnapshot | undefined> {
+    return this.pollIssueProjection(repo, (issues) => issues.find((candidate) => hasCanonicalMarker(candidate.body, marker)
+      && (!openOnly || candidate.state === "OPEN")));
   }
 
-  private async reconcileReviewFindingMarker(repo: string, markers: readonly string[]): Promise<IssueSnapshot | undefined> {
+  private reconcileReviewFindingMarker(repo: string, markers: readonly string[]): Promise<IssueSnapshot | undefined> {
+    return this.pollIssueProjection(repo, (issues) => issues.find((candidate) => candidate.state === "OPEN"
+      && markers.some((marker) => hasCanonicalMarker(candidate.body, marker))));
+  }
+
+  private async pollIssueProjection<T>(
+    repo: string,
+    select: (issues: readonly IssueSnapshot[]) => T | undefined,
+  ): Promise<T | undefined> {
     const delays = [0, 5, 10, 20, 40, 80, 160, 320] as const;
-    for (let attempt = 0; attempt < delays.length; attempt += 1) {
-      if (delays[attempt]) await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
-      const issue = (await this.listAllIssues(repo)).find((candidate) => candidate.state === "OPEN"
-        && markers.some((marker) => hasCanonicalMarker(candidate.body, marker)));
-      if (issue) return issue;
+    for (const delay of delays) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      const projection = select(await this.listAllIssues(repo));
+      if (projection !== undefined) return projection;
     }
     return undefined;
   }
@@ -1050,58 +1316,59 @@ export class GitHubClient implements ForgeHost {
       }
     }
 
-    const parseChecks = (result: string, omitInapplicable = false): PullRequestMergeGate["requiredChecks"] => {
+    const parseRequiredChecks = (result: string): PullRequestMergeGate["requiredChecks"] => {
       const parsed: unknown = JSON.parse(result);
-      if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
+      if (!Array.isArray(parsed)) throw new Error("GitHub required-checks response is not an array");
+      if (parsed.length === 0) throw new Error("GitHub reported no configured required checks");
       // A push run and a pull_request run can publish the same check name at
       // the same head SHA. Preserve every observation so a later success can
       // never erase a contradictory failure from the controller's merge gate.
-      return parsed.flatMap((entry: unknown) => {
-        if (!entry || typeof entry !== "object") throw new Error("GitHub checks response contains an invalid entry");
+      return parsed.map((entry: unknown) => {
+        if (!entry || typeof entry !== "object") throw new Error("GitHub required-checks response contains an invalid entry");
         const check = entry as { name?: unknown; state?: unknown; link?: unknown };
         const name = typeof check.name === "string" ? check.name.trim() : "";
-        const state = typeof check.state === "string" ? check.state : undefined;
-        const detailsUrl = typeof check.link === "string" ? check.link : undefined;
-        if (omitInapplicable && ["SKIPPED", "NEUTRAL"].includes(String(state ?? "").toUpperCase())) return [];
-        return [{
-          name: name || "unnamed-required-check",
-          state: mergeCheckState(state),
+        const reportedState = typeof check.state === "string" ? check.state.trim() : "";
+        if (!name || !reportedState) throw new Error("GitHub required-checks response contains a check without a name or state");
+        const state = mergeCheckState(reportedState);
+        if (state === "unavailable") throw new Error(`GitHub required check '${name}' has an unrecognized state`);
+        if (check.link !== undefined && typeof check.link !== "string") {
+          throw new Error(`GitHub required check '${name}' has an invalid details link`);
+        }
+        const detailsUrl = typeof check.link === "string" && check.link.trim() ? check.link : undefined;
+        return {
+          name,
+          state,
           ...(detailsUrl ? { detailsUrl } : {}),
-        }];
+        };
       });
     };
-    let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
+    let requiredChecks: PullRequestMergeGate["requiredChecks"];
+    let requiredChecksProvenance: PullRequestMergeGate["requiredChecksProvenance"] = "unavailable";
+    let requiredChecksHeadSha: string | undefined;
     try {
       const result = await this.gh([
         "pr", "checks", String(number), "--repo", repo, "--required",
         "--json", "name,state,link,completedAt,startedAt",
       ]);
-      requiredChecks = parseChecks(result);
+      const requiredProjection = parseRequiredChecks(result);
+      const requiredNames = [...new Set(requiredProjection.map((check) => check.name))];
+      const [checkRuns, statuses] = await Promise.all([
+        this.gh([
+          "api", `repos/${repo}/commits/${expectedHeadSha}/check-runs?per_page=100`,
+          "--paginate", "--slurp",
+        ]),
+        this.gh(["api", `repos/${repo}/commits/${expectedHeadSha}/status?per_page=100`]),
+      ]);
+      requiredChecks = projectImmutableCommitChecks(checkRuns, statuses, expectedHeadSha, requiredNames);
+      requiredChecksProvenance = "github-required";
+      requiredChecksHeadSha = expectedHeadSha;
     } catch (error) {
-      if (error instanceof Error && /no required checks reported/i.test(error.message)) {
-        try {
-          // Repositories without branch-protection required checks still
-          // expose check runs. Use them as the review gate rather than
-          // converting a normal GitHub response into an unavailable blocker.
-          const result = await this.gh([
-            "pr", "checks", String(number), "--repo", repo,
-            "--json", "name,state,link,completedAt,startedAt",
-          ]);
-          requiredChecks = parseChecks(result, true);
-        } catch (fallbackError) {
-          requiredChecks = [{
-            name: "required-checks-query",
-            state: "unavailable",
-            detailsUrl: fallbackError instanceof Error ? fallbackError.message.slice(0, 500) : String(fallbackError).slice(0, 500),
-          }];
-        }
-      } else {
-        requiredChecks = [{
-          name: "required-checks-query",
-          state: "unavailable",
-          detailsUrl: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
-        }];
-      }
+      const detail = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      requiredChecks = [{
+        name: "required-checks-query",
+        state: "unavailable",
+        ...(detail ? { detailsUrl: detail } : {}),
+      }];
     }
     // The checks query is PR-scoped. Re-read the PR after it so a head/base
     // race cannot attach current checks to a different reviewed revision.
@@ -1123,6 +1390,8 @@ export class GitHubClient implements ForgeHost {
       mergeable: mergeability === "mergeable",
       mergeability,
       ...(mergeabilityReasonText ? { mergeabilityReason: mergeabilityReasonText } : {}),
+      requiredChecksProvenance,
+      ...(requiredChecksHeadSha ? { requiredChecksHeadSha } : {}),
       requiredChecks,
       observedAt: new Date().toISOString(),
     };
@@ -1203,10 +1472,35 @@ export class GitHubClient implements ForgeHost {
   }
 
   async getChangedPathsBetween(repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {
-    const output = await this.gh([
-      "api", `repos/${repo}/compare/${baseSha}...${headSha}`, "--paginate", "--jq", ".files[].filename",
-    ]);
-    return [...new Set(output.split(/\r?\n/).map((path) => path.trim().replaceAll("\\", "/")).filter(Boolean))].sort();
+    return (await this.readComparison(repo, baseSha, headSha)).paths;
+  }
+
+  async getChangedHunksBetween(repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {
+    return (await this.readComparison(repo, baseSha, headSha)).hunks;
+  }
+
+  private readComparison(repo: string, baseSha: string, headSha: string): Promise<GitHubComparisonProjection> {
+    if (!GITHUB_COMMIT_SHA.test(baseSha) || !GITHUB_COMMIT_SHA.test(headSha)) {
+      return Promise.reject(new Error("GitHub comparison requires full 40-character commit SHAs"));
+    }
+    if (baseSha.toLowerCase() === headSha.toLowerCase()) {
+      return Promise.reject(new Error("GitHub comparison requires a newly pushed descendant commit"));
+    }
+    const key = `${repo.toLowerCase()}\n${baseSha.toLowerCase()}\n${headSha.toLowerCase()}`;
+    const cached = this.comparisonReads.get(key);
+    if (cached) return cached;
+    if (this.comparisonReads.size >= 32) {
+      const oldest = this.comparisonReads.keys().next().value as string | undefined;
+      if (oldest !== undefined) this.comparisonReads.delete(oldest);
+    }
+    const read = this.gh(["api", `repos/${repo}/compare/${baseSha}...${headSha}`])
+      .then((output) => projectGitHubComparison(JSON.parse(output) as GitHubComparison, baseSha, headSha))
+      .catch((error) => {
+        this.comparisonReads.delete(key);
+        throw error;
+      });
+    this.comparisonReads.set(key, read);
+    return read;
   }
 
   async mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void> {
@@ -1455,8 +1749,20 @@ export class GitHubClient implements ForgeHost {
       child.stderr.on("data", (chunk: string) => { stderr += chunk; });
       child.on("error", reject);
       child.on("close", (code) => {
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`gh ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`));
+        if (code === 0) {
+          resolve(stdout);
+          return;
+        }
+        // `gh pr checks` deliberately exits non-zero while checks are pending
+        // or failed, but still writes the authoritative typed JSON requested by
+        // the caller. Preserve that evidence; parsing and provenance validation
+        // happen in getPullRequestMergeGate. Transport/query failures do not
+        // have a usable JSON response and continue to reject.
+        if (args[0] === "pr" && args[1] === "checks" && args.includes("--required") && stdout.trim()) {
+          resolve(stdout);
+          return;
+        }
+        reject(new Error(`gh ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`));
       });
       if (input !== undefined) child.stdin.end(input);
       else child.stdin.end();
@@ -1507,7 +1813,7 @@ export function reviewFindingMarker(repo: string, pullRequest: number, finding: 
 }
 
 export function reviewFindingSemanticMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  const root = finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || [finding.location ?? "", finding.title].join("\n");
+  const root = finding.rootId?.trim() || finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || [finding.location ?? "", finding.title].join("\n");
   const identity = [repo.trim().toLowerCase(), String(pullRequest), root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n");
   return `<!-- FORGEDOCK:REVIEW-FINDING-IDENTITY v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
 }
@@ -1808,6 +2114,25 @@ function pullRequestSnapshotFromGitHub(repo: string, requestedNumber: number, ra
   };
 }
 
+function assertExactReviewPublicationRoute(
+  expected: PullRequestSnapshot,
+  actual: PullRequestSnapshot,
+  boundary: string,
+): void {
+  if (expected.repo.trim().toLowerCase() !== actual.repo.trim().toLowerCase()
+    || expected.number !== actual.number
+    || expected.headSha.toLowerCase() !== actual.headSha.toLowerCase()
+    || expected.headBranch !== actual.headBranch
+    || expected.baseBranch !== actual.baseBranch
+    || actual.state !== "OPEN") {
+    throw new Error(
+      `Review-finding publication route changed ${boundary}: expected ${expected.repo}#${expected.number}`
+      + ` ${expected.headBranch}@${expected.headSha} -> ${expected.baseBranch} (OPEN), found`
+      + ` ${actual.repo}#${actual.number} ${actual.headBranch}@${actual.headSha} -> ${actual.baseBranch} (${actual.state})`,
+    );
+  }
+}
+
 function pullRequestMatchesMergedIdentity(
   pullRequest: PullRequestSnapshot,
   expectedHeadSha: string,
@@ -1820,7 +2145,7 @@ function pullRequestMatchesMergedIdentity(
 
 function mergeCheckState(value: string | undefined): PullRequestMergeGate["requiredChecks"][number]["state"] {
   const normalized = String(value ?? "").toUpperCase();
-  if (["SUCCESS", "PASSED", "PASS", "COMPLETED"].includes(normalized)) return "passed";
+  if (["SUCCESS", "PASSED", "PASS"].includes(normalized)) return "passed";
   if (["FAILURE", "FAILED", "ERROR", "STARTUP_FAILURE", "ACTION_REQUIRED", "STALE"].includes(normalized)) return "failed";
   if (["CANCELLED", "CANCELED"].includes(normalized)) return "cancelled";
   if (["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"].includes(normalized)) return "pending";
@@ -1833,6 +2158,13 @@ function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
   if (mergeability === "conflicting") return `Pull request #${gate.pullRequest} is confirmed conflicting at ${gate.baseBranch} for reviewed ${gate.headSha}`;
   if (mergeability === "unknown") return `Pull request #${gate.pullRequest} mergeability is UNKNOWN at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
   if (mergeability === "unavailable") return `Pull request #${gate.pullRequest} mergeability query is unavailable at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
+    return `Required GitHub checks are unavailable from immutable commit-bound --required provenance for PR #${gate.pullRequest}`;
+  }
+  if (gate.requiredChecks.length === 0) {
+    return `Required GitHub checks are unavailable for PR #${gate.pullRequest}: GitHub reported no configured required checks`;
+  }
   const failed = gate.requiredChecks.filter((check) => check.state !== "passed");
   if (failed.length) {
     return `Required GitHub checks are not all passing for PR #${gate.pullRequest}: ${failed.map((check) => `${check.name}=${check.state}`).join(", ")}`;

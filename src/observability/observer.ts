@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { join } from "node:path";
-import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, observationStreamKey, retainObservationLogicalStreamId, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
+import { DEFAULT_OBSERVATION_RETENTION, createObservationProducer, normalizeObservationDraft, observationStreamKey, retainObservationLogicalStreamId, type ObservationDraft, type ObservationEnvelopeV1, type ObservationLayoutStore, type ObservationQuery, type ObservationQuerySource, type ObservationRedactionPolicy, type ObservationRetentionPolicy, type ObservationSink, type ObservationStore, type ObservationSubscription } from "./contracts.js";
 import { ObservationProjector, type ObservationProjectionSnapshot } from "./projections.js";
 import type { WorkspaceLayout } from "./workspace-layout.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
@@ -22,7 +22,7 @@ export type ObservationListener = (event: ObservationEnvelopeV1) => void;
  * Renderer-neutral observation runtime. The journal and projection are
  * operational state; this class never performs workflow mutations.
  */
-export class ForgeDockObserver implements ObservationSink {
+export class ForgeDockObserver implements ObservationSink, ObservationQuerySource {
   readonly #store: ObservationStore;
   readonly #projector = new ObservationProjector();
   readonly #listeners = new Set<ObservationListener>();

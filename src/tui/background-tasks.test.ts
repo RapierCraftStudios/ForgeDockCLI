@@ -7,9 +7,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, TUI_RESTART_TERMINAL_CAUSE } from "./background-tasks.js";
 import { ForgeDockObserver } from "../observability/observer.js";
 import { SqliteObservationStore } from "../observability/sqlite-store.js";
+import { createObservationProducer } from "../observability/contracts.js";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-"));
@@ -61,6 +62,84 @@ test("background observation captures split stdout and stderr before its termina
   assert.match(serialized, /stderr visible/);
   assert.match(serialized, /\[REDACTED\]/);
   assert.doesNotMatch(serialized, /integration-secret|\u001b\]52/);
+  await tasks.shutdown();
+  observer.close();
+});
+
+test("waitForTerminal resets semantic idle only for correlated semantic observations", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 32 });
+  const producer = createObservationProducer("background-semantic-test");
+  tasks.setObservationSink(observer);
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "setTimeout(()=>process.exit(0),1200)"],
+    cwd,
+    ctx,
+  });
+  const waiting = tasks.waitForTerminal(record.id, { warnAfterMs: 350 });
+  const events = [
+    ["workflow", "activity", "workflow.progress"],
+    ["agent", "activity", "activity.changed"],
+    ["agent", "tool", "tool.progress"],
+    ["agent", "tool", "tool.completed"],
+    ["agent", "activity", "output.delta"],
+    ["artifact", "artifact", "artifact.submitted"],
+    ["agent", "activity", "agent.session.progress"],
+  ] as const;
+  for (const [source, channel, kind] of events) {
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await observer.emit({ producer, identity: { controllerTaskId: record.id }, source, channel, kind, payload: {} });
+  }
+  assert.equal((await waiting).status, "completed");
+  assert.equal(messages.some((message) => message.includes("no semantic activity")), false);
+  await tasks.shutdown();
+  observer.close();
+});
+
+test("waitForTerminal warns for a long noisy process with no semantic activity", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 32 });
+  const producer = createObservationProducer("background-cursor-test");
+  tasks.setObservationSink(observer);
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "const timer=setInterval(()=>{process.stdout.write('raw stdout\\n'); process.stderr.write('raw stderr\\n')},25); setTimeout(()=>{clearInterval(timer); process.exit(0)},1800)"],
+    cwd,
+    ctx,
+  });
+  await observer.emit({ producer, identity: { controllerTaskId: record.id }, source: "workflow", channel: "activity", kind: "workflow.progress", payload: { phase: "before-wait" } });
+  const waiting = tasks.waitForTerminal(record.id, { warnAfterMs: 1_250 });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await observer.emit({ producer, identity: { controllerTaskId: "some-other-controller" }, source: "agent", channel: "activity", kind: "activity.changed", payload: {} });
+    await eventually(() => assert.ok(messages.some((message) => message.includes("no semantic activity"))));
+    assert.equal(tasks.isOperationallyActive(record.id), true);
+    await observer.flush();
+    const rawKinds = (await observer.query({ controllerTaskId: record.id, source: "process" })).map((event) => event.kind);
+    assert.ok(rawKinds.includes("output.stdout"));
+    assert.ok(rawKinds.includes("output.stderr"));
+    assert.equal((await waiting).status, "completed");
+    const warning = messages.find((message) => message.includes("no semantic activity"));
+    assert.match(warning ?? "", new RegExp(record.id));
+    assert.doesNotMatch(warning ?? "", /semantic output/i);
+  } finally {
+    if (tasks.isOperationallyActive(record.id)) tasks.cancel(record.id);
+    await waiting.catch(() => undefined);
+    await tasks.shutdown();
+    observer.close();
+  }
+});
+
+test("waitForTerminal survives observation query failures", async () => {
+  const { cwd, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:") });
+  tasks.setObservationSink({
+    emit: (draft) => observer.emit(draft),
+    query: async () => { throw new Error("observation database unavailable"); },
+  });
+  const record = tasks.start({ command: process.execPath, args: ["-e", "setTimeout(()=>process.exit(0),300)"], cwd, ctx });
+  assert.equal((await tasks.waitForTerminal(record.id, { warnAfterMs: 50 })).status, "completed");
   await tasks.shutdown();
   observer.close();
 });
@@ -130,6 +209,24 @@ test("an immediately exiting controller is reconciled exactly once", async () =>
   const record = tasks.start({ command: process.execPath, args: ["-e", "process.exit(0)"], cwd, ctx });
   await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
   assert.equal(messages.filter((message) => message.includes(record.id) && message.includes("completed")).length, 1);
+  await tasks.shutdown();
+});
+
+test("ordinary exit-2 claim deferrals have no TUI restart cause or wording", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "process.exit(2)"],
+    cwd,
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+    ctx,
+  });
+  await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "blocked"));
+  const persisted = JSON.parse(readFileSync(join(cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as Record<string, unknown>;
+  assert.equal(persisted.terminalCause, undefined);
+  assert.doesNotMatch(tasks.output(record.id), /TUI restart|resume required/i);
+  assert.doesNotMatch(messages.filter((message) => message.includes(record.id)).join("\n"), /terminal restart|nested-agent bridge|resume|required checkpoint|forgedock_resume/i);
   await tasks.shutdown();
 });
 
@@ -279,9 +376,11 @@ test("terminal restart blocks bridge-bound controllers without persisting bridge
 
   const persisted = JSON.parse(readFileSync(join(first.cwd, ".forgedock", "tasks", `${record.id}.json`), "utf8")) as Record<string, unknown>;
   assert.equal(persisted.status, "blocked");
+  assert.equal(persisted.terminalCause, TUI_RESTART_TERMINAL_CAUSE);
   assert.equal(persisted.restartRequired, NESTED_AGENT_BRIDGE_RESTART_REQUIRED);
   assert.equal(persisted.resumeScope, "orchestration");
   assert.doesNotMatch(JSON.stringify(persisted), /FORGEDOCK_NESTED_AGENT|bridge-secret|45678/);
+  assert.deepEqual(second.pendingRestartRecords(first.ctx).map((candidate) => candidate.id), [record.id]);
   assert.equal(second.isOperationallyActive(record.id), false);
   assert.match(second.output(record.id), /resume required after TUI restart/);
   assert.match(first.messages.at(-1) ?? "", /forgedock_resume_orchestration/);
@@ -289,6 +388,35 @@ test("terminal restart blocks bridge-bound controllers without persisting bridge
 
   await first.tasks.shutdown({ cancel: false });
   await second.shutdown();
+});
+
+test("blocked bridge records without a restart cause stay readable but silent", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const id = "task_old_blocked_bridge";
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: 999_999_999,
+    logPath: join(directory, `${id}.log`),
+    status: "blocked",
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    exitCode: 2,
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+  }));
+
+  assert.deepEqual(tasks.pendingRestartRecords(ctx), []);
+  const record = tasks.list().find((candidate) => candidate.id === id);
+  assert.equal(record?.status, "blocked");
+  assert.doesNotMatch(tasks.output(id), /TUI restart|resume required/i);
+  if (record) tasks.announceRestartRequired(record);
+  assert.equal(messages.some((message) => message.includes(id)), false);
+  await tasks.shutdown();
 });
 
 test("older bridge-bound records without a resume scope remain parseable", async () => {
@@ -309,6 +437,7 @@ test("older bridge-bound records without a resume scope remain parseable", async
   }));
   tasks.initialize(ctx);
   assert.equal(tasks.list().find((record) => record.id === id)?.status, "blocked");
+  assert.equal(tasks.list().find((record) => record.id === id)?.terminalCause, TUI_RESTART_TERMINAL_CAUSE);
   assert.doesNotMatch(messages.at(-1) ?? "", /forgedock_resume_orchestration/);
   assert.match(messages.at(-1) ?? "", /owning workflow checkpoint/);
   await tasks.shutdown();

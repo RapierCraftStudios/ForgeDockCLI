@@ -3,6 +3,23 @@
 
 # Changelog
 
+## Unreleased - 2026-08-18
+
+### Added
+
+- `npm run certify:orchestration` builds and runs an exact-file, single-concurrency local certification set with GitHub credentials removed; `npm run certify:orchestration:dry-run` prints the audited plan without execution.
+
+### Changed
+
+- Orchestration now defaults to one selected issue per visible DAG node and top-level `work-on` slot. `maxParallel` is a 1–20 issue-slot budget; an explicit batch consumes one slot per member, and transport capacity may lower actual dispatch.
+- Semantic dependencies and conflict claims have separate meanings: a dependency requires an authoritative successful predecessor Outcome, while a same-repository, same-target claim only serializes overlapping work until the predecessor is terminal. Dynamically refined Build Packet claims participate in scheduling, and a claim-deferred worker refreshes its exact target before dispatch.
+- Batching is an explicit opt-in. Eligible ordinary issues and review findings use typed compatibility; sensitive security/auth groups require exactly two members with shared causal-family and secondary proof and are hard-capped at two despite the current managed-config default of three. Priority labels alone neither define nor authorize compatibility.
+- Natural-language scope selection is projected into typed discovery evidence before controller validation. Fleet and orchestration views report selected/runnable issue demand, requested/transport/effective caps, node status, and typed waits without presenting queued demand as active.
+- `forgedock.verification/v2` now builds a bounded catalog from the refreshed exact base and runs only packet-selected `diff-check`, one safe direct TypeScript integrity command, and targeted direct Node tests. Required hosted CI remains separate live authority and must expose a nonempty passing GitHub-required set with authoritative provenance at the exact reviewed SHA.
+- Builder criterion coverage now uses typed path, symbol, test/invariant, and command anchors backed by passing controller-observed checks. Verification repair gets at most two fresh bounded sessions, retains the prior submission/session reference within the live process, and cannot widen frozen packet scope; after restart only the durable failure Outcome is reconstructed.
+- Review continuity now uses a durable `FindingRootLedger` and schema-v4 exact-SHA initial/closure plans. Omission does not close an open root. Controller-owned `mustFix` is distinct from final `blocking`: qualifying medium roots can remain nonblocking while still forcing `request_changes`, bounded remediation, re-verification, and closure review.
+- Dogfood readiness is now tracked as phased certification waves. Implementation and local regression evidence do not constitute a readiness claim; certification remains open.
+
 ## 1.8.1 - 2026-08-17
 
 ### Fixed
@@ -79,7 +96,7 @@
 - ForgeDock-branded Pi terminal with lazily activated semantic workflow tools, supervised parallel issue workers, visible nested reviewer agents, and evidence-backed human decision checkpoints.
 - Source-pinned ForgeDock Pi fork and packaged runtime staging with explicit provenance and fork policy.
 - Isolated live GitHub lifecycle probes covering investigation, Build Packet creation, build, verification, PR publication, parallel independent review, merge, closure, and cleanup.
-- Evidence-backed orchestration DAGs with deterministic priority ordering, claim-derived serialization edges, streaming ready-set dispatch, authoritative prerequisite admission, and real P2/P3 concern batching into one batch issue/work-on unit.
+- Evidence-backed orchestration DAGs with deterministic priority ordering, claim-derived serialization edges, streaming ready-set dispatch, authoritative prerequisite admission, and typed concern batching into one batch issue/work-on unit when explicitly enabled.
 - Explicit, durable branch promotion checkpoints for milestone lanes → staging and staging → protected production, with typed PR transport, frozen verification command/plan identity, independent review coverage, exact-SHA merge authorization, resume, cancellation, native `/promote`, and status inspection.
 - Automatic minimal `forge.yaml` bootstrap on normal parent-terminal launch, plus natural-language ForgeDock Next configuration with live-catalog model alias resolution and independent planning, worker, and reviewer model settings.
 - `FORGE.md` project guidance plus token-bounded, Obsidian-compatible `devdocs/` memory retrieval with anchors, links, and backlinks.

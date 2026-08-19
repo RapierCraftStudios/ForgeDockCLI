@@ -8,10 +8,12 @@ import {
   type DurableArtifact,
   type IntentPayload,
   type InvestigationPayload,
+  type FindingRootLedgerPayload,
   type OutcomePayload,
   type RemediationBlockedPayload,
   type ReviewFindingProjectionPayload,
   type VerificationAdjudicationPayload,
+  type VerificationCheckpointPayload,
   type ReviewVerdictPayload,
 } from "./schema.js";
 
@@ -133,6 +135,15 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         listSection("Out of scope", payload.outOfScope),
       ].filter(Boolean).join("\n\n");
     }
+    case "VerificationCheckpoint": {
+      const payload = artifact.payload as VerificationCheckpointPayload;
+      return [heading, meta, "",
+        `**Checkpoint:** \`${payload.checkpoint}\` · **Branch:** \`${payload.branch}\` · **Parent:** \`${payload.parentHeadSha}\` · **Frozen base:** \`${payload.baseSha}\``,
+        payload.summary,
+        listSection("Verified paths", payload.changedPaths.map(code)),
+        checkTable(payload.checks),
+      ].filter(Boolean).join("\n\n");
+    }
     case "BuildResult": {
       const payload = artifact.payload as BuildResultPayload;
       return [heading, meta, "", `**Branch:** \`${payload.branch}\` · **Target:** \`${payload.targetBranch ?? "unset"}\`${payload.promotionTarget ? ` · **Promotion:** \`${payload.promotionTarget}\`` : ""}${payload.productionTarget ? ` · **Production:** \`${payload.productionTarget}\`` : ""} · **Head:** \`${payload.headSha}\`${payload.baseSha ? ` · **Frozen base:** \`${payload.baseSha}\`` : ""}`, "", payload.summary,
@@ -162,6 +173,15 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
           ? `### Projection receipt\n${payload.projections.map((projection) => `- **${projection.findingId}** Â· ${projection.status}${projection.issueNumber ? ` Â· issue #${projection.issueNumber}` : ""}${projection.mismatches?.length ? ` Â· ${projection.mismatches.join(", ")}` : ""}`).join("\n")}`
           : "",
       ].filter(Boolean).join("\n\n");
+    }
+    case "FindingRootLedger": {
+      const payload = artifact.payload as FindingRootLedgerPayload;
+      return [heading, meta, "",
+        `**Epoch:** ${payload.epoch} · **PR:** #${payload.pullRequest} · **Head:** \`${payload.headSha}\``,
+        payload.roots.length
+          ? `### Structural roots\n${payload.roots.map((root) => `- **${root.rootId}** · ${root.state} · ${root.criterionIds.join(", ")} · \`${root.component}\` · ${root.symbols.map(code).join(", ")}`).join("\n")}`
+          : "### Structural roots\nNo roots recorded.",
+      ].join("\n\n");
     }
     case "VerificationAdjudication": {
       const payload = artifact.payload as VerificationAdjudicationPayload;

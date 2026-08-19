@@ -1,20 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestMergeGateOptions, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
+import {
+  abortablePollDelay,
+  controllerPollDelay,
+  controllerPollInterval,
+  pollingAbortError,
+  throwIfPollingAborted,
+} from "../review-pr/polling.js";
 import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFromArtifacts } from "./trajectory.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 
-const MAX_MERGEABILITY_REFRESH_ATTEMPTS = 3;
-const MERGEABILITY_REFRESH_DELAY_MS = 50;
+export interface MergeGatePollProgress {
+  attempt: number;
+  reason: "required-checks-pending" | "mergeability-unknown";
+  gate: PullRequestMergeGate;
+  nextPollInMs: number;
+}
 
-function waitForMergeabilityRefresh(attempt: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, MERGEABILITY_REFRESH_DELAY_MS * 2 ** (attempt - 1)));
+const mergeGatePollInterval = controllerPollInterval;
+const mergeGatePollDelay = controllerPollDelay;
+
+function abortError(signal: AbortSignal): Error {
+  return pollingAbortError(signal, "Merge-gate polling aborted");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  throwIfPollingAborted(signal, "Merge-gate polling aborted");
+}
+
+function waitForMergeGatePoll(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return abortablePollDelay(delayMs, signal, abortError);
 }
 
 /**
@@ -141,8 +163,21 @@ export async function completeWorkItem(
     autoMerge: boolean;
     childIssues?: readonly number[];
     memberContracts?: readonly BatchMemberContract[];
+    /** Abort controller shutdown or ownership cancellation without publishing a blocker. */
+    signal?: AbortSignal;
+    /** Poll cadence is clamped to a safe range; production polling has no attempt limit. */
+    mergeGatePollIntervalMs?: number;
+    /** Optional live evidence sink for UI/heartbeat integrations. */
+    onMergeGatePoll?: (progress: MergeGatePollProgress) => void | Promise<void>;
   },
-  dependencies: { host: ForgeHost; artifacts: ArtifactRepository; runs: RunRepository; telemetry?: TelemetryRepository },
+  dependencies: {
+    host: ForgeHost;
+    artifacts: ArtifactRepository;
+    runs: RunRepository;
+    telemetry?: TelemetryRepository;
+    /** Controller fencing witness, checked before each live query and mutation. */
+    leaseGuard?: { assertValid(): void };
+  },
 ): Promise<{ run: RunState; awaitingHuman: boolean; outcome?: DurableArtifact<"Outcome"> }> {
   if (input.run.state !== "merging") throw new Error(`Completion requires merging state, found ${input.run.state}`);
   if (input.verdict.payload.disposition !== "approve") throw new Error("Cannot complete without an approving Review Verdict");
@@ -156,20 +191,94 @@ export async function completeWorkItem(
     }
     if (pullRequest.state !== "MERGED") {
       if (!input.autoMerge) return { run, awaitingHuman: true };
-      const mergeGate = await readMergeGate(dependencies.host, pullRequest, input.verdict.payload.headSha, run.targetBranch!, { refreshUnknown: true });
-      const mergeGateReason = mergeGateFailure(mergeGate);
-      if (mergeGateReason) {
-        return blockMergeAdmission(run, pullRequest, mergeGate, mergeGateReason, dependencies, awaitingHumanForMergeGate(mergeGate));
+      let admissionAttempt = 0;
+      while (true) {
+        const admission = await waitForAuthoritativeMergeGate({
+          host: dependencies.host,
+          runs: dependencies.runs,
+          run,
+          pullRequest,
+          expectedHeadSha: input.verdict.payload.headSha,
+          expectedBaseBranch: run.targetBranch!,
+          pollIntervalMs: mergeGatePollInterval(input.mergeGatePollIntervalMs),
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.onMergeGatePoll ? { onPoll: input.onMergeGatePoll } : {}),
+          ...(dependencies.leaseGuard ? { leaseGuard: dependencies.leaseGuard } : {}),
+        });
+        if (admission.terminalReason) {
+          return blockMergeAdmission(
+            run,
+            admission.pullRequest,
+            admission.gate,
+            admission.terminalReason,
+            dependencies,
+            awaitingHumanForMergeGate(admission.gate),
+          );
+        }
+        pullRequest = admission.pullRequest;
+        if (admission.alreadyMerged) break;
+        throwIfAborted(input.signal);
+        dependencies.leaseGuard?.assertValid();
+        try {
+          await dependencies.host.mergePullRequest(
+            pullRequest.repo,
+            pullRequest.number,
+            input.verdict.payload.headSha,
+            run.targetBranch!,
+          );
+          break;
+        } catch (error) {
+          const afterCommand = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+          if (afterCommand.state === "MERGED") {
+            assertMergedPullRequestIdentity(
+              afterCommand,
+              input.pullRequest.repo,
+              input.pullRequest.number,
+              input.verdict.payload.headSha,
+              run.targetBranch!,
+            );
+            pullRequest = afterCommand;
+            break;
+          }
+          assertOpenPullRequestIdentity(
+            afterCommand,
+            input.pullRequest.repo,
+            input.pullRequest.number,
+            input.verdict.payload.headSha,
+            run.targetBranch!,
+          );
+          pullRequest = afterCommand;
+          const transientReason = transientMergeAdmissionError(error);
+          if (!transientReason) throw error;
+          admissionAttempt += 1;
+          const pollIntervalMs = mergeGatePollDelay(
+            mergeGatePollInterval(input.mergeGatePollIntervalMs),
+            admissionAttempt,
+          );
+          dependencies.leaseGuard?.assertValid();
+          await dependencies.runs.recordProgress({
+            runId: run.runId,
+            phase: "merge-gate.poll",
+            message: `Merge-time authority became transient for PR #${pullRequest.number}; re-querying live gate (attempt ${admissionAttempt})`,
+            occurredAt: new Date().toISOString(),
+          });
+          await input.onMergeGatePoll?.({
+            attempt: admissionAttempt,
+            reason: transientReason,
+            gate: admission.gate,
+            nextPollInMs: pollIntervalMs,
+          });
+          await waitForMergeGatePoll(pollIntervalMs, input.signal);
+        }
       }
-      await dependencies.host.mergePullRequest(
-        pullRequest.repo,
-        pullRequest.number,
+      pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+      assertMergedPullRequestIdentity(
+        pullRequest,
+        input.pullRequest.repo,
+        input.pullRequest.number,
         input.verdict.payload.headSha,
         run.targetBranch!,
       );
-      pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
-      assertRunTargetsBranch(run, pullRequest.baseBranch);
-      if (pullRequest.state !== "MERGED") throw new Error("Merge command completed but the pull request is not merged");
     }
 
     const merged = transition(run, "MERGE_COMPLETED", { headSha: pullRequest.headSha });
@@ -329,11 +438,8 @@ export async function completeWorkItem(
     await dependencies.runs.commit(run.version, closed.state, closed.record);
     return { run: closed.state, awaitingHuman: false, outcome };
   } catch (error) {
+    if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
     const reason = error instanceof Error ? error.message : String(error);
-    if (run.state === "merging" && /merge admission|required GitHub checks|pull request .*not mergeable|mergeability|confirmed conflicting/i.test(reason)) {
-      const gate = await readMergeGate(dependencies.host, input.pullRequest, input.verdict.payload.headSha, run.targetBranch ?? input.pullRequest.baseBranch, { refreshUnknown: true });
-      return blockMergeAdmission(run, input.pullRequest, gate, reason, dependencies, awaitingHumanForMergeGate(gate));
-    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
@@ -345,7 +451,6 @@ async function readMergeGate(
   pullRequest: PullRequestSnapshot,
   expectedHeadSha: string,
   expectedBaseBranch: string,
-  options: PullRequestMergeGateOptions = {},
 ): Promise<PullRequestMergeGate> {
   const unavailable = (detail: string): PullRequestMergeGate => ({
     repo: pullRequest.repo,
@@ -355,37 +460,192 @@ async function readMergeGate(
     mergeable: false,
     mergeability: "unavailable",
     mergeabilityReason: detail.slice(0, 500),
+    requiredChecksProvenance: "unavailable",
     requiredChecks: [{ name: "merge-admission-query", state: "unavailable", detailsUrl: detail.slice(0, 500) }],
     observedAt: new Date().toISOString(),
   });
   if (!host.getPullRequestMergeGate) return unavailable("ForgeHost does not implement authoritative pull-request merge admission");
-  for (let attempt = 1; attempt <= (options.refreshUnknown ? MAX_MERGEABILITY_REFRESH_ATTEMPTS : 1); attempt++) {
-    try {
-      const gate = await host.getPullRequestMergeGate(pullRequest.repo, pullRequest.number, expectedHeadSha, expectedBaseBranch, options);
-      if (!options.refreshUnknown || pullRequestMergeability(gate) !== "unknown" || attempt >= MAX_MERGEABILITY_REFRESH_ATTEMPTS) return gate;
-      await waitForMergeabilityRefresh(attempt);
-    } catch (error) {
-      return unavailable(error instanceof Error ? error.message : String(error));
-    }
+  try {
+    return await host.getPullRequestMergeGate(
+      pullRequest.repo,
+      pullRequest.number,
+      expectedHeadSha,
+      expectedBaseBranch,
+    );
+  } catch (error) {
+    return unavailable(error instanceof Error ? error.message : String(error));
   }
-  return unavailable("GitHub mergeability refresh attempts exhausted");
 }
 
-function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+interface MergeGateAdmission {
+  gate: PullRequestMergeGate;
+  pullRequest: PullRequestSnapshot;
+  terminalReason?: string;
+  alreadyMerged?: true;
+}
+
+async function waitForAuthoritativeMergeGate(input: {
+  host: ForgeHost;
+  runs: RunRepository;
+  run: RunState;
+  pullRequest: PullRequestSnapshot;
+  expectedHeadSha: string;
+  expectedBaseBranch: string;
+  pollIntervalMs: number;
+  signal?: AbortSignal;
+  onPoll?: (progress: MergeGatePollProgress) => void | Promise<void>;
+  leaseGuard?: { assertValid(): void };
+}): Promise<MergeGateAdmission> {
+  let pullRequest = input.pullRequest;
+  for (let attempt = 1; ; attempt += 1) {
+    throwIfAborted(input.signal);
+    input.leaseGuard?.assertValid();
+    const gate = await readMergeGate(input.host, pullRequest, input.expectedHeadSha, input.expectedBaseBranch);
+    assertMergeGateIdentity(gate, pullRequest.repo, pullRequest.number, input.expectedHeadSha, input.expectedBaseBranch);
+
+    // Re-read after every checks query, including unavailable responses, so no
+    // PR-scoped observation can be attached to a changed head/base/state.
+    const revalidated = await input.host.getPullRequest(pullRequest.repo, pullRequest.number);
+    if (revalidated.state === "MERGED") {
+      assertMergedPullRequestIdentity(
+        revalidated,
+        pullRequest.repo,
+        pullRequest.number,
+        input.expectedHeadSha,
+        input.expectedBaseBranch,
+      );
+      return { gate, pullRequest: revalidated, alreadyMerged: true };
+    }
+    assertOpenPullRequestIdentity(revalidated, pullRequest.repo, pullRequest.number, input.expectedHeadSha, input.expectedBaseBranch);
+    pullRequest = revalidated;
+
+    const terminalReason = terminalMergeGateFailure(gate);
+    if (terminalReason) return { gate, pullRequest, terminalReason };
+    const transientReason = transientMergeGateReason(gate);
+    if (!transientReason) return { gate, pullRequest };
+
+    const nextPollInMs = mergeGatePollDelay(input.pollIntervalMs, attempt);
+    const progress: MergeGatePollProgress = {
+      attempt,
+      reason: transientReason,
+      gate,
+      nextPollInMs,
+    };
+    input.leaseGuard?.assertValid();
+    await input.runs.recordProgress({
+      runId: input.run.runId,
+      phase: "merge-gate.poll",
+      message: transientReason === "required-checks-pending"
+        ? `Required checks pending for PR #${gate.pullRequest}; polling authoritative GitHub state (attempt ${attempt})`
+        : `GitHub mergeability unknown for PR #${gate.pullRequest}; polling authoritative state (attempt ${attempt})`,
+      occurredAt: new Date().toISOString(),
+    });
+    await input.onPoll?.(progress);
+    await waitForMergeGatePoll(nextPollInMs, input.signal);
+  }
+}
+
+function assertMergeGateIdentity(
+  gate: PullRequestMergeGate,
+  expectedRepo: string,
+  expectedNumber: number,
+  expectedHeadSha: string,
+  expectedBaseBranch: string,
+): void {
+  if (gate.repo.toLowerCase() !== expectedRepo.toLowerCase() || gate.pullRequest !== expectedNumber) {
+    throw new Error(`Merge admission identified ${gate.repo}#${gate.pullRequest}, expected ${expectedRepo}#${expectedNumber}`);
+  }
+  if (gate.headSha !== expectedHeadSha) {
+    throw new Error(`Merge admission is stale: reviewed ${expectedHeadSha}, gate observed ${gate.headSha}`);
+  }
+  if (gate.baseBranch !== expectedBaseBranch) {
+    throw new Error(`Merge admission target is stale: expected ${expectedBaseBranch}, gate observed ${gate.baseBranch}`);
+  }
+}
+
+function assertOpenPullRequestIdentity(
+  pullRequest: PullRequestSnapshot,
+  expectedRepo: string,
+  expectedNumber: number,
+  expectedHeadSha: string,
+  expectedBaseBranch: string,
+): void {
+  if (pullRequest.repo.toLowerCase() !== expectedRepo.toLowerCase() || pullRequest.number !== expectedNumber) {
+    throw new Error(`Pull request revalidation identified ${pullRequest.repo}#${pullRequest.number}, expected ${expectedRepo}#${expectedNumber}`);
+  }
+  if (pullRequest.headSha !== expectedHeadSha) {
+    throw new Error(`Approved SHA ${expectedHeadSha} is stale; current PR head is ${pullRequest.headSha}`);
+  }
+  if (pullRequest.baseBranch !== expectedBaseBranch) {
+    throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${pullRequest.baseBranch}`);
+  }
+  if (pullRequest.state !== "OPEN") {
+    throw new Error(`Pull request #${expectedNumber} changed state while reading merge admission: ${pullRequest.state}`);
+  }
+}
+
+function assertMergedPullRequestIdentity(
+  pullRequest: PullRequestSnapshot,
+  expectedRepo: string,
+  expectedNumber: number,
+  expectedHeadSha: string,
+  expectedBaseBranch: string,
+): void {
+  if (pullRequest.repo.toLowerCase() !== expectedRepo.toLowerCase()
+    || pullRequest.number !== expectedNumber
+    || pullRequest.headSha !== expectedHeadSha
+    || pullRequest.baseBranch !== expectedBaseBranch
+    || pullRequest.state !== "MERGED") {
+    throw new Error(
+      `Merge command completed without exact merged identity ${expectedRepo}#${expectedNumber} ${expectedHeadSha} -> ${expectedBaseBranch}`,
+    );
+  }
+}
+
+function terminalMergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: authoritative required checks are not immutably bound to ${gate.headSha}`;
+  }
+  if (gate.requiredChecks.length === 0) {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub reported no configured required checks`;
+  }
   const mergeability = pullRequestMergeability(gate);
-  if (mergeability === "conflicting") return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub confirmed the reviewed SHA conflicts with ${gate.baseBranch}`;
-  if (mergeability === "unknown") return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub mergeability remains UNKNOWN on ${gate.baseBranch}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
-  if (mergeability === "unavailable") return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub mergeability query is unavailable on ${gate.baseBranch}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
-  const nonPassing = gate.requiredChecks.filter((check) => check.state !== "passed");
-  if (!nonPassing.length) return undefined;
-  const pending = nonPassing.some((check) => check.state === "pending");
-  return `${pending ? "Awaiting" : "Required"} GitHub checks before merge for PR #${gate.pullRequest}: ${nonPassing.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+  if (mergeability === "conflicting") {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub confirmed the reviewed SHA conflicts with ${gate.baseBranch}`;
+  }
+  if (mergeability === "unavailable") {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub mergeability query is unavailable on ${gate.baseBranch}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  }
+  const terminalChecks = gate.requiredChecks.filter((check) => ["failed", "cancelled", "unavailable"].includes(check.state));
+  if (terminalChecks.length) {
+    return `Required GitHub checks failed closed for PR #${gate.pullRequest}: ${terminalChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+  }
+  return undefined;
+}
+
+function transientMergeGateReason(gate: PullRequestMergeGate): MergeGatePollProgress["reason"] | undefined {
+  if (gate.requiredChecks.some((check) => check.state === "pending")) return "required-checks-pending";
+  if (pullRequestMergeability(gate) === "unknown") return "mergeability-unknown";
+  return undefined;
+}
+
+function transientMergeAdmissionError(error: unknown): MergeGatePollProgress["reason"] | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/required GitHub checks.*(?:pending|queued|in_progress|requested|waiting)/i.test(message)) {
+    return "required-checks-pending";
+  }
+  if (/mergeability.*unknown/i.test(message)) return "mergeability-unknown";
+  return undefined;
 }
 
 function awaitingHumanForMergeGate(gate: PullRequestMergeGate): boolean {
-  // A confirmed conflict or a known failing/pending check needs an operator
-  // decision. UNKNOWN and unavailable are transport/computation states; they
-  // must remain recoverable evidence, never an "awaiting human merge" claim.
+  // Conflicts and terminal check failures can require operator action. Missing
+  // authority and unavailable observations are evidence failures, not claims
+  // that a human should manually merge around the controller.
+  if (gate.requiredChecksProvenance !== "github-required"
+    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) return false;
+  if (gate.requiredChecks.some((check) => check.state === "unavailable")) return false;
   const mergeability = pullRequestMergeability(gate);
   return mergeability !== "unknown" && mergeability !== "unavailable";
 }
@@ -419,6 +679,8 @@ async function blockMergeAdmission(
         mergeable: gate.mergeable,
         ...(gate.mergeability ? { mergeability: gate.mergeability } : {}),
         ...(gate.mergeabilityReason ? { mergeabilityReason: gate.mergeabilityReason } : {}),
+        ...(gate.requiredChecksProvenance ? { requiredChecksProvenance: gate.requiredChecksProvenance } : {}),
+        ...(gate.requiredChecksHeadSha ? { requiredChecksHeadSha: gate.requiredChecksHeadSha } : {}),
         observedAt: gate.observedAt,
         requiredChecks: gate.requiredChecks.map((check) => ({
           name: check.name,
@@ -436,6 +698,8 @@ async function blockMergeAdmission(
         gate.pullRequest,
         gate.headSha,
         gate.baseBranch,
+        gate.requiredChecksProvenance ?? "missing-provenance",
+        gate.requiredChecksHeadSha ?? "missing-check-head",
         pullRequestMergeability(gate),
         gate.mergeabilityReason ?? "",
         ...gate.requiredChecks

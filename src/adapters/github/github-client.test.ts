@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
-import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
+import type { PlanMaterializationRequest, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
 import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
 
@@ -102,11 +102,90 @@ describe("GitHub issue-search resolution", () => {
         { number: 8, state: "OPEN", milestone: null },
       ]);
     } });
-    assert.deepEqual(await client.listOpenIssueNumbersForSearch("is:issue  state:open no:milestone", "a/b"), [8, 9]);
+    assert.deepEqual(await client.listOpenIssueNumbersForSearch("is:issue  state:open no:milestone", "a/b"), [9, 8]);
     assert.deepEqual(received, [
       "issue", "list", "--repo", "a/b", "--state", "open",
       "--search", "is:issue state:open no:milestone", "--limit", "1000", "--json", "number,state,milestone",
     ]);
+  });
+
+  it("returns the bounded no-milestone membership projection without reordering it", async () => {
+    const client = new GitHubClient();
+    let received: string[] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      received = args;
+      return JSON.stringify([
+        { number: 12, state: "OPEN", milestone: null },
+        { number: 11, state: "OPEN", milestone: { title: "Later" } },
+        { number: 10, state: "CLOSED", milestone: null },
+      ]);
+    } });
+
+    assert.deepEqual(await client.listOpenIssueNumbersWithoutMilestone("a/b"), [12]);
+    assert.deepEqual(received, [
+      "issue", "list", "--repo", "a/b", "--state", "open",
+      "--limit", "1000", "--json", "number,state,milestone",
+    ]);
+  });
+});
+
+describe("GitHub immutable comparison reads", () => {
+  const baseSha = "a".repeat(40);
+  const headSha = "b".repeat(40);
+  const comparison = (files: Array<{ filename: string; patch?: string }>) => ({
+    status: "ahead",
+    ahead_by: 1,
+    base_commit: { sha: baseSha },
+    merge_base_commit: { sha: baseSha },
+    commits: [{ sha: headSha }],
+    files,
+  });
+
+  it("shares one exact compare response across changed paths and hunks", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      return JSON.stringify(comparison([
+        { filename: "src/b.ts", patch: "@@ -1 +4,2 @@ function changed()" },
+        { filename: "src/a.ts", patch: "@@ -2 +7 @@" },
+      ]));
+    } });
+
+    assert.deepEqual(await client.getChangedPathsBetween("a/b", baseSha, headSha), ["src/a.ts", "src/b.ts"]);
+    assert.deepEqual(await client.getChangedHunksBetween("a/b", baseSha, headSha), [
+      "src/a.ts:L7-L7",
+      "src/b.ts:L4-L5:function changed()",
+    ]);
+    assert.deepEqual(calls, [["api", `repos/a/b/compare/${baseSha}...${headSha}`]]);
+  });
+
+  it("accepts 299 complete patched files and rejects GitHub's 300-file cap", async () => {
+    const files = Array.from({ length: 300 }, (_, index) => ({
+      filename: `src/file-${index}.ts`,
+      patch: `@@ -1 +${index + 1} @@`,
+    }));
+    const accepted = new GitHubClient();
+    Object.defineProperty(accepted, "gh", { value: async () => JSON.stringify(comparison(files.slice(0, 299))) });
+    assert.equal((await accepted.getChangedPathsBetween("a/b", baseSha, headSha)).length, 299);
+
+    const capped = new GitHubClient();
+    Object.defineProperty(capped, "gh", { value: async () => JSON.stringify(comparison(files)) });
+    await assert.rejects(capped.getChangedHunksBetween("a/b", baseSha, headSha), /at least 300 files.*cannot prove completeness/);
+  });
+
+  it("fails closed on missing patches, non-descendant lineage, and non-SHA inputs", async () => {
+    const missingPatch = new GitHubClient();
+    Object.defineProperty(missingPatch, "gh", { value: async () => JSON.stringify(comparison([{ filename: "asset.bin" }])) });
+    await assert.rejects(missingPatch.getChangedHunksBetween("a/b", baseSha, headSha), /omitted the patch/);
+
+    const diverged = new GitHubClient();
+    Object.defineProperty(diverged, "gh", { value: async () => JSON.stringify({ ...comparison([]), status: "diverged" }) });
+    await assert.rejects(diverged.getChangedPathsBetween("a/b", baseSha, headSha), /strict descendant/);
+
+    const invalid = new GitHubClient();
+    Object.defineProperty(invalid, "gh", { value: async () => { throw new Error("must not query"); } });
+    await assert.rejects(invalid.getChangedPathsBetween("a/b", "base", "head"), /full 40-character commit SHAs/);
   });
 });
 
@@ -276,6 +355,11 @@ describe("GitHub pull request admission", () => {
           { name: "CI", state: "SUCCESS", link: "https://github.test/checks/pull-request", completedAt: "2026-08-14T10:01:00Z" },
         ]);
       }
+      if (args[0] === "api" && args[1]?.includes("/check-runs")) return JSON.stringify([{ check_runs: [
+        { name: "CI", head_sha: headSha, status: "completed", conclusion: "failure", html_url: "https://github.test/checks/push" },
+        { name: "CI", head_sha: headSha, status: "completed", conclusion: "success", html_url: "https://github.test/checks/pull-request" },
+      ] }]);
+      if (args[0] === "api" && args[1]?.includes("/status?")) return JSON.stringify({ sha: headSha, statuses: [] });
       if (args[0] === "pr" && args[1] === "merge") { mergeCommands += 1; return ""; }
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
@@ -294,7 +378,11 @@ describe("GitHub pull request admission", () => {
         return JSON.stringify(pullRequestProjection(186, state));
       }
       if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
-      if (args[0] === "pr" && args[1] === "checks") return "[]";
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Required CI", state: "SUCCESS" }]);
+      if (args[0] === "api" && args[1]?.includes("/check-runs")) return JSON.stringify([{ check_runs: [
+        { name: "Required CI", head_sha: headSha, status: "completed", conclusion: "success" },
+      ] }]);
+      if (args[0] === "api" && args[1]?.includes("/status?")) return JSON.stringify({ sha: headSha, statuses: [] });
       if (args[0] === "pr" && args[1] === "merge") {
         state = "MERGED";
         throw new Error("transport closed after GitHub accepted the merge");
@@ -455,6 +543,17 @@ describe("GitHub review finding projection", () => {
     );
     assert.equal(reviewFindingLaneMarker("A/B", 57), reviewFindingLaneMarker("a/b", 57));
     assert.match(reviewFindingLaneMarker("a/b", 57), /^<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 [a-f0-9]{64} -->$/);
+    const durableRoot = { ...finding, rootId: "root-redaction-marker", normalizedRoot: "old prose", causalRoot: "quoted marker suffix" };
+    assert.equal(
+      reviewFindingSemanticMarker("a/b", 57, durableRoot),
+      reviewFindingSemanticMarker("a/b", 57, {
+        ...durableRoot,
+        title: "Terminal metadata paraphrase no longer controls identity",
+        normalizedRoot: "completely changed controller prose",
+        causalRoot: "different wording",
+        location: "src/observer.ts:99",
+      }),
+    );
   });
 
   it("retains one issue per active root and reconciles stale or duplicate lane projections", () => {
@@ -495,6 +594,35 @@ describe("GitHub review finding projection", () => {
     );
   });
 
+  it("rejects an older publication generation after a newer head wins, including ABA", async () => {
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const client = new GitHubClient(".", admissions);
+    const headA = "a".repeat(40);
+    const headB = "b".repeat(40);
+    let live: PullRequestSnapshot = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN", headSha: headA, headBranch: "fix", baseBranch: "main",
+    };
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...live }) });
+    let mutations = 0;
+    Object.defineProperty(client, "gh", { value: async () => { mutations += 1; return "[[]]"; } });
+
+    const older = await client.beginReviewFindingPublication({ repo: "a/b", pullRequest: live, runId: "run-old" });
+    live = { ...live, headSha: headB };
+    const newer = await client.beginReviewFindingPublication({ repo: "a/b", pullRequest: live, runId: "run-new" });
+    assert.equal(newer.generation, older.generation + 1);
+    live = { ...live, headSha: headA };
+
+    await assert.rejects(client.reconcileReviewFindings({
+      repo: "a/b",
+      pullRequest: { ...live },
+      runId: "run-old",
+      publicationFence: older,
+      activeFindings: [],
+    }), /publication fence is stale/);
+    assert.equal(mutations, 0);
+  });
+
   it("adopts an existing marker-matched root issue across a fresh admission store", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
@@ -512,6 +640,7 @@ describe("GitHub review finding projection", () => {
     };
     issue.body = `**Source:** PR #57 - Fix\n**Reviewed SHA:** \`${pullRequest.headSha}\`\n${reviewFindingLaneMarker("a/b", 57)}\n${reviewFindingMarker("a/b", 57, finding)}`;
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     let created = false;
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
@@ -558,6 +687,7 @@ describe("GitHub review finding projection", () => {
       labels: ["review-finding", "needs-validation", "priority:P1"],
     };
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     let created = false;
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
@@ -607,6 +737,7 @@ describe("GitHub review finding projection", () => {
     const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed" }> = [];
     const closed: number[] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
@@ -679,6 +810,7 @@ describe("GitHub review finding projection", () => {
     const recurrenceComments: string[] = [];
     let created = false;
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([[issue]]);
@@ -733,6 +865,7 @@ describe("GitHub review finding projection", () => {
     const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed"; labels: string[] }> = [];
     const createArgs: string[][] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
@@ -781,6 +914,7 @@ describe("GitHub review finding projection", () => {
     let createdTitle = "";
     let createdArgs: string[] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
@@ -820,6 +954,7 @@ describe("GitHub review finding projection", () => {
     let createdBody = "";
     let createdArgs: string[] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
@@ -855,6 +990,7 @@ describe("GitHub review finding projection", () => {
       title: "Finding", evidence: "Evidence", location: "src/a.ts:1", intentRelevance: "Relevant", remediation: "Fix it",
     };
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
@@ -888,6 +1024,7 @@ describe("GitHub review finding projection", () => {
     let createdTitle = "";
     let contentChanged = false;
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
@@ -940,6 +1077,7 @@ describe("GitHub review finding projection", () => {
     let createdBody = "";
     let createdTitle = "";
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";
@@ -990,6 +1128,7 @@ describe("GitHub review finding projection", () => {
     let createdBody = "";
     let createdTitle = "";
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
     Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return "[[]]";

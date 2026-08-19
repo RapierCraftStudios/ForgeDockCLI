@@ -25,6 +25,11 @@ export interface BatchableWorkItem extends ScheduledWorkItem {
   sourceIssueUrl?: string;
   defectClass?: string;
   riskClass?: BatchRiskClass;
+  /** Explicit semantic compatibility evidence for security/auth batching. */
+  causalFamily?: string;
+  riskCapabilities?: readonly string[];
+  primaryDomain?: string;
+  sharedSymbols?: readonly string[];
   memberIssues?: readonly number[];
   memberContract?: BatchMemberContract;
 }
@@ -50,9 +55,51 @@ export interface MaterializedBatchIssue {
   summary: string;
 }
 
+export interface SensitiveBatchMemberEvidence {
+  riskClass?: BatchRiskClass;
+  causalFamily?: string;
+  riskCapabilities?: readonly string[];
+  primaryDomain?: string;
+  sharedSymbols?: readonly string[];
+  acceptanceCriteria?: readonly string[];
+  affectedFiles: readonly string[];
+  summary?: string;
+}
+
 const HIGH_BLAST_RADIUS = /(?:^|\/)(?:\.env\.example|docker-compose[^/]*|compose[^/]*|index\.[^/]+|main\.[^/]+)$/i;
 const MAX_ROUTINE_MEMBERS = 8;
-const MAX_SENSITIVE_MEMBERS = 3;
+export const MAX_SENSITIVE_MEMBERS = 2;
+const MAX_SENSITIVE_PRODUCTION_PATHS = 4;
+const MAX_SENSITIVE_ATOMIC_CRITERIA = 3;
+const BATCH_CONTRACT_VERSION = 2;
+
+/**
+ * Sensitive batching is deny-by-default: a shared path or source PR is only a
+ * grouping hint, never semantic compatibility evidence.
+ */
+export function isSensitiveBatchCompatible(items: readonly SensitiveBatchMemberEvidence[]): boolean {
+  if (items.length < 2 || items.length > MAX_SENSITIVE_MEMBERS) return false;
+  if (items.some((item) => !isSensitiveRisk(item.riskClass ?? "routine"))) return false;
+
+  const causalFamilies = items.map((item) => normalizedEvidence(item.causalFamily));
+  if (!causalFamilies[0] || causalFamilies.some((family) => family !== causalFamilies[0])) return false;
+
+  const sharesRiskCapability = hasCommonEvidence(items.map((item) => item.riskCapabilities));
+  const primaryDomains = items.map((item) => normalizedEvidence(item.primaryDomain));
+  const sharesPrimaryDomain = Boolean(primaryDomains[0]) && primaryDomains.every((domain) => domain === primaryDomains[0]);
+  const sharesSymbol = hasCommonEvidence(items.map((item) => item.sharedSymbols));
+  if (!sharesRiskCapability && !sharesPrimaryDomain && !sharesSymbol) return false;
+
+  const productionPaths = unique(items.flatMap((item) => item.affectedFiles)
+    .map(normalizeAffectedPath)
+    .filter((path): path is string => path !== undefined && isProductionPath(path)));
+  if (productionPaths.length > MAX_SENSITIVE_PRODUCTION_PATHS) return false;
+
+  const criteria = items.flatMap((item) => item.acceptanceCriteria ?? (item.summary ? [item.summary] : []));
+  return criteria.length > 0
+    && criteria.length <= MAX_SENSITIVE_ATOMIC_CRITERIA
+    && criteria.every((criterion) => criterion.trim().length > 0);
+}
 
 export function planIssueBatches(items: readonly BatchableWorkItem[]): IssueBatchPlan {
   const remaining = new Map<string, BatchableWorkItem>();
@@ -79,11 +126,12 @@ export function planIssueBatches(items: readonly BatchableWorkItem[]): IssueBatc
     }
     for (const [compound, candidates] of [...keyed].sort(([left], [right]) => left.localeCompare(right))) {
       candidates.sort((left, right) => left.priority - right.priority || left.issue - right.issue);
-      while (candidates.length >= minimum) {
-        const riskClass = (candidates[0]?.riskClass ?? "routine") as BatchRiskClass;
-        const cap = riskClass === "routine" ? MAX_ROUTINE_MEMBERS : MAX_SENSITIVE_MEMBERS;
-        const members = candidates.splice(0, cap);
-        if (members.length < minimum) break;
+      const riskClass = (candidates[0]?.riskClass ?? "routine") as BatchRiskClass;
+      const candidateGroups = isSensitiveRisk(riskClass)
+        ? pairSensitiveBatchCandidates(candidates)
+        : chunkBatchCandidates(candidates, MAX_ROUTINE_MEMBERS).filter((members) => members.length >= minimum);
+      for (const members of candidateGroups) {
+        if (members.length < minimum) continue;
         const key = compound.slice(compound.indexOf(":") + 1);
         const id = `batch:${kind}:${key}:${members.map((member) => member.issue).join("-")}`;
         groups.push({ id, kind, key, riskClass, members });
@@ -131,6 +179,7 @@ export function contractBatchGroups(
     const labels = unique(group.members.flatMap((member) => member.labels));
     const affectedFiles = unique(group.members.flatMap((member) => member.affectedFiles));
     const memberIssues = group.members.flatMap((member) => member.memberIssues?.length ? [...member.memberIssues] : [member.issue]);
+    const repository = group.members[0]?.repository ?? group.members[0]?.repo;
     const id = `issue-${issue.issue}`;
     for (const member of group.members) memberToBatch.set(member.id, id);
     replacements.push({
@@ -138,7 +187,7 @@ export function contractBatchGroups(
       issue: issue.issue,
       title: issue.title,
       summary: issue.summary,
-      ...(group.members[0]?.repository !== undefined ? { repository: group.members[0].repository } : group.members[0]?.repo !== undefined ? { repo: group.members[0].repo } : {}),
+      ...(repository !== undefined ? { repository } : {}),
       priority: Math.min(...group.members.map((member) => member.priority)),
       dependencies,
       claims,
@@ -185,9 +234,9 @@ export function renderBatchIssueBody(group: IssueBatchGroup): string {
     ]),
     "<!-- /FORGE:BATCH_MEMBERS -->",
     "",
-    "<!-- FORGEDOCK:BATCH_CONTRACT:v1 -->",
+    `<!-- FORGEDOCK:BATCH_CONTRACT:v${BATCH_CONTRACT_VERSION} -->`,
     contractJson,
-    "<!-- /FORGEDOCK:BATCH_CONTRACT:v1 -->",
+    `<!-- /FORGEDOCK:BATCH_CONTRACT:v${BATCH_CONTRACT_VERSION} -->`,
     "",
     "## Affected Surface",
     "",
@@ -206,10 +255,14 @@ export function renderBatchIssueBody(group: IssueBatchGroup): string {
 }
 
 export function parseBatchContract(body: string): BatchMemberContract[] {
-  const matches = [...body.matchAll(/<!-- FORGEDOCK:BATCH_CONTRACT:v1 -->([\s\S]*?)<!-- \/FORGEDOCK:BATCH_CONTRACT:v1 -->/g)];
-  if (matches.length !== 1) throw new Error("Batch body must contain exactly one FORGEDOCK:BATCH_CONTRACT:v1 block");
+  const matches = [1, 2].flatMap((version) => [...body.matchAll(new RegExp(
+    `<!-- FORGEDOCK:BATCH_CONTRACT:v${version} -->([\\s\\S]*?)<!-- \\/FORGEDOCK:BATCH_CONTRACT:v${version} -->`,
+    "g",
+  ))].map((match) => ({ version, match })));
+  if (matches.length !== 1) throw new Error("Batch body must contain exactly one supported FORGEDOCK:BATCH_CONTRACT block");
+  const { version, match } = matches[0]!;
   let parsed: unknown;
-  try { parsed = JSON.parse(matches[0]?.[1]?.trim() ?? ""); }
+  try { parsed = JSON.parse(match[1]?.trim() ?? ""); }
   catch (error) { throw new Error("Batch contract contains invalid JSON", { cause: error }); }
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { members?: unknown }).members)) {
     throw new Error("Batch contract must contain a members array");
@@ -229,9 +282,21 @@ export function parseBatchContract(body: string): BatchMemberContract[] {
         throw new Error(`Batch contract member #${issue} has invalid ${key}`);
       }
     }
+    for (const key of ["riskCapabilities", "sharedSymbols"] as const) {
+      if (member[key] !== undefined && (!Array.isArray(member[key]) || member[key].length === 0 || member[key].some((item) => typeof item !== "string" || !item.trim()))) {
+        throw new Error(`Batch contract member #${issue} has invalid ${key}`);
+      }
+    }
+    for (const key of ["causalFamily", "primaryDomain"] as const) {
+      if (member[key] !== undefined && (typeof member[key] !== "string" || !member[key].trim())) {
+        throw new Error(`Batch contract member #${issue} has invalid ${key}`);
+      }
+    }
     if (typeof member.title !== "string" || !member.title.trim()) throw new Error(`Batch contract member #${issue} has no title`);
     if (!["routine", "security", "auth", "billing"].includes(String(member.riskClass))) throw new Error(`Batch contract member #${issue} has invalid riskClass`);
-    const allowed = new Set(["issue", "repository", "title", "acceptanceCriteria", "affectedFiles", "claims", "riskClass", "sourceIssueUrl"]);
+    const allowed = new Set(version === 2
+      ? ["issue", "repository", "title", "acceptanceCriteria", "affectedFiles", "claims", "riskClass", "causalFamily", "riskCapabilities", "primaryDomain", "sharedSymbols", "sourceIssueUrl"]
+      : ["issue", "repository", "title", "acceptanceCriteria", "affectedFiles", "claims", "riskClass", "sourceIssueUrl"]);
     if (Object.keys(member).some((key) => !allowed.has(key))) throw new Error(`Batch contract member #${issue} contains unsupported fields`);
     seen.add(issue);
     members.push({
@@ -242,10 +307,17 @@ export function parseBatchContract(body: string): BatchMemberContract[] {
       affectedFiles: member.affectedFiles as string[],
       claims: member.claims as string[],
       riskClass: member.riskClass as BatchRiskClass,
+      ...(typeof member.causalFamily === "string" ? { causalFamily: member.causalFamily } : {}),
+      ...(Array.isArray(member.riskCapabilities) ? { riskCapabilities: member.riskCapabilities as string[] } : {}),
+      ...(typeof member.primaryDomain === "string" ? { primaryDomain: member.primaryDomain } : {}),
+      ...(Array.isArray(member.sharedSymbols) ? { sharedSymbols: member.sharedSymbols as string[] } : {}),
       ...(typeof member.sourceIssueUrl === "string" ? { sourceIssueUrl: member.sourceIssueUrl } : {}),
     });
   }
   if (members.length < 2) throw new Error("Batch contract must contain at least two unique members");
+  if (version === 2 && members.some((member) => isSensitiveRisk(member.riskClass)) && !isSensitiveBatchCompatible(members)) {
+    throw new Error("Sensitive batch contract lacks explicit compatible cause, risk/domain/symbol evidence, or bounded scope");
+  }
   if (body.includes("<!-- FORGE:BATCH_MEMBERS -->")) {
     const declared = parseBatchMemberIssues(body);
     const contracted = members.map((member) => member.issue).sort((left, right) => left - right);
@@ -305,6 +377,10 @@ function memberContract(member: BatchableWorkItem): BatchMemberContract {
     affectedFiles: [...member.affectedFiles].map((value) => escapeCode(value)).slice(0, 50),
     claims: [...member.claims].map((value) => escapeText(value, 300)).slice(0, 50),
     riskClass: member.riskClass ?? "routine",
+    ...(member.causalFamily?.trim() ? { causalFamily: escapeText(member.causalFamily, 300) } : {}),
+    ...(member.riskCapabilities?.length ? { riskCapabilities: unique(member.riskCapabilities.map((value) => escapeText(value, 300)).filter(Boolean)) } : {}),
+    ...(member.primaryDomain?.trim() ? { primaryDomain: escapeText(member.primaryDomain, 300) } : {}),
+    ...(member.sharedSymbols?.length ? { sharedSymbols: unique(member.sharedSymbols.map((value) => escapeText(value, 300)).filter(Boolean)) } : {}),
     ...(member.sourceIssueUrl ? { sourceIssueUrl: member.sourceIssueUrl.slice(0, 500) } : {}),
   };
 }
@@ -312,6 +388,169 @@ function memberContract(member: BatchableWorkItem): BatchMemberContract {
 function priorityFromLabels(labels: readonly string[]): string | undefined {
   return labels.find((label) => /^priority:P[0-3]$/.test(label))?.slice(-2)
     ?? labels.find((label) => /^P[0-3]$/.test(label));
+}
+
+type NormalizedSensitiveCandidate<T extends SensitiveBatchMemberEvidence> = {
+  candidate: T;
+  sensitiveRisk: boolean;
+  causalFamily?: string;
+  riskCapabilities: Set<string>;
+  primaryDomain?: string;
+  sharedSymbols: Set<string>;
+  productionPaths: Set<string>;
+  criteria: readonly string[];
+  evidenceKeys: string[];
+};
+
+/** Greedily pair sensitive candidates in input order without mutating the input. */
+export function pairSensitiveBatchCandidates<T extends SensitiveBatchMemberEvidence>(
+  candidates: readonly T[],
+  maximumPairs = Math.floor(candidates.length / MAX_SENSITIVE_MEMBERS),
+): T[][] {
+  if (!Number.isSafeInteger(maximumPairs) || maximumPairs < 0) {
+    throw new Error("maximumPairs must be a non-negative integer");
+  }
+  if (!maximumPairs || candidates.length < MAX_SENSITIVE_MEMBERS) return [];
+
+  const normalized = candidates.map(normalizeSensitiveCandidate);
+  const evidenceIndex = new Map<string, number[]>();
+  for (const [index, candidate] of normalized.entries()) {
+    for (const key of candidate.evidenceKeys) appendCandidateIndex(evidenceIndex, key, index);
+  }
+
+  const claimed = new Set<number>();
+  const pairs: T[][] = [];
+  for (let firstIndex = 0; firstIndex < normalized.length && pairs.length < maximumPairs; firstIndex++) {
+    if (claimed.has(firstIndex)) continue;
+    const first = normalized[firstIndex]!;
+    const partnerIndex = earliestCompatiblePartner(firstIndex, first, normalized, evidenceIndex, claimed);
+    if (partnerIndex === undefined) continue;
+    claimed.add(firstIndex);
+    claimed.add(partnerIndex);
+    pairs.push([first.candidate, normalized[partnerIndex]!.candidate]);
+  }
+  return pairs;
+}
+
+function normalizeSensitiveCandidate<T extends SensitiveBatchMemberEvidence>(
+  candidate: T,
+): NormalizedSensitiveCandidate<T> {
+  const causalFamily = normalizedEvidence(candidate.causalFamily);
+  const riskCapabilities = normalizedEvidenceSet(candidate.riskCapabilities);
+  const primaryDomain = normalizedEvidence(candidate.primaryDomain);
+  const sharedSymbols = normalizedEvidenceSet(candidate.sharedSymbols);
+  const evidenceKeys = causalFamily ? [
+    ...riskCapabilities].map((value) => sensitiveEvidenceKey(causalFamily, "capability", value)) : [];
+  if (causalFamily && primaryDomain) evidenceKeys.push(sensitiveEvidenceKey(causalFamily, "domain", primaryDomain));
+  if (causalFamily) {
+    evidenceKeys.push(...[...sharedSymbols].map((value) => sensitiveEvidenceKey(causalFamily, "symbol", value)));
+  }
+  return {
+    candidate,
+    sensitiveRisk: isSensitiveRisk(candidate.riskClass ?? "routine"),
+    ...(causalFamily ? { causalFamily } : {}),
+    riskCapabilities,
+    ...(primaryDomain ? { primaryDomain } : {}),
+    sharedSymbols,
+    productionPaths: new Set(candidate.affectedFiles
+      .map(normalizeAffectedPath)
+      .filter((path): path is string => path !== undefined && isProductionPath(path))),
+    criteria: candidate.acceptanceCriteria ?? (candidate.summary ? [candidate.summary] : []),
+    evidenceKeys: [...new Set(evidenceKeys)],
+  };
+}
+
+function earliestCompatiblePartner<T extends SensitiveBatchMemberEvidence>(
+  firstIndex: number,
+  first: NormalizedSensitiveCandidate<T>,
+  candidates: readonly NormalizedSensitiveCandidate<T>[],
+  evidenceIndex: ReadonlyMap<string, readonly number[]>,
+  claimed: ReadonlySet<number>,
+): number | undefined {
+  if (!first.sensitiveRisk || !first.causalFamily || !validSensitiveCandidateBounds(first)) return undefined;
+  const cursors = first.evidenceKeys.map((key) => ({ values: evidenceIndex.get(key) ?? [], offset: 0 }));
+  while (true) {
+    let partnerIndex: number | undefined;
+    for (const cursor of cursors) {
+      while (cursor.offset < cursor.values.length) {
+        const value = cursor.values[cursor.offset]!;
+        if (value > firstIndex && !claimed.has(value)) break;
+        cursor.offset++;
+      }
+      const value = cursor.values[cursor.offset];
+      if (value !== undefined && (partnerIndex === undefined || value < partnerIndex)) partnerIndex = value;
+    }
+    if (partnerIndex === undefined) return undefined;
+    for (const cursor of cursors) {
+      if (cursor.values[cursor.offset] === partnerIndex) cursor.offset++;
+    }
+    const partner = candidates[partnerIndex]!;
+    if (normalizedSensitivePairPotential(first, partner)
+      && isSensitiveBatchCompatible([first.candidate, partner.candidate])) return partnerIndex;
+  }
+}
+
+function normalizedSensitivePairPotential<T extends SensitiveBatchMemberEvidence>(
+  left: NormalizedSensitiveCandidate<T>,
+  right: NormalizedSensitiveCandidate<T>,
+): boolean {
+  if (!right.sensitiveRisk || left.causalFamily !== right.causalFamily || !validSensitiveCandidateBounds(right)) return false;
+  const productionPaths = new Set([...left.productionPaths, ...right.productionPaths]);
+  const criteriaCount = left.criteria.length + right.criteria.length;
+  return productionPaths.size <= MAX_SENSITIVE_PRODUCTION_PATHS
+    && criteriaCount > 0
+    && criteriaCount <= MAX_SENSITIVE_ATOMIC_CRITERIA;
+}
+
+function validSensitiveCandidateBounds(candidate: NormalizedSensitiveCandidate<SensitiveBatchMemberEvidence>): boolean {
+  return candidate.productionPaths.size <= MAX_SENSITIVE_PRODUCTION_PATHS
+    && candidate.criteria.length <= MAX_SENSITIVE_ATOMIC_CRITERIA
+    && candidate.criteria.every((criterion) => criterion.trim().length > 0);
+}
+
+function normalizedEvidenceSet(values: readonly string[] | undefined): Set<string> {
+  return new Set((values ?? []).map(normalizedEvidence).filter((value): value is string => value !== undefined));
+}
+
+function sensitiveEvidenceKey(causalFamily: string, kind: string, value: string): string {
+  return JSON.stringify([causalFamily, kind, value]);
+}
+
+function appendCandidateIndex(index: Map<string, number[]>, key: string, candidate: number): void {
+  const values = index.get(key);
+  if (values) values.push(candidate);
+  else index.set(key, [candidate]);
+}
+
+function hasCommonEvidence(values: readonly (readonly string[] | undefined)[]): boolean {
+  if (!values.length || values.some((value) => !value?.length)) return false;
+  const first = new Set(values[0]!.map(normalizedEvidence).filter((value): value is string => value !== undefined));
+  return [...first].some((candidate) => values.slice(1).every((value) =>
+    value!.some((entry) => normalizedEvidence(entry) === candidate)));
+}
+
+function normalizedEvidence(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLocaleLowerCase();
+  return normalized || undefined;
+}
+
+function isSensitiveRisk(risk: BatchRiskClass): boolean {
+  return risk === "security" || risk === "auth";
+}
+
+function isProductionPath(path: string): boolean {
+  const normalized = path.toLocaleLowerCase();
+  return !/(?:^|\/)(?:__tests__|tests?|specs?|fixtures?|mocks?|docs?)(?:\/|$)/.test(normalized)
+    && !/\.(?:test|spec)\.[^/]+$/.test(normalized)
+    && !/(?:^|\/)(?:test|spec)_[^/]+$/.test(normalized)
+    && !/\.mdx?$/.test(normalized);
+}
+
+export function chunkBatchCandidates<T>(values: readonly T[], size: number): T[][] {
+  if (!Number.isSafeInteger(size) || size < 1) throw new Error("chunk size must be a positive integer");
+  const chunks: T[][] = [];
+  for (let offset = 0; offset < values.length; offset += size) chunks.push(values.slice(offset, offset + size));
+  return chunks;
 }
 
 function leafDirectory(file: string | undefined): string | undefined {

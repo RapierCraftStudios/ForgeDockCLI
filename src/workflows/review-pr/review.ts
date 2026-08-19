@@ -3,7 +3,7 @@
 import { Type, type Static } from "typebox";
 import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
-import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { AgentExecutionInterruptedError, AgentRunError } from "../../runtime/agent-runtime.js";
@@ -11,7 +11,8 @@ import { scopeManifestFor, type AgentEvent, type AgentEventSink, type AgentRunRe
 import { SemanticIdleWatchdog } from "../../runtime/semantic-idle.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, reviewerToolCallBudget, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, findingMaterializationReason, shouldMaterializeFinding, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -30,6 +31,12 @@ const ReviewerFindingSchema = Type.Object({
 export const ReviewerSubmissionSchema = Type.Object({
   summary: Type.String({ minLength: 1 }),
   findings: Type.Array(ReviewerFindingSchema),
+  /** Closure reviewers explicitly audit every open durable root; omission is not closure. */
+  rootAssessments: Type.Optional(Type.Array(Type.Object({
+    rootId: Type.String({ minLength: 1 }),
+    status: Type.Union([Type.Literal("open"), Type.Literal("fixed"), Type.Literal("rejected")]),
+    evidence: Type.String({ minLength: 1 }),
+  }))),
 });
 export type ReviewerSubmission = Static<typeof ReviewerSubmissionSchema>;
 
@@ -56,6 +63,11 @@ export interface DeploymentReviewEvidence {
 const MAX_REVIEWER_ATTEMPT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_REVIEWER_ATTEMPT_DRAIN_MS = 15_000;
 const MIN_REVIEWER_ATTEMPT_DRAIN_MS = 100;
+const REVIEWER_ROLES = new Set<string>(ROLE_ORDER);
+
+function isReviewerRole(role: string): role is ReviewerRole {
+  return REVIEWER_ROLES.has(role);
+}
 
 const FINDING_ISSUE_POLICIES = new Set<FindingIssuePolicy>([
   "all", "approved-only", "none", "impact-gated", "shadow-impact-gated",
@@ -292,6 +304,8 @@ export async function reviewPullRequest(
     deliveryRunId?: string;
     /** Exact-head authority check that must pass before any verdict-side projection or durable verdict write. */
     beforeVerdictPublication?: () => Promise<void>;
+    /** Explicit work-on budget reassessment may re-evaluate the same immutable head without claiming code closure. */
+    allowSameHeadReassessment?: boolean;
     signal?: AbortSignal;
   },
   dependencies: {
@@ -367,29 +381,77 @@ export async function reviewPullRequest(
       buildResultBranch: input.buildResult?.payload.branch ?? input.deployment?.headBranch ?? frozen.headBranch,
       targetBranch: buildTargetBranch,
       ...(input.buildResult?.payload.baseSha !== undefined ? { baseSha: input.buildResult.payload.baseSha } : {}),
+      reviewedHeadSha: frozen.headSha,
+      phase: input.priorVerdict ? "closure" : "initial",
+      ...(input.priorVerdict?.payload.reviewPlan?.planId ? { parentPlanId: input.priorVerdict.payload.reviewPlan.planId } : {}),
+      ...(input.priorVerdict ? { parentVerdictId: input.priorVerdict.id } : {}),
     };
-    const priorRevisionPaths = await assertPriorVerdictAuthority(input.priorVerdict, {
+    const priorRevisionDelta = await assertPriorVerdictAuthority(input.priorVerdict, {
       run: input.run,
       pullRequest: frozen,
       packet: input.packet,
       deliveryRunId: expectedDeliveryRunId,
+      allowSameHeadReassessment: input.allowSameHeadReassessment === true,
       host: dependencies.host,
     });
     const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
-    const priorReviewPlan = input.priorVerdict?.payload.reviewPlan;
-    const reviewPlan = isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
-      run: input.run, pullRequest: frozen, packet: input.packet, context: planContext,
-    })
-      ? freezeReviewPlan(priorReviewPlan)
-      : planReviewPanel({
-        changedPaths,
-        diff,
-        packet: input.packet,
-        context: planContext,
-        repositoryPolicy: loadForgeGuidance(input.workspace),
-        ...(input.maxReviewSpecialists !== undefined ? { maxSpecialists: input.maxReviewSpecialists } : {}),
-      });
+    const reviewSubject = { repo: run.subject.repo, ...(run.subject.issue ? { issue: run.subject.issue } : {}), pr: frozen.number };
+    const priorRootLedger = input.priorVerdict
+      ? await loadPriorRootLedger({
+        artifacts: dependencies.artifacts,
+        run,
+        pullRequest: frozen,
+        priorVerdict: input.priorVerdict,
+      })
+      : undefined;
+    if (!input.allowSameHeadReassessment
+      && input.priorVerdict?.payload.disposition === "request_changes"
+      && input.priorVerdict.payload.findings.some((finding) => finding.mustFix ?? finding.blocking)
+      && !priorRootLedger) {
+      throw new Error("Cannot close prior must-fix findings without the exact linked finding-root ledger authority");
+    }
+    const openPriorRoots = priorRootLedger?.payload.roots.filter((root) => ["open", "fix-attempted", "regressed"].includes(root.state)) ?? [];
+    const closurePaths = priorRootLedger ? [...new Set([...priorRevisionDelta.paths, ...openPriorRoots.map((root) => root.component)])].sort() : [...changedPaths];
+    const executionPlanContext: Omit<ReviewPlanContext, "packetId" | "packetDigest"> = {
+      ...planContext,
+      deltaPaths: priorRootLedger ? [...priorRevisionDelta.paths].sort() : [...changedPaths].sort(),
+      openRootIds: openPriorRoots.map(({ rootId }) => rootId).sort(),
+    };
+    const ownerPathsByRole = new Map<ReviewerRole, Set<string>>();
+    for (const root of openPriorRoots) {
+      for (const role of root.ownerRoles.filter(isReviewerRole)) {
+        const paths = ownerPathsByRole.get(role) ?? new Set<string>();
+        paths.add(root.component);
+        ownerPathsByRole.set(role, paths);
+      }
+    }
+    const ownerScopes = ROLE_ORDER.flatMap((role) => {
+      const paths = ownerPathsByRole.get(role);
+      return paths ? [{ role, scope: [...paths].sort() }] : [];
+    });
+    const closureDiff = priorRootLedger
+      ? closurePaths.map((path) => `diff --git a/${path} b/${path}\n+++ b/${path}`).join("\n")
+      : diff;
+    const reviewPlan = planReviewPanel({
+      changedPaths: closurePaths,
+      diff: closureDiff,
+      packet: input.packet,
+      context: executionPlanContext,
+      generation: input.priorVerdict?.payload.reviewPlan?.generation
+        ? input.priorVerdict.payload.reviewPlan.generation + 1
+        : 1,
+      requiredOwners: ownerScopes,
+      ...(input.priorVerdict?.payload.reviewPlan?.budget ? { budgetPolicy: input.priorVerdict.payload.reviewPlan.budget } : {}),
+      repositoryPolicy: loadForgeGuidance(input.workspace),
+      maxSpecialists: Math.max(input.maxReviewSpecialists ?? 3, new Set(ownerScopes.filter(({ role }) => role !== "correctness").map(({ role }) => role)).size),
+    });
     assertReviewPlan(reviewPlan);
+    const reviewerAuthority = prepareReviewerAuthorityBrief(
+      input,
+      expectedHeadSha,
+      buildTargetBranch,
+      openPriorRoots,
+    );
     const reviewCycle = input.reviewCycle ?? { current: 1, total: 1 };
     const reviewerRoles = [...new Set(reviewPlan.executionGroups.map((selection) => selection.role))];
     const reviewDescription = (role: string): string => [
@@ -408,7 +470,8 @@ export async function reviewPullRequest(
       }
       remainingModelCalls--;
     };
-    const remediationDeltaPaths = input.priorVerdict?.payload.disposition === "request_changes" ? priorRevisionPaths : [];
+    const remediationDeltaPaths = input.priorVerdict?.payload.disposition === "request_changes" ? priorRevisionDelta.paths : [];
+    const remediationDeltaHunks = input.priorVerdict?.payload.disposition === "request_changes" ? priorRevisionDelta.hunks : [];
     const changedRemediationAuthorityReferences = input.buildResult
       ? changedDeliveryAuthorityFacts(input.priorVerdict, frozen, input.buildResult, buildTargetBranch)
       : [];
@@ -417,7 +480,8 @@ export async function reviewPullRequest(
       const roleDiff = scopedReviewDiff(reviewPlan, selection, diff, input.deployment
         ? { maxInitialDiffChars: DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS }
         : undefined);
-      const authorityBrief = reviewerAuthorityBrief(input, selection, expectedHeadSha, buildTargetBranch);
+      const roleRoots = reviewerAuthority.rootsByRole.get(role) ?? [];
+      const authorityBrief = reviewerAuthorityBrief(reviewerAuthority, selection, roleRoots);
       const explorationBudget = reviewerToolCallBudget(selection, reviewPlan);
       let priorFailure: string | undefined;
       let resumeSessionRef: string | undefined;
@@ -493,8 +557,11 @@ export async function reviewPullRequest(
               "Classify scopeDisposition=in_scope only when the minimal fix is wholly required by the frozen Build Packet and does not add a new guarantee, entity, protocol, or behavior excluded from it; otherwise use follow_up or rejected.",
               "For every in_scope finding, copy at least one Build Packet acceptance criterion verbatim into matchedAcceptanceCriteria. A broad consistency criterion does not authorize transitive redesign beyond the packet's explicit scope and exclusions.",
               input.priorVerdict
-                ? `This is a post-remediation review. A finding may remain in scope only when matchedPriorFindingIds names an accepted blocking finding from the prior verdict, or introducedByRemediation is true and anchored to the controller-observed prior-SHA delta (${remediationDeltaPaths.join(", ") || "exact delta unavailable"}) or an explicit changed authority fact (${changedRemediationAuthorityReferences.join("; ") || "none"}). Cumulative BuildResult paths and generic current route facts are not proof. Newly discovered pre-existing concerns are follow_up.`
+                ? `This is a post-remediation review. A finding may remain in scope only when matchedPriorFindingIds names an accepted open root/finding, or introducedByRemediation is true with introductionEvidence proving a changed causal symbol/hunk and distinct prior/current reproducers. Exact controller-observed hunks: ${remediationDeltaHunks.join(", ") || "none"}. Exact delta paths (${remediationDeltaPaths.join(", ") || "none"}) are inventory only and never prove introduction by themselves. Changed authority facts: ${changedRemediationAuthorityReferences.join("; ") || "none"}. Newly discovered pre-existing concerns must be follow_up.`
                 : "This is the initial review. matchedPriorFindingIds must be empty and introducedByRemediation must be false.",
+              roleRoots.length
+                ? `Audit every open durable root assigned to this execution group and emit a rootAssessments entry for each applicable root ID (${roleRoots.map(({ rootId }) => rootId).join(", ")}). fixed/rejected requires concrete current-head evidence; omission leaves the root open.`
+                : "No prior durable roots require closure assessment in this initial review.",
               "Do not duplicate a concern already covered by another title in your own report; report distinct root causes only.",
               "Review only this execution group's paths. Every other changed path is assigned to another frozen group; follow outside the shard only for a concrete dependency needed to prove a finding in this shard.",
               "The initial diff and exact execution-group path list are already your inventory. Do not list the checkout root, enumerate broad directories, or search the repository to rediscover them.",
@@ -684,11 +751,12 @@ export async function reviewPullRequest(
     });
     const prefiltered = applyFindingScopePolicy(consolidated, input.packet, input.priorVerdict, {
       remediationDeltaPaths,
+      remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
     const adjudicationCandidates = prefiltered.filter((finding) => finding.confidence !== "low"
       && finding.scopeDisposition === "in_scope"
-      && finding.blocking);
+      && (finding.mustFix ?? finding.blocking));
     const adjudication = adjudicationCandidates.length
       ? await adjudicateFindingScope({
         run, headSha: frozen.headSha, intent: input.intent, investigation: input.investigation,
@@ -710,14 +778,50 @@ export async function reviewPullRequest(
       })
       : undefined;
     const adjudicated = adjudication ? applyScopeAdjudication(prefiltered, adjudication.output.decisions) : prefiltered;
-    const findings = applyFindingScopePolicy(adjudicated, input.packet, input.priorVerdict, {
+    const scopedFindings = applyFindingScopePolicy(adjudicated, input.packet, input.priorVerdict, {
       remediationDeltaPaths,
+      remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
-    const disposition = findings.some((finding) => finding.blocking) ? "request_changes" as const : "approve" as const;
+    const rootAssessments = collectRootAssessments(reviewerResults, openPriorRoots);
+    const roots = reconcileFindingRootLedger({
+      ...(priorRootLedger ? { previous: priorRootLedger } : {}),
+      packet: input.packet,
+      findings: scopedFindings,
+      assessments: rootAssessments,
+      headSha: frozen.headSha,
+    });
+    const openFindings = openLedgerFindings(roots);
+    const activeRootIds = new Set(openFindings.flatMap((finding) => finding.rootId ? [finding.rootId] : []));
+    const activeFindingIds = new Set(roots.filter((root) => activeRootIds.has(root.rootId)).flatMap((root) => root.findingIds));
+    const findings = [
+      ...openFindings,
+      ...scopedFindings.filter((finding) => !activeFindingIds.has(finding.id)
+        && !(finding.rootId && activeRootIds.has(finding.rootId))
+        && !(finding.mustFix && finding.scopeDisposition === "in_scope")),
+    ];
+    const rootLedger = createArtifact({
+      kind: "FindingRootLedger",
+      runId: run.runId,
+      subject: reviewSubject,
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        checkpoint: "finding-root-ledger",
+        pullRequest: frozen.number,
+        headSha: frozen.headSha,
+        epoch: (priorRootLedger?.payload.epoch ?? 0) + 1,
+        roots,
+        ...(priorRootLedger ? { supersedes: priorRootLedger.id } : {}),
+      },
+    });
+    const disposition = openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
+    // First gate prevents a known-stale approval from projecting/closing finding
+    // issues; the same authority is refreshed again immediately before append.
     await input.beforeVerdictPublication?.();
+    await dependencies.artifacts.append(rootLedger);
+    run = attachArtifact(run, "FindingRootLedger", rootLedger.id);
     const findingIssuePolicy = resolveFindingIssuePolicy(input.findingIssuePolicy);
     const projectionEnabled = findingIssuePolicy === "all"
       || findingIssuePolicy === "impact-gated"
@@ -749,12 +853,24 @@ export async function reviewPullRequest(
     const subject = { repo: run.subject.repo, ...(run.subject.issue ? { issue: run.subject.issue } : {}), pr: frozen.number };
     let projectionEntries: ReviewFindingProjectionPayload["projections"] = [];
     let projectionPlan: DurableArtifact<"ReviewFindingProjection"> | undefined;
+    let publicationFence: ReviewFindingPublicationFence | undefined;
+    if (projectionEnabled) {
+      if (!dependencies.host.beginReviewFindingPublication || !dependencies.host.assertReviewFindingPublication) {
+        throw new Error("Review-finding projection requires durable monotonic host publication fencing");
+      }
+      publicationFence = await dependencies.host.beginReviewFindingPublication({
+        repo: frozen.repo,
+        pullRequest: frozen,
+        runId: run.runId,
+      });
+    }
     const projectionPayloadBase = {
       checkpoint: "review-finding-publication" as const,
       pullRequest: frozen.number,
       headSha: frozen.headSha,
       headBranch: frozen.headBranch,
       baseBranch: frozen.baseBranch,
+      ...(publicationFence ? { publicationFence } : {}),
       disposition,
       reviewerRoles: roles,
       findings,
@@ -783,20 +899,29 @@ export async function reviewPullRequest(
           status: "planned",
           projections: activeProjectionFindings.map((finding) => ({ findingId: finding.id, status: "pending" as const })),
         },
-      }, { id: reviewFindingProjectionPlanId(run.runId, frozen.headSha) });
+      }, { id: reviewFindingProjectionPlanId(run.runId, frozen.headSha, publicationFence!.generation) });
       await dependencies.artifacts.append(projectionPlan);
     }
     // The reviewer wave is fully settled above. Only this deterministic
     // post-wave path may project findings: scope filtering and consolidation
     // are complete before any GitHub issue lookup or creation occurs.
     if (projectionEnabled) {
-      projectionEntries = await materializeReviewFindings({ run, pullRequest: frozen, findings: activeProjectionFindings, policy: projectionMode }, dependencies.host);
+      if (!publicationFence) throw new Error("Review-finding publication fence was not allocated");
+      projectionEntries = await materializeReviewFindings({
+        run,
+        pullRequest: frozen,
+        findings: activeProjectionFindings,
+        policy: projectionMode,
+        publicationFence,
+      }, dependencies.host);
     }
     if (projectionEnabled && dependencies.host.reconcileReviewFindings) {
+      if (!publicationFence) throw new Error("Review-finding reconciliation has no current publication fence");
       await dependencies.host.reconcileReviewFindings({
         repo: frozen.repo,
         pullRequest: frozen,
         runId: run.runId,
+        publicationFence,
         activeFindings: activeProjectionFindings,
       });
     }
@@ -816,8 +941,10 @@ export async function reviewPullRequest(
       run = attachArtifact(run, "ReviewFindingProjection", projectionPlan.id);
       run = attachArtifact(run, "ReviewFindingProjection", projectionReceipt.id);
     }
+    await input.beforeVerdictPublication?.();
     const publicationSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, publicationSnapshot, "immediately before verdict publication");
+    if (publicationFence) await dependencies.host.assertReviewFindingPublication!(publicationFence);
     const verdict = createArtifact({
       kind: "ReviewVerdict",
       runId: run.runId,
@@ -861,6 +988,47 @@ export async function reviewPullRequest(
   }
 }
 
+async function loadPriorRootLedger(input: {
+  artifacts: ArtifactRepository;
+  run: RunState;
+  pullRequest: PullRequestSnapshot;
+  priorVerdict: DurableArtifact<"ReviewVerdict">;
+}): Promise<DurableArtifact<"FindingRootLedger"> | undefined> {
+  const repo = input.pullRequest.repo.trim().toLowerCase();
+  const ledgers = (await input.artifacts.list({
+    repo: input.pullRequest.repo,
+    ...(input.run.subject.issue !== undefined ? { issue: input.run.subject.issue } : {}),
+    pr: input.pullRequest.number,
+  }, "FindingRootLedger"))
+    .filter((artifact): artifact is DurableArtifact<"FindingRootLedger"> => artifact.kind === "FindingRootLedger")
+    .filter((artifact) => artifact.producer.role === "controller"
+      && artifact.runId === input.run.runId
+      && artifact.subject.repo.trim().toLowerCase() === repo
+      && artifact.subject.pr === input.pullRequest.number
+      && artifact.subject.issue === input.run.subject.issue
+      && artifact.payload.checkpoint === "finding-root-ledger"
+      && artifact.payload.pullRequest === input.pullRequest.number)
+    .sort((left, right) => left.payload.epoch - right.payload.epoch || left.createdAt.localeCompare(right.createdAt));
+  const byId = new Map(ledgers.map((ledger) => [ledger.id, ledger]));
+  for (const ledger of ledgers) {
+    if (ledger.payload.epoch < 1) throw new Error(`Finding root ledger ${ledger.id} has an invalid epoch`);
+    if (ledger.payload.epoch === 1) {
+      if (ledger.payload.supersedes !== undefined) throw new Error(`Finding root ledger ${ledger.id} has invalid initial lineage`);
+      continue;
+    }
+    const parent = ledger.payload.supersedes ? byId.get(ledger.payload.supersedes) : undefined;
+    if (!parent || parent.payload.epoch + 1 !== ledger.payload.epoch) {
+      throw new Error(`Finding root ledger ${ledger.id} has broken supersedes lineage`);
+    }
+  }
+  const matching = ledgers.filter((ledger) => ledger.payload.headSha === input.priorVerdict.payload.headSha);
+  if (matching.length === 0) return undefined;
+  const highestEpoch = Math.max(...matching.map((ledger) => ledger.payload.epoch));
+  const current = matching.filter((ledger) => ledger.payload.epoch === highestEpoch);
+  if (current.length !== 1) throw new Error("Prior finding root ledger authority is ambiguous at the reviewed head");
+  return current[0];
+}
+
 async function assertPriorVerdictAuthority(
   verdict: DurableArtifact<"ReviewVerdict"> | undefined,
   expected: {
@@ -868,12 +1036,13 @@ async function assertPriorVerdictAuthority(
     pullRequest: PullRequestSnapshot;
     packet: DurableArtifact<"BuildPacket">;
     deliveryRunId: string;
+    allowSameHeadReassessment: boolean;
     host: ForgeHost;
   },
-): Promise<readonly string[]> {
-  if (!verdict) return [];
+): Promise<{ paths: readonly string[]; hunks: readonly string[] }> {
+  if (!verdict) return { paths: [], hunks: [] };
   const plan = verdict.payload.reviewPlan as ReviewPlan | undefined;
-  const planSchemaVersion = (plan as { schemaVersion?: 2 | 3 } | undefined)?.schemaVersion;
+  const planSchemaVersion = (plan as { schemaVersion?: 2 | 3 | 4 } | undefined)?.schemaVersion;
   const context = plan?.context;
   const canonicalPlanIdentity = (() => {
     try {
@@ -892,7 +1061,7 @@ async function assertPriorVerdictAuthority(
     && verdict.payload.headBranch === expected.pullRequest.headBranch
     && verdict.payload.baseBranch === expected.pullRequest.baseBranch
     && plan !== undefined
-    && (planSchemaVersion === 2 || planSchemaVersion === 3)
+    && planSchemaVersion === 4
     && plan.frozen === true
     && Number.isSafeInteger(plan.generation)
     && plan.generation >= 1
@@ -906,53 +1075,38 @@ async function assertPriorVerdictAuthority(
     && context?.packetDigest === canonicalReviewDigest(expected.packet.payload)
     && context?.deliveryRunId === expected.deliveryRunId
     && context?.buildResultBranch === verdict.payload.headBranch
-    && context?.targetBranch === verdict.payload.baseBranch;
+    && context?.targetBranch === verdict.payload.baseBranch
+    && context?.reviewedHeadSha === verdict.payload.headSha
+    && (context?.phase === "initial" || context?.phase === "closure")
+    && Array.isArray(context?.deltaPaths)
+    && Array.isArray(context?.openRootIds);
   if (!valid) {
     throw new Error("Cannot use prior Review Verdict: run, delivery, subject, revision route, or Build Packet plan authority is foreign or incomplete");
   }
-  if (verdict.payload.headSha === expected.pullRequest.headSha) return [];
-  if (!expected.host.getChangedPathsBetween) {
-    throw new Error("Cannot use prior Review Verdict: the prior reviewed head cannot be proven in the current pull-request lineage");
+  if (verdict.payload.headSha === expected.pullRequest.headSha) {
+    if (expected.allowSameHeadReassessment || verdict.payload.disposition !== "request_changes") return { paths: [], hunks: [] };
+    throw new Error("Cannot use prior Review Verdict: closure requires a newly pushed pull-request revision");
+  }
+  if (!expected.host.getChangedPathsBetween || !expected.host.getChangedHunksBetween) {
+    throw new Error("Cannot use prior Review Verdict: exact changed-path and hunk authority is unavailable");
   }
   try {
-    return await expected.host.getChangedPathsBetween(
+    const paths = await expected.host.getChangedPathsBetween(
       expected.pullRequest.repo,
       verdict.payload.headSha,
       expected.pullRequest.headSha,
     );
+    const hunks = await expected.host.getChangedHunksBetween(
+      expected.pullRequest.repo,
+      verdict.payload.headSha,
+      expected.pullRequest.headSha,
+    );
+    if (paths.length === 0 || hunks.length === 0) {
+      throw new Error("comparison omitted exact changed paths or hunks");
+    }
+    return { paths, hunks };
   } catch {
     throw new Error("Cannot use prior Review Verdict: the prior reviewed head is not comparable to the current pull-request revision");
-  }
-}
-
-function isReusableFrozenReviewPlan(
-  verdict: DurableArtifact<"ReviewVerdict"> | undefined,
-  value: unknown,
-  expected: {
-    run: RunState;
-    pullRequest: PullRequestSnapshot;
-    packet: DurableArtifact<"BuildPacket">;
-    context: Omit<ReviewPlanContext, "packetId" | "packetDigest">;
-  },
-): value is ReviewPlan {
-  if (!verdict || !value || typeof value !== "object") return false;
-  try {
-    const plan = value as ReviewPlan;
-    assertReviewPlan(plan);
-    const expectedContext: ReviewPlanContext = {
-      ...expected.context,
-      packetId: expected.packet.id,
-      packetDigest: canonicalReviewDigest(expected.packet.payload),
-    };
-    return verdict.runId === expected.run.runId
-      && verdict.subject.repo === expected.run.subject.repo
-      && verdict.subject.issue === expected.run.subject.issue
-      && verdict.subject.pr === expected.pullRequest.number
-      && verdict.payload.headBranch === expected.pullRequest.headBranch
-      && verdict.payload.baseBranch === expected.pullRequest.baseBranch
-      && canonicalReviewDigest(plan.context) === canonicalReviewDigest(expectedContext);
-  } catch {
-    return false;
   }
 }
 
@@ -1183,6 +1337,34 @@ function assertCompleteScopeAdjudication(
   if (missing.length) throw new Error(`Scope adjudication omitted findings: ${missing.join(", ")}`);
 }
 
+function collectRootAssessments(
+  results: readonly { role: ReviewerRole; output: ReviewerSubmission }[],
+  roots: readonly FindingRoot[],
+): RootAssessment[] {
+  const rootById = new Map(roots.map((root) => [root.rootId, root]));
+  const grouped = new Map<string, Array<{ role: ReviewerRole; assessment: RootAssessment }>>();
+  for (const result of results) {
+    for (const assessment of result.output.rootAssessments ?? []) {
+      const root = rootById.get(assessment.rootId);
+      if (!root || (result.role !== "correctness" && !root.ownerRoles.includes(result.role))) continue;
+      const values = grouped.get(assessment.rootId) ?? [];
+      values.push({ role: result.role, assessment });
+      grouped.set(assessment.rootId, values);
+    }
+  }
+  return [...grouped].flatMap(([rootId, entries]) => {
+    const root = rootById.get(rootId)!;
+    const requiredRoles = new Set<ReviewerRole>(["correctness", ...root.ownerRoles.filter(isReviewerRole)]);
+    const observedRoles = new Set(entries.map(({ role }) => role));
+    if ([...requiredRoles].some((role) => !observedRoles.has(role))) return [];
+    const assessments = entries.map(({ assessment }) => assessment);
+    const status = assessments.some(({ status }) => status === "open") ? "open" as const
+      : assessments.every(({ status }) => status === "rejected") ? "rejected" as const
+        : "fixed" as const;
+    return [{ rootId, status, evidence: assessments.map(({ evidence }) => evidence).join(" | ") }];
+  });
+}
+
 function applyScopeAdjudication(
   findings: readonly ConsolidatedFinding[],
   decisions: readonly ScopeAdjudication["decisions"][number][],
@@ -1194,6 +1376,7 @@ function applyScopeAdjudication(
     return {
       ...finding,
       blocking: false,
+      mustFix: false,
       scopeDisposition: decision.disposition === "reject" ? "rejected" as const : "follow_up" as const,
       scopeRationale: `${finding.scopeRationale} Independent scope adjudication: ${decision.rationale}`,
     };
@@ -1212,28 +1395,72 @@ export function isReviewerExplorationLimitFailure(message: string): boolean {
   return /tool_budget_exhausted|tool budget (?:hard limit|exhausted)/i.test(message);
 }
 
-function reviewerAuthorityBrief(
-  input: {
-    intent: DurableArtifact<"Intent">;
-    investigation: DurableArtifact<"Investigation">;
-    packet: DurableArtifact<"BuildPacket">;
-    buildResult?: DurableArtifact<"BuildResult">;
-    deployment?: DeploymentReviewEvidence;
-    priorVerdict?: DurableArtifact<"ReviewVerdict">;
-  },
-  selection: ReviewPlan["executionGroups"][number],
+interface ReviewerAuthoritySource {
+  intent: DurableArtifact<"Intent">;
+  investigation: DurableArtifact<"Investigation">;
+  packet: DurableArtifact<"BuildPacket">;
+  buildResult?: DurableArtifact<"BuildResult">;
+  deployment?: DeploymentReviewEvidence;
+  priorVerdict?: DurableArtifact<"ReviewVerdict">;
+}
+
+function prepareReviewerAuthorityBrief(
+  input: ReviewerAuthoritySource,
   headSha: string,
   targetBranch: string,
+  openRoots: readonly FindingRoot[],
+) {
+  const rootsByRole = new Map<ReviewerRole, readonly FindingRoot[]>(ROLE_ORDER.map((role) => [
+    role,
+    openRoots.filter((root) => role === "correctness" || root.ownerRoles.includes(role)),
+  ]));
+  const acceptanceEvidence = input.buildResult
+    ? [...new Map(input.buildResult.payload.acceptanceEvidence.map((evidence) => [
+      `${evidence.criterionId ?? evidence.criterion}\n${JSON.stringify(evidence.anchors ?? {})}`,
+      evidence,
+    ])).values()].slice(0, 100)
+    : [];
+  return {
+    input,
+    headSha,
+    targetBranch,
+    rootsByRole,
+    acceptanceEvidence,
+    packetDigest: canonicalReviewDigest(input.packet.payload),
+  };
+}
+
+type PreparedReviewerAuthority = ReturnType<typeof prepareReviewerAuthorityBrief>;
+
+function reviewerAuthorityBrief(
+  prepared: PreparedReviewerAuthority,
+  selection: ReviewPlan["executionGroups"][number],
+  openRoots: readonly FindingRoot[],
 ): string {
+  const { input, headSha, targetBranch } = prepared;
   const boundedList = (values: readonly string[] | undefined, maximum = 100): string[] =>
     (values ?? []).slice(0, maximum).map((value) => safeText(value, 2_000));
   const packet = input.packet.payload;
+  const compactRoots = openRoots.map((root) => ({
+    rootId: root.rootId,
+    state: root.state,
+    criterionIds: root.criterionIds,
+    component: root.component,
+    symbols: root.symbols,
+    invariantFamily: root.invariantFamily,
+    failureFamily: root.failureFamily,
+    triggerFamily: root.triggerFamily,
+    ownerRoles: root.ownerRoles,
+  }));
+  const acceptanceEvidence = prepared.acceptanceEvidence;
   const brief = {
+    // Root authority is deliberately first so truncation can never erase it.
+    findingRootLedger: compactRoots,
     authority: {
       reviewedHeadSha: headSha,
       targetBranch,
       packetId: input.packet.id,
-      packetDigest: canonicalReviewDigest(packet),
+      packetDigest: prepared.packetDigest,
       executionGroupId: selection.id,
       executionGroupRole: selection.role,
       executionGroupCapabilities: selection.capabilities,
@@ -1275,7 +1502,7 @@ function reviewerAuthorityBrief(
     buildEvidence: input.buildResult ? {
       id: input.buildResult.id,
       summary: safeText(input.buildResult.payload.summary, 4_000),
-      acceptanceEvidence: input.buildResult.payload.acceptanceEvidence.slice(0, 100),
+      acceptanceEvidence,
       checks: input.buildResult.payload.checks,
       residualRisks: boundedList(input.buildResult.payload.residualRisks),
     } : {
@@ -1533,9 +1760,16 @@ export async function materializeReviewFindings(
     findings: ReadonlyArray<DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]>;
     fallbackReviewerRoles?: readonly string[];
     policy?: FindingProjectionMode;
+    publicationFence?: ReviewFindingPublicationFence;
   },
   host: ForgeHost,
 ): Promise<ReviewFindingProjectionPayload["projections"]> {
+  const publicationFence = input.publicationFence ?? await host.beginReviewFindingPublication?.({
+    repo: input.pullRequest.repo,
+    pullRequest: input.pullRequest,
+    runId: input.run.runId,
+  });
+  if (!publicationFence) throw new Error("Review-finding materialization requires a durable publication fence");
   const projections: ReviewFindingProjectionPayload["projections"] = [];
   for (const finding of terminalReviewFindings(input.findings, input.policy ?? "all")) {
     const issue = await host.materializeReviewFinding({
@@ -1545,6 +1779,7 @@ export async function materializeReviewFindings(
       runId: input.run.runId,
       reviewedHeadSha: input.pullRequest.headSha,
       reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
+      publicationFence,
       finding,
     });
     projections.push({
@@ -1559,8 +1794,8 @@ export async function materializeReviewFindings(
   return projections;
 }
 
-export function reviewFindingProjectionPlanId(runId: string, headSha: string): string {
-  return `review-projection-${runId}-${headSha.toLowerCase()}`;
+export function reviewFindingProjectionPlanId(runId: string, headSha: string, publicationGeneration?: number): string {
+  return `review-projection-${runId}-${headSha.toLowerCase()}${publicationGeneration === undefined ? "" : `-g${publicationGeneration}`}`;
 }
 
 export function reviewFindingProjectionReceiptId(planId: string): string {
@@ -1588,6 +1823,21 @@ export async function resumeReviewFindingProjection(
     || payload.baseBranch !== input.pullRequest.baseBranch) {
     throw new Error("Finding-publication checkpoint does not match the authoritative pull request route or head");
   }
+  if (!dependencies.host.beginReviewFindingPublication || !dependencies.host.assertReviewFindingPublication) {
+    throw new Error("Finding-publication resume requires durable monotonic host publication fencing");
+  }
+  let publicationFence = payload.publicationFence as ReviewFindingPublicationFence | undefined;
+  if (payload.status === "planned") {
+    publicationFence = await dependencies.host.beginReviewFindingPublication({
+      repo: input.pullRequest.repo,
+      pullRequest: input.pullRequest,
+      runId: input.run.runId,
+    });
+  } else {
+    if (!publicationFence) throw new Error("Completed finding-publication checkpoint has no durable publication fence");
+    await dependencies.host.assertReviewFindingPublication(publicationFence);
+  }
+  if (!publicationFence) throw new Error("Finding-publication resume did not establish a current publication fence");
   const planId = input.projection.id.endsWith(":completed")
     ? input.projection.id.slice(0, -":completed".length)
     : input.projection.id;
@@ -1603,12 +1853,14 @@ export async function resumeReviewFindingProjection(
       findings: activeFindings,
       fallbackReviewerRoles: payload.reviewerRoles,
       policy: "all",
+      publicationFence,
     }, dependencies.host);
     if (dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
         repo: input.pullRequest.repo,
         pullRequest: input.pullRequest,
         runId: input.run.runId,
+        publicationFence,
         activeFindings,
       });
     }
@@ -1617,7 +1869,7 @@ export async function resumeReviewFindingProjection(
       runId: input.run.runId,
       subject: input.projection.subject,
       producer: { role: "controller", runtime: "forgedock" },
-      payload: { ...payload, status: "completed", projections },
+      payload: { ...payload, publicationFence, status: "completed", projections },
     }, { id: completedProjectionId });
     await dependencies.artifacts.append(projectionReceipt);
     projectionReceiptId = projectionReceipt.id;
@@ -1626,6 +1878,9 @@ export async function resumeReviewFindingProjection(
   const reviewPlan = payload.reviewPlan as unknown as ReviewPlan | undefined;
   if (!reviewPlan) throw new Error("Finding-publication checkpoint is missing the frozen review plan");
   assertReviewPlan(reviewPlan);
+  const finalPullRequest = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
+  assertPullRequestRouteStable(input.pullRequest, finalPullRequest, "before resumed verdict publication");
+  await dependencies.host.assertReviewFindingPublication(publicationFence);
   const verdict = createArtifact({
     kind: "ReviewVerdict",
     runId: input.run.runId,

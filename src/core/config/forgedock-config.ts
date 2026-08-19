@@ -9,7 +9,7 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export const DEFAULT_AUTO_MERGE = true;
 export const DEFAULT_REVIEW_CI = { failureAction: "ask" as const, maxFixAttempts: 2, deliveryChecks: ["*"] as readonly string[], promotionChecks: ["*"] as readonly string[], deploymentChecks: ["*"] as readonly string[], repairPaths: [] as readonly string[] };
 export const DEFAULT_ORCHESTRATION = {
-  batchingPolicy: "aggressive" as const,
+  batchingPolicy: "none" as const,
   maxBatchSize: 8,
   maxSensitiveBatchSize: 3,
   scopeExpansion: "scope-locked" as const,

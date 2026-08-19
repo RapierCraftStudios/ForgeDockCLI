@@ -2,7 +2,7 @@
 
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
-import type { IssueSnapshot } from "./forge-host.js";
+import type { IssueSnapshot, ReviewFindingPublicationFence } from "./forge-host.js";
 import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueNumbers, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
@@ -24,6 +24,13 @@ export interface RemediationAdmissionRepository {
   complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void>;
   /** Atomically discard one stale materialized projection without releasing a live pending claim. */
   invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean>;
+}
+
+export interface ReviewFindingPublicationFenceRepository {
+  /** Atomically advances the durable monotonic fence for one repository/PR. */
+  beginReviewFindingPublication(input: Omit<ReviewFindingPublicationFence, "generation">): Promise<ReviewFindingPublicationFence>;
+  /** Fails unless the supplied generation is still the exact current fence. */
+  assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void>;
 }
 
 export interface ArtifactRepository {
@@ -102,8 +109,24 @@ export class ProjectedRunRepository implements RunRepository {
   }
 }
 
-export class InMemoryRemediationAdmissionRepository implements RemediationAdmissionRepository {
+export class InMemoryRemediationAdmissionRepository implements RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository {
   readonly records = new Map<string, { status: "pending" | "materialized"; snapshot?: IssueSnapshot }>();
+  readonly reviewPublicationFences = new Map<string, ReviewFindingPublicationFence>();
+
+  async beginReviewFindingPublication(input: Omit<ReviewFindingPublicationFence, "generation">): Promise<ReviewFindingPublicationFence> {
+    const key = reviewFindingPublicationFenceKey(input.repo, input.pullRequest);
+    const current = this.reviewPublicationFences.get(key);
+    const fence = { ...structuredClone(input), generation: (current?.generation ?? 0) + 1 };
+    this.reviewPublicationFences.set(key, fence);
+    return structuredClone(fence);
+  }
+
+  async assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void> {
+    const current = this.reviewPublicationFences.get(reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest));
+    if (!current || !sameReviewFindingPublicationFence(current, fence)) {
+      throw new Error(`Review-finding publication fence is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
+    }
+  }
 
   async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
     const admissionKey = remediationAdmissionKey(key);
@@ -276,6 +299,23 @@ export class ConcurrentRunUpdateError extends Error {
 
 function sameSubject(left: Subject, right: Subject): boolean {
   return left.repo === right.repo && left.issue === right.issue && left.pr === right.pr;
+}
+
+export function sameReviewFindingPublicationFence(
+  left: ReviewFindingPublicationFence,
+  right: ReviewFindingPublicationFence,
+): boolean {
+  return left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase()
+    && left.pullRequest === right.pullRequest
+    && left.generation === right.generation
+    && left.runId === right.runId
+    && left.headSha.toLowerCase() === right.headSha.toLowerCase()
+    && left.headBranch === right.headBranch
+    && left.baseBranch === right.baseBranch;
+}
+
+export function reviewFindingPublicationFenceKey(repo: string, pullRequest: number): string {
+  return `${repo.trim().toLowerCase()}|pr:${pullRequest}`;
 }
 
 export function remediationAdmissionKey(key: RemediationAdmissionKey): string {

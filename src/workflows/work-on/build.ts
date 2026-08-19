@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { Type, type Static } from "typebox";
-import type { DurableArtifact } from "../../core/artifacts/schema.js";
+import { CriterionEvidenceAnchorsSchema, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
@@ -16,6 +16,8 @@ export const BuilderSubmissionSchema = Type.Object({
     criterionId: Type.Optional(Type.String({ pattern: "^criterion-[1-9][0-9]*$" })),
     criterion: Type.String({ minLength: 1 }),
     implementation: Type.String({ minLength: 1 }),
+    /** Optional only so retained legacy submissions decode; the controller requires it before pass. */
+    anchors: Type.Optional(CriterionEvidenceAnchorsSchema),
   })),
   decisions: Type.Array(Type.String()),
   residualRisks: Type.Array(Type.String()),
@@ -31,6 +33,9 @@ export async function buildWorkItem(
     scopeHints?: ScopeHints;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
     repairContext?: readonly DurableArtifact[];
+    /** Retain the last accepted builder plan/report across bounded repair sessions. */
+    priorSubmission?: BuilderSubmission;
+    priorBuilderSessionRef?: string;
     worktree: string;
     provider?: string;
     model?: string;
@@ -54,7 +59,10 @@ export async function buildWorkItem(
         "This execution is bounded. Prioritize the frozen criteria, stop broad exploration early, and submit the complete typed result before the execution ceiling; a retained checkpoint will be resumed if the ceiling is reached.",
         "Turn the Build Packet into a criterion-by-criterion implementation checklist before making changes. For every criterion, identify the invariant, all relevant callers/implementations/adapters, and the regression scenario that must remain true.",
         ...(input.priorVerificationFailure ? [
-          "This is a bounded repair of the retained implementation. Use the controller-recorded failed checks as evidence and change only frozen Build Packet paths.",
+          "This is a bounded repair of the retained implementation. First reproduce every controller-recorded failed check with the typed verify tool before editing; do not guess from its summary.",
+          "After the narrow fix, rerun the failing frozen check plus every neighboring frozen check that covers the same criterion, path, symbol, or invariant. Re-audit every still-open frozen criterion before submitting; never treat an unrelated green generic check as criterion evidence.",
+          ...(input.priorSubmission ? [`Preserve and amend the prior builder checklist/submission rather than rebuilding it from memory: ${JSON.stringify(input.priorSubmission)}`] : []),
+          ...(input.priorBuilderSessionRef ? [`The prior builder session was ${input.priorBuilderSessionRef}; this runtime starts a schema-safe bounded repair session, so use the retained submission as continuity evidence.`] : []),
         ] : []),
         "Do not expand scope or perform unrelated cleanup. If the packet omits a required integration path, report the packet gap instead of silently widening the change.",
         "Prefer the smallest complete integration change: preserve existing public shapes, serialization, error/cancellation, concurrency, and repository conventions unless the frozen criteria explicitly require changing them.",
@@ -64,7 +72,11 @@ export async function buildWorkItem(
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
-        "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion and use implementation only for the concrete evidence.",
+        "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion.",
+        "Every criterionCoverage entry must include typed anchors: concrete repository paths, stable implementation symbols, stable test/invariant-matrix IDs, and the relevant frozen verification command IDs. Prose implementation notes remain readable but cannot authorize a pass. Use only command IDs actually relevant to that criterion; generic green checks cannot substitute for missing symbol/test evidence.",
+        ...(input.packet.payload.invariantMatrices?.length ? [
+          `Security-sensitive acceptance matrices are controller-derived and must be exercised where applicable: ${input.packet.payload.invariantMatrices.map((row) => `${row.id} (${row.criterionId}, testId=${row.testId})`).join("; ")}. Preserve their row/test IDs in focused tests and criterion anchors.`,
+        ] : []),
         "Before submitting, self-review the complete diff against every criterion and integration boundary: check callers, implementations, adapters, serialization, error/cancellation/concurrency paths, tests, and docs/configuration that the packet identifies. Do not mark a criterion covered from intent alone; cite concrete code, test, or verification evidence.",
         "Run the narrowest relevant frozen verification commands after editing, then re-read changed files for malformed edits, whitespace damage, and accidental mechanical churn.",
         "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",

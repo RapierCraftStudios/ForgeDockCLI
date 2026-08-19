@@ -53,8 +53,16 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
         ON observation_events(scope_key, run_sequence);
       CREATE INDEX IF NOT EXISTS observation_events_identity_run
         ON observation_events(json_extract(identity_json, '$.forgeRunId'), run_sequence);
+      CREATE INDEX IF NOT EXISTS observation_events_controller_task
+        ON observation_events(json_extract(identity_json, '$.controllerTaskId'));
       CREATE INDEX IF NOT EXISTS observation_events_kind
         ON observation_events(kind, occurred_at);
+      CREATE TABLE IF NOT EXISTS observation_cursors (
+        position INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT UNIQUE NOT NULL
+      );
+      INSERT OR IGNORE INTO observation_cursors (event_id)
+        SELECT event_id FROM observation_events ORDER BY rowid;
       CREATE TABLE IF NOT EXISTS observation_output_chunks (
         event_id TEXT PRIMARY KEY,
         scope_key TEXT NOT NULL,
@@ -168,6 +176,7 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
         JSON.stringify(envelope.delivery),
         JSON.stringify(envelope.security),
       );
+      this.#database.prepare("INSERT INTO observation_cursors (event_id) VALUES (?)").run(envelope.eventId);
       if (envelope.output) {
         this.#database.prepare(`
           INSERT INTO observation_output_chunks (event_id, scope_key, channel, chunk_sequence, text, bytes, created_at)
@@ -193,6 +202,7 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
     if (query.scopeKey) { clauses.push("e.scope_key = ?"); params.push(query.scopeKey); }
     if (query.forgeRunId) { clauses.push("json_extract(e.identity_json, '$.forgeRunId') = ?"); params.push(query.forgeRunId); }
     if (query.orchestrationId) { clauses.push("json_extract(e.identity_json, '$.orchestrationId') = ?"); params.push(query.orchestrationId); }
+    if (query.controllerTaskId) { clauses.push("json_extract(e.identity_json, '$.controllerTaskId') = ?"); params.push(query.controllerTaskId); }
     if (query.source) { clauses.push("e.source = ?"); params.push(query.source); }
     if (query.channel) { clauses.push("e.channel = ?"); params.push(query.channel); }
     if (query.kinds?.length) {
@@ -200,15 +210,25 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
       params.push(...query.kinds);
     }
     if (query.sinceRunSequence !== undefined) { clauses.push("e.run_sequence > ?"); params.push(query.sinceRunSequence); }
+    if (query.cursor !== undefined) {
+      const cursor = this.#database.prepare("SELECT position FROM observation_cursors WHERE event_id = ?").get(query.cursor) as { position: number } | undefined;
+      if (!cursor) throw new Error(`Unknown observation cursor: ${query.cursor}`);
+      clauses.push("c.position > ?");
+      params.push(cursor.position);
+    }
     const limit = Math.min(MAX_QUERY_LIMIT, Math.max(1, query.limit ?? DEFAULT_QUERY_LIMIT));
     const direction = query.newestFirst ? "DESC" : "ASC";
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const order = query.controllerTaskId !== undefined || query.cursor !== undefined
+      ? `c.position ${direction}`
+      : `e.run_sequence ${direction}, e.ingested_at ${direction}`;
     const rows = this.#database.prepare(`
       SELECT e.*, o.channel AS output_channel, o.chunk_sequence AS output_sequence, o.text AS output_text, o.bytes AS output_bytes
       FROM observation_events e
+      JOIN observation_cursors c ON c.event_id = e.event_id
       LEFT JOIN observation_output_chunks o ON o.event_id = e.event_id
       ${where}
-      ORDER BY e.run_sequence ${direction}, e.ingested_at ${direction}
+      ORDER BY ${order}
       LIMIT ?
     `).all(...params, limit) as Array<Record<string, unknown>>;
     return rows.map((row) => decodeEnvelope(row));

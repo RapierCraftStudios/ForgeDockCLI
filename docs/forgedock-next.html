@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>ForgeDock Next — Greenfield Rewrite Brief</title>
+  <title>ForgeDock Next — Implementation and Certification Brief</title>
   <style>
     :root {
       --bg: #090d12;
@@ -182,7 +182,7 @@
 <body>
 <div class="shell">
   <aside>
-    <div class="brand"><div class="mark">F</div><div><strong>ForgeDock Next</strong><small>rewrite decision brief</small></div></div>
+    <div class="brand"><div class="mark">F</div><div><strong>ForgeDock Next</strong><small>implementation &amp; certification</small></div></div>
     <nav aria-label="Document sections">
       <a href="#decision">The decision</a>
       <a href="#principles">Non-negotiables</a>
@@ -196,7 +196,7 @@
       <a href="#bloat">Removal decisions</a>
       <a href="#tui">Branded TUI & DX</a>
       <a href="#neutrality">No lock-in</a>
-      <a href="#migration">Delivery plan</a>
+      <a href="#migration">Certification plan</a>
       <a href="#acceptance">Acceptance tests</a>
     </nav>
     <div class="side-note">Standalone artifact. Removal choices are saved only in this browser via <code>localStorage</code>. No repository or network writes occur.</div>
@@ -204,17 +204,17 @@
 
   <main>
     <section id="decision">
-      <div class="eyebrow">Recommendation · greenfield replacement</div>
-      <h1>Delete the engine.<br>Keep the discipline.</h1>
-      <p class="lede">ForgeDock should not port its Claude-era engine to Pi. It should replace that engine with a small, typed workflow controller, use Pi as an embedded agent runtime, and expose a ForgeDock-owned CLI and TUI.</p>
-      <div class="thesis"><strong>Pi is the execution kernel—not the workflow authority, state store, product identity, or durable memory.</strong> GitHub holds institutional memory. ForgeDock code owns transitions and side effects. Models do bounded reasoning and implementation work. This preserves the valuable behavior without preserving the accidental machinery.</div>
-      <div class="stats" aria-label="Current complexity inventory">
-        <div class="stat"><b>45,689</b><span>lines across all 83 command specs</span></div>
-        <div class="stat"><b>20,006</b><span>lines for the three core workflow families</span></div>
-        <div class="stat"><b>12,143</b><span>lines in current CLI/runtime/engine files</span></div>
-        <div class="stat"><b>3</b><span>public workflows in the proposed product</span></div>
+      <div class="eyebrow">Implementation status · 2026-08-18</div>
+      <h1>Typed control.<br>Evidence before readiness.</h1>
+      <p class="lede">ForgeDock Next is implemented as a typed workflow controller around a replaceable Pi runtime. Current work synchronizes the operator contract and certifies it through focused, fault-injected, and live staging evidence.</p>
+      <div class="thesis"><strong>Implementation is not certification.</strong> GitHub remains durable semantic truth, ForgeDock code owns transitions and side effects, and models perform bounded work. No dogfood-readiness or release-readiness claim is made until every phased certification wave passes against one immutable candidate SHA.</div>
+      <div class="stats" aria-label="Current dogfood contract">
+        <div class="stat"><b>1</b><span>selected issue per visible node and slot by default</span></div>
+        <div class="stat"><b>maxParallel</b><span>1–20 issue-slot budget; batches charge per member</span></div>
+        <div class="stat"><b>exact SHA</b><span>required live CI and review authority</span></div>
+        <div class="stat"><b>5</b><span>ordered certification waves still to prove</span></div>
       </div>
-      <p class="muted">Core-spec breakdown: <code>work-on</code> 8,864 lines · <code>review-pr</code> 4,636 lines · <code>orchestrate</code> 6,506 lines. This is implementation evidence, not a target to preserve.</p>
+      <p class="muted">The word “wave” on this page refers only to certification order. DAG execution continuously streams ready nodes and has no topological wave barrier.</p>
     </section>
 
     <section id="principles">
@@ -224,7 +224,7 @@
       <div class="grid three">
         <div class="card accent"><span class="num">01</span><h3>Prove before coding</h3><p>Every issue is investigated. The valid outcomes are <code>confirmed</code>, <code>invalid</code>, or <code>decompose</code>.</p></div>
         <div class="card"><span class="num">02</span><h3>Freeze the job</h3><p>A versioned Build Packet fixes scope, acceptance criteria, relevant history, plan, risks, and verification.</p></div>
-        <div class="card"><span class="num">03</span><h3>Verify with evidence</h3><p>Tests, static checks, build commands, and acceptance checks are controller-recorded evidence—not model assurances.</p></div>
+        <div class="card"><span class="num">03</span><h3>Verify with live authority</h3><p><code>forgedock.verification/v2</code> executes only the exact-base packet selection with typed criterion anchors. Auto-merge requires nonempty GitHub-required checks, authoritative provenance, and passing observations at the exact reviewed SHA.</p></div>
         <div class="card"><span class="num">04</span><h3>Review independently</h3><p>A reviewer starts in a fresh session with intent, packet, evidence, and diff; never the builder conversation.</p></div>
         <div class="card"><span class="num">05</span><h3>Anchor to a SHA</h3><p>Review approval is valid only for the exact reviewed commit. A changed head invalidates the verdict.</p></div>
         <div class="card"><span class="num">06</span><h3>Recover from GitHub</h3><p>GitHub is durable truth. Local databases and Pi sessions accelerate execution but cannot be the only record.</p></div>
@@ -245,9 +245,9 @@
     </section>
 
     <section id="architecture">
-      <div class="eyebrow">Target system</div>
+      <div class="eyebrow">Current system</div>
       <h2>A small controller around a replaceable runtime</h2>
-      <p class="section-intro">“Built around Pi” should mean using its SDK, session runtime, tools, compaction, and provider ecosystem—not shelling out to a branded coding CLI and encoding the product in prompts again.</p>
+      <p class="section-intro">“Built around Pi” means using its SDK, session runtime, tools, compaction, and provider ecosystem—not shelling out to a branded coding CLI or encoding the product in prompts again.</p>
       <div class="diagram">
         <div class="layers">
           <div class="layer"><b>ForgeDock UX</b><span><code>npx forgedock</code> · three workflow commands · branded TUI · approvals · queue and review views</span></div>
@@ -263,7 +263,7 @@
         <div class="card"><h3>ForgeDock owns</h3><ul class="clean"><li>Workflow state and transition rules</li><li>Artifact schemas and GitHub rendering</li><li>Role permissions and tool policy</li><li>Verification and merge policy</li><li>User-facing CLI/TUI and terminology</li></ul></div>
         <div class="card"><h3>Pi supplies</h3><ul class="clean"><li>Provider-neutral model invocation</li><li>Agent sessions and compaction</li><li>Streaming events and tool-call loop</li><li>Provider auth/model discovery</li><li>TUI primitives that can accelerate the branded shell</li></ul></div>
       </div>
-      <pre aria-label="Proposed runtime interface">interface AgentRuntime {
+      <pre aria-label="Runtime interface">interface AgentRuntime {
   capabilities(): Promise&lt;RuntimeCapabilities&gt;;
   run(task: AgentTask, signal: AbortSignal): AsyncIterable&lt;AgentEvent&gt;;
   resume(ref: EphemeralSessionRef, input: ResumeInput): AsyncIterable&lt;AgentEvent&gt;;
@@ -324,9 +324,10 @@ forgedock models</pre>
         </div>
       </div>
       <div class="grid two" style="margin-top:14px">
-        <div class="card"><h3>Controller responsibilities</h3><ul class="checklist"><li>Resolve repository state and permissions</li><li>Create worktree and enforce role grants</li><li>Select the next state from validated output</li><li>Run deterministic verification commands</li><li>Create/update issue, branch, and PR artifacts</li><li>Check SHA freshness and merge eligibility</li><li>Persist every committed transition</li></ul></div>
-        <div class="card"><h3>Agent responsibilities</h3><ul class="checklist"><li>Investigate claims against code and history</li><li>Produce schema-valid artifacts</li><li>Plan changes within frozen scope</li><li>Edit and test only inside the granted workspace</li><li>Explain evidence, decisions, and residual risk</li><li>Remediate only accepted blocking findings</li></ul></div>
+        <div class="card"><h3>Controller responsibilities</h3><ul class="checklist"><li>Resolve repository state and permissions</li><li>Create worktree and enforce role grants</li><li>Select the next state from validated output</li><li>Run packet-scoped local verification</li><li>Read required hosted CI live at the exact SHA</li><li>Retain bounded evidence-backed builder repair</li><li>Create/update issue, branch, and PR artifacts</li><li>Check SHA freshness and merge eligibility</li><li>Persist every committed transition</li></ul></div>
+        <div class="card"><h3>Agent responsibilities</h3><ul class="checklist"><li>Investigate claims against code and history</li><li>Produce schema-valid artifacts</li><li>Plan changes within frozen scope</li><li>Edit and test only inside the granted workspace</li><li>Bind criteria to frozen path, symbol, test/invariant, and passing command anchors</li><li>Explain decisions and residual risk</li><li>Repair only accepted in-packet failures</li></ul></div>
       </div>
+      <p>Verification repair permits at most two fresh schema-safe bounded builder sessions. Within one live controller the next session receives the prior submission/session reference and exact failed-check Outcome so it amends the frozen checklist. After restart the Outcome remains durable evidence, but those explicit continuity parameters are not reconstructed. Typed criterion anchors must name frozen paths, symbols, tests/invariants, and passing required command IDs; a generic green build cannot prove semantic acceptance.</p>
       <h3 style="margin-top:24px">Investigation branches are first-class</h3>
       <div class="branch"><b>confirmed</b><span>Create the Build Packet and continue. Confidence/risk can determine whether preparation uses one or multiple fresh agents.</span></div>
       <div class="branch"><b>invalid</b><span>Post evidence and a proposed terminal outcome. The controller applies configured closure policy; no builder is started.</span></div>
@@ -337,12 +338,13 @@ forgedock models</pre>
     <section id="review">
       <div class="eyebrow">Workflow 2</div>
       <h2><code>review-pr</code>: independent and commit-specific</h2>
-      <p class="section-intro">Review is a frozen, budgeted protocol. Controller-observed evidence selects capabilities before execution; reviewer prose can propose findings but cannot create new reviewer nodes.</p>
+      <p class="section-intro">Review is a frozen, budgeted, exact-SHA protocol. Controller-observed evidence selects capabilities before execution; durable semantic finding roots preserve continuity across delta review and remediation.</p>
       <div class="grid three">
         <div class="card"><span class="num">INPUT</span><h3>Clean review packet</h3><p>Original issue intent, investigation, Build Packet, PR diff, verification evidence, repository policy, route facts, and current head SHA.</p></div>
         <div class="card"><span class="num">PLAN</span><h3>Capabilities, then resources</h3><p>Acceptance/correctness is mandatory. Security, data, API, concurrency, frontend, and release capabilities are packed into at most three specialist execution groups by default; overlap may share execution but never removes a required capability. The canonical plan identity binds topology, authority context, and enforced parallel/session/model-call budgets.</p></div>
-        <div class="card"><span class="num">OUTPUT</span><h3>One typed verdict</h3><p>Current findings require severity, confidence, causal root, typed blocker anchor, exact scope lineage, and remediation. The controller derives blocking only from qualifying source attestations; rejected or weak duplicates cannot elevate or corroborate another source.</p></div>
+        <div class="card"><span class="num">OUTPUT</span><h3>Durable roots and one verdict</h3><p>Current findings require a stable semantic root, severity, confidence, causal evidence, typed blocker anchor, exact scope lineage, and remediation. The controller derives <code>mustFix</code>; reviewer booleans and rendered Markdown are not authority.</p></div>
       </div>
+      <p><code>FindingRootLedger</code> is a durable exact-head artifact with monotonic epochs and structural root identity. Schema-v4 closure plans prove prior-to-current paths/hunks and require correctness plus every recorded owner role to assess each open, fix-attempted, or regressed root. Omission becomes <code>fix-attempted</code>, not fixed. Unproven newly discovered preexisting concerns become follow-up work rather than expanding remediation scope.</p>
       <h3 style="margin-top:24px">Deterministic policy, not reviewer vibes</h3>
       <div class="table-wrap"><table>
         <thead><tr><th>Condition</th><th>Controller response</th></tr></thead>
@@ -352,7 +354,8 @@ forgedock models</pre>
           <tr><td>Medium, high-confidence anchored finding</td><td>Block only with two independent roles or deterministic/reproducible controller evidence.</td></tr>
           <tr><td>Low confidence, low severity, vague/locationless prose, duplicate root, or obvious out-of-path claim</td><td>Keep non-blocking or reject before any model scope adjudication.</td></tr>
           <tr><td>Actionable in-scope blocking root</td><td>Enter remediation with the normalized roots in the verdict; re-run verification and review the new SHA in fresh context using the same validated frozen topology. A newly introduced blocker requires an exact prior-SHA delta path or an explicit authority value changed from the prior verdict.</td></tr>
-          <tr><td>Head SHA changed during review</td><td>Invalidate the verdict. Never approve a partial or mixed-SHA wave.</td></tr>
+          <tr><td>Accepted <code>mustFix</code> semantic root</td><td>Treat it as a controller-owned remediation obligation distinct from final <code>blocking</code>. Even a nonblocking medium root forces <code>request_changes</code>, scoped remediation, re-verification, a new SHA, and fresh closure review.</td></tr>
+          <tr><td>Head SHA changed during review</td><td>Invalidate the verdict. Never approve partial or mixed-SHA evidence.</td></tr>
           <tr><td>A logical reviewer fails after two attempts</td><td>Let siblings settle and preserve valid reports, then stop in a resumable fail-closed state with no partial approval.</td></tr>
         </tbody>
       </table></div>
@@ -365,21 +368,23 @@ forgedock models</pre>
       <h2><code>orchestrate</code>: schedule work, do not invent a second pipeline</h2>
       <p class="section-intro">An orchestration worker runs the same <code>work-on</code> state machine. Orchestration adds coordination only.</p>
       <div class="grid two">
-        <div class="card accent"><h3>Keep</h3><ul class="clean"><li>Explicit dependency DAG and cycle detection</li><li>One isolated worktree per active issue</li><li>Bounded concurrency and resource budgets</li><li>Predicted and observed path/component claims</li><li>Lease, heartbeat, stale-worker recovery</li><li>PR head freshness and merge sequencing</li><li>Restart/reconciliation from durable artifacts</li></ul></div>
+        <div class="card accent"><h3>Keep</h3><ul class="clean"><li>Typed discovery and explicit semantic dependency DAG</li><li>One selected issue per visible node/slot by default</li><li><code>maxParallel</code> issue-slot budget</li><li>Same-repository, same-target conflict claims</li><li>Dynamic Build Packet claim refinement</li><li>Lease, heartbeat, stale-worker recovery</li><li>Exact-target refresh after claim deferral</li><li>Truthful slot, wait, and semantic-activity views</li></ul></div>
         <div class="card"><h3>Do not carry forward</h3><ul class="clean"><li>Recursive opportunistic cascades</li><li>Near-miss/backlog mining inside execution</li><li>Complex value/cost scoring as a model task</li><li>Model-authoritative batching or completion sweeps (typed concern batching remains)</li><li>Background shell dispatch as workflow control</li><li>A second set of build/review semantics</li><li>Agents writing authoritative scheduling state</li></ul></div>
       </div>
       <h3 style="margin-top:24px">Minimal scheduler</h3>
       <pre>ready = issues
-  .filter(dependenciesSatisfied)
+  .filter(semanticDependenciesSucceeded)
   .filter(notTerminal)
   .filter(noActiveLease)
-  .filter(claimsCompatible)
+  .filter(noSameRepoTargetClaimConflict)
   .sort(byConfiguredPriorityThenAge);
 
-while (capacity.available && ready.length) {
-  controller.startWorkOn(ready.shift(), isolatedWorktree());
+while (occupiedIssueSlots &lt; maxParallel &amp;&amp; transport.available &amp;&amp; ready.length) {
+  controller.startWorkOn(refreshExactTarget(ready.shift()), isolatedWorktree());
 }</pre>
-      <p>The selected model interprets a natural-language issue query and proposes evidence-backed dependencies, priorities, labels, affected files, and coarse path/component claims. Typed code validates the graph, rejects cycles or unselected dependencies, and derives stable serialization edges. Compatible P2/P3 review findings with the same bounded concern surface may be contracted into one durable batch issue and one work-on agent; successful completion projects the batch Outcome to and closes every member. “Batch” refers only to that efficiency work unit—not a DAG level. The scheduler streams the live ready set as each node's own predecessors complete. Claims become precise after the Build Packet (expected paths). Actual changed paths are checked before publish and before merge. A conflict blocks or serializes work; a model does not “reason away” the collision.</p>
+      <p>Natural-language selection becomes typed discovery evidence before the controller freezes membership, routes, priorities, semantic dependencies, and predicted claims. By default each selected issue stays one visible node and one top-level <code>work-on</code> pipeline. <code>maxParallel</code> is a 1–20 issue-slot budget, not a node count: an explicit batch remains one node/pipeline but consumes one slot per member, and available transport may lower dispatch. An indivisible oversized batch may run alone to avoid deadlock. A semantic dependency requires an authoritative successful predecessor Outcome. A conflict claim is only a release constraint for overlapping work in the same repository against the same exact target; it releases at any terminal predecessor state and never becomes a semantic dependency. Frozen Build Packet paths refine live claims, queued nodes are reevaluated, and a claim-deferred worker refreshes the target immediately before dispatch.</p>
+      <p>Batching is disabled by default and requires an explicit policy opt-in. Eligible ordinary issues and review findings may contract only under typed route, dependency, concern, risk, and scope compatibility. Sensitive security/auth grouping is deny-by-default: exactly two members must share a causal family and secondary proof, and assembly hard-caps the group at two even though managed config currently defaults <code>max_sensitive_batch_size</code> to three. Priority labels alone do not authorize a batch. “Batch” means one efficiency work unit, never a DAG level. The scheduler continuously streams ready nodes rather than executing topological waves.</p>
+      <p>The board reports selected and runnable-now issue demand plus requested, sampled-transport, and effective caps; it does not label runnable demand as active occupancy. Node status and semantic-dependency, claim, issue-capacity, suspended-recovery, and decomposition waits explain what is running or queued. Idle decisions use correlated semantic observations instead of raw log-file byte growth, so old/unrelated events or noisy logs cannot make stalled work healthy.</p>
       <div class="callout"><strong>Decomposition is explicit, not a cascade.</strong> Child issues can be offered for enqueueing, but the scheduler does not recursively discover and launch unrelated work unless a user-configured query includes it.</div>
     </section>
 
@@ -421,7 +426,7 @@ while (capacity.available && ready.length) {
       <p class="muted"><strong>Compatibility:</strong> keep the existing protocol parser as a read-only migration layer. The current baseline emits v2 artifacts, which remain <code>legacy-unverified</code> and cannot authorize protected work. Future protected runs may emit <code>forgedock.protected/v1</code> only through the separately reviewed implementation slices; legacy sentinels/labels can be projected during a bounded transition period, then removed.</p>
       <h3>Project guidance and reference memory</h3>
       <div class="grid three">
-        <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists. A normal parent-terminal launch bootstraps a minimal file when absent; ForgeDock Next then updates only a marker-bounded managed section for live-catalog-resolved role models, thinking, concurrency, and merge defaults.</p></div>
+        <div class="card"><h3><code>forge.yaml</code></h3><p>Project configuration persists in a marker-bounded managed block. Orchestration defaults to <code>batching.policy: none</code>, <code>max_parallel: 4</code> (1–20), and mutation-free <code>dispatch_mode: preview</code>; invocation overrides managed values, which override built-ins.</p></div>
         <div class="card"><h3>Checkpoint-native resume</h3><p>Interrupted build nodes recover the deterministic retained worktree and frozen Build Packet. Same-session DAG resume preserves completed nodes, retries only failed or blocked nodes, and immediately restores streaming successor dispatch.</p></div>
         <div class="card"><h3><code>FORGE.md</code></h3><p>Explicit user-maintained project and agentic preferences, loaded by the terminal and bounded workflow roles while remaining subordinate to current intent.</p></div>
         <div class="card"><h3><code>devdocs/</code></h3><p>Obsidian-compatible reference notes with anchors, links, and backlinks. A compact scorer retrieves only relevant summaries; notes never authorize actions or override typed contracts.</p></div>
@@ -508,24 +513,18 @@ while (capacity.available && ready.length) {
     </section>
 
     <section id="migration">
-      <div class="eyebrow">Safe delivery</div>
-      <h2>Greenfield code, evidence-driven cutover</h2>
-      <p class="section-intro">“Scrap the engine” should not mean “forget what production taught us.” Preserve behavior through fixtures and acceptance tests, not copied architecture.</p>
+      <div class="eyebrow">Dogfood gate · certification pending</div>
+      <h2>Implementation lands before readiness is claimed</h2>
+      <p class="section-intro">Certification is ordered so cheap deterministic failures stop the candidate before live staging work. Each wave retains exact-SHA evidence, and a code or policy change invalidates the affected wave and all dependent waves.</p>
       <div class="grid roadmap">
-        <div class="card"><h3>Freeze the contract</h3><p>Approve this scope, state machine, six artifacts, controller authority, review policy, and removals. Create synthetic regression cases from observed patterns; do not commit private AlterLab content.</p></div>
-        <div class="card"><h3>Build the new skeleton</h3><p>TypeScript workspace with workflow core, ports, fake adapters, event log, schema validation, and tests. No dependency on the old engine.</p></div>
-        <div class="card"><h3>Prove Pi on investigation</h3><p>Run one read-only investigation through the Pi SDK with two different providers. Validate typed output, interruption, restart, and GitHub projection.</p></div>
-        <div class="card"><h3>Complete <code>work-on</code> to PR</h3><p>Add worktrees, Build Packet, builder, verification, and PR publication. Keep merge manual until review behavior is proven.</p></div>
-        <div class="card"><h3>Add independent review</h3><p>Implement SHA freezing, risk routing, findings, remediation, re-verification, and re-review. Shadow/canary against known scenarios.</p></div>
-        <div class="card"><h3>Add lean orchestration</h3><p>Dependencies, leases, claims, concurrency, recovery, and merge ordering—nothing else.</p></div>
-        <div class="card"><h3>Ship the branded TUI</h3><p>Build the workflow-native interface after the controller event model is stable, then expose it from <code>npx forgedock</code>.</p></div>
-        <div class="card"><h3>Remove legacy paths</h3><p>Delete the old engine, runner, Claude-specific hooks/specs, overlapping commands, and compatibility projection after the agreed cutover window.</p></div>
+        <div class="card"><h3>Wave 0 · deterministic gate</h3><p>Build, Next and focused regression tests, docs build, conformance, Markdown/link checks, and exact candidate-SHA receipts.</p></div>
+        <div class="card"><h3>Wave 1 · scheduler invariants</h3><p>Typed discovery, one-node/one-slot default, <code>maxParallel</code>, dependencies versus claims, dynamic claims, target refresh, batching opt-in, sensitive compatibility, and truthful activity/waits.</p></div>
+        <div class="card"><h3>Wave 2 · lifecycle faults</h3><p>Packet verification, exact-SHA CI, retained builder repair, criterion evidence, durable roots, delta review, <code>mustFix</code> remediation, and interruption at durable boundaries.</p></div>
+        <div class="card"><h3>Wave 3 · small live DAGs</h3><p>Controlled staging cases for independent, dependent, conflicting, cross-target, explicitly batched, repair, CI, review, merge, closure, and cleanup outcomes.</p></div>
+        <div class="card"><h3>Wave 4 · repeated canary</h3><p>Three to five fresh native staging runs, followed by an explicit maintainer certification decision bound to the same immutable SHA.</p></div>
       </div>
-      <div class="grid two" style="margin-top:14px">
-        <div class="callout danger"><strong>Immediate prerequisite:</strong> Pi 0.83.0 requires Node <code>&gt;=22.19.0</code>; this machine currently reports <code>22.17.0</code>. Update the development runtime and the package engine floor before the proof of concept.</div>
-        <div class="callout"><strong>Licensing decision:</strong> Pi and <code>@forgedock/protocol</code> are MIT. This repository is AGPL-3.0, so code merged and distributed here via <code>npx forgedock</code> remains under that repository’s license unless distribution/licensing is deliberately changed.</div>
-      </div>
-      <h3 style="margin-top:24px">Proposed source shape</h3>
+      <div class="callout danger" style="margin-top:14px"><strong>No readiness claim:</strong> implemented behavior and local green tests are necessary but insufficient. Until every required wave passes, the accurate status is <em>implemented, certification pending</em>.</div>
+      <h3 style="margin-top:24px">Current source shape</h3>
       <pre>src/
   cli/                   # three workflows + utilities
   tui/                   # ForgeDock-branded event-driven interface
@@ -554,8 +553,8 @@ while (capacity.available && ready.length) {
       <div class="eyebrow">Definition of done</div>
       <h2>The rewrite succeeds only if these remain true</h2>
       <div class="grid two">
-        <div class="card"><h3>Workflow behavior</h3><ul class="checklist"><li>Invalid issues stop before coding with evidence</li><li>Decomposed parents produce linked, independently runnable children</li><li>Builders cannot broaden frozen scope silently</li><li>Verification records executable results</li><li>Review starts without builder conversation context</li><li>Any changed SHA invalidates prior review</li><li>Blocking findings force fix, verification, and re-review</li></ul></div>
-        <div class="card"><h3>Portability and recovery</h3><ul class="checklist"><li>The same workflow runs on at least two providers</li><li>A local/custom provider can be configured without workflow code changes</li><li>The controller test suite passes with a fake runtime and no Pi</li><li>A killed run reconciles without guessing from chat history</li><li>A second machine can understand completed work from GitHub alone</li><li>Two conflicting issues are serialized or blocked deterministically</li><li>No role can exceed its side-effect grant</li></ul></div>
+        <div class="card"><h3>Workflow behavior</h3><ul class="checklist"><li>Default one issue per visible node and slot</li><li><code>maxParallel</code> and transport limits are truthful</li><li>Semantic dependencies require successful Outcomes</li><li>Same-repository/same-target claims only serialize</li><li>Dynamic claims and target refresh are enforced</li><li>Batching requires explicit compatible opt-in</li><li>Local verification remains packet-scoped</li><li>Required CI is live and exact-SHA</li></ul></div>
+        <div class="card"><h3>Review and recovery</h3><ul class="checklist"><li>Semantic activity is observation-backed</li><li>Builder repair retains bounded continuity</li><li>Criterion evidence is controller-observed</li><li>Finding roots survive projection and resume</li><li>Delta review is prior-SHA specific</li><li><code>mustFix</code> remains a distinct remediation obligation</li><li>A killed run resumes without duplicate effects</li><li>No role exceeds its side-effect grant</li></ul></div>
       </div>
       <h3 style="margin-top:24px">Regression scenario suite</h3>
       <div class="table-wrap"><table>
@@ -571,11 +570,11 @@ while (capacity.available && ready.length) {
           <tr><td>Provider fails or model becomes unavailable</td><td>Retry/fallback obeys policy; no duplicated GitHub side effects and no lost committed artifact.</td></tr>
         </tbody>
       </table></div>
-      <div class="thesis" style="margin-top:28px"><strong>Final recommendation:</strong> approve a greenfield ForgeDock core, delete rather than port the current engine, embed Pi behind a ForgeDock runtime boundary, and delay deep TUI customization until the new workflow contract is executable. The moat is not the old engine or a particular model. It is reliable, recoverable software delivery with durable institutional memory.</div>
+      <div class="thesis" style="margin-top:28px"><strong>Exit rule:</strong> retain the typed controller and evidence boundaries, complete every certification wave against one immutable candidate SHA, and record an explicit maintainer decision. Before that decision, describe the candidate only as implemented with certification pending.</div>
     </section>
 
     <footer class="footer">
-      <p><strong>ForgeDock Next rewrite brief</strong> · generated from the repository architecture/spec audit and observed workflow behavior · no private issue content included.</p>
+      <p><strong>ForgeDock Next implementation and certification brief</strong> · synchronized 2026-08-18 · no dogfood-readiness claim while certification remains open.</p>
       <p>Document path: <code>docs/forgedock-next.html</code></p>
     </footer>
   </main>

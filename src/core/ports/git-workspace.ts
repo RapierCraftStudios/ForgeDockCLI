@@ -14,8 +14,27 @@ export interface ReviewWorkspaceManager {
 }
 export interface PullRequestRepairWorkspaceManager extends ReviewWorkspaceManager { changedPaths(workspace: GitWorkspace): Promise<string[]>; commit(workspace: GitWorkspace, message: string): Promise<string>; head(workspace: GitWorkspace): Promise<string>; publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void>; }
 
+export class AdvertisedRemoteHeadMismatchError extends Error {
+  constructor(
+    readonly expectedSha: string,
+    readonly observedSha: string,
+  ) {
+    super(`Advertised remote head ${expectedSha} does not match fetched remote head ${observedSha}`);
+    this.name = "AdvertisedRemoteHeadMismatchError";
+  }
+}
+
 export interface GitWorkspaceManager {
   create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace>;
+  /**
+   * Move an untouched delivery workspace to an exact, host-advertised target
+   * revision. Implementations must fetch the branch directly, reject dirty or
+   * merge state and non-ancestor movement, use ff-only, and return the newly
+   * frozen base identity without resetting local work.
+   */
+  fastForwardToRemoteTarget?(workspace: GitWorkspace, advertisedHeadSha: string): Promise<GitWorkspace>;
+  /** Prove exact HEAD, no in-progress merge, and no changed delivery paths. */
+  assertPristineAtHead?(workspace: GitWorkspace, expectedHeadSha: string): Promise<void>;
   /** Uncommitted paths in the current build/remediation attempt. */
   changedPaths(workspace: GitWorkspace): Promise<string[]>;
   /** Complete path set carried by the delivery revision relative to its frozen base. */
@@ -49,6 +68,8 @@ export interface GitWorkspaceManager {
     expectedDigest: string,
     revision: string,
   ): Promise<boolean>;
+  /** Exact ordered parents for HEAD, used to recognize one retained non-merge commit. */
+  commitParents?(workspace: GitWorkspace): Promise<string[]>;
   commit(workspace: GitWorkspace, message: string): Promise<string>;
   push(workspace: GitWorkspace): Promise<void>;
   head(workspace: GitWorkspace): Promise<string>;

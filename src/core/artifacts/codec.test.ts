@@ -66,6 +66,35 @@ describe("artifact codec", () => {
     assert.deepEqual(findArtifacts(comment)[0], adjudication);
   });
 
+  it("round trips the durable verified-commit recovery checkpoint", () => {
+    const checkpoint = createArtifact({
+      kind: "VerificationCheckpoint",
+      runId: "run_verify_commit",
+      subject: { repo: "acme/widget", issue: 42 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        checkpoint: "verified-commit",
+        branch: "forgedock/issue-42",
+        targetBranch: "main",
+        baseSha: "a".repeat(40),
+        parentHeadSha: "a".repeat(40),
+        changedPaths: ["src/a.ts"],
+        pendingChangedPaths: ["src/a.ts"],
+        verifiedContentDigest: "b".repeat(64),
+        commitMessage: "forge: implement issue 42",
+        summary: "Implemented guard",
+        acceptanceEvidence: [{ criterionId: "criterion-1", criterion: "Guard runs", status: "passed", evidence: "guard test" }],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 1 }],
+        decisions: [],
+        residualRisks: [],
+      },
+    });
+    const comment = renderArtifactComment(checkpoint);
+    assert.match(comment, /Verification Checkpoint/);
+    assert.match(comment, /src\/a\.ts/);
+    assert.deepEqual(findArtifacts(comment)[0], checkpoint);
+  });
+
   it("renders explainable review routing and consolidated finding lineage", () => {
     const verdict = createArtifact({
       kind: "ReviewVerdict", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },

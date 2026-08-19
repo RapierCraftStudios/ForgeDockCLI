@@ -136,6 +136,8 @@ export interface ReviewFindingInput {
   severity: "critical" | "high" | "medium" | "low";
   confidence: "high" | "medium" | "low";
   blocking: boolean;
+  mustFix?: boolean;
+  rootId?: string;
   title: string;
   causalRoot?: string;
   /** Stable controller-normalized root identity used for projection adoption. */
@@ -152,10 +154,28 @@ export interface ReviewFindingInput {
   matchedAcceptanceCriteria?: readonly string[];
   matchedPriorFindingIds?: readonly string[];
   introducedByRemediation?: boolean;
+  introductionDisposition?: "introduced" | "newly-discovered-preexisting" | "continuation";
+  introductionEvidence?: {
+    priorReproducer: string;
+    currentReproducer: string;
+    causalSymbols: readonly string[];
+    hunkReferences: readonly string[];
+    authorityReferences?: readonly string[];
+  };
   evidenceAnchor?: {
     kind: "repository-location" | "delivery-authority" | "deterministic-check";
     reference: string;
   };
+}
+
+export interface ReviewFindingPublicationFence {
+  repo: string;
+  pullRequest: number;
+  generation: number;
+  runId: string;
+  headSha: string;
+  headBranch: string;
+  baseBranch: string;
 }
 
 export interface PullRequestSnapshot {
@@ -183,6 +203,8 @@ export interface PullRequestMergeGateOptions {
   refreshUnknown?: boolean;
 }
 
+export type PullRequestRequiredChecksProvenance = "github-required" | "unavailable";
+
 export interface PullRequestMergeGate {
   repo: string;
   pullRequest: number;
@@ -194,6 +216,13 @@ export interface PullRequestMergeGate {
   mergeability?: PullRequestMergeability;
   /** Bounded, redacted diagnostic for unknown/unavailable mergeability. */
   mergeabilityReason?: string;
+  /**
+   * Provenance for the required-check set. Optional only so legacy hosts and
+   * persisted records remain decodable; absence never authorizes a merge.
+   */
+  requiredChecksProvenance?: PullRequestRequiredChecksProvenance;
+  /** Immutable commit identity used to read every required-check observation. */
+  requiredChecksHeadSha?: string;
   requiredChecks: Array<{
     name: string;
     state: "pending" | "passed" | "failed" | "cancelled" | "unavailable";
@@ -295,12 +324,22 @@ export interface ForgeHost {
   getPullRequestDiff(repo: string, number: number): Promise<string>;
   /** Exact changed paths between two controller-reviewed commits, when the host can prove them. */
   getChangedPathsBetween?(repo: string, baseSha: string, headSha: string): Promise<readonly string[]>;
+  /** Exact changed hunks/symbol references between reviewed commits. */
+  getChangedHunksBetween?(repo: string, baseSha: string, headSha: string): Promise<readonly string[]>;
   publishPullRequestComment(input: {
     repo: string;
     pullRequest: number;
     marker: string;
     body: string;
   }): Promise<void>;
+  /** Atomically install a newer durable per-PR projection fence after exact route/head validation. */
+  beginReviewFindingPublication?(input: {
+    repo: string;
+    pullRequest: PullRequestSnapshot;
+    runId: string;
+  }): Promise<ReviewFindingPublicationFence>;
+  /** Revalidate the exact current publication generation without mutating. */
+  assertReviewFindingPublication?(fence: ReviewFindingPublicationFence): Promise<void>;
   materializeReviewFinding(input: {
     repo: string;
     sourceIssue?: number;
@@ -308,6 +347,7 @@ export interface ForgeHost {
     runId: string;
     reviewedHeadSha: string;
     reviewerRoles: readonly string[];
+    publicationFence: ReviewFindingPublicationFence;
     finding: ReviewFindingInput;
   }): Promise<IssueSnapshot>;
   /** Close review-finding projections superseded by the latest authoritative verdict. */
@@ -315,6 +355,7 @@ export interface ForgeHost {
     repo: string;
     pullRequest: PullRequestSnapshot;
     runId: string;
+    publicationFence: ReviewFindingPublicationFence;
     activeFindings: readonly ReviewFindingInput[];
   }): Promise<readonly number[]>;
   mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void>;

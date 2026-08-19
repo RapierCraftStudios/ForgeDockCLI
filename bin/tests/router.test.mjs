@@ -6,16 +6,44 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, cpSync, unlinkSync, rmSync, chmodSync, symlinkSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, delimiter } from "node:path";
 import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "forgedock.mjs");
 
+// Router tests exercise CLI routing, not the host machine's Claude installation.
+// Keep doctor/version detection covered with a real executable on PATH, while
+// avoiding slow or interactive host probes and disabling unrelated AI enrichment.
+// The shell stub is POSIX-only; these doctor integration tests already document
+// that Windows cannot execute script stubs through execFileSync("claude", ...).
+const ROUTER_STUB_BIN = process.platform === "win32"
+  ? null
+  : mkdtempSync(join(os.tmpdir(), "fd-router-stub-bin-"));
+if (ROUTER_STUB_BIN) {
+  writeFileSync(
+    join(ROUTER_STUB_BIN, "claude"),
+    "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\nprintf '%s\\n' '2.1.234 (Claude Code)'\n",
+    { mode: 0o755 },
+  );
+}
+
 function runCli(args, { cli = CLI, cwd, home, extraEnv } = {}) {
+  const inheritedPath = extraEnv?.PATH ?? process.env.PATH ?? "";
+  const fixturePath = ROUTER_STUB_BIN
+    ? `${ROUTER_STUB_BIN}${delimiter}${inheritedPath}`
+    : inheritedPath;
   return spawnSync(process.execPath, [cli, ...args], {
     cwd: cwd ?? mkdtempSync(join(os.tmpdir(), "fd-cli-cwd-")),
-    env: { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1", ...extraEnv },
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      NO_COLOR: "1",
+      FORGEDOCK_INIT_BACKEND: "none",
+      ...extraEnv,
+      PATH: fixturePath,
+    },
     encoding: "utf-8",
     timeout: 30000,
   });

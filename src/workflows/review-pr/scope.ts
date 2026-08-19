@@ -21,14 +21,20 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
   controllerEvidence: {
     /** Exact controller-observed diff from the prior reviewed SHA to current head. */
     remediationDeltaPaths?: readonly string[];
+    /** Exact prior->current hunk references (for example path:L10-L20 or path:symbol). */
+    remediationDeltaHunks?: readonly string[];
     /** Explicit authority facts whose prior-verdict value changed. */
     changedRemediationAuthorityReferences?: readonly string[];
   } = {},
 ): T[] {
   const criteria = new Set(packet.payload.acceptanceCriteria);
   const priorFindingIds = new Set(priorVerdict?.payload.findings
-    .filter((finding) => finding.blocking)
-    .flatMap((finding) => [finding.id, ...(finding.sourceFindingIds ?? [])]) ?? []);
+    .filter((finding) => finding.mustFix ?? finding.blocking)
+    .flatMap((finding) => [
+      finding.id,
+      ...(finding.sourceFindingIds ?? []),
+      ...(finding.rootId ? [finding.rootId] : []),
+    ]) ?? []);
 
   return findings.map((finding) => {
     // Compatibility: artifacts produced before scope adjudication existed keep
@@ -59,9 +65,28 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
       const continuesAcceptedFinding = (finding.matchedPriorFindingIds ?? []).some((id) => priorFindingIds.has(id));
       const changedPathEvidence = locationPath !== undefined
         && (controllerEvidence.remediationDeltaPaths ?? []).some((path) => pathMatchesExpectation(locationPath, normalizeRepoPath(path)));
+      const introduction = finding.introductionEvidence;
+      const hunkEvidence = introduction !== undefined
+        && introduction.hunkReferences.some((reference) => (controllerEvidence.remediationDeltaHunks ?? []).includes(reference));
+      const symbolEvidence = introduction !== undefined
+        && introduction.causalSymbols.some((symbol) => introduction.hunkReferences.some((reference) => reference.includes(symbol)));
+      const reproducerEvidence = introduction !== undefined
+        && introduction.priorReproducer.trim() !== introduction.currentReproducer.trim();
       const authorityEvidence = finding.evidenceAnchor?.kind === "delivery-authority"
-        && (controllerEvidence.changedRemediationAuthorityReferences ?? []).includes(finding.evidenceAnchor.reference);
-      const controllerProvesIntroduced = finding.introducedByRemediation === true && (changedPathEvidence || authorityEvidence);
+        && (controllerEvidence.changedRemediationAuthorityReferences ?? []).includes(finding.evidenceAnchor.reference)
+        && introduction?.authorityReferences?.includes(finding.evidenceAnchor.reference) === true;
+      if (finding.introducedByRemediation === true && finding.evidenceAnchor?.kind !== "delivery-authority"
+        && (introduction === undefined
+          || introduction.hunkReferences.length === 0
+          || (controllerEvidence.remediationDeltaHunks ?? []).length === 0
+          || !hunkEvidence)) {
+        throw new Error(`Post-remediation finding ${finding.id} claims introduction without exact current-head hunk authority`);
+      }
+      // A touched path is inventory, not causation. Introduction requires an
+      // exact changed hunk and symbol plus a prior/current reproducer, or an
+      // exact changed authority fact with the same comparative evidence.
+      const controllerProvesIntroduced = finding.introducedByRemediation === true
+        && reproducerEvidence && ((changedPathEvidence && hunkEvidence && symbolEvidence) || authorityEvidence);
       if (!continuesAcceptedFinding && !controllerProvesIntroduced) {
         accepted = false;
         controllerReasons.push(finding.introducedByRemediation
@@ -78,10 +103,19 @@ export function applyFindingScopePolicy<T extends ReviewFinding>(
     const rationale = [finding.scopeRationale, ...controllerReasons.map((reason) => `Controller downgrade: ${reason}.`)]
       .filter((part): part is string => Boolean(part?.trim()))
       .join(" ");
+    const introductionDisposition = priorVerdict?.payload.disposition === "request_changes"
+      ? (finding.matchedPriorFindingIds ?? []).some((id) => priorFindingIds.has(id))
+        ? "continuation" as const
+        : accepted && finding.introducedByRemediation
+          ? "introduced" as const
+          : "newly-discovered-preexisting" as const
+      : finding.introductionDisposition;
     return {
       ...finding,
       blocking: finding.blocking && accepted,
+      mustFix: (finding.mustFix ?? finding.blocking) && accepted,
       scopeDisposition,
+      ...(introductionDisposition ? { introductionDisposition } : {}),
       ...(rationale ? { scopeRationale: rationale } : {}),
       matchedAcceptanceCriteria: exactCriteria,
     };

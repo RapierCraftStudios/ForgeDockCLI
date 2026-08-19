@@ -7,7 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { controllerEnvironment } from "../runtime/controller-environment.js";
 import { BackgroundTaskObservationAdapter } from "../observability/adapters.js";
-import type { ObservationSink } from "../observability/contracts.js";
+import type { ObservationEnvelopeV1, ObservationQuerySource, ObservationSink } from "../observability/contracts.js";
 
 export type BackgroundTaskStatus = "running" | "detached" | "completed" | "blocked" | "failed" | "cancelled";
 
@@ -18,6 +18,8 @@ export type BackgroundTaskStatus = "running" | "detached" | "completed" | "block
  */
 export const NESTED_AGENT_BRIDGE_RESTART_REQUIRED = "nested-agent-bridge" as const;
 export type BackgroundTaskRestartRequirement = typeof NESTED_AGENT_BRIDGE_RESTART_REQUIRED;
+export const TUI_RESTART_TERMINAL_CAUSE = "tui-restart" as const;
+export type BackgroundTaskTerminalCause = typeof TUI_RESTART_TERMINAL_CAUSE;
 export type BackgroundTaskResumeScope = "orchestration" | "work-on" | "review-pr-rerun" | "promote" | "workflow";
 
 const ORCHESTRATION_RESUME_MESSAGE =
@@ -43,6 +45,8 @@ export interface BackgroundTaskRecord {
   startedAt: string;
   completedAt?: string;
   exitCode?: number;
+  /** Why this record was terminalized operationally, when distinct from its process exit. */
+  terminalCause?: BackgroundTaskTerminalCause;
   /** Non-secret operational binding; never store bridge URL/token here. */
   restartRequired?: BackgroundTaskRestartRequirement;
   /** Non-secret routing hint for the durable recovery handoff. */
@@ -67,6 +71,8 @@ const MAX_BACKGROUND_TASKS = 4;
  * bridge-bound controller alone.
  */
 const SUPERVISOR_HEARTBEAT_TTL_MS = 15_000;
+const MIN_OBSERVATION_POLL_MS = 250;
+const MAX_OBSERVATION_POLL_MS = 2_000;
 
 interface LiveTask {
   record: BackgroundTaskRecord;
@@ -87,14 +93,16 @@ export class ForgeDockBackgroundTasks {
   #ticker: NodeJS.Timeout | undefined;
   #ctx: ExtensionContext | undefined;
   #observationAdapter: BackgroundTaskObservationAdapter | undefined;
+  #observationQuery: ObservationQuerySource | undefined;
   readonly #finishing = new Set<string>();
 
   constructor(pi: ExtensionAPI) {
     this.#pi = pi;
   }
 
-  setObservationSink(sink: ObservationSink | undefined): void {
+  setObservationSink(sink: (ObservationSink & Partial<ObservationQuerySource>) | undefined): void {
     this.#observationAdapter = sink ? new BackgroundTaskObservationAdapter(sink) : undefined;
+    this.#observationQuery = sink && isObservationQuerySource(sink) ? sink : undefined;
     if (!this.#observationAdapter) return;
     for (const live of this.#live.values()) {
       if (live.adopted) this.#observationAdapter.adopted(live.record.id, live.record.pid);
@@ -114,13 +122,10 @@ export class ForgeDockBackgroundTasks {
     this.#directories.add(join(ctx.cwd, ".forgedock", "tasks"));
   }
 
-  /** Return restart-bound records without changing their durable state. */
+  /** Return records already terminalized specifically by TUI restart recovery. */
   pendingRestartRecords(ctx: ExtensionContext): BackgroundTaskRecord[] {
     this.bindContext(ctx);
-    return [...this.recordsFromDisk().values()].filter((record) =>
-      (record.status === "running" || record.status === "detached")
-      && record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED
-      && !this.bridgeOwnerIsLive(record));
+    return [...this.recordsFromDisk().values()].filter(isRestartBlockedTask);
   }
 
   /** Present a pending restart warning without adopting or terminalizing it. */
@@ -159,6 +164,7 @@ export class ForgeDockBackgroundTasks {
             record.status = "blocked";
             record.completedAt ??= new Date().toISOString();
             record.exitCode ??= 2;
+            record.terminalCause = TUI_RESTART_TERMINAL_CAUSE;
             this.persist(record);
             this.notifyRestartRequired(record);
             this.#records.set(record.id, record);
@@ -311,8 +317,11 @@ export class ForgeDockBackgroundTasks {
 
   async waitForTerminal(id: string, options: { warnAfterMs?: number } = {}): Promise<BackgroundTaskRecord> {
     const warnAfterMs = options.warnAfterMs ?? 120_000;
-    let lastOutputSize = 0;
+    const waitStartedAt = new Date().toISOString();
+    let observationCursor: string | undefined;
+    let observationCursorInitialized = false;
     let lastProgressAt = Date.now();
+    let emptyObservationPolls = 0;
     let warned = false;
     while (true) {
       const record = this.recordsFromDisk().get(id);
@@ -326,18 +335,55 @@ export class ForgeDockBackgroundTasks {
         }
         throw new Error(`ForgeDock controller task ${id} exited while detached without a locally observable controller result; inspect durable workflow state and resume explicitly`);
       }
-      const outputSize = fileSize(record.logPath) + fileSize(record.stderrLogPath);
-      if (outputSize > lastOutputSize) {
-        lastOutputSize = outputSize;
-        lastProgressAt = Date.now();
-        warned = false;
-      } else if (!warned && Date.now() - lastProgressAt >= warnAfterMs) {
+
+      if (this.#observationQuery) {
+        let semanticActivity = false;
+        try {
+          const events = await this.#observationQuery.query({
+            controllerTaskId: id,
+            ...(observationCursorInitialized && observationCursor !== undefined ? { cursor: observationCursor } : {}),
+            ...(!observationCursorInitialized ? { newestFirst: true, limit: 1 } : { limit: 500 }),
+          });
+          const chronological = observationCursorInitialized ? events : [...events].reverse();
+          if (events.length) observationCursor = chronological.at(-1)?.eventId;
+          semanticActivity = chronological.some((event) => isSemanticBackgroundActivity(event)
+            && (observationCursorInitialized || event.ingestedAt >= waitStartedAt));
+          observationCursorInitialized = true;
+          if (semanticActivity) {
+            lastProgressAt = Date.now();
+            warned = false;
+          }
+        } catch {
+          // Observation storage is rebuildable operational state. A transient or
+          // permanent query failure must neither fail the workflow wait nor be
+          // misreported as semantic progress.
+        }
+        emptyObservationPolls = semanticActivity
+          ? 0
+          : Math.min(32, emptyObservationPolls + 1);
+      }
+
+      const observationPollMs = Math.min(
+        MAX_OBSERVATION_POLL_MS,
+        MIN_OBSERVATION_POLL_MS * 2 ** Math.floor(emptyObservationPolls / 4),
+      );
+      if (!warned && Date.now() - lastProgressAt >= warnAfterMs) {
         warned = true;
-        const message = `ForgeDock controller task ${id} has no observable semantic output for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and recovery is still explicit.`;
+        const message = `ForgeDock controller task ${id} has no semantic activity for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and recovery is still explicit.`;
         this.#ctx?.ui.notify(message, "warning");
         try { this.#pi.sendMessage({ customType: "forgedock-progress-warning", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      const warningPollMs = warned
+        ? observationPollMs
+        : Math.max(1, warnAfterMs - (Date.now() - lastProgressAt));
+      // Query often enough that activity arriving anywhere inside the warning
+      // window is observed before an idle warning can be emitted. Normal
+      // production windows still back off to the capped adaptive cadence.
+      const semanticSafetyPollMs = Math.max(MIN_OBSERVATION_POLL_MS, Math.floor(warnAfterMs / 2));
+      await new Promise((resolve) => setTimeout(
+        resolve,
+        Math.min(observationPollMs, warningPollMs, semanticSafetyPollMs),
+      ));
     }
   }
 
@@ -410,8 +456,7 @@ export class ForgeDockBackgroundTasks {
       // restart classification instead of letting the old supervisor turn it
       // back into an ordinary failed/cancelled result.
       const persisted = this.recordsFromDisk().get(id);
-      const restartBlocked = persisted?.status === "blocked"
-        && persisted.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED;
+      const restartBlocked = persisted !== undefined && isRestartBlockedTask(persisted);
       if (persisted) live.record = persisted;
       if (!restartBlocked && live.record.status !== "cancelled") live.record.status = status;
       live.record.completedAt ??= new Date().toISOString();
@@ -542,6 +587,7 @@ export class ForgeDockBackgroundTasks {
   }
 
   private notifyRestartRequired(record: BackgroundTaskRecord): void {
+    if (record.terminalCause !== TUI_RESTART_TERMINAL_CAUSE) return;
     const resumeMessage = record.resumeScope === "orchestration"
       ? ORCHESTRATION_RESUME_MESSAGE
       : record.resumeScope === "work-on"
@@ -576,6 +622,7 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && Number.isInteger(record.pid) && (record.pid ?? 0) > 0
     && typeof record.logPath === "string" && Boolean(record.logPath)
     && typeof record.startedAt === "string"
+    && (record.terminalCause === undefined || record.terminalCause === TUI_RESTART_TERMINAL_CAUSE)
     && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
     && (record.resumeScope === undefined || ["orchestration", "work-on", "review-pr-rerun", "promote", "workflow"].includes(record.resumeScope))
     && (record.launchKey === undefined || (typeof record.launchKey === "string" && record.launchKey.length > 0 && record.launchKey.length <= 512))
@@ -607,6 +654,32 @@ function fileSize(path: string | undefined): number {
   if (!path) return 0;
   try { return statSync(path).size; } catch { return 0; }
 }
+
+function isObservationQuerySource(value: ObservationSink): value is ObservationSink & ObservationQuerySource {
+  return typeof (value as Partial<ObservationQuerySource>).query === "function";
+}
+
+function isSemanticBackgroundActivity(event: ObservationEnvelopeV1): boolean {
+  if (event.source === "workflow" && event.channel === "activity") {
+    return event.kind === "workflow.progress" || event.kind === "workflow.heartbeat";
+  }
+  if (event.source === "agent" && event.channel === "activity") {
+    return event.kind === "activity.changed"
+      || event.kind === "output.delta"
+      || event.kind === "agent.session.progress";
+  }
+  if (event.source === "agent" && event.channel === "lifecycle") {
+    return /(?:^|\.)session\.(?:started|completed|failed|cancelled)$/.test(event.kind);
+  }
+  if (event.source === "agent" && event.channel === "tool") {
+    return event.kind === "tool.progress" || event.kind === "tool.completed";
+  }
+  if ((event.source === "agent" || event.source === "artifact") && event.channel === "artifact") {
+    return event.kind === "artifact.created" || event.kind === "artifact.submitted";
+  }
+  return false;
+}
+
 function boundedTerminalError(path: string | undefined): string | undefined { if (!path || !existsSync(path)) return undefined; const raw = readFileSync(path, "utf8").trim(); if (!raw) return undefined; return truncateTail(raw, { maxBytes: 2_000, maxLines: 8 }).content.replace(/\s*\n\s*/g, " | "); }
 
 function readLogDelta(path: string | undefined, offset: number): { text: string; nextOffset: number } | undefined {
@@ -626,8 +699,14 @@ function readLogDelta(path: string | undefined, offset: number): { text: string;
   }
 }
 
+export function isRestartBlockedTask(record: BackgroundTaskRecord): boolean {
+  return record.status === "blocked"
+    && record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED
+    && record.terminalCause === TUI_RESTART_TERMINAL_CAUSE;
+}
+
 export function renderRecord(record: BackgroundTaskRecord): string {
-  const restartHint = record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED && record.status === "blocked"
+  const restartHint = isRestartBlockedTask(record)
     ? " · resume required after TUI restart"
     : "";
   return `${record.id} · ${record.status}${record.exitCode !== undefined ? ` (exit ${record.exitCode})` : ""}${restartHint} · pid ${record.pid} · ${record.args.slice(1, 3).join(" ") || record.command}`;

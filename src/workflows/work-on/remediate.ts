@@ -35,15 +35,19 @@ export async function remediateReview(
   dependencies: { runtime: AgentRuntime; runs: RunRepository; onAgentEvent?: AgentEventSink; verifier?: VerificationRunner },
 ): Promise<{ run: RunState; submission: BuilderSubmission; sessionRef: string }> {
   if (input.run.state !== "remediating") throw new Error(`Remediation requires remediating state, found ${input.run.state}`);
-  const findings = input.verdict.payload.findings.filter((finding) => finding.blocking);
-  if (!findings.length) throw new Error("Remediation requires at least one controller-accepted blocking finding");
+  const findings = input.verdict.payload.findings.filter((finding) =>
+    finding.scopeDisposition !== "rejected"
+      && finding.scopeDisposition !== "follow_up"
+      && (finding.mustFix ?? finding.blocking));
+  if (!findings.length) throw new Error("Remediation requires at least one open controller-accepted mustFix root");
+  const clusters = clusterMustFixFindings(findings);
   let run = input.run;
   try {
     const reviewCycle = input.reviewCycle ?? { current: 1, total: 1 };
     const result = await dependencies.runtime.run<BuilderSubmission>({
       id: `${run.runId}:remediate:${input.verdict.payload.headSha}:${run.attempt}`,
       role: "remediator",
-      description: `ForgeDock remediation · cycle ${reviewCycle.current}/${reviewCycle.total} · ${findings.length} blocking finding(s) · BuildResult ${input.buildResult.createdAt} · ReviewVerdict ${input.verdict.createdAt} · remediation remaining ${Math.max(0, reviewCycle.total - reviewCycle.current)}`,
+      description: `ForgeDock remediation · cycle ${reviewCycle.current}/${reviewCycle.total} · ${findings.length} mustFix root(s) in ${clusters.length} cluster(s) · BuildResult ${input.buildResult.createdAt} · ReviewVerdict ${input.verdict.createdAt} · remediation remaining ${Math.max(0, reviewCycle.total - reviewCycle.current)}`,
       observability: {
         phase: "remediation",
         cycle: reviewCycle,
@@ -52,9 +56,10 @@ export async function remediateReview(
         latestArtifacts: { buildResult: input.buildResult.createdAt, reviewVerdict: input.verdict.createdAt },
         remainingRemediationCycles: Math.max(0, reviewCycle.total - reviewCycle.current),
       },
-      objective: `Fix only the accepted blocking findings from review of ${input.verdict.payload.headSha}:\n${JSON.stringify(findings, null, 2)}`,
+      objective: `Fix every open controller-accepted mustFix root from review of ${input.verdict.payload.headSha}. Roots are bounded into at most two coherent clusters; no listed criterion violation may be ignored:\n${JSON.stringify(clusters, null, 2)}`,
       instructions: [
-        "Do not address rejected, non-blocking, speculative, or unrelated cleanup.",
+        "Address every root in every supplied cluster, including accepted medium/non-blocking roots. Do not drop a known frozen-criterion violation merely because it is not independently blocking.",
+        "Do not address rejected, follow-up, speculative, or unrelated cleanup.",
         ...(input.verification?.length ? [
           `Typed verification feedback is available only for these frozen command IDs: ${input.verification.map((command) => `${command.id}=${command.command} ${command.args.join(" ")}`).join("; ")}.`,
         ] : []),
@@ -109,3 +114,54 @@ export async function remediateReview(
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
   }
 }
+
+export interface MustFixCluster {
+  id: string;
+  family: string;
+  rootIds: string[];
+  productionPaths: string[];
+  findings: DurableArtifact<"ReviewVerdict">["payload"]["findings"];
+}
+
+/** Deterministic bounded remediation packets: never silently omit an accepted root. */
+export function clusterMustFixFindings(
+  findings: DurableArtifact<"ReviewVerdict">["payload"]["findings"],
+): MustFixCluster[] {
+  const byFamily = new Map<string, typeof findings>();
+  for (const finding of findings) {
+    const structural = finding.normalizedRoot?.split("\n") ?? [];
+    const family = [
+      (finding.matchedAcceptanceCriteria ?? []).map((criterion) => /criterion-[1-9][0-9]*/i.exec(criterion)?.[0] ?? criterion).sort().join("|"),
+      structural.length >= 5 ? [structural[0], structural[1], structural[3], structural[4]].join("|") : finding.causalRoot ?? finding.title,
+    ].join("::").toLowerCase();
+    const existing = byFamily.get(family) ?? [];
+    byFamily.set(family, [...existing, finding]);
+  }
+  const clusters: MustFixCluster[] = [];
+  for (const [family, members] of byFamily) {
+    for (let offset = 0; offset < members.length; offset += 3) {
+      const chunk = members.slice(offset, offset + 3);
+      const productionPaths = [...new Set(chunk.flatMap((finding) => finding.location ? [findingPath(finding.location)] : [])
+        .filter((path): path is string => Boolean(path) && !isTestPath(path!)))].sort();
+      if (productionPaths.length > 4) {
+        throw new Error(`MustFix cluster ${family} spans ${productionPaths.length} production paths; maximum is 4 and no root may be ignored`);
+      }
+      clusters.push({
+        id: `mustfix-cluster-${clusters.length + 1}`,
+        family,
+        rootIds: chunk.map((finding) => finding.rootId ?? finding.normalizedRoot ?? finding.id),
+        productionPaths,
+        findings: chunk,
+      });
+    }
+  }
+  if (clusters.length > 2) {
+    throw new Error(`Review produced ${clusters.length} mustFix clusters; maximum is 2 and the controller refuses to hide known criterion violations`);
+  }
+  return clusters;
+}
+
+function findingPath(location: string): string | undefined {
+  return /(?:^|[\s`(])([A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)+|[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_.@+-]+)(?=[:#\s`),]|$)/.exec(location.replaceAll("\\", "/"))?.[1];
+}
+function isTestPath(path: string): boolean { return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(path); }

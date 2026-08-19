@@ -20,8 +20,13 @@ describe("deterministic process verification", () => {
     const [result] = await runner.run([{
       id: "pass", command: process.execPath, args: ["-e", "console.log('verified')"],
       cwd: process.cwd(), timeoutMs: 5_000, required: true,
+      policyVersion: "forgedock.verification/v2", targets: ["dist/pass.test.js"], planId: "plan-pass",
     }]);
     assert.equal(result?.status, "passed");
+    assert.equal(result?.commandId, "pass");
+    assert.equal(result?.policyVersion, "forgedock.verification/v2");
+    assert.deepEqual(result?.commandTargets, ["dist/pass.test.js"]);
+    assert.equal(result?.planId, "plan-pass");
     assert.equal(result?.exitCode, 0);
     assert.match(result?.outputDigest ?? "", /^[0-9a-f]{64}$/);
     assert.match(result?.summary ?? "", /verified/);
@@ -161,6 +166,113 @@ describe("deterministic process verification", () => {
     }
   });
 
+  it("releases the machine-global lease before flushing buffered progress", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-progress-lock-"));
+    const lockPath = join(directory, "verification.lock");
+    let completedProgress!: () => void;
+    const completedProgressReached = new Promise<void>((resolve) => { completedProgress = resolve; });
+    let resumeProgress!: () => void;
+    const progressGate = new Promise<void>((resolve) => { resumeProgress = resolve; });
+    const command = {
+      id: "exclusive",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: directory,
+      timeoutMs: 5_000,
+      required: true,
+    } as const;
+    try {
+      const first = new ProcessVerificationRunner({ lockPath }).run([command], undefined, async (event) => {
+        if (event.phase !== "command-completed") return;
+        completedProgress();
+        await progressGate;
+      });
+      await completedProgressReached;
+
+      const second = new ProcessVerificationRunner({ lockPath }).run([command]);
+      const secondResult = await Promise.race([
+        second,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("lease remained held during progress write")), 1_000)),
+      ]);
+      assert.equal(secondResult[0]?.status, "passed");
+      resumeProgress();
+      assert.equal((await first)[0]?.status, "passed");
+    } finally {
+      resumeProgress();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves buffered progress order and command authority when writes fail", async () => {
+    const phases: string[] = [];
+    const results = await isolatedRunner().run([
+      {
+        id: "global",
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: process.cwd(),
+        timeoutMs: 5_000,
+        required: true,
+      },
+      {
+        id: "workspace",
+        command: process.execPath,
+        args: ["-e", "process.exit(7)"],
+        cwd: process.cwd(),
+        timeoutMs: 5_000,
+        required: true,
+        lockScope: "workspace",
+      },
+    ], undefined, (event) => {
+      phases.push(event.phase);
+      throw new Error("progress sink unavailable");
+    });
+
+    assert.deepEqual(phases, [
+      "lock-waiting",
+      "lock-acquired",
+      "command-started",
+      "command-completed",
+      "lock-released",
+      "command-started",
+      "command-completed",
+    ]);
+    assert.deepEqual(results.map((result) => result.status), ["passed", "failed"]);
+    assert.equal(results[1]?.exitCode, 7);
+  });
+
+  it("runs isolated workspace checks concurrently and reports typed command progress", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-independent-"));
+    const lockPath = join(directory, "verification.lock");
+    const progress: string[] = [];
+    const run = (id: string) => new ProcessVerificationRunner({ lockPath }).run([{
+      id,
+      command: process.execPath,
+      args: ["-e", "setTimeout(()=>process.exit(0),300)"],
+      cwd: directory,
+      timeoutMs: 5_000,
+      required: true,
+      lockScope: "workspace" as const,
+    }], undefined, (event) => { progress.push(`${id}:${event.phase}`); });
+    try {
+      const started = performance.now();
+      const [left, right] = await Promise.all([run("left"), run("right")]);
+      const elapsed = performance.now() - started;
+      assert.equal(left[0]?.status, "passed");
+      assert.equal(right[0]?.status, "passed");
+      assert.ok(elapsed < 550, `independent checks took ${elapsed}ms and appear serialized`);
+      assert.deepEqual(progress.filter((entry) => entry.endsWith("command-started")).sort(), [
+        "left:command-started", "right:command-started",
+      ]);
+      assert.deepEqual(progress.filter((entry) => entry.endsWith("command-completed")).sort(), [
+        "left:command-completed", "right:command-completed",
+      ]);
+      assert.equal(progress.some((entry) => entry.includes("lock-")), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("terminates the complete verification process tree on timeout", async () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-tree-"));
     const pidFile = join(directory, "descendant.pid");
@@ -189,6 +301,54 @@ describe("deterministic process verification", () => {
       if (descendantPid && isAlive(descendantPid)) terminatePid(descendantPid);
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it("rejects with the exact cancellation reason after terminating the child", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-cancel-"));
+    const pidFile = join(directory, "child.pid");
+    const controller = new AbortController();
+    const reason = new Error("lease continuity lost");
+    let childPid: number | undefined;
+    try {
+      const run = isolatedRunner().run([{
+        id: "cancelled",
+        command: process.execPath,
+        args: ["-e", "require('node:fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)", pidFile],
+        cwd: directory,
+        timeoutMs: 5_000,
+        required: true,
+        lockScope: "workspace",
+      }], controller.signal);
+      await waitForFile(pidFile);
+      childPid = Number(readFileSync(pidFile, "utf8"));
+      controller.abort(reason);
+      await assert.rejects(run, (error: unknown) => error === reason);
+      await assertEventuallyDead(childPid);
+    } finally {
+      if (childPid && isAlive(childPid)) terminatePid(childPid);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rechecks cancellation after registering the child listener", async () => {
+    const reason = new Error("cancelled during listener registration");
+    let abortedReads = 0;
+    const racingSignal = {
+      get aborted() { abortedReads += 1; return abortedReads >= 2; },
+      reason,
+      addEventListener() {},
+      removeEventListener() {},
+    } as unknown as AbortSignal;
+
+    await assert.rejects(isolatedRunner().run([{
+      id: "listener-race",
+      command: process.execPath,
+      args: ["-e", "setInterval(()=>{},1000)"],
+      cwd: process.cwd(),
+      timeoutMs: 5_000,
+      required: true,
+      lockScope: "workspace",
+    }], racingSignal), (error: unknown) => error === reason);
   });
 
   it("records spawn failures and continues through the remaining verification plan", async () => {
@@ -223,6 +383,14 @@ function isolatedRunner(environment: NodeJS.ProcessEnv = process.env): ProcessVe
     lockPath: join(tmpdir(), `forgedock-verifier-test-${randomUUID()}.lock`),
     environment,
   });
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (existsSync(path)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`verification child did not create ${path}`);
 }
 
 async function assertEventuallyDead(pid: number): Promise<void> {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { assembleWorkUnits, DEFAULT_BATCHING_OPTIONS } from "./assemble.js";
-import { parseBatchContract, parseBatchMemberIssues, renderBatchIssueBody, type BatchableWorkItem } from "./batching.js";
+import { contractBatchGroups, parseBatchContract, parseBatchMemberIssues, renderBatchIssueBody, type BatchableWorkItem } from "./batching.js";
 
 function item(issue: number, overrides: Partial<BatchableWorkItem> = {}): BatchableWorkItem {
   return {
@@ -21,25 +21,103 @@ function item(issue: number, overrides: Partial<BatchableWorkItem> = {}): Batcha
   };
 }
 
+function sensitiveItem(issue: number, overrides: Partial<BatchableWorkItem> = {}): BatchableWorkItem {
+  return item(issue, {
+    riskClass: "security",
+    causalFamily: "token-validation",
+    riskCapabilities: ["credential-validation"],
+    primaryDomain: "identity/session",
+    sharedSymbols: ["verifyToken"],
+    acceptanceCriteria: [`Reject invalid token variant ${issue}`],
+    ...overrides,
+  });
+}
+
 describe("shared work-unit assembly", () => {
-  it("defaults to bounded aggressive ordinary issue grouping with deterministic precedence", () => {
-    const result = assembleWorkUnits([
-      item(3), item(1), item(2, { affectedFiles: ["src/api/b.ts"] }),
-      item(4, { riskClass: "billing" }),
-    ], DEFAULT_BATCHING_OPTIONS);
-    assert.deepEqual(result.groups[0]?.members.map((member) => member.issue), [1, 3]);
-    assert.equal(result.groups[0]?.kind, "same-file");
-    assert.ok(result.ungrouped.some((member) => member.issue === 2));
-    assert.ok(result.excluded.some(({ item: member, reason }) => member.issue === 4 && reason === "billing"));
+  it("defaults five selected issues to five singleton nodes with no contraction", () => {
+    const values = [item(5), item(1), item(3), item(2), item(4)];
+    const result = assembleWorkUnits(values, DEFAULT_BATCHING_OPTIONS);
+    assert.equal(result.policy.policy, "none");
+    assert.equal(result.groups.length, 0);
+    assert.deepEqual(result.selected.map((member) => member.issue), [1, 2, 3, 4, 5]);
+    assert.deepEqual(result.ungrouped.map((member) => member.issue), [1, 2, 3, 4, 5]);
+    assert.equal(result.selected.length, values.length);
+    assert.equal(contractBatchGroups(result.selected, result.groups, []).length, 5);
   });
 
-  it("keeps conservative and none explicit rather than silently changing policy", () => {
-    const values = [item(1), item(2)];
+  it("preserves explicit aggressive contraction and conservative policy", () => {
+    const values = [
+      item(1, { labels: ["review-finding", "priority:P2"] }),
+      item(2, { labels: ["review-finding", "priority:P2"] }),
+      item(3, { labels: ["review-finding", "priority:P2"], affectedFiles: ["src/api/b.ts"] }),
+      item(4, { labels: ["review-finding", "priority:P2"], repository: "owner/other" }),
+    ];
+    const aggressive = assembleWorkUnits(values, { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
     const conservative = assembleWorkUnits(values, { ...DEFAULT_BATCHING_OPTIONS, policy: "conservative" });
-    const none = assembleWorkUnits(values, { ...DEFAULT_BATCHING_OPTIONS, policy: "none" });
-    assert.equal(conservative.groups.length, 0);
-    assert.equal(none.groups.length, 0);
-    assert.deepEqual(none.ungrouped.map((member) => member.issue), [1, 2]);
+    assert.deepEqual(aggressive.groups[0]?.members.map((member) => member.issue), [1, 2]);
+    assert.equal(aggressive.groups[0]?.kind, "same-file");
+    assert.deepEqual(conservative.groups[0]?.members.map((member) => member.issue), [1, 2]);
+    assert.ok(aggressive.ungrouped.some((member) => member.issue === 4));
+    assert.ok(conservative.ungrouped.some((member) => member.issue === 4));
+  });
+
+  it("caps explicitly compatible sensitive batches at two members", () => {
+    assert.equal(DEFAULT_BATCHING_OPTIONS.maxSensitiveBatchSize, 2);
+    const result = assembleWorkUnits([
+      sensitiveItem(1), sensitiveItem(2), sensitiveItem(3),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive", maxSensitiveBatchSize: 3 });
+    assert.deepEqual(result.groups.map((group) => group.members.map((member) => member.issue)), [[1, 2]]);
+    assert.deepEqual(result.ungrouped.map((member) => member.issue), [3]);
+  });
+
+  it("rejects same-file and source-PR hints without explicit sensitive compatibility", () => {
+    const values = [
+      item(10, { riskClass: "security", causalFamily: "token-validation", acceptanceCriteria: ["Reject invalid token"], sourcePullRequest: 44 }),
+      item(11, { riskClass: "security", causalFamily: "token-validation", acceptanceCriteria: ["Reject invalid token"], sourcePullRequest: 44 }),
+    ];
+    const result = assembleWorkUnits(values, { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.equal(result.groups.length, 0);
+    assert.deepEqual(result.ungrouped.map((member) => member.issue), [10, 11]);
+
+    const differentCause = assembleWorkUnits([
+      sensitiveItem(12, { causalFamily: "token-validation" }),
+      sensitiveItem(13, { causalFamily: "permission-bypass" }),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.equal(differentCause.groups.length, 0);
+  });
+
+  it("bounds sensitive batches to four production paths and three atomic criteria", () => {
+    const tooManyPaths = assembleWorkUnits([
+      sensitiveItem(20, { affectedFiles: ["src/security/shared.ts", "src/security/a.ts", "src/security/b.ts"] }),
+      sensitiveItem(21, { affectedFiles: ["src/security/shared.ts", "src/security/c.ts", "src/security/d.ts"] }),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.equal(tooManyPaths.groups.length, 0);
+
+    const tooManyCriteria = assembleWorkUnits([
+      sensitiveItem(22, { acceptanceCriteria: ["Reject expired tokens", "Reject wrong-audience tokens"] }),
+      sensitiveItem(23, { acceptanceCriteria: ["Reject replayed tokens", "Reject malformed tokens"] }),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.equal(tooManyCriteria.groups.length, 0);
+  });
+
+  it("accepts primary-domain or symbol overlap as secondary sensitive evidence", () => {
+    const byDomain = assembleWorkUnits([
+      sensitiveItem(30, { riskCapabilities: ["token-read"], sharedSymbols: ["readToken"] }),
+      sensitiveItem(31, { riskCapabilities: ["token-write"], sharedSymbols: ["writeToken"] }),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.deepEqual(byDomain.groups[0]?.members.map((member) => member.issue), [30, 31]);
+
+    const bySymbol = assembleWorkUnits([
+      sensitiveItem(32, { riskCapabilities: ["token-read"], primaryDomain: "edge", sharedSymbols: ["verifyToken"] }),
+      sensitiveItem(33, { riskCapabilities: ["token-write"], primaryDomain: "worker", sharedSymbols: ["verifyToken"] }),
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
+    assert.deepEqual(bySymbol.groups[0]?.members.map((member) => member.issue), [32, 33]);
+  });
+
+  it("rejects an already-contracted node under none", () => {
+    assert.throws(() => assembleWorkUnits([
+      item(99, { memberIssues: [1, 2] }),
+    ], DEFAULT_BATCHING_OPTIONS), /one selected issue per node/);
   });
 
   it("keeps recoverable needs-human prerequisites as singleton work units", () => {
@@ -47,7 +125,7 @@ describe("shared work-unit assembly", () => {
       item(110, { labels: ["enhancement", "needs-human"], affectedFiles: [] }),
       item(111, { dependencies: ["issue-110"] }),
       item(112, { labels: ["enhancement", "operator-only"] }),
-    ], DEFAULT_BATCHING_OPTIONS);
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
     assert.deepEqual(result.selected.map((member) => member.issue), [110, 111]);
     assert.ok(result.ungrouped.some((member) => member.issue === 110));
     assert.ok(result.excluded.some(({ item: member, reason }) => member.issue === 110 && reason === "recovery-state"));
@@ -58,7 +136,7 @@ describe("shared work-unit assembly", () => {
     const result = assembleWorkUnits([
       item(201, { affectedFiles: ["src/runtime/a.ts"], claims: ["src/runtime/a.ts"], sourcePullRequest: 137 }),
       item(202, { affectedFiles: [".github/workflows/ci.yml"], claims: [".github/workflows/ci.yml"], sourcePullRequest: 137 }),
-    ], DEFAULT_BATCHING_OPTIONS);
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
     assert.equal(result.groups.length, 0);
     assert.deepEqual(result.ungrouped.map((member) => member.issue), [201, 202]);
   });
@@ -69,7 +147,7 @@ describe("shared work-unit assembly", () => {
       item(173, { labels: ["review-finding", "priority:P2", "batch"], sourcePullRequest: 137 }),
       item(139, { labels: ["review-finding", "priority:P2"], sourcePullRequest: 137 }),
       item(143, { labels: ["review-finding", "priority:P2"], sourcePullRequest: 137 }),
-    ], DEFAULT_BATCHING_OPTIONS);
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive" });
     assert.deepEqual(result.selected.map((member) => member.issue), [139, 143, 172, 173]);
     assert.deepEqual(result.groups[0]?.members.map((member) => member.issue), [139, 143]);
     assert.deepEqual(result.ungrouped.map((member) => member.issue), [172, 173]);
@@ -81,7 +159,7 @@ describe("shared work-unit assembly", () => {
       item(1, { labels: ["enhancement", "priority:P1"], milestone: "release" }),
       item(2, { labels: ["enhancement", "priority:P1"], milestone: "release" }),
       item(3, { labels: ["enhancement", "priority:P1"], milestone: "other" }),
-    ], { ...DEFAULT_BATCHING_OPTIONS, priorities: ["P1"], milestone: "release" });
+    ], { ...DEFAULT_BATCHING_OPTIONS, policy: "aggressive", priorities: ["P1"], milestone: "release" });
     assert.deepEqual(result.selected.map((member) => member.issue), [1, 2]);
     assert.deepEqual(result.groups[0]?.members.map((member) => member.issue), [1, 2]);
     assert.throws(() => assembleWorkUnits([], { ...DEFAULT_BATCHING_OPTIONS, milestone: "release", noMilestone: true }), /mutually exclusive/);

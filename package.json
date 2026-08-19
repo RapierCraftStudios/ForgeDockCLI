@@ -70,6 +70,8 @@
     "test": "npm run build && npm run test:next",
     "test:next": "node --test --test-concurrency=4 \"dist/**/*.test.js\"",
     "test:legacy": "node --test --test-concurrency=4 \"bin/tests/**/*.test.mjs\" \"bin/engine/**/*.test.mjs\" \"packages/protocol/test/**/*.test.mjs\"",
+    "certify:orchestration": "npm run build --silent && node scripts/certify-orchestration.mjs",
+    "certify:orchestration:dry-run": "node scripts/certify-orchestration.mjs --dry-run",
     "next": "npm run build --silent && node bin/forgedock-next.mjs",
     "terminal": "npm run build --silent && node bin/forgedock-terminal.mjs",
     "docs:dev": "vitepress dev docs/site",

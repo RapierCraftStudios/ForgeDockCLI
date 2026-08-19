@@ -1,262 +1,182 @@
 # ForgeDock Next implementation status
 
-This is the execution tracker for the greenfield rewrite described in [`../forgedock-next.html`](../forgedock-next.html).
+**Updated:** 2026-08-18
+**Runtime status:** implemented behavior described below
+**Dogfood status:** certification pending; no readiness claim
 
-## Rules
+This tracker summarizes the executable ForgeDock Next core described in
+[`../forgedock-next.html`](../forgedock-next.html). The source and tests are
+authoritative when prose and code differ. Passing local regression tests proves an
+implementation boundary, not live dogfood readiness; the certification ledger is
+[`DOGFOODING-IMPLEMENTATION.md`](DOGFOODING-IMPLEMENTATION.md).
 
-- The legacy engine is evidence and a temporary compatibility path, not a dependency of the new core.
-- Workflow authority stays in typed ForgeDock code.
-- Pi is accessed only through `src/runtime/pi-adapter.ts`.
-- GitHub artifacts are durable truth; local state and Pi sessions are operational aids.
-- No phase is reported complete until its acceptance tests pass.
-- Private AlterLab issue content must not be copied into this repository.
-- [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md) is the sole normative source for protected bytes, identity, delegation, host guarantees, events, leases, bundles, compatibility, and tamper-evidence limits.
-- This documentation milestone does not implement runtime behavior, cryptography, persisted formats, or migrations. A future slice is not complete until its linked conformance tests and evidence pass; prose, parsing, or a green build alone is insufficient.
+## Authority rules
 
-## Verifiable authority milestone map
+- Typed ForgeDock code owns workflow transitions, side effects, verification,
+  review policy, merge admission, and completion.
+- Agents receive bounded role tools and submit typed proposals; they do not receive
+  workflow or GitHub mutation authority.
+- GitHub artifacts plus freshly read repository, PR, check, and issue state are
+  durable semantic truth. SQLite, leases, task records, sessions, and TUI views are
+  operational state.
+- [`VERIFIABLE-WORKFLOW-AUTHORITY.md`](VERIFIABLE-WORKFLOW-AUTHORITY.md) remains the
+  normative source for protected evidence, identity, capabilities, events, leases,
+  bundles, compatibility, and tamper-evidence limits. The current v2 artifacts are
+  legacy-unverified and do not become protected evidence through documentation.
+- No phase or release is called ready until its required tests and live
+  certification evidence pass at one immutable candidate SHA.
 
-The following is the implementation map for subsequent work. Issue references are intentionally pending until the controller creates the corresponding public milestone issues; no private issue content is copied here. Each row MUST cite the indicated anchors in its Build Packet and MUST remain unchecked until the named test/evidence set passes.
+## Implemented workflow core
 
-| Subsequent slice | Normative anchors | Issue reference | Required evidence before completion |
-| --- | --- | --- | --- |
-| Protected envelope, canonicalization, digest, signature, and chain verifier | [`#envelope`](VERIFIABLE-WORKFLOW-AUTHORITY.md#envelope), [`#canonical-bytes`](VERIFIABLE-WORKFLOW-AUTHORITY.md#canonical-bytes), [`#signatures`](VERIFIABLE-WORKFLOW-AUTHORITY.md#signatures), [`#verification`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification) | Pending controller-created issue | Canonical byte vectors, digest/signature vectors, malformed/incomplete/invalid-signature/chain-gap/wrong-binding tests, and full-SHA binding tests |
-| Controller identity, trust roots, rotation, loss, and revocation | [`#identity`](VERIFIABLE-WORKFLOW-AUTHORITY.md#identity) | Pending controller-created issue | Key custody/access-failure, identifier derivation, rotation, historical verification, loss, retirement, and revocation tests |
-| Capabilities, delegation, and replay protection | [`#capabilities`](VERIFIABLE-WORKFLOW-AUTHORITY.md#capabilities) | Pending controller-created issue | Closed-action/default-deny, complete ancestor lifecycle/revocation/expiry/unavailable-lineage, subset/depth, nonce atomicity, reusable logical-request ID/digest and distinct-operation, exact replay and mismatched-ID reuse, authenticated presenter/audience session, unavailable-store, and exact subject/run/SHA tests |
-| Canonical subjects and host adapter conformance | [`#subjects`](VERIFIABLE-WORKFLOW-AUTHORITY.md#subjects), [`#boundaries`](VERIFIABLE-WORKFLOW-AUTHORITY.md#boundaries) | Pending controller-created issue | Subject round trips, discovery, idempotency, stale-SHA, permission/conflict classification, publish/review/merge/CAS guarantee tests |
-| Versioned workflow events and stable views | [`#events`](VERIFIABLE-WORKFLOW-AUTHORITY.md#events) | Pending controller-created issue | Ordering, correlation/causation, duplicate/conflict, gap recovery, unknown-event quarantine, and non-authorizing consumer tests |
-| Distributed leases and compare-and-swap fencing | [`#leases`](VERIFIABLE-WORKFLOW-AUTHORITY.md#leases) | Pending controller-created issue | Acquire/heartbeat/expiry/release/takeover, monotonic sequence, stale-owner fencing, split-brain, idempotency, and unsupported-host tests |
-| Portable bundles and offline verification/import | [`#bundles`](VERIFIABLE-WORKFLOW-AUTHORITY.md#bundles), [`#tamper-limits`](VERIFIABLE-WORKFLOW-AUTHORITY.md#tamper-limits) | Pending controller-created issue | Deterministic archive vectors, size/secret exclusion, offline key/chain/checkpoint tests, conflict import, and archival non-authority tests |
-| Legacy v2 compatibility and protected migration | [`#compatibility`](VERIFIABLE-WORKFLOW-AUTHORITY.md#compatibility), [`#verification`](VERIFIABLE-WORKFLOW-AUTHORITY.md#verification) | Pending controller-created issue | Matrix coverage for valid legacy, valid protected, mixed, malformed, incomplete, unsupported, expired/revoked, and unverifiable sets; no silent rewrite tests |
-| Checkpoint/anchoring and deletion-limit evidence | [`#tamper-limits`](VERIFIABLE-WORKFLOW-AUTHORITY.md#tamper-limits) | Pending controller-created issue | Detectable gap tests, unanchored-tail limitation test, authenticated checkpoint coverage, and retention/recovery evidence |
+### `work-on`
 
-## Vertical slices
+- [x] Typed investigation outcomes (`confirmed`, `invalid`, `decompose`) and durable
+  Intent, Investigation, Build Packet, Build Result, Review Verdict, and Outcome
+  artifacts.
+- [x] Frozen Build Packet scope, stable criterion IDs, exact write authority,
+  bounded discovery reads, isolated worktrees, and controller-observed changed-path
+  validation.
+- [x] Packet-scoped `forgedock.verification/v2` discovery from the refreshed exact
+  base: `diff-check`, at most one safe direct TypeScript integrity gate, and targeted
+  direct Node tests selected by typed packet requirements. No automatic lint, docs,
+  broad npm lifecycle, or nested-coverage inheritance.
+- [x] Required hosted CI treated as live external authority. Auto-merge requires
+  `github-required` provenance, a nonempty required-check set, passing observations
+  at the exact reviewed SHA, and mergeability; pending/unknown is polled and missing,
+  stale, failed, cancelled, contradictory, conflicting, or unavailable authority
+  fails closed.
+- [x] At most two fresh bounded builder repair sessions. Within one live process the
+  repair receives the prior submission/session reference and exact failed-check
+  Outcome; after restart only durable Outcome continuity is reconstructed. Repairs
+  remain in frozen packet scope and return to independent verification.
+- [x] Criterion coverage anchored to frozen paths, symbols, tests/invariants, and
+  required command IDs with passing controller-observed results. A generic green
+  command cannot stand in for semantic criterion evidence. Security-sensitive
+  packets receive controller-derived invariant-matrix row IDs, bounded to 128
+  expanded cases; builders must exercise/anchor them, but the controller does not
+  generate repository tests or prove named symbols/test IDs exist.
+- [x] Exact-SHA publication, review, merge, closure, and recovery freshness checks,
+  including authoritative issue re-read before a merged Outcome is final.
+- [x] Durable checkpoint resume for investigation, build, verification, publication,
+  review/remediation, and completion without replaying completed semantic work.
 
-### 0. Foundation — implemented
+### `review-pr`
 
-- [x] TypeScript build and Node `>=22.19.0` runtime floor
-- [x] Eight v2 artifact schemas, including durable recursive-remediation and typed verification-adjudication checkpoints
-- [x] Human Markdown plus Base64url machine marker codec
-- [x] Typed `work-on` state machine with guarded transitions
-- [x] Optimistic run repository contract with in-memory and SQLite implementations
-- [x] SQLite compare-and-swap transitions and rebuildable artifact cache
-- [x] Provider-neutral `AgentRuntime` contract
-- [x] Deterministic fake runtime
-- [x] Pi 0.83 SDK adapter with terminating structured-output tool
-- [x] Role-based tool grants and read-only investigator boundary
-- [x] Worktree-confined read/search/edit/write operations with lexical and symlink escape rejection
-- [x] Unrestricted agent shell access disabled
-- [x] GitHub issue/comment adapter
-- [x] Cinematic Installer Chrome & Ember palette and F marks moved into an independent new UI module
-- [x] Branded `forgedock-next` development entry point
+- [x] Frozen exact-SHA Review Plans with bounded capability groups, parallel/session/
+  attempt/model-call budgets, fresh independent sessions, and fail-closed partial
+  failure behavior.
+- [x] Durable exact-head `FindingRootLedger` artifacts with monotonic epochs,
+  structural root IDs, aliases/owners, and explicit `open`, `fix-attempted`, `fixed`,
+  `regressed`, `follow-up`, or `rejected` state. Projection plans and receipts use
+  root identity and resume canonical GitHub publication idempotently.
+- [x] Schema-v4 initial and closure Review Plans. Closure review proves exact
+  prior-to-current paths/hunks, retains open-root owners, and requires correctness
+  plus every owner role to assess each prior open/fix-attempted/regressed root;
+  omission becomes `fix-attempted`, not closure.
+- [x] Controller policy derives `mustFix` separately from final `blocking`. A
+  qualifying medium root can remain nonblocking but still force `request_changes`;
+  reviewer booleans are not authority.
+- [x] Bounded remediation selects every accepted `mustFix` root (legacy fallback:
+  `blocking`) and refuses to silently omit roots when cluster bounds are exceeded.
+  Approval requires re-verification, a new pushed SHA, and fresh closure review with
+  no unresolved `mustFix ?? blocking` root.
+- [x] Exact-head required CI and mergeability are refreshed immediately before
+  verdict publication and merge admission. Pending, stale, contradictory, failed,
+  cancelled, or unavailable authority blocks.
 
-### 1. Investigation barrier — implemented and validated on live GitHub probes
+### `orchestrate`
 
-- [x] Resolve an issue through `gh`
-- [x] Create durable Intent
-- [x] Run an isolated investigator through `AgentRuntime`
-- [x] Validate `confirmed`, `invalid`, and `decompose` semantics
-- [x] Emit Investigation and terminal Outcome artifacts
-- [x] Commit deterministic transitions and failures
-- [x] Dry-run support
-- [x] Live read-only Pi adapter smoke test on Node `22.23.2` using the configured `openai-codex/gpt-5.6-sol` model
-- [x] Live combined investigation/GitHub smoke test through isolated repository issues
+- [x] One durable controller shared by CLI and TUI for DAG creation, execution,
+  attempts, persistence, reconciliation, status, and explicit resume.
+- [x] Natural-language selection projected into typed discovery evidence; controller
+  validation freezes repository/query membership, open state, routes, priorities,
+  semantic dependencies, decomposition replacements, and predicted claims before
+  mutation.
+- [x] Default one selected issue per visible DAG node and top-level `work-on` slot.
+  `maxParallel` (validated 1–20) is an issue-slot budget; a contracted node consumes
+  one slot per unique member, while lower transport availability reduces dispatch.
+  An indivisible oversized batch may run alone to avoid deadlock.
+- [x] Streaming ready-set scheduling without static topological execution waves.
+- [x] Separate semantic dependencies and conflict claims. Dependencies require an
+  authoritative successful predecessor Outcome. Claims are same-repository,
+  same-target release-only serialization constraints and release at any terminal
+  predecessor state.
+- [x] Dynamic claim refinement from frozen Build Packet paths, queued-node conflict
+  reevaluation, and exact target refresh before a previously claim-deferred node is
+  dispatched.
+- [x] Explicit batching policies with batching disabled by default. Opt-in assembly
+  supports typed-compatible eligible ordinary issues and review findings. Sensitive
+  security/auth batching requires exactly two members with matching causal-family
+  evidence and secondary proof, and assembly hard-caps it at two even though the
+  current managed-config default remains three. Incompatible work stays singleton;
+  P2/P3 labels alone are not the batching contract.
+- [x] Pure assembly, mutation-free preview, confirmation, authoritative issue
+  revalidation, idempotent materialization, dependency contraction, member Outcome
+  projection, and member closure.
+- [x] Truthful scheduler snapshots and board rows for selected and runnable-now issue
+  demand, requested/sampled-transport/effective caps, running-node status, nested
+  activity, semantic-dependency waits, claim waits, controller capacity,
+  suspension, blocked, awaiting-human, and terminal states. Runnable demand is not
+  presented as occupied.
+- [x] Observation-backed semantic activity for idle accounting. Generic output does
+  not independently prove progress; accepted controller/tool/reviewer observations
+  keep genuinely active work from being cancelled as idle.
+- [x] Durable parent DAG/node records, live-owner reconciliation, completed-node
+  preservation, retained-worktree recovery, and explicit failed/blocked-node resume.
 
-Development invocation after upgrading Node:
+## Configuration and UI
+
+- [x] Marker-bounded `next` configuration in `forge.yaml`, preserving unrelated
+  user-authored content.
+- [x] Independent planning, worker, and reviewer model/thinking selection, review CI
+  policy, delivery targets, merge defaults, orchestration concurrency, scope and
+  remediation bounds, and explicit batching policy.
+- [x] Native status/resume tools, fleet tree, run timeline, Review Desk, and
+  Orchestration Board as non-authorizing projections.
+- [x] Slot and wait text derived from scheduler state rather than inferred from task
+  count or generic transcript output.
+- [x] Background native controllers, passive completion notices, task inspection,
+  process-tree cancellation, and local detach/adoption/reconciliation.
+
+## Implemented local safety boundary
+
+Interactive single-checkout use bootstraps a retained Ed25519 lease witness on first
+mutating dispatch. Headless/direct CLI use can run
+`forgedock-next lease-witness-bootstrap` from the canonical checkout. Complete
+`FORGEDOCK_LEASE_WITNESS_*` environment configuration takes precedence; partial,
+mismatched, unsafe, rolled-back, or unverifiable continuity fails closed.
+
+This is single-machine, single-checkout fencing. Cross-machine/GitHub-backed lease
+coordination and cross-checkout mutual exclusion are not implemented claims.
+Confirmed Deep Plan packets remain active-session state until materialization, and a
+lost owning bridge can still require explicit DAG resume.
+
+## Remaining implementation/cutover work
+
+- [ ] GitHub-backed cross-machine lease coordination.
+- [ ] Token/cost admission budgets in addition to issue-pipeline concurrency.
+- [ ] Durable cross-restart child-session attachment beyond checkpoint resume.
+- [ ] Protected-artifact implementation and conformance slices defined in
+  `VERIFIABLE-WORKFLOW-AUTHORITY.md`.
+- [ ] Legacy artifact read migration, duplicate-engine removal, and final cutover
+  hardening.
+
+## Current verification status
+
+The changed behavior has focused implementation tests, but this document does not
+freeze a test count or claim a green candidate. For the exact candidate checkout,
+run and retain:
 
 ```bash
 npm run build
-node bin/forgedock-next.mjs work-on 123 \
-  --through investigate \
-  --repo owner/repo \
-  --provider openai-codex \
-  --model gpt-5.6-sol \
-  --dry-run
+npm run test:next
+npm run certify:orchestration
+npm run docs:build
+node scripts/conformance-check.mjs
 ```
 
-Remove `--dry-run` only in a designated test repository; it publishes Intent and Investigation comments.
-
-### 2. Complete `work-on` — executable core and CLI implemented
-
-- [x] Build Packet author policy and durable artifact
-- [x] Git worktree adapter and branch ownership
-- [x] Builder session with bounded worktree mutation, typed frozen-verification feedback agency, and no shell/GitHub grant
-- [x] Credential-isolated verification runner with normalized/redacted output digests; every frozen required command executes independently with fail-closed evidence
-- [x] Live controller milestones project review/remediation cycle, phase, reviewer roles, artifact timestamps, remediation budget, active child, and current tool/path into CLI progress and fleet visibility
-- [x] Scope-drift check against expected paths
-- [x] Hook-disabled branch push and PR publication with verified-SHA, raw committed-blob, and asserted Git-tree checks; repository clean filters are rejected
-- [x] End-to-end six-artifact trajectory test through merge and closure
-- [x] Auto-merge default after successful verification and independent approval, with explicit `--no-auto-merge` opt-out
-- [x] Durable, fail-closed remediation admission keyed by parent identity, verified SHA, and finding marker, including interrupted awaiting-dispatch recovery
-- [x] One-shot GitHub App credential refresh and retry for an expiring `gh` token during long controller runs
-- [x] Idempotent publication reconciliation after a crash between push and state commit, including retry coverage for a PR created before the publication transition commits
-- [x] Apply controller-owned issue closure and authoritative re-read for invalid investigation outcomes; preserve decomposition behavior
-- [x] Fail-safe semantic-state reconstruction from GitHub artifacts plus local status store
-- [x] Duplicate-run admission guard: terminal subjects skip and interrupted subjects block unless `--rerun` is explicit
-- [x] Fresh DAG initial dispatch ignores stale workflow labels; only explicit DAG recovery may request checkpoint resume
-- [x] Verification-stage resume from retained workspaces without replaying investigation or build; exhausted baselines require a durable human adjudication before typed resume
-- [x] Review/remediation/publication/completion checkpoint recovery from durable artifacts without replaying completed semantic phases
-- [x] Explicit staging-review source-branch evidence, immutable recovery base refs, and fail-closed cross-branch resume validation
-- [x] Repository-aware lane policy: configurable staging delivery, feature-lane promotion target, protected production target, preview-only orchestration by default, and confirmed canonical milestone-branch provisioning from the repository default
-- [x] Separate durable feature→integration and integration→production promotion controller with typed PR transport, verification/review gates, protected-target checks, exact-SHA merge authorization, resume, and status inspection
-- [x] Claim serialization remains separate from semantic dependencies and releases successors after any terminal predecessor
-- [x] Frozen verification-plan coverage: every controller-approved diff/package command executes and contributes evidence instead of stopping after the first failure or claiming unobserved success
-- [x] Typed controller-owned verification gates plus legacy manual-gate recognition prevent staging/lifecycle evidence from being parsed as unsupported shell commands
-- [x] Script-free isolated dependency preparation reapplies only the pinned pi-subagents visibility patch before verification
-- [x] Same-invocation verification recovery: in-packet build and post-review remediation failures receive at most two evidence-backed builder repairs, with durable crash-resume budgets and no scope widening
-- [x] Truthful Build Results require controller-observed changed paths to match the worker report and explicit coverage for every frozen acceptance criterion
-- [x] Stable criterion IDs plus verbatim builder contracts prevent model wording from changing frozen acceptance evidence
-- [x] Frozen Build Packet scope replaces issue-hint authority durably, grants only bounded discovery reads plus exact writes, and is rebuilt deterministically on resume
-- [x] Terminal merged Outcomes remain unpublished until idempotent trajectory projection and authoritative re-read proof that every parent/member issue is closed
-
-### 3. Independent `review-pr` — executable core and CLI implemented
-
-- [x] Resolve original intent and exact PR head SHA
-- [x] Detached read-only review worktree at the frozen SHA
-- [x] Baseline fresh-context reviewer
-- [x] Typed, immutable Review Plan with a canonical hash over every authority-bearing field, explicit run/repository/PR/packet/delivery context, deterministic legacy-plan replanning, bounded many-to-one execution groups, compatibility projections for older verdict readers, and enforced session/parallel/attempt/model-call/adjudication budgets
-- [x] Mandatory acceptance/correctness capability plus changed-path, added-diff, Build Packet, route-fact, and explicit repository-policy risk routing; reviewer prose cannot expand topology, overlapping data/API routing retains both capabilities in one execution group, and post-remediation reuse requires exact plan lineage and identity
-- [x] Current reviewer submissions require a causal root and typed blocker anchors; normalization retains source/session lineage while blocking severity, confidence, scope, and corroboration derive only from independently qualifying attestations
-- [x] Basic confidence, scope, path, and duplicate filtering before semantic scope adjudication; exact acceptance-criterion scope gates and controller-observed prior-SHA remediation deltas prevent cumulative paths, generic route facts, adjacent concerns, or falsely introduced concerns from expanding delivery
-- [x] At most two attempts per logical review group with exact persisted-session resume first, stable logical task IDs, budget-bounded parallel all-settled waves, preserved successful sibling reports, and fail-closed no-partial-approval behavior
-- [x] Full head SHA, head branch, base branch, and PR-state freshness invalidation before, during, and immediately before verdict publication; standalone review preserves explicit delivery-run lineage
-- [x] Bounded remediation, re-verification, revision push, and fresh re-review loop; remediated Build Results validate rename-complete delivery paths and stable content against frozen scope, an immutable base SHA, and the asserted committed tree across recovery
-- [x] Policy-controlled auto-merge default with explicit per-run or project-level opt-out
-- [x] Live GitHub review smoke test with parallel, independently inspectable nested reviewer sessions
-- [x] Per-execution-group provisional PR comments and a controller-authoritative consolidated Review Verdict; normal remediation keeps root-cause blockers in the verdict, while terminal materialization and reconciliation share one normalized aggregate identity so stale component projections close without closing the active aggregate
-- [x] Preserve schema-valid output across trailing transport failure and resume one genuinely incomplete persisted reviewer session before the single allowed replacement attempt
-
-### 4. Lean `orchestrate` — shared durable controller implemented; distributed coordination pending
-
-- [x] Dependency DAG, unknown-dependency checks, and cycle diagnostics
-- [x] Bounded concurrency with deterministic priority ordering
-- [x] Exact path-prefix and component conflict claims
-- [x] Conservative serialization when no claims are configured
-- [x] Isolated `work-on` worker lifecycle
-- [x] In-memory and SQLite lease ownership, heartbeat, expiry, and stale recovery semantics
-- [x] Explicit issue-set CLI and dry-run plan
-- [x] Natural-language issue discovery produces a typed evidence-backed DAG with priorities, dependencies, and path/component claims
-- [x] Every native `/orchestrate` invocation performs model intent routing first; deterministic controller validation then freezes repository, URL/query membership, count, open-state, milestone, and decomposed-parent constraints before mutation
-- [x] Visible asynchronous workers stream the live DAG ready set without static topological phase barriers
-- [x] Same-session DAG resume preserves completed nodes and retries failed/blocked nodes through durable work-on checkpoint recovery; explicit fresh-rerun authorization is carried to selected failed nodes without repeating unsupported resume mode
-- [x] Interrupted building runs recover their deterministic retained worktree and continue from the frozen Build Packet
-- [x] Shared pure work-unit assembly with aggressive, conservative, and none policies, filters, deterministic clustering, and dependency contraction
-- [x] Authoritative batch revalidation/materialization through ForgeHost with deterministic idempotency markers
-- [x] Compatible ordinary and P2/P3 review findings sharing a bounded concern surface contract into one durable batch issue and one work-on agent
-- [x] Strict machine-readable member contracts are parsed before batch execution
-- [x] Successful batch completion projects a typed merged Outcome and protocol trajectory receipt to each member before closing the member issues
-- [x] Durable recursive-remediation checkpoints, checkpoint-authorized nested child targeting with frozen depth/child limits, synchronized parent-SHA and child-commit ancestry verification, actual expanded-path proof, and exact expanded-review transition without replaying superseded checkpoints or later verified Build Results
-- [x] Explicit ScopeManifest enforcement across investigator, builder, remediator, and reviewer runtime tool grants
-- [x] Scheduler suspension statuses, typed event sinks, orchestration snapshots, and restartable remediation projections
-- [x] Downstream typed work-on admission verifies prerequisite issues have an authoritative completed outcome
-- [x] Durable same-checkout cross-process leases and heartbeats with authenticated retained-checkpoint fencing epochs, typed unverifiable recovery, and controller lease guards; token-only expiry recovery is insufficient, and signed higher-epoch re-enrollment is required after rollback or checkpoint loss
-- [x] Durable SQLite controller progress/heartbeat records are separate from state-machine authority and visible through status
-- [x] Native orchestration does not implicitly resume stale DAGs; durable DAG IDs are shown separately from background task IDs, and DAG output requests resolve through orchestration status
-- [x] Durable parent DAG records persist scheduler nodes, dependencies, child run IDs, terminal status, route metadata, and per-node errors for CLI/status restart inspection
-- [x] SQLite WAL writers use bounded busy timeouts, transactional rollback safety, and bounded busy retries across concurrent controllers
-- [x] Native orchestration resolves a routed repository to one canonical local checkout before reading checkout configuration, opening witnessed SQLite state, or dispatching workers; dispatch paths fail closed for ambiguous, missing, and duplicate target checkouts
-- [x] CLI and TUI use one shared orchestration controller for frozen DAG creation, execution attempts, event projection, persistence, reconciliation, and resume; CLI numeric selection and TUI routed preview remain caller adapters
-- [x] Caller-supplied execution admission is mandatory and backed by a witnessed SQLite lease with heartbeat/fencing; persisted execution claim identities are non-secret token digests
-- [x] `orchestrate --resume <dag-id>`, native status/resume tools, frozen provider/model/thinking metadata, and transport-capacity capping are wired through restart recovery
-- [x] Native controller teardown can detach still-running tasks for later local adoption without weakening explicit cancellation
-- [ ] Cross-machine/GitHub-backed lease coordination (the retained witness port is implemented; GitHub coordination remains a separate future adapter; local recovery remains fail-closed)
-- [ ] Promote Build Packet paths into live scheduler claims
-- [ ] Token/cost budgets in addition to worker concurrency
-- [x] Restart reconciliation tests cover live native adoption, terminal authoritative re-read, completed-node preservation, interrupted-node relaunch, and no duplicate live worker dispatch
-- [ ] Cross-process merge-sequencing integration tests
-
-### 5. ForgeDock terminal (Pi fork)
-
-- [x] Fork Pi at `RapierCraftStudios/pi` and pin it as the `vendor/pi` submodule
-- [x] Preserve the upstream remote and document the fork/update boundary
-- [x] Apply ForgeDock identity, Chrome & Ember startup styling, config namespace, and terminal title in source
-- [x] Add receipt-backed first-run onboarding with welcome/privacy, provider authentication, explicit model selection, and a completion card
-- [x] Replace Pi's product-facing assistant identity in the default system prompt while retaining Pi only as an internal kernel attribution
-- [x] Launch the fork from the primary `forgedock` package entry point
-- [x] Inject controller-backed `/work-on`, `/review-pr`, `/orchestrate`, and `/forgedock-status` commands
-- [x] Expose one semantic native tool per command, activate only the invoked workflow schema, and let the selected model resolve natural-language intent without runtime Markdown loading
-- [x] Bundle pinned `pi-subagents`, launch visible parallel issue workers, and preserve the typed controller as the only mutation authority
-- [x] Surface nested reviewer grandchildren as selectable fleet-tree rows and summarize them as `(+N agents)` on the parent status row
-- [x] Resume incomplete nested reviewers through the package-owned RPC/session lease lifecycle, including child-safe issue-worker RPC registration, bounded handshake failure, structured-output recovery, and no controller polling loop
-- [x] Provide native multi-image clipboard attachments with inline previews plus compact, expandable built-in and ForgeDock semantic-tool presentation without renderer dependencies or execution overrides
-- [x] Route child `need_decision` and `interview_request` escalations to the parent supervisor, with a lazily activated pi-native decision interview for decisions that require the user
-- [x] Add a checkout-safe build-and-launch script plus `/forgedock-runtime` provenance/RPC diagnostics so cached registry runtimes cannot be mistaken for local code
-- [x] Add native session-scoped background controller tasks with task IDs, bounded log tails, completion notifications, `/forgedock-tasks` management, and complete process-tree cancellation
-- [x] Remove fixed wall-clock lifetimes from workflow controllers and nested reviews; retain explicit cancellation, owner-disconnect cleanup, and verification-command and short transport-handshake bounds
-- [x] Materialize issue-worker definitions with an absolute child-only ForgeDock extension path so strict subagent tool allowlists can actually load `forgedock_work_on`
-- [x] Project typed run transitions into auto-provisioned, mutually exclusive `workflow:*` GitHub labels without making labels authoritative
-- [x] Distinguish invalid, blocked, failed, suspended, and awaiting-human states in CLI, TUI, and orchestration board projections
-- [x] Refresh explicitly configured GitHub App credentials at interactive terminal startup through a packaged cross-platform Node helper
-- [x] Serialize verification, bound Node test fanout, terminate full subprocess trees on timeout/cancellation, isolate credential-free verification homes, and redact credential-shaped durable output
-- [x] Keep subagent transcripts out of delivery worktrees and reject automatic remediation outside frozen Build Packet paths
-- [x] Correlate concurrent worker tool calls by call ID and retain only bounded, single-line, credential-redacted failure summaries in live controller logs
-- [x] Bootstrap `forge.yaml` on parent-terminal launch and preserve it through an isolated ForgeDock Next managed section with natural-language `/forgedock-config`, live-catalog model alias resolution, and independent planning, worker, and reviewer role updates
-- [x] Load explicit `FORGE.md` project guidance in the terminal and bounded typed workflow agents
-- [x] Provide token-bounded `devdocs/` memory retrieval with anchors, wiki links, backlinks, and an explicit reference-only authority boundary
-- [x] Persist user-requested preferences and decisions through `/forgedock-remember`
-- [x] Workflow event bus and stable orchestration view model
-- [x] Run timeline projection
-- [x] Review desk checkpoint projection
-- [x] Orchestration board projection
-- [ ] Model/provider profiles and capability diagnostics
-- [x] Tabbed single/multi/preview decision interviews with explicit recommendations, custom answers, notes, review, and elaboration for supervised child escalations
-- [x] Native `/deep-plan` with supervisor/model invocation, bounded dependency-aware rounds, typed planning packets, explicit confirmation, confirmation-gated idempotent GitHub issue-DAG materialization, and an orchestration-ready handoff that never dispatches implicitly
-- [x] Native DAG status and resume tools remain discoverable in assistant mode while workflow mode retains least-authority tool activation
-- [ ] Session attach and durable cross-restart child supervision
-
-### 6. Cutover
-
-- [ ] Legacy artifact read compatibility
-- [ ] Synthetic production-behavior regression suite
-- [ ] Remove Claude/OpenCode runner and hooks
-- [ ] Remove the old engine and duplicate recovery commands
-- [ ] Move non-core commands to extensions/archive
-- [ ] Remove the temporary `forgedock-next` alias
-- [ ] Packaging, docs, and release hardening
-
-## Authenticated lease recovery status
-
-Token-only local lease behavior is insufficient. The Next lease port now carries a
-strictly increasing fencing epoch separate from the holder token and binds SQLite
-rows to an authenticated retained checkpoint. Missing, invalid, divergent, or
-rolled-back continuity fails closed for acquire, heartbeat, release, and guarded
-workflow mutations. Explicit signed higher-epoch re-enrollment is required after
-restore; ordinary expiry recovery is not a continuity recovery. CLI/TUI factories
-must configure a retained witness outside the operational-store backup scope.
-
-Interactive single-checkout dogfooding bootstraps its local witness on first
-dispatch. For headless or direct CLI use, run `forgedock-next lease-witness-bootstrap`
-once from the canonical checkout. It creates non-overwriting Ed25519 material and
-the retained checkpoint under OS-local user data, then stores only path references
-in the ignored `.forgedock/lease-witness.json`. Complete `FORGEDOCK_LEASE_WITNESS_*`
-environment configuration takes precedence. Partial environment configuration,
-checkout/reference mismatch, unsafe key paths, mismatched keys, invalid signatures,
-and group/other-readable private keys on POSIX all fail closed.
-
-This local bootstrap does not claim cross-machine or cross-checkout safety. A
-confirmed Deep Plan packet is still active-session memory until materialization;
-restart therefore requires repeating confirmation. Materialization creates the
-issue-number DAG but requires a separate explicit `/orchestrate` confirmation to
-dispatch it. Native task detach/adoption is local operational recovery; if the
-owning bridge is lost, the durable DAG may require explicit resume.
-
-The staging review gate records validation against reviewed SHA
-`e963e098d259375c1d693efc846e6c568bf7e5e7` and the current target branch in
-[`VERIFIABLE-WORKFLOW-AUTHORITY.md`](./VERIFIABLE-WORKFLOW-AUTHORITY.md).
-
-## Current verification
-
-- New TypeScript build: passing.
-- New core and terminal integration tests cover typed configuration, streaming DAG scheduling, P2/P3 work-unit contraction and member closure, prerequisite admission, FORGE.md preferences, token-bounded devdocs retrieval, links/backlinks, native background controller completion/cancellation, and the previously listed workflow/runtime boundaries, including runtime provenance/RPC diagnostics, lazy semantic-tool dispatch, least-authority issue-child tooling, visible and resumable nested reviewer delegation, scored Review Plans, adaptive specialist escalation, semantic finding consolidation, supervisor escalation activation, tabbed decision-interview rendering, controller streaming, resumable verification, deterministic review thresholds, a complete synthetic `work-on` trajectory across all six artifacts, GitHub reconciliation, dual issue/PR projection, workspace-escape tests, and the branded Pi fork launcher.
-- Pi adapter module import: passing.
-- Live Pi structured-output smoke test: passing both before and after replacing Pi's filesystem tools with ForgeDock's sandboxed operations; the model received only `read`, read `package.json`, called the terminating `submit_artifact` tool, and returned the expected package name/version.
-- Fork source build, focused ForgeDock brand test, terminal version/help launch, CLI status, degraded branding, and package-content smoke tests: passing.
-- ForgeDock Next suite: 356 passing, 0 failing. `npm run build`, `npm run docs:build`, and conformance checks are green. With the staging shell's `jq` path available, the legacy invocation reaches 1,813 passing, 0 failing, and 8 intentionally skipped. Two Windows-only baseline defects were fixed: file-URL conversion for the invariant test module and path-semantic ownership checks for orphaned command symlinks.
-- Phase G in progress: agent receipts are persisted in SQLite and surfaced through `status --json`/trajectory comments, while controller progress is persisted and surfaced through `status --json`; runtime preflight runs before semantic mutation, nested verification scripts produce covered evidence without duplicate execution, and packet/remediation writes are exact-path scoped.
-
-## Resolved environment and dependency blockers
-
-1. **Node runtime:** the machine-wide Node installation was upgraded to `22.23.2` and verified through Winget. A checksum-verified user-scoped `22.23.2` fallback also remains installed, and `bin/forgedock-next.mjs` can re-execute itself with a compatible configured/user-scoped/Pi runtime if launched by an older Node executable.
-2. **Pi ownership and transitive vulnerability:** ForgeDock now maintains the source fork at `RapierCraftStudios/pi` and pins it under `vendor/pi` rather than carrying an opaque compiled copy. The distributed coding-agent dependency resolves fixed `brace-expansion@5.0.9`; ForgeDock development and production audits report zero vulnerabilities. Fork provenance, MIT licensing, upstream synchronization, and the controller/kernel boundary are documented in `vendor/pi/FORGEDOCK.md`.
-3. **GitHub authentication:** interactive startup refreshes `rapiercraft-forgedock[bot]` through the packaged Node helper when `FORGEDOCK_APP_PEM` is configured. This avoids Windows Bash path conversion failures and restores expired installation credentials before workers launch.
-4. **Live lifecycle probes:** issue #4 completed the six-artifact path through parallel nested review, PR #18 merge, issue closure, and successful-workspace cleanup. Issue #16/PR #17 removed the Windows-only legacy verification blockers discovered by the probe.
-5. **CodeQL configuration:** GitHub default setup is the sole authoritative CodeQL producer for this repository; `.github/workflows/codeql.yml` remains absent so default PR/security analysis is not suppressed by dual configuration. Before promoting source PR #186 (reviewed head `8aa2c7ae638699e9fdbcd27b37549ccba6993683`) to `main`, the controller must freshly re-read the external authority and establish all three facts: default setup is enabled, it produced an exact check context for that head and the check passed for the exact head, and the current `main` ruleset no longer requires the legacy `Analyze (javascript-typescript)` context. The exact context and ruleset must be re-read immediately before promotion; neither may be inferred from workflow inventory or historical evidence. Pending, stale, cancelled, failed, mismatched, or unavailable authority blocks promotion. A default-setup outage remains blocked evidence and is not solved by restoring a competing advanced workflow or enabling dual CodeQL modes.
+Run any available Markdown/link checks and the focused scheduler, verification,
+review, work-on, adapter, observer, TUI, and recovery tests. Then complete the
+phased live certification waves in `DOGFOODING-IMPLEMENTATION.md`. Until those
+waves pass against one immutable SHA, the only accurate status is **implemented,
+certification pending**.
