@@ -17,12 +17,12 @@ echo "forge.yaml" >> .gitignore  # if your credentials path is sensitive
 
 ## CLI Flags
 
-`--verbose` and `--fast` apply to both `npx forgedock` (the full install journey) and `npx forgedock init` (config-only regeneration); `--manual` and `--minimal` apply to `init` only:
+`--verbose` and `--fast` apply to both `npx forgedockcli` (the full install journey) and `npx forgedockcli init` (config-only regeneration); `--manual` and `--minimal` apply to `init` only:
 
 | Flag | Behavior |
 |------|----------|
-| `--manual` | `npx forgedock init` only. Skips the annotated review screen and asks plain, one-field-at-a-time prompts instead, pre-filled with the detected values as defaults. |
-| `--minimal` | `npx forgedock init` only. Skips detection enrichment and the review screen entirely, and writes a short `forge.yaml` containing only the three required sections (`project`, `paths`, `branches`) with detected values. |
+| `--manual` | `npx forgedockcli init` only. Skips the annotated review screen and asks plain, one-field-at-a-time prompts instead, pre-filled with the detected values as defaults. |
+| `--minimal` | `npx forgedockcli init` only. Skips detection enrichment and the review screen entirely, and writes a short `forge.yaml` containing only the three required sections (`project`, `paths`, `branches`) with detected values. |
 | `--verbose` | Shows each field's detection source and confidence rationale on the review screen (e.g. `git remote`, `package.json`, `gh api`), instead of only flagging low-confidence fields. |
 | `--fast` | Skips the animation/motion frames and jumps straight to the static screens. |
 
@@ -267,7 +267,7 @@ agents:
 | `subagent_model` | string | No | `default_model`, else `"sonnet"` | Short alias, same accepted values as `default_model`. Overrides the model used for child agents spawned internally by a top-level command (see above). Omit to inherit `default_model`. |
 
 **Resolution order** (highest precedence first):
-1. `--model <id>` — CLI flag, `npx forgedock run` only (headless; main agent only).
+1. `--model <id>` — CLI flag, `npx forgedockcli run` only (headless; main agent only).
 2. `FORGEDOCK_MODEL` env var — headless runner only (main agent only).
 3. `agents.default_model` — this field. Governs the main agent.
 4. Hardcoded default — `"sonnet"` for interactive agents, `"claude-sonnet-5"` for the headless runner (`bin/runner.mjs`'s `DEFAULT_MODEL`).
@@ -277,7 +277,7 @@ agents:
 2. `agents.default_model` — falls back here when `subagent_model` is unset.
 3. Hardcoded default — `"sonnet"`.
 
-**Headless runner note**: `bin/runner.mjs` (`npx forgedock run`, used for CI/headless invocations) calls the Anthropic SDK directly and also accepts a full Anthropic model ID here as a pass-through escape hatch (e.g. `"claude-opus-4-6"`). A full model ID does **not** work for interactive Agent/Task tool calls in command specs — those only accept the short-alias enum (`sonnet`/`opus`/`haiku`/`fable`). Prefer the short alias unless you specifically need a headless-only override. `subagent_model` is interactive-only — it has no headless-runner equivalent, since the headless runner does not spawn child sub-agents.
+**Headless runner note**: `bin/runner.mjs` (`npx forgedockcli run`, used for CI/headless invocations) calls the Anthropic SDK directly and also accepts a full Anthropic model ID here as a pass-through escape hatch (e.g. `"claude-opus-4-6"`). A full model ID does **not** work for interactive Agent/Task tool calls in command specs — those only accept the short-alias enum (`sonnet`/`opus`/`haiku`/`fable`). Prefer the short alias unless you specifically need a headless-only override. `subagent_model` is interactive-only — it has no headless-runner equivalent, since the headless runner does not spawn child sub-agents.
 
 Projects without this section see no behavior change — everything defaults exactly as it did before these fields existed.
 
@@ -791,7 +791,7 @@ adaptive_scripts:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `enabled` | boolean | No | `true` | When `true`, pipeline agents check `.forgedock/scripts/` for a per-repo script before using the universal one. Set to `false` to disable per-repo overrides entirely and always use universal scripts. |
-| `directory` | string (relative path) | No | `".forgedock/scripts"` | Directory where per-repo adaptive scripts live, relative to the project root. Scaffolded by `npx forgedock init`. |
+| `directory` | string (relative path) | No | `".forgedock/scripts"` | Directory where per-repo adaptive scripts live, relative to the project root. Scaffolded by `npx forgedockcli init`. |
 | `commit` | boolean | No | `false` | When `false`, `.forgedock/scripts/` is `.gitignore`d — scripts are local-only and not shared with the team. Set to `true` (and remove the `.gitignore` entry) to commit per-repo scripts to version control. |
 
 **Commands that use this section**: `work-on` (Phase 0B script resolution), any pipeline command that calls a deterministic script
@@ -854,15 +854,15 @@ ForgeDock manages a canonical set of GitHub labels for use across all pipeline c
 
 ```bash
 # Create/update all ForgeDock-managed labels on the repo defined in forge.yaml:
-npx forgedock labels setup
+npx forgedockcli labels setup
 
 # Or target a specific repo explicitly:
-npx forgedock labels setup --repo owner/repo
+npx forgedockcli labels setup --repo owner/repo
 ```
 
 Running this command is idempotent — it creates labels that don't exist and updates the color/description of labels that do. Safe to re-run at any time.
 
-**When to run it**: Once after `npx forgedock install`, or whenever a pipeline command fails with "label not found". The command bootstraps every label the pipeline relies on.
+**When to run it**: Once after `npx forgedockcli install`, or whenever a pipeline command fails with "label not found". The command bootstraps every label the pipeline relies on.
 
 ### Canonical label set
 
@@ -922,7 +922,7 @@ SHOW_ATTRIBUTION=$(yq '.branding.show_attribution // "true"' forge.yaml 2>/dev/n
 
 ## GitHub App Install
 
-During `npx forgedock`, the installer prompts you to install the ForgeDock GitHub App (`rapiercraft-forgedock`) on your account or org.
+During `npx forgedockcli`, the installer prompts you to install the ForgeDock GitHub App (`rapiercraft-forgedock`) on your account or org.
 
 **What installing it does today**: registers the app against the account/org you choose. That's it.
 
@@ -934,7 +934,7 @@ During `npx forgedock`, the installer prompts you to install the ForgeDock GitHu
 
 **Why this matters**: GitHub App installation tokens get materially higher API rate limits than a personal access token, and actions taken with them are attributed to the bot (`rapiercraft-forgedock[bot]`) rather than your personal account. Those benefits are real, but delivering them to arbitrary installers requires a hosted token-minting backend service that doesn't exist yet (tracked as forge#1890). Installing the app today is safe and free, but on its own changes nothing about how the pipeline authenticates.
 
-`npx forgedock doctor` reports this status explicitly (Check 12: "GitHub App / bot token") so you aren't left guessing whether a bot token is active.
+`npx forgedockcli doctor` reports this status explicitly (Check 12: "GitHub App / bot token") so you aren't left guessing whether a bot token is active.
 
 **If you want bot-token behavior today**: you'd need to register your own GitHub App (with your own private key), and drive your own token-refresh loop (mint an installation token via the app's `/app/installations/{id}/access_tokens` API, then `gh auth login --with-token`, repeating before the ~1-hour expiry). This is an advanced, self-hosted setup — ForgeDock does not package a generic version of this for you.
 
@@ -1062,7 +1062,7 @@ Downstream consumers read `field.value` for the raw value and `field.confidence`
 
 ## SessionStart Hook Integration
 
-ForgeDock does **not** write anything into your project's `CLAUDE.md` or `AGENTS.md`. Instead, `npx forgedock` registers a `SessionStart` hook in `~/.claude/settings.json` — a small script that runs at the start of every Claude Code session and prints ForgeDock's context straight to that session, without touching any file in your repo.
+ForgeDock does **not** write anything into your project's `CLAUDE.md` or `AGENTS.md`. Instead, `npx forgedockcli` registers a `SessionStart` hook in `~/.claude/settings.json` — a small script that runs at the start of every Claude Code session and prints ForgeDock's context straight to that session, without touching any file in your repo.
 
 ### How It Works
 
@@ -1071,28 +1071,28 @@ The hook resolves the current directory's state and reacts accordingly:
 | State | Behavior |
 |-------|----------|
 | `managed-active` (`forge.yaml` present, not opted out) | Prints a summary of `forge.yaml` (project, repo, branches) plus the available pipeline commands |
-| `managed-active`, no `forge.yaml` yet | Suggests running `npx forgedock init` |
+| `managed-active`, no `forge.yaml` yet | Suggests running `npx forgedockcli init` |
 | `managed-optedout` | Completely silent — no output |
-| `unmanaged` | Prints a one-time, suppressible nudge to run `npx forgedock enable` |
+| `unmanaged` | Prints a one-time, suppressible nudge to run `npx forgedockcli enable` |
 
-The hook entry is registered idempotently: re-installing (`npx forgedock update`) will not duplicate it, and unrelated hooks or settings in `~/.claude/settings.json` are left untouched. If `settings.json` is malformed, the installer skips writing rather than risk corrupting it.
+The hook entry is registered idempotently: re-installing (`npx forgedockcli update`) will not duplicate it, and unrelated hooks or settings in `~/.claude/settings.json` are left untouched. If `settings.json` is malformed, the installer skips writing rather than risk corrupting it.
 
 ### Commands
 
 | Command | Action |
 |---------|--------|
-| `npx forgedock` / `npx forgedock install` | Registers the SessionStart hook (along with installing commands and writing `forge.yaml`) |
-| `npx forgedock update` | Re-registers the hook when the resolved source can be safely refreshed (relink only — does not touch `forge.yaml`) |
-| `npx forgedock uninstall` | Removes the hook entry from `settings.json` |
+| `npx forgedockcli` / `npx forgedockcli install` | Registers the SessionStart hook (along with installing commands and writing `forge.yaml`) |
+| `npx forgedockcli update` | Re-registers the hook when the resolved source can be safely refreshed (relink only — does not touch `forge.yaml`) |
+| `npx forgedockcli uninstall` | Removes the hook entry from `settings.json` |
 
 ### Opting Out
 
 Per-directory, independent of the global hook registration. Each command acts on the current working directory — run it inside the project directory:
 
 ```bash
-npx forgedock disable  # the current directory goes silent (managed-optedout)
-npx forgedock enable   # re-activate the current directory
-npx forgedock status   # show the current directory's resolved state
+npx forgedockcli disable  # the current directory goes silent (managed-optedout)
+npx forgedockcli enable   # re-activate the current directory
+npx forgedockcli status   # show the current directory's resolved state
 ```
 
 See [Per-Directory State Registry](#per-directory-state-registry) below for how opt-out state is tracked.
@@ -1101,9 +1101,9 @@ See [Per-Directory State Registry](#per-directory-state-registry) below for how 
 
 ## Persisted Toolset Home (`~/.forge/`)
 
-`npx`/`npm` never installs `forgedock` to a stable location on your machine — it resolves to wherever `npx`'s cache (or a global npm install, or a git clone) happens to physically live. Historically, `~/.claude/commands/` and the SessionStart hook's script path were symlinked **directly** from that ephemeral location. When npm/npx (or the OS) later evicted its cache, those symlinks silently dangled — Claude Code sessions stopped getting ForgeDock context with no error shown.
+`npx`/`npm` never installs `forgedockcli` to a stable location on your machine — it resolves to wherever `npx`'s cache (or a global npm install, or a git clone) happens to physically live. Historically, `~/.claude/commands/` and the SessionStart hook's script path were symlinked **directly** from that ephemeral location. When npm/npx (or the OS) later evicted its cache, those symlinks silently dangled — Claude Code sessions stopped getting ForgeDock context with no error shown.
 
-For npm/npx sources, every `npx forgedock` (or `npx forgedock update`) run copies ForgeDock's own installable payload into a stable, version-independent home:
+For npm/npx sources, every `npx forgedockcli` (or `npx forgedockcli update`) run copies ForgeDock's own installable payload into a stable, version-independent home:
 
 ```
 ~/.forge/
@@ -1120,27 +1120,27 @@ For npm/npx sources, every `npx forgedock` (or `npx forgedock update`) run copie
 
 | Command | Behavior |
 |---------|----------|
-| `npx forgedock` / `npx forgedock install` | Copies the resolved package's payload into `~/.forge/` (content-compared — unchanged files are never rewritten) before linking commands, then links from `~/.forge/`, not the original source |
-| `npx forgedock init` | Does not touch `~/.forge/` — `init` only writes `forge.yaml`, it never installs commands |
-| `npx forgedock update` (npm/npx install) | Refreshes `~/.forge/` from whatever the currently-resolved package looks like, then relinks |
-| `npx forgedock update` (git-clone install) | Updates and relinks a `main` checkout; a non-main checkout is left untouched and gets actionable guidance because the current source must remain the source used after the command returns |
-| `npx forgedock doctor` | Reports the effective source path, version, and git branch, then reports `~/.forge/version` and confirms `~/.forge/{bin,commands,scripts,templates}` for npm installs |
+| `npx forgedockcli` / `npx forgedockcli install` | Copies the resolved package's payload into `~/.forge/` (content-compared — unchanged files are never rewritten) before linking commands, then links from `~/.forge/`, not the original source |
+| `npx forgedockcli init` | Does not touch `~/.forge/` — `init` only writes `forge.yaml`, it never installs commands |
+| `npx forgedockcli update` (npm/npx install) | Refreshes `~/.forge/` from whatever the currently-resolved package looks like, then relinks |
+| `npx forgedockcli update` (git-clone install) | Updates and relinks a `main` checkout; a non-main checkout is left untouched and gets actionable guidance because the current source must remain the source used after the command returns |
+| `npx forgedockcli doctor` | Reports the effective source path, version, and git branch, then reports `~/.forge/version` and confirms `~/.forge/{bin,commands,scripts,templates}` for npm installs |
 
 The copy is idempotent: files whose content is already byte-identical are never rewritten, so steady-state re-runs are fast and don't generate false "updated" noise.
 
 ### The Git-Clone Exemption
 
-If you run ForgeDock from a git clone (or a git worktree) of the repo itself — the development/self-hosted install mode — nothing is copied into `~/.forge/`. A git clone is already a stable, user-owned location; copying it into `~/.forge/` and linking commands from the copy instead of the clone would silently disconnect `git pull` (or `npx forgedock update`'s git branch) from what's actually linked into `~/.claude/commands/`. So:
+If you run ForgeDock from a git clone (or a git worktree) of the repo itself — the development/self-hosted install mode — nothing is copied into `~/.forge/`. A git clone is already a stable, user-owned location; copying it into `~/.forge/` and linking commands from the copy instead of the clone would silently disconnect `git pull` (or `npx forgedockcli update`'s git branch) from what's actually linked into `~/.claude/commands/`. So:
 
 - `~/.claude/commands/` continues to symlink directly from the clone, exactly as before this feature.
-- `~/.forge/{bin,commands,scripts,templates}` correctly does **not** exist for this install mode — `npx forgedock doctor` treats that absence as healthy, not a warning.
-- `npx forgedock update` never switches a non-main checkout to `main` and then restores it. That transient update would leave the next invocation running the old branch source, so the command reports the effective path, branch, and version and tells you to run from a main checkout instead.
+- `~/.forge/{bin,commands,scripts,templates}` correctly does **not** exist for this install mode — `npx forgedockcli doctor` treats that absence as healthy, not a warning.
+- `npx forgedockcli update` never switches a non-main checkout to `main` and then restores it. That transient update would leave the next invocation running the old branch source, so the command reports the effective path, branch, and version and tells you to run from a main checkout instead.
 
 ### Not the Same as `~/.forge/{runs,index}`
 
 `~/.forge/` also hosts two **unrelated, pre-existing** directories used by other parts of ForgeDock:
 
-- `~/.forge/runs/` — durable engine run state for `npx forgedock run-issue` / `resume-stalled` (see `bin/engine.mjs`).
+- `~/.forge/runs/` — durable engine run state for `npx forgedockcli run-issue` / `resume-stalled` (see `bin/engine.mjs`).
 - `~/.forge/index/` — the `recall` knowledge index (see `bin/recall.mjs`, `docs/FORGE-PROTOCOL.md`).
 
 These are **engine data**, not the toolset itself, and this feature does not read, write, or otherwise change them. `~/.forge/{bin,commands,scripts,templates,version}` (this section) and `~/.forge/{runs,index}` (engine data) are unrelated siblings that merely happen to live under the same `~/.forge/` root — don't conflate the two when reading `~/.forge/`'s contents.
@@ -1210,7 +1210,7 @@ If you downgrade to a build older than PR #467 **and** your project is accessed 
 **Recovery**: after downgrading, re-apply your opt-out with the older build (run inside the project directory):
 
 ```bash
-npx forgedock disable
+npx forgedockcli disable
 ```
 
 This re-writes the entry under the key form the older build expects.
@@ -1220,9 +1220,9 @@ This re-writes the entry under the key form the older build expects.
 Use the `forgedock enable` and `forgedock disable` commands to add or remove a directory from the opt-out set. Each command acts on the current working directory by default — run it inside the project directory, or pass an explicit path:
 
 ```bash
-npx forgedock enable [dir]   # Remove a directory from the opt-out set (default: cwd)
-npx forgedock disable [dir]  # Add a directory to the opt-out set (default: cwd)
-npx forgedock status [dir]   # Show a directory's resolved state (default: cwd)
+npx forgedockcli enable [dir]   # Remove a directory from the opt-out set (default: cwd)
+npx forgedockcli disable [dir]  # Add a directory to the opt-out set (default: cwd)
+npx forgedockcli status [dir]   # Show a directory's resolved state (default: cwd)
 ```
 
 ---
@@ -1241,8 +1241,8 @@ The directory (`~/.forge/`) is created automatically on first write with `mkdir(
 
 ### When It's Written
 
-- After every successful `npx forgedock install` (end of the onboarding journey, right after the "Forged." celebration screen).
-- After every successful `npx forgedock update` — the main git-clone branch and npm branch route through the same repair step (`relinkAndHint()`), so the receipt is refreshed either way. A non-main git-clone advisory intentionally does not relink or rewrite the receipt.
+- After every successful `npx forgedockcli install` (end of the onboarding journey, right after the "Forged." celebration screen).
+- After every successful `npx forgedockcli update` — the main git-clone branch and npm branch route through the same repair step (`relinkAndHint()`), so the receipt is refreshed either way. A non-main git-clone advisory intentionally does not relink or rewrite the receipt.
 
 The write is best-effort and never blocks or fails the install/update it records: any error (permission denied, disk full, unusual `FORGE_HOME` layout) degrades silently to a no-op, matching the fail-open contract already used by the command-manifest and hook-registration steps.
 
