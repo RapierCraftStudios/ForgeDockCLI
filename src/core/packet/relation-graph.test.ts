@@ -49,11 +49,15 @@ describe("controller relation graph", () => {
   });
 
   it("rejects conflicting edge IDs and missing authoritative node digests", () => {
+    assert.throws(() => buildRelationGraph({ baseSha: "d".repeat(40), seeds: [{ path: "src/./escape.ts", provenance: "issue" }], limits }), /Invalid repository path/);
+    assert.throws(() => buildRelationGraph({ baseSha: "d".repeat(40), seeds: [{ path: "..\\escape.ts", provenance: "issue" }], limits }), /Invalid repository path/);
+    assert.throws(() => buildRelationGraph({ baseSha: "e".repeat(40), seeds: [{ path: "a.ts", provenance: "issue" }], facts: [{ adapterId: "x", nodes: [], edges: [{ id: "bad", sourceId: "x", targetId: "y", kind: "import", adapterId: "x", provenance: "repository", evidenceDigest: "bad" }] }], limits }), /digest/);
     const digest = digestRelation("node");
     const node = { id: fileNodeId("src/a.ts"), kind: "file" as const, identity: "src/a.ts", digest };
     const edge = { id: "same", sourceId: node.id, targetId: node.id, kind: "import" as const, adapterId: "a", provenance: "repository" as const, sourcePath: "src/a.ts", targetPath: "src/a.ts", evidenceDigest: digestRelation("one") };
     assert.throws(() => buildRelationGraph({ baseSha: "1".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue", contentDigest: digest }], facts: [{ adapterId: "a", nodes: [node], edges: [edge] }, { adapterId: "b", nodes: [node], edges: [{ ...edge, adapterId: "b", evidenceDigest: digestRelation("two") }] }] }), /edge collision/);
-    assert.throws(() => buildRelationGraph({ baseSha: "2".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue" }], facts: [{ adapterId: "a", nodes: [node], edges: [] }] }), /authoritative content digest/);
+    const { digest: _omittedDigest, ...undigestedNode } = node;
+    assert.throws(() => buildRelationGraph({ baseSha: "2".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue" }], facts: [{ adapterId: "a", nodes: [undigestedNode], edges: [] }] }), /valid content digest/);
   });
 
   it("keeps closure bounded by bytes, files, depth, and collateral", () => {
