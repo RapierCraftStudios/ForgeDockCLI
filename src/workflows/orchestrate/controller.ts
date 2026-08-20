@@ -994,7 +994,7 @@ export class OrchestrationController {
     attempt: OrchestrationWorkerAttemptRecord,
     result: Exclude<ScheduleWorkerResult, void>,
   ): Promise<Exclude<ScheduleWorkerResult, void>> {
-    if (result.status !== "retry_wait" || result.retryCheckpointId !== undefined || !this.dependencies.retryArtifacts) return result;
+    if ((result.status !== "retry_wait" && result.retryCode?.endsWith("-exhausted") !== true) || result.retryCheckpointId !== undefined || !this.dependencies.retryArtifacts) return result;
     const repository = item.repository ?? state.record.repository;
     const operationKey = result.operationKey ?? `${result.retryDomain ?? "workflow"}:${result.retryCode ?? "retryable"}`;
     const checkpoint = await persistRetryCheckpoint({
@@ -2053,16 +2053,17 @@ function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleW
     ? { operationKey: `${classification.domain}:${classification.code}` }
     : { retryAfterMs: classification.retryAfterMs, operationKey: `${classification.domain}:${classification.code}` };
   const delay = retryBackoffMs(attempt, backoffOptions);
+  const exhausted = attempt >= maxAttempts;
   return {
-    status: "retry_wait",
+    status: exhausted ? "failed" : "retry_wait",
     error: error instanceof Error ? error : String(error),
-    retryable: true,
+    retryable: !exhausted,
     retryAfterMs: delay,
     nextAttemptAt: new Date(Date.now() + delay).toISOString(),
     attempt,
     maxAttempts,
     retryDomain: classification.domain,
-    retryCode: classification.code,
+    retryCode: exhausted ? `${classification.code}-exhausted` : classification.code,
     operationKey: `${classification.domain}:${classification.code}`,
   };
 }

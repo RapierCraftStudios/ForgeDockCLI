@@ -87,7 +87,8 @@ test("waitForTerminal resets semantic idle only for correlated semantic observat
     ["artifact", "artifact", "artifact.submitted"],
     ["agent", "activity", "agent.session.progress"],
   ] as const;
-  for (const [source, channel, kind] of events) {
+  await observer.emit({ producer, identity: { controllerTaskId: record.id }, source: events[0][0], channel: events[0][1], kind: events[0][2], payload: {} });
+  for (const [source, channel, kind] of events.slice(1)) {
     await new Promise((resolve) => setTimeout(resolve, 120));
     await observer.emit({ producer, identity: { controllerTaskId: record.id }, source, channel, kind, payload: {} });
   }
