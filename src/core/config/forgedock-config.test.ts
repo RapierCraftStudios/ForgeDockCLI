@@ -1,11 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, resolveReviewCiConfig, updateForgeDockConfig } from "./forgedock-config.js";
+
+function findRepositoryRoot(start: string): string {
+  let current = resolve(start);
+  while (true) {
+    if (existsSync(join(current, "package.json"))) return current;
+    const parent = dirname(current);
+    if (parent === current) throw new Error("Unable to locate repository root");
+    current = parent;
+  }
+}
+
+const repositoryRoot = findRepositoryRoot(dirname(fileURLToPath(import.meta.url)));
+const staleNpxForgedockPattern = /\bnpx\s+forgedock(?!cli)\b/;
+
+function readRepositoryFile(path: string): string {
+  return readFileSync(join(repositoryRoot, path), "utf8");
+}
 
 describe("ForgeDock Next project configuration", () => {
   it("bootstraps a valid minimal forge.yaml exactly once", () => {
@@ -131,6 +149,29 @@ describe("ForgeDock Next project configuration", () => {
   it("applies a configured thinking suffix idempotently", () => {
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol", "max"), "openai-codex/gpt-5.6-sol:max");
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol:high", "max"), "openai-codex/gpt-5.6-sol:max");
+  });
+  it("keeps configuration documentation and package identity coherent", () => {
+    const documentation = readRepositoryFile("docs/CONFIG.md");
+    assert.doesNotMatch(documentation, staleNpxForgedockPattern);
+    assert.match(documentation, /npx forgedockcli install/);
+    assert.match(documentation, /npx forgedockcli init/);
+    assert.match(documentation, /npx forgedockcli update/);
+
+    for (const staleInvocation of ["npx forgedock", "npx forgedock init", "npx forgedock update"]) {
+      assert.match(staleInvocation, staleNpxForgedockPattern);
+    }
+    for (const renamedInvocation of ["npx forgedockcli", "npx forgedockcli init", "npx forgedockcli update"]) {
+      assert.doesNotMatch(renamedInvocation, staleNpxForgedockPattern);
+    }
+    assert.doesNotMatch("forgedock", staleNpxForgedockPattern);
+
+    const packageManifest = JSON.parse(readRepositoryFile("package.json"));
+    const packageLock = JSON.parse(readRepositoryFile("package-lock.json"));
+    assert.equal(packageManifest.name, "forgedockcli");
+    assert.equal(packageManifest.bin.forgedockcli, "bin/forgedock-terminal.mjs");
+    assert.equal(packageManifest.bin.forgedock, "bin/forgedock-terminal.mjs");
+    assert.equal(packageLock.name, "forgedockcli");
+    assert.equal(packageLock.packages[""].name, "forgedockcli");
   });
   it("round-trips repository-owned review CI policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.deepEqual(resolveReviewCiConfig(), { failureAction: "ask", maxFixAttempts: 2, deliveryChecks: ["*"], promotionChecks: ["*"], deploymentChecks: ["*"], repairPaths: [], requiredChecksDefault: "require", requiredChecksTargets: {} }); updateForgeDockConfig(cwd, { review: { ci: { failureAction: "auto-fix", maxFixAttempts: 3, deliveryChecks: ["build"], repairPaths: [".github/workflows"], requiredChecks: { default: "require", targets: { staging: "if-present" } } } } }); assert.equal(resolveReviewCiConfig(readForgeDockConfig(cwd)).failureAction, "auto-fix"); assert.equal(resolveReviewCiConfig(readForgeDockConfig(cwd)).requiredChecksTargets.staging, "if-present"); assert.match(readFileSync(join(cwd, "forge.yaml"), "utf8"), /failure_action: "auto-fix"/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
   it("rejects unsafe CI repair policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.throws(() => updateForgeDockConfig(cwd, { reviewCiMaxFixAttempts: 6 }), /1 to 5/); assert.throws(() => updateForgeDockConfig(cwd, { reviewCiRepairPaths: ["../outside"] }), /repository-relative/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
