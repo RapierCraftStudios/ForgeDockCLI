@@ -851,10 +851,23 @@ async function workOn(
       const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
       const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
       const packet = latestArtifactOfKind(runArtifacts, "BuildPacket");
-      if (admission.checkpoint === "target-advance") {
+      const retryTargetsDelivery = admission.checkpoint === "retry" && latestArtifactOfKind(runArtifacts, "TargetAdvanceCheckpoint") !== undefined;
+      if (admission.checkpoint === "target-advance" || retryTargetsDelivery) {
+        const retryCheckpoint = latestArtifactOfKind(runArtifacts, "RetryCheckpoint");
+        if (retryCheckpoint?.payload.status === "waiting") {
+          const nextAt = Date.parse(retryCheckpoint.payload.attempt.nextAt);
+          if (Number.isFinite(nextAt) && nextAt > Date.now()) {
+            throw new Error(`RetryCheckpoint ${retryCheckpoint.id} is not due until ${retryCheckpoint.payload.attempt.nextAt}`);
+          }
+        }
         await orchestration?.promoteTargetRouteClaim?.();
         const targetCheckpoint = latestArtifactOfKind(runArtifacts, "TargetAdvanceCheckpoint");
-        const targetBuild = latestArtifactOfKind(runArtifacts, "BuildResult");
+        const targetBuild = targetCheckpoint
+          ? runArtifacts.find((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult" && artifact.id === targetCheckpoint.payload.sourceBuildResultId)
+          : undefined;
+        const targetFreshBuild = targetCheckpoint?.payload.freshBuildResultId
+          ? runArtifacts.find((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult" && artifact.id === targetCheckpoint.payload.freshBuildResultId)
+          : undefined;
         if (!targetCheckpoint || !targetBuild || !packet || !investigation) {
           throw new Error(`Run ${resumeRunId} lacks the packet, investigation, BuildResult, and target checkpoint required for target recovery`);
         }
@@ -869,8 +882,8 @@ async function workOn(
         const targetVerification = discoverVerificationCommands(process.cwd(), targetCheckpoint.payload.sourceBaseSha);
         const recovered = await resumeTargetAdvanceWorkOn({
           run: targetRun, checkpoint: targetCheckpoint, intent: intentArtifact!, investigation, packet,
-          buildResult: targetBuild, ...(targetPr !== undefined ? { pullRequest: targetPr } : {}), workspace: targetWorkspace,
-          resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(process.cwd(), baseSha),
+          buildResult: targetBuild, ...(targetFreshBuild !== undefined ? { freshBuildResult: targetFreshBuild } : {}), ...(targetPr !== undefined ? { pullRequest: targetPr } : {}), workspace: targetWorkspace,
+          resolveVerificationCatalog: (baseSha: string) => discoverVerificationCommands(process.cwd(), baseSha),
           verification: targetVerification, signal: leaseController.signal,
         }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, leaseGuard, ...(orchestration?.promoteTargetRouteClaim ? { promoteTargetRouteClaim: orchestration.promoteTargetRouteClaim } : {}), onAgentEvent });
         process.stdout.write(`${statusGlyph("active", mode)} Recovered target movement for ${resumeRunId} at ${recovered.buildResult.payload.headSha}; fresh review admission is required
@@ -941,7 +954,7 @@ async function workOn(
           baseBranch: deliveryTargetBranch,
           scopeHints: { affectedFiles: earlyAffectedFiles, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
           verification,
-          resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(process.cwd(), baseSha),
+          resolveVerificationCatalog: (baseSha: string) => discoverVerificationCommands(process.cwd(), baseSha),
           scopeExpansion: parentRemediation ? "recursive" : effectiveOrchestration.scopeExpansion,
           maxRemediationCycles: effectiveOrchestration.maxRemediationCycles,
           maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effectiveOrchestration.maxRemediationDepth,
@@ -2387,12 +2400,16 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
                 error: error.message,
                 retryable: true,
                 ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
-                retryAfterMs: 500,
-                attempt: error.run.attempt,
-                maxAttempts: 3,
-                nextAttemptAt: new Date(Date.now() + 500).toISOString(),
-                retryDomain: "workflow",
-                retryCode: "target-advanced",
+                ...(error.retryCheckpointId ? { retryCheckpointId: error.retryCheckpointId } : {}),
+                retryAfterMs: error.retryDisposition.retryAfterMs ?? 500,
+                attempt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.number
+                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.number ?? error.run.attempt,
+                maxAttempts: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.max
+                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.max ?? 3,
+                nextAttemptAt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.nextAt
+                  ?? new Date(Date.now() + (error.retryDisposition.retryAfterMs ?? 500)).toISOString(),
+                retryDomain: error.retryDisposition.domain,
+                retryCode: error.retryDisposition.code,
               };
             }
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
@@ -2868,12 +2885,16 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
                 error: error.message,
                 retryable: true,
                 ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
-                retryAfterMs: 500,
-                attempt: error.run.attempt,
-                maxAttempts: 3,
-                nextAttemptAt: new Date(Date.now() + 500).toISOString(),
-                retryDomain: "workflow",
-                retryCode: "target-advanced",
+                ...(error.retryCheckpointId ? { retryCheckpointId: error.retryCheckpointId } : {}),
+                retryAfterMs: error.retryDisposition.retryAfterMs ?? 500,
+                attempt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.number
+                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.number ?? error.run.attempt,
+                maxAttempts: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.max
+                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.max ?? 3,
+                nextAttemptAt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.nextAt
+                  ?? new Date(Date.now() + (error.retryDisposition.retryAfterMs ?? 500)).toISOString(),
+                retryDomain: error.retryDisposition.domain,
+                retryCode: error.retryDisposition.code,
               };
             }
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);

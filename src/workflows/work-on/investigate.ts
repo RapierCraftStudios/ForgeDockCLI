@@ -346,18 +346,24 @@ function enforceInvestigationSemantics(payload: InvestigationPayload): void {
 export class WorkflowExecutionError extends Error {
   readonly recoverable: boolean;
   readonly retryDisposition: RetryClassification;
-  readonly targetAdvanceCheckpointId?: string;
+  readonly targetAdvanceCheckpointId: string | undefined;
+  readonly retryCheckpointId: string | undefined;
 
   constructor(message: string, readonly run: RunState, options: ErrorOptions & {
     recoverable?: boolean;
     /** Typed retry authority; `recoverable` remains supported for old callers. */
     retryDisposition?: RetryClassification;
-    /** Durable target/retry checkpoint identity for scheduler propagation. */
+    /** Durable target checkpoint identity for scheduler propagation. */
+    targetAdvanceCheckpointId?: string;
+    /** Durable RetryCheckpoint identity for scheduler propagation. */
+    retryCheckpointId?: string;
+    /** Backwards-compatible alias for target checkpoint identity. */
     checkpointId?: string;
   } = {}) {
     super(message, options);
     this.name = "WorkflowExecutionError";
-    if (options.checkpointId !== undefined) this.targetAdvanceCheckpointId = options.checkpointId;
+    this.targetAdvanceCheckpointId = options.targetAdvanceCheckpointId ?? options.checkpointId;
+    this.retryCheckpointId = options.retryCheckpointId;
     const classified = options.retryDisposition
       ?? classifyRetryableError(options.cause, { domain: "workflow" });
     this.retryDisposition = options.retryDisposition ?? (options.recoverable === true

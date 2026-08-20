@@ -38,14 +38,17 @@ export async function persistRetryCheckpoint(input: {
     throw new Error("Retry checkpoint attempt and delay bounds are invalid");
   }
   const prior = (await input.artifacts.list(input.subject, "RetryCheckpoint"))
-    .filter((artifact): artifact is DurableArtifact<"RetryCheckpoint"> => artifact.kind === "RetryCheckpoint" && artifact.runId === input.runId)
+    .filter((artifact): artifact is DurableArtifact<"RetryCheckpoint"> => artifact.kind === "RetryCheckpoint"
+      && artifact.runId === input.runId
+      && artifact.payload.operationKey === input.operationKey
+      && artifact.payload.semanticKey === input.semanticKey)
     .sort((left, right) => left.payload.updatedAt.localeCompare(right.payload.updatedAt) || left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
     .at(-1);
   const now = new Date().toISOString();
   const firstAt = prior?.payload.attempt.firstAt ?? now;
   const nextAttemptAt = input.nextAttemptAt
     ?? new Date(Date.now() + (input.retryAfterMs ?? 0)).toISOString();
-  const status = input.status ?? (input.attempt > input.maxAttempts ? "exhausted" : "waiting");
+  const status = input.status ?? (input.attempt >= input.maxAttempts ? "exhausted" : "waiting");
   const cause = input.cause instanceof Error ? input.cause : new Error(String(input.cause));
   const payload: RetryCheckpointPayload = {
     checkpoint: "retry",

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import type { RetryClassification } from "../../core/retry.js";
+import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
@@ -85,10 +85,15 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
     || buildResult.runId !== run.runId || intent.runId !== run.runId) {
     throw new Error("Target recovery packet/build/intent identity does not match the admitted run");
   }
+  const retainedHead = checkpoint.payload.freshBuildResultId && checkpoint.payload.phase !== "target-read"
+    ? (checkpoint.payload.integrationHeadSha ?? checkpoint.payload.mergeHeadSha ?? checkpoint.payload.sourceHeadSha)
+    : checkpoint.payload.sourceHeadSha;
   if (pullRequest !== undefined
     && (pullRequest.repo.toLowerCase() !== checkpoint.payload.repository.toLowerCase()
+      || pullRequest.number !== checkpoint.payload.pullRequest && checkpoint.payload.pullRequest !== undefined
       || pullRequest.baseBranch !== checkpoint.payload.targetBranch
-      || pullRequest.headSha.toLowerCase() !== checkpoint.payload.sourceHeadSha.toLowerCase())) {
+      || pullRequest.headBranch !== workspace.branch
+      || pullRequest.headSha.toLowerCase() !== retainedHead.toLowerCase())) {
     throw new Error("Target recovery checkpoint does not match the retained pull request route or head");
   }
   if (checkpoint.payload.targetBranch !== run.targetBranch || checkpoint.payload.repository.toLowerCase() !== run.subject.repo.toLowerCase()) {
@@ -96,6 +101,9 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
   }
   if (checkpoint.payload.sourceVerdictId !== undefined && input.priorVerdict?.id !== checkpoint.payload.sourceVerdictId) {
     throw new Error("Target recovery checkpoint source verdict does not match the retained PR verdict");
+  }
+  if (checkpoint.payload.sourceVerdictId === undefined && input.priorVerdict !== undefined && checkpoint.payload.phase !== "target-read") {
+    throw new Error("Target recovery retained an unexpected source verdict");
   }
   if (checkpoint.payload.routeClaimKey !== normalizedTargetRouteClaim(checkpoint.payload.repository, checkpoint.payload.targetBranch)
     || JSON.stringify([...checkpoint.payload.expectedPaths].sort()) !== JSON.stringify([...packet.payload.expectedPaths].sort())) {
@@ -110,14 +118,44 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
   }
 }
 
+async function assertTargetReceiptChain(input: TargetAdvanceResumeInput, artifacts: ArtifactRepository): Promise<void> {
+  const payload = input.checkpoint.payload;
+  const ordered = await artifacts.list(input.run.subject);
+  const requireField = (value: string | undefined, label: string): string => {
+    if (!value) throw new Error(`Target recovery ${payload.phase} receipt is missing ${label}`);
+    return value;
+  };
+  if (payload.phase === "integrated" || payload.phase === "verified" || payload.phase === "fenced" || payload.phase === "pushed" || payload.phase === "reviewed") {
+    const integration = requireField(payload.integrationHeadSha, "integration head");
+    const merge = requireField(payload.mergeHeadSha, "merge head");
+    if (integration.toLowerCase() !== merge.toLowerCase()) throw new Error("Target recovery integration and merge receipts disagree");
+  }
+  if (payload.phase === "verified" || payload.phase === "fenced" || payload.phase === "pushed" || payload.phase === "reviewed") {
+    const verificationId = requireField(payload.freshVerificationCheckpointId, "fresh verification checkpoint");
+    const buildId = requireField(payload.freshBuildResultId, "fresh BuildResult");
+    const verification = ordered.find((artifact): artifact is DurableArtifact<"VerificationCheckpoint"> => artifact.kind === "VerificationCheckpoint" && artifact.id === verificationId);
+    const fresh = ordered.find((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult" && artifact.id === buildId);
+    if (!verification || !fresh || verification.runId !== input.run.runId || fresh.runId !== input.run.runId) throw new Error("Target recovery fresh receipt references are missing or cross-run");
+    if (fresh.payload.headSha.toLowerCase() !== payload.integrationHeadSha!.toLowerCase() || verification.payload.verifiedContentDigest !== payload.verifiedContentDigest) throw new Error("Target recovery fresh receipt content or head proof is stale");
+    if (fresh.payload.baseSha?.toLowerCase() !== payload.observedTargetSha.toLowerCase() || verification.payload.baseSha.toLowerCase() !== payload.observedTargetSha.toLowerCase()) throw new Error("Target recovery fresh receipt base is stale");
+  }
+  if (payload.phase === "pushed" || payload.phase === "reviewed") {
+    const pushed = requireField(payload.pushedHeadSha, "pushed head");
+    if (payload.pullRequest === undefined) throw new Error(`Target recovery ${payload.phase} receipt is missing pull request identity`);
+    if (pushed.toLowerCase() !== payload.integrationHeadSha!.toLowerCase()) throw new Error("Target recovery pushed head receipt is stale");
+  }
+}
+
 export interface TargetAdvanceResumeInput {
   run: RunState;
   checkpoint: DurableArtifact<"TargetAdvanceCheckpoint">;
   intent: DurableArtifact<"Intent">;
   investigation: DurableArtifact<"Investigation">;
   packet: DurableArtifact<"BuildPacket">;
+  /** Source BuildResult named by checkpoint.sourceBuildResultId. */
   buildResult: DurableArtifact<"BuildResult">;
-  /** Optional because initial publication can be fenced before a PR exists. */
+  /** Fresh recovered BuildResult, when a crash occurred after verification. */
+  freshBuildResult?: DurableArtifact<"BuildResult">;
   pullRequest?: PullRequestSnapshot;
   workspace: GitWorkspace;
   verification: readonly Omit<VerificationCommand, "cwd">[];
@@ -146,6 +184,7 @@ export async function resumeTargetAdvanceWorkOn(
   const checkpoint = input.checkpoint.payload;
   const pullRequest = input.pullRequest;
   assertTargetRecoveryIdentity(input);
+  await assertTargetReceiptChain(input, dependencies.artifacts);
   assertLease(dependencies);
   if (dependencies.promoteTargetRouteClaim) {
     await dependencies.promoteTargetRouteClaim();
@@ -186,17 +225,39 @@ export async function resumeTargetAdvanceWorkOn(
       attempt,
       maxAttempts: checkpoint.attempt.max,
       retryAfterMs: 1_000,
-      status: attempt > checkpoint.attempt.max ? "exhausted" : "waiting",
+      status: attempt >= checkpoint.attempt.max ? "exhausted" : "waiting",
       cause: error,
     });
-    if (attempt > checkpoint.attempt.max) {
-      const blocked = transition(run, "BLOCK", { reason: `Target advancement recovery exhausted after ${checkpoint.attempt.max} attempts: ${reason}` });
+    if (attempt >= checkpoint.attempt.max) {
+      const exhaustedOutcome = createArtifact({
+        kind: "Outcome", runId: run.runId, subject: run.subject,
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: {
+          status: "blocked",
+          reason: `Target advancement recovery exhausted after ${checkpoint.attempt.max} attempts: ${reason}`,
+          ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+          childIssues: [],
+        },
+      }, { id: `target_exhausted_${createHash("sha256").update(`${run.runId}:${checkpoint.routeClaimKey}:${checkpoint.attempt.max}`).digest("hex").slice(0, 32)}` });
+      await dependencies.artifacts.append(exhaustedOutcome);
+      const blocked = transition(attachArtifact(run, "Outcome", exhaustedOutcome.id), "BLOCK", { reason: exhaustedOutcome.payload.reason });
       await dependencies.runs.commit(run.version, blocked.state, blocked.record);
-      throw new WorkflowExecutionError(blocked.record.reason ?? reason, blocked.state, { cause: error, recoverable: false });
+      throw new WorkflowExecutionError(blocked.record.reason ?? reason, blocked.state, {
+        cause: error,
+        recoverable: false,
+        retryDisposition: {
+          disposition: "permanent", retryable: false, domain: "workflow", code: "target-advance-exhausted",
+          cause: error instanceof Error ? error : new Error(reason),
+        },
+        ...(checkpointArtifact ? { targetAdvanceCheckpointId: checkpointArtifact.id } : {}),
+        retryCheckpointId: retryCheckpoint.id,
+      });
     }
-    const recovery = transition(run, "TARGET_ADVANCE_DETECTED", { reason });
+    const recovery = run.state === "target_recovery"
+      ? { state: run, record: undefined }
+      : transition(run, "TARGET_ADVANCE_DETECTED", { reason });
     const wait = transition(recovery.state, "RETRY_WAIT_SCHEDULED", { reason });
-    await dependencies.runs.commit(run.version, recovery.state, recovery.record);
+    if (recovery.record) await dependencies.runs.commit(run.version, recovery.state, recovery.record);
     await dependencies.runs.commit(recovery.state.version, wait.state, wait.record);
     const retryDisposition: RetryClassification = {
       disposition: "retryable", retryable: true, domain: "workflow", code: "target-advanced",
@@ -204,10 +265,75 @@ export async function resumeTargetAdvanceWorkOn(
     };
     throw new WorkflowExecutionError(reason, wait.state, {
       cause: error, recoverable: true, retryDisposition,
-      ...(checkpointArtifact ? { checkpointId: checkpointArtifact.id } : { checkpointId: retryCheckpoint.id }),
+      ...(checkpointArtifact ? { targetAdvanceCheckpointId: checkpointArtifact.id } : {}),
+      retryCheckpointId: retryCheckpoint.id,
     });
   };
   let targetSha: string;
+  const recoveredFresh = input.freshBuildResult
+    ?? (checkpoint.freshBuildResultId
+      ? (await dependencies.artifacts.list(run.subject, "BuildResult")).find((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult" && artifact.id === checkpoint.freshBuildResultId)
+      : undefined);
+  if (recoveredFresh && checkpoint.freshBuildResultId && checkpoint.phase !== "target-read") {
+    if (recoveredFresh.runId !== run.runId || recoveredFresh.payload.baseSha?.toLowerCase() !== checkpoint.observedTargetSha.toLowerCase()
+      || recoveredFresh.payload.headSha.toLowerCase() !== (checkpoint.integrationHeadSha ?? checkpoint.mergeHeadSha ?? recoveredFresh.payload.headSha).toLowerCase()) {
+      throw new Error("Target recovery fresh BuildResult receipt is stale or does not match the checkpoint");
+    }
+    targetSha = await getBranchHead(targetRepository, checkpoint.targetBranch);
+    if (targetSha.toLowerCase() !== checkpoint.observedTargetSha.toLowerCase()) {
+      return scheduleTargetRetry(new TargetBranchAdvancedError(checkpoint.targetBranch, checkpoint.observedTargetSha, targetSha), "target-read");
+    }
+    const recoveredHead = await dependencies.git.head(input.workspace);
+    if (recoveredHead.toLowerCase() !== recoveredFresh.payload.headSha.toLowerCase()) {
+      throw new Error("Retained target recovery workspace is not at the durably verified fresh head");
+    }
+    let recoveredRun = attachArtifact(attachArtifact(run, "VerificationCheckpoint", checkpoint.freshVerificationCheckpointId ?? ""), "BuildResult", recoveredFresh.id);
+    const publishing = transition(recoveredRun, "TARGET_ADVANCE_COMPLETED", { headSha: recoveredFresh.payload.headSha });
+    await dependencies.runs.commit(recoveredRun.version, publishing.state, publishing.record);
+    recoveredRun = publishing.state;
+    if (checkpoint.phase === "verified") {
+      await persistTargetAdvanceCheckpoint({
+        run: recoveredRun, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
+        workspace: input.workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "fenced",
+        attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+        ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+        ...(checkpoint.freshVerificationCheckpointId ? { freshVerificationCheckpointId: checkpoint.freshVerificationCheckpointId } : {}),
+        freshBuildResultId: recoveredFresh.id,
+        integrationHeadSha: checkpoint.integrationHeadSha ?? recoveredFresh.payload.headSha,
+        mergeHeadSha: checkpoint.mergeHeadSha ?? recoveredFresh.payload.headSha,
+        ...(pullRequest !== undefined ? { pullRequest: pullRequest.number } : {}), artifacts: dependencies.artifacts,
+      });
+    }
+    const published = pullRequest
+      ? await publishRemediationRevision({ run: recoveredRun, pullRequest, packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace, expectedTargetHeadSha: targetSha }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts })
+      : await publishPullRequest({ run: recoveredRun, intent: input.intent, packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
+    await persistTargetAdvanceCheckpoint({
+      run: published.run, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
+      workspace: input.workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "pushed",
+      attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+      ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+      ...(checkpoint.freshVerificationCheckpointId ? { freshVerificationCheckpointId: checkpoint.freshVerificationCheckpointId } : {}), freshBuildResultId: recoveredFresh.id,
+      integrationHeadSha: checkpoint.integrationHeadSha ?? recoveredFresh.payload.headSha,
+      mergeHeadSha: checkpoint.mergeHeadSha ?? recoveredFresh.payload.headSha,
+      pullRequest: published.pullRequest.number, pushedHeadSha: published.pullRequest.headSha, artifacts: dependencies.artifacts,
+    });
+    const reviewed = await reviewPullRequest({
+      run: published.run, pullRequest: published.pullRequest, intent: input.intent, investigation: input.investigation,
+      packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace.path, findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
+    }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+      ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+    await persistTargetAdvanceCheckpoint({
+      run: reviewed.run, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
+      workspace: input.workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "reviewed",
+      attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+      ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+      ...(checkpoint.freshVerificationCheckpointId ? { freshVerificationCheckpointId: checkpoint.freshVerificationCheckpointId } : {}), freshBuildResultId: recoveredFresh.id,
+      integrationHeadSha: checkpoint.integrationHeadSha ?? recoveredFresh.payload.headSha,
+      mergeHeadSha: checkpoint.mergeHeadSha ?? recoveredFresh.payload.headSha,
+      pullRequest: published.pullRequest.number, pushedHeadSha: published.pullRequest.headSha, artifacts: dependencies.artifacts,
+    });
+    return { run: reviewed.run, pullRequest: published.pullRequest, buildResult: recoveredFresh };
+  }
   try {
     targetSha = await getBranchHead(targetRepository, checkpoint.targetBranch);
   } catch (error) {
@@ -225,7 +351,8 @@ export async function resumeTargetAdvanceWorkOn(
     });
   } catch (error) {
     const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => targetSha);
-    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase()) {
+    const classification = classifyRetryableError(error, { domain: "workflow" });
+    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase() || classification.retryable) {
       return scheduleTargetRetry(error, "integrated");
     }
     throw error;
@@ -288,6 +415,12 @@ export async function resumeTargetAdvanceWorkOn(
     throw new Error("Synchronized target recovery head is not a descendant of the reviewed head");
   }
   const changedPaths = canonicalizeConcreteScopePaths(await dependencies.git.revisionChangedPaths(workspace)).sort();
+  await persistTargetAdvanceCheckpoint({
+    run, packet: input.packet, buildResult: input.buildResult, workspace, targetBranch: checkpoint.targetBranch,
+    observedTargetSha: targetSha, phase: "integrated", attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}), integrationHeadSha: newHead, mergeHeadSha: newHead,
+    artifacts: dependencies.artifacts,
+  });
   if (changedPaths.some((path) => !expectedPaths.has(path))) throw new Error("Synchronized revision broadened the frozen packet scope");
   const catalog = input.resolveVerificationCatalog
     ? await input.resolveVerificationCatalog(targetSha)
@@ -300,7 +433,8 @@ export async function resumeTargetAdvanceWorkOn(
     checks = await dependencies.verifier.run(commands, input.signal);
   } catch (error) {
     const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => targetSha);
-    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase()) {
+    const classification = classifyRetryableError(error, { domain: "workflow" });
+    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase() || classification.retryable) {
       return scheduleTargetRetry(error, "verified");
     }
     throw error;
@@ -311,7 +445,8 @@ export async function resumeTargetAdvanceWorkOn(
     postTarget = await getBranchHead(targetRepository, checkpoint.targetBranch);
     if (postTarget.toLowerCase() !== targetSha.toLowerCase()) throw new TargetBranchAdvancedError(checkpoint.targetBranch, targetSha, postTarget);
   } catch (error) {
-    if (error instanceof TargetBranchAdvancedError) return scheduleTargetRetry(error, "target-read");
+    const classification = classifyRetryableError(error, { domain: "workflow" });
+    if (error instanceof TargetBranchAdvancedError || classification.retryable) return scheduleTargetRetry(error, "target-read");
     throw error;
   }
   const postHead = await dependencies.git.head(workspace);
@@ -333,7 +468,11 @@ export async function resumeTargetAdvanceWorkOn(
   await dependencies.artifacts.append(verificationCheckpoint);
   const freshBuildResult = createArtifact({
     kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller", runtime: "forgedock" },
-    payload: { ...input.buildResult.payload, branch: workspace.branch, targetBranch: checkpoint.targetBranch, headSha: newHead, baseSha: targetSha, changedPaths, summary: `Fresh target-recovery build ${newHead}.`, checks },
+    payload: {
+      ...input.buildResult.payload, branch: workspace.branch, targetBranch: checkpoint.targetBranch, headSha: newHead, baseSha: targetSha,
+      changedPaths, summary: `Fresh target-recovery build ${newHead}.`, checks,
+      acceptanceEvidence: verificationCheckpoint.payload.acceptanceEvidence,
+    },
   });
   await dependencies.artifacts.append(freshBuildResult);
   const verifiedTargetCheckpoint = await persistTargetAdvanceCheckpoint({
@@ -356,7 +495,10 @@ export async function resumeTargetAdvanceWorkOn(
     run: publishing.state, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult, workspace,
     targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "fenced",
     attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
-    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+    freshVerificationCheckpointId: verificationCheckpoint.id,
+    freshBuildResultId: freshBuildResult.id,
+    integrationHeadSha: newHead,
+    mergeHeadSha: newHead,
     ...(pullRequest !== undefined ? { pullRequest: pullRequest.number } : {}),
     artifacts: dependencies.artifacts,
   });
@@ -2691,7 +2833,7 @@ function guardMutationBoundaries(dependencies: WorkOnDependencies): WorkOnDepend
     ...dependencies,
     artifacts: guarded(dependencies.artifacts, ["append"]),
     runs: guarded(dependencies.runs, ["create", "commit", "recordProgress"]),
-    git: guarded(dependencies.git, ["create", "fastForwardToRemoteTarget", "syncToRemoteHead", "integrateRemoteBase", "prepareWorkspaceDependencies", "commit", "push"]),
+    git: guarded(dependencies.git, ["create", "fastForwardToRemoteTarget", "syncToRemoteHead", "integrateRemoteBase", "prepareWorkspaceDependencies", "stageConflictResolutions", "commit", "push"]),
     host: guarded(dependencies.host, [
       "materializeBatchIssue", "publishIssueComment", "materializeRemediationChildren",
       "materializeDecomposition", "createPullRequest", "publishPullRequestComment",

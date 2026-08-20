@@ -191,6 +191,12 @@ export function decideSubjectAdmission(
   const latestTargetAdvanceIndex = lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
   const latestRetry = latestArtifactOfKind(latest.artifacts, "RetryCheckpoint");
   const latestRetryIndex = lastArtifactIndex(latest.artifacts, "RetryCheckpoint");
+  if (latestRetry?.payload.status === "exhausted") {
+    return {
+      action: "block", runId: latest.runId, state: "blocked",
+      reason: `RetryCheckpoint ${latestRetry.id} exhausted after ${latestRetry.payload.attempt.max} attempts; target recovery cannot resume`,
+    };
+  }
   const latestNonterminalCheckpoint = latestRetryIndex > latestTargetAdvanceIndex ? latestRetry : latestTargetAdvance;
   const latestNonterminalCheckpointIndex = Math.max(latestRetryIndex, latestTargetAdvanceIndex);
   if (latestNonterminalCheckpoint && latestNonterminalCheckpointIndex > latestOutcomeIndex

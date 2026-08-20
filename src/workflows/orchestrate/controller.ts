@@ -1039,16 +1039,28 @@ export class OrchestrationController {
       } catch (error) {
         const retry = retryResultForError(error, attempt.attempt);
         if (retry) {
-          const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
-          await this.finishAttempt(state, item.id, attempt.attemptId, durableRetry);
-          return durableRetry;
+          try {
+            const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
+            await this.finishAttempt(state, item.id, attempt.attemptId, durableRetry);
+            return durableRetry;
+          } catch (persistenceError) {
+            const fallback: Exclude<ScheduleWorkerResult, void> = { status: "retry_wait", error: persistenceError instanceof Error ? persistenceError : String(persistenceError), retryable: true, retryDomain: "transport", retryCode: "retry-checkpoint-persist" };
+            await this.finishAttempt(state, item.id, attempt.attemptId, fallback);
+            return fallback;
+          }
         }
         await this.failAttempt(state, item.id, attempt.attemptId, error);
         throw error;
       }
-      result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
-      await this.finishAttempt(state, item.id, attempt.attemptId, result);
-      return result;
+      try {
+        result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
+        await this.finishAttempt(state, item.id, attempt.attemptId, result);
+        return result;
+      } catch (error) {
+        const fallback: Exclude<ScheduleWorkerResult, void> = { status: "retry_wait", error: error instanceof Error ? error : String(error), retryable: true, retryDomain: "transport", retryCode: "retry-checkpoint-persist" };
+        await this.finishAttempt(state, item.id, attempt.attemptId, fallback);
+        return fallback;
+      }
     }
 
     const existingAttempts = requiredNode(state.record, item.id).attempts ?? [];
@@ -1070,9 +1082,15 @@ export class OrchestrationController {
       await this.failAttempt(state, item.id, attempt.attemptId, error);
       throw error;
     }
-    result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
-    await this.finishAttempt(state, item.id, attempt.attemptId, result);
-    return result;
+    try {
+      result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
+      await this.finishAttempt(state, item.id, attempt.attemptId, result);
+      return result;
+    } catch (error) {
+      const fallback: Exclude<ScheduleWorkerResult, void> = { status: "retry_wait", error: error instanceof Error ? error : String(error), retryable: true, retryDomain: "transport", retryCode: "retry-checkpoint-persist" };
+      await this.finishAttempt(state, item.id, attempt.attemptId, fallback);
+      return fallback;
+    }
   }
 
   private workerContext(

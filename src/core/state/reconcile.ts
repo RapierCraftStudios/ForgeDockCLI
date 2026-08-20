@@ -92,7 +92,12 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     || (nonterminalCheckpoint !== undefined
       && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex));
   if (nonterminalCheckpoint && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex)) {
-    state = nonterminalCheckpoint.kind === "RetryCheckpoint" ? "retry_wait" : "target_recovery";
+    state = nonterminalCheckpoint.kind === "RetryCheckpoint"
+      ? (nonterminalCheckpoint.payload.status === "exhausted" ? "blocked" : "retry_wait")
+      : "target_recovery";
+    if (nonterminalCheckpoint.kind === "RetryCheckpoint" && nonterminalCheckpoint.payload.status === "exhausted") {
+      warnings.push("RetryCheckpoint is exhausted and cannot authorize another attempt");
+    }
   } else if (remediationCheckpoint !== undefined && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex)) {
     state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
     if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");
