@@ -48,6 +48,7 @@ export type ScheduleWorkerResult = void | {
   maxAttempts?: number;
   retryDomain?: string;
   retryCode?: string;
+  operationKey?: string;
   /** Authoritative replacement issue numbers returned by a decomposition outcome. */
   childIssues?: readonly number[];
 };
@@ -306,6 +307,27 @@ export async function runSchedule(
       if (signal.aborted) onAbort();
     });
   };
+  const waitForRetry = async (delayMs: number): Promise<void> => {
+    throwIfAborted();
+    if (!options.signal) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        options.signal!.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        options.signal!.removeEventListener("abort", onAbort);
+        const reason = options.signal!.reason;
+        reject(reason instanceof Error ? reason : new Error(String(reason ?? "Orchestration scheduling was cancelled")));
+      };
+      options.signal!.addEventListener("abort", onAbort, { once: true });
+      if (options.signal!.aborted) onAbort();
+    });
+  };
   let observedCapacity = maxParallel;
   const readCapacity = async (): Promise<number> => {
     let value: number;
@@ -388,7 +410,7 @@ export async function runSchedule(
         status.set(item.id, "retry_wait");
         waitReasons.set(item.id, { kind: "retry", domain: "workflow", code: "durable-checkpoint", nextAttemptAt, attempt, maxAttempts });
         const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
-        const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+        const wake = waitForRetry(delay).then(() => {
           retryWakeups.delete(item.id);
           if (status.get(item.id) !== "retry_wait") return;
           status.set(item.id, "queued");
@@ -1134,6 +1156,15 @@ function validateGraphAndIndexIssueSlots(
   const issueSlotsById = new Map<string, number>();
   for (const item of items) {
     if (ids.has(item.id)) throw new Error(`Duplicate work item id: ${item.id}`);
+    if (item.targetRouteClaim !== undefined) {
+      if (item.repository === undefined || item.targetBranch === undefined) {
+        throw new Error(`Work item ${item.id} has a target route claim without repository and target branch identity`);
+      }
+      const expectedRoute = normalizedDeliveryRouteClaim(item.repository, item.targetBranch);
+      if (item.targetRouteClaim !== expectedRoute) {
+        throw new Error(`Work item ${item.id} target route claim is inconsistent with its repository/target branch`);
+      }
+    }
     issueSlotsById.set(item.id, scheduledWorkItemIssueSlots(item));
     ids.add(item.id);
   }

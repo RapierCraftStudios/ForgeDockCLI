@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import type { RetryClassification } from "../../core/retry.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -84,7 +85,7 @@ export async function publishPullRequest(
       const targetBranch = error.targetBranch;
       // The checkpoint is durable before the state transition. A restart can
       // therefore recover the exact target route even if projection fails.
-      await persistTargetAdvanceCheckpoint({
+      const checkpoint = await persistTargetAdvanceCheckpoint({
         run,
         packet: input.packet,
         buildResult: input.buildResult,
@@ -94,11 +95,21 @@ export async function publishPullRequest(
         phase: "target-read",
         ...(dependencies.artifacts ? { artifacts: dependencies.artifacts } : {}),
       });
+      const retryDisposition: RetryClassification = {
+        disposition: "retryable",
+        retryable: true,
+        domain: "workflow",
+        code: "target-advanced",
+        cause: error,
+      };
       const next = transition(run, "TARGET_ADVANCE_DETECTED", {
         reason: `${reason}; route=${normalizedTargetRouteClaim(run.subject.repo, targetBranch)}`,
       });
       await dependencies.runs.commit(run.version, next.state, next.record);
-      throw new WorkflowExecutionError(reason, next.state, { cause: error });
+      throw new WorkflowExecutionError(reason, next.state, {
+        cause: error, retryDisposition,
+        ...(checkpoint ? { checkpointId: checkpoint.id } : {}),
+      });
     }
     const next = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, next.state, next.record);

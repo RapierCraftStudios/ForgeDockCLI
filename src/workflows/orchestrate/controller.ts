@@ -1168,6 +1168,7 @@ export class OrchestrationController {
         ...(normalized.nextAttemptAt !== undefined ? { retryNextAt: normalized.nextAttemptAt } : {}),
         ...(normalized.retryDomain !== undefined ? { retryDomain: normalized.retryDomain as Exclude<OrchestrationWorkerAttemptRecord["retryDomain"], undefined> } : {}),
         ...(normalized.retryCode !== undefined ? { retryCode: normalized.retryCode } : {}),
+        ...(normalized.operationKey !== undefined ? { operationKey: normalized.operationKey } : {}),
       }),
     );
     if (normalized.retryCheckpointId !== undefined || normalized.targetAdvanceCheckpointId !== undefined) {
@@ -1471,6 +1472,8 @@ export class OrchestrationController {
       || node.status === "blocked"
       || node.status === "suspended"
       || node.status === "invalid"
+      || node.status === "target_recovery"
+      || node.status === "retry_wait"
       || node.status === "running"
       || node.status === "queued");
     this.replaceRecord(state, {
@@ -2003,6 +2006,7 @@ function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleW
     maxAttempts,
     retryDomain: classification.domain,
     retryCode: classification.code,
+    operationKey: `${classification.domain}:${classification.code}`,
   };
 }
 

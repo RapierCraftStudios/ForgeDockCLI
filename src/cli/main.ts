@@ -2378,6 +2378,23 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             return { status: "suspended", error };
           }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
+            const targetRecovery = error.run.state === "target_recovery" || error.run.state === "retry_wait"
+              || error.retryDisposition.code === "target-advanced";
+            if (targetRecovery) {
+              process.stdout.write(`${statusGlyph("active", mode)} ${item.id} target movement deferred · durable retry will re-admit the frozen route\n`);
+              return {
+                status: "retry_wait",
+                error: error.message,
+                retryable: true,
+                ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
+                retryAfterMs: 500,
+                attempt: error.run.attempt,
+                maxAttempts: 3,
+                nextAttemptAt: new Date(Date.now() + 500).toISOString(),
+                retryDomain: "workflow",
+                retryCode: "target-advanced",
+              };
+            }
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
             return { status: "suspended", error: error.message };
           }
@@ -2842,6 +2859,23 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             return { status: "suspended", error };
           }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
+            const targetRecovery = error.run.state === "target_recovery" || error.run.state === "retry_wait"
+              || error.retryDisposition.code === "target-advanced";
+            if (targetRecovery) {
+              process.stdout.write(`${statusGlyph("active", mode)} ${item.id} target movement deferred · durable retry will re-admit the frozen route\n`);
+              return {
+                status: "retry_wait",
+                error: error.message,
+                retryable: true,
+                ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
+                retryAfterMs: 500,
+                attempt: error.run.attempt,
+                maxAttempts: 3,
+                nextAttemptAt: new Date(Date.now() + 500).toISOString(),
+                retryDomain: "workflow",
+                retryCode: "target-advanced",
+              };
+            }
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · bounded agent checkpoint retained at ${error.run.state}; resume will continue the retained worktree\n`);
             return { status: "suspended", error: error.message };
           }

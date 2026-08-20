@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
+import type { RetryClassification } from "../../core/retry.js";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
@@ -40,7 +42,9 @@ import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, runTargetForLane, type IssueLane, type ParentRemediationTarget } from "./lane.js";
-import { persistTargetAdvanceCheckpoint } from "./target-recovery.js";
+import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
+import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
+import { expandInvariantMatrix } from "./invariant-matrix.js";
 
 export { repositoryPathFromLocation } from "../review-pr/scope.js";
 
@@ -68,6 +72,42 @@ export interface WorkOnResult {
   outcome?: DurableArtifact<"Outcome">;
   pullRequest?: PullRequestSnapshot;
   awaitingHuman?: boolean;
+}
+function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
+  const { run, checkpoint, intent, packet, buildResult, workspace, pullRequest } = input;
+  if (checkpoint.runId !== run.runId || checkpoint.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || checkpoint.subject.issue !== run.subject.issue || checkpoint.subject.pr !== run.subject.pr) {
+    throw new Error("Target recovery checkpoint run/subject identity does not match the admitted run");
+  }
+  if (checkpoint.payload.packetArtifactId !== packet.id || packet.runId !== run.runId
+    || checkpoint.payload.sourceBuildResultId !== buildResult.id
+    || checkpoint.payload.sourceHeadSha.toLowerCase() !== buildResult.payload.headSha.toLowerCase()
+    || buildResult.runId !== run.runId || intent.runId !== run.runId) {
+    throw new Error("Target recovery packet/build/intent identity does not match the admitted run");
+  }
+  if (pullRequest !== undefined
+    && (pullRequest.repo.toLowerCase() !== checkpoint.payload.repository.toLowerCase()
+      || pullRequest.baseBranch !== checkpoint.payload.targetBranch
+      || pullRequest.headSha.toLowerCase() !== checkpoint.payload.sourceHeadSha.toLowerCase())) {
+    throw new Error("Target recovery checkpoint does not match the retained pull request route or head");
+  }
+  if (checkpoint.payload.targetBranch !== run.targetBranch || checkpoint.payload.repository.toLowerCase() !== run.subject.repo.toLowerCase()) {
+    throw new Error("Target recovery checkpoint target route does not match the admitted run");
+  }
+  if (checkpoint.payload.sourceVerdictId !== undefined && input.priorVerdict?.id !== checkpoint.payload.sourceVerdictId) {
+    throw new Error("Target recovery checkpoint source verdict does not match the retained PR verdict");
+  }
+  if (checkpoint.payload.routeClaimKey !== normalizedTargetRouteClaim(checkpoint.payload.repository, checkpoint.payload.targetBranch)
+    || JSON.stringify([...checkpoint.payload.expectedPaths].sort()) !== JSON.stringify([...packet.payload.expectedPaths].sort())) {
+    throw new Error("Target recovery checkpoint route or frozen packet scope does not match the run");
+  }
+  const verificationPlanId = createHash("sha256").update(JSON.stringify(packet.payload.verificationPlan)).digest("hex");
+  if (checkpoint.payload.verificationPlanId !== verificationPlanId) throw new Error("Target recovery checkpoint verification plan is stale");
+  if (!workspace.path || !workspace.branch || !workspace.baseRef
+    || checkpoint.payload.workspace.branch !== workspace.branch || checkpoint.payload.workspace.baseRef !== workspace.baseRef
+    || !workspacePathsEquivalent(checkpoint.payload.workspace.path, workspace.path)) {
+    throw new Error("Target recovery workspace does not match the canonical checkpoint workspace");
+  }
 }
 
 export interface TargetAdvanceResumeInput {
@@ -105,34 +145,49 @@ export async function resumeTargetAdvanceWorkOn(
   }
   const checkpoint = input.checkpoint.payload;
   const pullRequest = input.pullRequest;
-  if (checkpoint.repository.toLowerCase() !== input.run.subject.repo.toLowerCase()
-    || (pullRequest !== undefined && checkpoint.targetBranch !== pullRequest.baseBranch)
-    || checkpoint.sourceBuildResultId !== input.buildResult.id
-    || checkpoint.sourceHeadSha.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()
-    || (pullRequest !== undefined && pullRequest.headSha.toLowerCase() !== checkpoint.sourceHeadSha.toLowerCase())) {
-    throw new Error("Target recovery checkpoint, PR, and Build Result identity do not match");
+  assertTargetRecoveryIdentity(input);
+  assertLease(dependencies);
+  if (dependencies.promoteTargetRouteClaim) {
+    await dependencies.promoteTargetRouteClaim();
+    assertLease(dependencies);
   }
   if (!dependencies.host.getBranchHead || !dependencies.git.integrateRemoteBase) {
     throw new Error("Target recovery requires authoritative branch reads and exact remote-base integration");
   }
   let run = input.run;
-  await dependencies.promoteTargetRouteClaim?.();
   const resumed = transition(run, run.state === "retry_wait" ? "RETRY_DUE" : "RESUME_TARGET_ADVANCE", {
     reason: `Recovering ${checkpoint.routeClaimKey} at source ${checkpoint.sourceHeadSha}`,
   });
   await dependencies.runs.commit(run.version, resumed.state, resumed.record);
   run = resumed.state;
-  const targetRepository = pullRequest?.repo ?? input.run.subject.repo;
+  const targetRepository = checkpoint.repository;
   const getBranchHead = dependencies.host.getBranchHead;
   const scheduleTargetRetry = async (error: unknown, phase: "integrated" | "verified" | "target-read"): Promise<never> => {
     const reason = error instanceof Error ? error.message : String(error);
     const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => undefined);
     const observedTargetSha = observed && /^[0-9a-f]{7,64}$/i.test(observed) ? observed : checkpoint.sourceBaseSha;
     const attempt = checkpoint.attempt.number + 1;
-    await persistTargetAdvanceCheckpoint({
+    const checkpointArtifact = await persistTargetAdvanceCheckpoint({
       run, packet: input.packet, buildResult: input.buildResult, workspace: input.workspace,
       targetBranch: checkpoint.targetBranch, observedTargetSha, phase,
       attempt, maxAttempts: checkpoint.attempt.max, artifacts: dependencies.artifacts,
+      ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+    });
+    const retryCheckpoint = await persistRetryCheckpoint({
+      artifacts: dependencies.artifacts,
+      runId: run.runId,
+      subject: run.subject,
+      domain: "workflow",
+      code: "target-advanced",
+      phase,
+      operationKey: `target-advanced:${checkpoint.routeClaimKey}`,
+      semanticKey: checkpoint.routeClaimKey,
+      artifactIds: [input.checkpoint.id, ...(checkpointArtifact ? [checkpointArtifact.id] : [])],
+      attempt,
+      maxAttempts: checkpoint.attempt.max,
+      retryAfterMs: 1_000,
+      status: attempt > checkpoint.attempt.max ? "exhausted" : "waiting",
+      cause: error,
     });
     if (attempt > checkpoint.attempt.max) {
       const blocked = transition(run, "BLOCK", { reason: `Target advancement recovery exhausted after ${checkpoint.attempt.max} attempts: ${reason}` });
@@ -143,9 +198,21 @@ export async function resumeTargetAdvanceWorkOn(
     const wait = transition(recovery.state, "RETRY_WAIT_SCHEDULED", { reason });
     await dependencies.runs.commit(run.version, recovery.state, recovery.record);
     await dependencies.runs.commit(recovery.state.version, wait.state, wait.record);
-    throw new WorkflowExecutionError(reason, wait.state, { cause: error, recoverable: true });
+    const retryDisposition: RetryClassification = {
+      disposition: "retryable", retryable: true, domain: "workflow", code: "target-advanced",
+      cause: error instanceof Error ? error : new Error(reason),
+    };
+    throw new WorkflowExecutionError(reason, wait.state, {
+      cause: error, recoverable: true, retryDisposition,
+      ...(checkpointArtifact ? { checkpointId: checkpointArtifact.id } : { checkpointId: retryCheckpoint.id }),
+    });
   };
-  const targetSha = await getBranchHead(targetRepository, checkpoint.targetBranch);
+  let targetSha: string;
+  try {
+    targetSha = await getBranchHead(targetRepository, checkpoint.targetBranch);
+  } catch (error) {
+    return scheduleTargetRetry(error, "target-read");
+  }
   if (!/^[0-9a-f]{7,64}$/i.test(targetSha)) throw new Error("Authoritative target read is not a Git SHA");
   if (targetSha.toLowerCase() === checkpoint.sourceBaseSha.toLowerCase()) {
     throw new Error(`Target ${checkpoint.targetBranch} has not advanced beyond ${checkpoint.sourceBaseSha}`);
@@ -259,7 +326,7 @@ export async function resumeTargetAdvanceWorkOn(
       checkpoint: "verified-commit", branch: workspace.branch, targetBranch: checkpoint.targetBranch, baseSha: targetSha,
       parentHeadSha: checkpoint.sourceHeadSha, changedPaths, pendingChangedPaths: changedPaths,
       verifiedContentDigest: freshContentDigest, commitMessage: `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`,
-      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: freshTargetRecoveryEvidence(input.packet, input.buildResult, checks, changedPaths, expectedPaths),
+      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: freshTargetRecoveryEvidence(input.packet, input.buildResult, checks, changedPaths, expectedPaths, frozenVerification),
       checks, decisions: [`Target recovery rebased ${checkpoint.sourceHeadSha} onto ${targetSha}.`], residualRisks: [],
     },
   });
@@ -269,10 +336,30 @@ export async function resumeTargetAdvanceWorkOn(
     payload: { ...input.buildResult.payload, branch: workspace.branch, targetBranch: checkpoint.targetBranch, headSha: newHead, baseSha: targetSha, changedPaths, summary: `Fresh target-recovery build ${newHead}.`, checks },
   });
   await dependencies.artifacts.append(freshBuildResult);
+  const verifiedTargetCheckpoint = await persistTargetAdvanceCheckpoint({
+    run, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult, workspace,
+    targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "verified",
+    attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+    freshVerificationCheckpointId: verificationCheckpoint.id,
+    freshBuildResultId: freshBuildResult.id,
+    integrationHeadSha: newHead,
+    mergeHeadSha: newHead,
+    ...(pullRequest !== undefined ? { pullRequest: pullRequest.number } : {}),
+    artifacts: dependencies.artifacts,
+  });
   run = attachArtifact(run, "VerificationCheckpoint", verificationCheckpoint.id);
   run = attachArtifact(run, "BuildResult", freshBuildResult.id);
   const publishing = transition(run, "TARGET_ADVANCE_COMPLETED", { headSha: newHead });
   await dependencies.runs.commit(run.version, publishing.state, publishing.record);
+  const fencedTargetCheckpoint = await persistTargetAdvanceCheckpoint({
+    run: publishing.state, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult, workspace,
+    targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "fenced",
+    attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+    ...(pullRequest !== undefined ? { pullRequest: pullRequest.number } : {}),
+    artifacts: dependencies.artifacts,
+  });
   const published = pullRequest
     ? await publishRemediationRevision({ run: publishing.state, pullRequest, packet: input.packet, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
@@ -294,13 +381,20 @@ function freshTargetRecoveryEvidence(
   checks: readonly CheckResult[],
   changedPaths: readonly string[],
   expectedPaths: ReadonlySet<string>,
+  verification: readonly Omit<VerificationCommand, "cwd">[],
 ): DurableArtifact<"VerificationCheckpoint">["payload"]["acceptanceEvidence"] {
   const source = sourceBuild.payload.acceptanceEvidence;
   if (source.length !== packet.payload.acceptanceCriteria.length) {
     throw new Error("Target recovery cannot establish fresh criterion evidence from an incomplete prior evidence plan");
   }
+  const strictSemantic = packet.payload.verificationPolicyVersion === "forgedock.verification/v2";
+  if (strictSemantic && !packet.payload.evidenceContract) {
+    throw new Error("Target recovery cannot revalidate policy-v2 evidence without the frozen evidence contract");
+  }
+  const commandById = new Map(verification.map((command) => [command.id, command]));
   const passedCommands = new Set(checks.filter((check) => check.status === "passed").map((check) => check.commandId).filter((id): id is string => id !== undefined));
   const observedPaths = new Set(changedPaths);
+  const contractById = new Map((packet.payload.evidenceContract?.criteria ?? []).map((criterion) => [criterion.criterionId, criterion]));
   return packet.payload.acceptanceCriteria.map((criterion, index) => {
     const criterionId = `criterion-${index + 1}`;
     const evidence = source.find((item) => item.criterionId === criterionId && item.criterion === criterion && item.status === "passed");
@@ -310,6 +404,34 @@ function freshTargetRecoveryEvidence(
     const anchors = evidence.anchors;
     if (anchors.paths.some((path) => !expectedPaths.has(path) || !observedPaths.has(path))) {
       throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors`);
+    }
+    if (strictSemantic && (anchors.symbols.length === 0 || anchors.testIds.length === 0)) {
+      throw new Error(`Target recovery criterion ${criterionId} lacks proven symbols or test IDs`);
+    }
+    const contract = contractById.get(criterionId);
+    if (strictSemantic && !contract) throw new Error(`Target recovery criterion ${criterionId} lacks a frozen evidence contract`);
+    const requiredIds = contract?.requiredCommandIds ?? [];
+    const semanticIds = contract?.semanticCommandIds ?? [];
+    const anchoredIds = new Set(anchors.verificationCommandIds);
+    const missingRequired = [...new Set([...requiredIds, ...semanticIds])].filter((id) => !anchoredIds.has(id) || !passedCommands.has(id));
+    if (missingRequired.length) throw new Error(`Target recovery criterion ${criterionId} has unproven required semantic commands: ${missingRequired.join(", ")}`);
+    if (strictSemantic && requiredIds.length > 0 && semanticIds.length === 0) {
+      throw new Error(`Target recovery criterion ${criterionId} is backed only by generic verification capability`);
+    }
+    for (const id of semanticIds) {
+      const command = commandById.get(id);
+      if (!command || command.evidenceCapability === undefined || command.evidenceCapability === "generic") {
+        throw new Error(`Target recovery criterion ${criterionId} lacks controller semantic capability for ${id}`);
+      }
+      if ((command.evidenceCapability === "targeted-test" || command.evidenceCapability === "path-bound") && !command.targets?.length) {
+        throw new Error(`Target recovery criterion ${criterionId} has unusable semantic capability for ${id}`);
+      }
+    }
+    const matrixIds = (packet.payload.invariantMatrices ?? [])
+      .filter((row) => row.criterionId === criterionId)
+      .flatMap((row) => [row.testId, ...expandInvariantMatrix(row).map((item) => item.id)]);
+    if (matrixIds.some((id) => !anchors.testIds.includes(id))) {
+      throw new Error(`Target recovery criterion ${criterionId} has incomplete invariant matrix evidence`);
     }
     if (anchors.verificationCommandIds.some((id) => !passedCommands.has(id))) {
       throw new Error(`Target recovery criterion ${criterionId} has stale verification command anchors`);

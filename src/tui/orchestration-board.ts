@@ -240,7 +240,7 @@ export class OrchestrationBoardController {
       .slice(0, MAX_DAG_ROWS);
     for (const record of records) {
       const completed = record.snapshot.nodes.filter((node) => node.status === "completed").length;
-      const terminal = record.snapshot.nodes.filter((node) => !["queued", "running"].includes(node.status)).length;
+      const terminal = record.snapshot.nodes.filter((node) => ["completed", "skipped", "failed", "blocked", "invalid"].includes(node.status)).length;
       const active = record.snapshot.nodes.filter((node) => node.status === "running").length;
       const total = record.snapshot.nodes.length;
       const progress = record.phase === "completed" ? `${completed}/${total} complete` : `${terminal}/${total} terminal`;
@@ -379,6 +379,8 @@ function statusGlyph(status: ScheduledStatus, theme: Theme): string {
     case "invalid": return theme.fg("error", "!");
     case "skipped": return theme.fg("muted", "↷");
     case "suspended": return theme.fg("warning", "Ⅱ");
+    case "target_recovery": return theme.fg("warning", "↻");
+    case "retry_wait": return theme.fg("warning", "…");
     default: return theme.fg("dim", "·");
   }
 }

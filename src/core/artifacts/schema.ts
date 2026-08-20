@@ -832,6 +832,8 @@ export const TargetAdvanceCheckpointPayloadSchema = Type.Object({
   integrationHeadSha: Type.Optional(Sha), mergeHeadSha: Type.Optional(Sha),
   freshVerificationCheckpointId: Type.Optional(BoundedString), freshBuildResultId: Type.Optional(BoundedString),
   pullRequest: Type.Optional(Type.Integer({ minimum: 1 })), pushedHeadSha: Type.Optional(Sha),
+  /** Identity of the immediately preceding checkpoint update. */
+  supersedes: Type.Optional(BoundedString),
   createdAt: IsoDateTime, updatedAt: IsoDateTime,
 });
 
@@ -845,6 +847,7 @@ export const RetryCheckpointPayloadSchema = Type.Object({
   artifactIds: Type.Array(BoundedString, { maxItems: 4096 }),
   attempt: Type.Object({ number: Type.Integer({ minimum: 1 }), max: Type.Integer({ minimum: 1 }), firstAt: IsoDateTime, nextAt: IsoDateTime, deadlineAt: Type.Optional(IsoDateTime) }),
   retryAfterMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  supersedes: Type.Optional(BoundedString),
   reconciliation: Type.Union([Type.Literal("pending"), Type.Literal("proven-absent"), Type.Literal("proven-present"), Type.Literal("completed")]),
   status: Type.Union([Type.Literal("waiting"), Type.Literal("due"), Type.Literal("cancelled"), Type.Literal("exhausted")]),
   cause: Type.Object({ class: BoundedString, status: Type.Optional(Type.Integer({ minimum: 100, maximum: 599 })), message: Type.String({ minLength: 1, maxLength: 4096 }) }),

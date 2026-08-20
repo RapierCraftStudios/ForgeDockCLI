@@ -36,7 +36,10 @@ export function reconcileLatestRunArtifacts(artifacts: readonly DurableArtifact[
 export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): ReconciledSemanticState {
   const ordered = [...artifacts];
   const latest = new Map<string, DurableArtifact>();
-  for (const artifact of ordered) latest.set(artifact.kind, artifact);
+  for (const artifact of ordered) {
+    const previous = latest.get(artifact.kind);
+    if (!previous || artifactOrderingKey(artifact) >= artifactOrderingKey(previous)) latest.set(artifact.kind, artifact);
+  }
   const warnings: string[] = [];
   const latestOutcome = latest.get("Outcome") as DurableArtifact<"Outcome"> | undefined;
   const verdict = latest.get("ReviewVerdict") as DurableArtifact<"ReviewVerdict"> | undefined;
@@ -79,8 +82,8 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
   const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
-  const targetAdvanceCheckpointIndex = lastArtifactIndex(ordered, "TargetAdvanceCheckpoint");
-  const retryCheckpointIndex = lastArtifactIndex(ordered, "RetryCheckpoint");
+  const targetAdvanceCheckpointIndex = latestArtifactIndex(ordered, "TargetAdvanceCheckpoint");
+  const retryCheckpointIndex = latestArtifactIndex(ordered, "RetryCheckpoint");
   const nonterminalCheckpoint = retryCheckpointIndex > targetAdvanceCheckpointIndex ? retryCheckpoint : targetAdvanceCheckpoint;
   const nonterminalCheckpointIndex = Math.max(retryCheckpointIndex, targetAdvanceCheckpointIndex);
   let state: RunStateName = "queued";
@@ -152,13 +155,26 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   };
 }
 
+function artifactOrderingKey(artifact: DurableArtifact): string {
+  const payload = artifact.payload as { updatedAt?: string; attempt?: { number?: number } };
+  return `${payload.updatedAt ?? artifact.createdAt}|${artifact.createdAt}|${String(payload.attempt?.number ?? 0).padStart(12, "0")}|${artifact.id}`;
+}
+
+function latestArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
+  let latest = -1;
+  for (let index = 0; index < artifacts.length; index += 1) {
+    if (artifacts[index]?.kind !== kind) continue;
+    if (latest < 0 || artifactOrderingKey(artifacts[index]!) >= artifactOrderingKey(artifacts[latest]!)) latest = index;
+  }
+  return latest;
+}
+
 function lastArtifactIndex(artifacts: readonly DurableArtifact[], kind: DurableArtifact["kind"]): number {
   for (let index = artifacts.length - 1; index >= 0; index--) {
     if (artifacts[index]?.kind === kind) return index;
   }
   return -1;
 }
-
 function lastOutcomeIndex(
   artifacts: readonly DurableArtifact[],
   status: DurableArtifact<"Outcome">["payload"]["status"],

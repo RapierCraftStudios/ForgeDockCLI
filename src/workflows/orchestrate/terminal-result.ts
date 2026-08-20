@@ -16,7 +16,15 @@ export function terminalOrchestrationResult(
   reconciled: ReconciledSubjectState,
 ): Exclude<ScheduleWorkerResult, void> | undefined {
   if (reconciled.state === "target_recovery") {
-    return { status: "target_recovery", error: "durable TargetAdvanceCheckpoint retained; target execution is not implemented" };
+    const checkpoint = reconciled.targetAdvanceCheckpoint;
+    return {
+      status: "target_recovery",
+      error: checkpoint
+        ? `durable target recovery checkpoint ${checkpoint.id} is resumable at ${checkpoint.payload.phase}/${checkpoint.payload.attempt.number}`
+        : "durable target recovery checkpoint retained and resumable",
+      ...(checkpoint ? { targetAdvanceCheckpointId: checkpoint.id } : {}),
+      retryable: true,
+    };
   }
   if (reconciled.state === "retry_wait") {
     const retry = reconciled.retryCheckpoint;

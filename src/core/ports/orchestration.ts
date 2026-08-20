@@ -78,6 +78,7 @@ export interface OrchestrationWorkerAttemptRecord {
   retryNextAt?: string;
   retryDomain?: "github" | "provider" | "workflow" | "lease" | "transport";
   retryCode?: string;
+  operationKey?: string;
 }
 
 export interface OrchestrationRecoveryRecord {

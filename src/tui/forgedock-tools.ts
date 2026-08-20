@@ -4700,8 +4700,10 @@ export class VisibleDagDelegator {
       && (this.directControllerTransport?.isActive?.(record.id) ?? true)
       && !owned.has(record.id)).length;
     const available = 4 - externalActive;
-    if (available < 1) throw new Error("Native controller transport is at capacity; wait for a task to finish or cancel it explicitly");
-    return available;
+    // Zero capacity is durable backpressure. Let the scheduler retain the
+    // queued DAG and poll rather than converting admission pressure into a
+    // worker exception.
+    return Math.max(0, available);
   }
 
   private async findPiRunByLaunchKey(cwd: string, launchKey: string): Promise<string | undefined> {
@@ -4797,7 +4799,7 @@ export class VisibleDagDelegator {
       }
       if (record && ["completed", "blocked", "failed", "cancelled"].includes(record.status)) {
         const terminal = await this.authoritativeTerminal(stored, item);
-        if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Native controller task ${taskId} stopped at a resumable workflow checkpoint` };
+        if (terminal?.status === "suspended" || terminal?.status === "target_recovery" || terminal?.status === "retry_wait") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Native controller task ${taskId} stopped at a resumable workflow checkpoint` };
         if (terminal) return { disposition: "terminal", result: terminal, reason: "Native controller task is terminal and durable workflow state was reconciled" };
         return { disposition: "interrupted", reason: "Native controller task " + taskId + " ended without authoritative terminal workflow state" };
       }
@@ -4825,11 +4827,11 @@ export class VisibleDagDelegator {
     }
     if (runId && this.completedAsyncRuns.has(runId)) {
       const terminal = await this.authoritativeTerminal(stored, item);
-      if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Pi worker ${runId} stopped at a resumable workflow checkpoint` };
+      if (terminal?.status === "suspended" || terminal?.status === "target_recovery" || terminal?.status === "retry_wait") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `Pi worker ${runId} stopped at a resumable workflow checkpoint` };
       if (terminal) return { disposition: "terminal", result: terminal, reason: "Pi worker completion was observed and durable workflow state was reconciled" };
     }
     const terminal = await this.authoritativeTerminal(stored, item);
-    if (terminal?.status === "suspended") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `${item.id} stopped at a resumable workflow checkpoint` };
+    if (terminal?.status === "suspended" || terminal?.status === "target_recovery" || terminal?.status === "retry_wait") return { disposition: "interrupted", reason: terminal.error instanceof Error ? terminal.error.message : terminal.error ?? `${item.id} stopped at a resumable workflow checkpoint` };
     if (terminal) return { disposition: "terminal", result: terminal, reason: "Durable workflow state is terminal" };
     return { disposition: "interrupted", reason: "No live worker transport could be reconciled for " + item.id };
   }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
+import type { RetryClassification } from "../../core/retry.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -52,10 +53,11 @@ export async function publishRemediationRevision(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    let targetCheckpoint: DurableArtifact<"TargetAdvanceCheckpoint"> | undefined;
     if (error instanceof TargetBranchAdvancedError) {
       // Persist target drift before changing the run state. The checkpoint is
       // the durable recovery authority when this process dies after the fence.
-      await persistTargetAdvanceCheckpoint({
+      targetCheckpoint = await persistTargetAdvanceCheckpoint({
         run,
         packet: input.packet,
         buildResult: input.buildResult,
@@ -71,6 +73,13 @@ export async function publishRemediationRevision(
     // Target movement is recoverable authority drift, never a terminal block.
     // The retained BuildResult/PR identity is re-admitted by target recovery.
     await dependencies.runs.commit(run.version, next.state, next.record);
-    throw new WorkflowExecutionError(reason, next.state, { cause: error });
+    const retryDisposition: RetryClassification | undefined = error instanceof TargetBranchAdvancedError
+      ? { disposition: "retryable", retryable: true, domain: "workflow", code: "target-advanced", cause: error }
+      : undefined;
+    throw new WorkflowExecutionError(reason, next.state, {
+      cause: error,
+      ...(retryDisposition ? { retryDisposition } : {}),
+      ...(targetCheckpoint ? { checkpointId: targetCheckpoint.id } : {}),
+    });
   }
 }

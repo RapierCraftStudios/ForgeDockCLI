@@ -980,7 +980,6 @@ function criterionAnchorPreflightFailure(input: {
       return command !== undefined && (
         command.targeting === "expected-test-paths" && Boolean(command.targets?.length)
         || command.targets?.some((target) => anchoredPaths.includes(target))
-        || /(?:^|[-_:])(?:test|spec|regression|invariant)(?:$|[-_:])/i.test(command.id)
       );
     });
     if (!hasSemanticCommand) {
