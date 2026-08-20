@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -250,8 +251,7 @@ export function bootstrapLocalLeaseWitness(
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
     pauseAfterWitnessInstallForTest();
 
-    const reference = localWitnessReference(paths);
-    writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    publishLocalWitnessReference(paths);
     return localWitnessBootstrapResult(paths, false);
   } catch (error) {
     if (existsSync(temporaryDirectory)) rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -280,8 +280,7 @@ function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): 
     keyId: paths.keyId,
   });
 
-  const reference = localWitnessReference(paths);
-  writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  publishLocalWitnessReference(paths);
   return localWitnessBootstrapResult(paths, true);
 }
 
@@ -334,6 +333,24 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function publishLocalWitnessReference(paths: ReturnType<typeof localWitnessPaths>): void {
+  const temporaryPath = `${paths.configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    const reference = localWitnessReference(paths);
+    // Complete the reference before making it visible. A hard-link install is
+    // atomic and, unlike rename, cannot overwrite a reference published by a
+    // concurrent bootstrapper.
+    writeFileSync(temporaryPath, `${JSON.stringify(reference, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    linkSync(temporaryPath, paths.configPath);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
 }
 
 function pauseAfterWitnessInstallForTest(): void {
