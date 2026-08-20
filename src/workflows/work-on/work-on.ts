@@ -25,6 +25,7 @@ import {
   WorkflowExecutionError,
 } from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
+import { certifyRelationGraphCheckpoint } from "../../core/packet/relation-checkpoint-certification.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
 import { publishPullRequest } from "./publish.js";
@@ -224,6 +225,7 @@ export async function resumeTargetAdvanceWorkOn(
   const catalog = input.resolveVerificationCatalog
     ? await input.resolveVerificationCatalog(targetSha)
     : input.verification;
+  await certifyPacketRelationAuthority(input.packet, workspace.path, targetSha, dependencies.artifacts);
   const frozenVerification = selectPacketVerificationCommands(input.packet.payload, catalog, targetSha);
   const commands = frozenVerification.map((command) => ({ ...command, cwd: workspace.path }));
   let checks: CheckResult[];
@@ -381,6 +383,7 @@ async function prepareCleanPreBuilderExecution(
     throw new Error("Authoritative target advanced repeatedly while refreshing the build workspace", { cause: lastMismatch });
   }
   if (!refreshed.baseSha) throw new Error("Target refresh did not return a frozen base SHA");
+  await certifyPacketRelationAuthority(input.packet, refreshed.path, refreshed.baseSha, dependencies.artifacts);
 
   const catalog = input.resolveVerificationCatalog
     ? await input.resolveVerificationCatalog(refreshed.baseSha)
@@ -444,6 +447,21 @@ async function assertPristineWorkspace(
   if (head.toLowerCase() !== expectedHeadSha.toLowerCase() || changed.length) {
     throw new Error(`Workspace pristine assertion failed ${phase}: expected ${expectedHeadSha}, observed ${head}${changed.length ? ` with changed paths ${changed.join(", ")}` : ""}`);
   }
+}
+
+async function certifyPacketRelationAuthority(
+  packet: DurableArtifact<"BuildPacket">,
+  cwd: string,
+  baseSha: string,
+  artifacts: ArtifactRepository,
+): Promise<void> {
+  if (!packet.payload.relationGraph) return;
+  const checkpoints = await artifacts.list(packet.subject, "RelationGraphCheckpoint");
+  const bound = checkpoints.find((artifact): artifact is DurableArtifact<"RelationGraphCheckpoint"> =>
+    artifact.kind === "RelationGraphCheckpoint" && artifact.id === packet.payload.relationGraph?.checkpointId
+      && artifact.payload.checkpointDigest === packet.payload.relationGraph?.checkpointDigest);
+  if (!bound) throw new Error("[graph-authority] Exact relation graph checkpoint is missing or tampered");
+  await certifyRelationGraphCheckpoint({ checkpoint: bound.payload, packet: packet.payload, cwd, baseSha });
 }
 
 function frozenPacketCommands(
@@ -1225,8 +1243,9 @@ async function continueBuildDelivery(
   };
   let run = input.run;
   const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  if (!input.workspace.baseSha) throw new Error("Builder dispatch requires an exact frozen workspace base SHA");
+  await certifyPacketRelationAuthority(input.packet, input.workspace.path, input.workspace.baseSha, dependencies.artifacts);
   if (input.priorVerificationFailure === undefined) {
-    if (!input.workspace.baseSha) throw new Error("Builder dispatch requires an exact frozen workspace base SHA");
     await assertPristineWorkspace(input.workspace, input.workspace.baseSha, dependencies, "immediately before builder dispatch");
   }
   const built = await buildWorkItem({

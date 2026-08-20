@@ -32,7 +32,7 @@ import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
 import { closeExpectedWriteScope } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
-import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, type RelationGraph } from "../../core/packet/relation-graph.js";
+import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
 import { repositoryAdaptersFor } from "../../adapters/repository/index.js";
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
@@ -212,7 +212,7 @@ export async function prepareBuildPacket(
         subject: run.subject,
         producer: { role: "controller", runtime: "forgedock" },
         payload: relationGraphCheckpoint,
-      });
+      }, { ...(relationGraphCheckpoint.checkpointId ? { id: relationGraphCheckpoint.checkpointId } : {}) });
       await dependencies.artifacts.append(checkpoint);
       run = attachArtifact(run, "RelationGraphCheckpoint", checkpoint.id);
     }
@@ -498,40 +498,57 @@ async function deriveRelationGraphMetadata(
   const limits = { maxNodes: 10_000, maxEdges: 25_000, maxDepth: 8, maxFiles: 2_000, maxBytes: 4_000_000, maxCollateralPaths: 512 };
   const facts = [];
   for (const adapter of adapters) facts.push(await adapter.inspect({ cwd, limits }));
+  const availableFiles = new Set(facts.flatMap((fact) => fact.nodes
+    .filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test" || node.kind === "config")
+    .map((node) => node.identity)));
+  // A model/issue path that is not present in this checkout cannot become a
+  // graph seed. Preserve legacy packet compatibility until an authoritative
+  // checkout containing the declared seed is available.
+  if (seeds.some(({ path }) => !availableFiles.has(path))) return {};
   // Manifest/config relations are authoritative controller inputs, not model
   // suggestions. Seed only the exact config files discovered by the adapter.
+  const nodeDigestByPath = new Map(facts.flatMap((fact) => fact.nodes
+    .filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test" || node.kind === "config")
+    .map((node) => [node.identity, node.digest] as const)));
+  const authoritativeSeeds = seeds.map((seed) => ({ ...seed, contentDigest: nodeDigestByPath.get(seed.path)! }));
   const configSeeds = facts.flatMap((fact) => fact.nodes
     .filter((node): node is typeof node & { digest: string } => node.kind === "config" && node.identity.includes("/") && Boolean(node.digest))
     .map((node) => ({ path: node.identity, provenance: "config" as const, contentDigest: node.digest })));
-  const authoritativeSeeds = [...seeds, ...configSeeds];
-  const graph = buildRelationGraph({ baseSha, seeds: authoritativeSeeds, facts, limits });
+  const allSeeds = [...authoritativeSeeds, ...configSeeds];
+  const graph = buildRelationGraph({ baseSha, seeds: allSeeds, facts, limits });
   const closure = closeRelationGraph(graph);
   if (closure.diagnostics.length) throw new PacketAuthorCorrectableError(closure.diagnostics);
   const writablePaths = finalExpectedPaths
     ? [...new Set(finalExpectedPaths)].sort()
     : [...new Set([...closure.writablePaths, ...expectedPaths.filter((path) => issuePaths.includes(path) || controllerPaths.includes(path))])].sort();
+  if (writablePaths.some((path) => !closure.writablePaths.includes(path))) {
+    throw new PacketAuthorCorrectableError(["[graph-closure] Packet writable paths exceed the authoritative relation closure"]);
+  }
   const commandIds = policyMetadata.verificationCommandIdentities?.map(({ id }) => id).sort() ?? closure.commandIds;
   const invariantIds = closure.invariantIds;
   const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
   const commandPlanDigest = graphCommandPlanDigest(policyMetadata);
   const evidenceContractDigest = graphEvidenceContractDigest(evidenceContract);
+  const closureDigest = digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds, commandIds });
+  const checkpoint = relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, invariantIds, commandIds, closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest });
+  const checkpointId = checkpoint.checkpointId ?? relationGraphCheckpointId(checkpoint.checkpointDigest ?? "");
+  const checkpointDigest = checkpoint.checkpointDigest ?? "";
   const metadata = {
     version: "forgedock.relation-graph/v1" as const,
     baseSha: graph.baseSha,
     graphDigest: graph.graphDigest,
     configDigest,
-    closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds, commandIds }),
+    closureDigest,
     commandPlanDigest,
     evidenceContractDigest,
+    checkpointId,
+    checkpointDigest,
     writablePaths,
     evidencePaths: closure.evidencePaths,
     invariantIds,
     commandIds,
   };
-  return {
-    metadata,
-    checkpoint: relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, invariantIds, commandIds, closureDigest: metadata.closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest }),
-  };
+  return { metadata, checkpoint };
 }
 
 export function canonicalizePacketVerification(
@@ -675,39 +692,41 @@ function matchLegacyCommand(
   }));
 }
 
+function selectedCommandIds(
+  packet: Pick<BuildPacketPayload, "verificationRequirements">,
+  catalog: readonly VerificationCatalogEntry[],
+): Set<string> {
+  const ids = packet.verificationRequirements?.length
+    ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
+    : new Set(catalog.map((command) => command.id));
+  for (const command of catalog) {
+    if (command.selection === "always" || command.id === "diff-check") ids.add(command.id);
+  }
+  return ids;
+}
+
 function selectedCatalogCommands(
   packet: Pick<BuildPacketPayload, "verificationRequirements">,
   catalog: readonly VerificationCatalogEntry[],
 ): VerificationCatalogEntry[] {
-  const selectedIds = packet.verificationRequirements?.length
-    ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
-    : new Set(catalog.map((command) => command.id));
-  for (const command of catalog) {
-    if (command.selection === "always" || command.id === "diff-check") selectedIds.add(command.id);
-  }
-  return catalog.filter((command) => selectedIds.has(command.id));
+  const ids = selectedCommandIds(packet, catalog);
+  return catalog.filter((command) => ids.has(command.id));
 }
 
 function packetVerificationPolicyMetadata(
   packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements">,
   catalog: readonly VerificationCatalogEntry[],
 ): Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> {
-  const selectedIds = packet.verificationRequirements?.length
-    ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
-    : new Set(catalog.map((command) => command.id));
-  for (const command of catalog) if (command.selection === "always") selectedIds.add(command.id);
-  const selected = catalog.filter((command) => selectedIds.has(command.id));
+  const selected = selectedCatalogCommands(packet, catalog);
+  if (!selected.length) return {};
   const policyVersions = [...new Set(selected.map((command) => command.policyVersion).filter((value): value is string => Boolean(value)))];
   const [policyVersion, ...additionalPolicyVersions] = policyVersions;
-  if (!policyVersion) return {};
   if (additionalPolicyVersions.length) throw new Error("Selected verification catalog mixes incompatible policy versions");
   const targeted = selected.filter((command) => command.targeting === "expected-test-paths");
   if (targeted.length) validateVerificationTargetPaths(packet.expectedPaths, targeted);
-  const expectedTestPaths = targeted.length
-    ? resolveVerificationTargets(packet.expectedPaths, targeted)
-    : [];
+  const expectedTestPaths = targeted.length ? resolveVerificationTargets(packet.expectedPaths, targeted) : [];
   return {
-    verificationPolicyVersion: policyVersion,
+    ...(policyVersion !== undefined ? { verificationPolicyVersion: policyVersion } : {}),
     verificationCommandTargets: selected.map((command) => ({
       id: command.id,
       targets: command.targeting === "expected-test-paths" ? expectedTestPaths : [],
@@ -740,6 +759,7 @@ export function selectPacketVerificationCommands(
 ): Array<Omit<VerificationCommand, "cwd">> {
   if (!/^[0-9a-f]{7,64}$/i.test(baseSha)) throw new Error(`Cannot freeze verification plan for invalid base SHA ${baseSha}`);
   if (packet.relationGraph) {
+    if (!packet.relationGraph.checkpointId || !packet.relationGraph.checkpointDigest) throw new Error("[graph-authority] Frozen relation graph is missing its checkpoint identity");
     if (packet.relationGraph.baseSha.toLowerCase() !== baseSha.toLowerCase()) throw new Error("[graph-drift] Frozen relation graph base SHA differs from selected revision");
     const closureDigest = digestRelation({
       graphDigest: packet.relationGraph.graphDigest,
@@ -786,15 +806,11 @@ export function selectPacketVerificationCommands(
   }
 
   const typedRequirements = packet.verificationRequirements;
-  const selectedIds = typedRequirements?.length
-    ? new Set(typedRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
-    : new Set(catalog.map((command) => command.id));
+  const selectedIds = selectedCommandIds(packet, catalog);
   for (const id of selectedIds) {
     if (!commandById.has(id)) throw new Error(`Frozen Build Packet references unavailable verification command '${id}'`);
   }
-  for (const command of catalog) {
-    if (command.selection === "always" || command.id === "diff-check") selectedIds.add(command.id);
-  }
+
   if (packet.relationGraph) {
     const frozenCommandIds = [...packet.relationGraph.commandIds].sort();
     const selectedCommandIds = [...selectedIds].sort();

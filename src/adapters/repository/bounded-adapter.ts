@@ -31,7 +31,7 @@ export class BoundedRepositoryAdapter implements RepositoryAdapter {
   constructor(readonly id: string, readonly languages: readonly string[], readonly extensions: ReadonlySet<string> = SOURCE_EXTENSIONS, manifests: ReadonlySet<string> = MANIFESTS) { this.manifests = manifests; }
 
   async inspect(context: RepositoryAdapterContext): Promise<RepositoryFactSet> {
-    const files = await boundedFiles(context.cwd, context.limits.maxFiles, context.limits.maxBytes);
+    const files = await boundedFiles(context.cwd, context.limits.maxFiles, context.limits.maxBytes, context.limits.maxDepth);
     const accepted = files.filter((path) => this.extensions.has(ext(path)) || this.manifests.has(path.split("/").at(-1) ?? ""));
     const byteCount = await totalFileBytes(context.cwd, accepted);
     const nodes: RelationNode[] = [];
@@ -51,7 +51,7 @@ export class BoundedRepositoryAdapter implements RepositoryAdapter {
         edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(target), "import", path, target, { sourceBytes: text, relation: `${path} imports ${target}` }));
       }
       for (const config of configPaths) {
-        if (path === config || !new RegExp(`(?:^|[\\s"'=/])${escapeRegExp(config.split("/").at(-1) ?? "")}(?:$|[\\s"'])`).test(text)) continue;
+        if (path === config || !new RegExp(`(?:^|[\\s"'=/])${escapeRegExp(config.split("/").at(-1) ?? "")}(?:$|[\\s"'])`).test(stripComments(text))) continue;
         edges.push(makeEdge(this.id, fileNodeId(path), configIds.get(config)!, "reads-config", path, config, { sourceBytes: text, configBytes: contents.get(config) ?? "", relation: `${path} reads ${config}` }));
       }
       if (kind === "test") {
@@ -113,17 +113,17 @@ export function repositoryAdaptersFor(languages: readonly string[], configuredTa
   return unique.length ? unique.map(adapterForLanguage) : [new NoTargetRepositoryAdapter()];
 }
 
-async function boundedFiles(root: string, maxFiles: number, maxBytes: number): Promise<string[]> {
+async function boundedFiles(root: string, maxFiles: number, maxBytes: number, maxDepth: number): Promise<string[]> {
   const result: string[] = []; let bytes = 0;
-  async function visit(directory: string): Promise<void> {
-    if (result.length >= maxFiles || bytes >= maxBytes) return;
+  async function visit(directory: string, depth: number): Promise<void> {
+    if (depth > maxDepth || result.length >= maxFiles || bytes >= maxBytes) return;
     let entries;
     try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
       if (result.length >= maxFiles || bytes >= maxBytes) return;
       if (entry.name.startsWith(".") && entry.name !== ".github") continue;
-      if (entry.isDirectory()) { if (!SKIP.has(entry.name)) await visit(pathJoin(directory, entry.name)); continue; }
+      if (entry.isDirectory()) { if (!SKIP.has(entry.name)) await visit(pathJoin(directory, entry.name), depth + 1); continue; }
       const path = canonicalRelationPath(relative(root, pathJoin(directory, entry.name)));
       if (!SOURCE_EXTENSIONS.has(ext(path)) && !MANIFESTS.has(entry.name)) continue;
       try {
@@ -134,7 +134,7 @@ async function boundedFiles(root: string, maxFiles: number, maxBytes: number): P
       result.push(path);
     }
   }
-  await visit(root); return result;
+  await visit(root, 0); return result;
 }
 
 async function totalFileBytes(root: string, files: readonly string[]): Promise<number> {
@@ -157,12 +157,14 @@ function basename(path: string): string { return path.split("/").at(-1) ?? path;
 function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function referencedPaths(source: string, text: string, known: Set<string>, adapterId = "monorepo"): string[] {
   const found = new Set<string>();
-  const patterns = [/(?:from|import)\s*["']([^"']+)["']/g, /require\s*\(\s*["']([^"']+)["']\s*\)/g, /(?:import|include)\s*["']([^"']+)["']/g];
-  if (adapterId === "python") patterns.push(/from\s+([.A-Za-z0-9_]+)\s+import/g);
-  if (adapterId === "rust") patterns.push(/(?:mod|use\s+crate::)\s*([A-Za-z0-9_:]+)/g);
-  if (adapterId === "go") patterns.push(/import\s+\(?\s*["']([^"']+)["']/g);
-  if (adapterId === "jvm") patterns.push(/(?:import|package)\s+([A-Za-z0-9_.]+)/g);
-  for (const pattern of patterns) for (const match of text.matchAll(pattern)) {
+  const code = stripComments(text);
+  const patterns = [/(?:^|[;{}\n])\s*import\s+(?:[^;\n]*?\s+from\s*)?["']([^"']+)["']/gm, /(?:^|[;{}\n])\s*import\s*["']([^"']+)["']/gm, /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g, /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g];
+  if (adapterId === "python") patterns.push(/^\s*from\s+([.A-Za-z0-9_]+)\s+import\b/gm);
+  if (adapterId === "rust") patterns.push(/(?:^|[;{}\n])\s*(?:mod|use\s+crate::)\s*([A-Za-z0-9_:]+)/gm);
+  if (adapterId === "go") patterns.push(/\bimport\s+\(?\s*["']([^"']+)["']/g);
+  if (adapterId === "jvm") patterns.push(/^\s*(?:import|package)\s+([A-Za-z0-9_.]+)/gm);
+  for (const pattern of patterns) for (const match of code.matchAll(pattern)) {
+    if (!isCodePosition(code, match.index ?? 0)) continue;
     const raw = match[1]; if (!raw || (!raw.startsWith(".") && !raw.includes("/") && adapterId !== "rust" && adapterId !== "jvm")) continue;
     const base = raw.startsWith(".") ? join(source.split("/").slice(0, -1).join("/"), raw) : raw.replaceAll("::", "/").replaceAll(".", "/");
     const normalized = base.replaceAll("\\", "/").replace(/^\.\//, "");
@@ -174,6 +176,39 @@ function referencedPaths(source: string, text: string, known: Set<string>, adapt
   }
   return [...found].sort();
 }
+function isCodePosition(text: string, position: number): boolean {
+  let quote: string | undefined;
+  let escaped = false;
+  for (let index = 0; index < position; index += 1) {
+    const char = text[index]!;
+    if (quote && escaped) { escaped = false; continue; }
+    if (quote && char === "\\") { escaped = true; continue; }
+    if ((char === "\"" || char === "'" || char === "`") && (!quote || quote === char)) quote = quote ? undefined : char;
+  }
+  return quote === undefined;
+}
+
+function stripComments(text: string): string {
+  let result = "";
+  let quote: string | undefined;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    const next = text[index + 1];
+    if (lineComment) { result += char === "\n" ? "\n" : " "; if (char === "\n") lineComment = false; continue; }
+    if (blockComment) { result += char === "\n" ? "\n" : " "; if (char === "*" && next === "/") { result += " "; index += 1; blockComment = false; } continue; }
+    if (!quote && char === "/" && next === "/") { result += "  "; index += 1; lineComment = true; continue; }
+    if (!quote && char === "/" && next === "*") { result += "  "; index += 1; blockComment = true; continue; }
+    result += char;
+    if (quote && escaped) { escaped = false; continue; }
+    if (quote && char === "\\") { escaped = true; continue; }
+    if ((char === "\"" || char === "'" || char === "`") && (!quote || quote === char)) quote = quote ? undefined : char;
+  }
+  return result;
+}
+
 function makeEdge(adapterId: string, sourceId: string, targetId: string, kind: RelationEdge["kind"], sourcePath: string, targetPath: string, evidence: unknown): RelationEdge {
   return { id: `${adapterId}:${kind}:${sourcePath}:${targetPath}`, sourceId, targetId, kind, adapterId, provenance: "repository", sourcePath: canonicalRelationPath(sourcePath), targetPath: canonicalRelationPath(targetPath), evidenceDigest: digestRelation(evidence) };
 }

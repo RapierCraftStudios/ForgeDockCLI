@@ -206,6 +206,9 @@ export const BuildPacketPayloadSchema = Type.Object({
     closureDigest: PacketDigest,
     commandPlanDigest: PacketDigest,
     evidenceContractDigest: PacketDigest,
+    /** Exact durable checkpoint identity bound to this packet. */
+    checkpointId: NonEmptyString,
+    checkpointDigest: PacketDigest,
     writablePaths: Type.Array(NonEmptyString),
     evidencePaths: Type.Array(NonEmptyString),
     invariantIds: Type.Array(NonEmptyString),
@@ -800,6 +803,9 @@ export const RelationGraphCheckpointPayloadSchema = Type.Object({
     maxDepth: Type.Integer({ minimum: 1 }), maxFiles: Type.Integer({ minimum: 1 }),
     maxBytes: Type.Integer({ minimum: 1 }), maxCollateralPaths: Type.Integer({ minimum: 0 }),
   }),
+  /** Identity fields are optional only for decoding pre-certification checkpoints. */
+  checkpointId: Type.Optional(NonEmptyString),
+  checkpointDigest: Type.Optional(Digest),
   createdAt: IsoDateTime,
 });
 

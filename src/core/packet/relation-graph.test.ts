@@ -87,6 +87,16 @@ describe("repository adapter layouts", () => {
       assert.ok(generated.edges.some((edge) => edge.kind === "generated-by"));    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("does not authorize paths from comments or arbitrary quoted strings", async () => {
+    const root = await fixture({
+      "src/a.ts": "// import './b.ts'\nconst example = \"import './b.ts'\";",
+      "src/b.ts": "export const b = true;",
+    });
+    try {
+      const result = await adapterForLanguage("typescript").inspect({ cwd: root, limits });
+      assert.equal(result.edges.some((edge) => edge.kind === "import" && edge.targetPath === "src/b.ts"), false);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   it("supports configured and explicit no-target runners", async () => {
     const root = await fixture({ "src/a.ts": "" });
     try {
