@@ -449,8 +449,8 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => JSON.parse(String((row as { receipt_json: string }).receipt_json)) as AgentRunReceipt);
   }
 
-  async rebuildRun(state: RunState): Promise<void> {
-    await withSqliteBusyRetry(() => this.inTransaction(() => {
+  async rebuildRun(state: RunState): Promise<RunState> {
+    const persisted = await withSqliteBusyRetry(() => this.inTransaction(() => {
       // Rebuild only the rebuildable current-state row. Transition history,
       // progress, and telemetry are operational evidence and must survive a
       // cache/state repair; deleting them made stalls look like fresh runs.
@@ -462,7 +462,12 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET version = excluded.version, state_json = excluded.state_json
       `).run(state.runId, version, JSON.stringify(persisted));
+      return persisted;
     }));
+    // Do not mutate the recovery object until the transaction has committed;
+    // current callers retain this object as the next transition's authority.
+    Object.assign(state, persisted);
+    return persisted;
   }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {

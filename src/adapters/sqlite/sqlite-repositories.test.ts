@@ -453,14 +453,22 @@ describe("SQLite operational repositories", () => {
       const started = transition(queued, "START_INVESTIGATION");
       await store.commit(queued.version, started.state, started.record);
       await store.recordProgress({ runId: queued.runId, phase: "controller.heartbeat", message: "stale", occurredAt: "2026-01-01T00:00:00.000Z" });
-      await store.rebuildRun({ ...started.state, state: "building" });
+      const recovered = { ...started.state, state: "building" as const, version: 0 };
+      const rebuilt = await store.rebuildRun(recovered);
+      assert.equal(rebuilt.version, 1);
+      assert.equal(recovered.version, 1);
       assert.equal((await store.load(queued.runId))?.state, "building");
-      assert.equal((await store.load(queued.runId))?.version, started.state.version);
+      assert.equal((await store.load(queued.runId))?.version, rebuilt.version);
       assert.deepEqual((await store.history(queued.runId)).map((record) => record.event), ["START_INVESTIGATION"]);
       assert.deepEqual((await store.listProgress(queued.runId)).map(({ phase, message }) => ({ phase, message })), [{ phase: "controller.heartbeat", message: "stale" }]);
-      const resumed = transition((await store.load(queued.runId))!, "RESUME_BUILD");
-      await store.commit(started.state.version, resumed.state, resumed.record);
+      const resumed = transition(recovered, "RESUME_BUILD");
+      await store.commit(recovered.version, resumed.state, resumed.record);
       assert.equal((await store.history(queued.runId)).at(-1)?.event, "RESUME_BUILD");
+      const staleWriter = transition({ ...recovered, version: 0 }, "RESUME_BUILD");
+      await assert.rejects(
+        store.commit(0, staleWriter.state, staleWriter.record),
+        ConcurrentRunUpdateError,
+      );
     } finally {
       store.close();
     }
