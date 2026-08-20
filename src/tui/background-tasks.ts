@@ -375,7 +375,8 @@ export class ForgeDockBackgroundTasks {
       if (!warned && Date.now() - lastProgressAt >= warnAfterMs) {
         warned = true;
         const message = `ForgeDock controller task ${id} has no semantic activity for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and recovery is still explicit.`;
-        this.#ctx?.ui.notify(message, "warning");
+        const notify = this.#ctx?.ui.notify;
+      if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
         try { this.#pi.sendMessage({ customType: "forgedock-progress-warning", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
       }
       const warningPollMs = warned
@@ -595,7 +596,8 @@ export class ForgeDockBackgroundTasks {
       void this.#observationAdapter?.discarded(task.record.id);
       this.#live.delete(task.record.id);
       const message = `${renderRecord(task.record)} — detached controller exited without an observable exit result; durable workflow state remains authoritative\nLog: ${task.record.logPath}`;
-      this.#ctx?.ui.notify(message, "warning");
+      const notify = this.#ctx?.ui.notify;
+      if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
       try { this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
       this.renderStatus();
     }
@@ -626,7 +628,8 @@ export class ForgeDockBackgroundTasks {
             ? PROMOTE_RESUME_MESSAGE
             : LEGACY_WORKFLOW_RESUME_MESSAGE;
     const message = `${renderRecord(record)} — interrupted during terminal restart because its ephemeral nested-agent bridge cannot be reattached. ${resumeMessage}`;
-    this.#ctx?.ui.notify(message, "warning");
+    const notify = this.#ctx?.ui.notify;
+    if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
     try {
       this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
     } catch {
