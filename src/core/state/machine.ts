@@ -131,6 +131,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
   verifying: {
     VERIFICATION_PASSED: "publishing",
     VERIFICATION_FAILED: "blocked",
+    TARGET_ADVANCE_DETECTED: "target_recovery",
     BLOCK: "blocked",
     FAIL: "failed",
     CANCEL: "cancelled",

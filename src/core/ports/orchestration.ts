@@ -141,6 +141,8 @@ export interface OrchestrationItemRecord {
   /** Optional for records written before repository identity was stored per node. */
   repository?: string;
   targetBranch?: string;
+  /** Normalized repository/target serialization resource. */
+  targetRouteClaim?: string;
   lane?: "fast" | "feature";
   promotionTarget?: string;
   productionTarget?: string;

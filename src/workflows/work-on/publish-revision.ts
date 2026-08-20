@@ -7,7 +7,7 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import { transition, type RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
-import { assertTargetHeadUnchanged, recordTargetFenceOutcome, TargetBranchAdvancedError } from "./publish.js";
+import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
 
 export async function publishRemediationRevision(
   input: { run: RunState; pullRequest: PullRequestSnapshot; buildResult: DurableArtifact<"BuildResult">; workspace: GitWorkspace; expectedTargetHeadSha?: string },
@@ -51,10 +51,9 @@ export async function publishRemediationRevision(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const next = error instanceof TargetBranchAdvancedError ? transition(run, "BLOCK", { reason }) : transition(run, "FAIL", { reason });
-    if (error instanceof TargetBranchAdvancedError && dependencies.artifacts) {
-      await recordTargetFenceOutcome(run, reason, dependencies.artifacts, input.pullRequest.url);
-    }
+    const next = error instanceof TargetBranchAdvancedError ? transition(run, "TARGET_ADVANCE_DETECTED", { reason }) : transition(run, "FAIL", { reason });
+    // Target movement is recoverable authority drift, never a terminal block.
+    // The retained BuildResult/PR identity is re-admitted by target recovery.
     await dependencies.runs.commit(run.version, next.state, next.record);
     throw new WorkflowExecutionError(reason, next.state, { cause: error });
   }

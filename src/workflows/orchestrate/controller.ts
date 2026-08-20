@@ -40,6 +40,7 @@ import {
   type ScheduleWorkerResult,
   type ScheduledStatus,
   type ScheduledWorkItem,
+  normalizedDeliveryRouteClaim,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
 
@@ -1048,6 +1049,11 @@ export class OrchestrationController {
         state.claim.assertValid();
         await schedulerContext.promoteClaims(claims);
       },
+      promoteTargetRouteClaim: async () => {
+        assertAttemptActive(state.record, item.id, attemptId);
+        state.claim.assertValid();
+        await schedulerContext.promoteTargetRouteClaim();
+      },
       recordTask: async (identity) => {
         const identityValues = Object.values(identity);
         if (!identityValues.length
@@ -1691,6 +1697,11 @@ function nodeRecordFromItem(item: ScheduledWorkItem): OrchestrationNodeRecord {
     claims: [...item.claims],
     ...(item.repository !== undefined ? { repository: item.repository } : {}),
     ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
+    ...(item.targetRouteClaim !== undefined
+      ? { targetRouteClaim: item.targetRouteClaim }
+      : item.repository !== undefined && item.targetBranch !== undefined
+        ? { targetRouteClaim: normalizedDeliveryRouteClaim(item.repository, item.targetBranch) }
+        : {}),
     ...(item.lane !== undefined ? { lane: item.lane } : {}),
     ...(item.promotionTarget !== undefined ? { promotionTarget: item.promotionTarget } : {}),
     ...(item.productionTarget !== undefined ? { productionTarget: item.productionTarget } : {}),
@@ -1714,6 +1725,7 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
     claims: [...node.claims],
     ...(node.repository !== undefined ? { repository: node.repository } : {}),
     ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}),
+    ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}),
     ...(node.lane !== undefined ? { lane: node.lane } : {}),
     ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}),
     ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}),

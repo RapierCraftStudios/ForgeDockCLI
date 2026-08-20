@@ -431,6 +431,7 @@ async function workOn(
   argv: string[],
   orchestration?: {
     promoteClaims(claims: readonly string[]): Promise<void>;
+    promoteTargetRouteClaim?(): Promise<void>;
     recordRun?(runId: string): Promise<void>;
     /** Abort this nested work-on when its parent orchestration loses liveness. */
     signal?: AbortSignal;
@@ -2256,6 +2257,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           try {
             await workOn(resumeArgs, {
               promoteClaims: controllerContext.promoteClaims,
+              promoteTargetRouteClaim: controllerContext.promoteTargetRouteClaim,
               recordRun: (runId) => controllerContext.recordTask({ runId }),
               signal: workerSignal,
             });
@@ -2322,6 +2324,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
               metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
             },
             onClaimsPromoted: async (paths) => {
+              await controllerContext.promoteTargetRouteClaim();
               await promoteOrchestrationClaimsFromEnvironment(paths);
               await controllerContext.promoteClaims(paths);
             },
@@ -2789,6 +2792,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
         try {
           await workOn(workerArgs, {
             promoteClaims: context.promoteClaims,
+            promoteTargetRouteClaim: context.promoteTargetRouteClaim,
             recordRun: async (runId) => {
               await context.recordTask({ runId });
             },

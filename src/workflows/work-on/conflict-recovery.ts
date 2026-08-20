@@ -12,6 +12,7 @@ import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js
 import { publishRemediationRevision } from "./publish-revision.js";
 import { uncoveredVerificationCommands } from "./verify.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
+import { persistTargetAdvanceCheckpoint as persistTargetAdvanceCheckpointShared } from "./target-recovery.js";
 
 /** The old approval is evidence for admission only; it is never reused for the new SHA. */
 export interface ConflictRecoveryInput {
@@ -311,6 +312,24 @@ export async function recoverConflictingRevision(
     return { run: published.run, buildResult, pullRequest: published.pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const targetMovement = /Target branch changed[^:]*: expected [^,]+, observed ([0-9a-f]{7,64})/i.exec(reason)
+      ?? /target[^\n]*expected [^\s,]+[,: ]+observed[ =]([0-9a-f]{7,64})/i.exec(reason);
+    if (targetMovement && run.state !== "blocked") {
+      await persistTargetAdvanceCheckpointShared({
+        run,
+        packet: input.packet,
+        buildResult: input.buildResult,
+        workspace,
+        targetBranch: input.run.targetBranch ?? input.pullRequest.baseBranch,
+        observedTargetSha: targetMovement[1]!,
+        phase: "target-read",
+        verdict: input.verdict,
+        artifacts: dependencies.artifacts,
+      });
+      const next = transition(run, "TARGET_ADVANCE_DETECTED", { reason });
+      await dependencies.runs.commit(run.version, next.state, next.record);
+      return { run: next.state };
+    }
     // Publication owns its transition to `failed` when a push succeeds but
     // the subsequent PR projection/read fails. Adopt and preserve that typed
     // state; attempting VERIFICATION_FAILED from the stale `publishing`

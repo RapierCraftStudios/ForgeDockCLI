@@ -7,6 +7,7 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import { transition, type RunState } from "../../core/state/machine.js";
 import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
+import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 
 export function assertParentRemediationPullRequestTarget(input: {
   parentBranch: string;
@@ -79,10 +80,27 @@ export async function publishPullRequest(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const next = error instanceof TargetBranchAdvancedError ? transition(run, "BLOCK", { reason }) : transition(run, "FAIL", { reason });
-    if (error instanceof TargetBranchAdvancedError && dependencies.artifacts) {
-      await recordTargetFenceOutcome(run, reason, dependencies.artifacts);
+    if (error instanceof TargetBranchAdvancedError) {
+      const targetBranch = error.targetBranch;
+      // The checkpoint is durable before the state transition. A restart can
+      // therefore recover the exact target route even if projection fails.
+      await persistTargetAdvanceCheckpoint({
+        run,
+        packet: input.packet,
+        buildResult: input.buildResult,
+        workspace: input.workspace,
+        targetBranch,
+        observedTargetSha: error.observedBaseSha,
+        phase: "target-read",
+        ...(dependencies.artifacts ? { artifacts: dependencies.artifacts } : {}),
+      });
+      const next = transition(run, "TARGET_ADVANCE_DETECTED", {
+        reason: `${reason}; route=${normalizedTargetRouteClaim(run.subject.repo, targetBranch)}`,
+      });
+      await dependencies.runs.commit(run.version, next.state, next.record);
+      throw new WorkflowExecutionError(reason, next.state, { cause: error });
     }
+    const next = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, next.state, next.record);
     throw new WorkflowExecutionError(reason, next.state, { cause: error });
   }

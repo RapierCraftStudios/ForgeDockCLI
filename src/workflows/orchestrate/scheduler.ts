@@ -15,6 +15,8 @@ export interface ScheduledWorkItem {
   claims: readonly string[];
   /** Optional for legacy records; new work retains its repository identity per node. */
   repository?: string;
+  /** Normalized target-sensitive serialization resource, retained on every delivery item. */
+  targetRouteClaim?: string;
   /** Frozen repository delivery route retained through scheduling and durable recovery. */
   targetBranch?: string;
   /** Durable retry wake-up metadata; omitted for legacy queued items. */
@@ -79,6 +81,8 @@ export type ScheduleCapacity = number | (() => number | Promise<number>);
 export interface ScheduleWorkerContext {
   /** Add concrete Build Packet paths before the worker mutates its checkout. */
   promoteClaims(claims: readonly string[]): Promise<void>;
+  /** Promote the normalized repository/target route immediately before mutation. */
+  promoteTargetRouteClaim(): Promise<void>;
 }
 export interface RunScheduleOptions {
   onEvent?: ScheduleEventSink;
@@ -511,6 +515,14 @@ export async function runSchedule(
             throw error;
           }
         },
+        promoteTargetRouteClaim: async () => {
+          const route = item.targetRouteClaim
+            ?? (item.repository !== undefined && item.targetBranch !== undefined
+              ? normalizedDeliveryRouteClaim(item.repository, item.targetBranch)
+              : undefined);
+          if (!route) throw new Error(`Delivery item ${item.id} has no complete repository/target route`);
+          await context.promoteClaims([route]);
+        },
       };
       const promise = worker(item, context)
         .then((result) => {
@@ -745,10 +757,17 @@ export function scheduledClaimsConflict(
   return claimsConflict(leftClaims, rightClaims);
 }
 
+export function normalizedDeliveryRouteClaim(repository: string, targetBranch: string): string {
+  const repo = repository.trim().toLowerCase().replaceAll("\\", "/").replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  const target = targetBranch.trim().replaceAll("\\", "/").replace(/^refs\/heads\//, "");
+  if (!repo || !target) throw new Error("Delivery route requires repository and target branch");
+  return `target-route:${repo}:${target}`;
+}
+
 function claimRouteKey(item: ScheduledWorkItem): string | undefined {
-  const repository = item.repository?.trim().toLowerCase();
+  const repository = item.repository?.trim();
   const targetBranch = item.targetBranch?.trim();
-  return repository && targetBranch ? JSON.stringify([repository, targetBranch]) : undefined;
+  return repository && targetBranch ? normalizedDeliveryRouteClaim(repository, targetBranch) : undefined;
 }
 
 function claimRoutesMayConflict(left: ScheduledWorkItem, right: ScheduledWorkItem): boolean {
