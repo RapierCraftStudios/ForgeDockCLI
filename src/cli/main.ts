@@ -858,19 +858,20 @@ async function workOn(
           throw new Error(`Run ${resumeRunId} lacks the packet, investigation, BuildResult, and target checkpoint required for target recovery`);
         }
         const targetPr = await github.findOpenPullRequest?.(subject.repo, targetBuild.payload.branch);
-        if (!targetPr || targetPr.headSha.toLowerCase() !== targetCheckpoint.payload.sourceHeadSha.toLowerCase()) {
-          throw new Error(`Run ${resumeRunId} has no authoritative open PR at the checkpoint head`);
+        if (targetPr && targetPr.headSha.toLowerCase() !== targetCheckpoint.payload.sourceHeadSha.toLowerCase()) {
+          throw new Error(`Run ${resumeRunId} has an open PR whose head does not match the target checkpoint`);
         }
         const targetRun = await store.load(resumeRunId);
-        if (!targetRun || targetRun.state !== "target_recovery") throw new Error(`Run ${resumeRunId} is not durably admitted for target recovery`);
+        if (!targetRun || (targetRun.state !== "target_recovery" && targetRun.state !== "retry_wait")) throw new Error(`Run ${resumeRunId} is not durably admitted for target recovery`);
         const targetGit = new GitWorktreeManager(process.cwd());
         const targetWorkspace = await targetGit.recover({ runId: resumeRunId, issue: issue.number, baseRef: `origin/${deliveryTargetBranch}` });
         const targetVerification = discoverVerificationCommands(process.cwd(), targetCheckpoint.payload.sourceBaseSha);
         const recovered = await resumeTargetAdvanceWorkOn({
           run: targetRun, checkpoint: targetCheckpoint, intent: intentArtifact!, investigation, packet,
-          buildResult: targetBuild, pullRequest: targetPr, workspace: targetWorkspace,
+          buildResult: targetBuild, ...(targetPr !== undefined ? { pullRequest: targetPr } : {}), workspace: targetWorkspace,
+          resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(process.cwd(), baseSha),
           verification: targetVerification, signal: leaseController.signal,
-        }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, leaseGuard, onAgentEvent });
+        }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, leaseGuard, ...(orchestration?.promoteTargetRouteClaim ? { promoteTargetRouteClaim: orchestration.promoteTargetRouteClaim } : {}), onAgentEvent });
         process.stdout.write(`${statusGlyph("active", mode)} Recovered target movement for ${resumeRunId} at ${recovered.buildResult.payload.headSha}; fresh review admission is required
 `);
         return;

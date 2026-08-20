@@ -52,6 +52,8 @@ export interface WorkOnDependencies {
   host: ForgeHost;
   telemetry?: TelemetryRepository;
   /** Controller-owned fencing guard checked before every dependent mutation. */
+  /** Route claim must be held before any target-sensitive recovery mutation. */
+  promoteTargetRouteClaim?: () => Promise<void>;
   leaseGuard?: LeaseGuard;
   onAgentEvent?: AgentEventSink;
   /** Repository-owned target-aware CI admission policy. */
@@ -74,9 +76,11 @@ export interface TargetAdvanceResumeInput {
   investigation: DurableArtifact<"Investigation">;
   packet: DurableArtifact<"BuildPacket">;
   buildResult: DurableArtifact<"BuildResult">;
-  pullRequest: PullRequestSnapshot;
+  /** Optional because initial publication can be fenced before a PR exists. */
+  pullRequest?: PullRequestSnapshot;
   workspace: GitWorkspace;
   verification: readonly Omit<VerificationCommand, "cwd">[];
+  resolveVerificationCatalog?: VerificationCatalogResolver;
   /** Admission evidence only; it is never passed to a fresh review. */
   priorVerdict?: DurableArtifact<"ReviewVerdict">;
   signal?: AbortSignal;
@@ -99,23 +103,26 @@ export async function resumeTargetAdvanceWorkOn(
     throw new Error(`Target recovery requires target_recovery or retry_wait state, found ${input.run.state}`);
   }
   const checkpoint = input.checkpoint.payload;
+  const pullRequest = input.pullRequest;
   if (checkpoint.repository.toLowerCase() !== input.run.subject.repo.toLowerCase()
-    || checkpoint.targetBranch !== input.pullRequest.baseBranch
+    || (pullRequest !== undefined && checkpoint.targetBranch !== pullRequest.baseBranch)
     || checkpoint.sourceBuildResultId !== input.buildResult.id
     || checkpoint.sourceHeadSha.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()
-    || input.pullRequest.headSha.toLowerCase() !== checkpoint.sourceHeadSha.toLowerCase()) {
+    || (pullRequest !== undefined && pullRequest.headSha.toLowerCase() !== checkpoint.sourceHeadSha.toLowerCase())) {
     throw new Error("Target recovery checkpoint, PR, and Build Result identity do not match");
   }
   if (!dependencies.host.getBranchHead || !dependencies.git.integrateRemoteBase) {
     throw new Error("Target recovery requires authoritative branch reads and exact remote-base integration");
   }
   let run = input.run;
+  await dependencies.promoteTargetRouteClaim?.();
   const resumed = transition(run, run.state === "retry_wait" ? "RETRY_DUE" : "RESUME_TARGET_ADVANCE", {
     reason: `Recovering ${checkpoint.routeClaimKey} at source ${checkpoint.sourceHeadSha}`,
   });
   await dependencies.runs.commit(run.version, resumed.state, resumed.record);
   run = resumed.state;
-  const targetSha = await dependencies.host.getBranchHead(input.pullRequest.repo, checkpoint.targetBranch);
+  const targetRepository = pullRequest?.repo ?? input.run.subject.repo;
+  const targetSha = await dependencies.host.getBranchHead(targetRepository, checkpoint.targetBranch);
   if (!/^[0-9a-f]{7,64}$/i.test(targetSha)) throw new Error("Authoritative target read is not a Git SHA");
   if (targetSha.toLowerCase() === checkpoint.sourceBaseSha.toLowerCase()) {
     throw new Error(`Target ${checkpoint.targetBranch} has not advanced beyond ${checkpoint.sourceBaseSha}`);
@@ -136,15 +143,17 @@ export async function resumeTargetAdvanceWorkOn(
   const outside = conflictPaths.filter((path) => !expectedPaths.has(path));
   if (outside.length) throw new Error(`Target merge conflicts outside frozen packet: ${outside.join(", ")}`);
   if (conflictPaths.length) {
+    if (!pullRequest) throw new Error("Conflict recovery without an existing PR requires a packet-scoped resolver admission checkpoint");
+    const existingPullRequest = pullRequest;
     if (!dependencies.git.unmergedPaths || !dependencies.git.stageConflictResolutions || !input.priorVerdict) {
       throw new Error("Target conflict recovery cannot prove resolver admission or index completion");
     }
     const resolved = await resolvePacketConflicts({
       input: {
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult: input.buildResult, verdict: input.priorVerdict, pullRequest: input.pullRequest,
+        buildResult: input.buildResult, verdict: input.priorVerdict, pullRequest: existingPullRequest,
         workspace, commands: input.verification.map((command) => ({ ...command, cwd: workspace.path })),
-        mergeGate: { repo: input.pullRequest.repo, mergeability: "conflicting", mergeable: false, headSha: checkpoint.sourceHeadSha, baseBranch: checkpoint.targetBranch, pullRequest: input.pullRequest.number, requiredChecks: [], observedAt: new Date().toISOString() },
+        mergeGate: { repo: existingPullRequest.repo, mergeability: "conflicting", mergeable: false, headSha: checkpoint.sourceHeadSha, baseBranch: checkpoint.targetBranch, pullRequest: existingPullRequest.number, requiredChecks: [], observedAt: new Date().toISOString() },
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
       },
       workspace,
@@ -170,17 +179,36 @@ export async function resumeTargetAdvanceWorkOn(
   }
   const changedPaths = canonicalizeConcreteScopePaths(await dependencies.git.revisionChangedPaths(workspace)).sort();
   if (changedPaths.some((path) => !expectedPaths.has(path))) throw new Error("Synchronized revision broadened the frozen packet scope");
-  const commands = input.verification.map((command) => ({ ...command, cwd: workspace.path }));
+  const catalog = input.resolveVerificationCatalog
+    ? await input.resolveVerificationCatalog(targetSha)
+    : input.verification;
+  const frozenVerification = selectPacketVerificationCommands(input.packet.payload, catalog, targetSha);
+  const commands = frozenVerification.map((command) => ({ ...command, cwd: workspace.path }));
   const checks = await dependencies.verifier.run(commands, input.signal);
   if (commands.some((command, index) => command.required && checks[index]?.status !== "passed")) throw new Error("Frozen verification plan failed after target recovery");
-  const postTarget = await dependencies.host.getBranchHead(input.pullRequest.repo, checkpoint.targetBranch);
-  if (postTarget.toLowerCase() !== targetSha.toLowerCase()) throw new TargetBranchAdvancedError(checkpoint.targetBranch, targetSha, postTarget);
+  let postTarget: string;
+  try {
+    postTarget = await dependencies.host.getBranchHead(targetRepository, checkpoint.targetBranch);
+    if (postTarget.toLowerCase() !== targetSha.toLowerCase()) throw new TargetBranchAdvancedError(checkpoint.targetBranch, targetSha, postTarget);
+  } catch (error) {
+    if (!(error instanceof TargetBranchAdvancedError)) throw error;
+    await persistTargetAdvanceCheckpoint({
+      run, packet: input.packet, buildResult: input.buildResult, workspace,
+      targetBranch: checkpoint.targetBranch, observedTargetSha: error.observedBaseSha,
+      phase: "target-read", attempt: checkpoint.attempt.number + 1, maxAttempts: checkpoint.attempt.max,
+      artifacts: dependencies.artifacts,
+    });
+    const recovery = transition(run, "TARGET_ADVANCE_DETECTED", { reason: error.message });
+    const wait = transition(recovery.state, "RETRY_WAIT_SCHEDULED", { reason: error.message });
+    await dependencies.runs.commit(run.version, recovery.state, recovery.record);
+    await dependencies.runs.commit(recovery.state.version, wait.state, wait.record);
+    throw new WorkflowExecutionError(error.message, wait.state, { cause: error, recoverable: true });
+  }
   const postHead = await dependencies.git.head(workspace);
   if (postHead.toLowerCase() !== newHead.toLowerCase() || (await dependencies.git.changedPaths(workspace)).length) throw new Error("Retained workspace mutated during target recovery verification");
+  if (!dependencies.git.committedContentMatches) throw new Error("Target recovery requires committed regular-file content proof");
   const freshContentDigest = await deliveryContentDigest(workspace.path, changedPaths);
-  const contentMatches = dependencies.git.committedContentMatches
-    ? await dependencies.git.committedContentMatches(workspace, changedPaths, freshContentDigest, newHead)
-    : true;
+  const contentMatches = await dependencies.git.committedContentMatches(workspace, changedPaths, freshContentDigest, newHead);
   if (!contentMatches) throw new Error("Recovered committed content does not match the verified mutation digest");
   const verificationCheckpoint = createArtifact({
     kind: "VerificationCheckpoint", runId: run.runId, subject: run.subject, producer: { role: "controller", runtime: "forgedock" },
@@ -188,7 +216,7 @@ export async function resumeTargetAdvanceWorkOn(
       checkpoint: "verified-commit", branch: workspace.branch, targetBranch: checkpoint.targetBranch, baseSha: targetSha,
       parentHeadSha: checkpoint.sourceHeadSha, changedPaths, pendingChangedPaths: changedPaths,
       verifiedContentDigest: freshContentDigest, commitMessage: `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`,
-      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => ({ criterion, status: "passed" as const, evidence: `Verified against target ${targetSha}.` })),
+      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: [],
       checks, decisions: [`Target recovery rebased ${checkpoint.sourceHeadSha} onto ${targetSha}.`], residualRisks: [],
     },
   });
@@ -202,9 +230,13 @@ export async function resumeTargetAdvanceWorkOn(
   run = attachArtifact(run, "BuildResult", freshBuildResult.id);
   const publishing = transition(run, "TARGET_ADVANCE_COMPLETED", { headSha: newHead });
   await dependencies.runs.commit(run.version, publishing.state, publishing.record);
-  const published = await publishRemediationRevision({ run: publishing.state, pullRequest: input.pullRequest, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
-    git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
-  });
+  const published = pullRequest
+    ? await publishRemediationRevision({ run: publishing.state, pullRequest, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
+      git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
+    })
+    : await publishPullRequest({ run: publishing.state, intent: input.intent, packet: input.packet, buildResult: freshBuildResult, workspace }, {
+      git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
+    });
   const reviewed = await reviewPullRequest({
     run: published.run, pullRequest: published.pullRequest, intent: input.intent,
     investigation: input.investigation, packet: input.packet, buildResult: freshBuildResult,
