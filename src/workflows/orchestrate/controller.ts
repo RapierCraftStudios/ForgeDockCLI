@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
+import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
 import {
   findDurableOrchestrationIssueConflicts,
   normalizeOrchestrationRepository,
@@ -478,7 +479,14 @@ export class OrchestrationController {
         continue;
       }
       if (node.status === "retry_wait") {
-        actions.set(node.id, { kind: "terminal", result: { status: "retry_wait", error: node.error ?? "retry checkpoint retained" } });
+        const nextAttemptAt = node.waitReason?.kind === "retry" ? node.waitReason.nextAttemptAt : undefined;
+        if (nextAttemptAt === undefined || Date.parse(nextAttemptAt) <= Date.parse(this.now())) {
+          this.updateNode(state, node.id, (current) => clearNodeForRetry(current));
+        }
+        actions.set(node.id, {
+          kind: "launch",
+          recovery: "resume",
+        });
         continue;
       }
       if (node.status === "running" || node.status === "suspended") {
@@ -493,6 +501,24 @@ export class OrchestrationController {
             this.applyTerminalAttemptEvidence(state, node.id, attemptEvidence, terminal);
             if (terminal.status === "completed") {
               completed.add(node.id);
+            } else if (terminal.status === "retry_wait") {
+              const nextAttemptAt = terminal.nextAttemptAt ?? this.now();
+              this.updateNode(state, node.id, (current) => {
+                const { activeAttemptId: _activeAttemptId, ...rest } = current;
+                return {
+                  ...rest,
+                  status: "retry_wait",
+                  waitReason: {
+                    kind: "retry",
+                    domain: terminal.retryDomain ?? "workflow",
+                    code: terminal.retryCode ?? "retryable",
+                    nextAttemptAt,
+                    attempt: terminal.attempt ?? attemptEvidence.attempt,
+                    maxAttempts: terminal.maxAttempts ?? 3,
+                  },
+                };
+              });
+              actions.set(node.id, { kind: "launch", recovery: "resume" });
             } else {
               actions.set(node.id, { kind: "terminal", result: terminal });
             }
@@ -971,6 +997,11 @@ export class OrchestrationController {
       try {
         result = await action.reconciliation.wait(context);
       } catch (error) {
+        const retry = retryResultForError(error, attempt.attempt);
+        if (retry) {
+          await this.finishAttempt(state, item.id, attempt.attemptId, retry);
+          return retry;
+        }
         await this.failAttempt(state, item.id, attempt.attemptId, error);
         throw error;
       }
@@ -988,6 +1019,11 @@ export class OrchestrationController {
     try {
       result = await this.dependencies.worker(item, context);
     } catch (error) {
+      const retry = retryResultForError(error, attempt.attempt);
+      if (retry) {
+        await this.finishAttempt(state, item.id, attempt.attemptId, retry);
+        return retry;
+      }
       await this.failAttempt(state, item.id, attempt.attemptId, error);
       throw error;
     }
@@ -1099,14 +1135,14 @@ export class OrchestrationController {
     const decompositionChildren = normalized.status === "skipped" && normalized.childIssues !== undefined
       ? normalizeChildIssues(normalized.childIssues, requiredNode(state.record, nodeId).issue)
       : undefined;
-    const status: DurableOrchestrationNodeStatus = normalized.status === "failed" && isLeaseContinuityFailure(normalized.error)
+    const status = (normalized.status === "failed" && isLeaseContinuityFailure(normalized.error)
       ? "suspended"
-      : normalized.status;
+      : normalized.status) as OrchestrationWorkerAttemptStatus;
     this.completeActiveAttempt(
       state,
       nodeId,
       attemptId,
-      status,
+      status as DurableOrchestrationNodeStatus,
       normalized.error,
       (attempt, now) => ({
         ...attempt,
@@ -1119,6 +1155,9 @@ export class OrchestrationController {
         ...(normalized.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: normalized.targetAdvanceCheckpointId } : {}),
         ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
         ...(normalized.retryAfterMs !== undefined ? { retryAfterMs: normalized.retryAfterMs } : {}),
+        ...(normalized.nextAttemptAt !== undefined ? { retryNextAt: normalized.nextAttemptAt } : {}),
+        ...(normalized.retryDomain !== undefined ? { retryDomain: normalized.retryDomain as Exclude<OrchestrationWorkerAttemptRecord["retryDomain"], undefined> } : {}),
+        ...(normalized.retryCode !== undefined ? { retryCode: normalized.retryCode } : {}),
       }),
     );
     if (normalized.retryCheckpointId !== undefined || normalized.targetAdvanceCheckpointId !== undefined) {
@@ -1683,6 +1722,11 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
     ...(node.title !== undefined ? { title: node.title } : {}),
     ...(node.summary !== undefined ? { summary: node.summary } : {}),
     ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}),
+    ...(node.waitReason?.kind === "retry" ? {
+      retryNextAt: node.waitReason.nextAttemptAt,
+      retryAttempt: node.waitReason.attempt,
+      retryMaxAttempts: node.waitReason.maxAttempts,
+    } : {}),
   };
 }
 
@@ -1830,7 +1874,17 @@ function scheduleResultFromAttempt(
     case "target_recovery":
       return { status: "target_recovery", ...(error !== undefined ? { error } : {}) };
     case "retry_wait":
-      return { status: "retry_wait", ...(error !== undefined ? { error } : {}) };
+      return {
+        status: "retry_wait",
+        ...(error !== undefined ? { error } : {}),
+        ...(attempt.retryNextAt !== undefined ? { nextAttemptAt: attempt.retryNextAt } : {}),
+        ...(attempt.retryAfterMs !== undefined ? { retryAfterMs: attempt.retryAfterMs } : {}),
+        ...(attempt.retryable !== undefined ? { retryable: attempt.retryable } : {}),
+        ...(attempt.retryDomain !== undefined ? { retryDomain: attempt.retryDomain } : {}),
+        ...(attempt.retryCode !== undefined ? { retryCode: attempt.retryCode } : {}),
+        attempt: attempt.attempt,
+        maxAttempts: 3,
+      };
     case "interrupted":
       return { status: "failed", error: error ?? "worker attempt was interrupted" };
     case "launching":
@@ -1912,6 +1966,27 @@ function resumedLiveAttempt(
     status: "running",
     updatedAt: now,
     ...(heartbeatAt !== undefined ? { lastHeartbeatAt: heartbeatAt } : {}),
+  };
+}
+
+function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleWorkerResult, void> | undefined {
+  const classification = classifyRetryableError(error);
+  if (!classification.retryable) return undefined;
+  const maxAttempts = 3;
+  const backoffOptions = classification.retryAfterMs === undefined
+    ? { operationKey: `${classification.domain}:${classification.code}` }
+    : { retryAfterMs: classification.retryAfterMs, operationKey: `${classification.domain}:${classification.code}` };
+  const delay = retryBackoffMs(attempt, backoffOptions);
+  return {
+    status: "retry_wait",
+    error: error instanceof Error ? error : String(error),
+    retryable: true,
+    retryAfterMs: delay,
+    nextAttemptAt: new Date(Date.now() + delay).toISOString(),
+    attempt,
+    maxAttempts,
+    retryDomain: classification.domain,
+    retryCode: classification.code,
   };
 }
 

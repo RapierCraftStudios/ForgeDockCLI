@@ -17,6 +17,10 @@ export interface ScheduledWorkItem {
   repository?: string;
   /** Frozen repository delivery route retained through scheduling and durable recovery. */
   targetBranch?: string;
+  /** Durable retry wake-up metadata; omitted for legacy queued items. */
+  retryNextAt?: string;
+  retryAttempt?: number;
+  retryMaxAttempts?: number;
   lane?: "fast" | "feature";
   promotionTarget?: string;
   productionTarget?: string;
@@ -40,6 +44,8 @@ export type ScheduleWorkerResult = void | {
   nextAttemptAt?: string;
   attempt?: number;
   maxAttempts?: number;
+  retryDomain?: string;
+  retryCode?: string;
   /** Authoritative replacement issue numbers returned by a decomposition outcome. */
   childIssues?: readonly number[];
 };
@@ -326,6 +332,7 @@ export async function runSchedule(
   let queuedCount = items.length;
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
+  const retryWakeups = new Map<string, Promise<void>>();
   let occupiedIssueSlots = 0;
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const queuedWaitReasonChanges = new Set<string>();
@@ -359,7 +366,7 @@ export async function runSchedule(
     emit("resumed", itemId);
   }
 
-  while (running.size || queuedCount > 0) {
+  while (running.size || queuedCount > 0 || retryWakeups.size > 0) {
     if (options.signal?.aborted && running.size) {
       // Cancellation stops new launches immediately, but the controller must
       // retain its execution claim until every admitted worker has settled.
@@ -370,6 +377,24 @@ export async function runSchedule(
     let waitingForCapacity = false;
     for (const item of orderedItems) {
       if (status.get(item.id) !== "queued") continue;
+      if (item.retryNextAt !== undefined && Date.parse(item.retryNextAt) > Date.now()) {
+        const nextAttemptAt = item.retryNextAt;
+        const attempt = item.retryAttempt ?? 1;
+        const maxAttempts = item.retryMaxAttempts ?? Number.MAX_SAFE_INTEGER;
+        status.set(item.id, "retry_wait");
+        waitReasons.set(item.id, { kind: "retry", domain: "workflow", code: "durable-checkpoint", nextAttemptAt, attempt, maxAttempts });
+        const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
+        const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+          retryWakeups.delete(item.id);
+          if (status.get(item.id) !== "retry_wait") return;
+          status.set(item.id, "queued");
+          waitReasons.delete(item.id);
+          emit("resumed", item.id);
+        });
+        retryWakeups.set(item.id, wake);
+        emit("retry_wait", item.id);
+        continue;
+      }
       // Only explicit semantic dependencies block their successors on
       // failure. Claim-serialization predecessors merely hold the resource
       // until they reach a terminal state, including failed/blocked/invalid.
@@ -495,17 +520,40 @@ export async function runSchedule(
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             emit("target_recovery", item.id);
           } else if (outcome.status === "retry_wait") {
+            const nextAttemptAt = outcome.nextAttemptAt
+              ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString();
+            const attempt = outcome.attempt ?? 1;
+            const maxAttempts = outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER;
             status.set(item.id, "retry_wait");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             waitReasons.set(item.id, {
               kind: "retry",
-              domain: "workflow",
-              code: outcome.retryable === false ? "retry-not-authorized" : "retryable",
-              nextAttemptAt: outcome.nextAttemptAt ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString(),
-              attempt: outcome.attempt ?? 1,
-              maxAttempts: outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER,
+              domain: outcome.retryDomain ?? "workflow",
+              code: outcome.retryCode ?? "retryable",
+              nextAttemptAt,
+              attempt,
+              maxAttempts,
             });
-            emit("retry_wait", item.id);
+            if (attempt >= maxAttempts) {
+              status.set(item.id, "failed");
+              emit("failed", item.id);
+            } else {
+              // Retry waits do not occupy worker capacity or a node lease. Keep
+              // the DAG running and wake exactly this item when its durable
+              // deadline arrives; dependents remain queued meanwhile.
+              queuedCount++;
+              const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
+              const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+                retryWakeups.delete(item.id);
+                if (status.get(item.id) !== "retry_wait") return;
+                status.set(item.id, "queued");
+                errors.delete(item.id);
+                waitReasons.delete(item.id);
+                emit("resumed", item.id);
+              });
+              retryWakeups.set(item.id, wake);
+              emit("retry_wait", item.id);
+            }
           } else if (outcome.status === "failed" && isLeaseContinuityFailure(outcome.error)) {
             // Continuity loss is a suspension, not an ordinary worker failure:
             // dependents stay queued until the controller explicitly re-enrolls
@@ -605,6 +653,10 @@ export async function runSchedule(
       // There is ready work but no slot. Keep the queue durable and wait for a
       // fresh external capacity sample instead of failing a launch.
       await waitForCapacity();
+      continue;
+    }
+    if (retryWakeups.size) {
+      await Promise.race(retryWakeups.values());
       continue;
     }
     // A suspended prerequisite intentionally leaves its dependents queued so a

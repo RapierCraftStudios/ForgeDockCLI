@@ -9,7 +9,6 @@ import {
   type OrchestrationNodeRecord,
   type OrchestrationRecord,
   type OrchestrationRepository,
-  type OrchestrationWorkerAttemptRecord,
 } from "../../core/ports/orchestration.js";
 export interface StaleOrchestrationReaperDependencies {
   repository: OrchestrationRepository;
@@ -68,6 +67,10 @@ export class StaleOrchestrationReaper {
       result.scanned += records.length;
       for (const record of records) {
         const timestamp = this.now();
+        if (isRetryWaiting(record)) {
+          result.skippedLive++;
+          continue;
+        }
         if (!hasStartedExecution(record) && !isStaleUnstarted(record, timestamp, this.staleAfterMs)) {
           result.skippedUnstarted++;
           continue;
@@ -93,6 +96,10 @@ export class StaleOrchestrationReaper {
           const latest = await this.dependencies.repository.loadOrchestration(record.orchestrationId);
           if (!latest || latest.status !== "running") {
             result.skippedTerminal++;
+            continue;
+          }
+          if (isRetryWaiting(latest)) {
+            result.skippedLive++;
             continue;
           }
           const latestTimestamp = this.now();
@@ -144,7 +151,9 @@ function recoverRecord(
     ...structuredClone(record),
     executionAttempt: previousAttempt + 1,
     executionClaimId: claim.claimId,
-    status: "failed",
+    status: record.nodes.some((node) => node.status === "running" || node.activeAttemptId !== undefined)
+      ? "running"
+      : "failed",
     updatedAt: now,
     nodes: record.nodes.map((node) => recoverNode(node, reason, now)),
   };
@@ -160,14 +169,33 @@ function recoverNode(node: OrchestrationNodeRecord, reason: string, now: string)
 
   const attempts = (node.attempts ?? []).map((attempt) => {
     if (attempt.status !== "launching" && attempt.status !== "running" && attempt.status !== "suspended") return attempt;
-    return interruptedAttempt(attempt, reason, now);
+    return {
+      ...attempt,
+      status: "retry_wait" as const,
+      updatedAt: now,
+      completedAt: now,
+      error: reason,
+      retryable: true,
+      retryAfterMs: 1_000,
+      retryNextAt: new Date(Date.parse(now) + 1_000).toISOString(),
+      retryDomain: "lease" as const,
+      retryCode: "lease-expired",
+    };
   });
   const { activeAttemptId: _activeAttemptId, error: _error, waitReason: _waitReason, ...rest } = node;
   return {
     ...rest,
-    status: "suspended",
+    status: "retry_wait",
     attempts,
     error: reason,
+    waitReason: {
+      kind: "retry",
+      domain: "lease",
+      code: "lease-expired",
+      nextAttemptAt: new Date(Date.parse(now) + 1_000).toISOString(),
+      attempt: (activeAttemptEvidence?.attempt ?? 1) + 1,
+      maxAttempts: 3,
+    },
     lastRecovery: {
       mode: "relaunch",
       reconciledAt: now,
@@ -178,18 +206,10 @@ function recoverNode(node: OrchestrationNodeRecord, reason: string, now: string)
   };
 }
 
-function interruptedAttempt(
-  attempt: OrchestrationWorkerAttemptRecord,
-  reason: string,
-  now: string,
-): OrchestrationWorkerAttemptRecord {
-  return {
-    ...attempt,
-    status: "interrupted",
-    updatedAt: now,
-    completedAt: now,
-    error: reason,
-  };
+function isRetryWaiting(record: OrchestrationRecord): boolean {
+  return record.nodes.length > 0
+    && record.nodes.some((node) => node.status === "retry_wait")
+    && record.nodes.every((node) => node.status === "retry_wait" || node.status === "queued");
 }
 
 function hasStartedExecution(record: OrchestrationRecord): boolean {

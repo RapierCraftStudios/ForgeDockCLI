@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
 import {
   createArtifact,
   InvestigationPayloadSchema,
@@ -344,10 +345,20 @@ function enforceInvestigationSemantics(payload: InvestigationPayload): void {
 
 export class WorkflowExecutionError extends Error {
   readonly recoverable: boolean;
+  readonly retryDisposition: RetryClassification;
 
-  constructor(message: string, readonly run: RunState, options: ErrorOptions & { recoverable?: boolean } = {}) {
+  constructor(message: string, readonly run: RunState, options: ErrorOptions & {
+    recoverable?: boolean;
+    /** Typed retry authority; `recoverable` remains supported for old callers. */
+    retryDisposition?: RetryClassification;
+  } = {}) {
     super(message, options);
     this.name = "WorkflowExecutionError";
-    this.recoverable = options.recoverable === true;
+    const classified = options.retryDisposition
+      ?? classifyRetryableError(options.cause, { domain: "workflow" });
+    this.retryDisposition = options.retryDisposition ?? (options.recoverable === true
+      ? { ...classified, disposition: "retryable", retryable: true, code: "legacy-recoverable" }
+      : classified);
+    this.recoverable = options.recoverable ?? this.retryDisposition.retryable;
   }
 }

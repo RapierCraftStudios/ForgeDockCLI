@@ -25,6 +25,8 @@ import type {
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository } from "../../core/ports/repositories.js";
 import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
+import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
+import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 
 export const repositoryFromRemote = parseRepositoryFromRemote;
@@ -88,18 +90,21 @@ function isReadOnlyGhInvocation(args: readonly string[]): boolean {
 }
 
 function isTransientGitHubReadFailure(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /HTTP (?:429|5\d{2})\b/i.test(message)
-    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|error connecting to api\.github\.com|check your internet connection|temporarily unavailable|no server is currently available)/i.test(message);
+  return classifyRetryableError(error, { domain: "github", authenticationRefreshAvailable: false }).retryable;
 }
 
 /** Transport failures may occur after a mutating GitHub request has committed. */
 function isTransientGitHubMutationFailure(error: unknown): boolean {
-  return isTransientGitHubReadFailure(error);
+  return classifyRetryableError(error, { domain: "github" }).retryable;
 }
 
-function waitForReadRetry(attempt: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, READ_RETRY_DELAY_MS * 2 ** (attempt - 1)));
+function waitForReadRetry(attempt: number, error?: unknown): Promise<void> {
+  const classification = classifyRetryableError(error ?? new Error("GitHub read retry"), { domain: "github" });
+  const delay = retryBackoffMs(attempt, {
+    ...(classification.retryAfterMs !== undefined ? { retryAfterMs: classification.retryAfterMs } : {}),
+    operationKey: `github-read:${classification.code}`,
+  });
+  return new Promise((resolve) => setTimeout(resolve, delay));
 }
 const MAX_FALLBACK_PATCH_CHARS_PER_FILE = 16_384;
 
@@ -1382,21 +1387,44 @@ export class GitHubClient implements ForgeHost {
     if (!input.headBranch || !input.baseBranch || input.headBranch === input.baseBranch) {
       throw new Error("Promotion pull request requires distinct source and target branches");
     }
-    const url = (await this.gh([
-      "pr", "create", "--repo", input.repo, "--head", input.headBranch, "--base", input.baseBranch,
-      "--title", input.title, "--body-file", "-",
-    ], input.body)).trim();
-    if (!url) throw new Error("GitHub did not return a pull request URL");
-    const number = Number(url.split("/").at(-1));
-    if (!Number.isSafeInteger(number) || number < 1) throw new Error("GitHub returned an invalid pull request URL");
-    const pullRequest = await this.getPullRequest(input.repo, number);
-    if (pullRequest.state !== "OPEN") {
-      throw new Error(`New pull request #${number} is not open (GitHub state: ${pullRequest.state})`);
-    }
-    if (pullRequest.headBranch !== input.headBranch || pullRequest.baseBranch !== input.baseBranch) {
-      throw new Error(`New pull request #${number} identity does not match ${input.headBranch} -> ${input.baseBranch}`);
-    }
-    return pullRequest;
+    // PR creation is non-atomic with the response. Reconcile the exact branch
+    // route before replaying, including after a lost response.
+    const reconcile = async (): Promise<PullRequestSnapshot | undefined> => {
+      const candidate = await this.findOpenPromotionPullRequest(input.repo, input.headBranch, input.baseBranch);
+      if (!candidate) return undefined;
+      if (candidate.headBranch !== input.headBranch || candidate.baseBranch !== input.baseBranch) {
+        throw new Error(`Existing pull request route does not match ${input.headBranch} -> ${input.baseBranch}`);
+      }
+      return candidate;
+    };
+    return reconcileBeforeReplay({
+      operation: "github.pull-request.create",
+      input: {
+        repo: input.repo,
+        headBranch: input.headBranch,
+        baseBranch: input.baseBranch,
+        title: input.title,
+        body: input.body,
+      },
+      reconcile,
+      mutate: async () => {
+        const url = (await this.gh([
+          "pr", "create", "--repo", input.repo, "--head", input.headBranch, "--base", input.baseBranch,
+          "--title", input.title, "--body-file", "-",
+        ], input.body)).trim();
+        if (!url) throw new Error("GitHub did not return a pull request URL");
+        const number = Number(url.split("/").at(-1));
+        if (!Number.isSafeInteger(number) || number < 1) throw new Error("GitHub returned an invalid pull request URL");
+        const pullRequest = await this.getPullRequest(input.repo, number);
+        if (pullRequest.state !== "OPEN") {
+          throw new Error(`New pull request #${number} is not open (GitHub state: ${pullRequest.state})`);
+        }
+        if (pullRequest.headBranch !== input.headBranch || pullRequest.baseBranch !== input.baseBranch) {
+          throw new Error(`New pull request #${number} identity does not match ${input.headBranch} -> ${input.baseBranch}`);
+        }
+        return pullRequest;
+      },
+    });
   }
 
   async getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot> {
@@ -1965,14 +1993,14 @@ export class GitHubClient implements ForgeHost {
       try {
         return await this.runGh(args, input);
       } catch (error) {
-        if (!this.authRefreshAttempted && isGitHubAuthenticationFailure(error)) {
+        if (readOnly && !this.authRefreshAttempted && isGitHubAuthenticationFailure(error)) {
           this.authRefreshAttempted = true;
           const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))();
           if (!refreshed) throw error;
           continue;
         }
         if (!readOnly || !isTransientGitHubReadFailure(error) || attempts >= MAX_READ_ATTEMPTS) throw error;
-        await waitForReadRetry(attempts);
+        await waitForReadRetry(attempts, error);
       }
     }
     throw new Error("GitHub read attempts exhausted");

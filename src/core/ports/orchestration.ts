@@ -75,6 +75,9 @@ export interface OrchestrationWorkerAttemptRecord {
   targetAdvanceCheckpointId?: string;
   retryable?: boolean;
   retryAfterMs?: number;
+  retryNextAt?: string;
+  retryDomain?: "github" | "provider" | "workflow" | "lease" | "transport";
+  retryCode?: string;
 }
 
 export interface OrchestrationRecoveryRecord {

@@ -1515,7 +1515,7 @@ test("orchestration preview stays read-only and final admission rejects a live d
   await shutdownFakePi(state, commandContext());
 });
 
-test("authorized orchestration reaps an expired durable owner before final scope admission", async () => {
+test("authorized orchestration retains an expired durable owner in retry_wait before final scope admission", async () => {
   let now = Date.parse("2026-08-18T00:00:00.000Z");
   const repository = new InMemoryOrchestrationRepository();
   const leases = new InMemoryLeaseRepository();
@@ -1584,17 +1584,19 @@ test("authorized orchestration reaps an expired durable owner before final scope
     noMilestone: true,
   });
 
-  const result = await tool.execute("expired-owned-dispatch", {
-    issueNumbers: [901],
-    executionPlan: [{ issue: 901, title: "Replacement", summary: "Replace expired owner", dependsOn: [], claims: ["src"], labels: [] }],
-    confirmed: true,
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  await assert.rejects(
+    tool.execute("expired-owned-dispatch", {
+      issueNumbers: [901],
+      executionPlan: [{ issue: 901, title: "Replacement", summary: "Replace expired owner", dependsOn: [], claims: ["src"], labels: [] }],
+      confirmed: true,
+    }, undefined, undefined, { ...commandContext(), hasUI: false } as any),
+    /active durable DAG ownership.*#901.*dag_expired_owner/,
+  );
 
-  assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
   const recovered = await repository.loadOrchestration(stale.orchestrationId);
-  assert.equal(recovered?.status, "failed");
-  assert.equal(recovered?.nodes[0]?.status, "suspended");
-  assert.equal(repository.records.size, 2, "the failed owner and fresh DAG must both remain durable");
+  assert.equal(recovered?.status, "running");
+  assert.equal(recovered?.nodes[0]?.status, "retry_wait");
+  assert.equal(repository.records.size, 1, "the retrying owner remains the sole durable DAG");
   await staleClaim.release();
   await shutdownFakePi(state, commandContext());
 });

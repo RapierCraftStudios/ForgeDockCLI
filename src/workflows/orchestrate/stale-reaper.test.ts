@@ -72,12 +72,14 @@ describe("stale orchestration reaper", () => {
     assert.equal(left.reaped.length + right.reaped.length, 1);
     assert.equal(left.skippedLive + right.skippedLive, 1);
     const persisted = await repository.loadOrchestration("dag-stale");
-    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.status, "running");
     assert.equal(persisted?.executionAttempt, 2);
     assert.match(persisted?.nodes[0]?.error ?? "", /lease expired/);
-    assert.equal(persisted?.nodes[0]?.status, "suspended");
+    assert.equal(persisted?.nodes[0]?.status, "retry_wait");
     assert.equal(persisted?.nodes[0]?.activeAttemptId, undefined);
-    assert.equal(persisted?.nodes[0]?.attempts?.[0]?.status, "interrupted");
+    assert.equal(persisted?.nodes[0]?.attempts?.[0]?.status, "retry_wait");
+    assert.equal(persisted?.nodes[0]?.waitReason?.kind, "retry");
+    assert.equal(persisted?.nodes[0]?.waitReason?.domain, "lease");
     assert.equal(leases.inspect?.("orchestration-execution:dag-stale"), undefined);
 
     const again = await reapStaleOrchestrations({ repository, executionAdmission: first, now: () => "2026-01-01T00:02:00.000Z" });
@@ -173,7 +175,7 @@ describe("stale orchestration reaper", () => {
     assert.equal(leases.inspect?.("orchestration-execution:dag-crash"), undefined);
     const retry = await reapStaleOrchestrations({ repository, executionAdmission, now: () => "2026-01-01T00:04:00.000Z" });
     assert.equal(retry.reaped.length, 1);
-    assert.equal((await repository.loadOrchestration("dag-crash"))?.status, "failed");
+    assert.equal((await repository.loadOrchestration("dag-crash"))?.status, "running");
   });
 
   it("rejects a late stale controller save after reaping advances the execution attempt", async () => {
@@ -189,7 +191,7 @@ describe("stale orchestration reaper", () => {
       repository.saveOrchestration({ ...record, status: "completed", updatedAt: "2026-01-01T00:05:00.000Z" }),
       /Stale orchestration update.*behind persisted attempt/,
     );
-    assert.equal((await repository.loadOrchestration("dag-fence"))?.status, "failed");
+    assert.equal((await repository.loadOrchestration("dag-fence"))?.status, "running");
   });
 
   it("rejects a same-attempt save from a different controller claim in memory", async () => {
