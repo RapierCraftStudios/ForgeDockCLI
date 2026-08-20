@@ -453,14 +453,19 @@ describe("SQLite operational repositories", () => {
       const started = transition(queued, "START_INVESTIGATION");
       await store.commit(queued.version, started.state, started.record);
       await store.recordProgress({ runId: queued.runId, phase: "controller.heartbeat", message: "stale", occurredAt: "2026-01-01T00:00:00.000Z" });
-      await store.rebuildRun({ ...started.state, state: "building" });
-      assert.equal((await store.load(queued.runId))?.state, "building");
-      assert.equal((await store.load(queued.runId))?.version, started.state.version);
+      const divergent = { ...started.state, state: "building" as const, version: 0 };
+      const rebuilt = await store.rebuildRun(divergent);
+      assert.notStrictEqual(rebuilt, divergent);
+      assert.equal(rebuilt.state, "building");
+      assert.equal(rebuilt.version, 1);
+      assert.deepEqual(await store.load(queued.runId), rebuilt);
       assert.deepEqual((await store.history(queued.runId)).map((record) => record.event), ["START_INVESTIGATION"]);
       assert.deepEqual((await store.listProgress(queued.runId)).map(({ phase, message }) => ({ phase, message })), [{ phase: "controller.heartbeat", message: "stale" }]);
-      const resumed = transition((await store.load(queued.runId))!, "RESUME_BUILD");
-      await store.commit(started.state.version, resumed.state, resumed.record);
+      const resumed = transition(rebuilt, "RESUME_BUILD");
+      await store.commit(rebuilt.version, resumed.state, resumed.record);
       assert.equal((await store.history(queued.runId)).at(-1)?.event, "RESUME_BUILD");
+      const stale = transition(divergent, "RESUME_BUILD");
+      await assert.rejects(store.commit(divergent.version, stale.state, stale.record), ConcurrentRunUpdateError);
     } finally {
       store.close();
     }

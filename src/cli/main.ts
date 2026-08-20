@@ -814,8 +814,7 @@ async function workOn(
         } else if (run.targetBranch && run.targetBranch !== frozenTarget.targetBranch) {
           throw new Error(`Durable invalid run target ${run.targetBranch} conflicts with current issue lane target ${frozenTarget.targetBranch}`);
         } else if (run.state !== "invalid" || !run.targetBranch) {
-          await store.rebuildRun(recoveredRun);
-          run = recoveredRun;
+          run = await store.rebuildRun(recoveredRun);
         } else {
           assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
         }
@@ -876,8 +875,7 @@ async function workOn(
           throw new Error(`Durable run ${resumeRunId} targets a different issue`);
         } else if (earlyRun.state !== admission.state || earlyRun.targetBranch !== frozenTarget.targetBranch) {
           process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} (${earlyRun.state}) from durable GitHub ${admission.state} checkpoint\n`);
-          await store.rebuildRun(recoveredEarlyRun);
-          earlyRun = recoveredEarlyRun;
+          earlyRun = await store.rebuildRun(recoveredEarlyRun);
         } else {
           earlyRun = { ...earlyRun, ...frozenTarget, scopeManifest: earlyRun.scopeManifest ?? earlyScopeManifest };
         }
@@ -1034,8 +1032,7 @@ async function workOn(
         || (admission.state === "blocked" && run.blockedReason !== recoveredRun.blockedReason)
         || JSON.stringify(run.scopeManifest ?? null) !== JSON.stringify(recoveredScopeManifest)) {
         process.stderr.write(`warning: rebuilding divergent local run ${resumeRunId} state or scope (${run.state}) from durable GitHub authority (${admission.state})\n`);
-        await store.rebuildRun(recoveredRun);
-        run = await store.load(resumeRunId) ?? recoveredRun;
+        run = await store.rebuildRun(recoveredRun);
       } else if (run.targetBranch) {
         assertRunFollowsLane(run, lane, effectiveOrchestration.productionTarget);
       } else {
