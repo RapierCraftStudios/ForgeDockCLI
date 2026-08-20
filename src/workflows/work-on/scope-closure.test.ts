@@ -37,6 +37,14 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
+  it("admits a prefixed regression test for a short documentation contract stem", async () => {
+    const result = await closeExpectedWriteScope(["src/core/config/forgedock-config.test.ts"], {
+      issueWriteHints: ["docs/CONFIG.md"],
+    });
+    assert.deepEqual(result.expectedPaths, ["docs/CONFIG.md", "src/core/config/forgedock-config.test.ts"]);
+    assert.deepEqual(result.rejectedPaths, []);
+  });
+
   it("proves collateral tests through normalized relative TypeScript imports", async () => {
     const result = await closeExpectedWriteScope([
       "src/workflows/orchestrate/scheduler.test.ts",

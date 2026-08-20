@@ -117,7 +117,23 @@ function canonicalConcrete(paths: readonly string[], diagnostics: string[]): str
 
 function isBasenameCompanion(candidate: string, hints: readonly string[]): boolean {
   const candidateKey = logicalBasename(candidate);
-  return Boolean(candidateKey && hints.some((hint) => logicalBasename(hint) === candidateKey));
+  if (!candidateKey) return false;
+  return hints.some((hint) => {
+    const hintKey = logicalBasename(hint);
+    if (hintKey === candidateKey) return true;
+    // Documentation contracts commonly use a short product-neutral stem
+    // (`CONFIG.md`) while their existing regression test carries a bounded
+    // product prefix (`forgedock-config.test.ts`). Permit that suffix relation
+    // only for test/spec/fixture candidates, never for production sources.
+    return isTestLike(candidate) && ["-", "_", "."].some((separator) =>
+      candidateKey.endsWith(`${separator}${hintKey}`) || hintKey.endsWith(`${separator}${candidateKey}`));
+  });
+}
+
+function isTestLike(path: string): boolean {
+  const basename = path.split("/").at(-1) ?? "";
+  const withoutExtension = basename.replace(/\.[^.]+$/, "");
+  return TEST_SUFFIX.test(withoutExtension);
 }
 
 async function hasFrozenContentRelation(
