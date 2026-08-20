@@ -39,18 +39,33 @@ describe("lease-backed orchestration execution admission", () => {
 
   it("never exposes the secret lease token in claim failures", async () => {
     const inner = new InMemoryLeaseRepository();
+    let holderToken = "";
+    const leases = {
+      acquire(itemId: string, owner: string, ttlMs: number, now?: number) {
+        const lease = inner.acquire(itemId, owner, ttlMs, now);
+        holderToken = lease?.token ?? "";
+        return lease;
+      },
+      inspect: inner.inspect.bind(inner),
+      heartbeat: inner.heartbeat.bind(inner),
+      release: inner.release.bind(inner),
+      guard: inner.guard.bind(inner),
+      reEnroll: inner.reEnroll.bind(inner),
+      continuity: inner.continuity.bind(inner),
+    };
     let now = 1_000;
-    const admission = new LeaseBackedOrchestrationExecutionAdmission(inner, { owner: "first", ttlMs: 100, heartbeatMs: 50, now: () => now });
+    const admission = new LeaseBackedOrchestrationExecutionAdmission(leases, { owner: "first", ttlMs: 100, heartbeatMs: 50, now: () => now });
     const claim = await admission.acquire("dag-secret-error");
     assert.ok(claim);
-    const token = inner.inspect?.("orchestration-execution:dag-secret-error")?.token;
-    assert.ok(token);
+    assert.ok(holderToken);
+    const inspection = leases.inspect("orchestration-execution:dag-secret-error");
+    assert.equal(inspection && "token" in inspection, false);
     now = 1_101;
     inner.acquire("orchestration-execution:dag-secret-error", "replacement", 100, now);
     assert.throws(() => claim.assertValid(), (error: unknown) => {
       assert.ok(error instanceof Error);
       assert.match(error.message, /claim/);
-      assert.equal(error.message.includes(token), false);
+      assert.equal(error.message.includes(holderToken), false);
       return true;
     });
     await claim.release();

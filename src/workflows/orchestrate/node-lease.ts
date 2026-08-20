@@ -3,13 +3,14 @@
 import type {
   Lease,
   LeaseAcquisitionOptions,
+  LeaseInspection,
   LeaseRepository,
 } from "../../core/ports/lease.js";
 
 export type NodeLeaseObservation =
   | { state: "absent" }
-  | { state: "active"; lease: Lease }
-  | { state: "expired"; lease: Lease };
+  | { state: "active"; lease: LeaseInspection }
+  | { state: "expired"; lease: LeaseInspection };
 
 export interface NodeLeaseWaitOptions {
   now?: () => number;

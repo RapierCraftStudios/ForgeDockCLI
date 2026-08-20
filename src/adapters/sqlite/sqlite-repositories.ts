@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
-import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
+import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseInspection, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
 import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
@@ -533,12 +533,14 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     });
   }
 
-  inspect(itemId: string): Lease | undefined {
+  inspect(itemId: string): LeaseInspection | undefined {
     return this.inTransaction(() => {
       this.#assertLeaseContinuity();
-      const row = this.#database.prepare("SELECT * FROM leases WHERE item_id = ?")
-        .get(itemId) as Record<string, string | number> | undefined;
-      return row ? leaseFromRow(row) : undefined;
+      const row = this.#database.prepare(`
+        SELECT item_id, owner, binding, epoch, acquired_at, heartbeat_at, expires_at
+        FROM leases WHERE item_id = ?
+      `).get(itemId) as Record<string, string | number> | undefined;
+      return row ? leaseInspectionFromRow(row) : undefined;
     });
   }
 
@@ -837,6 +839,14 @@ function leaseFromRow(row: Record<string, string | number>): Lease {
   const binding = typeof row.binding === "string" && row.binding.trim() ? row.binding : undefined;
   return {
     itemId: String(row.item_id), owner: String(row.owner), token: String(row.token), ...(binding !== undefined ? { binding } : {}), epoch: Number(row.epoch),
+    acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at), continuity: "verified",
+  };
+}
+
+function leaseInspectionFromRow(row: Record<string, string | number>): LeaseInspection {
+  const binding = typeof row.binding === "string" && row.binding.trim() ? row.binding : undefined;
+  return {
+    itemId: String(row.item_id), owner: String(row.owner), ...(binding !== undefined ? { binding } : {}), epoch: Number(row.epoch),
     acquiredAt: Number(row.acquired_at), heartbeatAt: Number(row.heartbeat_at), expiresAt: Number(row.expires_at), continuity: "verified",
   };
 }

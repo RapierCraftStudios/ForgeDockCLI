@@ -466,13 +466,31 @@ describe("SQLite operational repositories", () => {
     }
   });
 
-  it("persists cross-process-style leases with stale recovery", () => {
+  it("redacts SQLite lease inspections while preserving authenticated lifecycle operations", () => {
     const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
     try {
-      const first = store.acquire("issue-9", "worker-a", 100, 1_000);
+      const first = store.acquire("issue-9", "worker-a", 100, 1_000, {
+        binding: "orchestration:dag-sqlite:attempt:1:item:issue-9",
+      });
       assert.ok(first);
+      const expected = {
+        itemId: first.itemId,
+        owner: first.owner,
+        binding: first.binding,
+        epoch: first.epoch,
+        acquiredAt: first.acquiredAt,
+        heartbeatAt: first.heartbeatAt,
+        expiresAt: first.expiresAt,
+        continuity: first.continuity,
+      } as const;
+      const active = store.inspect("issue-9");
+      assert.deepEqual(active, expected);
+      assert.equal(active && "token" in active, false);
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_050), undefined);
       assert.equal(store.heartbeat("issue-9", first.token, 100, 1_050).expiresAt, 1_150);
+      const expired = store.inspect("issue-9");
+      assert.deepEqual(expired, { ...expected, heartbeatAt: 1_050, expiresAt: 1_150 });
+      assert.equal(expired && "token" in expired, false);
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
     } finally {
       store.close();
@@ -490,7 +508,9 @@ describe("SQLite operational repositories", () => {
       assert.doesNotThrow(() => guard.assertValid());
       now = 1_100;
       assert.throws(() => guard.check(), /expired/i);
-      assert.equal(store.inspect("issue-guard")?.token, lease.token, "guard expiry must retain takeover evidence");
+      const inspection = store.inspect("issue-guard");
+      assert.equal(inspection?.owner, "worker-a", "guard expiry must retain takeover evidence");
+      assert.equal(inspection && "token" in inspection, false, "inspection must not expose holder authority");
       assert.equal(store.acquire("issue-guard", "worker-b", 100, now)?.owner, "worker-b");
     } finally {
       store.close();
