@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { Worker } from "node:worker_threads";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -16,6 +17,43 @@ import {
   leaseWitnessRequirementMessage,
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
+
+function concurrentFirstUseWitnesses(checkout: string, localDataRoot: string): Promise<Array<{ state: string; epoch: number }>> {
+  const barrier = new SharedArrayBuffer(4);
+  const moduleUrl = new URL("./lease-witness.js", import.meta.url).href;
+  const workerSource = `
+    (async () => {
+      const { parentPort, workerData } = await import("node:worker_threads");
+      const { createOrBootstrapLocalLeaseWitness } = await import(workerData.moduleUrl);
+      Atomics.wait(new Int32Array(workerData.barrier), 0, 0);
+      try {
+        const witness = createOrBootstrapLocalLeaseWitness(workerData.checkout, {
+          localDataRoot: workerData.localDataRoot,
+          environment: {},
+        });
+        parentPort.postMessage(witness.verify());
+      } catch (error) {
+        parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });
+      }
+    })();
+  `;
+  const workers = [0, 1].map(() => new Worker(workerSource, {
+    eval: true,
+    workerData: { barrier, checkout, localDataRoot, moduleUrl },
+  }));
+  const results = Promise.all(workers.map((worker) => new Promise<{ state: string; epoch: number }>((resolve, reject) => {
+    worker.once("message", (message: { state?: string; epoch?: number; error?: string }) => {
+      void worker.terminate();
+      if (message.error) reject(new Error(message.error));
+      else resolve({ state: message.state ?? "", epoch: message.epoch ?? -1 });
+    });
+    worker.once("error", reject);
+  })));
+  const barrierView = new Int32Array(barrier);
+  Atomics.store(barrierView, 0, 1);
+  Atomics.notify(barrierView, 0, workers.length);
+  return results;
+}
 
 describe("retained lease checkpoint witness", () => {
   it("authenticates compare-and-advance and rejects invalid signatures", () => {
@@ -114,6 +152,28 @@ describe("retained lease checkpoint witness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("adopts concurrent first-use bootstrap winners before SQLite admission", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const results = await concurrentFirstUseWitnesses(checkout, localDataRoot);
+      assert.deepEqual(results.map((result) => [result.state, result.epoch]), [
+        ["verified", 0],
+        ["verified", 0],
+      ]);
+
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      const store = new SqliteRepositories(join(checkout, ".forgedock", "state.db"), { witness });
+      try {
+        assert.equal(store.acquire("concurrent-first-use", "worker", 1_000, 1_000)?.epoch, 1);
+        assert.equal(store.continuity().state, "verified");
+      } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("bridges the historical epoch-one bootstrap only into an unused lease store", () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-witness-old-bootstrap-"));
     const checkout = join(root, "checkout");
@@ -167,6 +227,10 @@ describe("retained lease checkpoint witness", () => {
 
       assert.throws(
         () => bootstrapLocalLeaseWitness(checkout, { localDataRoot }),
+        /cannot be safely recovered|expected files|continuity/i,
+      );
+      assert.throws(
+        () => createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} }),
         /cannot be safely recovered|expected files|continuity/i,
       );
       assert.equal(readFileSync(created.privateKeyPath, "utf8").includes("PRIVATE KEY"), true);

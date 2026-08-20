@@ -89,6 +89,8 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+const LOCAL_BOOTSTRAP_RETRY_ATTEMPTS = 50;
+const LOCAL_BOOTSTRAP_RETRY_DELAY_MS = 10;
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -190,10 +192,27 @@ export function createOrBootstrapLocalLeaseWitness(
   try {
     bootstrapLocalLeaseWitness(cwd, options);
   } catch (error) {
-    // A concurrent first-use process may have completed bootstrap after our
-    // initial lookup. Adopt it only if the complete witness now verifies.
+    // Only rename collisions indicate the narrow concurrent-install window.
+    // Keep retrying through the synchronous publication gap, but never turn
+    // malformed or otherwise unsafe local state into an adoption candidate.
+    if (!isExistingPathError(error)) throw error;
+    for (let attempt = 0; attempt < LOCAL_BOOTSTRAP_RETRY_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) waitForLocalBootstrapRetry();
+      const raced = createConfiguredLeaseWitness(cwd, options);
+      if (raced) return raced;
+      try {
+        // If the winner installed its directory but has not published the
+        // reference yet, this call validates and publishes that orphaned
+        // material without replacing it. A competing reference publication
+        // is another EEXIST and is handled by the next bounded attempt.
+        bootstrapLocalLeaseWitness(cwd, options);
+      } catch (retryError) {
+        if (!isExistingPathError(retryError)) throw retryError;
+      }
+    }
     const raced = createConfiguredLeaseWitness(cwd, options);
     if (raced) return raced;
+    // Preserve the original collision after the finite adoption window.
     throw error;
   }
 
@@ -327,6 +346,18 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function isExistingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  // POSIX rename reports ENOTEMPTY when the competing directory is non-empty;
+  // Windows reports EEXIST for the same atomic-install collision.
+  return code === "EEXIST" || code === "ENOTEMPTY";
+}
+
+function waitForLocalBootstrapRetry(): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCAL_BOOTSTRAP_RETRY_DELAY_MS);
 }
 
 function payload(epoch: number, keyId: string): Buffer {
