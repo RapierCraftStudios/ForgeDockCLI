@@ -290,7 +290,7 @@ patch(join(root, "src", "tui", "fleet-status.ts"), [
   [
     'export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
     'function nestedCount(children: AsyncJobState["nestedChildren"]): number {\n\treturn (children ?? []).reduce((count, child) => count + 1 + nestedCount(child.children), 0);\n}\n\nfunction nestedCountForStep(job: AsyncJobState, index: number, stepCount: number): number {\n\tconst children = (job.nestedChildren ?? []).filter((child) => child.parentStepIndex === index\n\t\t|| (stepCount === 1 && child.parentStepIndex === undefined));\n\treturn nestedCount(children);\n}\n\nexport function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {',
-    "function activeNestedChild",
+    "function nestedCountForStep",
   ],
   [
     '\t\t\t\ttokens: job.totalTokens?.total ?? 0,\n\t\t\t});',
