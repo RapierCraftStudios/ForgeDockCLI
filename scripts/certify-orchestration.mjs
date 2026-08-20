@@ -33,6 +33,8 @@ const modules = [
   "dist/workflows/work-on/prepare.relation-graph.test.js",
   "dist/workflows/work-on/target-recovery.test.js",
   "dist/workflows/work-on/publish-revision.test.js",
+  "dist/workflows/reset/pristine-reset.test.js",
+  "dist/workflows/reset/migration.test.js",
 ];
 
 const coverage = {
@@ -50,6 +52,7 @@ const coverage = {
   "relation-graph-authority": ["relation-graph", "relation-checkpoint-certification", "prepare-relation-graph"],
   "target-advance-recovery": ["target-recovery", "publish-revision", "conflict-recovery", "scheduler", "controller"],
   "durable-retry-semantics": ["retry", "retry-checkpoints", "stale-reaper", "scheduler", "controller"],
+  "terminal-preserving-migration": ["pristine-reset", "migration", "sqlite-repositories"],
 };
 
 const arguments_ = process.argv.slice(2);
