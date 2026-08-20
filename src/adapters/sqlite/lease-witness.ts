@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -11,6 +12,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createHash, createPublicKey, generateKeyPairSync, randomUUID, sign, timingSafeEqual, verify, type KeyLike } from "node:crypto";
@@ -89,6 +91,8 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+const LOCAL_BOOTSTRAP_LOCK_TIMEOUT_MS = 1_000;
+const LOCAL_BOOTSTRAP_LOCK_POLL_MS = 10;
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -184,22 +188,26 @@ export function createOrBootstrapLocalLeaseWitness(
   cwd: string,
   options: LocalLeaseWitnessOptions = {},
 ): RetainedCheckpointWitness {
+  // Explicit configuration has its original fail-closed precedence and does
+  // not need a local bootstrap lock. Local first use, including its initial
+  // absence checks, is serialized so a reader never observes publication in
+  // the interval between directory installation and reference creation.
   const configured = createConfiguredLeaseWitness(cwd, options);
   if (configured) return configured;
-
-  try {
-    bootstrapLocalLeaseWitness(cwd, options);
-  } catch (error) {
-    // A concurrent first-use process may have completed bootstrap after our
-    // initial lookup. Adopt it only if the complete witness now verifies.
-    const raced = createConfiguredLeaseWitness(cwd, options);
-    if (raced) return raced;
-    throw error;
+  if (hasExplicitWitnessConfiguration(options.environment ?? process.env)) {
+    throw new LeaseContinuityError("explicit lease witness configuration could not be verified");
   }
 
-  const created = createConfiguredLeaseWitness(cwd, options);
-  if (!created) throw new LeaseContinuityError("local lease witness bootstrap did not produce a configured witness");
-  return created;
+  const paths = localWitnessPaths(cwd, options.localDataRoot);
+  return withLocalBootstrapLock(paths, () => {
+    const alreadyConfigured = createConfiguredLeaseWitness(cwd, options);
+    if (alreadyConfigured) return alreadyConfigured;
+
+    bootstrapLocalLeaseWitnessLocked(paths);
+    const created = createConfiguredLeaseWitness(cwd, options);
+    if (!created) throw new LeaseContinuityError("local lease witness bootstrap did not produce a configured witness");
+    return created;
+  });
 }
 
 /**
@@ -211,13 +219,16 @@ export function bootstrapLocalLeaseWitness(
   options: Pick<LocalLeaseWitnessOptions, "localDataRoot"> = {},
 ): LocalLeaseWitnessBootstrap {
   const paths = localWitnessPaths(cwd, options.localDataRoot);
+  return withLocalBootstrapLock(paths, () => bootstrapLocalLeaseWitnessLocked(paths));
+}
+
+function bootstrapLocalLeaseWitnessLocked(paths: ReturnType<typeof localWitnessPaths>): LocalLeaseWitnessBootstrap {
   if (existsSync(paths.configPath)) throw new Error(`Lease witness bootstrap already exists at ${paths.configPath}`);
   if (existsSync(paths.witnessDirectory)) return recoverLocalLeaseWitness(paths);
 
   mkdirSync(dirname(paths.witnessDirectory), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(paths.configPath), { recursive: true, mode: 0o700 });
   const temporaryDirectory = `${paths.witnessDirectory}.tmp-${process.pid}-${randomUUID()}`;
-  let installed = false;
   try {
     mkdirSync(temporaryDirectory, { mode: 0o700 });
     const keys = generateKeyPairSync("ed25519");
@@ -240,19 +251,23 @@ export function bootstrapLocalLeaseWitness(
     writeCheckpoint(temporaryCheckpoint, createSignedLeaseCheckpoint(0, privateKey, paths.keyId));
     if (witness.verify().state !== "verified") throw new LeaseContinuityError("newly seeded local witness could not be verified");
     renameSync(temporaryDirectory, paths.witnessDirectory);
-    installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
 
-    const reference = localWitnessReference(paths);
-    writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    publishLocalReference(paths);
     return localWitnessBootstrapResult(paths, false);
   } catch (error) {
     if (existsSync(temporaryDirectory)) rmSync(temporaryDirectory, { recursive: true, force: true });
-    if (installed && !existsSync(paths.configPath) && existsSync(paths.witnessDirectory)) {
-      rmSync(paths.witnessDirectory, { recursive: true, force: true });
-    }
+    // The rename is the durable publication of valid key material. If
+    // reference publication fails, retain it as a complete orphan for the
+    // locked recovery path instead of deleting valid witness state.
     throw error;
   }
+}
+
+interface LocalBootstrapLockOwner {
+  pid: number;
+  token: string;
+  createdAt: number;
 }
 
 /**
@@ -262,6 +277,110 @@ export function bootstrapLocalLeaseWitness(
  * all verify for this canonical checkout. Nothing in the witness directory is
  * modified by recovery.
  */
+
+function withLocalBootstrapLock<T>(paths: ReturnType<typeof localWitnessPaths>, operation: () => T): T {
+  const release = acquireLocalBootstrapLock(paths.lockPath);
+  try {
+    return operation();
+  } finally {
+    release();
+  }
+}
+
+function acquireLocalBootstrapLock(lockPath: string): () => void {
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const owner: LocalBootstrapLockOwner = { pid: process.pid, token: randomUUID(), createdAt: Date.now() };
+  const ownerText = `${JSON.stringify(owner)}\n`;
+  const deadline = Date.now() + LOCAL_BOOTSTRAP_LOCK_TIMEOUT_MS;
+
+  for (;;) {
+    try {
+      writeFileSync(lockPath, ownerText, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      return () => releaseLocalBootstrapLock(lockPath, owner.token);
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) throw error;
+    }
+
+    const existing = readLocalBootstrapLockOwner(lockPath);
+    if (existing && !isProcessAlive(existing.pid)) {
+      try {
+        unlinkSync(lockPath);
+      } catch (error) {
+        if (!isNotFoundError(error)) throw error;
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new LeaseContinuityError("timed out acquiring the local lease witness bootstrap lock");
+    }
+    sleepSynchronously(LOCAL_BOOTSTRAP_LOCK_POLL_MS);
+  }
+}
+
+function releaseLocalBootstrapLock(lockPath: string, token: string): void {
+  try {
+    const owner = readLocalBootstrapLockOwner(lockPath);
+    if (owner?.token !== token) return;
+    unlinkSync(lockPath);
+  } catch (error) {
+    if (!isNotFoundError(error)) throw error;
+  }
+}
+
+function readLocalBootstrapLockOwner(lockPath: string): LocalBootstrapLockOwner | undefined {
+  let text: string;
+  try {
+    text = readFileSync(lockPath, "utf8");
+  } catch (error) {
+    if (isNotFoundError(error)) return undefined;
+    throw error;
+  }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("owner must be an object");
+    const value = parsed as Record<string, unknown>;
+    if (Object.keys(value).sort().join("\0") !== ["createdAt", "pid", "token"].join("\0")
+      || typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0
+      || typeof value.token !== "string" || value.token.length === 0
+      || typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt <= 0) {
+      throw new Error("owner shape is invalid");
+    }
+    return value as unknown as LocalBootstrapLockOwner;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new LeaseContinuityError(`local lease witness bootstrap lock is malformed: ${detail}`);
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function sleepSynchronously(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function hasExplicitWitnessConfiguration(environment: NodeJS.ProcessEnv): boolean {
+  return [
+    environment.FORGEDOCK_LEASE_WITNESS_PATH,
+    environment.FORGEDOCK_LEASE_WITNESS_PUBLIC_KEY,
+    environment.FORGEDOCK_LEASE_WITNESS_PRIVATE_KEY,
+  ].some((value) => value !== undefined);
+}
+
 function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): LocalLeaseWitnessBootstrap {
   assertWitnessDirectory(paths);
   const publicKey = readFileSync(paths.publicKeyPath, "utf8");
@@ -273,8 +392,7 @@ function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): 
     keyId: paths.keyId,
   });
 
-  const reference = localWitnessReference(paths);
-  writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  publishLocalReference(paths);
   return localWitnessBootstrapResult(paths, true);
 }
 
@@ -300,6 +418,19 @@ function assertWitnessDirectory(paths: ReturnType<typeof localWitnessPaths>): vo
     if (error instanceof LeaseContinuityError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
     throw new LeaseContinuityError(`existing local witness cannot be safely recovered: ${detail}`);
+  }
+}
+
+function publishLocalReference(paths: ReturnType<typeof localWitnessPaths>): void {
+  const reference = localWitnessReference(paths);
+  const temporaryPath = `${paths.configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    // Publish the complete reference atomically without allowing a competing
+    // writer to overwrite an existing checkout configuration.
+    writeFileSync(temporaryPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    linkSync(temporaryPath, paths.configPath);
+  } finally {
+    if (existsSync(temporaryPath)) rmSync(temporaryPath, { force: true });
   }
 }
 
@@ -449,6 +580,7 @@ function localWitnessPaths(cwd: string, requestedLocalDataRoot?: string) {
     checkpointPath: join(witnessDirectory, "checkpoint.json"),
     publicKeyPath: join(witnessDirectory, "public.pem"),
     privateKeyPath: join(witnessDirectory, "private.pem"),
+    lockPath: `${witnessDirectory}.bootstrap.lock`,
   };
 }
 

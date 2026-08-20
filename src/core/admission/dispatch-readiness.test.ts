@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { createOrBootstrapLocalLeaseWitness } from "../../adapters/sqlite/lease-witness.js";
 import { InMemoryLeaseWitness } from "../ports/lease.js";
 import { collectDispatchReadiness, dispatchModelReference, formatDispatchReadiness, resolveDispatchRuntime } from "./dispatch-readiness.js";
 
@@ -184,6 +188,36 @@ test("a verified witness and all resolved role models produce a ready report", a
   assert.equal(report.ready, true);
   assert.deepEqual(report.diagnostics, []);
   assert.deepEqual(report.repository, { repo: "owner/repo", defaultBranch: "main" });
+});
+
+test("a bootstrapped verified witness crosses the complete dispatch-readiness boundary", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-dispatch-witness-"));
+  const checkout = join(root, "checkout");
+  const localDataRoot = join(root, "local-data");
+  mkdirSync(checkout);
+  try {
+    const witness = createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} });
+    const report = await collectDispatchReadiness({
+      checkoutRoot: checkout,
+      config: {
+        workerModel: "provider/worker",
+        reviewerModel: "provider/reviewer",
+        planningModel: "provider/planner",
+      },
+      environment: {},
+      requireLeaseWitness: true,
+      leaseWitness: witness,
+      runtimeInstallCheck: async () => undefined,
+      runtime: {
+        async preflight({ provider, model } = {}) { return { provider: provider!, model: model! }; },
+      },
+      githubProbe: async () => ({ repo: "owner/repo", defaultBranch: "staging" }),
+    });
+
+    assert.equal(report.ready, true);
+    assert.equal(report.diagnostics.some((diagnostic) => diagnostic.code === "lease-witness-invalid"), false);
+    assert.deepEqual(report.repository, { repo: "owner/repo", defaultBranch: "staging" });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("project model references stay strict even when an environment provider exists", async () => {

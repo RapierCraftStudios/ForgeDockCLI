@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
-import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
@@ -92,6 +93,62 @@ describe("retained lease checkpoint witness", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("serializes independent first-use callers through one published witness", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const modulePath = new URL("./lease-witness.js", import.meta.url).href;
+      const callers = [
+        spawnLeaseBootstrapChild(modulePath, checkout, localDataRoot),
+        spawnLeaseBootstrapChild(modulePath, checkout, localDataRoot),
+      ];
+      // Both children are released by the same barrier, so neither can turn
+      // this into a sequential in-process test.
+      callers.forEach((child) => child.start());
+      const results = await Promise.all(callers.map((child) => child.result));
+      const first = results[0]!;
+      assert.deepEqual(first, results[1]);
+      assert.deepEqual(first.snapshot, { state: "verified", epoch: 0 });
+      assert.equal(typeof first.reference.checkoutDigest, "string");
+      assert.equal((first.reference.checkoutDigest as string).length, 64);
+      assert.equal(existsSync(localBootstrapLockPath(checkout, localDataRoot)), false);
+      assert.doesNotMatch(readFileSync(join(checkout, ".forgedock", "lease-witness.json"), "utf8"), /PRIVATE KEY|PUBLIC KEY/);
+      assert.deepEqual(readdirSync(join(checkout, ".forgedock")), ["lease-witness.json"]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("reclaims dead bootstrap owners but fails boundedly for live owners", () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-lock-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    const lockPath = localBootstrapLockPath(checkout, localDataRoot);
+    try {
+      mkdirSync(join(localDataRoot, "ForgeDock", "lease-witnesses"), { recursive: true });
+      writeFileSync(lockPath, "not-json");
+      assert.throws(
+        () => bootstrapLocalLeaseWitness(checkout, { localDataRoot }),
+        /bootstrap lock is malformed/i,
+      );
+      assert.equal(existsSync(lockPath), true);
+      rmSync(lockPath);
+      writeFileSync(lockPath, JSON.stringify({ pid: findDeadPid(), token: randomUUID(), createdAt: Date.now() }));
+      const reclaimed = bootstrapLocalLeaseWitness(checkout, { localDataRoot });
+      assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().epoch, 0);
+      assert.equal(reclaimed.privateKeyPath.includes(checkout), false);
+
+      rmSync(reclaimed.configPath);
+      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: Date.now() }));
+      assert.throws(
+        () => bootstrapLocalLeaseWitness(checkout, { localDataRoot }),
+        /timed out.*bootstrap lock/i,
+      );
+      assert.equal(readFileSync(reclaimed.privateKeyPath, "utf8").includes("PRIVATE KEY"), true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("creates the local witness on first use without weakening corrupt-state checks", () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-witness-first-use-"));
     const checkout = join(root, "checkout");
@@ -169,6 +226,7 @@ describe("retained lease checkpoint witness", () => {
         () => bootstrapLocalLeaseWitness(checkout, { localDataRoot }),
         /cannot be safely recovered|expected files|continuity/i,
       );
+      assert.equal(readdirSync(join(localDataRoot, "ForgeDock", "lease-witnesses")).some((entry) => entry.endsWith(".bootstrap.lock")), false);
       assert.equal(readFileSync(created.privateKeyPath, "utf8").includes("PRIVATE KEY"), true);
       assert.equal(readFileSync(created.publicKeyPath, "utf8").includes("PUBLIC KEY"), true);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -239,3 +297,71 @@ describe("retained lease checkpoint witness", () => {
     assert.match(message, /forgedock-next lease-witness-bootstrap/);
   });
 });
+
+interface LeaseBootstrapChildResult {
+  snapshot: { state: string; epoch: number };
+  reference: Record<string, unknown>;
+}
+
+function spawnLeaseBootstrapChild(modulePath: string, checkout: string, localDataRoot: string): {
+  start: () => void;
+  result: Promise<LeaseBootstrapChildResult>;
+} {
+  const script = `
+    import { readFileSync } from "node:fs";
+    import { createOrBootstrapLocalLeaseWitness } from ${JSON.stringify(modulePath)};
+    process.stdin.once("data", () => {
+      try {
+        const witness = createOrBootstrapLocalLeaseWitness(${JSON.stringify(checkout)}, { localDataRoot: ${JSON.stringify(localDataRoot)}, environment: {} });
+        const snapshot = witness.verify();
+        const reference = JSON.parse(readFileSync(${JSON.stringify(join(checkout, ".forgedock", "lease-witness.json"))}, "utf8"));
+        process.stdout.write(JSON.stringify({ snapshot: { state: snapshot.state, epoch: snapshot.epoch }, reference }) + "\\n");
+      } catch (error) {
+        process.stderr.write(error instanceof Error ? error.stack ?? error.message : String(error));
+        process.exitCode = 1;
+      }
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const result = new Promise<LeaseBootstrapChildResult>((resolveResult, rejectResult) => {
+    child.once("close", (code) => {
+      if (code !== 0) {
+        rejectResult(new Error(`bootstrap child exited ${code}: ${stderr}`));
+        return;
+      }
+      try {
+        resolveResult(JSON.parse(stdout) as LeaseBootstrapChildResult);
+      } catch (error) {
+        rejectResult(error);
+      }
+    });
+  });
+  return {
+    start: () => { child.stdin.write("go\\n"); child.stdin.end(); },
+    result,
+  };
+}
+
+function localBootstrapLockPath(checkout: string, localDataRoot: string): string {
+  const canonicalCheckout = realpathSync.native(checkout);
+  const canonicalIdentity = process.platform === "win32" ? canonicalCheckout.toLowerCase() : canonicalCheckout;
+  const digest = createHash("sha256").update(canonicalIdentity, "utf8").digest("hex");
+  return join(resolve(localDataRoot), "ForgeDock", "lease-witnesses", `${digest}.bootstrap.lock`);
+}
+
+function findDeadPid(): number {
+  for (let pid = process.pid + 1; pid < process.pid + 100_000; pid += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return pid;
+    }
+  }
+  return 2_000_000_000;
+}
