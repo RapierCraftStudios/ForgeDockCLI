@@ -50,6 +50,17 @@ describe("typed pristine repository reset", () => {
     assert.deepEqual(manifest.comments.map((comment) => comment.id), [11]);
   });
 
+  it("allows one authorized artifact projection on its issue and PR threads", async () => {
+    const deps = fakeDeps();
+    deps.host.listPullRequests = async () => [{ number: 7, state: "OPEN", headSha: sha, headBranch: "forgedock/issue-1-run", baseBranch: "main" }];
+    deps.host.listPullRequestComments = async (_repo, pr) => [{
+      id: 14, issue: pr, pr, marker: "artifact:a1", runId: "run-1", artifactId: "a1",
+      bodySha256: sha256("managed-pr"), body: "managed-pr", managed: true as const,
+    }];
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    assert.deepEqual(manifest.comments.map((comment) => comment.id), [11, 14]);
+  });
+
   it("restores labels from the pre-workflow cutoff rather than current workflow labels", async () => {
     const deps = fakeDeps();
     deps.host.readLabels = async () => ({

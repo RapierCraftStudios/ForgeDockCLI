@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
@@ -531,11 +531,18 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       const path = record.match(/(?:^|\n)worktree (.+)/)?.[1];
       const headSha = record.match(/(?:^|\n)HEAD ([0-9a-f]{40,64})/i)?.[1];
       const branchRef = record.match(/(?:^|\n)branch refs\/heads\/(.+)/)?.[1];
-      if (!path || !headSha || !branchRef || !sameFilesystemPath(resolve(path), this.#repo) && !sameFilesystemPath(dirname(resolve(path)), dirname(this.#root))) continue;
+      if (!path || !headSha || !branchRef) continue;
+      const resolvedPath = resolve(path);
+      const managedRelative = relative(this.#root, resolvedPath);
+      if (!managedRelative || managedRelative.startsWith("..") || isAbsolute(managedRelative)) continue;
+      const branchIssue = /^forgedock\/issue-(\d+)-/.exec(branchRef)?.[1];
+      const selectedByIssue = branchIssue !== undefined && selection.issueNumbers.includes(Number(branchIssue));
+      const selectedByDag = selection.dagIds.some((dagId) => branchRef.includes(dagId) || resolvedPath.includes(dagId));
+      if (!selectedByIssue && !selectedByDag) continue;
       if (!(branchRef.startsWith("forgedock/") || branchRef.startsWith("review/"))) continue;
-      const dirtyOutput = await this.git(["status", "--porcelain", "-z"], path);
+      const dirtyOutput = await this.git(["status", "--porcelain", "-z"], resolvedPath);
       const dirty = dirtyOutput.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
-      records.push({ path: resolve(path), branch: branchRef, headSha, dirty, managed: true });
+      records.push({ path: resolvedPath, branch: branchRef, headSha, dirty, managed: true });
     }
     return records;
   }
@@ -543,15 +550,39 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   async archiveDirtyManaged(worktree: { path: string; branch: string; headSha: string }): Promise<{ path: string; sha256: string; kind: "dirty-diff" } | undefined> {
     const path = resolve(worktree.path);
     if (!existsSync(path)) return undefined;
-    const diff = await this.git(["diff", "--binary", "HEAD", "--"], path);
-    if (!diff) return undefined;
-    const archivePath = join(process.cwd(), ".forgedock", "reset-archives", `${basename(path)}-${Date.now()}.diff`);
+    const trackedPatch = await this.git(["diff", "--binary", "HEAD", "--"], path);
+    const untrackedOutput = await this.git(["ls-files", "--others", "--exclude-standard", "-z"], path);
+    const untrackedPaths = untrackedOutput.split("\0").filter((entry) => entry && !isOperationalPath(entry)).sort();
+    const untracked: Array<{ path: string; mode: number; contentBase64: string }> = [];
+    let archivedBytes = 0;
+    for (const relativePath of untrackedPaths) {
+      const candidate = resolve(path, relativePath);
+      assertInside(path, candidate);
+      const metadata = await lstat(candidate);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        throw new Error(`Reset cannot safely archive non-regular untracked path: ${relativePath}`);
+      }
+      const content = await readFile(candidate);
+      archivedBytes += content.byteLength;
+      if (archivedBytes > 64 * 1024 * 1024) throw new Error("Reset untracked-file archive exceeds 64 MiB");
+      untracked.push({ path: relativePath, mode: metadata.mode & 0o777, contentBase64: content.toString("base64") });
+    }
+    if (!trackedPatch && !untracked.length) return undefined;
+    const archive = `${JSON.stringify({
+      schema: "forgedock.dirty-worktree-archive/v1",
+      worktree: path,
+      branch: worktree.branch,
+      headSha: worktree.headSha,
+      trackedPatch,
+      untracked,
+    }, null, 2)}\n`;
+    const archivePath = join(process.cwd(), ".forgedock", "reset-archives", `${basename(path)}-${Date.now()}.json`);
     await mkdir(dirname(archivePath), { recursive: true });
     const temporary = `${archivePath}.tmp-${process.pid}-${Date.now()}`;
-    await writeFile(temporary, diff, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, archive, { encoding: "utf8", mode: 0o600 });
     await chmod(temporary, 0o600);
     await rename(temporary, archivePath);
-    return { path: archivePath, sha256: createHash("sha256").update(diff, "utf8").digest("hex"), kind: "dirty-diff" };
+    return { path: archivePath, sha256: createHash("sha256").update(archive, "utf8").digest("hex"), kind: "dirty-diff" };
   }
 
   async assertAbsent(input: { path: string; branch: string; headSha: string }): Promise<void> {

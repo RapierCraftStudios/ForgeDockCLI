@@ -238,9 +238,15 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const artifactCommentIds = new Map<string, number>();
   for (const comment of managedComments) {
     if (!comment.artifactId) continue;
-    const previous = artifactCommentIds.get(comment.artifactId);
-    if (previous !== undefined && previous !== comment.id) throw new Error(`Reset discovery found duplicate publication for artifact ${comment.artifactId}`);
-    artifactCommentIds.set(comment.artifactId, comment.id);
+    // One controller artifact may intentionally be projected to both its issue
+    // and PR threads. Reject only duplicate copies within the same channel.
+    const channel = comment.pr !== undefined ? `pr:${comment.pr}` : `issue:${comment.issue}`;
+    const publicationKey = `${comment.artifactId}:${channel}`;
+    const previous = artifactCommentIds.get(publicationKey);
+    if (previous !== undefined && previous !== comment.id) {
+      throw new Error(`Reset discovery found duplicate publication for artifact ${comment.artifactId} on ${channel}`);
+    }
+    artifactCommentIds.set(publicationKey, comment.id);
   }
   const labelMap = Object.fromEntries(labels.map(([number, value]) => {
     const issueComments = managedComments.filter((comment) => comment.issue === number && comment.pr === undefined);
