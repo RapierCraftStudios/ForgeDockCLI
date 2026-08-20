@@ -870,7 +870,9 @@ describe("worker leases", () => {
     assert.doesNotThrow(() => guard.assertValid());
     now = 1_100;
     assert.throws(() => guard.check(), /expired/i);
-    assert.equal(leases.inspect?.("issue-guard")?.token, lease.token, "guard expiry must not delete takeover evidence");
+    const inspection = leases.inspect?.("issue-guard");
+    assert.equal(inspection?.owner, lease.owner, "guard expiry must retain redacted takeover evidence");
+    assert.equal("token" in (inspection ?? {}), false);
     assert.equal(leases.acquire("issue-guard", "worker-b", 100, now)?.owner, "worker-b");
   });
 
