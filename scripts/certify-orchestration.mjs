@@ -27,6 +27,12 @@ const modules = [
   "dist/workflows/work-on/conflict-recovery.test.js",
   "dist/workflows/orchestrate/decomposition-dependencies.test.js",
   "dist/core/retry.test.js",
+  "dist/core/state/retry-checkpoints.test.js",
+  "dist/core/packet/relation-graph.test.js",
+  "dist/core/packet/relation-checkpoint-certification.test.js",
+  "dist/workflows/work-on/prepare.relation-graph.test.js",
+  "dist/workflows/work-on/target-recovery.test.js",
+  "dist/workflows/work-on/publish-revision.test.js",
 ];
 
 const coverage = {
@@ -41,7 +47,9 @@ const coverage = {
   "scoped-verification": ["certification", "verification-policy", "process-verifier", "verify"],
   "runtime-budgets": ["agent-runtime"],
   "output-bounds-and-redaction": ["process-verifier"],
-  "relation-target-retry-semantics": ["decomposition-dependencies", "lane", "conflict-recovery", "retry"],
+  "relation-graph-authority": ["relation-graph", "relation-checkpoint-certification", "prepare-relation-graph"],
+  "target-advance-recovery": ["target-recovery", "publish-revision", "conflict-recovery", "scheduler", "controller"],
+  "durable-retry-semantics": ["retry", "retry-checkpoints", "stale-reaper", "scheduler", "controller"],
 };
 
 const arguments_ = process.argv.slice(2);
@@ -68,7 +76,8 @@ const command = [process.execPath, "--test", `--test-concurrency=${concurrency}`
 const renderedCommand = command.join(" ");
 const commandAudit = {
   unexpectedTestTargets: modules.filter((target) =>
-    !/^dist\/(?:[a-z0-9-]+\/)*[a-z0-9-]+\.test\.js$/i.test(target)
+    !/^dist\/(?:[a-z0-9.-]+\/)*[a-z0-9.-]+\.test\.js$/i.test(target)
+    || target.includes("..")
     || /[*?{}[\]]/.test(target)),
   fullSuiteCommandsInPlan: [
     /(?:^|\s)npm(?:\.cmd)?\s+(?:run\s+)?(?:test|test:next|test:legacy)(?:\s|$)/i.test(renderedCommand) ? "npm test" : undefined,
