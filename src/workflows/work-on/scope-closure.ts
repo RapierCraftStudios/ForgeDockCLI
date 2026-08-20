@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { readFile, realpath } from "node:fs/promises";
-import { resolve, relative, isAbsolute } from "node:path";
+import { resolve, relative, isAbsolute, posix } from "node:path";
 import { canonicalizeConcreteScopePaths, isConcreteScopePath } from "../../runtime/agent-runtime.js";
 
 const COLLATERAL_LIMIT = 16;
@@ -130,7 +130,7 @@ async function hasFrozenContentRelation(
     if (content === undefined) continue;
     for (const hint of hints) {
       if (hint === candidate) continue;
-      if (containsLiteralPathReference(content, hint)) return true;
+      if (containsLiteralPathReference(content, path, hint)) return true;
     }
   }
   return false;
@@ -169,8 +169,9 @@ async function readBoundedRepositoryFile(
   }
 }
 
-function containsLiteralPathReference(content: string, referencedPath: string): boolean {
+function containsLiteralPathReference(content: string, sourcePath: string, referencedPath: string): boolean {
   const forms = new Set([referencedPath, `./${referencedPath}`, `/${referencedPath}`]);
+  const referencedModule = stripModuleExtension(referencedPath);
   for (const quote of ["\"", "'", "`"] as const) {
     let cursor = 0;
     while (cursor < content.length) {
@@ -178,12 +179,20 @@ function containsLiteralPathReference(content: string, referencedPath: string): 
       if (start < 0) break;
       const end = content.indexOf(quote, start + 1);
       if (end < 0) break;
-      const literal = content.slice(start + 1, end);
+      const literal = content.slice(start + 1, end).replaceAll("\\", "/");
       if (forms.has(literal) || literal.endsWith(`/${referencedPath}`)) return true;
+      if (literal.startsWith(".")) {
+        const resolvedImport = posix.normalize(posix.join(posix.dirname(sourcePath), literal));
+        if (!resolvedImport.startsWith("../") && stripModuleExtension(resolvedImport) === referencedModule) return true;
+      }
       cursor = end + 1;
     }
   }
   return false;
+}
+
+function stripModuleExtension(path: string): string {
+  return path.replace(/\.(?:[cm]?[jt]sx?)$/i, "");
 }
 
 function logicalBasename(path: string): string {

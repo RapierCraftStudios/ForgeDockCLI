@@ -37,6 +37,23 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
+  it("proves collateral tests through normalized relative TypeScript imports", async () => {
+    const result = await closeExpectedWriteScope([
+      "src/workflows/orchestrate/scheduler.test.ts",
+      "src/adapters/sqlite/sqlite-repositories.test.ts",
+    ], {
+      issueWriteHints: ["src/core/ports/lease.ts", "src/adapters/sqlite/sqlite-repositories.ts"],
+      cwd: process.cwd(),
+    });
+    assert.deepEqual(result.expectedPaths, [
+      "src/adapters/sqlite/sqlite-repositories.test.ts",
+      "src/adapters/sqlite/sqlite-repositories.ts",
+      "src/core/ports/lease.ts",
+      "src/workflows/orchestrate/scheduler.test.ts",
+    ]);
+    assert.deepEqual(result.rejectedPaths, []);
+  });
+
   it("rejects investigation-only exact and basename-related writes", async () => {
     const exact = await closeExpectedWriteScope(["docs/CONFIG.md"], {
       investigationWriteHints: ["docs/CONFIG.md"],

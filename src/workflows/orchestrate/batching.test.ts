@@ -165,6 +165,20 @@ describe("orchestration work-unit batching", () => {
     assert.deepEqual(graph.edges.map(({ predecessor, successor }) => [predecessor, successor]), [["planned", "concrete"]]);
   });
 
+  it("extracts every plain source location declared in one affected-files bullet", () => {
+    const body = [
+      "## Affected Files",
+      "- `src/workflows/orchestrate/node-lease.ts` — src/workflows/orchestrate/node-lease.ts:34-42; src/core/ports/lease.ts:4-13; src/adapters/sqlite/sqlite-repositories.ts:442-448",
+      "## Evidence",
+      "Do not authorize src/unrelated/outside.ts from another section.",
+    ].join("\n");
+    assert.deepEqual(affectedFilesFromIssueBody(body), [
+      "src/workflows/orchestrate/node-lease.ts",
+      "src/core/ports/lease.ts",
+      "src/adapters/sqlite/sqlite-repositories.ts",
+    ]);
+  });
+
   it("accepts bounded glob paths and ignores unsafe or unbounded paths", () => {
     const body = [
       "## Affected Files", "- `src/**/*.ts`", "- `src/components/*.tsx`", "- `**/*.md`", "- `../outside.ts`", "- `src/../../outside.ts`", "- `/etc/passwd`", "- `C:/etc/passwd`",

@@ -329,7 +329,13 @@ export function parseBatchContract(body: string): BatchMemberContract[] {
 export function affectedFilesFromIssueBody(body: string): string[] {
   const section = /^#{2,3}\s+(?:Affected Files|Deliverables|Files to change)\s*$([\s\S]*?)(?=^#{1,3}\s+|(?![\s\S]))/im.exec(body)?.[1] ?? "";
   const backticked = [...section.matchAll(/`([^`\r\n]+)`/g)].map((match) => match[1]!.trim());
-  return unique(backticked.map(normalizeAffectedPath).filter((path): path is string => path !== undefined));
+  // Review findings often place one primary path in backticks and list the
+  // additional controller-authorized callers/tests as plain source locations
+  // after an em dash. Retain every concrete repository path in this scoped
+  // section instead of silently granting only the first Markdown token.
+  const plain = [...section.matchAll(/\b((?:src|test|tests|docs|scripts|packages|bin|commands|agents)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)(?=[:\s,;)])/g)]
+    .map((match) => match[1]!.trim());
+  return unique([...backticked, ...plain].map(normalizeAffectedPath).filter((path): path is string => path !== undefined));
 }
 
 function normalizeAffectedPath(value: string): string | undefined {
