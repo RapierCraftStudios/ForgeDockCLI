@@ -5,7 +5,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join as pathJoin, relative } from "node:path";
 import { canonicalRelationPath, digestRelation, fileNodeId, nodeId, type RelationEdge, type RelationGraphLimits, type RelationNode } from "../../core/packet/relation-graph.js";
 
-export interface RepositoryFactSet { adapterId: string; nodes: RelationNode[]; edges: RelationEdge[]; files: string[]; targets: string[]; }
+export interface RepositoryFactSet { adapterId: string; nodes: RelationNode[]; edges: RelationEdge[]; files: string[]; targets: string[]; fileCount?: number; byteCount?: number; }
 export interface RepositoryAdapterContext { cwd: string; limits: RelationGraphLimits; configuredTargets?: readonly string[]; }
 export interface RepositoryAdapter { readonly id: string; readonly languages: readonly string[]; inspect(context: RepositoryAdapterContext): Promise<RepositoryFactSet>; }
 
@@ -33,32 +33,43 @@ export class BoundedRepositoryAdapter implements RepositoryAdapter {
   async inspect(context: RepositoryAdapterContext): Promise<RepositoryFactSet> {
     const files = await boundedFiles(context.cwd, context.limits.maxFiles, context.limits.maxBytes);
     const accepted = files.filter((path) => this.extensions.has(ext(path)) || this.manifests.has(path.split("/").at(-1) ?? ""));
+    const byteCount = await totalFileBytes(context.cwd, accepted);
     const nodes: RelationNode[] = [];
     const edges: RelationEdge[] = [];
     const known = new Set(accepted);
-    for (const path of accepted) {
-      const kind = this.manifests.has(path.split("/").at(-1) ?? "") ? "config" : GENERATED_RE.test(path) ? "generated" : TEST_RE.test(path) ? "test" : "file";
-      const digest = await fileDigest(pathJoin(context.cwd, path));
-      nodes.push({ id: fileNodeId(path), kind, identity: path, ...(digest ? { digest } : {}) });
-      if (this.manifests.has(path.split("/").at(-1) ?? "")) nodes.push({ id: nodeId("config", path), kind: "config", identity: path, ...(digest ? { digest } : {}) });
-      const text = await safeRead(pathJoin(context.cwd, path), context.limits.maxBytes);
+    const configPaths = accepted.filter((path) => this.manifests.has(path.split("/").at(-1) ?? ""));
+    const configIds = new Map(configPaths.map((path) => [path, nodeId("config", path)]));
+    const contents = new Map<string, string>();
+    for (const path of accepted) contents.set(path, await readAuthoritativeText(pathJoin(context.cwd, path)));
+    for (const path of accepted) {      const kind = GENERATED_RE.test(path) ? "generated" : TEST_RE.test(path) ? "test" : "file";
+      const absolute = pathJoin(context.cwd, path);
+      const digest = await fileDigest(absolute);
+      const text = contents.get(path)!;
+      nodes.push({ id: fileNodeId(path), kind, identity: path, digest });
+      if (this.manifests.has(path.split("/").at(-1) ?? "")) nodes.push({ id: nodeId("config", path), kind: "config", identity: path, digest });
       for (const target of referencedPaths(path, text, known, this.id)) {
-        edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(target), "import", path, target, text));
+        edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(target), "import", path, target, { sourceBytes: text, relation: `${path} imports ${target}` }));
+      }
+      for (const config of configPaths) {
+        if (path === config || !new RegExp(`(?:^|[\\s"'=/])${escapeRegExp(config.split("/").at(-1) ?? "")}(?:$|[\\s"'])`).test(text)) continue;
+        edges.push(makeEdge(this.id, fileNodeId(path), configIds.get(config)!, "reads-config", path, config, { sourceBytes: text, configBytes: contents.get(config) ?? "", relation: `${path} reads ${config}` }));
       }
       if (kind === "test") {
         const stem = basename(path).replace(/\.(?:test|spec)s?\b/i, "").replace(/\.[^.]+$/, "").toLowerCase();
         for (const candidate of accepted.filter((other) => other !== path && !TEST_RE.test(other)
           && ext(other) === ext(path) && basename(other).toLowerCase().startsWith(stem)).slice(0, 16)) {
-          edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(candidate), "test-covers", path, candidate, `${path}:${candidate}`));
+          edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(candidate), "test-covers", path, candidate, { sourceBytes: text, relation: `${path} covers ${candidate}` }));
         }
       }
       if (GENERATED_RE.test(path)) {
-        const source = accepted.find((candidate) => !GENERATED_RE.test(candidate) && basename(candidate).toLowerCase().includes(basename(path).replace(/\.generated\./i, ".").split(".")[0]?.toLowerCase() ?? "_"));
-        if (source) edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(source), "generated-by", path, source, `${path}:${source}`));
+        const candidates = accepted.filter((candidate) => !GENERATED_RE.test(candidate) && !TEST_RE.test(candidate) && basename(candidate).toLowerCase().includes(basename(path).replace(/\.generated\./i, ".").split(".")[0]?.toLowerCase() ?? "_"));
+        if (candidates.length > 1) throw new Error(`Ambiguous generated relation '${path}': ${candidates.join(", ")}`);
+        const source = candidates[0];
+        if (source) edges.push(makeEdge(this.id, fileNodeId(path), fileNodeId(source), "generated-by", path, source, { generatedBytes: text, sourceBytes: contents.get(source) ?? "", relation: `${path} generated by ${source}` }));
       }
     }
     const targets = context.configuredTargets ? [...context.configuredTargets].map(canonicalRelationPath).filter((path) => known.has(path)).sort() : [];
-    return { adapterId: this.id, nodes: dedupeNodes(nodes), edges: dedupeEdges(edges), files: accepted, targets };
+    return { adapterId: this.id, nodes: dedupeNodes(nodes), edges: dedupeEdges(edges), files: accepted, targets, fileCount: accepted.length, byteCount };
   }
 }
 
@@ -115,17 +126,35 @@ async function boundedFiles(root: string, maxFiles: number, maxBytes: number): P
       if (entry.isDirectory()) { if (!SKIP.has(entry.name)) await visit(pathJoin(directory, entry.name)); continue; }
       const path = canonicalRelationPath(relative(root, pathJoin(directory, entry.name)));
       if (!SOURCE_EXTENSIONS.has(ext(path)) && !MANIFESTS.has(entry.name)) continue;
-      try { const stat = await import("node:fs/promises").then(({ stat }) => stat(pathJoin(directory, entry.name))); bytes += stat.size; } catch { /* read failures are non-authoritative */ }
+      try {
+        const stat = await import("node:fs/promises").then(({ stat }) => stat(pathJoin(directory, entry.name)));
+        if (!stat.isFile() || stat.size > maxBytes - bytes) return;
+        bytes += stat.size;
+      } catch { return; }
       result.push(path);
     }
   }
   await visit(root); return result;
 }
 
-async function safeRead(path: string, maxBytes: number): Promise<string> { try { return (await readFile(path, "utf8")).slice(0, maxBytes); } catch { return ""; } }
-async function fileDigest(path: string): Promise<string | undefined> { try { return createHash("sha256").update(await readFile(path)).digest("hex"); } catch { return undefined; } }
+async function totalFileBytes(root: string, files: readonly string[]): Promise<number> {
+  let total = 0;
+  for (const path of files) {
+    const stat = await import("node:fs/promises").then(({ stat }) => stat(pathJoin(root, path)));
+    if (!stat.isFile()) throw new Error(`Relation path is not a regular file '${path}'`);
+    total += stat.size;
+  }
+  return total;
+}
+
+async function readAuthoritativeText(path: string): Promise<string> {
+  try { return await readFile(path, "utf8"); } catch (error) { throw new Error(`Unable to read authoritative relation file '${path}': ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+async function fileDigest(path: string): Promise<string> { try { return createHash("sha256").update(await readFile(path)).digest("hex"); } catch (error) { throw new Error(`Unable to digest authoritative relation file '${path}': ${error instanceof Error ? error.message : String(error)}`); } }
 function ext(path: string): string { const index = path.lastIndexOf("."); return index < 0 ? "" : path.slice(index).toLowerCase(); }
 function basename(path: string): string { return path.split("/").at(-1) ?? path; }
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function referencedPaths(source: string, text: string, known: Set<string>, adapterId = "monorepo"): string[] {
   const found = new Set<string>();
   const patterns = [/(?:from|import)\s*["']([^"']+)["']/g, /require\s*\(\s*["']([^"']+)["']\s*\)/g, /(?:import|include)\s*["']([^"']+)["']/g];
@@ -145,8 +174,8 @@ function referencedPaths(source: string, text: string, known: Set<string>, adapt
   }
   return [...found].sort();
 }
-function makeEdge(adapterId: string, sourceId: string, targetId: string, kind: RelationEdge["kind"], sourcePath: string, targetPath: string, evidence: string): RelationEdge {
-  return { id: `${adapterId}:${kind}:${sourcePath}:${targetPath}`, sourceId, targetId, kind, adapterId, provenance: "repository", sourcePath, targetPath, evidenceDigest: digestRelation(evidence) };
+function makeEdge(adapterId: string, sourceId: string, targetId: string, kind: RelationEdge["kind"], sourcePath: string, targetPath: string, evidence: unknown): RelationEdge {
+  return { id: `${adapterId}:${kind}:${sourcePath}:${targetPath}`, sourceId, targetId, kind, adapterId, provenance: "repository", sourcePath: canonicalRelationPath(sourcePath), targetPath: canonicalRelationPath(targetPath), evidenceDigest: digestRelation(evidence) };
 }
 function dedupeNodes(nodes: RelationNode[]): RelationNode[] { return [...new Map(nodes.map((node) => [node.id, node])).values()].sort((a, b) => a.id.localeCompare(b.id)); }
 function dedupeEdges(edges: RelationEdge[]): RelationEdge[] { return [...new Map(edges.map((edge) => [edge.id, edge])).values()].sort((a, b) => a.id.localeCompare(b.id)); }

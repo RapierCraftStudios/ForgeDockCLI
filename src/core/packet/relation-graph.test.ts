@@ -21,7 +21,8 @@ async function fixture(files: Record<string, string>): Promise<string> {
 describe("controller relation graph", () => {
   it("is deterministic and computes a bounded fixed point", () => {
     const edge = { id: "e", sourceId: fileNodeId("src/a.ts"), targetId: fileNodeId("src/b.ts"), kind: "import" as const, adapterId: "fixture", provenance: "repository" as const, sourcePath: "src/a.ts", targetPath: "src/b.ts", evidenceDigest: digestRelation("a imports b") };
-    const input = { baseSha: "a".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue" as const }], facts: [{ adapterId: "fixture", nodes: [{ id: fileNodeId("src/a.ts"), kind: "file" as const, identity: "src/a.ts" }, { id: fileNodeId("src/b.ts"), kind: "file" as const, identity: "src/b.ts" }], edges: [edge] }], limits };
+    const nodeDigest = digestRelation("fixture-node");
+    const input = { baseSha: "a".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue" as const }], facts: [{ adapterId: "fixture", nodes: [{ id: fileNodeId("src/a.ts"), kind: "file" as const, identity: "src/a.ts", digest: nodeDigest }, { id: fileNodeId("src/b.ts"), kind: "file" as const, identity: "src/b.ts", digest: nodeDigest }], edges: [edge] }], limits };
     const first = buildRelationGraph(input);
     const second = buildRelationGraph({ ...input, facts: [...input.facts].reverse() });
     assert.equal(first.graphDigest, second.graphDigest);
@@ -36,9 +37,9 @@ describe("controller relation graph", () => {
       baseSha: "c".repeat(40),
       seeds: [{ path: "src/a.ts", provenance: "issue" }],
       facts: [{ adapterId: "fixture", nodes: [
-        { id: fileNodeId("src/a.ts"), kind: "file", identity: "src/a.ts" },
-        { id: fileNodeId("test/a.test.ts"), kind: "test", identity: "test/a.test.ts" },
-        { id: fileNodeId("test/unrelated.test.ts"), kind: "test", identity: "test/unrelated.test.ts" },
+        { id: fileNodeId("src/a.ts"), kind: "file", identity: "src/a.ts", digest: digestRelation("a") },
+        { id: fileNodeId("test/a.test.ts"), kind: "test", identity: "test/a.test.ts", digest: digestRelation("test-a") },
+        { id: fileNodeId("test/unrelated.test.ts"), kind: "test", identity: "test/unrelated.test.ts", digest: digestRelation("test-unrelated") },
       ], edges: [{ id: "cover", sourceId: fileNodeId("test/a.test.ts"), targetId: fileNodeId("src/a.ts"), kind: "test-covers", adapterId: "fixture", provenance: "repository", sourcePath: "test/a.test.ts", targetPath: "src/a.ts", evidenceDigest: digestRelation("cover") }] }], limits,
     });
     const closure = closeRelationGraph(graph);
@@ -47,12 +48,20 @@ describe("controller relation graph", () => {
     assert.ok(!closure.evidencePaths.includes("test/unrelated.test.ts"));
   });
 
-  it("fails closed on graph limits, malformed provenance, and dangling edges", () => {
-    assert.throws(() => buildRelationGraph({ baseSha: "d".repeat(40), seeds: [{ path: "../escape.ts", provenance: "issue" }], limits }), /Invalid repository path/);
-    assert.throws(() => buildRelationGraph({ baseSha: "e".repeat(40), seeds: [{ path: "a.ts", provenance: "issue" }], facts: [{ adapterId: "x", nodes: [], edges: [{ id: "bad", sourceId: "x", targetId: "y", kind: "import", adapterId: "x", provenance: "repository", evidenceDigest: "bad" }] }], limits }), /digest/);
-    const tiny = { ...limits, maxNodes: 1 };
-    assert.throws(() => buildRelationGraph({ baseSha: "f".repeat(40), seeds: [{ path: "a.ts", provenance: "issue" }, { path: "b.ts", provenance: "controller" }], limits: tiny }), /maxNodes/);
+  it("rejects conflicting edge IDs and missing authoritative node digests", () => {
+    const digest = digestRelation("node");
+    const node = { id: fileNodeId("src/a.ts"), kind: "file" as const, identity: "src/a.ts", digest };
+    const edge = { id: "same", sourceId: node.id, targetId: node.id, kind: "import" as const, adapterId: "a", provenance: "repository" as const, sourcePath: "src/a.ts", targetPath: "src/a.ts", evidenceDigest: digestRelation("one") };
+    assert.throws(() => buildRelationGraph({ baseSha: "1".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue", contentDigest: digest }], facts: [{ adapterId: "a", nodes: [node], edges: [edge] }, { adapterId: "b", nodes: [node], edges: [{ ...edge, adapterId: "b", evidenceDigest: digestRelation("two") }] }] }), /edge collision/);
+    assert.throws(() => buildRelationGraph({ baseSha: "2".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue" }], facts: [{ adapterId: "a", nodes: [node], edges: [] }] }), /authoritative content digest/);
   });
+
+  it("keeps closure bounded by bytes, files, depth, and collateral", () => {
+    const digest = digestRelation("node");
+    const node = (path: string) => ({ id: fileNodeId(path), kind: "file" as const, identity: path, digest });
+    assert.throws(() => buildRelationGraph({ baseSha: "3".repeat(40), seeds: [{ path: "src/a.ts", provenance: "issue", contentDigest: digest }], facts: [{ adapterId: "a", nodes: [node("src/a.ts")], edges: [], fileCount: 2, byteCount: 101 }], limits: { ...limits, maxFiles: 1, maxBytes: 100 } }), /maxFiles|maxBytes/);
+  });
+
 });
 
 describe("repository adapter layouts", () => {

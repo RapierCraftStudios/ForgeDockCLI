@@ -75,7 +75,7 @@ export interface PacketClosure {
 export interface RelationGraphBuildInput {
   baseSha: string;
   seeds: readonly RelationSeed[];
-  facts?: { adapterId: string; nodes: readonly RelationNode[]; edges: readonly RelationEdge[] }[];
+  facts?: { adapterId: string; nodes: readonly RelationNode[]; edges: readonly RelationEdge[]; fileCount?: number; byteCount?: number }[];
   limits?: Partial<RelationGraphLimits>;
 }
 
@@ -126,26 +126,45 @@ export function buildRelationGraph(input: RelationGraphBuildInput): RelationGrap
   if (uniqueSeeds.length > 4096) throw new Error("Relation graph seed limit exceeded");
   const nodeMap = new Map<string, RelationNode>();
   const edgeMap = new Map<string, RelationEdge>();
+  let declaredFiles = 0;
+  let declaredBytes = 0;
   for (const fact of input.facts ?? []) {
+    if (!fact.adapterId.trim()) throw new Error("Relation graph facts require an adapter ID");
+    if (fact.fileCount !== undefined) declaredFiles += fact.fileCount;
+    if (fact.byteCount !== undefined) declaredBytes += fact.byteCount;
     for (const node of fact.nodes) {
-      if (!node.id || !node.identity) throw new Error(`Adapter ${fact.adapterId} produced an invalid node`);
+      if (!node.id || !node.identity || !["file", "symbol", "interface", "config", "generated", "test", "invariant", "command"].includes(node.kind)) {
+        throw new Error(`Adapter ${fact.adapterId} produced an invalid node`);
+      }
       if (["file", "generated", "test", "config"].includes(node.kind)) canonicalRelationPath(node.identity);
+      if (!DIGEST.test(node.digest ?? "")) throw new Error(`Relation node '${node.id}' lacks a valid content digest`);
       if (nodeMap.has(node.id) && canonicalJson(nodeMap.get(node.id)) !== canonicalJson(node)) throw new Error(`Relation graph node collision '${node.id}'`);
       nodeMap.set(node.id, { ...node });
     }
-    for (const edge of fact.edges) {
-      if (edge.adapterId !== fact.adapterId) throw new Error(`Relation edge '${edge.id}' has mismatched adapter provenance`);
-      if (!DIGEST.test(edge.evidenceDigest)) throw new Error(`Relation edge '${edge.id}' lacks a valid evidence digest`);
-      if (edge.provenance === "repository" && !edge.sourcePath && !edge.targetPath) throw new Error(`Repository edge '${edge.id}' lacks path provenance`);
-      if (edge.sourcePath !== undefined) canonicalRelationPath(edge.sourcePath);
-      if (edge.targetPath !== undefined) canonicalRelationPath(edge.targetPath);
-      edgeMap.set(edge.id, { ...edge });
+    for (const rawEdge of fact.edges) {
+      if (!rawEdge.id || !rawEdge.sourceId || !rawEdge.targetId || !["import", "call", "implements", "reads-config", "generated-by", "serializes", "deserializes", "test-covers", "asserts", "invariant", "command-target"].includes(rawEdge.kind)) throw new Error(`Adapter ${fact.adapterId} produced an invalid edge`);
+      if (rawEdge.adapterId !== fact.adapterId) throw new Error(`Relation edge '${rawEdge.id}' has mismatched adapter provenance`);
+      if (!DIGEST.test(rawEdge.evidenceDigest)) throw new Error(`Relation edge '${rawEdge.id}' lacks a valid evidence digest`);
+      if (rawEdge.provenance === "repository" && !rawEdge.sourcePath && !rawEdge.targetPath) throw new Error(`Repository edge '${rawEdge.id}' lacks path provenance`);
+      const edge = { ...rawEdge, ...(rawEdge.sourcePath !== undefined ? { sourcePath: canonicalRelationPath(rawEdge.sourcePath) } : {}), ...(rawEdge.targetPath !== undefined ? { targetPath: canonicalRelationPath(rawEdge.targetPath) } : {}) };
+      const previous = edgeMap.get(edge.id);
+      if (previous && canonicalJson(previous) !== canonicalJson(edge)) throw new Error(`Relation graph edge collision '${edge.id}'`);
+      edgeMap.set(edge.id, edge);
     }
   }
   for (const seed of uniqueSeeds) {
+    if (seed.contentDigest !== undefined && !DIGEST.test(seed.contentDigest)) throw new Error(`Relation seed '${seed.path}' lacks a valid content digest`);
     const id = fileNodeId(seed.path);
-    if (!nodeMap.has(id)) nodeMap.set(id, { id, kind: "file", identity: seed.path, ...(seed.contentDigest ? { digest: seed.contentDigest } : {}) });
+    if (!nodeMap.has(id)) {
+      if (!seed.contentDigest) throw new Error(`Relation seed '${seed.path}' has no authoritative content digest`);
+      nodeMap.set(id, { id, kind: "file", identity: seed.path, digest: seed.contentDigest });
+    } else if (seed.contentDigest && nodeMap.get(id)?.digest !== seed.contentDigest) {
+      throw new Error(`Relation seed '${seed.path}' content digest differs from adapter evidence`);
+    }
   }
+  const fileNodes = [...nodeMap.values()].filter((node) => ["file", "generated", "test", "config"].includes(node.kind)).length;
+  if (declaredFiles > limits.maxFiles || fileNodes > limits.maxFiles) throw new Error(`Relation graph exceeds maxFiles (${limits.maxFiles})`);
+  if (declaredBytes > limits.maxBytes) throw new Error(`Relation graph exceeds maxBytes (${limits.maxBytes})`);
   if (nodeMap.size > limits.maxNodes) throw new Error(`Relation graph exceeds maxNodes (${limits.maxNodes})`);
   if (edgeMap.size > limits.maxEdges) throw new Error(`Relation graph exceeds maxEdges (${limits.maxEdges})`);
   const graphBase = { version: "forgedock.relation-graph/v1" as const, baseSha: input.baseSha.toLowerCase(), adapterIds: [...new Set((input.facts ?? []).map((fact) => fact.adapterId))].sort(), seeds: uniqueSeeds, nodes: [...nodeMap.values()].sort(nodeOrder), edges: [...edgeMap.values()].sort(edgeOrder), limits };
@@ -186,7 +205,8 @@ export function closeRelationGraph(graph: RelationGraph): PacketClosure {
   }
   if (frontier.length) diagnostics.push(`[graph-depth] relation closure exceeded maxDepth ${graph.limits.maxDepth}`);
   const reachable = [...seen].map((id) => nodeById.get(id)).filter((node): node is RelationNode => Boolean(node));
-  const writablePaths = reachable.filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test").map((node) => node.identity).sort();
+  const configSeedPaths = new Set(graph.seeds.filter((seed) => seed.provenance === "config").map((seed) => seed.path));
+  const writablePaths = reachable.filter((node) => (node.kind === "file" || node.kind === "generated" || node.kind === "test") && !configSeedPaths.has(node.identity)).map((node) => node.identity).sort();
   const evidencePaths = reachable.filter((node) => node.kind === "test" || node.kind === "file" || node.kind === "generated").map((node) => node.identity).sort();
   const invariantIds = reachable.filter((node) => node.kind === "invariant").map((node) => node.identity).sort();
   const commandIds = reachable.filter((node) => node.kind === "command").map((node) => node.identity).sort();

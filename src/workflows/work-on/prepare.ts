@@ -498,7 +498,13 @@ async function deriveRelationGraphMetadata(
   const limits = { maxNodes: 10_000, maxEdges: 25_000, maxDepth: 8, maxFiles: 2_000, maxBytes: 4_000_000, maxCollateralPaths: 512 };
   const facts = [];
   for (const adapter of adapters) facts.push(await adapter.inspect({ cwd, limits }));
-  const graph = buildRelationGraph({ baseSha, seeds, facts, limits });
+  // Manifest/config relations are authoritative controller inputs, not model
+  // suggestions. Seed only the exact config files discovered by the adapter.
+  const configSeeds = facts.flatMap((fact) => fact.nodes
+    .filter((node): node is typeof node & { digest: string } => node.kind === "config" && node.identity.includes("/") && Boolean(node.digest))
+    .map((node) => ({ path: node.identity, provenance: "config" as const, contentDigest: node.digest })));
+  const authoritativeSeeds = [...seeds, ...configSeeds];
+  const graph = buildRelationGraph({ baseSha, seeds: authoritativeSeeds, facts, limits });
   const closure = closeRelationGraph(graph);
   if (closure.diagnostics.length) throw new PacketAuthorCorrectableError(closure.diagnostics);
   const writablePaths = finalExpectedPaths
