@@ -48,46 +48,49 @@ export async function closeExpectedWriteScope(
     ...issueHints,
     ...(input.controllerWriteHints ?? []),
   ], diagnostics);
-  const relationHints = directHints;
+  const relationHints = [...directHints];
   const directSet = new Set(directHints);
   const collateral: string[] = [];
   const accepted = new Set(issueHints);
   const contents = new Map<string, string | undefined>();
   let relationReads = 0;
+  const proposedPaths = canonicalConcrete(proposed, diagnostics);
+  const pending = [...new Set(proposedPaths.filter((path) => !directSet.has(path)))];
+  for (const path of proposedPaths) if (directSet.has(path)) accepted.add(path);
 
-  for (const raw of proposed) {
-    const path = canonicalConcrete([raw], diagnostics)[0];
-    if (!path) {
-      rejectedPaths.push(raw);
-      continue;
-    }
-    if (directSet.has(path)) {
+  // Resolve a bounded fixed point over real source/import relationships. This
+  // lets a controller-authorized interface admit its direct implementation and
+  // tests regardless of model output ordering, without trusting investigation
+  // prose or unrelated same-root files as write authority.
+  let advanced = true;
+  while (advanced && pending.length && collateral.length < maxCollateralPaths) {
+    advanced = false;
+    for (let index = 0; index < pending.length && collateral.length < maxCollateralPaths;) {
+      const path = pending[index]!;
+      const basenameRelation = isBasenameCompanion(path, relationHints);
+      const contentRelation = !basenameRelation && input.cwd !== undefined
+        ? await hasFrozenContentRelation(path, relationHints, input.cwd, contents, () => {
+          relationReads += 1;
+          return relationReads <= MAX_RELATION_READS;
+        })
+        : false;
+      if (!basenameRelation && !contentRelation) {
+        index += 1;
+        continue;
+      }
+      pending.splice(index, 1);
+      collateral.push(path);
       accepted.add(path);
-      continue;
+      relationHints.push(path);
+      advanced = true;
     }
-    const basenameRelation = isBasenameCompanion(path, relationHints);
-    const contentRelation = !basenameRelation && input.cwd !== undefined
-      ? await hasFrozenContentRelation(path, relationHints, input.cwd, contents, () => {
-        relationReads += 1;
-        return relationReads <= MAX_RELATION_READS;
-      })
-      : false;
-    if (!basenameRelation && !contentRelation) {
-      rejectedPaths.push(path);
-      continue;
-    }
-    if (collateral.length >= maxCollateralPaths) {
-      rejectedPaths.push(path);
-      continue;
-    }
-    collateral.push(path);
-    accepted.add(path);
   }
+  rejectedPaths.push(...pending);
 
   if (rejectedPaths.length) {
     diagnostics.push(`[write-scope] Expected paths are not directly hinted or a bounded companion of a write hint: ${[...new Set(rejectedPaths)].sort().join(", ")}`);
   }
-  if (proposed.length > maxCollateralPaths + directHints.length) {
+  if (proposedPaths.length > maxCollateralPaths + directHints.length) {
     diagnostics.push(`[write-scope-limit] At most ${maxCollateralPaths} collateral expected paths may be admitted before freeze`);
   }
   return {
@@ -128,9 +131,12 @@ async function hasFrozenContentRelation(
   for (const path of paths) {
     const content = await readBoundedRepositoryFile(path, cwd, contents, canRead);
     if (content === undefined) continue;
-    for (const hint of hints) {
-      if (hint === candidate) continue;
-      if (containsLiteralPathReference(content, path, hint)) return true;
+    if (path === candidate) {
+      for (const hint of hints) {
+        if (containsLiteralPathReference(content, path, hint)) return true;
+      }
+    } else if (containsLiteralPathReference(content, path, candidate)) {
+      return true;
     }
   }
   return false;

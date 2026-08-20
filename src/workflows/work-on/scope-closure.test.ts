@@ -54,6 +54,24 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
+  it("admits a bounded transitive controller dependency set regardless of proposal order", async () => {
+    const proposed = [
+      "src/workflows/work-on/complete.test.ts",
+      "src/workflows/review-pr/ci-policy.test.ts",
+      "src/workflows/promotion/promotion.test.ts",
+      "src/core/config/forgedock-config.test.ts",
+      "src/core/config/forgedock-config.ts",
+      "src/cli/main.ts",
+      "src/workflows/review-pr/review-deployment.test.ts",
+    ];
+    const result = await closeExpectedWriteScope(proposed, {
+      issueWriteHints: ["src/workflows/review-pr/review-existing.ts"],
+      cwd: process.cwd(),
+    });
+    assert.deepEqual(result.rejectedPaths, []);
+    assert.equal(proposed.every((path) => result.expectedPaths.includes(path)), true);
+  });
+
   it("rejects investigation-only exact and basename-related writes", async () => {
     const exact = await closeExpectedWriteScope(["docs/CONFIG.md"], {
       investigationWriteHints: ["docs/CONFIG.md"],
