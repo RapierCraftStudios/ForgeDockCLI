@@ -116,6 +116,23 @@ describe("typed pristine repository reset", () => {
     assert.deepEqual(deps.mutations, ["fence", "stop"]);
   });
 
+  it("records preserved DAG nodes and leaves closed issue evidence untouched", async () => {
+    const deps = fakeDeps();
+    deps.host.readIssue = async (_repo, issue) => ({ number: issue, state: issue === 2 ? "CLOSED" as const : "OPEN" as const, labels: ["workflow:building"], body: "original body" });
+    deps.host.listComments = async (_repo, issue) => issue === 2
+      ? [{ id: 22, issue, marker: "artifact:a1", runId: "run-1", artifactId: "a1", bodySha256: sha256("closed"), body: "closed", managed: true as const }]
+      : [{ id: 11, issue, marker: "artifact:a1", runId: "run-1", artifactId: "a1", bodySha256: sha256("managed"), body: "managed", managed: true as const }];
+    deps.state.capture = async () => ({
+      runs: [{ runId: "run-1", version: 1, state: "running" }], artifacts: [{ artifactId: "a1", subjectKey: "o/r|i:1|p:", kind: "Intent" as ArtifactKind, sha256: "artifact" }], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [], selectedIssueNumbers: [1],
+      preservedNodes: [{ orchestrationId: "dag", nodeId: "issue-2", issue: 2, memberIssues: [2], status: "completed", runIds: ["run-completed"], reason: "completed" }], preservedRunIds: ["run-completed"],
+    });
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1, 2], dagIds: [] }, deps);
+    assert.deepEqual(manifest.labels["2"], undefined);
+    assert.deepEqual(manifest.comments.map((comment) => comment.id), [11]);
+    assert.deepEqual(manifest.preservedRunIds, ["run-completed"]);
+    assert.equal(manifest.preservedNodes[0]?.status, "completed");
+  });
+
   it("archives dirty worktrees before exact force removal", async () => {
     const deps = fakeDeps();
     const order: string[] = [];

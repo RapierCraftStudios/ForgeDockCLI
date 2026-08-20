@@ -1534,11 +1534,23 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
           || (dag.repository.toLowerCase() === target.repo.toLowerCase() && dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))));
         const dags = selectedDagRecords.map((dag) => ({ orchestrationId: dag.orchestrationId, repository: dag.repository, status: dag.status, updatedAt: dag.updatedAt, recordSha256: sha256Reset(JSON.stringify(dag)) }));
         const dagIds = new Set(dags.map((dag) => dag.orchestrationId));
-        const dagRunIds = new Set(selectedDagRecords.flatMap((dag) => dag.nodes.flatMap((node) => [
-          ...node.childRunIds,
-          ...(node.attempts ?? []).flatMap((attempt) => attempt.runId ? [attempt.runId] : []),
-        ])));
-        const runs = allRuns.filter((run) => (run.subject.repo.toLowerCase() === target.repo.toLowerCase() && target.issueNumbers.includes(run.subject.issue ?? -1)) || dagRunIds.has(run.runId))
+        const nodeSelection = selectResetDagNodes(selectedDagRecords, target);
+        const dagRunIds = new Set(nodeSelection.selected.flatMap(({ node }) => resetNodeRunIds(node)));
+        const preservedNodes = nodeSelection.preserved.map(({ dag, node, reason }) => ({
+          orchestrationId: dag.orchestrationId, nodeId: node.id, issue: node.issue,
+          memberIssues: [...new Set([node.issue, ...(node.memberIssues ?? [])])].sort((a, b) => a - b),
+          status: node.status, runIds: resetNodeRunIds(node), reason,
+        }));
+        const preservedRunIds = [...new Set(preservedNodes.flatMap((node) => node.runIds))].sort();
+        const selectedNodeRunIds = new Set(dagRunIds);
+        if (preservedRunIds.some((runId) => selectedNodeRunIds.has(runId))) {
+          throw new Error("Reset selection is ambiguous; a run identity belongs to both selected and preserved DAG nodes");
+        }
+        const missingPreservedRuns = preservedRunIds.filter((runId) => !allRuns.some((run) => run.runId === runId));
+        if (missingPreservedRuns.length) throw new Error(`Reset preservation evidence is incomplete; run rows were not found: ${missingPreservedRuns.join(", ")}`);
+        const preservedArtifactIds = [...new Set(store.listArtifactsForRuns(preservedRunIds).map((artifact) => artifact.artifactId))].sort();
+        const runs = allRuns.filter((run) => dagRunIds.has(run.runId)
+          || (!selectedDagRecords.length && run.subject.repo.toLowerCase() === target.repo.toLowerCase() && target.issueNumbers.includes(run.subject.issue ?? -1)))
           .map((run) => ({ runId: run.runId, version: run.version, state: run.state }));
         const runIds = runs.map((run) => run.runId);
         const selectedRunRecords = allRuns.filter((run) => runIds.includes(run.runId));
@@ -1547,21 +1559,31 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
           pullRequestNumbers: [...new Set(selectedLocalArtifacts.map((artifact) => artifact.subject.pr).filter((number): number is number => number !== undefined))],
           headBranches: [...new Set(selectedLocalArtifacts.flatMap((artifact) => artifact.kind === "BuildResult" ? [artifact.payload.branch] : []))],
         };
+        const activeIssueNumbers = target.issueNumbers.length
+          ? (selectedDagRecords.length
+            ? target.issueNumbers.filter((issue) => nodeSelection.selected.some(({ node }) => node.issue === issue || (node.memberIssues ?? []).includes(issue)))
+            : [...target.issueNumbers])
+          : nodeSelection.selected.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]);
         const promotions = (await store.listPromotions(10_000)).filter((promotion) => promotion.repository.toLowerCase() === target.repo.toLowerCase()
-          && target.issueNumbers.some((issue) => promotion.sourceBranch.includes(`issue-${issue}`)))
+          && activeIssueNumbers.some((issue) => promotion.sourceBranch.includes(`issue-${issue}`)))
           .map((promotion) => ({ promotionId: promotion.promotionId, repository: promotion.repository, version: promotion.version, phase: promotion.phase, snapshotSha256: sha256Reset(JSON.stringify(promotion)) }));
-        const leaseIds = [...runIds, ...dags.map((dag) => `orchestration-execution:${dag.orchestrationId}`), ...target.dagIds.map((dag) => `orchestration-execution:${dag}`), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        const leaseIds = [...runIds, ...dags.map((dag) => `orchestration-execution:${dag.orchestrationId}`), ...target.dagIds.map((dag) => `orchestration-execution:${dag}`), ...([...new Set(activeIssueNumbers)].map((issue) => `issue-${issue}`))];
+        const selectedNodeIds = new Set(nodeSelection.selected.map(({ node }) => node.id));
+        const selectedNodeLeases = (itemId: string): boolean => selectedDagRecords.some((dag) => itemId.startsWith(`orchestration:${dag.orchestrationId}:`))
+          && [...selectedNodeIds].some((nodeId) => itemId.includes(`:node:${nodeId}:`));
         const leaseSnapshots = store.listAllLeaseSnapshots().filter((lease) => leaseIds.includes(lease.itemId)
-          || target.dagIds.some((dag) => lease.itemId.startsWith(`orchestration:${dag}:`))
+          || selectedNodeLeases(lease.itemId)
           || runIds.some((runId) => lease.itemId.includes(runId)));
-        const taskIdentities = readResetTaskRecords(target, runIds).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
+        const taskIdentities = readResetTaskRecords(target, runIds, nodeSelection.selected.map(({ node }) => node.id)).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
         return {
           runs, artifacts: store.listArtifactsForRuns(runIds),
           tasks: taskIdentities,
           observations: store.listTelemetryIdentitiesForRuns(runIds),
           fences: store.listReviewFindingPublicationFenceSnapshots().filter((fence) => fence.repository?.toLowerCase() === target.repo.toLowerCase()
-            && (target.issueNumbers.includes(fence.pullRequest ?? -1) || target.dagIds.some((dag) => fence.fenceKey.includes(dag)))),
-          promotions, dags, leases: leaseSnapshots, archive: [], authorization,
+            && (activeIssueNumbers.includes(fence.pullRequest ?? -1) || target.dagIds.some((dag) => fence.fenceKey.includes(dag)))),
+          promotions, dags, leases: leaseSnapshots, authorization,
+          preservedNodes, preservedRunIds, preservedArtifactIds, archive: [],
+          selectedIssueNumbers: [...new Set(activeIssueNumbers)].sort((a, b) => a - b),
           observationEvents: observations ? observations.listResetEventsForRuns(runIds) : [],
         };
       },
@@ -1594,6 +1616,13 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         for (const task of manifest.tasks) for (const suffix of [".json", ".log", ".stderr"]) {
           if (existsSync(join(taskDirectory, `${task.taskId}${suffix}`))) throw new Error(`Reset purge postcondition failed; task file remains: ${task.taskId}${suffix}`);
         }
+      },
+      verifyPreserved: async (manifest) => {
+        if (!store) return;
+        const missing = manifest.preservedRunIds.filter((runId) => !store.listRuns(10_000).some((run) => run.runId === runId));
+        if (missing.length) throw new Error(`Reset preservation postcondition failed; run rows missing: ${missing.join(", ")}`);
+        const missingArtifacts = manifest.preservedArtifactIds.filter((artifactId) => !store.listArtifactsForRuns(manifest.preservedRunIds).some((artifact) => artifact.artifactId === artifactId));
+        if (missingArtifacts.length) throw new Error(`Reset preservation postcondition failed; artifact rows missing: ${missingArtifacts.join(", ")}`);
       },
       purgeTaskFiles: async (tasks) => {
         const directory = join(process.cwd(), ".forgedock", "tasks");
@@ -1631,7 +1660,7 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
     cancellation: {
       fence: async (target, leaseIds = []) => {
         if (!store) throw new Error("Reset apply requires a local state database to prove worker fencing");
-        const patterns = [...leaseIds, ...target.dagIds.flatMap((dag) => [`orchestration-execution:${dag}`, `orchestration:${dag}:`]), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        const patterns = [...leaseIds, ...target.dagIds.map((dag) => `orchestration-execution:${dag}`)];
         store.assertResetNoLiveLeasePatterns(patterns);
       },
       stopWorkers: async (target, leaseIds = []) => {
@@ -1639,7 +1668,7 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         // no live owner is permitted; stale workers cannot durably mutate and
         // are reaped by the normal lease CAS during purge.
         if (!store) throw new Error("Reset apply requires a local state database to stop workers safely");
-        const patterns = [...leaseIds, ...target.dagIds.flatMap((dag) => [`orchestration-execution:${dag}`, `orchestration:${dag}:`]), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        const patterns = [...leaseIds, ...target.dagIds.map((dag) => `orchestration-execution:${dag}`)];
         store.assertResetNoLiveLeasePatterns(patterns);
         stopResetTaskProcesses(target, leaseIds);
       },
@@ -1689,10 +1718,55 @@ function archiveResetTaskEvidence(manifest: PristineResetManifest): ResetArchive
   return writeResetArchive(`reset-${manifest.digest}.tasks.json`, { schema: "forgedock.pristine-reset/tasks/v1", files: taskFiles }, "tasks");
 }
 
-function readResetTaskRecords(target: ResetSelection, runIds: readonly string[]): Array<{ id: string; pid?: number; status?: string; launchKey?: string; runId?: string; snapshotSha256: string }> {
+function resetNodeRunIds(node: OrchestrationNodeRecord): string[] {
+  return [...new Set([
+    ...node.childRunIds,
+    ...(node.attempts ?? []).flatMap((attempt) => attempt.runId ? [attempt.runId] : []),
+  ])].sort();
+}
+
+/** Select only unfinished node identities; a DAG record never authorizes all child runs. */
+function selectResetDagNodes(
+  dags: readonly OrchestrationRecord[],
+  target: ResetSelection,
+): { selected: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>; preserved: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord; reason: "completed" | "invalid" | "unselected" }> } {
+  const terminal = new Set(["completed", "invalid", "skipped"]);
+  const candidates = dags.flatMap((dag) => dag.nodes.map((node) => ({ dag, node })));
+  for (const dag of dags) {
+    if (target.dagIds.includes(dag.orchestrationId) && dag.repository.toLowerCase() !== target.repo.toLowerCase()) {
+      throw new Error(`Reset selection repository mismatch for DAG ${dag.orchestrationId}`);
+    }
+  }
+  const selected = new Set<string>();
+  if (target.issueNumbers.length) {
+    for (const issue of target.issueNumbers) {
+      const matches = candidates.filter(({ dag, node }) => {
+        const repository = node.repository ?? dag.repository;
+        return repository.toLowerCase() === target.repo.toLowerCase()
+          && (node.issue === issue || (node.memberIssues ?? []).includes(issue));
+      });
+      if (matches.length > 1) {
+        throw new Error(`Reset selection is ambiguous for issue #${issue}; it maps to multiple repository/node/member identities`);
+      }
+      if (matches.length === 0 && dags.length) {
+        throw new Error(`Reset selection could not map issue #${issue} to an exact DAG node identity`);
+      }
+      if (matches[0]) selected.add(`${matches[0].dag.orchestrationId}|${matches[0].node.id}`);
+    }
+  } else {
+    for (const { dag, node } of candidates) selected.add(`${dag.orchestrationId}|${node.id}`);
+  }
+  const selectedNodes = candidates.filter(({ dag, node }) => selected.has(`${dag.orchestrationId}|${node.id}`) && !terminal.has(node.status));
+  const preserved = candidates.filter(({ dag, node }) => !selected.has(`${dag.orchestrationId}|${node.id}`) || terminal.has(node.status)).map(({ dag, node }) => ({
+    dag, node, reason: terminal.has(node.status) ? (node.status === "invalid" ? "invalid" : "completed") : "unselected",
+  } as const));
+  return { selected: selectedNodes, preserved };
+}
+
+function readResetTaskRecords(target: ResetSelection, runIds: readonly string[], nodeIds: readonly string[] = []): Array<{ id: string; pid?: number; status?: string; launchKey?: string; runId?: string; snapshotSha256: string }> {
   const directory = join(process.cwd(), ".forgedock", "tasks");
   if (!existsSync(directory)) return [];
-  const identities = [...runIds, ...target.dagIds, ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+  const identities = [...runIds, ...nodeIds, ...target.issueNumbers.map((issue) => `issue-${issue}`)];
   return readdirSync(directory).filter((name) => name.endsWith(".json")).flatMap((name) => {
     try {
       const contents = readFileSync(join(directory, name), "utf8");

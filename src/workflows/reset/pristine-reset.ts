@@ -71,6 +71,16 @@ export interface ResetArchiveIdentity {
 
 export interface ResetRunIdentity { runId: string; version: number; state: string; }
 export interface ResetDagIdentity { orchestrationId: string; repository: string; status: string; updatedAt: string; recordSha256: string; }
+/** Evidence for a DAG node intentionally left behind when its parent record is removed. */
+export interface ResetPreservedNodeIdentity {
+  orchestrationId: string;
+  nodeId: string;
+  issue: number;
+  memberIssues: readonly number[];
+  status: string;
+  runIds: readonly string[];
+  reason: "completed" | "invalid" | "unselected";
+}
 export interface ResetTaskIdentity { taskId: string; runId?: string; launchKey?: string; snapshotSha256: string; }
 export interface ResetObservationIdentity { key: string; runId: string; taskId: string; sessionRef: string; receiptSha256: string; }
 export interface ResetFenceIdentity { fenceKey: string; generation: number; snapshotSha256: string; repository?: string; pullRequest?: number; }
@@ -107,6 +117,12 @@ export interface PristineResetManifest {
   fences: readonly ResetFenceIdentity[];
   promotions: readonly ResetPromotionIdentity[];
   dags: readonly ResetDagIdentity[];
+  /** Proof that deleting a parent DAG did not authorize deletion of these nodes. */
+  preservedNodes: readonly ResetPreservedNodeIdentity[];
+  /** Run identities referenced by preserved nodes; all must survive apply. */
+  preservedRunIds: readonly string[];
+  /** Artifact rows reachable from preserved runs; used by the postcondition check. */
+  preservedArtifactIds: readonly string[];
   leases: readonly { itemId: string; expiresAt: number; owner: string; tokenSha256: string }[];
   archive: readonly ResetArchiveIdentity[];
   actions: readonly ResetAction[];
@@ -153,6 +169,10 @@ export interface ResetStateStore {
     fences: readonly ResetFenceIdentity[];
     promotions: readonly ResetPromotionIdentity[];
     dags: readonly ResetDagIdentity[];
+    preservedNodes?: readonly ResetPreservedNodeIdentity[];
+    preservedRunIds?: readonly string[];
+    preservedArtifactIds?: readonly string[];
+    selectedIssueNumbers?: readonly number[];
     leases: PristineResetManifest["leases"];
     archive: readonly ResetArchiveIdentity[];
     authorization?: ResetExternalAuthorization;
@@ -164,6 +184,7 @@ export interface ResetStateStore {
   archiveSnapshots?(selection: ResetSelection, manifest: PristineResetManifest): Promise<readonly ResetArchiveIdentity[]>;
   purgeTaskFiles?(tasks: readonly ResetTaskIdentity[]): Promise<void>;
   verifyPurged?(manifest: PristineResetManifest): Promise<void>;
+  verifyPreserved?(manifest: Pick<PristineResetManifest, "preservedNodes" | "preservedRunIds" | "preservedArtifactIds">): Promise<void>;
 }
 
 export interface ResetWorkspaceStore {
@@ -229,10 +250,13 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const selectedDagIds = new Set(captured.dags.map((dag) => dag.orchestrationId));
   const missingDags = dagIds.filter((dagId) => !selectedDagIds.has(dagId));
   if (missingDags.length) throw new Error(`Reset discovery is incomplete; selected DAGs were not found: ${missingDags.join(", ")}`);
+  const issueState = new Map(issues.map((issue) => [issue.number, issue.state]));
+  const mutableIssueNumbers = new Set(captured.selectedIssueNumbers ?? issueNumbers);
+  const openPullRequests = new Set(pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => pr.number));
   const pullComments = deps.host.listPullRequestComments
-    ? (await Promise.all(pullRequests.map((pr) => deps.host.listPullRequestComments!(selection.repo, pr.number)))).flat()
+    ? (await Promise.all(pullRequests.filter((pr) => openPullRequests.has(pr.number)).map((pr) => deps.host.listPullRequestComments!(selection.repo, pr.number)))).flat()
     : [];
-  const allComments = [...comments, ...pullComments];
+  const allComments = [...comments.filter((comment) => mutableIssueNumbers.has(comment.issue) && issueState.get(comment.issue) === "OPEN"), ...pullComments];
   const managedComments = allComments.filter((comment) => comment.managed === true
     && isSelectedResetComment(comment, selectedRunIds, selectedArtifactIds, selectedDagIds));
   const artifactCommentIds = new Map<string, number>();
@@ -248,7 +272,7 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
     }
     artifactCommentIds.set(publicationKey, comment.id);
   }
-  const labelMap = Object.fromEntries(labels.map(([number, value]) => {
+  const labelMap = Object.fromEntries(labels.filter(([number]) => mutableIssueNumbers.has(number) && issueState.get(number) === "OPEN").map(([number, value]) => {
     const issueComments = managedComments.filter((comment) => comment.issue === number && comment.pr === undefined);
     const cutoffAt = firstWorkflowOwnershipCutoff([value], issueComments);
     return [String(number), {
@@ -265,7 +289,7 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
     { type: "archive", paths: [...captured.archive.map((item) => item.path), ...worktrees.flatMap((item) => item.archivePath ? [item.archivePath] : [])] },
     { type: "purge-database", runs: captured.runs.length, artifacts: captured.artifacts.length, dags: captured.dags.length, tasks: captured.tasks.length, observations: captured.observations.length, fences: captured.fences.length, promotions: captured.promotions.length, leases: captured.leases.length },
     { type: "delete-comments", ids: managedComments.map((comment) => comment.id).sort((a, b) => a - b) },
-    ...issueNumbers.map((issue) => ({ type: "restore-labels" as const, issue, labels: labelMap[String(issue)]?.restored ?? [] })),
+    ...Object.entries(labelMap).map(([issue, state]) => ({ type: "restore-labels" as const, issue: Number(issue), labels: state.restored })),
     { type: "close-pull-requests", numbers: pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => pr.number) },
     { type: "delete-exact-refs", refs: refs.map((ref) => ref.exactRef) },
     { type: "remove-worktrees", paths: worktrees.map((worktree) => worktree.path) },
@@ -275,7 +299,10 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
     schema: "forgedock.pristine-reset/v1", repo: selection.repo, selection: { ...selection, issueNumbers, dagIds },
     issues: issueRows, labels: labelMap, comments: managedComments, pullRequests, refs, worktrees,
     runs: captured.runs, artifacts: captured.artifacts, tasks: captured.tasks, observations: captured.observations,
-    fences: captured.fences, promotions: captured.promotions, dags: captured.dags, leases: captured.leases,
+    fences: captured.fences, promotions: captured.promotions, dags: captured.dags,
+    preservedNodes: captured.preservedNodes ?? [], preservedRunIds: [...new Set(captured.preservedRunIds ?? [])].sort(),
+    preservedArtifactIds: [...new Set(captured.preservedArtifactIds ?? [])].sort(),
+    leases: captured.leases,
     observationEvents: captured.observationEvents ?? [],
     archive: captured.archive, actions,
   });
@@ -329,6 +356,7 @@ export async function applyPristineReset(manifest: PristineResetManifest, expect
   }
   if (deps.state.purgeTaskFiles) await deps.state.purgeTaskFiles(manifest.tasks);
   if (deps.state.verifyPurged) await deps.state.verifyPurged(manifest);
+  if (deps.state.verifyPreserved) await deps.state.verifyPreserved(manifest);
   if (deps.state.observationVerifyPurged && manifest.observationEvents.length) await deps.state.observationVerifyPurged({ events: manifest.observationEvents });
 }
 
@@ -355,9 +383,11 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
     const artifactIds = new Set(manifest.artifacts.map((artifact) => artifact.artifactId));
     const dagIds = new Set(manifest.dags.map((dag) => dag.orchestrationId));
     const selectedIds = new Set(manifest.comments.map((comment) => comment.id));
-    const issueComments = (await Promise.all(manifest.selection.issueNumbers.map((issue) => deps.host.listComments(manifest.repo, issue)))).flat();
+    const issueComments = (await Promise.all(manifest.selection.issueNumbers
+      .filter((issue) => manifest.labels[String(issue)] !== undefined)
+      .map((issue) => deps.host.listComments(manifest.repo, issue)))).flat();
     const pullComments = deps.host.listPullRequestComments
-      ? (await Promise.all(manifest.pullRequests.map((pr) => deps.host.listPullRequestComments!(manifest.repo, pr.number)))).flat()
+      ? (await Promise.all(manifest.pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => deps.host.listPullRequestComments!(manifest.repo, pr.number)))).flat()
       : [];
     for (const candidate of [...issueComments, ...pullComments]) {
       if (candidate.managed && isSelectedResetComment(candidate, runIds, artifactIds, dagIds) && !selectedIds.has(candidate.id)) {
