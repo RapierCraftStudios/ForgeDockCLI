@@ -1156,7 +1156,7 @@ function decompositionChildIssuesFromArtifacts(
   });
 }
 
-async function materializeVisibleDecomposition(input: {
+export async function materializeVisibleDecomposition(input: {
   github: GitHubClient;
   artifacts: { list(subject: { repo: string; issue: number }): Promise<readonly DurableArtifact[]> };
   repository: string;
@@ -1164,36 +1164,41 @@ async function materializeVisibleDecomposition(input: {
   effective: EffectiveOrchestrationConfig;
   orchestration: Readonly<OrchestrationRecord>;
   node: Readonly<OrchestrationNodeRecord>;
-  item: VisibleOrchestrationItem;
+  item: Pick<BatchableWorkItem, "issue" | "repository">;
   childIssues?: readonly number[];
 }): Promise<{
   childIssues: readonly number[];
   items: readonly VisibleOrchestrationItem[];
   serializationEdges?: readonly ClaimSerializationEdge[];
 } | undefined> {
+  const effectiveRepository = orchestrationItemRepository(input.node, input.item, input.repository);
+  const authoritativeRepository = await input.github.getRepository(effectiveRepository);
+  const authoritativeDefaultBranch = authoritativeRepository.defaultBranch;
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
-    const artifacts = await input.artifacts.list({ repo: input.repository, issue: input.item.issue });
+    const artifacts = await input.artifacts.list({ repo: effectiveRepository, issue: input.item.issue });
     const reconciled = reconcileLatestRunArtifacts(artifacts);
     if (reconciled.state !== "decomposed") return undefined;
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
   const dependencyNodes = [
-    ...input.orchestration.nodes.map((candidate) => ({
-      id: candidate.id,
-      issue: candidate.issue,
-      ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
-    })),
+    ...input.orchestration.nodes
+      .filter((candidate) => orchestrationItemRepository(candidate, {}, input.repository) === effectiveRepository)
+      .map((candidate) => ({
+        id: candidate.id,
+        issue: candidate.issue,
+        ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
+      })),
     ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
   ];
-  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
+  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveRepository));
   const childItems: VisibleOrchestrationItem[] = [];
   for (const issue of childSnapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
     const lane = await resolveIssueLane(
       issue,
-      input.defaultBranch,
+      authoritativeDefaultBranch,
       input.github,
       input.effective.fastLaneTarget,
       input.effective.featurePromotionTarget,
@@ -1208,8 +1213,8 @@ async function materializeVisibleDecomposition(input: {
       issue: issue.number,
       priority: priorityFromIssueLabels(issue.labels ?? []),
       dependencies,
-      claims: [...new Set([...affectedFiles, ...(affectedFiles.length ? [] : ["component:repository"])])],
-      repository: input.repository,
+      claims: [...new Set([...affectedFiles, ...(affectedFiles.length ? [] : [`component:${effectiveRepository}`])])],
+      repository: effectiveRepository,
       targetBranch: lane.targetBranch,
       lane: lane.kind,
       ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2951,12 +2956,13 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         }),
         taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
+          const itemRepository = orchestrationItemRepository({}, item, readyRepository.repo);
           return {
             agent: "forgedock-issue-worker",
             task: buildIssueWorkerTask(
               item.issue,
               {
-                repository: repository!.repo,
+                repository: itemRepository,
                 autoMerge,
                 batching: effective.batchingPolicy,
                 scopeExpansion: effective.scopeExpansion,
@@ -2982,9 +2988,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(controllerEntryAvailable() ? {
           controllerTaskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => {
             const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
+            const itemRepository = orchestrationItemRepository({}, item, readyRepository.repo);
             return {
               args: buildIssueWorkerControllerArgs(item.issue, {
-                repository: repository!.repo,
+                repository: itemRepository,
                 autoMerge,
                 scopeExpansion: effective.scopeExpansion,
                 maxRemediationCycles: effective.maxRemediationCycles,
@@ -3011,13 +3018,14 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           waitControllerTask: async (taskId: string) => await backgroundTasks.waitForTerminal(taskId),
         } : {}),
         assertCompleted: async (item) => {
-          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: readyRepository.repo, issue: item.issue }));
+          const itemRepository = orchestrationItemRepository({}, item, readyRepository.repo);
+          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: itemRepository, issue: item.issue }));
           if (reconciled.state === "completed") return;
           if (reconciled.state === "invalid") {
             return { status: "invalid", error: `#${item.issue} was classified invalid; no delivery work was performed` };
           }
           if (reconciled.state === "decomposed") {
-            const issueArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: item.issue });
+            const issueArtifacts = await artifacts.list({ repo: itemRepository, issue: item.issue });
             return {
               status: "skipped",
               error: `#${item.issue} decomposed into authoritative child work`,
@@ -3027,7 +3035,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
-          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: readyRepository.repo, issue: item.issue }), reconciled);
+          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: itemRepository, issue: item.issue }), reconciled);
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
         },
@@ -3718,6 +3726,14 @@ function issueNumberFromId(id: string): number {
   const match = /^issue-(\d+)$/.exec(id);
   if (!match) throw new Error(`Invalid issue dependency id: ${id}`);
   return Number(match[1]);
+}
+
+export function orchestrationItemRepository(
+  node: Pick<OrchestrationNodeRecord, "repository">,
+  item: Pick<BatchableWorkItem, "repository">,
+  orchestrationRepository: string,
+): string {
+  return node.repository ?? item.repository ?? orchestrationRepository;
 }
 
 export function shouldResumeObservedItem(_labels: readonly string[], sameSessionRetry: boolean): boolean {
