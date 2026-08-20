@@ -1213,6 +1213,80 @@ describe("fresh-context PR review", () => {
     assert.deepEqual(host.reconciliations[0]?.activeFindings.map(({ id }) => id), host.findingIssues.map(({ finding }) => finding.id));
   });
 
+  it("preserves distinct trigger roots through concurrent reviewer completion and post-wave projection", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const completionOrder: string[] = [];
+    const triggerFinding = (id: string, trigger: "chunk" | "terminal") => ({
+      ...inScope,
+      id,
+      severity: "high" as const,
+      confidence: "high" as const,
+      blocking: true,
+      mustFix: true,
+      causalRoot: `redaction grammar failure ${trigger === "chunk" ? "alpha" : "beta"}`,
+      title: "Redaction grammar failure",
+      evidence: trigger === "chunk"
+        ? "normalizeObservationDraft() observes a chunk continuation."
+        : "normalizeObservationDraft() observes terminal metadata.",
+      location: "src/lock.ts:20",
+      intentRelevance: "Concurrent updates pass",
+      remediation: "Fix the redaction grammar failure.",
+      impact: {
+        ...inScope.impact,
+        trigger: trigger === "chunk"
+          ? "A chunk continuation reaches the boundary."
+          : "Terminal metadata reaches the boundary.",
+        affectedInvariant: "Concurrent updates pass",
+      },
+    });
+    const triggerByRole = {
+      correctness: triggerFinding("trigger-alpha", "chunk"),
+      concurrency: triggerFinding("trigger-beta", "terminal"),
+    } as const;
+    const reviewerResponse = async (task: AgentTask<unknown>) => {
+      const reviewerRole = task.id.endsWith(":review-correctness") ? "correctness" : "concurrency";
+      await new Promise<void>((resolve) => setTimeout(resolve, reviewerRole === "correctness" ? 10 : 1));
+      completionOrder.push(reviewerRole);
+      return {
+        summary: `${reviewerRole} trigger review`,
+        findings: [reviewerRole === "correctness" ? triggerByRole.correctness : triggerByRole.concurrency],
+      };
+    };
+    const scriptedResponse = async (task: AgentTask<unknown>) => task.role === "adjudicator"
+      ? acceptAdjudication(task)
+      : reviewerResponse(task);
+    const hostEvents: string[] = [];
+    const host = new FakeHost(hostEvents);
+    const backing = new InMemoryArtifactRepository();
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      // Reviewer execution is concurrent, so responses must be selected by the
+      // task contract rather than assuming FIFO completion/consumer order.
+      runtime: new FakeAgentRuntime(Array.from({ length: 6 }, () => scriptedResponse)),
+      host, artifacts: backing, runs,
+    });
+
+    assert.deepEqual(completionOrder, ["concurrency", "correctness"]);
+    const ledger = backing.artifacts.find((artifact): artifact is DurableArtifact<"FindingRootLedger"> => artifact.kind === "FindingRootLedger");
+    assert.ok(ledger);
+    assert.equal(ledger.payload.headSha, sha);
+    assert.equal(ledger.payload.roots.length, 2);
+    assert.equal(result.verdict.payload.headSha, sha);
+    assert.equal(result.verdict.payload.headBranch, "fix");
+    assert.equal(result.verdict.payload.baseBranch, "main");
+    assert.equal(result.verdict.payload.findings.length, 2);
+    const findingIds = new Set(result.verdict.payload.findings.map(({ id }) => id));
+    assert.deepEqual(new Set(host.findingIssues.map(({ finding }) => finding.id)), findingIds);
+    assert.deepEqual(new Set(host.reconciliations[0]?.activeFindings.map(({ id }) => id)), findingIds);
+    const waveIndex = hostEvents.findIndex((event) => event === "comment:wave");
+    const firstIssueIndex = hostEvents.findIndex((event) => event.startsWith("issue:"));
+    assert.ok(firstIssueIndex > waveIndex, "both-root projection must follow the settled reviewer wave");
+    assert.equal(host.publicationFence?.headSha, sha);
+    assert.equal(host.publicationFence?.headBranch, "fix");
+    assert.equal(host.publicationFence?.baseBranch, "main");
+  });
+
   for (const severity of ["high", "medium"] as const) {
     it(`applies central confidence/corroboration policy to ${severity}-severity evidence`, async () => {
       const runs = new InMemoryRunRepository();

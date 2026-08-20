@@ -73,7 +73,67 @@ function finding(id: string, family: "marker" | "identity" | "terminal", paraphr
   };
 }
 
+function distinctTriggerFinding(id: string, trigger: "chunk" | "terminal"): Finding {
+  const base = finding(id, "marker");
+  const triggerText = trigger === "chunk"
+    ? "A chunk continuation reaches the boundary."
+    : "Terminal metadata reaches the boundary.";
+  const evidence = trigger === "chunk"
+    ? "normalizeObservationDraft() observes a chunk continuation."
+    : "normalizeObservationDraft() observes terminal metadata.";
+  return {
+    ...base,
+    title: "Redaction grammar failure",
+    causalRoot: "redaction grammar failure",
+    evidence,
+    remediation: "Fix the redaction grammar failure.",
+    intentRelevance: "The shared redaction invariant must remain fail-closed.",
+    impact: {
+      ...base.impact!,
+      trigger: triggerText,
+      affectedInvariant: "The shared redaction invariant must remain fail-closed.",
+    },
+  };
+}
+
 describe("durable finding root ledger", () => {
+  it("invariant:matrix-identity-isolation-08ec249e1001 keeps distinct trigger families in separate roots", () => {
+    const chunk = distinctTriggerFinding("trigger-chunk", "chunk");
+    const terminal = distinctTriggerFinding("trigger-terminal", "terminal");
+    const roots = reconcileFindingRootLedger({ packet, findings: [chunk, terminal], headSha: head1 });
+
+    assert.equal(roots.length, 2);
+    assert.notEqual(roots[0]?.rootId, roots[1]?.rootId);
+    assert.notEqual(roots[0]?.structuralKey, roots[1]?.structuralKey);
+    assert.deepEqual(new Set(roots.flatMap((root) => root.findingIds)), new Set([chunk.id, terminal.id]));
+    assert.deepEqual(new Set(roots.map((root) => root.representative.id)), new Set([chunk.id, terminal.id]));
+    assert.equal(openLedgerFindings(roots).length, 2);
+  });
+
+  it("invariant:matrix-identity-isolation-a4e95565b4a2 keeps closure independent across epochs", () => {
+    const chunk = distinctTriggerFinding("epoch-chunk", "chunk");
+    const terminal = distinctTriggerFinding("epoch-terminal", "terminal");
+    const initial = reconcileFindingRootLedger({ packet, findings: [chunk, terminal], headSha: head1 });
+    const terminalRoot = initial.find((root) => root.representative.id === terminal.id)!;
+    const chunkRoot = initial.find((root) => root.representative.id === chunk.id)!;
+    const previous = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: initial },
+    });
+
+    const next = reconcileFindingRootLedger({
+      previous,
+      packet,
+      findings: [distinctTriggerFinding("epoch-chunk-next", "chunk")],
+      assessments: [{ rootId: terminalRoot.rootId, status: "fixed", evidence: "Terminal trigger no longer reproduces." }],
+      headSha: head2,
+    });
+    assert.equal(next.find((root) => root.rootId === terminalRoot.rootId)?.state, "fixed");
+    assert.equal(next.find((root) => root.rootId === chunkRoot.rootId)?.state, "open");
+    assert.ok(next.find((root) => root.rootId === chunkRoot.rootId)?.findingIds.includes(chunk.id));
+    assert.deepEqual(openLedgerFindings(next).map((finding) => finding.rootId), [chunkRoot.rootId]);
+  });
+
   it("retains structural roots across marker, identity, metadata, and terminal paraphrases", () => {
     const initial = reconcileFindingRootLedger({ packet, findings: [finding("m1", "marker"), finding("i1", "identity"), finding("t1", "terminal")], headSha: head1 });
     const previous = createArtifact({

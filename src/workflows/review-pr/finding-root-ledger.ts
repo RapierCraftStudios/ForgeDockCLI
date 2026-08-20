@@ -33,9 +33,10 @@ export function reconcileFindingRootLedger(input: {
 
   for (const finding of input.findings) {
     const structural = structuralFindingRoot(finding, input.packet);
-    const root = prior.get(structural.rootId)
-      ?? aliases.get(structural.structuralKey)
-      ?? [...prior.values()].find((candidate) => structurallyEquivalent(candidate, structural));
+    // Root identity is intentionally exact: structuralFindingRoot() owns every
+    // identity dimension, including triggerFamily. Never use a lossy fuzzy
+    // family match here, because it can collapse distinct causal triggers.
+    const root = prior.get(structural.rootId) ?? aliases.get(structural.structuralKey);
     const state = finding.scopeDisposition === "rejected" ? "rejected"
       : finding.scopeDisposition === "follow_up" ? "follow-up"
         : root?.state === "fixed" ? "regressed" : "open";
@@ -161,41 +162,21 @@ function symbolsForFinding(finding: LedgerFinding): string[] {
 function semanticFamily(value: string): string {
   const text = value.toLowerCase();
   const families: Array<[string, RegExp]> = [
+    // Prefer one stable semantic family. A paraphrase may mention incidental
+    // vocabulary from another family (for example, "fail-closed" or
+    // "stream"), but that wording must not change its structural identity.
     ["redaction-grammar", /redact|credential|secret|token|password|marker|userinfo/],
-    ["chunk-boundary", /chunk|split|fragment|continuation|stream/],
-    ["adapter-lifecycle", /adapter|lifecycle|recreat|producer|cleanup|terminal/],
     ["identity-isolation", /identity|session|nodeid|pisession|collision|interleav|isolation/],
     ["terminal-metadata", /terminal|completed|failed|cancelled|metadata|ordering/],
+    ["adapter-lifecycle", /adapter|lifecycle|recreat|producer|cleanup/],
+    ["chunk-boundary", /chunk|split|fragment|continuation|stream/],
     ["backpressure", /backpressure|drop|queue|fail.closed/],
     ["authority-binding", /authority|head sha|revision|route|binding/],
     ["criterion-evidence", /criterion|acceptance evidence|verification command|check id/],
   ];
-  const matched = families.filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
-  if (matched.length) return matched.slice(0, 3).join("+");
+  const family = families.find(([, pattern]) => pattern.test(text))?.[0];
+  if (family) return family;
   return text.replace(/[^a-z0-9]+/g, " ").split(" ").filter((token) => token.length > 2 || /^\d+$/.test(token)).sort().slice(0, 8).join("-") || "unspecified";
-}
-
-function structurallyEquivalent(left: FindingRoot, right: ReturnType<typeof structuralFindingRoot>): boolean {
-  const familyMatches = [
-    familyEquivalent(left.invariantFamily, right.invariantFamily),
-    familyEquivalent(left.failureFamily, right.failureFamily),
-    familyEquivalent(left.triggerFamily, right.triggerFamily),
-  ].filter(Boolean).length;
-  return left.component === right.component
-    && intersects(left.criterionIds, right.criterionIds)
-    && intersects(left.symbols, right.symbols)
-    && familyMatches >= 2;
-}
-
-function familyEquivalent(left: string, right: string): boolean {
-  if (left === right) return true;
-  const canonical = new Set([
-    "redaction-grammar", "chunk-boundary", "adapter-lifecycle", "identity-isolation",
-    "terminal-metadata", "backpressure", "authority-binding", "criterion-evidence",
-  ]);
-  const leftFamilies = left.split("+").filter((family) => canonical.has(family));
-  const rightFamilies = right.split("+").filter((family) => canonical.has(family));
-  return leftFamilies.some((family) => rightFamilies.includes(family));
 }
 
 function cloneRoot(root: FindingRoot): FindingRoot {
