@@ -6,6 +6,34 @@ import { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 import { acquireNodeLease, inspectNodeLease, waitForNodeLease } from "./node-lease.js";
 
 describe("orchestration node lease recovery", () => {
+  it("redacts holder tokens from active and expired observations while retaining reconciliation evidence", () => {
+    const leases = new InMemoryLeaseRepository();
+    const acquired = leases.acquire("issue-redaction", "worker-a", 100, 1_000, {
+      binding: "orchestration:dag-redaction:attempt:1:item:issue-redaction",
+      recovery: "initial",
+    });
+    assert.ok(acquired);
+
+    const active = inspectNodeLease(leases, "issue-redaction", 1_050);
+    assert.equal(active?.state, "active");
+    if (active?.state === "active") {
+      assert.equal(Object.hasOwn(active.lease, "token"), false);
+      assert.equal(active.lease.itemId, "issue-redaction");
+      assert.equal(active.lease.owner, "worker-a");
+      assert.equal(active.lease.binding, acquired.binding);
+      assert.equal(active.lease.epoch, acquired.epoch);
+      assert.equal(active.lease.expiresAt, acquired.expiresAt);
+    }
+
+    const expired = inspectNodeLease(leases, "issue-redaction", 1_100);
+    assert.equal(expired?.state, "expired");
+    if (expired?.state === "expired") {
+      assert.equal(Object.hasOwn(expired.lease, "token"), false);
+      assert.equal(expired.lease.binding, acquired.binding);
+      assert.equal(expired.lease.heartbeatAt, acquired.heartbeatAt);
+    }
+  });
+
   it("waits for a live heartbeat instead of stealing the node, then fences the expired predecessor", async () => {
     const leases = new InMemoryLeaseRepository();
     let now = 1_000;

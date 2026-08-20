@@ -6,7 +6,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
-import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
+import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseInspection, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
 import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
@@ -533,12 +533,14 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     });
   }
 
-  inspect(itemId: string): Lease | undefined {
+  inspect(itemId: string): LeaseInspection | undefined {
     return this.inTransaction(() => {
       this.#assertLeaseContinuity();
       const row = this.#database.prepare("SELECT * FROM leases WHERE item_id = ?")
         .get(itemId) as Record<string, string | number> | undefined;
-      return row ? leaseFromRow(row) : undefined;
+      if (!row) return undefined;
+      const { token: _token, ...inspection } = leaseFromRow(row);
+      return inspection;
     });
   }
 
