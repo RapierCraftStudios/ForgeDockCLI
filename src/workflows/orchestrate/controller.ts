@@ -473,6 +473,14 @@ export class OrchestrationController {
       if (storedNode.status === "completed") continue;
       const node = await this.revalidateNodeRoute(state, storedNode);
       const item = itemFromNodeRecord(node);
+      if (node.status === "target_recovery") {
+        actions.set(node.id, { kind: "terminal", result: { status: "target_recovery", error: node.error ?? "target advance checkpoint retained" } });
+        continue;
+      }
+      if (node.status === "retry_wait") {
+        actions.set(node.id, { kind: "terminal", result: { status: "retry_wait", error: node.error ?? "retry checkpoint retained" } });
+        continue;
+      }
       if (node.status === "running" || node.status === "suspended") {
         const attemptEvidence = referencedAttempt(node);
         if (attemptEvidence
@@ -1107,8 +1115,21 @@ export class OrchestrationController {
         completedAt: now,
         ...(decompositionChildren !== undefined ? { decompositionChildren } : {}),
         ...(normalized.error !== undefined ? { error: errorMessage(normalized.error) } : {}),
+        ...(normalized.retryCheckpointId !== undefined ? { retryCheckpointId: normalized.retryCheckpointId } : {}),
+        ...(normalized.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: normalized.targetAdvanceCheckpointId } : {}),
+        ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
+        ...(normalized.retryAfterMs !== undefined ? { retryAfterMs: normalized.retryAfterMs } : {}),
       }),
     );
+    if (normalized.retryCheckpointId !== undefined || normalized.targetAdvanceCheckpointId !== undefined) {
+      this.updateNode(state, nodeId, (node) => ({
+        ...node,
+        ...(normalized.retryCheckpointId !== undefined ? { retryCheckpointId: normalized.retryCheckpointId } : {}),
+        ...(normalized.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: normalized.targetAdvanceCheckpointId } : {}),
+        ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
+        ...(normalized.retryAfterMs !== undefined ? { retryAfterMs: normalized.retryAfterMs } : {}),
+      }));
+    }
     await this.flush(state);
   }
 
@@ -1259,6 +1280,8 @@ export class OrchestrationController {
               ...(result.error !== undefined ? { error: errorMessage(result.error) } : {}),
             }],
         ...(error !== undefined ? { error: errorMessage(error) } : {}),
+        ...(result.retryCheckpointId !== undefined ? { retryCheckpointId: result.retryCheckpointId } : {}),
+        ...(result.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: result.targetAdvanceCheckpointId } : {}),
         lastRecovery: {
           mode: "terminal",
           reconciledAt: now,
@@ -1289,6 +1312,8 @@ export class OrchestrationController {
         ...rest,
         status: durableStatus(result.status),
         ...(result.error !== undefined ? { error: errorMessage(result.error) } : {}),
+        ...(result.retryCheckpointId !== undefined ? { retryCheckpointId: result.retryCheckpointId } : {}),
+        ...(result.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: result.targetAdvanceCheckpointId } : {}),
         lastRecovery: {
           mode: "terminal",
           reconciledAt: now,
@@ -1802,6 +1827,10 @@ function scheduleResultFromAttempt(
           : {}),
         ...(error !== undefined ? { error } : {}),
       };
+    case "target_recovery":
+      return { status: "target_recovery", ...(error !== undefined ? { error } : {}) };
+    case "retry_wait":
+      return { status: "retry_wait", ...(error !== undefined ? { error } : {}) };
     case "interrupted":
       return { status: "failed", error: error ?? "worker attempt was interrupted" };
     case "launching":
@@ -1836,7 +1865,7 @@ function requiredNode(record: OrchestrationRecord, nodeId: string): Orchestratio
 }
 
 function isDurablyTerminalNode(node: OrchestrationNodeRecord): boolean {
-  return node.status !== "queued" && node.status !== "running" && node.activeAttemptId === undefined;
+  return node.status !== "queued" && node.status !== "running" && node.status !== "retry_wait" && node.activeAttemptId === undefined;
 }
 
 function clearNodeForRetry(node: OrchestrationNodeRecord): OrchestrationNodeRecord {

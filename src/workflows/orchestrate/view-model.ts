@@ -159,6 +159,7 @@ export function renderWaitReason(reason: WaitReason | { kind?: unknown; [key: st
       const typed = reason as WaitReason & { kind: "suspended-predecessor" };
       return `suspended predecessor ${typed.predecessor} at ${typed.checkpoint}`;
     }
+    case "retry": return `retry:${reason.code}@${reason.nextAttemptAt}`;
     case "decomposition-replan": return `decomposition replan ${(reason as WaitReason & { kind: "decomposition-replan" }).children.map((issue) => `#${issue}`).join(",")}`;
     default: return `unknown wait reason ${safeInline(String(reason.kind ?? "unknown"))}`;
   }
@@ -198,6 +199,7 @@ function buildSerializationChains(edges: readonly OrchestrationSerializationEdge
   for (const edge of edges) {
     appendAdjacency(incoming, edge.successor, edge);
     appendAdjacency(outgoing, edge.predecessor, edge);
+
   }
   const visited = new Set<OrchestrationSerializationEdge>();
   const chains: OrchestrationSerializationChain[] = [];
@@ -298,6 +300,8 @@ function statusGlyph(status: ScheduledStatus): string {
     case "invalid": return "!";
     case "skipped": return "↷";
     case "suspended": return "Ⅱ";
+    case "target_recovery": return "↺";
+    case "retry_wait": return "…";
     default: return "·";
   }
 }

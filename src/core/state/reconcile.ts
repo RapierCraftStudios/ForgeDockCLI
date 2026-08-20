@@ -8,6 +8,8 @@ export interface ReconciledSemanticState {
   warnings: string[];
   artifactIds: string[];
   remediationCheckpoint?: DurableArtifact<"RemediationBlocked">;
+  targetAdvanceCheckpoint?: DurableArtifact<"TargetAdvanceCheckpoint">;
+  retryCheckpoint?: DurableArtifact<"RetryCheckpoint">;
 }
 
 export interface ReconciledSubjectState extends ReconciledSemanticState {
@@ -39,6 +41,8 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const latestOutcome = latest.get("Outcome") as DurableArtifact<"Outcome"> | undefined;
   const verdict = latest.get("ReviewVerdict") as DurableArtifact<"ReviewVerdict"> | undefined;
   const remediationCheckpoint = latest.get("RemediationBlocked") as DurableArtifact<"RemediationBlocked"> | undefined;
+  const targetAdvanceCheckpoint = latest.get("TargetAdvanceCheckpoint") as DurableArtifact<"TargetAdvanceCheckpoint"> | undefined;
+  const retryCheckpoint = latest.get("RetryCheckpoint") as DurableArtifact<"RetryCheckpoint"> | undefined;
   const build = latest.get("BuildResult") as DurableArtifact<"BuildResult"> | undefined;
   const packet = latest.get("BuildPacket") as DurableArtifact<"BuildPacket"> | undefined;
   const investigation = latest.get("Investigation") as DurableArtifact<"Investigation"> | undefined;
@@ -73,8 +77,24 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     : undefined;
   const outcome = recoverableTerminalOutcome ?? latestOutcome;
   const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
-  const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
+  const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
+  const targetAdvanceCheckpointIndex = lastArtifactIndex(ordered, "TargetAdvanceCheckpoint");
+  const retryCheckpointIndex = lastArtifactIndex(ordered, "RetryCheckpoint");
+  const nonterminalCheckpoint = retryCheckpointIndex > targetAdvanceCheckpointIndex ? retryCheckpoint : targetAdvanceCheckpoint;
+  const nonterminalCheckpointIndex = Math.max(retryCheckpointIndex, targetAdvanceCheckpointIndex);
+  let state: RunStateName = "queued";
+  const checkpointIsLatest = (remediationCheckpoint !== undefined
+    && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex))
+    || (nonterminalCheckpoint !== undefined
+      && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex));
+  if (nonterminalCheckpoint && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex)) {
+    state = nonterminalCheckpoint.kind === "RetryCheckpoint" ? "retry_wait" : "target_recovery";
+  } else if (remediationCheckpoint !== undefined && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex)) {
+    state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
+    if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");
+  }
+
   // A verified build published after a review verdict is a new review head.
   // The older verdict must not make the run look terminally blocked while the
   // publication/review path is still recoverable. Admission already uses this
@@ -84,13 +104,6 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     && build !== undefined
     && buildIndex > lastArtifactIndex(ordered, "ReviewVerdict");
 
-  let state: RunStateName = "queued";
-  const checkpointIsLatest = remediationCheckpoint !== undefined
-    && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex);
-  if (checkpointIsLatest) {
-    state = remediationCheckpoint.payload.status === "ready-to-resume" ? "reviewing" : "blocked";
-    if (remediationCheckpoint.payload.status === "terminal") warnings.push("Remediation checkpoint is terminal and requires human action");
-  }
   const interruptedOutcomeSuperseded = (outcome?.payload.status === "blocked" || outcome?.payload.status === "failed")
     && build !== undefined
     && buildIndex > outcomeIndex;
@@ -134,6 +147,8 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     warnings,
     artifactIds: ordered.map((artifact) => artifact.id),
     ...(remediationCheckpoint ? { remediationCheckpoint } : {}),
+    ...(targetAdvanceCheckpoint ? { targetAdvanceCheckpoint } : {}),
+    ...(retryCheckpoint ? { retryCheckpoint } : {}),
   };
 }
 

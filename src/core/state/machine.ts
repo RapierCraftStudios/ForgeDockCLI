@@ -10,6 +10,8 @@ export type RunStateName =
   | "building"
   | "verifying"
   | "publishing"
+  | "target_recovery"
+  | "retry_wait"
   | "reviewing"
   | "remediating"
   | "merging"
@@ -42,6 +44,16 @@ export type TransitionEvent =
   | "RESUME_COMPLETION"
   | "RESUME_CONFLICT_RECOVERY"
   | "RESUME_PUBLICATION"
+  | "TARGET_ADVANCE_DETECTED"
+  | "TARGET_RECOVERY_REQUESTED"
+  | "RESUME_TARGET_ADVANCE"
+  | "TARGET_RECOVERY_RESUMED"
+  | "TARGET_ADVANCE_COMPLETED"
+  | "RETRY_WAIT_STARTED"
+  | "RETRY_WAIT_SCHEDULED"
+  | "RESUME_RETRY_WAIT"
+  | "RETRY_WAIT_EXPIRED"
+  | "RETRY_DUE"
   | "RECOVER_REVISION_PUBLICATION"
   | "PR_PUBLISHED"
   | "REVIEW_APPROVED"
@@ -123,7 +135,15 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     FAIL: "failed",
     CANCEL: "cancelled",
   },
-  publishing: { RESUME_PUBLICATION: "publishing", PR_PUBLISHED: "reviewing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  publishing: { RESUME_PUBLICATION: "publishing", TARGET_ADVANCE_DETECTED: "target_recovery", TARGET_RECOVERY_REQUESTED: "target_recovery", PR_PUBLISHED: "reviewing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  target_recovery: {
+    RESUME_TARGET_ADVANCE: "target_recovery", TARGET_RECOVERY_RESUMED: "target_recovery", TARGET_ADVANCE_COMPLETED: "publishing",
+    RETRY_WAIT_STARTED: "retry_wait", RETRY_WAIT_SCHEDULED: "retry_wait", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled",
+  },
+  retry_wait: {
+    RESUME_RETRY_WAIT: "retry_wait", RETRY_WAIT_EXPIRED: "target_recovery", RETRY_DUE: "target_recovery",
+    BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled",
+  },
   reviewing: {
     REVIEW_APPROVED: "merging",
     REVIEW_CHANGES_REQUESTED: "remediating",
@@ -133,7 +153,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     CANCEL: "cancelled",
   },
   remediating: { RESUME_REMEDIATION: "remediating", REMEDIATION_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
-  merging: { RESUME_COMPLETION: "merging", MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  merging: { RESUME_COMPLETION: "merging", TARGET_ADVANCE_DETECTED: "target_recovery", MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   closing: { CLOSE_COMPLETED: "completed", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   completed: {},
   invalid: {},
@@ -216,7 +236,7 @@ export function transition(
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
-  if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
+if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RESUME_TARGET_ADVANCE" || event === "TARGET_RECOVERY_RESUMED" || event === "RESUME_RETRY_WAIT" || event === "RETRY_DUE" || event === "RETRY_WAIT_EXPIRED" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

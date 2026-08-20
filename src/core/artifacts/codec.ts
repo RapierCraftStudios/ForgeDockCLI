@@ -11,6 +11,9 @@ import {
   type FindingRootLedgerPayload,
   type OutcomePayload,
   type RemediationBlockedPayload,
+  type RelationGraphCheckpointPayload,
+  type TargetAdvanceCheckpointPayload,
+  type RetryCheckpointPayload,
   type ReviewFindingProjectionPayload,
   type VerificationAdjudicationPayload,
   type VerificationCheckpointPayload,
@@ -198,6 +201,28 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
         listSection("Approved paths", payload.approvedPaths.map(code)),
         listSection("Child outcomes", payload.childOutcomeIds.map(code)),
       ].filter(Boolean).join("\n\n");
+    }
+    case "RelationGraphCheckpoint": {
+      const payload = artifact.payload as RelationGraphCheckpointPayload;
+      return [heading, meta, "", `**Checkpoint:** \`${payload.checkpoint}\` · **Version:** \`${payload.version}\` · **Base:** \`${payload.baseSha}\``,
+        `**Graph:** \`${payload.graphDigest}\` · nodes ${payload.nodes.length} · edges ${payload.edges.length}`,
+        `**Adapters:** ${payload.adapterIds.map(code).join(", ")}`, listSection("Writable paths", payload.writablePaths.map(code)),
+      ].filter(Boolean).join("\n\n");
+    }
+    case "TargetAdvanceCheckpoint": {
+      const payload = artifact.payload as TargetAdvanceCheckpointPayload;
+      return [heading, meta, "", `**Checkpoint:** \`${payload.checkpoint}\` · **Phase:** \`${payload.phase}\``,
+        `**Target:** \`${payload.repository}\` → \`${payload.targetBranch}\` · **Observed:** \`${payload.observedTargetSha}\``,
+        `**Attempt:** ${payload.attempt.number}/${payload.attempt.max} · **Workspace:** \`${payload.workspace.path}\``,
+        listSection("Expected paths", payload.expectedPaths.map(code)),
+      ].filter(Boolean).join("\n\n");
+    }
+    case "RetryCheckpoint": {
+      const payload = artifact.payload as RetryCheckpointPayload;
+      return [heading, meta, "", `**Checkpoint:** \`${payload.checkpoint}\` · **Status:** \`${payload.status}\` · **Domain:** \`${payload.domain}\``,
+        `**Operation:** \`${payload.operationKey}\` · **Next attempt:** \`${payload.attempt.nextAt}\` · ${payload.attempt.number}/${payload.attempt.max}`,
+        `**Cause:** ${payload.cause.class} — ${payload.cause.message}`,
+      ].join("\n\n");
     }
     case "Outcome": {
       const payload = artifact.payload as OutcomePayload;

@@ -732,6 +732,104 @@ export const FindingRootLedgerPayloadSchema = Type.Object({
   supersedes: Type.Optional(NonEmptyString),
 });
 
+const Digest = Type.String({ pattern: "^[0-9a-fA-F]{64}$" });
+const BoundedString = Type.String({ minLength: 1, maxLength: 4096 });
+
+/** Durable authority for a bounded, adapter-produced relation graph. */
+export const RelationGraphCheckpointPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("relation-graph"),
+  version: Type.Literal("forgedock.relation-graph/v1"),
+  baseSha: Sha,
+  graphDigest: Digest,
+  configDigest: Digest,
+  closureDigest: Digest,
+  commandPlanDigest: Digest,
+  evidenceContractDigest: Digest,
+  adapterIds: Type.Array(BoundedString, { minItems: 1, maxItems: 32 }),
+  seeds: Type.Array(Type.Object({
+    path: BoundedString,
+    provenance: Type.Union([Type.Literal("issue"), Type.Literal("controller"), Type.Literal("config")]),
+    contentDigest: Type.Optional(Digest),
+  }), { maxItems: 4096 }),
+  nodes: Type.Array(Type.Object({
+    id: BoundedString,
+    kind: Type.Union([
+      Type.Literal("file"), Type.Literal("symbol"), Type.Literal("interface"), Type.Literal("config"),
+      Type.Literal("generated"), Type.Literal("test"), Type.Literal("invariant"), Type.Literal("command"),
+    ]),
+    identity: BoundedString,
+    digest: Type.Optional(Digest),
+  }), { maxItems: 100_000 }),
+  edges: Type.Array(Type.Object({
+    id: BoundedString,
+    sourceId: BoundedString,
+    targetId: BoundedString,
+    kind: Type.Union([
+      Type.Literal("import"), Type.Literal("call"), Type.Literal("implements"), Type.Literal("reads-config"),
+      Type.Literal("generated-by"), Type.Literal("serializes"), Type.Literal("deserializes"), Type.Literal("test-covers"),
+      Type.Literal("asserts"), Type.Literal("invariant"), Type.Literal("command-target"),
+    ]),
+    adapterId: BoundedString,
+    provenance: Type.Union([Type.Literal("controller"), Type.Literal("repository"), Type.Literal("config")]),
+    sourcePath: Type.Optional(BoundedString),
+    targetPath: Type.Optional(BoundedString),
+    evidenceDigest: Digest,
+  }), { maxItems: 200_000 }),
+  writablePaths: Type.Array(BoundedString, { maxItems: 4096 }),
+  evidencePaths: Type.Array(BoundedString, { maxItems: 4096 }),
+  invariantIds: Type.Array(BoundedString, { maxItems: 4096 }),
+  commandIds: Type.Array(BoundedString, { maxItems: 4096 }),
+  limits: Type.Object({
+    maxNodes: Type.Integer({ minimum: 1 }), maxEdges: Type.Integer({ minimum: 1 }),
+    maxDepth: Type.Integer({ minimum: 1 }), maxFiles: Type.Integer({ minimum: 1 }),
+    maxBytes: Type.Integer({ minimum: 1 }), maxCollateralPaths: Type.Integer({ minimum: 0 }),
+  }),
+  createdAt: IsoDateTime,
+});
+
+/** Durable authority for a target integration/advance attempt. */
+export const TargetAdvanceCheckpointPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("target-advance"),
+  version: Type.Literal("forgedock.target-advance/v1"),
+  repository: BoundedString,
+  targetBranch: BoundedString,
+  routeClaimKey: BoundedString,
+  claimId: Type.Optional(BoundedString),
+  packetArtifactId: BoundedString,
+  sourceBuildResultId: BoundedString,
+  sourceVerdictId: Type.Optional(BoundedString),
+  sourceBaseSha: Sha,
+  sourceHeadSha: Sha,
+  observedTargetSha: Sha,
+  phase: Type.Union([Type.Literal("target-read"), Type.Literal("integrated"), Type.Literal("verified"), Type.Literal("fenced"), Type.Literal("pushed"), Type.Literal("reviewed")]),
+  expectedPaths: Type.Array(BoundedString, { maxItems: 4096 }),
+  verifiedContentDigest: Digest,
+  verificationPlanId: BoundedString,
+  attempt: Type.Object({ number: Type.Integer({ minimum: 1 }), max: Type.Integer({ minimum: 1 }) }),
+  workspace: Type.Object({ path: BoundedString, branch: BoundedString, baseRef: BoundedString }),
+  integrationHeadSha: Type.Optional(Sha), mergeHeadSha: Type.Optional(Sha),
+  freshVerificationCheckpointId: Type.Optional(BoundedString), freshBuildResultId: Type.Optional(BoundedString),
+  pullRequest: Type.Optional(Type.Integer({ minimum: 1 })), pushedHeadSha: Type.Optional(Sha),
+  createdAt: IsoDateTime, updatedAt: IsoDateTime,
+});
+
+/** Durable, nonterminal retry intent. It never authorizes dispatch by itself. */
+export const RetryCheckpointPayloadSchema = Type.Object({
+  checkpoint: Type.Literal("retry"),
+  version: Type.Literal("forgedock.retry/v1"),
+  domain: Type.Union([Type.Literal("github"), Type.Literal("provider"), Type.Literal("workflow"), Type.Literal("lease"), Type.Literal("transport")]),
+  code: BoundedString, phase: BoundedString, operationKey: BoundedString, semanticKey: BoundedString,
+  nodeId: Type.Optional(BoundedString), attemptId: Type.Optional(BoundedString), sessionRef: Type.Optional(BoundedString),
+  artifactIds: Type.Array(BoundedString, { maxItems: 4096 }),
+  attempt: Type.Object({ number: Type.Integer({ minimum: 1 }), max: Type.Integer({ minimum: 1 }), firstAt: IsoDateTime, nextAt: IsoDateTime, deadlineAt: Type.Optional(IsoDateTime) }),
+  retryAfterMs: Type.Optional(Type.Integer({ minimum: 0 })),
+  reconciliation: Type.Union([Type.Literal("pending"), Type.Literal("proven-absent"), Type.Literal("proven-present"), Type.Literal("completed")]),
+  status: Type.Union([Type.Literal("waiting"), Type.Literal("due"), Type.Literal("cancelled"), Type.Literal("exhausted")]),
+  cause: Type.Object({ class: BoundedString, status: Type.Optional(Type.Integer({ minimum: 100, maximum: 599 })), message: Type.String({ minLength: 1, maxLength: 4096 }) }),
+  createdAt: IsoDateTime, updatedAt: IsoDateTime,
+});
+
+
 export const ArtifactPayloadSchemas = {
   Intent: IntentPayloadSchema,
   Investigation: InvestigationPayloadSchema,
@@ -744,6 +842,9 @@ export const ArtifactPayloadSchemas = {
   Outcome: OutcomePayloadSchema,
   VerificationAdjudication: VerificationAdjudicationPayloadSchema,
   RemediationBlocked: RemediationBlockedPayloadSchema,
+  RelationGraphCheckpoint: RelationGraphCheckpointPayloadSchema,
+  TargetAdvanceCheckpoint: TargetAdvanceCheckpointPayloadSchema,
+  RetryCheckpoint: RetryCheckpointPayloadSchema,
 } as const satisfies Record<string, TSchema>;
 
 export type ArtifactKind = keyof typeof ArtifactPayloadSchemas;
@@ -766,6 +867,9 @@ export type FindingRootLedgerPayload = ArtifactPayloadByKind["FindingRootLedger"
 export type OutcomePayload = ArtifactPayloadByKind["Outcome"];
 export type VerificationAdjudicationPayload = ArtifactPayloadByKind["VerificationAdjudication"];
 export type RemediationBlockedPayload = ArtifactPayloadByKind["RemediationBlocked"];
+export type RelationGraphCheckpointPayload = ArtifactPayloadByKind["RelationGraphCheckpoint"];
+export type TargetAdvanceCheckpointPayload = ArtifactPayloadByKind["TargetAdvanceCheckpoint"];
+export type RetryCheckpointPayload = ArtifactPayloadByKind["RetryCheckpoint"];
 
 export type DurableArtifact<K extends ArtifactKind = ArtifactKind> = K extends ArtifactKind ? {
   schema: "forgedock.artifact/v2";

@@ -3,7 +3,7 @@
 import type { RemediationBlockedPayload } from "../../core/artifacts/schema.js";
 import type { ScheduleEvent, ScheduledStatus, WaitReason } from "./scheduler.js";
 
-export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed" | "snapshot";
+export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "invalid" | "resumed" | "snapshot";
 
 export interface OrchestrationRoute {
   repository?: string;

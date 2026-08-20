@@ -15,6 +15,20 @@ export function terminalOrchestrationResult(
   artifacts: readonly DurableArtifact[],
   reconciled: ReconciledSubjectState,
 ): Exclude<ScheduleWorkerResult, void> | undefined {
+  if (reconciled.state === "target_recovery") {
+    return { status: "target_recovery", error: "durable TargetAdvanceCheckpoint retained; target execution is not implemented" };
+  }
+  if (reconciled.state === "retry_wait") {
+    const retry = reconciled.retryCheckpoint;
+    return {
+      status: "retry_wait",
+      error: retry ? `${retry.payload.domain}/${retry.payload.code} retry due at ${retry.payload.attempt.nextAt}` : "durable RetryCheckpoint retained",
+      ...(retry?.id !== undefined ? { retryCheckpointId: retry.id } : {}),
+      ...(retry?.payload.attempt.nextAt !== undefined ? { nextAttemptAt: retry.payload.attempt.nextAt } : {}),
+      ...(retry?.payload.attempt.number !== undefined ? { attempt: retry.payload.attempt.number } : {}),
+      ...(retry?.payload.attempt.max !== undefined ? { maxAttempts: retry.payload.attempt.max } : {}),
+    };
+  }
   if (reconciled.state !== "blocked" && reconciled.state !== "failed") return undefined;
 
   const outcome = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"Outcome"> =>

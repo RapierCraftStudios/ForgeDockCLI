@@ -29,10 +29,17 @@ export interface ScheduledWorkItem {
   plan?: OrchestrationPlanMetadata;
 }
 
-export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid";
+export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "invalid";
 export type ScheduleWorkerResult = void | {
-  status: "completed" | "skipped" | "blocked" | "suspended" | "failed" | "invalid";
+  status: "completed" | "skipped" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "failed" | "invalid";
   error?: Error | string;
+  retryable?: boolean;
+  retryCheckpointId?: string;
+  targetAdvanceCheckpointId?: string;
+  retryAfterMs?: number;
+  nextAttemptAt?: string;
+  attempt?: number;
+  maxAttempts?: number;
   /** Authoritative replacement issue numbers returned by a decomposition outcome. */
   childIssues?: readonly number[];
 };
@@ -49,7 +56,7 @@ export interface ScheduleResult {
   observedCapacity?: number;
 }
 export interface ScheduleEvent {
-  type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "invalid" | "resumed";
+  type: "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "invalid" | "resumed";
   itemId?: string;
   status: ReadonlyMap<string, ScheduledStatus>;
   errors: ReadonlyMap<string, Error>;
@@ -483,7 +490,23 @@ export async function runSchedule(
       const promise = worker(item, context)
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
-          if (outcome.status === "failed" && isLeaseContinuityFailure(outcome.error)) {
+          if (outcome.status === "target_recovery") {
+            status.set(item.id, "target_recovery");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            emit("target_recovery", item.id);
+          } else if (outcome.status === "retry_wait") {
+            status.set(item.id, "retry_wait");
+            if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            waitReasons.set(item.id, {
+              kind: "retry",
+              domain: "workflow",
+              code: outcome.retryable === false ? "retry-not-authorized" : "retryable",
+              nextAttemptAt: outcome.nextAttemptAt ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString(),
+              attempt: outcome.attempt ?? 1,
+              maxAttempts: outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER,
+            });
+            emit("retry_wait", item.id);
+          } else if (outcome.status === "failed" && isLeaseContinuityFailure(outcome.error)) {
             // Continuity loss is a suspension, not an ordinary worker failure:
             // dependents stay queued until the controller explicitly re-enrolls
             // and resumes the retained DAG.

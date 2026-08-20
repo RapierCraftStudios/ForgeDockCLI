@@ -7,7 +7,7 @@ import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
   | { action: "start" }
-  | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
+  | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "target_recovery" | "retry_wait" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "target-advance" | "retry" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
@@ -187,6 +187,23 @@ export function decideSubjectAdmission(
   const latestVerdictIndex = lastArtifactIndex(latest.artifacts, "ReviewVerdict");
   const latestOutcomeIndex = lastArtifactIndex(latest.artifacts, "Outcome");
   const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
+  const latestTargetAdvance = latestArtifactOfKind(latest.artifacts, "TargetAdvanceCheckpoint");
+  const latestTargetAdvanceIndex = lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
+  const latestRetry = latestArtifactOfKind(latest.artifacts, "RetryCheckpoint");
+  const latestRetryIndex = lastArtifactIndex(latest.artifacts, "RetryCheckpoint");
+  const latestNonterminalCheckpoint = latestRetryIndex > latestTargetAdvanceIndex ? latestRetry : latestTargetAdvance;
+  const latestNonterminalCheckpointIndex = Math.max(latestRetryIndex, latestTargetAdvanceIndex);
+  if (latestNonterminalCheckpoint && latestNonterminalCheckpointIndex > latestOutcomeIndex
+    && latestNonterminalCheckpointIndex > latestBuildIndex) {
+    if (latestNonterminalCheckpoint.kind === "RetryCheckpoint"
+      && (latestNonterminalCheckpoint.payload.status === "waiting" || latestNonterminalCheckpoint.payload.status === "due")) {
+      return { action: "resume", runId: latest.runId, state: "retry_wait", checkpoint: "retry", artifacts: latest.artifacts };
+    }
+    if (latestNonterminalCheckpoint.kind === "TargetAdvanceCheckpoint") {
+      return { action: "resume", runId: latest.runId, state: "target_recovery", checkpoint: "target-advance", artifacts: latest.artifacts };
+    }
+  }
+
   const latestVerificationAdjudication = latestArtifactOfKind(latest.artifacts, "VerificationAdjudication");
   const latestVerificationAdjudicationIndex = lastArtifactIndex(latest.artifacts, "VerificationAdjudication");
 

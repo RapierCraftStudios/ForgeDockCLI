@@ -8,6 +8,8 @@ export type DurableOrchestrationNodeStatus =
   | "failed"
   | "blocked"
   | "suspended"
+  | "target_recovery"
+  | "retry_wait"
   | "invalid";
 
 export type OrchestrationWaitReason =
@@ -16,6 +18,7 @@ export type OrchestrationWaitReason =
   | { kind: "active-claim-conflict"; node: string; claims: string[] }
   | { kind: "capacity"; maxParallel: number }
   | { kind: "suspended-predecessor"; predecessor: string; checkpoint: string }
+  | { kind: "retry"; domain: string; code: string; nextAttemptAt: string; attempt: number; maxAttempts: number }
   | { kind: "decomposition-replan"; children: number[] };
 
 /** JSON-safe, caller-defined evidence frozen with an orchestration plan. */
@@ -39,6 +42,8 @@ export type OrchestrationWorkerAttemptStatus =
   | "failed"
   | "blocked"
   | "suspended"
+  | "target_recovery"
+  | "retry_wait"
   | "invalid"
   | "interrupted";
 
@@ -66,6 +71,10 @@ export interface OrchestrationWorkerAttemptRecord {
   /** Authoritative replacement scope persisted with a terminal skipped attempt. */
   decompositionChildren?: number[];
   error?: string;
+  retryCheckpointId?: string;
+  targetAdvanceCheckpointId?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
 }
 
 export interface OrchestrationRecoveryRecord {
@@ -152,6 +161,10 @@ export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
   /** Optional for records created before structured worker recovery existed. */
   attempts?: OrchestrationWorkerAttemptRecord[];
   activeAttemptId?: string;
+  retryCheckpointId?: string;
+  targetAdvanceCheckpointId?: string;
+  retryable?: boolean;
+  retryAfterMs?: number;
   lastRecovery?: OrchestrationRecoveryRecord;
 }
 
