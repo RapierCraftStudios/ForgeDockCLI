@@ -1471,7 +1471,14 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         }, "evidence")];
       },
       closePullRequest: (repo, number, reason) => github.closePullRequest(repo, number, reason),
-      readRef: (repo, ref) => github.getBranchHead?.(repo, ref.replace(/^refs\/heads\//, "")),
+      readRef: async (repo, ref) => {
+        try {
+          return await github.getBranchHead?.(repo, ref.replace(/^refs\/heads\//, ""));
+        } catch (error) {
+          if (/HTTP 404|not found|Reference does not exist/i.test(error instanceof Error ? error.message : String(error))) return undefined;
+          throw error;
+        }
+      },
       deleteExactRef: (repo, ref, sha) => github.deleteExactRemoteRef(repo, ref, sha),
     },
     state: {

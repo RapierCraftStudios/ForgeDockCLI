@@ -3,7 +3,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -549,7 +549,25 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
 
   async archiveDirtyManaged(worktree: { path: string; branch: string; headSha: string }): Promise<{ path: string; sha256: string; kind: "dirty-diff" } | undefined> {
     const path = resolve(worktree.path);
-    if (!existsSync(path)) return undefined;
+    const archiveDirectory = join(process.cwd(), ".forgedock", "reset-archives");
+    if (!existsSync(path)) {
+      if (!existsSync(archiveDirectory)) return undefined;
+      const prefix = `${basename(path)}-`;
+      const candidates = (await readdir(archiveDirectory)).filter((name) => name.startsWith(prefix) && name.endsWith(".json")).sort().reverse();
+      for (const name of candidates) {
+        const archivePath = join(archiveDirectory, name);
+        const content = await readFile(archivePath, "utf8");
+        try {
+          const parsed = JSON.parse(content) as { schema?: string; worktree?: string; branch?: string; headSha?: string };
+          if (parsed.schema !== "forgedock.dirty-worktree-archive/v1"
+            || resolve(parsed.worktree ?? "") !== path
+            || parsed.branch !== worktree.branch
+            || parsed.headSha?.toLowerCase() !== worktree.headSha.toLowerCase()) continue;
+          return { path: archivePath, sha256: createHash("sha256").update(content, "utf8").digest("hex"), kind: "dirty-diff" };
+        } catch { /* Ignore unrelated or damaged archive files. */ }
+      }
+      return undefined;
+    }
     const trackedPatch = await this.git(["diff", "--binary", "HEAD", "--"], path);
     const untrackedOutput = await this.git(["ls-files", "--others", "--exclude-standard", "-z"], path);
     const untrackedPaths = untrackedOutput.split("\0").filter((entry) => entry && !isOperationalPath(entry)).sort();
