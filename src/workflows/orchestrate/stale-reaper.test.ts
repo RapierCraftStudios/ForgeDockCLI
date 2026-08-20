@@ -150,6 +150,43 @@ describe("stale orchestration reaper", () => {
     assert.equal(result.skippedUnstarted, 1);
   });
 
+  it("reaps aged queued legacy records without execution attempts but skips fresh ones", async () => {
+    const repository = new InMemoryOrchestrationRepository();
+    const leases = new InMemoryLeaseRepository();
+    const old = runningRecord("dag-legacy-old", 1, 10);
+    const fresh = { ...runningRecord("dag-legacy-fresh", 1, 11), updatedAt: "2026-01-01T00:01:59.500Z" };
+    const { executionAttempt: _oldAttempt, executionClaimId: _oldClaim, ...oldLegacyBase } = old;
+    const { activeAttemptId: _oldActive, ...oldLegacyNode } = old.nodes[0]!;
+    const oldLegacy: OrchestrationRecord = {
+      ...oldLegacyBase,
+      nodes: [{ ...oldLegacyNode, status: "queued", attempts: [] }],
+    };
+    const { executionAttempt: _freshAttempt, executionClaimId: _freshClaim, ...freshLegacyBase } = fresh;
+    const { activeAttemptId: _freshActive, ...freshLegacyNode } = fresh.nodes[0]!;
+    const freshLegacy: OrchestrationRecord = {
+      ...freshLegacyBase,
+      nodes: [{ ...freshLegacyNode, status: "queued", attempts: [] }],
+    };
+    await repository.createOrchestration(oldLegacy);
+    await repository.createOrchestration(freshLegacy);
+
+    const result = await reapStaleOrchestrations({
+      repository,
+      executionAdmission: admission(leases, "reaper", () => 1_000),
+      now: () => "2026-01-01T00:02:00.000Z",
+      staleAfterMs: 1_000,
+    });
+
+    const recovered = await repository.loadOrchestration("dag-legacy-old");
+    assert.equal(result.reaped.length, 1);
+    assert.equal(result.skippedUnstarted, 1);
+    assert.equal(recovered?.status, "failed");
+    assert.equal(recovered?.executionAttempt, 1);
+    assert.equal(recovered?.executionClaimId !== undefined, true);
+    assert.equal(recovered?.nodes[0]?.status, "queued");
+    assert.equal((await repository.loadOrchestration("dag-legacy-fresh"))?.status, "running");
+  });
+
   it("releases the winner after a persistence crash so the next status pass can retry", async () => {
     class FailOnceRepository extends InMemoryOrchestrationRepository {
       fail = true;

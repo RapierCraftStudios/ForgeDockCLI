@@ -220,7 +220,7 @@ function hasStartedExecution(record: OrchestrationRecord): boolean {
 }
 
 function isStaleUnstarted(record: OrchestrationRecord, now: string, staleAfterMs: number): boolean {
-  if (record.executionAttempt !== 0 || record.nodes.some((node) => node.status !== "queued" || (node.attempts?.length ?? 0) > 0)) return false;
+  if ((record.executionAttempt ?? 0) !== 0 || record.nodes.some((node) => node.status !== "queued" || (node.attempts?.length ?? 0) > 0)) return false;
   const updatedAt = Date.parse(record.updatedAt);
   const nowAt = Date.parse(now);
   return Number.isFinite(updatedAt) && Number.isFinite(nowAt) && nowAt - updatedAt >= staleAfterMs;
