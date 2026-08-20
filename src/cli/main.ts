@@ -44,7 +44,8 @@ import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
 import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
-import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
+import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
+import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
@@ -849,6 +850,31 @@ async function workOn(
       const intentArtifact = latestArtifactOfKind(runArtifacts, "Intent");
       const investigation = latestArtifactOfKind(runArtifacts, "Investigation");
       const packet = latestArtifactOfKind(runArtifacts, "BuildPacket");
+      if (admission.checkpoint === "target-advance") {
+        await orchestration?.promoteTargetRouteClaim?.();
+        const targetCheckpoint = latestArtifactOfKind(runArtifacts, "TargetAdvanceCheckpoint");
+        const targetBuild = latestArtifactOfKind(runArtifacts, "BuildResult");
+        if (!targetCheckpoint || !targetBuild || !packet || !investigation) {
+          throw new Error(`Run ${resumeRunId} lacks the packet, investigation, BuildResult, and target checkpoint required for target recovery`);
+        }
+        const targetPr = await github.findOpenPullRequest?.(subject.repo, targetBuild.payload.branch);
+        if (!targetPr || targetPr.headSha.toLowerCase() !== targetCheckpoint.payload.sourceHeadSha.toLowerCase()) {
+          throw new Error(`Run ${resumeRunId} has no authoritative open PR at the checkpoint head`);
+        }
+        const targetRun = await store.load(resumeRunId);
+        if (!targetRun || targetRun.state !== "target_recovery") throw new Error(`Run ${resumeRunId} is not durably admitted for target recovery`);
+        const targetGit = new GitWorktreeManager(process.cwd());
+        const targetWorkspace = await targetGit.recover({ runId: resumeRunId, issue: issue.number, baseRef: `origin/${deliveryTargetBranch}` });
+        const targetVerification = discoverVerificationCommands(process.cwd(), targetCheckpoint.payload.sourceBaseSha);
+        const recovered = await resumeTargetAdvanceWorkOn({
+          run: targetRun, checkpoint: targetCheckpoint, intent: intentArtifact!, investigation, packet,
+          buildResult: targetBuild, pullRequest: targetPr, workspace: targetWorkspace,
+          verification: targetVerification, signal: leaseController.signal,
+        }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, leaseGuard, onAgentEvent });
+        process.stdout.write(`${statusGlyph("active", mode)} Recovered target movement for ${resumeRunId} at ${recovered.buildResult.payload.headSha}; fresh review admission is required
+`);
+        return;
+      }
       if (!intentArtifact) {
         throw new Error(`Run ${resumeRunId} does not contain the durable Intent required for ${admission.checkpoint} resume`);
       }
@@ -2799,6 +2825,13 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             signal: workerSignal,
           });
         } catch (error) {
+          if (error instanceof TargetBranchAdvancedError && current.action === "resume" && current.checkpoint === "target-advance") {
+            const checkpoint = latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint");
+            const attempt = (checkpoint?.payload.attempt.number ?? 1) + 1;
+            const maxAttempts = checkpoint?.payload.attempt.max ?? 3;
+            if (attempt > maxAttempts) return { status: "failed", error: `Target branch moved ${maxAttempts} times; target recovery exhausted`, attempt, maxAttempts, retryDomain: "workflow", retryCode: "target-advance-exhausted" };
+            return { status: "retry_wait", error: error.message, attempt, maxAttempts, retryAfterMs: Math.min(30_000, 500 * 2 ** (attempt - 1)), retryDomain: "workflow", retryCode: "target-advanced" };
+          }
           if (workerSignal.aborted) {
             return { status: "suspended", error: "Orchestration worker lost liveness; worker aborted and dependents remain queued" };
           }

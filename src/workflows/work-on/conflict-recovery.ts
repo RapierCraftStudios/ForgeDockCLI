@@ -344,7 +344,7 @@ export async function recoverConflictingRevision(
   }
 }
 
-async function resolvePacketConflicts(input: {
+export async function resolvePacketConflicts(input: {
   input: ConflictRecoveryInput;
   workspace: GitWorkspace;
   conflictPaths: readonly string[];

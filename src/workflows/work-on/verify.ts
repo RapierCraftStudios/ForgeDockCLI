@@ -745,7 +745,7 @@ function looksLikeExecutableCandidate(candidate: string, fenced: boolean): boole
   return !/^(?:(?:Dockerfile|Makefile|README|LICENSE|CHANGELOG|SECURITY)(?:\.[^\s]+)?|[^\s]+\.(?:[cm]?[jt]sx?|json|ya?ml|md|mdx|toml|rs|go|py|java|cs|cpp|h))(?::\d+)?$/i.test(candidate);
 }
 
-async function deliveryContentDigest(workspacePath: string, paths: readonly string[]): Promise<string> {
+export async function deliveryContentDigest(workspacePath: string, paths: readonly string[]): Promise<string> {
   const root = resolve(workspacePath);
   const hash = createHash("sha256");
   for (const path of [...paths].sort()) {

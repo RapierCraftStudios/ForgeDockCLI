@@ -476,7 +476,11 @@ export class OrchestrationController {
       const node = await this.revalidateNodeRoute(state, storedNode);
       const item = itemFromNodeRecord(node);
       if (node.status === "target_recovery") {
-        actions.set(node.id, { kind: "terminal", result: { status: "target_recovery", error: node.error ?? "target advance checkpoint retained" } });
+        actions.set(node.id, {
+          kind: "launch",
+          recovery: "resume",
+          ...(activeAttempt(node)?.attemptId !== undefined ? { recoveryOfAttemptId: activeAttempt(node)!.attemptId } : {}),
+        });
         continue;
       }
       if (node.status === "retry_wait") {

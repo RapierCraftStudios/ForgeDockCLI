@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import { InMemoryRunRepository } from "../../core/ports/repositories.js";
+import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { RunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent, type TransitionRecord } from "../../core/state/machine.js";
 import { publishPullRequest, renderPullRequestHandoff } from "./publish.js";
@@ -89,6 +89,23 @@ describe("PR publication", () => {
     assert.match(host.input?.body ?? "", /Build Packet/);
     assert.match(host.input?.body ?? "", /Build Result/);
   });
+
+  it("retains a typed target checkpoint instead of terminally blocking on movement", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await publishingRun(runs);
+    const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, targetBranch: "main", baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [{ criterion: "Pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [] } });
+    await artifacts.append(packet); await artifacts.append(buildResult);
+    const host = new PublishHost(); host.branchHead = "e".repeat(40);
+    await assert.rejects(() => publishPullRequest({ run, intent, packet, buildResult, workspace }, { git: new PublishGit(), host, runs, artifacts }), /advanced before publication/);
+    assert.equal((await runs.load(run.runId))?.state, "target_recovery");
+    const checkpoint = (await artifacts.list(run.subject, "TargetAdvanceCheckpoint")).at(-1);
+    assert.equal(checkpoint?.kind, "TargetAdvanceCheckpoint");
+    assert.equal(checkpoint?.payload.observedTargetSha, "e".repeat(40));
+  });
+
 
   it("refuses to push when the retained workspace no longer matches the verified SHA", async () => {
     const runs = new InMemoryRunRepository();

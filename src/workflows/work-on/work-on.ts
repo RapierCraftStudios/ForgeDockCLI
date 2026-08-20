@@ -14,6 +14,7 @@ import {
 } from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
+import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { buildWorkItem, type BuilderSubmission } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
@@ -25,11 +26,12 @@ import {
 } from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
+import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
-import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, type VerificationResult } from "./verify.js";
-import { recoverConflictingRevision } from "./conflict-recovery.js";
+import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, deliveryContentDigest, type VerificationResult } from "./verify.js";
+import { recoverConflictingRevision, resolvePacketConflicts } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { makePullRequestCiGreen } from "../review-pr/fix-ci.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
@@ -37,6 +39,7 @@ import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, runTargetForLane, type IssueLane, type ParentRemediationTarget } from "./lane.js";
+import { persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 
 export { repositoryPathFromLocation } from "../review-pr/scope.js";
 
@@ -64,9 +67,153 @@ export interface WorkOnResult {
   awaitingHuman?: boolean;
 }
 
+export interface TargetAdvanceResumeInput {
+  run: RunState;
+  checkpoint: DurableArtifact<"TargetAdvanceCheckpoint">;
+  intent: DurableArtifact<"Intent">;
+  investigation: DurableArtifact<"Investigation">;
+  packet: DurableArtifact<"BuildPacket">;
+  buildResult: DurableArtifact<"BuildResult">;
+  pullRequest: PullRequestSnapshot;
+  workspace: GitWorkspace;
+  verification: readonly Omit<VerificationCommand, "cwd">[];
+  /** Admission evidence only; it is never passed to a fresh review. */
+  priorVerdict?: DurableArtifact<"ReviewVerdict">;
+  signal?: AbortSignal;
+}
+
 type VerificationCatalogResolver = (
   baseSha: string,
 ) => readonly Omit<VerificationCommand, "cwd">[] | Promise<readonly Omit<VerificationCommand, "cwd">[]>;
+
+/** from the exact retained worktree. Every
+ * target-sensitive operation is fenced by the caller's lease and route claim;
+ * this function never reuses the old approval as a verdict for the new head.
+ */
+export async function resumeTargetAdvanceWorkOn(
+  input: TargetAdvanceResumeInput,
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult & { buildResult: DurableArtifact<"BuildResult"> }> {
+  dependencies = guardMutationBoundaries(dependencies);
+  if (input.run.state !== "target_recovery" && input.run.state !== "retry_wait") {
+    throw new Error(`Target recovery requires target_recovery or retry_wait state, found ${input.run.state}`);
+  }
+  const checkpoint = input.checkpoint.payload;
+  if (checkpoint.repository.toLowerCase() !== input.run.subject.repo.toLowerCase()
+    || checkpoint.targetBranch !== input.pullRequest.baseBranch
+    || checkpoint.sourceBuildResultId !== input.buildResult.id
+    || checkpoint.sourceHeadSha.toLowerCase() !== input.buildResult.payload.headSha.toLowerCase()
+    || input.pullRequest.headSha.toLowerCase() !== checkpoint.sourceHeadSha.toLowerCase()) {
+    throw new Error("Target recovery checkpoint, PR, and Build Result identity do not match");
+  }
+  if (!dependencies.host.getBranchHead || !dependencies.git.integrateRemoteBase) {
+    throw new Error("Target recovery requires authoritative branch reads and exact remote-base integration");
+  }
+  let run = input.run;
+  const resumed = transition(run, run.state === "retry_wait" ? "RETRY_DUE" : "RESUME_TARGET_ADVANCE", {
+    reason: `Recovering ${checkpoint.routeClaimKey} at source ${checkpoint.sourceHeadSha}`,
+  });
+  await dependencies.runs.commit(run.version, resumed.state, resumed.record);
+  run = resumed.state;
+  const targetSha = await dependencies.host.getBranchHead(input.pullRequest.repo, checkpoint.targetBranch);
+  if (!/^[0-9a-f]{7,64}$/i.test(targetSha)) throw new Error("Authoritative target read is not a Git SHA");
+  if (targetSha.toLowerCase() === checkpoint.sourceBaseSha.toLowerCase()) {
+    throw new Error(`Target ${checkpoint.targetBranch} has not advanced beyond ${checkpoint.sourceBaseSha}`);
+  }
+  const integrated = await dependencies.git.integrateRemoteBase(input.workspace, {
+    expectedHeadSha: checkpoint.sourceHeadSha,
+    expectedBaseSha: targetSha,
+  });
+  let workspace = integrated.workspace;
+  await persistTargetAdvanceCheckpoint({
+    run, packet: input.packet, buildResult: input.buildResult, workspace,
+    targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "integrated",
+    attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    artifacts: dependencies.artifacts,
+  });
+  const conflictPaths = canonicalizeConcreteScopePaths(integrated.conflictPaths).sort();
+  const expectedPaths = new Set(canonicalizeConcreteScopePaths(checkpoint.expectedPaths));
+  const outside = conflictPaths.filter((path) => !expectedPaths.has(path));
+  if (outside.length) throw new Error(`Target merge conflicts outside frozen packet: ${outside.join(", ")}`);
+  if (conflictPaths.length) {
+    if (!dependencies.git.unmergedPaths || !dependencies.git.stageConflictResolutions || !input.priorVerdict) {
+      throw new Error("Target conflict recovery cannot prove resolver admission or index completion");
+    }
+    const resolved = await resolvePacketConflicts({
+      input: {
+        run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+        buildResult: input.buildResult, verdict: input.priorVerdict, pullRequest: input.pullRequest,
+        workspace, commands: input.verification.map((command) => ({ ...command, cwd: workspace.path })),
+        mergeGate: { repo: input.pullRequest.repo, mergeability: "conflicting", mergeable: false, headSha: checkpoint.sourceHeadSha, baseBranch: checkpoint.targetBranch, pullRequest: input.pullRequest.number, requiredChecks: [], observedAt: new Date().toISOString() },
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      },
+      workspace,
+      conflictPaths,
+      dependencies: {
+        runtime: dependencies.runtime, artifacts: dependencies.artifacts, runs: dependencies.runs,
+        git: dependencies.git, verifier: dependencies.verifier, host: dependencies.host,
+        ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+      },
+    });
+    const reported = canonicalizeConcreteScopePaths(resolved.changedPaths).sort();
+    if (JSON.stringify(reported) !== JSON.stringify(conflictPaths)) throw new Error("Conflict resolver report does not exactly match unmerged paths");
+    await dependencies.git.stageConflictResolutions(workspace, conflictPaths);
+    const unresolved = canonicalizeConcreteScopePaths(await dependencies.git.unmergedPaths(workspace)).sort();
+    if (unresolved.length) throw new Error(`Unmerged paths remain after packet conflict resolution: ${unresolved.join(", ")}`);
+  }
+  if (!integrated.mergeCommitExists) await dependencies.git.commit(workspace, `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`);
+  workspace.baseSha = targetSha;
+  const newHead = await dependencies.git.head(workspace);
+  if (newHead.toLowerCase() === checkpoint.sourceHeadSha.toLowerCase()
+    || !await dependencies.git.isAncestor(workspace, checkpoint.sourceHeadSha, newHead)) {
+    throw new Error("Synchronized target recovery head is not a descendant of the reviewed head");
+  }
+  const changedPaths = canonicalizeConcreteScopePaths(await dependencies.git.revisionChangedPaths(workspace)).sort();
+  if (changedPaths.some((path) => !expectedPaths.has(path))) throw new Error("Synchronized revision broadened the frozen packet scope");
+  const commands = input.verification.map((command) => ({ ...command, cwd: workspace.path }));
+  const checks = await dependencies.verifier.run(commands, input.signal);
+  if (commands.some((command, index) => command.required && checks[index]?.status !== "passed")) throw new Error("Frozen verification plan failed after target recovery");
+  const postTarget = await dependencies.host.getBranchHead(input.pullRequest.repo, checkpoint.targetBranch);
+  if (postTarget.toLowerCase() !== targetSha.toLowerCase()) throw new TargetBranchAdvancedError(checkpoint.targetBranch, targetSha, postTarget);
+  const postHead = await dependencies.git.head(workspace);
+  if (postHead.toLowerCase() !== newHead.toLowerCase() || (await dependencies.git.changedPaths(workspace)).length) throw new Error("Retained workspace mutated during target recovery verification");
+  const freshContentDigest = await deliveryContentDigest(workspace.path, changedPaths);
+  const contentMatches = dependencies.git.committedContentMatches
+    ? await dependencies.git.committedContentMatches(workspace, changedPaths, freshContentDigest, newHead)
+    : true;
+  if (!contentMatches) throw new Error("Recovered committed content does not match the verified mutation digest");
+  const verificationCheckpoint = createArtifact({
+    kind: "VerificationCheckpoint", runId: run.runId, subject: run.subject, producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      checkpoint: "verified-commit", branch: workspace.branch, targetBranch: checkpoint.targetBranch, baseSha: targetSha,
+      parentHeadSha: checkpoint.sourceHeadSha, changedPaths, pendingChangedPaths: changedPaths,
+      verifiedContentDigest: freshContentDigest, commitMessage: `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`,
+      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: input.packet.payload.acceptanceCriteria.map((criterion) => ({ criterion, status: "passed" as const, evidence: `Verified against target ${targetSha}.` })),
+      checks, decisions: [`Target recovery rebased ${checkpoint.sourceHeadSha} onto ${targetSha}.`], residualRisks: [],
+    },
+  });
+  await dependencies.artifacts.append(verificationCheckpoint);
+  const freshBuildResult = createArtifact({
+    kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller", runtime: "forgedock" },
+    payload: { ...input.buildResult.payload, branch: workspace.branch, targetBranch: checkpoint.targetBranch, headSha: newHead, baseSha: targetSha, changedPaths, summary: `Fresh target-recovery build ${newHead}.`, checks },
+  });
+  await dependencies.artifacts.append(freshBuildResult);
+  run = attachArtifact(run, "VerificationCheckpoint", verificationCheckpoint.id);
+  run = attachArtifact(run, "BuildResult", freshBuildResult.id);
+  const publishing = transition(run, "TARGET_ADVANCE_COMPLETED", { headSha: newHead });
+  await dependencies.runs.commit(run.version, publishing.state, publishing.record);
+  const published = await publishRemediationRevision({ run: publishing.state, pullRequest: input.pullRequest, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
+    git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
+  });
+  const reviewed = await reviewPullRequest({
+    run: published.run, pullRequest: published.pullRequest, intent: input.intent,
+    investigation: input.investigation, packet: input.packet, buildResult: freshBuildResult,
+    workspace: workspace.path, findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
+  }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
+    ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+  return { run: reviewed.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
+}
+
 
 interface ScopeExpansionOptions {
   scopeExpansion?: "scope-locked" | "recursive";
