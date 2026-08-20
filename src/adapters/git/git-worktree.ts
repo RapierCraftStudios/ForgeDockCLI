@@ -541,7 +541,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       if (!selectedByIssue && !selectedByDag) continue;
       if (!(branchRef.startsWith("forgedock/") || branchRef.startsWith("review/"))) continue;
       const dirtyOutput = await this.git(["status", "--porcelain", "-z"], resolvedPath);
-      const dirty = dirtyOutput.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
+      const dirty = dirtyOutput.split("\0").filter(Boolean).map((entry) => entry.slice(3)).filter((entry) => !isOperationalPath(entry)).sort();
       records.push({ path: resolvedPath, branch: branchRef, headSha, dirty, managed: true });
     }
     return records;

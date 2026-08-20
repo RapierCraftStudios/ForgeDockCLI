@@ -387,12 +387,14 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
     // real GitHub captures always carry events for a restoration decision.
     if (state.events.length) {
       const currentLabels = new Set(current.current);
-      const expectedLabels = new Set(expected);
-      if ([...expectedLabels].some((label) => !currentLabels.has(label))) {
-        throw new Error(`Reset label ${phase}condition drift: #${issue}`);
-      }
-      const unexpectedManaged = [...currentLabels].some((label) => isResetManagedLabel(label) && !expectedLabels.has(label));
-      if (unexpectedManaged) throw new Error(`Reset label ${phase}condition drift: #${issue}`);
+      const matches = (expectedLabels: readonly string[]): boolean => {
+        const expectedSet = new Set(expectedLabels);
+        return expectedLabels.every((label) => currentLabels.has(label))
+          && ![...currentLabels].some((label) => isResetManagedLabel(label) && !expectedSet.has(label));
+      };
+      const matchesExpected = matches(expected);
+      const matchesCompletedPhase = phase === "before" && matches(state.restored);
+      if (!matchesExpected && !matchesCompletedPhase) throw new Error(`Reset label ${phase}condition drift: #${issue}`);
     }
   }
   if (phase === "after" && deps.workspaces.assertAbsent) {

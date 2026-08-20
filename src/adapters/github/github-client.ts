@@ -1884,13 +1884,17 @@ export class GitHubClient implements ForgeHost {
     }
   }
 
-  async restoreWorkflowLabels(repo: string, issue: number, labels: readonly string[], expected?: { current: readonly string[] }): Promise<void> {
+  async restoreWorkflowLabels(repo: string, issue: number, labels: readonly string[], expected?: { current: readonly string[]; restored?: readonly string[] }): Promise<void> {
     if (expected) {
       const current = (await this.getIssue(issue, repo)).labels ?? [];
       const managed = (value: string) => /^(?:workflow(?::|$)|needs-human(?:$|:))/i.test(value);
-      const expectedManaged = new Set(expected.current.filter(managed));
       const currentManaged = new Set(current.filter(managed));
-      if ([...expectedManaged].some((label) => !currentManaged.has(label)) || [...currentManaged].some((label) => !expectedManaged.has(label))) {
+      const matches = (values: readonly string[]): boolean => {
+        const expectedManaged = new Set(values.filter(managed));
+        return [...expectedManaged].every((label) => currentManaged.has(label))
+          && [...currentManaged].every((label) => expectedManaged.has(label));
+      };
+      if (!matches(expected.current) && !matches(expected.restored ?? labels)) {
         throw new Error(`GitHub labels changed before reset on #${issue}`);
       }
     }
