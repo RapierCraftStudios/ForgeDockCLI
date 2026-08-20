@@ -8,6 +8,7 @@ import {
   OBSERVATION_SCHEMA_VERSION,
   type ObservationDraft,
   type ObservationEnvelopeV1,
+  type ObservationIdentity,
   type ObservationLayoutStore,
   type ObservationQuery,
   type ObservationRetentionPolicy,
@@ -21,6 +22,21 @@ import type { WorkspaceLayout } from "./workspace-layout.js";
 
 const DEFAULT_QUERY_LIMIT = 500;
 const MAX_QUERY_LIMIT = 5_000;
+
+/** Exact event identities accepted by the internal cleanup boundary. */
+export interface SqliteObservationPurgeManifest {
+  events: readonly {
+    eventId: string;
+    scopeKey: string;
+    identity: ObservationIdentity;
+  }[];
+}
+
+export interface SqliteObservationPurgeResult {
+  events: number;
+  outputChunks: number;
+  attentionRows: number;
+}
 
 /** Operational journal for observations. It is rebuildable and never owns workflow state. */
 export class SqliteObservationStore implements ObservationStore, ObservationLayoutStore {
@@ -301,6 +317,35 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
     });
   }
 
+  /** Delete only the immutable event identities captured by a cleanup manifest. */
+  async purgeExactManifest(manifest: SqliteObservationPurgeManifest): Promise<SqliteObservationPurgeResult> {
+    return this.withTransaction(() => {
+      const events = manifest.events;
+      const ids = events.map(({ eventId }) => eventId);
+      if (ids.some((eventId) => typeof eventId !== "string" || eventId.length === 0)) throw new Error("Observation purge manifest event IDs must be non-empty");
+      if (new Set(ids).size !== ids.length) throw new Error("Observation purge manifest contains duplicate event IDs");
+      for (const expected of events) {
+        const row = this.#database.prepare("SELECT scope_key, identity_json FROM observation_events WHERE event_id = ?")
+          .get(expected.eventId) as { scope_key: string; identity_json: string } | undefined;
+        if (!row) throw new Error(`Observation purge manifest event is absent: ${expected.eventId}`);
+        const identity = parseJson(row.identity_json, undefined as ObservationIdentity | undefined);
+        if (row.scope_key !== expected.scopeKey || !sameObservationIdentity(identity, expected.identity)) {
+          throw new Error(`Observation purge manifest identity mismatch: ${expected.eventId}`);
+        }
+      }
+      const result: SqliteObservationPurgeResult = { events: 0, outputChunks: 0, attentionRows: 0 };
+      for (const { eventId } of events) {
+        result.attentionRows += Number(this.#database.prepare("DELETE FROM observation_attention WHERE event_id = ?").run(eventId).changes ?? 0);
+        result.outputChunks += Number(this.#database.prepare("DELETE FROM observation_output_chunks WHERE event_id = ?").run(eventId).changes ?? 0);
+        // Cursors are not FK children, so remove them explicitly before the
+        // event. Never touch cursors for events outside the manifest.
+        this.#database.prepare("DELETE FROM observation_cursors WHERE event_id = ?").run(eventId);
+        result.events += Number(this.#database.prepare("DELETE FROM observation_events WHERE event_id = ?").run(eventId).changes ?? 0);
+      }
+      return result;
+    });
+  }
+
   close(): void {
     this.#database.close();
   }
@@ -392,6 +437,14 @@ function decodeEnvelope(row: Record<string, unknown>): ObservationEnvelopeV1 {
 function parseJson<T>(value: unknown, fallback: T): T {
   if (typeof value !== "string") return fallback;
   try { return JSON.parse(value) as T; } catch { return fallback; }
+}
+
+function sameObservationIdentity(left: ObservationIdentity | undefined, right: ObservationIdentity): boolean {
+  if (!left) return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) return false;
+  return rightKeys.every((key) => left[key as keyof ObservationIdentity] === right[key as keyof ObservationIdentity]);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

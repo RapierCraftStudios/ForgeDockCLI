@@ -13,6 +13,29 @@ import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/tele
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
 
+/** Exact persisted identities accepted by the internal cleanup boundary. */
+export interface SqliteRepositoryPurgeManifest {
+  runs?: readonly { runId: string }[];
+  artifacts?: readonly { artifactId: string; subjectKey: string; kind: ArtifactKind }[];
+  orchestrations?: readonly { orchestrationId: string }[];
+  promotions?: readonly { promotionId: string }[];
+  telemetry?: readonly { telemetryKey: string; runId: string; taskId: string; sessionRef: string }[];
+  remediationAdmissions?: readonly { admissionKey: string }[];
+  reviewFindingFences?: readonly { fenceKey: string }[];
+  leases?: readonly { itemId: string }[];
+}
+
+export interface SqliteRepositoryPurgeResult {
+  runs: number;
+  artifacts: number;
+  orchestrations: number;
+  promotions: number;
+  telemetry: number;
+  remediationAdmissions: number;
+  reviewFindingFences: number;
+  leases: number;
+}
+
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
   readonly #witness: LeaseWitness | undefined;
@@ -557,8 +580,76 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     this.#acceptWitness(snapshot);
   }
 
+  /**
+   * Delete only rows named by a previously captured manifest. This is kept off
+   * the repository ports deliberately: cleanup must not become a general
+   * deletion primitive, and an identity mismatch aborts the whole transaction.
+   */
+  async purgeExactManifest(manifest: SqliteRepositoryPurgeManifest, now = Date.now()): Promise<SqliteRepositoryPurgeResult> {
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      const runs = manifest.runs ?? [];
+      const artifacts = manifest.artifacts ?? [];
+      const orchestrations = manifest.orchestrations ?? [];
+      const promotions = manifest.promotions ?? [];
+      const telemetry = manifest.telemetry ?? [];
+      const remediationAdmissions = manifest.remediationAdmissions ?? [];
+      const reviewFindingFences = manifest.reviewFindingFences ?? [];
+      const leases = manifest.leases ?? [];
+      assertUniqueManifestValues(runs.map(({ runId }) => runId), "run");
+      assertUniqueManifestValues(artifacts.map(({ artifactId }) => artifactId), "artifact");
+      assertUniqueManifestValues(orchestrations.map(({ orchestrationId }) => orchestrationId), "orchestration");
+      assertUniqueManifestValues(promotions.map(({ promotionId }) => promotionId), "promotion");
+      assertUniqueManifestValues(telemetry.map(({ telemetryKey }) => telemetryKey), "telemetry");
+      assertUniqueManifestValues(remediationAdmissions.map(({ admissionKey }) => admissionKey), "remediation admission");
+      assertUniqueManifestValues(reviewFindingFences.map(({ fenceKey }) => fenceKey), "review finding fence");
+      assertUniqueManifestValues(leases.map(({ itemId }) => itemId), "lease");
+
+      for (const row of runs) this.assertExactRow("runs", "run_id", row.runId, ["run_id"]);
+      for (const row of artifacts) this.assertExactRow("artifacts", "artifact_id", row.artifactId, ["artifact_id", "subject_key", "kind"], [row.artifactId, row.subjectKey, row.kind]);
+      for (const row of orchestrations) this.assertExactRow("orchestrations", "orchestration_id", row.orchestrationId, ["orchestration_id"]);
+      for (const row of promotions) this.assertExactRow("promotion_records", "promotion_id", row.promotionId, ["promotion_id"]);
+      for (const row of telemetry) this.assertExactRow("run_telemetry", "telemetry_key", row.telemetryKey, ["telemetry_key", "run_id", "task_id", "session_ref"], [row.telemetryKey, row.runId, row.taskId, row.sessionRef]);
+      for (const row of remediationAdmissions) this.assertExactRow("remediation_admissions", "admission_key", row.admissionKey, ["admission_key"]);
+      for (const row of reviewFindingFences) this.assertExactRow("review_finding_publication_fences", "fence_key", row.fenceKey, ["fence_key"]);
+      for (const row of leases) {
+        const current = this.#database.prepare("SELECT expires_at FROM leases WHERE item_id = ?").get(row.itemId) as { expires_at: number } | undefined;
+        if (!current) throw new Error(`Purge manifest lease is absent: ${row.itemId}`);
+        if (current.expires_at > now) throw new Error(`Cannot purge active lease: ${row.itemId}`);
+      }
+
+      // Delete children explicitly before their parent rows even though the
+      // schema also carries ON DELETE CASCADE. This remains safe for older
+      // databases whose foreign-key pragma was not enabled at creation time.
+      for (const row of runs) {
+        this.#database.prepare("DELETE FROM transitions WHERE run_id = ?").run(row.runId);
+        this.#database.prepare("DELETE FROM run_progress WHERE run_id = ?").run(row.runId);
+      }
+      const result: SqliteRepositoryPurgeResult = {
+        runs: 0, artifacts: 0, orchestrations: 0, promotions: 0,
+        telemetry: 0, remediationAdmissions: 0, reviewFindingFences: 0, leases: 0,
+      };
+      for (const row of runs) result.runs += Number(this.#database.prepare("DELETE FROM runs WHERE run_id = ?").run(row.runId).changes ?? 0);
+      for (const row of artifacts) result.artifacts += Number(this.#database.prepare("DELETE FROM artifacts WHERE artifact_id = ? AND subject_key = ? AND kind = ?").run(row.artifactId, row.subjectKey, row.kind).changes ?? 0);
+      for (const row of orchestrations) result.orchestrations += Number(this.#database.prepare("DELETE FROM orchestrations WHERE orchestration_id = ?").run(row.orchestrationId).changes ?? 0);
+      for (const row of promotions) result.promotions += Number(this.#database.prepare("DELETE FROM promotion_records WHERE promotion_id = ?").run(row.promotionId).changes ?? 0);
+      for (const row of telemetry) result.telemetry += Number(this.#database.prepare("DELETE FROM run_telemetry WHERE telemetry_key = ? AND run_id = ? AND task_id = ? AND session_ref = ?").run(row.telemetryKey, row.runId, row.taskId, row.sessionRef).changes ?? 0);
+      for (const row of remediationAdmissions) result.remediationAdmissions += Number(this.#database.prepare("DELETE FROM remediation_admissions WHERE admission_key = ?").run(row.admissionKey).changes ?? 0);
+      for (const row of reviewFindingFences) result.reviewFindingFences += Number(this.#database.prepare("DELETE FROM review_finding_publication_fences WHERE fence_key = ?").run(row.fenceKey).changes ?? 0);
+      for (const row of leases) result.leases += Number(this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(row.itemId, now).changes ?? 0);
+      return result;
+    }));
+  }
+
   close(): void {
     this.#database.close();
+  }
+
+  private assertExactRow(table: string, keyColumn: string, key: string, columns: readonly string[], expected?: readonly (string | number)[]): void {
+    const row = this.#database.prepare(`SELECT ${columns.join(", ")} FROM ${table} WHERE ${keyColumn} = ?`).get(key) as Record<string, string | number> | undefined;
+    if (!row) throw new Error(`Purge manifest ${table} row is absent: ${key}`);
+    if (expected && columns.some((column, index) => String(row[column]) !== String(expected[index]))) {
+      throw new Error(`Purge manifest identity mismatch in ${table}: ${key}`);
+    }
   }
 
   private saveOrchestrationInTransaction(record: OrchestrationRecord): void {
@@ -638,6 +729,11 @@ function normalizeLeaseBinding(binding: string | undefined): string | undefined 
   if (!value) throw new Error("Lease binding must not be empty");
   if (value.length > 512) throw new Error("Lease binding is too long");
   return value;
+}
+
+function assertUniqueManifestValues(values: readonly string[], label: string): void {
+  if (values.some((value) => typeof value !== "string" || value.length === 0)) throw new Error(`Purge manifest ${label} identity must be non-empty`);
+  if (new Set(values).size !== values.length) throw new Error(`Purge manifest contains duplicate ${label} identities`);
 }
 
 function orchestrationExecutionAttempt(record: OrchestrationRecord): number {

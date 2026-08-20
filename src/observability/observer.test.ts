@@ -32,6 +32,37 @@ function runNodeModule(source: string): Promise<void> {
   });
 }
 
+test("purges an exact observation manifest in FK order without touching unrelated events", async () => {
+  const store = new SqliteObservationStore(":memory:");
+  const producer = createObservationProducer("purge-test", 1);
+  const targetIdentity = { forgeRunId: "purge-run", logicalStreamId: "purge-stream" };
+  try {
+    const attention = await store.append({
+      producer, identity: targetIdentity, source: "workflow", channel: "activity", kind: "attention.created",
+      payload: { attentionId: "attention-purge", level: "warning", reason: "test" },
+    });
+    const output = await store.append({
+      producer, identity: targetIdentity, source: "process", channel: "stdout", kind: "process.output",
+      payload: {}, output: { channel: "stdout", text: "target" },
+    });
+    const unrelated = await store.append({
+      producer, identity: { forgeRunId: "unrelated-run" }, source: "workflow", channel: "activity", kind: "workflow.progress", payload: {},
+    });
+    await assert.rejects(store.purgeExactManifest({ events: [{ eventId: output.eventId, scopeKey: "wrong", identity: targetIdentity }] }), /identity mismatch/);
+    assert.equal((await store.query({ forgeRunId: "purge-run" })).length, 2);
+    const result = await store.purgeExactManifest({ events: [
+      { eventId: attention.eventId, scopeKey: "purge-run", identity: targetIdentity },
+      { eventId: output.eventId, scopeKey: "purge-run", identity: targetIdentity },
+    ] });
+    assert.deepEqual(result, { events: 2, outputChunks: 1, attentionRows: 1 });
+    assert.deepEqual(await store.query({ forgeRunId: "purge-run" }), []);
+    assert.equal((await store.query({ forgeRunId: "unrelated-run" }))[0]?.eventId, unrelated.eventId);
+  } finally {
+    store.close();
+  }
+});
+
+
 test("journal assigns per-run sequences, preserves channels, and redacts sensitive payloads", async () => {
   const observer = observerWithStore();
   await observer.emit({

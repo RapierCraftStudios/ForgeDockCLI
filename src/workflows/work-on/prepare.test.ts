@@ -152,6 +152,76 @@ describe("Build Packet preparation", () => {
     assert.match(runtime.tasks[2]?.instructions ?? "", /one bounded recovery attempt/);
   });
 
+  it("repairs one targeted verification capability mismatch and derives compiled targets centrally", async () => {
+    const catalog = {
+      commands: [{
+        id: "typescript-tests", command: "npm", args: ["test"], timeoutMs: 1_000, required: true,
+        selection: "packet" as const, targeting: "expected-test-paths" as const,
+        policyVersion: "forgedock.verification/v2", typescriptLayout: {
+          sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest",
+        },
+      }],
+      controllerGates: [],
+    };
+    const invalid = {
+      ...packet,
+      expectedPaths: ["src/foo.test.js"],
+      verificationPlan: ["npm test"],
+      verificationRequirements: [{ kind: "command" as const, id: "typescript-tests", criterionIds: ["criterion-1"], rationale: "Regression" }],
+    };
+    const repaired = { ...invalid, expectedPaths: ["src/foo.test.ts"] };
+    const runtime = new FakeAgentRuntime([investigation, invalid, repaired]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_capability_repair", subject: { repo: "a/b", issue: 6 }, producer: { role: "controller" },
+      payload: { title: "Target tests", problem: "Unsafe target", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog,
+    }, { runtime, artifacts, runs });
+
+    assert.equal(prepared.run.state, "building");
+    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "typescript-tests", targets: ["dist/foo.test.js"] }]);
+    assert.equal(runtime.tasks[2]?.id, "run_capability_repair:build-packet:1:capability-repair");
+    assert.match(runtime.tasks[2]?.instructions ?? "", /one bounded :capability-repair attempt/);
+  });
+
+  it("blocks after the single capability repair is exhausted without creating a packet", async () => {
+    const catalog = {
+      commands: [{
+        id: "typescript-tests", command: "npm", args: ["test"], timeoutMs: 1_000, required: true,
+        selection: "packet" as const, targeting: "expected-test-paths" as const,
+        policyVersion: "forgedock.verification/v2", typescriptLayout: {
+          sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest",
+        },
+      }],
+      controllerGates: [],
+    };
+    const invalid = {
+      ...packet,
+      expectedPaths: ["src/foo.test.js"],
+      verificationPlan: ["npm test"],
+      verificationRequirements: [{ kind: "command" as const, id: "typescript-tests", criterionIds: ["criterion-1"], rationale: "Regression" }],
+    };
+    const runtime = new FakeAgentRuntime([investigation, invalid, invalid]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_capability_block", subject: { repo: "a/b", issue: 7 }, producer: { role: "controller" },
+      payload: { title: "Target tests", problem: "Unsafe target", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    await assert.rejects(() => prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog,
+    }, { runtime, artifacts, runs }), /Verification capability mismatch exhausted after bounded repair/);
+    assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+    const blocked = await runs.load(intent.runId);
+    assert.equal(blocked?.state, "blocked");
+    assert.equal(runtime.tasks.length, 3);
+  });
+
   it("grants bounded source discovery when the issue has no concrete affected-file hints", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet]);
     const artifacts = new InMemoryArtifactRepository();

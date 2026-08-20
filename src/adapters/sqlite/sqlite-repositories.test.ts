@@ -685,6 +685,40 @@ describe("SQLite operational repositories", () => {
     }
   });
 
+  it("purges only an exact repository manifest, refuses active leases, and preserves lease state", async () => {
+    const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
+    try {
+      const target = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 91 }, runId: "run-purge-target" });
+      const unrelated = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 92 }, runId: "run-purge-unrelated" });
+      const artifact = createArtifact({
+        kind: "Intent", runId: target.runId, subject: target.subject,
+        producer: { role: "controller" },
+        payload: { title: "Purge", problem: "Purge", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      await store.create(target);
+      await store.create(unrelated);
+      await store.append(artifact);
+      const next = transition(target, "START_INVESTIGATION");
+      await store.commit(target.version, next.state, next.record);
+      await store.recordProgress({ runId: target.runId, phase: "purge-test", message: "child row", occurredAt: "2026-01-01T00:00:00.000Z" });
+      const lease = store.acquire(target.runId, "purge-test", 100, 1_000);
+      assert.ok(lease);
+      const manifest = { runs: [{ runId: target.runId }], artifacts: [{ artifactId: artifact.id, subjectKey: "a/b|i:91|p:", kind: "Intent" as const }], leases: [{ itemId: target.runId }] };
+      await assert.rejects(store.purgeExactManifest({ ...manifest, artifacts: [{ ...manifest.artifacts[0]!, subjectKey: "a/b|i:999|p:" }] }), /identity mismatch/);
+      await assert.rejects(store.purgeExactManifest(manifest, 1_050), /active lease/);
+      assert.equal((await store.load(target.runId))?.runId, target.runId);
+      const purged = await store.purgeExactManifest(manifest, 1_101);
+      assert.deepEqual(purged, { runs: 1, artifacts: 1, orchestrations: 0, promotions: 0, telemetry: 0, remediationAdmissions: 0, reviewFindingFences: 0, leases: 1 });
+      assert.equal(await store.load(target.runId), undefined);
+      assert.deepEqual(await store.history(target.runId), []);
+      assert.deepEqual(await store.listProgress(target.runId), []);
+      assert.equal((await store.load(unrelated.runId))?.runId, unrelated.runId);
+      assert.equal(store.acquire("lease-state-check", "purge-test", 100, 1_101)?.epoch, 2, "purge must not reset lease_state");
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses compare-and-swap versions to reject concurrent writers", async () => {
     const store = new SqliteRepositories(":memory:");
     try {

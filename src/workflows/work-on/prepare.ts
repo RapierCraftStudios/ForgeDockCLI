@@ -4,6 +4,12 @@ import { createHash } from "node:crypto";
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type ControllerVerificationGate, type DurableArtifact, type VerificationRequirement } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand } from "../../core/ports/verification.js";
+import {
+  isVerificationCapabilityMismatchError,
+  projectVerificationCapabilities,
+  resolveVerificationTargets,
+  validateVerificationTargetPaths,
+} from "../../core/ports/verification-capabilities.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import {
   canonicalizeConcreteScopePaths,
@@ -65,12 +71,13 @@ export async function prepareBuildPacket(
 ): Promise<{ run: RunState; packet: DurableArtifact<"BuildPacket">; sessionRef: string }> {
   if (input.run.state !== "preparing") throw new Error(`Build Packet requires preparing state, found ${input.run.state}`);
   let run = input.run;
+  let capabilityRepairAttempted = false;
   try {
     const affectedScope = [
       ...(input.scopeHints?.affectedFiles ?? []),
       ...input.investigation.payload.affectedSurfaces,
     ];
-    const result = await runPacketAuthorWithRecovery(dependencies.runtime, {
+    const packetTask: AgentTask<BuildPacketPayload> = {
       id: `${run.runId}:build-packet:${run.attempt}`,
       role: "packet-author",
       objective: "Freeze a buildable, reviewable contract from the proven issue intent and investigation.",
@@ -86,11 +93,8 @@ export async function prepareBuildPacket(
         "Map verificationPlan to the acceptance criteria through typed verificationRequirements. Each requirement must use exactly one allowed command ID or controller-gate ID from the supplied catalog, include one or more criterion-N IDs, and explain its rationale. Do not invent command IDs or shell strings.",
         "The legacy verificationPlan field is retained only for compatibility; emit one exact controller-gate:<id> token or one fenced executable command per typed requirement. Never encode controller-owned lifecycle evidence as prose.",
         "Allowed command IDs and controller gate IDs are supplied below. Unknown IDs, unfenced executable prose, and requirements that do not cover every acceptance criterion are rejected before the builder starts.",
-        `Verification catalog: ${JSON.stringify({
-          commands: (input.verificationCatalog?.commands ?? []).map(({ id, command, args }) => ({ id, command, args })),
-          controllerGates: input.verificationCatalog?.controllerGates ?? CONTROLLER_VERIFICATION_GATES,
-        })}`,
-        "State exclusions explicitly. Do not modify the repository.",
+        `Verification capabilities: ${JSON.stringify(projectVerificationCapabilities(input.verificationCatalog?.commands ?? []))}`,
+        "Select only command IDs from the capability list. For targeted tests, expected paths must remain repository-relative TypeScript test files under the stated source root and extension set; the controller derives compiled output paths. Do not propose JavaScript/MJS paths for the TypeScript command, and do not invent a legacy command.",
       ].join("\n"),
       context: [input.intent, input.investigation, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
       workspace: {
@@ -116,35 +120,33 @@ export async function prepareBuildPacket(
         ...(input.planningModel !== undefined ? { planningModel: input.planningModel } : {}),
         ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
       },
-    }, {
+    };
+    let result = await runPacketAuthorWithRecovery(dependencies.runtime, packetTask, {
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
     });
 
-    if (!result.output.expectedPaths.length) throw new Error("Build Packet must declare at least one concrete expected path");
-    const declaredPaths = canonicalizeConcreteScopePaths(
-      (input.scopeHints?.affectedFiles ?? []).filter(isConcreteScopePath),
-    );
-    const expectedPaths = canonicalizeConcreteScopePaths([
-      ...result.output.expectedPaths,
-      ...declaredPaths,
-    ]);
-    const verifiedOutput = input.verificationCatalog && (
-      input.verificationCatalog.commands.length > 0
-      || Boolean(result.output.verificationRequirements?.length)
-    )
-      ? canonicalizePacketVerification(result.output, input.verificationCatalog)
-      : result.output;
-    const {
-      verificationPolicyVersion: _untrustedPolicyVersion,
-      verificationCommandTargets: _untrustedCommandTargets,
-      invariantMatrices: _untrustedInvariantMatrices,
-      ...controllerVerifiedOutput
-    } = verifiedOutput;
-    const policyMetadata = input.verificationCatalog
-      ? packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, input.verificationCatalog.commands)
-      : {};
-    const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
+    let materialized;
+    try {
+      materialized = materializePacketOutput(result.output, input.verificationCatalog, input.scopeHints?.affectedFiles ?? []);
+    } catch (error) {
+      if (!isVerificationCapabilityMismatchError(error)) throw error;
+      capabilityRepairAttempted = true;
+      const repairTask: AgentTask<BuildPacketPayload> = {
+        ...packetTask,
+        id: `${packetTask.id}:capability-repair`,
+        instructions: [
+          packetTask.instructions,
+          `The previous packet selected verification capabilities that cannot safely execute: ${error.message}. This is the one bounded :capability-repair attempt. Preserve the packet evidence, correct only the verification selection and expected test paths to fit the supplied capabilities, then submit the complete schema-valid Build Packet exactly once.`,
+        ].join("\n"),
+      };
+      result = await runPacketAuthorWithRecovery(dependencies.runtime, repairTask, {
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+      });
+      materialized = materializePacketOutput(result.output, input.verificationCatalog, input.scopeHints?.affectedFiles ?? []);
+    }
+    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices } = materialized;
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
@@ -169,6 +171,12 @@ export async function prepareBuildPacket(
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (capabilityRepairAttempted && isVerificationCapabilityMismatchError(error)) {
+      const blockedReason = `Verification capability mismatch exhausted after bounded repair: ${reason}`;
+      const blocked = transition(run, "BLOCK", { reason: blockedReason });
+      await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+      throw new WorkflowExecutionError(blockedReason, blocked.state, { cause: error });
+    }
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_PREPARATION", { reason });
       await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
@@ -178,6 +186,35 @@ export async function prepareBuildPacket(
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
   }
+}
+
+function materializePacketOutput(
+  output: BuildPacketPayload,
+  catalog: VerificationCatalog | undefined,
+  affectedFiles: readonly string[],
+): {
+  expectedPaths: string[];
+  controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "invariantMatrices">;
+  policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets"> | Record<string, never>;
+  invariantMatrices: ReturnType<typeof deriveSecurityInvariantMatrices>;
+} {
+  if (!output.expectedPaths.length) throw new Error("Build Packet must declare at least one concrete expected path");
+  const declaredPaths = canonicalizeConcreteScopePaths(affectedFiles.filter(isConcreteScopePath));
+  const expectedPaths = canonicalizeConcreteScopePaths([...output.expectedPaths, ...declaredPaths]);
+  const verifiedOutput = catalog && (catalog.commands.length > 0 || Boolean(output.verificationRequirements?.length))
+    ? canonicalizePacketVerification(output, catalog)
+    : output;
+  const {
+    verificationPolicyVersion: _untrustedPolicyVersion,
+    verificationCommandTargets: _untrustedCommandTargets,
+    invariantMatrices: _untrustedInvariantMatrices,
+    ...controllerVerifiedOutput
+  } = verifiedOutput;
+  const policyMetadata = catalog
+    ? packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands)
+    : {};
+  const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
+  return { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices };
 }
 
 function canonicalizePacketVerification(
@@ -276,14 +313,9 @@ function packetVerificationPolicyMetadata(
   if (!policyVersion) return {};
   if (additionalPolicyVersions.length) throw new Error("Selected verification catalog mixes incompatible policy versions");
   const targeted = selected.filter((command) => command.targeting === "expected-test-paths");
-  const layout = targeted[0]?.typescriptLayout;
-  if (targeted.length && targeted.some((command) => JSON.stringify(command.typescriptLayout) !== JSON.stringify(layout))) {
-    throw new Error("Selected targeted verification commands disagree on source/output layout");
-  }
+  if (targeted.length) validateVerificationTargetPaths(packet.expectedPaths, targeted);
   const expectedTestPaths = targeted.length
-    ? canonicalizeConcreteScopePaths(packet.expectedPaths)
-      .filter(isNodeTestPath)
-      .map((path) => compiledTestTarget(path, layout))
+    ? resolveVerificationTargets(packet.expectedPaths, targeted)
     : [];
   return {
     verificationPolicyVersion: policyVersion,
@@ -324,20 +356,10 @@ export function selectPacketVerificationCommands(
   }
 
   const targetedCommands = catalog.filter((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
-  const layouts = targetedCommands.flatMap((command) => command.typescriptLayout ? [command.typescriptLayout] : []);
-  if (targetedCommands.length && layouts.length !== targetedCommands.length) {
-    throw new Error("Targeted verification command has no controller-proven source/output layout");
-  }
-  const layout = layouts[0];
-  if (layouts.some((candidate) => JSON.stringify(candidate) !== JSON.stringify(layout))) {
-    throw new Error("Targeted verification commands disagree on source/output layout");
-  }
-  const expectedTestPaths = canonicalizeConcreteScopePaths(packet.expectedPaths)
-    .filter(isNodeTestPath)
-    .map((path) => compiledTestTarget(path, layout));
-  if (expectedTestPaths.length > 32) {
-    throw new Error(`Build Packet selects ${expectedTestPaths.length} test paths; targeted verification is bounded to 32`);
-  }
+  if (targetedCommands.length) validateVerificationTargetPaths(packet.expectedPaths, targetedCommands);
+  const expectedTestPaths = targetedCommands.length
+    ? resolveVerificationTargets(packet.expectedPaths, targetedCommands)
+    : [];
   const targetedSelected = catalog.some((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
   if (typedRequirements?.length && expectedTestPaths.length && !targetedSelected) {
     throw new Error("Build Packet declares expected test paths without selecting the targeted test command");
@@ -377,26 +399,6 @@ export function selectPacketVerificationCommands(
     })),
   })).digest("hex").slice(0, 16);
   return selected.map((command) => ({ ...command, planId }));
-}
-
-function isNodeTestPath(path: string): boolean {
-  return /(?:^|\/)\S+\.test\.(?:[cm]?[jt]sx?)$/i.test(path);
-}
-
-function compiledTestTarget(
-  path: string,
-  layout: VerificationCommand["typescriptLayout"] | undefined,
-): string {
-  if (!layout) throw new Error(`Cannot target compiled test '${path}' without a controller-proven TypeScript layout`);
-  const normalized = path.replaceAll("\\", "/");
-  const sourcePrefix = `${layout.sourceRoot.replace(/\/$/, "")}/`;
-  if (!normalized.startsWith(sourcePrefix)) {
-    throw new Error(`Targeted test '${path}' is outside the frozen TypeScript source root ${layout.sourceRoot}`);
-  }
-  const extension = /\.(tsx?|mts|cts)$/i.exec(normalized)?.[1]?.toLowerCase();
-  const compiledExtension = extension === "mts" ? "mjs" : extension === "cts" ? "cjs" : extension ? "js" : undefined;
-  if (!compiledExtension) throw new Error(`Targeted test '${path}' has no supported TypeScript output extension`);
-  return `${layout.outputRoot.replace(/\/$/, "")}/${normalized.slice(sourcePrefix.length).replace(/\.(?:tsx?|mts|cts)$/i, `.${compiledExtension}`)}`;
 }
 
 async function runPacketAuthorWithRecovery(
