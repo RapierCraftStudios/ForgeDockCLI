@@ -1289,6 +1289,7 @@ export interface OrchestrationTransportIdentity {
 }
 
 interface ControllerTaskTransport {
+  setLimit?(maxTasks: number): void;
   start(spec: ControllerTaskSpec): Promise<string>;
   findByLaunchIdentity?(identity: OrchestrationTransportIdentity): Promise<string | undefined> | string | undefined;
   wait(taskId: string): Promise<BackgroundTaskRecord | void>;
@@ -1456,6 +1457,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     () => orchestrationRepository ?? options.orchestrationRepository,
     (record) => rebuildVisibleDagInput(orchestrationCwd, record),
     {
+      setLimit: (maxTasks) => backgroundTasks.setLimit(maxTasks),
       start: async (spec) => {
         if (!orchestrationContext) throw new Error("ForgeDock orchestration context is unavailable for direct controller dispatch");
         return startNativeControllerTask(pi, backgroundTasks, spec, orchestrationContext);
@@ -4688,8 +4690,10 @@ export class VisibleDagDelegator {
   }
 
   private transportCapacity(stored: StoredDagRun | undefined): number {
+    const configuredLimit = stored?.durableRecord.maxParallel ?? 4;
+    this.directControllerTransport?.setLimit?.(configuredLimit);
     const records = this.directControllerTransport?.list?.();
-    if (!records) return 4;
+    if (!records) return configuredLimit;
     const owned = new Set([
       ...(stored?.directChildRunIds ?? []),
       ...(stored?.durableRecord.nodes ?? []).flatMap((node) =>
@@ -4699,7 +4703,7 @@ export class VisibleDagDelegator {
       (record.status === "running" || record.status === "detached")
       && (this.directControllerTransport?.isActive?.(record.id) ?? true)
       && !owned.has(record.id)).length;
-    const available = 4 - externalActive;
+    const available = configuredLimit - externalActive;
     // Zero capacity is durable backpressure. Let the scheduler retain the
     // queued DAG and poll rather than converting admission pressure into a
     // worker exception.

@@ -65,7 +65,7 @@ export interface BackgroundTaskRecord {
   ownerReleasedAt?: string;
 }
 
-const MAX_BACKGROUND_TASKS = 4;
+const DEFAULT_BACKGROUND_TASK_LIMIT = 4;
 /**
  * The task supervisor heartbeat is operational evidence, not workflow truth.
  * A live owner renews it from the existing task ticker; a replacement TUI
@@ -99,9 +99,18 @@ export class ForgeDockBackgroundTasks {
   #observationAdapter: BackgroundTaskObservationAdapter | undefined;
   #observationQuery: ObservationQuerySource | undefined;
   readonly #finishing = new Set<string>();
+  #maxTasks = DEFAULT_BACKGROUND_TASK_LIMIT;
 
   constructor(pi: ExtensionAPI) {
     this.#pi = pi;
+  }
+
+  /** Match native controller capacity to the caller-authorized orchestration cap. */
+  setLimit(maxTasks: number): void {
+    if (!Number.isSafeInteger(maxTasks) || maxTasks < 1) {
+      throw new Error("ForgeDock background task limit must be a positive integer");
+    }
+    this.#maxTasks = maxTasks;
   }
 
   setObservationSink(sink: (ObservationSink & Partial<ObservationQuerySource>) | undefined): void {
@@ -215,8 +224,8 @@ export class ForgeDockBackgroundTasks {
       const existing = this.findByLaunchKey(input.launchKey);
       if (existing) return existing;
     }
-    if (this.#live.size >= MAX_BACKGROUND_TASKS) {
-      throw new Error(`ForgeDock background task limit (${MAX_BACKGROUND_TASKS}) reached; wait for or cancel an existing task`);
+    if (this.#live.size >= this.#maxTasks) {
+      throw new Error(`ForgeDock background task limit (${this.#maxTasks}) reached; wait for or cancel an existing task`);
     }
     const id = `task_${crypto.randomUUID().replaceAll("-", "").slice(0, 10)}`;
     const directory = join(input.cwd, ".forgedock", "tasks");

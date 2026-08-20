@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -64,6 +67,34 @@ describe("Build Packet preparation", () => {
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
     ]);
+  });
+
+  it("binds production packet relation authority to the exact frozen workspace base", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-packet-base-"));
+    const baseSha = "f".repeat(40);
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await mkdir(join(cwd, "test"), { recursive: true });
+      await writeFile(join(cwd, "src/a.ts"), "export const a = true;\n");
+      await writeFile(join(cwd, "test/a.test.ts"), "import '../src/a.js';\n");
+      const runtime = new FakeAgentRuntime([investigation, packet]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_packet_exact_base", subject: { repo: "a/b", issue: 101 }, producer: { role: "controller" },
+        payload: { title: "Exact base", problem: "Freeze relation authority", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const scopeHints = { affectedFiles: ["src/a.ts", "test/a.test.ts"], writePaths: ["src/a.ts", "test/a.test.ts"] } as const;
+      const investigated = await investigateWorkItem({ intent, cwd, scopeHints }, { runtime, artifacts, runs });
+      const prepared = await prepareBuildPacket({
+        run: investigated.run, intent, investigation: investigated.investigation, cwd, baseSha, scopeHints,
+      }, { runtime, artifacts, runs });
+      assert.equal(prepared.packet.payload.relationGraph?.baseSha, baseSha);
+      const checkpoint = artifacts.artifacts.find((artifact) => artifact.kind === "RelationGraphCheckpoint");
+      assert.equal(checkpoint?.kind === "RelationGraphCheckpoint" ? checkpoint.payload.baseSha : undefined, baseSha);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("canonicalizes typed verification requirements against the controller catalog", async () => {

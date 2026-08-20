@@ -1752,6 +1752,41 @@ test("dead detached task evidence does not reduce native orchestration capacity"
   await delegator.shutdown();
 });
 
+test("configured orchestration concurrency raises native transport capacity", async () => {
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const records: any[] = [];
+  let configuredLimit = 0;
+  const transport = {
+    setLimit: (limit: number) => { configuredLimit = limit; },
+    list: () => records,
+    isActive: () => true,
+    start: async () => {
+      const id = `configured-${records.length + 1}`;
+      records.push({ id, command: "node", args: [], cwd: process.cwd(), pid: records.length + 1, logPath: "", status: "running" as const, startedAt: new Date(0).toISOString() });
+      return id;
+    },
+    wait: async (id: string) => ({ ...records.find((record) => record.id === id), status: "completed" as const, exitCode: 0 }),
+  };
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const delegator = new VisibleDagDelegator(state.pi, () => repository, undefined, transport, () => admission);
+  const run = await delegator.start({
+    repository: "a/b",
+    items: Array.from({ length: 10 }, (_, index) => ({ id: `issue-${index + 1}`, issue: index + 1, title: `Issue ${index + 1}`, summary: "Configured capacity", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [index + 1] })),
+    maxParallel: 10,
+    taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    controllerTaskFor: () => ({ args: [], cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+  await run.completion;
+  const durable = await repository.loadOrchestration(run.id);
+  assert.equal(configuredLimit, 10);
+  assert.equal(durable?.transportCapacity, 10);
+  assert.equal(durable?.effectiveMaxParallel, 10);
+  await delegator.shutdown();
+});
+
 test("live capacity excludes this DAG's immediate native launch receipts", async () => {
   const state = fakePi();
   const repository = new InMemoryOrchestrationRepository();

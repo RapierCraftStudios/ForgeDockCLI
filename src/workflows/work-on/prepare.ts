@@ -58,6 +58,8 @@ export async function prepareBuildPacket(
     investigation: DurableArtifact<"Investigation">;
     priorArtifacts?: readonly DurableArtifact[];
     cwd: string;
+    /** Exact frozen workspace base; required by production work-on callers. */
+    baseSha?: string;
     scopeHints?: ScopeHints;
     provider?: string;
     model?: string;
@@ -161,7 +163,7 @@ export async function prepareBuildPacket(
           input.scopeHints?.writePaths ?? [],
           input.cwd,
           input.scopeHints !== undefined,
-          input.run.headSha ?? "0000000",
+          input.baseSha ?? input.run.headSha ?? "0000000",
         );
         break;
       } catch (error) {
