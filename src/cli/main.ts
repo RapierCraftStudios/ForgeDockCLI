@@ -1334,6 +1334,8 @@ async function workOn(
       verifier,
       host: github,
       telemetry: store,
+      ciPolicy: reviewCi,
+      ciRepairWorkspaces: git,
       leaseGuard,
       onAgentEvent,
     });

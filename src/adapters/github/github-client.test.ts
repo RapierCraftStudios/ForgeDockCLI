@@ -38,6 +38,19 @@ describe("GitHub read retry boundary", () => {
     assert.equal(attempts, 2);
   });
 
+  it("retries gh CLI connection guidance as a transient read failure", async () => {
+    let attempts = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("gh api failed (1): error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com");
+      return JSON.stringify({ nameWithOwner: "a/b", defaultBranchRef: { name: "main" } });
+    } });
+
+    assert.deepEqual(await client.getRepository("a/b"), { repo: "a/b", defaultBranch: "main" });
+    assert.equal(attempts, 2);
+  });
+
   it("bounds retries for a persistently unavailable read", async () => {
     let attempts = 0;
     const client = new GitHubClient();

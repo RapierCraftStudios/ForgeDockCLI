@@ -55,7 +55,7 @@ const MAX_GITHUB_BRANCHES = 5_000;
 const MAX_GITHUB_BRANCH_PAGES = Math.ceil(MAX_GITHUB_BRANCHES / GITHUB_BRANCH_PAGE_SIZE);
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
 const MAX_READ_ATTEMPTS = 6;
-const READ_RETRY_DELAY_MS = 50;
+const READ_RETRY_DELAY_MS = 100;
 const MAX_MERGEABILITY_REFRESH_ATTEMPTS = 3;
 
 function normalizePullRequestMergeability(value: unknown): PullRequestMergeability {
@@ -90,7 +90,7 @@ function isReadOnlyGhInvocation(args: readonly string[]): boolean {
 function isTransientGitHubReadFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /HTTP (?:429|5\d{2})\b/i.test(message)
-    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|temporarily unavailable|no server is currently available)/i.test(message);
+    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|error connecting to api\.github\.com|check your internet connection|temporarily unavailable|no server is currently available)/i.test(message);
 }
 
 /** Transport failures may occur after a mutating GitHub request has committed. */
