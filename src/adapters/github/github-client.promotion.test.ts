@@ -72,6 +72,28 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
   });
 
+  it("reads exact immutable required checks for an already merged PR", async () => {
+    const client = new GitHubClient();
+    const checks = [{ name: "Required CI", state: "SUCCESS", link: "https://github.test/check" }];
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "MERGED", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify(checks);
+      const immutable = immutableCommitCheckResponse(args, checks);
+      if (immutable !== undefined) return immutable;
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.mergeability, "mergeable");
+    assert.equal(gate.requiredChecksProvenance, "github-required");
+    assert.equal(gate.requiredChecksHeadSha, sha);
+    assert.deepEqual(gate.requiredChecks, [{ name: "Required CI", state: "passed", detailsUrl: "https://github.test/check" }]);
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
+  });
+
   it("keeps UNKNOWN distinct from a confirmed conflict and refreshes UNKNOWN only when requested", async () => {
     const client = new GitHubClient();
     let mergeabilityReads = 0;

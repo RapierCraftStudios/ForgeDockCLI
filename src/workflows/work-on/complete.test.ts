@@ -36,6 +36,7 @@ class CompletionHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   snapshot = { ...openPr };
   merges = 0;
+  gateReads = 0;
   mergeBase?: string;
   mergeGate: PullRequestMergeGate = {
     repo: "a/b", pullRequest: 9, headSha: sha, baseBranch: "main", mergeable: true,
@@ -46,7 +47,10 @@ class CompletionHost implements ForgeHost {
   closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
-  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> { return { ...this.mergeGate, requiredChecks: [...this.mergeGate.requiredChecks] }; }
+  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> {
+    this.gateReads += 1;
+    return { ...this.mergeGate, requiredChecks: [...this.mergeGate.requiredChecks] };
+  }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
@@ -568,6 +572,70 @@ describe("merge and close authority", () => {
     assert.equal(result.run.state, "completed");
     assert.equal(host.merges, 0);
     assert.deepEqual(host.closes, [2]);
+  });
+
+  it("admits an initially merged PR only after a passing authoritative gate", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.snapshot.state = "MERGED";
+    const result = await completeWorkItem({ run, pullRequest: { ...openPr, state: "MERGED" }, verdict: verdict(run), autoMerge: true }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+
+    assert.equal(result.run.state, "completed");
+    assert.equal(result.outcome?.payload.status, "merged");
+    assert.equal(host.gateReads, 1);
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, [2]);
+  });
+
+  it("blocks an initially merged PR for missing or non-passing gate evidence", async () => {
+    for (const evidence of ["missing-provenance", "failed", "cancelled", "pending", "unavailable", "unknown-mergeability"] as const) {
+      const runs = new InMemoryRunRepository();
+      const run = await mergingRun(runs);
+      const host = new CompletionHost();
+      host.snapshot.state = "MERGED";
+      host.mergeGate = { ...host.mergeGate };
+      if (evidence === "missing-provenance") delete host.mergeGate.requiredChecksProvenance;
+      else if (evidence === "unknown-mergeability") {
+        host.mergeGate.mergeable = false;
+        host.mergeGate.mergeability = "unknown";
+      } else {
+        host.mergeGate.requiredChecks = [{ name: "CI", state: evidence }];
+      }
+      const artifacts = new InMemoryArtifactRepository();
+      const result = await completeWorkItem({ run, pullRequest: { ...openPr, state: "MERGED" }, verdict: verdict(run), autoMerge: true }, {
+        host, artifacts, runs,
+      });
+
+      assert.equal(result.run.state, "blocked");
+      assert.equal(result.outcome?.payload.status, "blocked");
+      assert.equal(host.gateReads, 1);
+      assert.equal(host.merges, 0);
+      assert.deepEqual(host.closes, []);
+      assert.equal((await artifacts.list(run.subject, "Outcome")).length, 1);
+    }
+  });
+
+  it("blocks a concurrent merge after invalid gate evidence", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeGate = { ...host.mergeGate, requiredChecks: [{ name: "CI", state: "failed" }] };
+    host.getPullRequestMergeGate = async () => {
+      host.snapshot.state = "MERGED";
+      host.gateReads += 1;
+      return { ...host.mergeGate, requiredChecks: [...host.mergeGate.requiredChecks] };
+    };
+
+    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(host.gateReads, 1);
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, []);
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {

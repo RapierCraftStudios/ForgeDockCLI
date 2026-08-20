@@ -1288,8 +1288,8 @@ export class GitHubClient implements ForgeHost {
     if (pullRequest.baseBranch !== expectedBaseBranch) {
       throw new Error(`Pull request target changed: expected ${expectedBaseBranch}, current ${pullRequest.baseBranch}`);
     }
-    if (pullRequest.state !== "OPEN") {
-      throw new Error(`Pull request #${number} is not open (GitHub state: ${pullRequest.state})`);
+    if (pullRequest.state !== "OPEN" && pullRequest.state !== "MERGED") {
+      throw new Error(`Pull request #${number} is neither open nor merged (GitHub state: ${pullRequest.state})`);
     }
     let mergeability: PullRequestMergeability = "unavailable";
     let mergeabilityReasonText: string | undefined;
@@ -1379,7 +1379,7 @@ export class GitHubClient implements ForgeHost {
     if (finalPullRequest.baseBranch !== expectedBaseBranch) {
       throw new Error(`Pull request target changed while reading required checks: expected ${expectedBaseBranch}, current ${finalPullRequest.baseBranch}`);
     }
-    if (finalPullRequest.state !== "OPEN") {
+    if (finalPullRequest.state !== "OPEN" && finalPullRequest.state !== "MERGED") {
       throw new Error(`Pull request #${number} changed state while reading required checks: ${finalPullRequest.state}`);
     }
     return {

@@ -189,58 +189,50 @@ export async function completeWorkItem(
     if (pullRequest.headSha !== input.verdict.payload.headSha) {
       throw new Error(`Approved SHA ${input.verdict.payload.headSha} is stale; current PR head is ${pullRequest.headSha}`);
     }
-    if (pullRequest.state !== "MERGED") {
-      if (!input.autoMerge) return { run, awaitingHuman: true };
-      let admissionAttempt = 0;
-      while (true) {
-        const admission = await waitForAuthoritativeMergeGate({
-          host: dependencies.host,
-          runs: dependencies.runs,
+    // An already-merged PR still needs the same authoritative admission as an
+    // OPEN PR. Only an OPEN PR with auto-merge disabled may stop here; a
+    // pre-merged PR must never bypass required-check validation.
+    if (pullRequest.state !== "MERGED" && !input.autoMerge) return { run, awaitingHuman: true };
+    let admissionAttempt = 0;
+    while (true) {
+      const admission = await waitForAuthoritativeMergeGate({
+        host: dependencies.host,
+        runs: dependencies.runs,
+        run,
+        pullRequest,
+        expectedHeadSha: input.verdict.payload.headSha,
+        expectedBaseBranch: run.targetBranch!,
+        pollIntervalMs: mergeGatePollInterval(input.mergeGatePollIntervalMs),
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(input.onMergeGatePoll ? { onPoll: input.onMergeGatePoll } : {}),
+        ...(dependencies.leaseGuard ? { leaseGuard: dependencies.leaseGuard } : {}),
+      });
+      if (admission.terminalReason) {
+        return blockMergeAdmission(
           run,
-          pullRequest,
-          expectedHeadSha: input.verdict.payload.headSha,
-          expectedBaseBranch: run.targetBranch!,
-          pollIntervalMs: mergeGatePollInterval(input.mergeGatePollIntervalMs),
-          ...(input.signal ? { signal: input.signal } : {}),
-          ...(input.onMergeGatePoll ? { onPoll: input.onMergeGatePoll } : {}),
-          ...(dependencies.leaseGuard ? { leaseGuard: dependencies.leaseGuard } : {}),
-        });
-        if (admission.terminalReason) {
-          return blockMergeAdmission(
-            run,
-            admission.pullRequest,
-            admission.gate,
-            admission.terminalReason,
-            dependencies,
-            awaitingHumanForMergeGate(admission.gate),
-          );
-        }
-        pullRequest = admission.pullRequest;
-        if (admission.alreadyMerged) break;
-        throwIfAborted(input.signal);
-        dependencies.leaseGuard?.assertValid();
-        try {
-          await dependencies.host.mergePullRequest(
-            pullRequest.repo,
-            pullRequest.number,
-            input.verdict.payload.headSha,
-            run.targetBranch!,
-          );
-          break;
-        } catch (error) {
-          const afterCommand = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
-          if (afterCommand.state === "MERGED") {
-            assertMergedPullRequestIdentity(
-              afterCommand,
-              input.pullRequest.repo,
-              input.pullRequest.number,
-              input.verdict.payload.headSha,
-              run.targetBranch!,
-            );
-            pullRequest = afterCommand;
-            break;
-          }
-          assertOpenPullRequestIdentity(
+          admission.pullRequest,
+          admission.gate,
+          admission.terminalReason,
+          dependencies,
+          awaitingHumanForMergeGate(admission.gate),
+        );
+      }
+      pullRequest = admission.pullRequest;
+      if (admission.alreadyMerged) break;
+      throwIfAborted(input.signal);
+      dependencies.leaseGuard?.assertValid();
+      try {
+        await dependencies.host.mergePullRequest(
+          pullRequest.repo,
+          pullRequest.number,
+          input.verdict.payload.headSha,
+          run.targetBranch!,
+        );
+        break;
+      } catch (error) {
+        const afterCommand = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+        if (afterCommand.state === "MERGED") {
+          assertMergedPullRequestIdentity(
             afterCommand,
             input.pullRequest.repo,
             input.pullRequest.number,
@@ -248,29 +240,40 @@ export async function completeWorkItem(
             run.targetBranch!,
           );
           pullRequest = afterCommand;
-          const transientReason = transientMergeAdmissionError(error);
-          if (!transientReason) throw error;
-          admissionAttempt += 1;
-          const pollIntervalMs = mergeGatePollDelay(
-            mergeGatePollInterval(input.mergeGatePollIntervalMs),
-            admissionAttempt,
-          );
-          dependencies.leaseGuard?.assertValid();
-          await dependencies.runs.recordProgress({
-            runId: run.runId,
-            phase: "merge-gate.poll",
-            message: `Merge-time authority became transient for PR #${pullRequest.number}; re-querying live gate (attempt ${admissionAttempt})`,
-            occurredAt: new Date().toISOString(),
-          });
-          await input.onMergeGatePoll?.({
-            attempt: admissionAttempt,
-            reason: transientReason,
-            gate: admission.gate,
-            nextPollInMs: pollIntervalMs,
-          });
-          await waitForMergeGatePoll(pollIntervalMs, input.signal);
+          break;
         }
+        assertOpenPullRequestIdentity(
+          afterCommand,
+          input.pullRequest.repo,
+          input.pullRequest.number,
+          input.verdict.payload.headSha,
+          run.targetBranch!,
+        );
+        pullRequest = afterCommand;
+        const transientReason = transientMergeAdmissionError(error);
+        if (!transientReason) throw error;
+        admissionAttempt += 1;
+        const pollIntervalMs = mergeGatePollDelay(
+          mergeGatePollInterval(input.mergeGatePollIntervalMs),
+          admissionAttempt,
+        );
+        dependencies.leaseGuard?.assertValid();
+        await dependencies.runs.recordProgress({
+          runId: run.runId,
+          phase: "merge-gate.poll",
+          message: `Merge-time authority became transient for PR #${pullRequest.number}; re-querying live gate (attempt ${admissionAttempt})`,
+          occurredAt: new Date().toISOString(),
+        });
+        await input.onMergeGatePoll?.({
+          attempt: admissionAttempt,
+          reason: transientReason,
+          gate: admission.gate,
+          nextPollInMs: pollIntervalMs,
+        });
+        await waitForMergeGatePoll(pollIntervalMs, input.signal);
       }
+    }
+    if (pullRequest.state !== "MERGED") {
       pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
       assertMergedPullRequestIdentity(
         pullRequest,
@@ -506,6 +509,7 @@ async function waitForAuthoritativeMergeGate(input: {
     // Re-read after every checks query, including unavailable responses, so no
     // PR-scoped observation can be attached to a changed head/base/state.
     const revalidated = await input.host.getPullRequest(pullRequest.repo, pullRequest.number);
+    const terminalReason = terminalMergeGateFailure(gate);
     if (revalidated.state === "MERGED") {
       assertMergedPullRequestIdentity(
         revalidated,
@@ -514,12 +518,17 @@ async function waitForAuthoritativeMergeGate(input: {
         input.expectedHeadSha,
         input.expectedBaseBranch,
       );
-      return { gate, pullRequest: revalidated, alreadyMerged: true };
+      // A merged PR cannot wait for evidence that may only become available
+      // before merging. It is accepted only when this fresh witness is fully
+      // authoritative and passing; pending/unknown evidence fails closed.
+      const mergedFailure = terminalReason ?? mergedMergeGateFailure(gate);
+      return mergedFailure
+        ? { gate, pullRequest: revalidated, terminalReason: mergedFailure }
+        : { gate, pullRequest: revalidated, alreadyMerged: true };
     }
     assertOpenPullRequestIdentity(revalidated, pullRequest.repo, pullRequest.number, input.expectedHeadSha, input.expectedBaseBranch);
     pullRequest = revalidated;
 
-    const terminalReason = terminalMergeGateFailure(gate);
     if (terminalReason) return { gate, pullRequest, terminalReason };
     const transientReason = transientMergeGateReason(gate);
     if (!transientReason) return { gate, pullRequest };
@@ -627,6 +636,21 @@ function terminalMergeGateFailure(gate: PullRequestMergeGate): string | undefine
 function transientMergeGateReason(gate: PullRequestMergeGate): MergeGatePollProgress["reason"] | undefined {
   if (gate.requiredChecks.some((check) => check.state === "pending")) return "required-checks-pending";
   if (pullRequestMergeability(gate) === "unknown") return "mergeability-unknown";
+  return undefined;
+}
+
+function mergedMergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+  const transientReason = transientMergeGateReason(gate);
+  if (transientReason === "required-checks-pending") {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: required checks were not all passing when the PR was already merged`;
+  }
+  if (transientReason === "mergeability-unknown") {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: mergeability was not authoritative when the PR was already merged`;
+  }
+  const nonPassing = gate.requiredChecks.filter((check) => check.state !== "passed");
+  if (nonPassing.length) {
+    return `Merge admission is blocked for PR #${gate.pullRequest}: required checks were not all passing: ${nonPassing.map((check) => `${check.name}=${check.state}`).join(", ")}`;
+  }
   return undefined;
 }
 
