@@ -7,6 +7,13 @@ import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import { ensureForgeDockConfig, modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, resolveReviewCiConfig, updateForgeDockConfig } from "./forgedock-config.js";
 
+function assertCurrentPackageDocumentation(contents: string): void {
+  assert.doesNotMatch(contents, /\bnpx forgedock\b/);
+  assert.match(contents, /\bnpx forgedockcli(?:\s|$)/);
+  assert.match(contents, /\bnpx forgedockcli install\b/);
+  assert.match(contents, /\bnpx forgedockcli update\b/);
+}
+
 describe("ForgeDock Next project configuration", () => {
   it("bootstraps a valid minimal forge.yaml exactly once", () => {
     const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
@@ -132,6 +139,20 @@ describe("ForgeDock Next project configuration", () => {
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol", "max"), "openai-codex/gpt-5.6-sol:max");
     assert.equal(modelWithThinking("openai-codex/gpt-5.6-sol:high", "max"), "openai-codex/gpt-5.6-sol:max");
   });
+
+  it("keeps CONFIG.md aligned with the published CLI package", () => {
+    const docs = readFileSync(join(process.cwd(), "docs/CONFIG.md"), "utf8");
+    const packageManifest = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as {
+      name?: string;
+      bin?: Record<string, string>;
+    };
+
+    assertCurrentPackageDocumentation(docs);
+    assert.throws(() => assertCurrentPackageDocumentation("npx forgedock install"));
+    assert.equal(packageManifest.name, "forgedockcli");
+    assert.equal(packageManifest.bin?.forgedock, "bin/forgedock-terminal.mjs");
+  });
+
   it("round-trips repository-owned review CI policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.deepEqual(resolveReviewCiConfig(), { failureAction: "ask", maxFixAttempts: 2, deliveryChecks: ["*"], promotionChecks: ["*"], deploymentChecks: ["*"], repairPaths: [], requiredChecksDefault: "require", requiredChecksTargets: {} }); updateForgeDockConfig(cwd, { review: { ci: { failureAction: "auto-fix", maxFixAttempts: 3, deliveryChecks: ["build"], repairPaths: [".github/workflows"], requiredChecks: { default: "require", targets: { staging: "if-present" } } } } }); assert.equal(resolveReviewCiConfig(readForgeDockConfig(cwd)).failureAction, "auto-fix"); assert.equal(resolveReviewCiConfig(readForgeDockConfig(cwd)).requiredChecksTargets.staging, "if-present"); assert.match(readFileSync(join(cwd, "forge.yaml"), "utf8"), /failure_action: "auto-fix"/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
   it("rejects unsafe CI repair policy", () => { const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-")); try { assert.throws(() => updateForgeDockConfig(cwd, { reviewCiMaxFixAttempts: 6 }), /1 to 5/); assert.throws(() => updateForgeDockConfig(cwd, { reviewCiRepairPaths: ["../outside"] }), /repository-relative/); } finally { rmSync(cwd, { recursive: true, force: true }); } });
 });
