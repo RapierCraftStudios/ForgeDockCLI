@@ -89,6 +89,9 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+const LOCAL_WITNESS_COLLISION_RETRY_ATTEMPTS = 50;
+const LOCAL_WITNESS_COLLISION_RETRY_DELAY_MS = 10;
+const LOCAL_WITNESS_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -190,9 +193,12 @@ export function createOrBootstrapLocalLeaseWitness(
   try {
     bootstrapLocalLeaseWitness(cwd, options);
   } catch (error) {
-    // A concurrent first-use process may have completed bootstrap after our
-    // initial lookup. Adopt it only if the complete witness now verifies.
-    const raced = createConfiguredLeaseWitness(cwd, options);
+    // The winner installs its directory before publishing the checkout
+    // reference. Only that expected first-use filesystem collision gets a
+    // bounded adoption window; permission, corruption, and binding failures
+    // remain immediate.
+    if (!isExpectedFirstUseCollision(error)) throw error;
+    const raced = adoptConcurrentLocalLeaseWitness(cwd, options);
     if (raced) return raced;
     throw error;
   }
@@ -242,6 +248,7 @@ export function bootstrapLocalLeaseWitness(
     renameSync(temporaryDirectory, paths.witnessDirectory);
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
+    pauseAfterWitnessInstallForTest();
 
     const reference = localWitnessReference(paths);
     writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -327,6 +334,37 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function pauseAfterWitnessInstallForTest(): void {
+  // This opt-in seam lets the focused child-process regression hold the exact
+  // directory-installed/reference-not-yet-published interleaving. It is
+  // inert unless a test explicitly supplies the variable.
+  const value = process.env.FORGEDOCK_TEST_LEASE_WITNESS_PAUSE_AFTER_INSTALL_MS;
+  if (value === undefined) return;
+  const milliseconds = Number(value);
+  if (Number.isSafeInteger(milliseconds) && milliseconds > 0) {
+    Atomics.wait(LOCAL_WITNESS_RETRY_WAIT, 0, 0, milliseconds);
+  }
+}
+
+function isExpectedFirstUseCollision(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error
+    && ["EEXIST", "ENOTEMPTY"].includes(String((error as { code?: unknown }).code));
+}
+
+function adoptConcurrentLocalLeaseWitness(
+  cwd: string,
+  options: LocalLeaseWitnessOptions,
+): RetainedCheckpointWitness | undefined {
+  for (let attempt = 0; attempt < LOCAL_WITNESS_COLLISION_RETRY_ATTEMPTS; attempt += 1) {
+    const raced = createConfiguredLeaseWitness(cwd, options);
+    if (raced) return raced;
+    if (attempt + 1 < LOCAL_WITNESS_COLLISION_RETRY_ATTEMPTS) {
+      Atomics.wait(LOCAL_WITNESS_RETRY_WAIT, 0, 0, LOCAL_WITNESS_COLLISION_RETRY_DELAY_MS);
+    }
+  }
+  return undefined;
 }
 
 function payload(epoch: number, keyId: string): Buffer {

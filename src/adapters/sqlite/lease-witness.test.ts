@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
@@ -16,6 +18,40 @@ import {
   leaseWitnessRequirementMessage,
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
+
+function runWitnessController(modulePath: string, checkout: string, localDataRoot: string): Promise<{ epoch: number; signature: string }> {
+  const source = `
+    import { createOrBootstrapLocalLeaseWitness } from ${JSON.stringify(modulePath)};
+    const witness = createOrBootstrapLocalLeaseWitness(${JSON.stringify(checkout)}, {
+      localDataRoot: ${JSON.stringify(localDataRoot)},
+      environment: {},
+    });
+    const snapshot = witness.verify();
+    if (snapshot.state !== "verified" || snapshot.epoch !== 0 || !snapshot.checkpoint) {
+      throw new Error("child controller did not obtain a verified epoch-zero witness");
+    }
+    process.stdout.write(JSON.stringify({ epoch: snapshot.epoch, signature: snapshot.checkpoint.signature }));
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+      env: { ...process.env, FORGEDOCK_TEST_LEASE_WITNESS_PAUSE_AFTER_INSTALL_MS: "250" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`witness controller exited ${code}: ${stderr}`));
+        return;
+      }
+      try { resolve(JSON.parse(stdout) as { epoch: number; signature: string }); }
+      catch (error) { reject(new Error(`invalid witness controller output: ${stdout}`, { cause: error })); }
+    });
+  });
+}
 
 describe("retained lease checkpoint witness", () => {
   it("authenticates compare-and-advance and rejects invalid signatures", () => {
@@ -88,6 +124,31 @@ describe("retained lease checkpoint witness", () => {
         const lease = store.acquire("first-use", "worker", 1_000, 1_000);
         assert.equal(lease?.epoch, 1);
         assert.equal(store.continuity().state, "verified");
+      } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("adopts one verified witness across concurrent first-use controller processes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    try {
+      const modulePath = join(dirname(fileURLToPath(import.meta.url)), "lease-witness.js");
+      const results = await Promise.all([
+        runWitnessController(modulePath, checkout, localDataRoot),
+        runWitnessController(modulePath, checkout, localDataRoot),
+      ]);
+      assert.deepEqual(results[0], results[1]);
+      assert.equal(results[0].epoch, 0);
+
+      const witness = createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} });
+      assert.ok(witness);
+      assert.equal(witness.verify().state, "verified");
+      assert.equal(witness.verify().epoch, 0);
+      const store = new SqliteRepositories(join(checkout, ".forgedock", "state.db"), { witness });
+      try {
+        assert.equal(store.acquire("concurrent-first-use", "worker", 1_000, 1_000)?.epoch, 1);
       } finally { store.close(); }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
