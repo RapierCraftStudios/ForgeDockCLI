@@ -355,9 +355,11 @@ export async function recoverConflictingRevision(
     const published = await publishRemediationRevision({
       run,
       pullRequest: latestAfterVerify,
+      packet: input.packet,
       buildResult,
       workspace,
       expectedTargetHeadSha: targetSha,
+      verdict: input.verdict,
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     return { run: published.run, buildResult, pullRequest: published.pullRequest };
   } catch (error) {

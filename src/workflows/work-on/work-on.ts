@@ -272,7 +272,7 @@ export async function resumeTargetAdvanceWorkOn(
   const publishing = transition(run, "TARGET_ADVANCE_COMPLETED", { headSha: newHead });
   await dependencies.runs.commit(run.version, publishing.state, publishing.record);
   const published = pullRequest
-    ? await publishRemediationRevision({ run: publishing.state, pullRequest, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
+    ? await publishRemediationRevision({ run: publishing.state, pullRequest, packet: input.packet, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     })
     : await publishPullRequest({ run: publishing.state, intent: input.intent, packet: input.packet, buildResult: freshBuildResult, workspace }, {
@@ -1415,7 +1415,7 @@ async function continueBuildDelivery(
     run = remediationVerification.run;
     if (!remediationVerification.buildResult) return { run, pullRequest };
     buildResult = remediationVerification.buildResult;
-    const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+    const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
@@ -1574,7 +1574,7 @@ export async function resumeWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -1755,7 +1755,7 @@ export async function resumeReviewWorkOn(
     run = verified.run;
     if (!verified.buildResult) return { run, pullRequest };
     buildResult = verified.buildResult;
-    let revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+    let revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
@@ -1816,7 +1816,7 @@ export async function resumeReviewWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+      revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -2119,7 +2119,7 @@ export async function resumePublicationWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const revision = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -2395,7 +2395,7 @@ export async function resumeConflictRecoveryWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const published = await publishRemediationRevision({ run, pullRequest, buildResult, workspace: input.workspace }, {
+      const published = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
         git: dependencies.git,
         host: dependencies.host,
         runs: dependencies.runs,

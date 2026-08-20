@@ -454,6 +454,7 @@ describe("approved target-conflict recovery", () => {
     const retried = await publishRemediationRevision({
       run: resumed.state,
       pullRequest: { ...pullRequest, headSha: newSha },
+      packet: values.packet,
       buildResult,
       workspace: { ...workspace, baseSha: targetSha },
     }, { git, host, runs });

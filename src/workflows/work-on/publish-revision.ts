@@ -8,9 +8,10 @@ import { transition, type RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
+import { persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 
 export async function publishRemediationRevision(
-  input: { run: RunState; pullRequest: PullRequestSnapshot; buildResult: DurableArtifact<"BuildResult">; workspace: GitWorkspace; expectedTargetHeadSha?: string },
+  input: { run: RunState; pullRequest: PullRequestSnapshot; packet: DurableArtifact<"BuildPacket">; buildResult: DurableArtifact<"BuildResult">; workspace: GitWorkspace; expectedTargetHeadSha?: string; verdict?: DurableArtifact<"ReviewVerdict"> },
   dependencies: { git: GitWorkspaceManager; host: ForgeHost; runs: RunRepository; artifacts?: ArtifactRepository },
 ): Promise<{ run: RunState; pullRequest: PullRequestSnapshot }> {
   if (input.run.state !== "publishing") throw new Error(`Revision publication requires publishing state, found ${input.run.state}`);
@@ -51,6 +52,21 @@ export async function publishRemediationRevision(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof TargetBranchAdvancedError) {
+      // Persist target drift before changing the run state. The checkpoint is
+      // the durable recovery authority when this process dies after the fence.
+      await persistTargetAdvanceCheckpoint({
+        run,
+        packet: input.packet,
+        buildResult: input.buildResult,
+        workspace: input.workspace,
+        targetBranch: input.pullRequest.baseBranch,
+        observedTargetSha: error.observedBaseSha,
+        phase: "target-read",
+        ...(input.verdict ? { verdict: input.verdict } : {}),
+        ...(dependencies.artifacts ? { artifacts: dependencies.artifacts } : {}),
+      });
+    }
     const next = error instanceof TargetBranchAdvancedError ? transition(run, "TARGET_ADVANCE_DETECTED", { reason }) : transition(run, "FAIL", { reason });
     // Target movement is recoverable authority drift, never a terminal block.
     // The retained BuildResult/PR identity is re-admitted by target recovery.

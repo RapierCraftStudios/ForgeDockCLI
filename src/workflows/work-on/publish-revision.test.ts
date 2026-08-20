@@ -2,10 +2,10 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
-import { InMemoryRunRepository } from "../../core/ports/repositories.js";
+import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 
@@ -16,6 +16,12 @@ const stalePr: PullRequestSnapshot = {
   repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
   state: "OPEN", headSha: oldSha, headBranch: workspace.branch, baseBranch: "main",
 };
+
+function packetFor(run: ReturnType<typeof createRun>): ReturnType<typeof createArtifact<"BuildPacket">> {
+  return createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: {
+    scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["docs/a.md"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+  } });
+}
 
 class RevisionGit implements GitWorkspaceManager {
   pushes = 0;
@@ -71,7 +77,7 @@ describe("remediation revision publication", () => {
       },
     });
     const host = new LaggingPrHost();
-    const result = await publishRemediationRevision({ run, pullRequest: stalePr, buildResult, workspace }, {
+    const result = await publishRemediationRevision({ run, pullRequest: stalePr, packet: packetFor(run), buildResult, workspace }, {
       git: new RevisionGit(), host, runs,
     });
     assert.equal(result.run.state, "reviewing");
@@ -106,13 +112,19 @@ describe("remediation revision publication", () => {
     });
     const git = new RevisionGit();
     const host = new LaggingPrHost();
+    const artifacts = new InMemoryArtifactRepository();
     await assert.rejects(
-      publishRemediationRevision({ run, pullRequest: stalePr, buildResult, workspace: { ...workspace, baseSha: expectedBaseSha }, expectedTargetHeadSha: expectedBaseSha }, {
-        git, host, runs,
+      publishRemediationRevision({ run, pullRequest: stalePr, packet: packetFor(run), buildResult, workspace: { ...workspace, baseSha: expectedBaseSha }, expectedTargetHeadSha: expectedBaseSha }, {
+        git, host, runs, artifacts,
       }),
       /Target branch main advanced before publication/,
     );
     assert.equal(git.pushes, 0);
-    assert.equal((await runs.load(run.runId))?.state, "blocked");
+    assert.equal((await runs.load(run.runId))?.state, "target_recovery");
+    const checkpoints = (await artifacts.list(run.subject, "TargetAdvanceCheckpoint"))
+      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint");
+    assert.equal(checkpoints.length, 1);
+    assert.equal(checkpoints[0]?.payload.observedTargetSha, verifiedSha);
+    assert.equal(checkpoints[0]?.payload.phase, "target-read");
   });
 });
