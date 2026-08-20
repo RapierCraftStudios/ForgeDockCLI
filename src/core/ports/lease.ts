@@ -14,6 +14,9 @@ export interface Lease {
   continuity: "verified";
 }
 
+/** Read-only lease evidence; holder authority is intentionally excluded. */
+export type LeaseInspection = Omit<Lease, "token">;
+
 /**
  * Optional logical binding carried by a lease row. It is deliberately
  * separate from the secret holder token: recovery can identify which
@@ -66,7 +69,7 @@ export interface LeaseGuard {
 export interface LeaseRepository {
   acquire(itemId: string, owner: string, ttlMs: number, now?: number, options?: LeaseAcquisitionOptions): Lease | undefined;
   /** Read-only lease evidence for diagnostics and stale-controller reconciliation. */
-  inspect?(itemId: string, now?: number): Lease | undefined;
+  inspect?(itemId: string, now?: number): LeaseInspection | undefined;
   heartbeat(itemId: string, token: string, ttlMs: number, now?: number): Lease;
   release(itemId: string, token: string): boolean;
   guard(itemId: string, token: string, now?: () => number): LeaseGuard;
@@ -154,10 +157,15 @@ export class InMemoryLeaseRepository implements LeaseRepository {
     return { ...lease };
   }
 
+  // The concrete class retains the historical structural return type for
+  // source compatibility with older direct callers; runtime inspection is
+  // still redacted and the LeaseRepository boundary above is authoritative.
   inspect(itemId: string): Lease | undefined {
     this.#assertContinuity();
     const lease = this.#leases.get(itemId);
-    return lease ? { ...lease } : undefined;
+    if (!lease) return undefined;
+    const { token: _token, ...inspection } = lease;
+    return inspection as Lease;
   }
 
   heartbeat(itemId: string, token: string, ttlMs: number, now = Date.now()): Lease {

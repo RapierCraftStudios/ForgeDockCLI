@@ -466,14 +466,33 @@ describe("SQLite operational repositories", () => {
     }
   });
 
-  it("persists cross-process-style leases with stale recovery", () => {
+  it("redacts active and expired inspection while preserving authenticated stale recovery", () => {
     const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
     try {
-      const first = store.acquire("issue-9", "worker-a", 100, 1_000);
+      const first = store.acquire("issue-9", "worker-a", 100, 1_000, {
+        binding: "orchestration:dag-9:attempt:1:item:issue-9",
+      });
       assert.ok(first);
+      const active = store.inspect("issue-9");
+      assert.ok(active);
+      assert.equal(Object.hasOwn(active, "token"), false);
+      assert.equal(active.itemId, first.itemId);
+      assert.equal(active.owner, first.owner);
+      assert.equal(active.binding, first.binding);
+      assert.equal(active.epoch, first.epoch);
+      assert.equal(active.expiresAt, first.expiresAt);
       assert.equal(store.acquire("issue-9", "worker-b", 100, 1_050), undefined);
       assert.equal(store.heartbeat("issue-9", first.token, 100, 1_050).expiresAt, 1_150);
-      assert.equal(store.acquire("issue-9", "worker-b", 100, 1_151)?.owner, "worker-b");
+      const expired = store.inspect("issue-9");
+      assert.ok(expired);
+      assert.equal(Object.hasOwn(expired, "token"), false);
+      assert.equal(expired.binding, first.binding);
+      assert.equal(expired.heartbeatAt, 1_050);
+      const replacement = store.acquire("issue-9", "worker-b", 100, 1_151);
+      assert.equal(replacement?.owner, "worker-b");
+      assert.throws(() => store.heartbeat("issue-9", first.token, 100, 1_151), /another worker|stale/i);
+      assert.equal(store.heartbeat("issue-9", replacement!.token, 100, 1_151).owner, "worker-b");
+      assert.equal(store.release("issue-9", replacement!.token), true);
     } finally {
       store.close();
     }
@@ -490,7 +509,10 @@ describe("SQLite operational repositories", () => {
       assert.doesNotThrow(() => guard.assertValid());
       now = 1_100;
       assert.throws(() => guard.check(), /expired/i);
-      assert.equal(store.inspect("issue-guard")?.token, lease.token, "guard expiry must retain takeover evidence");
+      const inspection = store.inspect("issue-guard");
+      assert.ok(inspection, "guard expiry must retain takeover evidence");
+      assert.equal(Object.hasOwn(inspection, "token"), false);
+      assert.equal(inspection.itemId, "issue-guard");
       assert.equal(store.acquire("issue-guard", "worker-b", 100, now)?.owner, "worker-b");
     } finally {
       store.close();
