@@ -467,24 +467,23 @@ export type AgentReceiptSink = (receipt: AgentRunReceipt) => void | Promise<void
 
 /** Adds rebuildable telemetry without giving telemetry authority over workflow state. */
 /** Enforces aggregate controller budgets without making telemetry authoritative state. */
-export const DEFAULT_RUNTIME_BUDGET_LIMITS: Required<RuntimeBudgetLimits> = {
-  maxTotalTokens: 500_000,
-  maxCostUsd: 50,
-  maxTokensPerRun: 100_000,
-};
+export const DEFAULT_RUNTIME_BUDGET_LIMITS: RuntimeBudgetLimits = {};
 
 export function configuredRuntimeBudgetLimits(environment: NodeJS.ProcessEnv = process.env): RuntimeBudgetLimits {
-  const read = (name: string, fallback: number): number => {
+  const read = (name: string): number | undefined => {
     const raw = environment[name];
-    if (raw === undefined || raw.trim() === "") return fallback;
+    if (raw === undefined || raw.trim() === "") return undefined;
     const value = Number(raw);
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite number`);
     return value;
   };
+  const maxTotalTokens = read("FORGEDOCK_AGENT_MAX_TOTAL_TOKENS");
+  const maxCostUsd = read("FORGEDOCK_AGENT_MAX_COST_USD");
+  const maxTokensPerRun = read("FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN");
   return {
-    maxTotalTokens: read("FORGEDOCK_AGENT_MAX_TOTAL_TOKENS", DEFAULT_RUNTIME_BUDGET_LIMITS.maxTotalTokens),
-    maxCostUsd: read("FORGEDOCK_AGENT_MAX_COST_USD", DEFAULT_RUNTIME_BUDGET_LIMITS.maxCostUsd),
-    maxTokensPerRun: read("FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN", DEFAULT_RUNTIME_BUDGET_LIMITS.maxTokensPerRun),
+    ...(maxTotalTokens !== undefined ? { maxTotalTokens } : {}),
+    ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
+    ...(maxTokensPerRun !== undefined ? { maxTokensPerRun } : {}),
   };
 }
 

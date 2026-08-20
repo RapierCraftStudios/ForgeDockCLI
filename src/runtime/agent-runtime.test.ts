@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { FakeAgentRuntime } from "./fake-runtime.js";
-import { AgentBudgetExceededError, AgentRunError, BudgetedAgentRuntime, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForBuildPacket, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
+import { AgentBudgetExceededError, AgentRunError, BudgetedAgentRuntime, TelemetryAgentRuntime, configuredRuntimeBudgetLimits, createScopeManifestReceipt, scopeManifestFor, scopeManifestForBuildPacket, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
 import { summarizeControllerTiming, type AgentRunReceipt } from "../core/ports/telemetry.js";
 
 function task(id: string) {
@@ -82,6 +82,16 @@ test("reviewer scope receipts are whole-checkout read-only and tamper evident", 
   assert.deepEqual(receipt.scope, { readRoots: ["."], writeRoots: [], source: "issue-hints" });
   assert.deepEqual(validateScopeManifestReceipt(receipt), receipt);
   assert.throws(() => validateScopeManifestReceipt({ ...receipt, scopeDigest: "0".repeat(64) }), /does not match/);
+});
+
+test("runtime budgets are opt-in and parse only explicit positive limits", () => {
+  assert.deepEqual(configuredRuntimeBudgetLimits({}), {});
+  assert.deepEqual(configuredRuntimeBudgetLimits({
+    FORGEDOCK_AGENT_MAX_TOTAL_TOKENS: "750000",
+    FORGEDOCK_AGENT_MAX_COST_USD: "75.5",
+    FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN: "250000",
+  }), { maxTotalTokens: 750000, maxCostUsd: 75.5, maxTokensPerRun: 250000 });
+  assert.throws(() => configuredRuntimeBudgetLimits({ FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN: "0" }), /positive finite/);
 });
 
 test("budget runtime aggregates fulfilled receipts and blocks aggregate overflow", async () => {
