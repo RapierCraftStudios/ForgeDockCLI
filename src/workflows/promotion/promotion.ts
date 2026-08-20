@@ -14,6 +14,8 @@ import type {
 } from "../../core/ports/promotion.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult } from "../../core/ports/verification.js";
+import { resolveReviewCiConfig, type EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
+import { assessMergeAdmission, formatPullRequestCiBlock, requiredChecksMode } from "../review-pr/ci-policy.js";
 import { attachArtifact, createRun, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
 import { reviewPullRequest } from "../review-pr/review.js";
@@ -71,6 +73,7 @@ export interface PromotionInput {
   targetBranch?: string;
   configuredPromotionTarget?: string;
   configuredProductionTarget?: string;
+  ciPolicy?: EffectiveReviewCiConfig;
   cwd: string;
   verification: readonly Omit<VerificationCommand, "cwd">[];
   authorizeCreation?: boolean;
@@ -212,7 +215,7 @@ export async function promoteBranch(
     return advance(record, { phase: "cancelled", cancelledAt: new Date().toISOString(), cancellationReason: reason }, dependencies.promotions);
   }
   try {
-    const recovered = await recoverMergedPromotion(record, dependencies);
+    const recovered = await recoverMergedPromotion(record, dependencies, input.ciPolicy ?? resolveReviewCiConfig());
     if (recovered) return recovered;
     throwIfPollingAborted(input.signal, "Promotion merge-gate polling aborted");
     await assertFrozenRefs(record, dependencies.host);
@@ -521,7 +524,7 @@ type PromotionMergeObservation =
   | { status: "ready"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate }
   | { status: "pending"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate; reason: PromotionMergeGatePollProgress["reason"] }
   | { status: "blocked"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate; reason: string }
-  | { status: "merged"; pullRequest: PullRequestSnapshot };
+  | { status: "merged"; pullRequest: PullRequestSnapshot; gate: PullRequestMergeGate };
 
 async function mergePromotion(
   record: PromotionRecord,
@@ -532,7 +535,7 @@ async function mergePromotion(
   const pollIntervalMs = controllerPollInterval(input.mergeGatePollIntervalMs);
   let attempt = 0;
   while (true) {
-    const observation = await observePromotionMergeGate(record, dependencies.host, input.signal);
+    const observation = await observePromotionMergeGate(record, dependencies.host, input.signal, input.ciPolicy ?? resolveReviewCiConfig());
     if (observation.status === "merged") return completeMergedPromotion(record, observation.pullRequest, dependencies);
     if (observation.status === "blocked") {
       return blockPromotion(record, observation.reason, dependencies.promotions);
@@ -552,6 +555,7 @@ async function mergePromotion(
         record.pullRequest!.number,
         record.review!.headSha,
         record.targetBranch,
+        { requiredChecksMode: requiredChecksMode(input.ciPolicy ?? resolveReviewCiConfig(), record.targetBranch) },
       );
     } catch (error) {
       // A transport can report failure after GitHub accepted the merge. Re-read
@@ -562,7 +566,7 @@ async function mergePromotion(
 
       // Never classify a merge-command error from its text. Only a fresh typed
       // gate may turn it into pending/unknown or a terminal authority blocker.
-      const afterFailure = await observePromotionMergeGate(record, dependencies.host, input.signal);
+      const afterFailure = await observePromotionMergeGate(record, dependencies.host, input.signal, input.ciPolicy ?? resolveReviewCiConfig());
       if (afterFailure.status === "merged") return completeMergedPromotion(record, afterFailure.pullRequest, dependencies);
       if (afterFailure.status === "blocked") {
         if (promotionMergeGateAuthorityUnavailable(afterFailure.gate)) throw error;
@@ -588,15 +592,16 @@ async function observePromotionMergeGate(
   record: PromotionRecord,
   host: ForgeHost,
   signal?: AbortSignal,
+  policy?: EffectiveReviewCiConfig,
 ): Promise<PromotionMergeObservation> {
   throwIfPollingAborted(signal, "Promotion merge-gate polling aborted");
   const pullRequest = await readExactPromotionPullRequest(record, host);
-  if (pullRequest.state === "MERGED") return { status: "merged", pullRequest };
-  if (pullRequest.state !== "OPEN") {
-    throw new Error(`Promotion pull request #${pullRequest.number} is ${pullRequest.state}, expected OPEN`);
+  if (pullRequest.state !== "OPEN" && pullRequest.state !== "MERGED") {
+    throw new Error(`Promotion pull request #${pullRequest.number} is ${pullRequest.state}, expected OPEN or MERGED`);
   }
-  await assertFrozenRefs(record, host);
+  if (pullRequest.state !== "MERGED") await assertFrozenRefs(record, host);
   if (!host.getPullRequestMergeGate) throw new Error("Promotion merge requires authoritative GitHub merge-admission support");
+  const effectivePolicy = policy ?? resolveReviewCiConfig();
   const gate = await host.getPullRequestMergeGate(
     record.repository,
     pullRequest.number,
@@ -609,13 +614,19 @@ async function observePromotionMergeGate(
   // prevents a pending check result for one head from being stamped onto a
   // later incarnation of the same branch name.
   const revalidated = await readExactPromotionPullRequest(record, host);
-  if (revalidated.state === "MERGED") return { status: "merged", pullRequest: revalidated };
+  if (revalidated.state === "MERGED") {
+    const mergedAssessment = assessMergeAdmission(revalidated, gate, effectivePolicy);
+    if (!mergedAssessment.ready) {
+      return { status: "blocked", pullRequest: revalidated, gate, reason: `Promotion merge admission is blocked: ${formatPullRequestCiBlock(mergedAssessment, effectivePolicy.failureAction, "after")}` };
+    }
+    return { status: "merged", pullRequest: revalidated, gate };
+  }
   if (revalidated.state !== "OPEN") {
     throw new Error(`Promotion pull request #${revalidated.number} changed state while reading merge admission: ${revalidated.state}`);
   }
   await assertFrozenRefs(record, host);
 
-  const terminalReason = promotionMergeGateBlocker(gate);
+  const terminalReason = promotionMergeGateBlocker(gate, revalidated, effectivePolicy);
   if (terminalReason) return { status: "blocked", pullRequest: revalidated, gate, reason: terminalReason };
   const transientReason = promotionMergeGatePendingReason(gate);
   if (transientReason) return { status: "pending", pullRequest: revalidated, gate, reason: transientReason };
@@ -638,26 +649,10 @@ async function pollPromotionMergeGate(
   );
 }
 
-function promotionMergeGateBlocker(gate: PullRequestMergeGate): string | undefined {
-  if (gate.requiredChecksProvenance !== "github-required"
-    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
-    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: required checks are not immutably bound to ${gate.headSha}`;
-  }
-  if (gate.requiredChecks.length === 0) {
-    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: required-checks=unavailable`;
-  }
-  const mergeability = pullRequestMergeability(gate);
-  if (mergeability === "conflicting") {
-    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: mergeability=conflicting${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
-  }
-  if (mergeability === "unavailable") {
-    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: mergeability=unavailable${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
-  }
-  const terminalChecks = gate.requiredChecks.filter((check) => ["failed", "cancelled", "unavailable"].includes(check.state));
-  if (terminalChecks.length) {
-    return `Promotion merge admission is blocked for PR #${gate.pullRequest}: ${terminalChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`;
-  }
-  return undefined;
+function promotionMergeGateBlocker(gate: PullRequestMergeGate, pullRequest: PullRequestSnapshot, policy: EffectiveReviewCiConfig): string | undefined {
+  const assessment = assessMergeAdmission(pullRequest, gate, policy);
+  if (assessment.pending.length || pullRequestMergeability(gate) === "unknown") return undefined;
+  return assessment.ready ? undefined : `Promotion merge admission is blocked: ${formatPullRequestCiBlock(assessment, policy.failureAction, "after")}`;
 }
 
 function promotionMergeGateAuthorityUnavailable(gate: PullRequestMergeGate): boolean {
@@ -743,13 +738,17 @@ async function completeMergedPromotion(
 async function recoverMergedPromotion(
   record: PromotionRecord,
   dependencies: PromotionDependencies,
+  policy: EffectiveReviewCiConfig,
 ): Promise<PromotionRecord | undefined> {
   const awaitingMerge = record.phase === "awaiting-merge"
     || (record.phase === "failed" && record.resumePhase === "awaiting-merge");
   if (!awaitingMerge || !record.pullRequest || !record.review) return undefined;
   const pullRequest = await readExactPromotionPullRequest(record, dependencies.host);
   if (pullRequest.state !== "MERGED") return undefined;
-  return completeMergedPromotion(record, pullRequest, dependencies);
+  const observation = await observePromotionMergeGate(record, dependencies.host, undefined, policy);
+  if (observation.status === "blocked") return blockPromotion(record, observation.reason, dependencies.promotions);
+  if (observation.status !== "merged") return undefined;
+  return completeMergedPromotion(record, observation.pullRequest, dependencies);
 }
 
 async function blockPromotion(

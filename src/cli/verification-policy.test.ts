@@ -34,6 +34,7 @@ describe("verification policy discovery", () => {
     const commands = discoverVerificationCommands(repo, "HEAD");
     assert.deepEqual(commands.map(({ id }) => id), ["diff-check"]);
     assert.equal(commands[0]?.selection, "always");
+    assert.equal(commands[0]?.evidenceCapability, "generic");
   });
 
   it("keeps broad lint and documentation scripts out of ordinary issue execution", () => {
@@ -103,10 +104,12 @@ describe("verification policy discovery", () => {
     }, catalog, "a".repeat(40));
     assert.deepEqual(plan.map(({ id }) => id), ["diff-check", "build", "test"]);
     assert.equal(plan.find(({ id }) => id === "build")?.command, process.execPath);
+    assert.equal(plan.find(({ id }) => id === "build")?.evidenceCapability, "generic");
     assert.deepEqual(plan.find(({ id }) => id === "build")?.args, [
       "node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--outDir", ".forgedock/verification-dist",
     ]);
     assert.deepEqual(plan.find(({ id }) => id === "test")?.targets, [".forgedock/verification-dist/feature.test.js"]);
+    assert.equal(plan.find(({ id }) => id === "test")?.evidenceCapability, "targeted-test");
     assert.deepEqual(plan.find(({ id }) => id === "test")?.args.slice(-1), [".forgedock/verification-dist/feature.test.js"]);
     assert.equal(plan.some(({ id }) => id === "docs:build" || id === "lint"), false);
     assert.ok(plan.every(({ policyVersion, planId }) => policyVersion === "forgedock.verification/v2" && Boolean(planId)));

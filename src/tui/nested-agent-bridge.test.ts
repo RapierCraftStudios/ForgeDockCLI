@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -67,6 +70,11 @@ test("controller reviewer tasks use the child-safe nested delegation protocol", 
   const events = new FakeEvents();
   const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
   try {
+    const health = await fetch(bridge.env.FORGEDOCK_NESTED_AGENT_HEALTH_URL!, {
+      headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}` },
+    });
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true, owner: "forgedock" });
     const response = await fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
       method: "POST",
       headers: {
@@ -206,6 +214,35 @@ test("nested reviewer scope receipts fail closed on omission, tampering, or narr
   }
 });
 
+test("nested bridge confines reviewer cwd to canonical trusted roots", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-bridge-roots-"));
+  const managed = join(root, "managed");
+  const valid = join(managed, "review");
+  const escape = join(root, "escape");
+  mkdirSync(valid, { recursive: true });
+  symlinkSync("/etc", escape, "dir");
+  const events = new FakeEvents();
+  const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI, { allowedRoots: [managed] });
+  const base = {
+    ownerRunId: "run-path", id: "run-path:review:abc:security", role: "reviewer",
+    objective: "Review", instructions: "Read only", context: [],
+    ...REVIEWER_SCOPE, tools: ["read"], outputSchema: { type: "object" }, provider: "openai-codex", model: "gpt-test",
+  };
+  const post = (cwd: string) => fetch(bridge.env.FORGEDOCK_NESTED_AGENT_URL!, {
+    method: "POST",
+    headers: { authorization: `Bearer ${bridge.env.FORGEDOCK_NESTED_AGENT_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ ...base, cwd }),
+  });
+  try {
+    assert.equal((await post(valid)).status, 200);
+    assert.equal((await post("/etc")).status, 500);
+    assert.equal((await post(join(managed, "missing"))).status, 500);
+    assert.equal((await post(escape)).status, 500);
+  } finally {
+    await bridge.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 test("incomplete persisted reviewers are resumed through the package-owned RPC lifecycle", async () => {
   const events = new FakeEvents();
   const bridge = await startNestedAgentBridge({ events } as unknown as ExtensionAPI);
@@ -244,6 +281,7 @@ test("incomplete persisted reviewers are resumed through the package-owned RPC l
     await bridge.close();
   }
 });
+
 
 test("a resumed reviewer may recover an exact schema-valid terminal JSON report", async () => {
   const events = new FakeEvents();

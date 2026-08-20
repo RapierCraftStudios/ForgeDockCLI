@@ -1,14 +1,47 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "pi-subagents");
-const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-if (manifest.version !== "0.40.0") {
-  throw new Error(`ForgeDock visibility patch expects pi-subagents 0.40.0, found ${manifest.version}`);
+function assertRegularPath(file, label) {
+  const resolved = resolve(file);
+  if (realpathSync(resolved) !== resolved) throw new Error(`${label} must not be a symlink: ${file}`);
+  const metadata = lstatSync(resolved);
+  if (!metadata.isFile() && resolved !== root) throw new Error(`${label} must be a regular file: ${file}`);
+  if (resolved === root && !metadata.isDirectory()) throw new Error(`${label} must be a regular directory: ${file}`);
+  if (worktreeRoot) {
+    const worktreeReal = realpathSync(worktreeRoot);
+    const targetReal = realpathSync(resolved);
+    const path = relative(worktreeReal, targetReal);
+    if (path.startsWith("..") || resolve(path) === resolve(".")) {
+      throw new Error(`${label} escapes the prepared worktree: ${file}`);
+    }
+  }
+}
+
+const requestedWorktree = process.argv[2] === "--worktree" ? process.argv[3] : undefined;
+if (process.argv[2] === "--worktree" && !requestedWorktree) {
+  throw new Error("ForgeDock visibility patch requires a worktree path");
+}
+const root = requestedWorktree
+  ? resolve(requestedWorktree, "node_modules", "pi-subagents")
+  : join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "pi-subagents");
+const worktreeRoot = requestedWorktree ? resolve(requestedWorktree) : undefined;
+if (worktreeRoot) {
+  const relativeRoot = relative(worktreeRoot, root);
+  if (relativeRoot.startsWith("..") || resolve(relativeRoot) === resolve(".")) {
+    throw new Error(`ForgeDock visibility patch target escapes the prepared worktree: ${root}`);
+  }
+}
+if (requestedWorktree && !existsSync(root)) process.exit(0);
+assertRegularPath(root, "pi-subagents package root");
+const manifestPath = join(root, "package.json");
+assertRegularPath(manifestPath, "pi-subagents package manifest");
+const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+if (manifest.name !== "pi-subagents" || manifest.version !== "0.40.0") {
+  throw new Error(`ForgeDock visibility patch expects pi-subagents 0.40.0, found ${manifest.name ?? "unknown"} ${manifest.version ?? "unknown"}`);
 }
 
 patch(join(root, "src", "shared", "child-transcript.ts"), [
@@ -71,13 +104,14 @@ patch(join(root, "src", "runs", "foreground", "execution.ts"), [
   ],
 ]);
 
-// The hard budget blocks only additional read/search probes. A reviewer that
-// then submits schema-valid structured output has converged successfully; do
-// not discard that result merely because one final probe was denied.
-patch(join(root, "src", "slash", "delegation-adapters.ts"), [[
-  'if (child?.toolBudgetBlocked) return "tool_budget_exhausted";',
+// Upstream treats a blocked child tool budget as an operational failure even
+// when the child also captured structured output. Keep that fail-closed signal
+// intact so a reviewer can never turn an unexpected runtime budget block into
+// a completed delegation.
+patchAny(join(root, "src", "slash", "delegation-adapters.ts"), [
   'if (child?.toolBudgetBlocked && child?.structuredOutput === undefined) return "tool_budget_exhausted";',
-]]);
+  'if (child?.toolBudgetBlocked) return "tool_budget_exhausted";',
+], 'if (child?.toolBudgetBlocked) return "tool_budget_exhausted";');
 
 // ForgeDock's typed review controller, not the interactive parent model, owns
 // scope classification and reviewer synthesis. Do not inject the generic
@@ -317,6 +351,7 @@ patch(join(root, "src", "tui", "fleet-status.ts"), [
 ]);
 
 function patch(file, replacements) {
+  assertRegularPath(file, "pinned pi-subagents source file");
   let source = readFileSync(file, "utf8");
   let changed = false;
   for (const [before, after, appliedMarker = after] of replacements) {
@@ -328,16 +363,22 @@ function patch(file, replacements) {
     const count = source.split(before).length - 1;
     if (count !== 1) throw new Error(`ForgeDock visibility patch could not find one expected block in ${file}; found ${count}`);
     source = source.replace(before, after);
+    if (!source.includes(appliedMarker)) throw new Error(`ForgeDock visibility patch did not produce its expected output in ${file}`);
     changed = true;
   }
-  if (changed) writeFileSync(file, source, "utf8");
+  if (changed) {
+    assertRegularPath(file, "pinned pi-subagents source file");
+    writeFileSync(file, source, "utf8");
+  }
 }
 
 function patchAny(file, candidates, after) {
+  assertRegularPath(file, "pinned pi-subagents source file");
   let source = readFileSync(file, "utf8");
   if (source.includes(after)) return;
   const matches = candidates.filter((candidate) => source.includes(candidate));
   if (matches.length !== 1) throw new Error(`ForgeDock visibility patch could not find one supported block in ${file}; found ${matches.length}`);
   source = source.replace(matches[0], after);
+  assertRegularPath(file, "pinned pi-subagents source file");
   writeFileSync(file, source, "utf8");
 }

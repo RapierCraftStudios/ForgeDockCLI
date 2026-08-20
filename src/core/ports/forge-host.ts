@@ -203,7 +203,7 @@ export interface PullRequestMergeGateOptions {
   refreshUnknown?: boolean;
 }
 
-export type PullRequestRequiredChecksProvenance = "github-required" | "unavailable";
+export type PullRequestRequiredChecksProvenance = "github-required" | "github-none" | "unavailable";
 
 export interface PullRequestMergeGate {
   repo: string;
@@ -244,6 +244,26 @@ export function pullRequestMergeability(gate: Pick<PullRequestMergeGate, "mergea
 }
 
 export interface PullRequestCheckDiagnostic { name: string; state: PullRequestMergeGate["requiredChecks"][number]["state"]; detailsUrl?: string; logExcerpt: string; }
+
+export interface RepositoryResetHost {
+  listIssueCommentSnapshots(subject: { repo: string; issue?: number; pr?: number }): Promise<readonly {
+    id?: number;
+    author: string;
+    createdAt: string;
+    body: string;
+    url?: string;
+    containsArtifact: boolean;
+  }[]>;
+  deleteIssueComment(repo: string, commentId: number): Promise<void>;
+  closePullRequest(repo: string, number: number, reason: string): Promise<void>;
+  deleteExactRemoteRef(repo: string, ref: string, expectedSha: string): Promise<void>;
+  listLabelEvents(repo: string, issue: number): Promise<readonly {
+    name: string;
+    action: "labeled" | "unlabeled";
+    occurredAt: string;
+    eventId: number;
+  }[]>;
+}
 
 export interface ForgeHost {
   getIssue?(number: number, repo?: string): Promise<IssueSnapshot>;
@@ -358,7 +378,7 @@ export interface ForgeHost {
     publicationFence: ReviewFindingPublicationFence;
     activeFindings: readonly ReviewFindingInput[];
   }): Promise<readonly number[]>;
-  mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void>;
+  mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string, options?: { requiredChecksMode?: "require" | "if-present" }): Promise<void>;
   /** Request closure; the controller independently re-reads getIssue before terminal publication. */
   closeIssue(repo: string, number: number, reason: string): Promise<void>;
 }

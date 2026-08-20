@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
+import { DEFAULT_REVIEW_CI } from "../../core/config/forgedock-config.js";
 import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
@@ -37,6 +38,7 @@ class CompletionHost implements ForgeHost {
   snapshot = { ...openPr };
   merges = 0;
   mergeBase?: string;
+  mergeOptions?: { requiredChecksMode?: "require" | "if-present" } | undefined;
   mergeGate: PullRequestMergeGate = {
     repo: "a/b", pullRequest: 9, headSha: sha, baseBranch: "main", mergeable: true,
     requiredChecksProvenance: "github-required",
@@ -50,9 +52,10 @@ class CompletionHost implements ForgeHost {
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
-  async mergePullRequest(_repo: string, _number: number, _head: string, base: string): Promise<void> {
+  async mergePullRequest(_repo: string, _number: number, _head: string, base: string, options?: { requiredChecksMode?: "require" | "if-present" }): Promise<void> {
     this.merges++;
     this.mergeBase = base;
+    this.mergeOptions = options;
     this.snapshot.state = "MERGED";
   }
   async closeIssue(_repo: string, issue: number): Promise<void> {
@@ -62,12 +65,12 @@ class CompletionHost implements ForgeHost {
   }
 }
 
-async function mergingRun(runs: InMemoryRunRepository, runId = `run_complete_${crypto.randomUUID()}`): Promise<RunState> {
+async function mergingRun(runs: InMemoryRunRepository, runId = `run_complete_${crypto.randomUUID()}`, targetBranch = "main"): Promise<RunState> {
   let run = createRun({
     workflow: "work-on",
     subject: { repo: "a/b", issue: 2 },
     runId,
-    target: { lane: "fast", targetBranch: "main" },
+    target: { lane: "fast", targetBranch },
   });
   await runs.create(run);
   for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED"] as TransitionEvent[]) {
@@ -522,6 +525,49 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
+  it("blocks auto-merge when GitHub reports an empty required-check projection", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeGate.requiredChecksProvenance = "github-none";
+    host.mergeGate.requiredChecks = [];
+    const result = await completeWorkItem({
+      run, pullRequest: openPr, verdict: verdict(run), autoMerge: true,
+      ciPolicy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "require", requiredChecksTargets: {} },
+    }, {
+      host, artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /GitHub reported no required checks for reviewed/);
+    assert.equal(result.outcome?.payload.mergeGate?.requiredChecksProvenance, "github-none");
+    assert.equal(result.awaitingHuman, false);
+    assert.equal(host.merges, 0);
+  });
+
+  it("accepts exact github-none checks under a staging if-present override", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs, undefined, "staging");
+    const host = new CompletionHost();
+    host.snapshot = { ...host.snapshot, baseBranch: "staging" };
+    host.mergeGate = {
+      ...host.mergeGate,
+      baseBranch: "staging",
+      requiredChecksProvenance: "github-none",
+      requiredChecksHeadSha: sha,
+      requiredChecks: [],
+    };
+    const result = await completeWorkItem({
+      run,
+      pullRequest: host.snapshot,
+      verdict: verdict(run),
+      autoMerge: true,
+      ciPolicy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "require", requiredChecksTargets: { staging: "if-present" } },
+    }, { host, artifacts: new InMemoryArtifactRepository(), runs });
+    assert.equal(result.run.state, "completed");
+    assert.equal(host.merges, 1);
+    assert.deepEqual(host.mergeOptions, { requiredChecksMode: "if-present" });
+  });
+
   it("fails closed when the exact PR head changes after the gate query", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
@@ -596,6 +642,23 @@ describe("merge and close authority", () => {
     );
     assert.equal(host.snapshot.state, "MERGED");
     assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
+  it("retains the closing checkpoint after transient closure exhaustion", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    Object.defineProperty(host, "closeIssue", { value: async () => { throw new Error("TLS handshake timeout"); } });
+    const artifacts = new InMemoryArtifactRepository();
+    let caught: unknown;
+    try {
+      await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal((caught as { recoverable?: boolean }).recoverable, true);
+    assert.equal((caught as { run?: RunState }).run?.state, "closing");
+    assert.equal((await runs.load(run.runId))?.state, "closing");
   });
 
   it("does not publish a terminal Outcome when issue closure fails after merge", async () => {

@@ -77,3 +77,21 @@ export function expandInvariantMatrix(row: InvariantMatrixRow, maximumCases = 12
   }
   return cases.map((values, index) => ({ id: `${row.testId}:case-${String(index + 1).padStart(3, "0")}`, values }));
 }
+
+/** Return every durable matrix test ID, including the row test and all expanded cases. */
+export function invariantMatrixCaseIds(rows: readonly InvariantMatrixRow[]): string[] {
+  return rows.flatMap((row) => [row.testId, ...expandInvariantMatrix(row).map(({ id }) => id)]);
+}
+
+/** Stable row/test/case identity projection used by evidence contracts. */
+export function invariantMatrixIdentities(rows: readonly InvariantMatrixRow[]): {
+  rowIds: string[];
+  testIds: string[];
+  caseIds: string[];
+} {
+  return {
+    rowIds: rows.map(({ id }) => id),
+    testIds: rows.map(({ testId }) => testId),
+    caseIds: rows.flatMap((row) => expandInvariantMatrix(row).map(({ id }) => id)),
+  };
+}

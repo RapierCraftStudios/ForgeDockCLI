@@ -7,6 +7,12 @@ export type CheckResult = Static<typeof CheckResultSchema>;
 
 export type VerificationLockScope = "machine-global" | "workspace";
 
+/** Safe, controller-owned meaning of a verification command's result. */
+export const VERIFICATION_EVIDENCE_CAPABILITIES = [
+  "generic", "targeted-test", "regression", "invariant", "path-bound",
+] as const;
+export type VerificationEvidenceCapability = typeof VERIFICATION_EVIDENCE_CAPABILITIES[number];
+
 export interface VerificationCommand {
   id: string;
   command: string;
@@ -32,6 +38,8 @@ export interface VerificationCommand {
   planId?: string;
   /** Commands covered transitively by another selected script; do not execute twice. */
   coveredBy?: readonly string[];
+  /** Optional explicit semantic classification owned by the controller catalog. */
+  evidenceCapability?: VerificationEvidenceCapability;
 }
 
 export type VerificationCommandProgress =

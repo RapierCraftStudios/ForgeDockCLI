@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { FakeAgentRuntime } from "./fake-runtime.js";
-import { AgentRunError, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
+import { AgentRunError, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForBuildPacket, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
 import { summarizeControllerTiming, type AgentRunReceipt } from "../core/ports/telemetry.js";
 
 function task(id: string) {
@@ -82,4 +82,14 @@ test("reviewer scope receipts are whole-checkout read-only and tamper evident", 
   assert.deepEqual(receipt.scope, { readRoots: ["."], writeRoots: [], source: "issue-hints" });
   assert.deepEqual(validateScopeManifestReceipt(receipt), receipt);
   assert.throws(() => validateScopeManifestReceipt({ ...receipt, scopeDigest: "0".repeat(64) }), /does not match/);
+});
+
+test("build packet evidence paths grant reads without broadening writes", () => {
+  const scope = scopeManifestForBuildPacket(["src/a.ts"], ["docs/review.ts", "package.json"]);
+  assert.deepEqual(scope.writePaths, ["src/a.ts"]);
+  assert.deepEqual(scope.writeRoots, []);
+  assert.ok(scope.readRoots.includes("src"));
+  assert.ok(scope.readRoots.includes("docs/review.ts"));
+  assert.equal(scope.readRoots.includes("docs"), false);
+  assert.ok(scope.readRoots.includes("package.json"));
 });

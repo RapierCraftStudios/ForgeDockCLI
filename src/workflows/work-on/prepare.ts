@@ -27,8 +27,11 @@ import {
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
-import { latestPriorLearningArtifacts, WorkflowExecutionError } from "./investigate.js";
+import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
+import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
+import { closeExpectedWriteScope } from "./scope-closure.js";
+import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic } from "../../core/artifacts/schema.js";
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
   & Partial<Omit<VerificationCommand, "cwd" | "id" | "command" | "args">>;
@@ -71,10 +74,11 @@ export async function prepareBuildPacket(
 ): Promise<{ run: RunState; packet: DurableArtifact<"BuildPacket">; sessionRef: string }> {
   if (input.run.state !== "preparing") throw new Error(`Build Packet requires preparing state, found ${input.run.state}`);
   let run = input.run;
-  let capabilityRepairAttempted = false;
+  let authorCorrectableAttempted = false;
   try {
     const affectedScope = [
       ...(input.scopeHints?.affectedFiles ?? []),
+      ...(input.scopeHints?.writePaths ?? []),
       ...input.investigation.payload.affectedSurfaces,
     ];
     const packetTask: AgentTask<BuildPacketPayload> = {
@@ -95,6 +99,12 @@ export async function prepareBuildPacket(
         "Allowed command IDs and controller gate IDs are supplied below. Unknown IDs, unfenced executable prose, and requirements that do not cover every acceptance criterion are rejected before the builder starts.",
         `Verification capabilities: ${JSON.stringify(projectVerificationCapabilities(input.verificationCatalog?.commands ?? []))}`,
         "Select only command IDs from the capability list. For targeted tests, expected paths must remain repository-relative TypeScript test files under the stated source root and extension set; the controller derives compiled output paths. Do not propose JavaScript/MJS paths for the TypeScript command, and do not invent a legacy command.",
+        ...(input.verificationCatalog ? [
+          `Frozen command requirements must use these exact IDs from the supplied catalog: ${input.verificationCatalog.commands.map(({ id }) => id).join(", ") || "(none)"}.`,
+        ] : []),
+        "expectedPaths are write authority only. evidencePaths are criterion-scoped read-only evidence declarations and never expand expectedPaths.",
+        "Use exact roles (implementation, source, test, invariant, artifact, generated, fixture, unchanged-boundary) and exact criterion IDs criterion-1, criterion-2, etc.; declare only paths visible through the approved read surfaces.",
+        "Use only safe command capabilities and exact catalog IDs; do not expose arbitrary executable authority beyond legacy fenced-plan compatibility.",
       ].join("\n"),
       context: [input.intent, input.investigation, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
       workspace: {
@@ -121,32 +131,61 @@ export async function prepareBuildPacket(
         ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
       },
     };
-    let result = await runPacketAuthorWithRecovery(dependencies.runtime, packetTask, {
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
-    });
-
-    let materialized;
-    try {
-      materialized = materializePacketOutput(result.output, input.verificationCatalog, input.scopeHints?.affectedFiles ?? []);
-    } catch (error) {
-      if (!isVerificationCapabilityMismatchError(error)) throw error;
-      capabilityRepairAttempted = true;
-      const repairTask: AgentTask<BuildPacketPayload> = {
+    let result!: AgentRunResult<BuildPacketPayload>;
+    let materialized: Awaited<ReturnType<typeof materializePacketOutput>>;
+    let repairDiagnostics: string[] = [];
+    for (let session = 0; session < 2; session += 1) {
+      const task = session === 0 ? packetTask : {
         ...packetTask,
-        id: `${packetTask.id}:capability-repair`,
+        id: `${packetTask.id}:${repairDiagnostics.some((diagnostic) => diagnostic.includes("capability-mismatch")) ? "capability-repair" : repairDiagnostics.some((diagnostic) => diagnostic.includes("submit_artifact")) ? "submit-retry" : "repair"}`,
         instructions: [
           packetTask.instructions,
-          `The previous packet selected verification capabilities that cannot safely execute: ${error.message}. This is the one bounded :capability-repair attempt. Preserve the packet evidence, correct only the verification selection and expected test paths to fit the supplied capabilities, then submit the complete schema-valid Build Packet exactly once.`,
+          `The shared retry budget permits one fresh repair session${repairDiagnostics.some((diagnostic) => diagnostic.includes("capability-mismatch")) ? " (one bounded :capability-repair attempt)" : ""}. This is the one bounded recovery attempt.`,
+          `COMPLETE diagnostics from the controller:\n${repairDiagnostics.join("\\n")}`,
+          `Safe capability contract:\n${JSON.stringify(projectVerificationCapabilities(input.verificationCatalog?.commands ?? []))}`,
         ].join("\n"),
       };
-      result = await runPacketAuthorWithRecovery(dependencies.runtime, repairTask, {
-        ...(input.signal !== undefined ? { signal: input.signal } : {}),
-        ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
-      });
-      materialized = materializePacketOutput(result.output, input.verificationCatalog, input.scopeHints?.affectedFiles ?? []);
+      try {
+        result = await dependencies.runtime.run(task, {
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+        });
+        materialized = await materializePacketOutput(
+          result.output,
+          input.verificationCatalog,
+          input.scopeHints?.affectedFiles ?? [],
+          input.investigation.payload.affectedSurfaces,
+          input.scopeHints?.metadataRoots ?? [],
+          input.scopeHints?.writePaths ?? [],
+          input.cwd,
+          input.scopeHints !== undefined,
+        );
+        break;
+      } catch (error) {
+        if (isVerificationCapabilityMismatchError(error)) {
+          error = new PacketAuthorCorrectableError([`[capability-mismatch] ${error.message}`]);
+        } else if (!(error instanceof PacketAuthorCorrectableError)
+          && error instanceof Error
+          && /ended without calling submit_artifact/i.test(error.message)) {
+          error = new PacketAuthorCorrectableError([`[submit_artifact] ${error.message}`]);
+        }
+        if (!isAuthorCorrectablePacketError(error)) throw error;
+        authorCorrectableAttempted = true;
+        repairDiagnostics = error.diagnostics;
+        if (session === 1) {
+          const grouped = repairDiagnostics.some((diagnostic) => diagnostic.includes("capability-mismatch"))
+            ? `Verification capability mismatch exhausted after bounded repair. Complete diagnostics:\n${repairDiagnostics.join("\\n")}`
+            : `Build Packet authoring exhausted after two sessions. Correctable diagnostics:\n${repairDiagnostics.join("\\n")}`;
+          const blockedState = await appendPreparationBlockedOutcome(run, grouped, dependencies);
+          throw new WorkflowExecutionError(grouped, blockedState, { cause: error });
+        }
+        if (error.directBlock) {
+          const blockedState = await appendPreparationBlockedOutcome(run, error.diagnostics.join("\\n"), dependencies);
+          throw new WorkflowExecutionError(error.diagnostics.join("\\n"), blockedState, { cause: error });
+        }
+      }
     }
-    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices } = materialized;
+    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths } = materialized!;
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
@@ -157,11 +196,13 @@ export async function prepareBuildPacket(
         expectedPaths,
         ...policyMetadata,
         ...(invariantMatrices.length ? { invariantMatrices } : {}),
+        ...(evidencePaths.length ? { evidencePaths } : {}),
+        ...(evidenceContract ? { evidenceContract } : {}),
       },
     });
     await dependencies.artifacts.append(packet);
     run = attachArtifact(run, "BuildPacket", packet.id);
-    const packetScopeManifest = scopeManifestForBuildPacket(expectedPaths);
+    const packetScopeManifest = scopeManifestForBuildPacket(expectedPaths, evidencePaths.map(({ path }) => path));
     const advanced = transition(run, "BUILD_PACKET_READY", {
       scopeManifest: packetScopeManifest,
     });
@@ -170,12 +211,12 @@ export async function prepareBuildPacket(
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
+    if (error instanceof WorkflowExecutionError) throw error;
     const reason = error instanceof Error ? error.message : String(error);
-    if (capabilityRepairAttempted && isVerificationCapabilityMismatchError(error)) {
-      const blockedReason = `Verification capability mismatch exhausted after bounded repair: ${reason}`;
-      const blocked = transition(run, "BLOCK", { reason: blockedReason });
-      await dependencies.runs.commit(run.version, blocked.state, blocked.record);
-      throw new WorkflowExecutionError(blockedReason, blocked.state, { cause: error });
+    if (authorCorrectableAttempted && isAuthorCorrectablePacketError(error)) {
+      const blockedReason = `Build Packet authoring exhausted after bounded repair: ${error.message}`;
+      const blockedState = await appendPreparationBlockedOutcome(run, blockedReason, dependencies);
+      throw new WorkflowExecutionError(blockedReason, blockedState, { cause: error });
     }
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_PREPARATION", { reason });
@@ -188,33 +229,216 @@ export async function prepareBuildPacket(
   }
 }
 
-function materializePacketOutput(
+class PacketAuthorCorrectableError extends Error {
+  readonly diagnostics: string[];
+  readonly directBlock: boolean;
+
+  constructor(diagnostics: string[], directBlock = false) {
+    super(diagnostics.join("\\n"));
+    this.name = "PacketAuthorCorrectableError";
+    this.diagnostics = diagnostics;
+    this.directBlock = directBlock;
+  }
+}
+
+function isAuthorCorrectablePacketError(error: unknown): error is PacketAuthorCorrectableError {
+  return error instanceof PacketAuthorCorrectableError;
+}
+
+async function appendPreparationBlockedOutcome(
+  run: RunState,
+  reason: string,
+  dependencies: { artifacts: ArtifactRepository; runs: RunRepository },
+): Promise<RunState> {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: run.runId,
+    subject: run.subject,
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: {
+      status: "blocked",
+      reason,
+      ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
+      ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
+      ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
+      childIssues: [],
+    },
+  }, { id: deterministicOutcomeId(run.runId, run.subject, `blocked:preparation:${reason}`) });
+  await dependencies.artifacts.append(outcome);
+  const attached = attachArtifact(run, "Outcome", outcome.id);
+  const blocked = transition(attached, "BLOCK", { reason });
+  await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+  return blocked.state;
+}
+
+function diagnosticText(diagnostic: VerificationEvidenceDiagnostic): string {
+  return `[${diagnostic.code}${diagnostic.criterionId ? ` ${diagnostic.criterionId}` : ""}] ${diagnostic.message}`;
+}
+
+function approvedEvidencePath(path: string, approved: ReadonlySet<string>): boolean {
+  return approved.has(path) || [...approved].some((root) =>
+    root !== "." && !root.includes(".") && path.startsWith(`${root}/`));
+}
+
+function canonicalizeEvidenceDeclarations(
+  declarations: readonly EvidencePathDeclaration[] | undefined,
+  criterionCount: number,
+  approved: ReadonlySet<string>,
+): { declarations: EvidencePathDeclaration[]; diagnostics: string[] } {
+  const diagnostics: string[] = [];
+  const result: EvidencePathDeclaration[] = [];
+  const criterionIds = new Set(Array.from({ length: criterionCount }, (_, index) => `criterion-${index + 1}`));
+  if ((declarations?.length ?? 0) > 64) diagnostics.push("[evidence-path-limit] Evidence paths are bounded to 64 declarations");
+  for (const declaration of (declarations ?? []).slice(0, 64)) {
+    let path: string;
+    try {
+      path = canonicalEvidencePath(declaration.path);
+    } catch (error) {
+      diagnostics.push(`[invalid-evidence-path] ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    const unknown = declaration.criterionIds.filter((id) => !criterionIds.has(id));
+    if (unknown.length) diagnostics.push(`[unknown-criterion] Evidence path '${path}' references unknown criterion(s): ${unknown.join(", ")}`);
+    if (!approvedEvidencePath(path, approved)) {
+      diagnostics.push(`[evidence-scope] Evidence path '${path}' is outside controller-approved read surfaces`);
+      continue;
+    }
+    const ids = [...new Set(declaration.criterionIds)].filter((id) => criterionIds.has(id));
+    if (!ids.length) continue;
+    result.push({ path, criterionIds: ids, role: declaration.role });
+  }
+  return { declarations: result, diagnostics };
+}
+
+async function materializePacketOutput(
   output: BuildPacketPayload,
   catalog: VerificationCatalog | undefined,
   affectedFiles: readonly string[],
-): {
+  investigationSurfaces: readonly string[] = [],
+  metadataPaths: readonly string[] = [],
+  controllerWriteHints: readonly string[] = [],
+  cwd = process.cwd(),
+  enforceScopeClosure = true,
+): Promise<{
   expectedPaths: string[];
-  controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "invariantMatrices">;
-  policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets"> | Record<string, never>;
+  evidencePaths: EvidencePathDeclaration[];
+  evidenceContract?: import("../../core/artifacts/schema.js").VerificationEvidenceContract;
+  controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "invariantMatrices" | "evidenceContract" | "evidencePaths">;
+  policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>;
   invariantMatrices: ReturnType<typeof deriveSecurityInvariantMatrices>;
-} {
-  if (!output.expectedPaths.length) throw new Error("Build Packet must declare at least one concrete expected path");
+}> {
+  if (!output.expectedPaths.length) throw new PacketAuthorCorrectableError(["[write-scope] Build Packet must declare at least one concrete expected path"]);
+  const criterionDuplicates = [...new Set(output.acceptanceCriteria.filter((criterion, index, criteria) => criteria.indexOf(criterion) !== index))];
+  if (criterionDuplicates.length) {
+    throw new PacketAuthorCorrectableError([
+      `[duplicate-acceptance-criteria] Build Packet acceptanceCriteria contains duplicate value(s): ${criterionDuplicates.join(", ")}`,
+    ]);
+  }
   const declaredPaths = canonicalizeConcreteScopePaths(affectedFiles.filter(isConcreteScopePath));
-  const expectedPaths = canonicalizeConcreteScopePaths([...output.expectedPaths, ...declaredPaths]);
+  const investigatedPaths = canonicalizeConcreteScopePaths(investigationSurfaces.filter(isConcreteScopePath));
+  const controllerPaths = canonicalizeConcreteScopePaths(controllerWriteHints.filter(isConcreteScopePath));
+  const closure = await closeExpectedWriteScope(output.expectedPaths, {
+    issueWriteHints: declaredPaths,
+    investigationWriteHints: enforceScopeClosure ? investigatedPaths : [],
+    controllerWriteHints: controllerPaths,
+    cwd,
+  });
+  // Packets authored before durable scope hints were introduced have no
+  // relation surface at all. Preserve their decode/prepare compatibility, but
+  // keep the strict closure whenever any investigation or controller surface
+  // is present (those surfaces must never silently authorize writes).
+  const legacyUnhinted = declaredPaths.length === 0
+    && (!enforceScopeClosure || investigatedPaths.length === 0)
+    && controllerPaths.length === 0;
+  if (closure.diagnostics.length && !legacyUnhinted) {
+    throw new PacketAuthorCorrectableError(closure.diagnostics);
+  }
+  const expectedPaths = legacyUnhinted
+    ? canonicalizeConcreteScopePaths(output.expectedPaths)
+    : closure.expectedPaths;
+  const approved = new Set<string>([
+    ...expectedPaths,
+    ...investigatedPaths,
+    ...declaredPaths,
+    ...controllerPaths,
+    ...scopeDiscoveryRoots([...expectedPaths, ...investigatedPaths, ...declaredPaths, ...controllerPaths]),
+    ...STANDARD_SCOPE_METADATA_ROOTS,
+    ...metadataPaths.filter(isConcreteScopePath),
+  ]);
+  const evidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
   const verifiedOutput = catalog && (catalog.commands.length > 0 || Boolean(output.verificationRequirements?.length))
     ? canonicalizePacketVerification(output, catalog)
     : output;
   const {
     verificationPolicyVersion: _untrustedPolicyVersion,
     verificationCommandTargets: _untrustedCommandTargets,
+    verificationCommandIdentities: _untrustedCommandIdentities,
     invariantMatrices: _untrustedInvariantMatrices,
+    evidenceContract: _untrustedEvidenceContract,
+    evidencePaths: _modelEvidencePaths,
     ...controllerVerifiedOutput
   } = verifiedOutput;
   const policyMetadata = catalog
     ? packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands)
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
-  return { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices };
+  if (!catalog) {
+    if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
+  }
+  // A policy-v2 packet is newly materialized controller authority. Missing
+  // capability metadata on any command that will execute is a catalog defect,
+  // not author input to repair; fail closed before persistence.
+  if (policyMetadata.verificationPolicyVersion === "forgedock.verification/v2") {
+    const missingCapabilities = selectedCatalogCommands(controllerVerifiedOutput, catalog.commands)
+      .filter((command) => command.evidenceCapability === undefined)
+      .map((command) => command.id);
+    if (missingCapabilities.length) {
+      throw new PacketAuthorCorrectableError([
+        `[missing-capability] Selected policy-v2 command(s) lack evidenceCapability metadata: ${missingCapabilities.join(", ")}`,
+      ], true);
+    }
+  }
+  // Evidence contracts are a v2 policy feature. Legacy and custom catalogs must
+  // retain their historical packet behavior rather than acquiring new semantic
+  // requirements merely because a catalog was supplied.
+  const selectedCommands = selectedCatalogCommands(controllerVerifiedOutput, catalog.commands);
+  const hasExplicitEvidenceCapabilities = selectedCommands.every((command) => command.evidenceCapability !== undefined);
+  if (policyMetadata.verificationPolicyVersion !== "forgedock.verification/v2" || !hasExplicitEvidenceCapabilities) {
+    if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
+  }
+  const targetById = new Map((policyMetadata.verificationCommandTargets ?? []).map(({ id, targets }) => [id, targets]));
+  const projectedCommands = projectVerificationCapabilities(catalog.commands).map((capability) => ({
+    ...capability,
+    // Projection is controller-owned: every command has explicit semantic metadata and exact derived targets.
+    evidenceCapability: catalog.commands.find(({ id }) => id === capability.id)?.evidenceCapability ?? "generic",
+    targets: targetById.get(capability.id) ?? [],
+  }));
+  const derivationInput: EvidenceContractInput = {
+    acceptanceCriteria: controllerVerifiedOutput.acceptanceCriteria,
+    ...(controllerVerifiedOutput.verificationRequirements ? { verificationRequirements: controllerVerifiedOutput.verificationRequirements } : {}),
+    controllerGates: catalog.controllerGates,
+    commands: projectedCommands,
+    invariantMatrices,
+    expectedPaths,
+    evidencePaths: evidence.declarations,
+  };
+  const derivation = deriveEvidenceContract(derivationInput);
+  const diagnostics = [...evidence.diagnostics, ...derivation.diagnostics.map(diagnosticText)];
+  if (diagnostics.length) {
+    const semanticAvailable = catalog.commands.some((command) => command.evidenceCapability !== undefined && command.evidenceCapability !== "generic");
+    const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
+    throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
+  }
+  return {
+    expectedPaths,
+    evidencePaths: evidence.declarations,
+    evidenceContract: derivation.contract,
+    controllerVerifiedOutput,
+    policyMetadata,
+    invariantMatrices,
+  };
 }
 
 function canonicalizePacketVerification(
@@ -227,15 +451,15 @@ function canonicalizePacketVerification(
   const requirements: VerificationRequirement[] = output.verificationRequirements?.length
     ? output.verificationRequirements.map((requirement) => {
       if (!requirement.criterionIds.every((id) => criterionIds.includes(id))) {
-        throw new Error(`Build Packet verification requirement ${requirement.id} references an unknown acceptance criterion`);
+        throw new PacketAuthorCorrectableError([`[unknown-criterion] Build Packet verification requirement ${requirement.id} references an unknown acceptance criterion`]);
       }
       if (requirement.kind === "command" && !commandById.has(requirement.id)) {
-        throw new Error(`Build Packet verification requirement references unknown command ID '${requirement.id}'`);
+        throw new PacketAuthorCorrectableError([`[unknown-command] Build Packet verification requirement references unknown command ID '${requirement.id}'`]);
       }
       if (requirement.kind === "controller-gate") {
         const gateId = requirement.id as ControllerVerificationGate["id"];
         if (!gateById.has(gateId)) {
-          throw new Error(`Build Packet verification requirement references unknown controller gate ID '${requirement.id}'`);
+          throw new PacketAuthorCorrectableError([`[unknown-controller-gate] Build Packet verification requirement references unknown controller gate ID '${requirement.id}'`]);
         }
       }
       return {
@@ -253,14 +477,14 @@ function canonicalizePacketVerification(
       }
       const command = matchLegacyCommand(entry, catalog.commands);
       if (!command) {
-        throw new Error(`Build Packet verification plan contains unsupported or unfenced controller prose: ${entry}`);
+        throw new PacketAuthorCorrectableError([`[unsupported-verification] Build Packet verification plan contains unsupported or unfenced controller prose: ${entry}`]);
       }
       return { kind: "command" as const, id: command.id, criterionIds, rationale: "Legacy executable requirement canonicalized before dispatch." };
     });
 
   const covered = new Set(requirements.flatMap((requirement) => requirement.criterionIds));
   const missing = criterionIds.filter((id) => !covered.has(id));
-  if (missing.length) throw new Error(`Build Packet verification requirements do not cover ${missing.join(", ")}`);
+  if (missing.length) throw new PacketAuthorCorrectableError([`[missing-requirement] Build Packet verification requirements do not cover ${missing.join(", ")}`]);
   const canonicalGates = new Map((output.controllerGates ?? []).map((gate) => [gate.id, gate]));
   for (const requirement of requirements) {
     if (requirement.kind === "controller-gate") {
@@ -299,10 +523,23 @@ function matchLegacyCommand(
   }));
 }
 
+function selectedCatalogCommands(
+  packet: Pick<BuildPacketPayload, "verificationRequirements">,
+  catalog: readonly VerificationCatalogEntry[],
+): VerificationCatalogEntry[] {
+  const selectedIds = packet.verificationRequirements?.length
+    ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
+    : new Set(catalog.map((command) => command.id));
+  for (const command of catalog) {
+    if (command.selection === "always" || command.id === "diff-check") selectedIds.add(command.id);
+  }
+  return catalog.filter((command) => selectedIds.has(command.id));
+}
+
 function packetVerificationPolicyMetadata(
   packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements">,
   catalog: readonly VerificationCatalogEntry[],
-): Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets"> {
+): Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> {
   const selectedIds = packet.verificationRequirements?.length
     ? new Set(packet.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
     : new Set(catalog.map((command) => command.id));
@@ -323,12 +560,29 @@ function packetVerificationPolicyMetadata(
       id: command.id,
       targets: command.targeting === "expected-test-paths" ? expectedTestPaths : [],
     })),
+    verificationCommandIdentities: selected.map((command) => ({
+      id: command.id,
+      command: command.command,
+      args: [...command.args],
+      ...(command.evidenceCapability !== undefined ? { evidenceCapability: command.evidenceCapability } : {}),
+      ...(command.targeting !== undefined ? { targeting: command.targeting } : {}),
+      identityDigest: verificationCommandIdentityDigest(command),
+    })),
   };
 }
 
+function verificationCommandIdentityDigest(command: Pick<VerificationCommand, "command" | "args" | "evidenceCapability" | "targeting" | "policyVersion">): string {
+  return createHash("sha256").update(JSON.stringify({
+    command: command.command,
+    args: [...command.args],
+    evidenceCapability: command.evidenceCapability,
+    targeting: command.targeting,
+    policyVersion: command.policyVersion,
+  })).digest("hex");
+}
 /** Materialize the exact bounded command plan selected by one frozen packet. */
 export function selectPacketVerificationCommands(
-  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements" | "verificationPolicyVersion" | "verificationCommandTargets">,
+  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements" | "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> & Partial<Pick<BuildPacketPayload, "acceptanceCriteria" | "controllerGates" | "invariantMatrices" | "evidencePaths" | "evidenceContract">>,
   catalog: readonly Omit<VerificationCommand, "cwd">[],
   baseSha: string,
 ): Array<Omit<VerificationCommand, "cwd">> {
@@ -339,11 +593,25 @@ export function selectPacketVerificationCommands(
     commandById.set(command.id, command);
   }
 
+  for (const identity of packet.verificationCommandIdentities ?? []) {
+    const command = commandById.get(identity.id);
+    if (!command) throw new Error(`Frozen Build Packet references unavailable verification command '${identity.id}'`);
+    const expectedDigest = verificationCommandIdentityDigest(command);
+    if (identity.identityDigest !== expectedDigest
+      || identity.command !== command.command
+      || JSON.stringify(identity.args) !== JSON.stringify([...command.args])
+      || identity.evidenceCapability !== command.evidenceCapability
+      || identity.targeting !== command.targeting) {
+      throw new Error(`[command-drift] Frozen verification command '${identity.id}' executable identity or capability metadata differs from the current catalog`);
+    }
+  }
+
   for (const requirement of packet.verificationRequirements ?? []) {
     if (requirement.kind === "command" && !commandById.has(requirement.id)) {
       throw new Error(`Frozen Build Packet references unavailable verification command '${requirement.id}'`);
     }
   }
+
   const typedRequirements = packet.verificationRequirements;
   const selectedIds = typedRequirements?.length
     ? new Set(typedRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id))
@@ -356,13 +624,21 @@ export function selectPacketVerificationCommands(
   }
 
   const targetedCommands = catalog.filter((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
-  if (targetedCommands.length) validateVerificationTargetPaths(packet.expectedPaths, targetedCommands);
-  const expectedTestPaths = targetedCommands.length
-    ? resolveVerificationTargets(packet.expectedPaths, targetedCommands)
-    : [];
+  const hasFrozenEvidenceContract = packet.evidenceContract?.version === "forgedock.evidence/v1";
+  const selectionDiagnostics: string[] = [];
+  let expectedTestPaths: string[] = [];
+  try {
+    if (targetedCommands.length) validateVerificationTargetPaths(packet.expectedPaths, targetedCommands);
+    expectedTestPaths = targetedCommands.length
+      ? resolveVerificationTargets(packet.expectedPaths, targetedCommands)
+      : [];
+  } catch (error) {
+    if (!hasFrozenEvidenceContract) throw error;
+    selectionDiagnostics.push(`[target-drift] ${error instanceof Error ? error.message : String(error)}`);
+  }
   const targetedSelected = catalog.some((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
   if (typedRequirements?.length && expectedTestPaths.length && !targetedSelected) {
-    throw new Error("Build Packet declares expected test paths without selecting the targeted test command");
+    selectionDiagnostics.push("[target-drift] Build Packet declares expected test paths without selecting the targeted test command");
   }
 
   const selected = catalog.filter((command) => selectedIds.has(command.id)).map((command) => {
@@ -371,7 +647,10 @@ export function selectPacketVerificationCommands(
       throw new Error(`Verification command '${command.id}' has unsupported targeting policy`);
     }
     if (!expectedTestPaths.length && typedRequirements?.length) {
-      throw new Error(`Verification command '${command.id}' requires at least one expected test path`);
+      if (!hasFrozenEvidenceContract) {
+        throw new Error(`Verification command '${command.id}' requires at least one expected test path`);
+      }
+      selectionDiagnostics.push(`[target-drift] Verification command '${command.id}' requires at least one expected test path`);
     }
     return {
       ...command,
@@ -379,45 +658,70 @@ export function selectPacketVerificationCommands(
       targets: expectedTestPaths,
     };
   });
+  const policyDiagnostics: string[] = [];
   if (packet.verificationPolicyVersion) {
     const mismatched = selected.filter((command) => command.policyVersion !== packet.verificationPolicyVersion);
     if (mismatched.length) {
-      throw new Error(`Frozen verification policy ${packet.verificationPolicyVersion} does not match command(s): ${mismatched.map((command) => command.id).join(", ")}`);
+      policyDiagnostics.push(`[policy-mismatch] Frozen verification policy ${packet.verificationPolicyVersion} does not match command(s): ${mismatched.map((command) => command.id).join(", ")}`);
     }
   }
-  if (packet.verificationCommandTargets) {
-    const actualTargets = selected.map((command) => ({ id: command.id, targets: [...(command.targets ?? [])] }));
-    if (JSON.stringify(actualTargets) !== JSON.stringify(packet.verificationCommandTargets)) {
-      throw new Error("Frozen verification command targets do not match the executable packet-selected plan");
-    }
+  const actualTargets = selected.map((command) => ({ id: command.id, targets: [...(command.targets ?? [])] }));
+  if (packet.verificationCommandTargets
+    && JSON.stringify(actualTargets) !== JSON.stringify(packet.verificationCommandTargets)) {
+    policyDiagnostics.push("[target-drift] Frozen verification command targets do not match the executable packet-selected plan");
+  }
+  if (!hasFrozenEvidenceContract) {
+    if (selectionDiagnostics.length) throw new Error(selectionDiagnostics.join("\\n"));
+    if (policyDiagnostics.length) throw new Error(policyDiagnostics.join("\\n"));
   }
   if (selected.length && !selected.some((command) => command.required)) throw new Error("Selected verification plan has no required command");
+
+  let evidenceContractDigest: string | undefined;
+  if (hasFrozenEvidenceContract) {
+    const evidenceDiagnostics = [...selectionDiagnostics, ...policyDiagnostics];
+    for (const declaration of packet.evidencePaths ?? []) {
+      try {
+        canonicalEvidencePath(declaration.path);
+      } catch (error) {
+        evidenceDiagnostics.push(`[invalid-evidence-path] ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    for (const command of selected) {
+      if (command.evidenceCapability === undefined) {
+        evidenceDiagnostics.push(`[missing-capability] Selected command '${command.id}' has no evidenceCapability metadata`);
+      }
+    }
+    const actualContractInput: EvidenceContractInput = {
+      acceptanceCriteria: packet.acceptanceCriteria ?? [],
+      ...(packet.verificationRequirements ? { verificationRequirements: packet.verificationRequirements } : {}),
+      ...(packet.controllerGates ? { controllerGates: packet.controllerGates } : {}),
+      commands: selected.map(({ id, evidenceCapability, targets }) => ({
+        id,
+        ...(evidenceCapability !== undefined ? { evidenceCapability } : {}),
+        ...(targets !== undefined ? { targets } : {}),
+      })),
+      ...(packet.invariantMatrices ? { invariantMatrices: packet.invariantMatrices } : {}),
+      expectedPaths: packet.expectedPaths,
+      ...(packet.evidencePaths ? { evidencePaths: packet.evidencePaths } : {}),
+    };
+    const contractDiagnostics = validateEvidenceContract(packet.evidenceContract!, actualContractInput);
+    evidenceDiagnostics.push(...contractDiagnostics.map(diagnosticText));
+    evidenceContractDigest = createHash("sha256").update(JSON.stringify(packet.evidenceContract)).digest("hex");
+    if (evidenceDiagnostics.length) {
+      throw new Error([
+        "Evidence contract revalidation failed; executable verification plan was not authorized:",
+        ...evidenceDiagnostics.map((diagnostic) => `- ${diagnostic}`),
+        "Evidence-path existence at the requested base SHA cannot be validated here without workspace/cwd; integration must perform that read-only check.",
+      ].join("\\n"));
+    }
+  }
   const planId = createHash("sha256").update(JSON.stringify({
     baseSha: baseSha.toLowerCase(),
-    commands: selected.map(({ id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot }) => ({
-      id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot,
+    evidenceContractIdentity: packet.evidenceContract?.version,
+    evidenceContractDigest,
+    commands: selected.map(({ id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot, evidenceCapability }) => ({
+      id, command, args, timeoutMs, required, policyVersion, targets, lockScope, typescriptLayout, cleanOutputRoot, evidenceCapability,
     })),
   })).digest("hex").slice(0, 16);
   return selected.map((command) => ({ ...command, planId }));
-}
-
-async function runPacketAuthorWithRecovery(
-  runtime: AgentRuntime,
-  task: AgentTask<BuildPacketPayload>,
-  options: { signal?: AbortSignal; onEvent?: AgentEventSink },
-): Promise<AgentRunResult<BuildPacketPayload>> {
-  try {
-    return await runtime.run(task, options);
-  } catch (error) {
-    if (!(error instanceof Error) || !/ended without calling submit_artifact/i.test(error.message)) throw error;
-    const retryTask: AgentTask<BuildPacketPayload> = {
-      ...task,
-      id: `${task.id}:submit-retry`,
-      instructions: [
-        task.instructions,
-        "The previous packet-author session ended without calling submit_artifact. This is the one bounded recovery attempt; preserve the evidence already gathered, finish the schema-valid Build Packet, and call submit_artifact exactly once as your final action.",
-      ].join("\n"),
-    };
-    return runtime.run(retryTask, options);
-  }
 }

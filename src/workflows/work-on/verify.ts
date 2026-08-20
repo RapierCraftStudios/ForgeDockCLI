@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { createArtifact, type ControllerVerificationGate, type DurableArtifact } from "../../core/artifacts/schema.js";
+import { createArtifact, type ControllerVerificationGate, type DurableArtifact, type CriterionEvidenceAnchors, type VerificationEvidenceDiagnostic } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationCommandProgress, VerificationRunner } from "../../core/ports/verification.js";
@@ -12,6 +12,7 @@ import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import type { BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
+import { validateEvidenceContract } from "./evidence-contract.js";
 
 export interface VerificationResult {
   run: RunState;
@@ -26,6 +27,62 @@ class DeliveryContentLinkError extends Error {
     this.name = "DeliveryContentLinkError";
   }
 }
+
+export interface CommittedRepairVerification {
+  checks: CheckResult[];
+  changedPaths: string[];
+  verifiedContentDigest: string;
+}
+
+/**
+ * Re-verifies a controller-published repair without treating the repair agent
+ * as a builder. The proof is intentionally narrower than verifyAndCommit: the
+ * repair may only produce a non-merge child of the reviewed head, within the
+ * frozen packet scope, whose exact committed blobs and frozen checks pass.
+ */
+export async function verifyCommittedRepair(
+  input: {
+    packet: DurableArtifact<"BuildPacket">;
+    workspace: GitWorkspace;
+    expectedHeadSha: string;
+    parentHeadSha: string;
+    commands: readonly VerificationCommand[];
+    verifier: VerificationRunner;
+    signal?: AbortSignal;
+  },
+  git: GitWorkspaceManager,
+): Promise<CommittedRepairVerification> {
+  const headSha = await git.head(input.workspace);
+  if (headSha.toLowerCase() !== input.expectedHeadSha.toLowerCase()) {
+    throw new Error(`CI repair workspace head ${headSha} does not match expected published head ${input.expectedHeadSha}`);
+  }
+  if (headSha.toLowerCase() === input.parentHeadSha.toLowerCase()) {
+    throw new Error("CI repair published no committed child revision");
+  }
+  if (!git.commitParents) {
+    throw new Error("CI repair verification requires exact committed parent proof");
+  }
+  const parents = await git.commitParents(input.workspace);
+  if (parents.length !== 1 || parents[0]?.toLowerCase() !== input.parentHeadSha.toLowerCase()) {
+    throw new Error(`CI repair revision ${headSha} is not the exact non-merge child of ${input.parentHeadSha}`);
+  }
+  const changedPaths = canonicalizeConcreteScopePaths(await git.revisionChangedPaths(input.workspace)).sort();
+  if (!changedPaths.length) throw new Error("CI repair published an empty revision");
+  const expectedPaths = new Set(canonicalizeConcreteScopePaths(input.packet.payload.expectedPaths));
+  const outside = changedPaths.filter((path) => !expectedPaths.has(path));
+  if (outside.length) throw new Error(`CI repair changed paths outside the Build Packet: ${outside.join(", ")}`);
+  const before = await deliveryContentDigest(input.workspace.path, changedPaths);
+  const checks = await input.verifier.run(input.commands, input.signal);
+  const after = await deliveryContentDigest(input.workspace.path, changedPaths);
+  if (before !== after) throw new Error("CI repair verification commands changed controller-approved delivery content");
+  const failed = checks.filter((check) => check.status !== "passed");
+  if (failed.length) throw new Error(`CI repair packet verification failed: ${failed.map((check) => `${check.command}=${check.status}`).join(", ")}`);
+  if (!await git.committedContentMatches(input.workspace, changedPaths, after, headSha)) {
+    throw new Error("CI repair committed blobs do not match the controller-verified delivery content");
+  }
+  return { checks, changedPaths, verifiedContentDigest: after };
+}
+
 
 export async function verifyAndCommit(
   input: {
@@ -51,7 +108,8 @@ export async function verifyAndCommit(
     reason: string,
     checks: CheckResult[],
     changedPaths: string[],
-    failureKind?: "builder-semantic-evidence" | "builder-report" | "required-check" | "scope" | "verification-mutation",
+    failureKind?: "builder-semantic-evidence" | "builder-report" | "required-check" | "scope" | "verification-mutation" | "packet-contract",
+    diagnostics?: readonly VerificationEvidenceDiagnostic[],
   ): Promise<VerificationResult> => {
     const outcome = createArtifact({
       kind: "Outcome",
@@ -77,6 +135,7 @@ export async function verifyAndCommit(
           decisions: input.submission.decisions,
           residualRisks: input.submission.residualRisks,
           checks,
+          ...(diagnostics?.length ? { diagnostics: [...diagnostics] } : {}),
         },
       },
     });
@@ -127,46 +186,80 @@ export async function verifyAndCommit(
         : undefined;
 
     const frozenCriteria = input.packet.payload.acceptanceCriteria;
+    const criterionIds = frozenCriteria.map((_, index) => `criterion-${index + 1}`);
     const criterionById = new Map<string, string>(
-      frozenCriteria.map((criterion, index) => [`criterion-${index + 1}`, criterion] as const),
+      frozenCriteria.map((criterion, index) => [criterionIds[index]!, criterion] as const),
     );
-    const resolvedCoverage = input.submission.criterionCoverage.map((coverage) => ({
-      coverage,
-      criterion: coverage.criterionId === undefined
-        ? coverage.criterion
-        : criterionById.get(coverage.criterionId),
-    }));
+    // Stable IDs are authoritative whenever present. Omitted IDs are retained
+    // only for old builder packets, and can be resolved by exact text when that
+    // text identifies one (and only one) frozen criterion. In particular, a
+    // duplicate acceptance string must never silently select the first entry.
+    const resolvedCoverage = input.submission.criterionCoverage.map((coverage) => {
+      if (coverage.criterionId !== undefined) {
+        const criterion = criterionById.get(coverage.criterionId);
+        return { coverage: { ...coverage }, criterionId: coverage.criterionId, criterion };
+      }
+      const matches = criterionIds.filter((id) => criterionById.get(id) === coverage.criterion);
+      if (matches.length !== 1) return { coverage: { ...coverage }, criterionId: undefined, criterion: coverage.criterion };
+      const criterionId = matches[0]!;
+      return {
+        coverage: { ...coverage, criterionId },
+        criterionId,
+        criterion: criterionById.get(criterionId),
+      };
+    });
     const coverageCounts = new Map<string, number>();
     for (const resolved of resolvedCoverage) {
-      if (resolved.criterion !== undefined) {
-        coverageCounts.set(resolved.criterion, (coverageCounts.get(resolved.criterion) ?? 0) + 1);
+      if (resolved.criterionId !== undefined && criterionById.has(resolved.criterionId)) {
+        coverageCounts.set(resolved.criterionId, (coverageCounts.get(resolved.criterionId) ?? 0) + 1);
       }
     }
-    const missingCoverage = frozenCriteria.filter((criterion) => !coverageCounts.has(criterion));
-    const duplicateCoverage = frozenCriteria.filter((criterion) => (coverageCounts.get(criterion) ?? 0) > 1);
+    const missingCoverage = criterionIds.filter((criterionId) => !coverageCounts.has(criterionId));
+    const duplicateCoverage = criterionIds.filter((criterionId) => (coverageCounts.get(criterionId) ?? 0) > 1);
     const unknownCoverage = resolvedCoverage
-      .filter((resolved) => resolved.criterion === undefined || !frozenCriteria.includes(resolved.criterion))
+      .filter((resolved) => resolved.criterionId === undefined || !criterionById.has(resolved.criterionId)
+        || criterionById.get(resolved.criterionId) !== resolved.coverage.criterion)
       .map(({ coverage }) => coverage.criterionId ? `${coverage.criterionId} (${coverage.criterion})` : coverage.criterion);
     const coverageFailure = missingCoverage.length || duplicateCoverage.length || unknownCoverage.length
-      ? `Builder criterion coverage is incomplete:${missingCoverage.length ? ` missing ${missingCoverage.join(" | ")}` : ""}${duplicateCoverage.length ? ` duplicated ${duplicateCoverage.join(" | ")}` : ""}${unknownCoverage.length ? ` unknown ${unknownCoverage.join(" | ")}` : ""}`
+      ? `Builder criterion coverage is incomplete:${missingCoverage.length ? ` missing ${missingCoverage.map((id) => `${id} (${criterionById.get(id)})`).join(" | ")}` : ""}${duplicateCoverage.length ? ` duplicated ${duplicateCoverage.map((id) => `${id} (${criterionById.get(id)})`).join(" | ")}` : ""}${unknownCoverage.length ? ` unknown ${unknownCoverage.join(" | ")}` : ""}`
       : undefined;
     const strictSemanticEvidence = usesStrictSemanticEvidence(input.packet);
-    const anchorPreflightFailure = coverageFailure || !strictSemanticEvidence ? undefined : criterionAnchorPreflightFailure({
+    const hasEvidenceContract = input.packet.payload.evidenceContract?.version === "forgedock.evidence/v1";
+    const contractValidationDiagnostics = hasEvidenceContract
+      ? validateEvidenceContract(input.packet.payload.evidenceContract!, {
+        acceptanceCriteria: input.packet.payload.acceptanceCriteria,
+        ...(input.packet.payload.verificationRequirements ? { verificationRequirements: input.packet.payload.verificationRequirements } : {}),
+        ...(input.packet.payload.controllerGates ? { controllerGates: input.packet.payload.controllerGates } : {}),
+        expectedPaths: input.packet.payload.expectedPaths,
+        ...(input.packet.payload.evidencePaths ? { evidencePaths: input.packet.payload.evidencePaths } : {}),
+        ...(input.packet.payload.invariantMatrices ? { invariantMatrices: input.packet.payload.invariantMatrices } : {}),
+        commands: input.commands,
+      })
+      : [];
+    const contractBuilderDiagnostics = hasEvidenceContract
+      ? collectContractStructuralDiagnostics({ packet: input.packet, coverage: resolvedCoverage.map(({ coverage }) => coverage), commands: input.commands })
+      : [];
+    const contractDiagnostics = [...contractValidationDiagnostics, ...contractBuilderDiagnostics];
+    const contractFailure = contractDiagnostics.length
+      ? `Builder evidence contract preflight failed: ${contractDiagnostics.map((item) => `[${item.code}${item.criterionId ? ` ${item.criterionId}` : ""}] ${item.message}`).join("; ")}`
+      : undefined;
+    const anchorPreflightFailure = coverageFailure || !strictSemanticEvidence || hasEvidenceContract ? undefined : criterionAnchorPreflightFailure({
       packet: input.packet,
-      coverage: resolvedCoverage.map(({ coverage }, index) => ({ ...coverage, criterionId: coverage.criterionId ?? `criterion-${index + 1}` })),
+      coverage: resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })),
       commands: input.commands,
       allowedPaths: [...expectedPaths],
     });
 
-    const preflightFailure = unexpected.length
-      ? `Delivery revision contains paths outside the Build Packet: ${unexpected.join(", ")}`
-      : !changedPaths.length
-        ? "Builder produced no repository changes"
-        : uncoveredPlan.length
-          ? `Frozen verification plan is not covered by controller-approved commands: ${uncoveredPlan.join(", ")}`
-          : !input.commands.some((command) => command.required)
-            ? "No required verification commands were configured"
-            : changeReportFailure ?? coverageFailure;
+    const preflightFailure = contractFailure
+      ?? (unexpected.length
+        ? `Delivery revision contains paths outside the Build Packet: ${unexpected.join(", ")}`
+        : !changedPaths.length
+          ? "Builder produced no repository changes"
+          : uncoveredPlan.length
+            ? `Frozen verification plan is not covered by controller-approved commands: ${uncoveredPlan.join(", ")}`
+            : !input.commands.some((command) => command.required)
+              ? "No required verification commands were configured"
+              : changeReportFailure ?? coverageFailure);
     let contentDigestBefore: string | undefined;
     if (!preflightFailure) {
       try {
@@ -203,30 +296,42 @@ export async function verifyAndCommit(
       }
     }
     const checkByIdentity = new Map(checks.map((check, index) => [checkIdentity(check, index), check] as const));
-    const requiredFailure = input.commands.some((command, index) => {
+    const requiredFailures = input.commands.flatMap((command, index) => {
+      if (!command.required) return [];
       const identity = command.id ? `id:${command.id}` : `position:${index}`;
       const observed = checkByIdentity.get(identity) ?? checks[index];
-      return command.required && observed?.status !== "passed";
+      return observed?.status === "passed" ? [] : [{ commandId: command.id, status: observed?.status ?? "missing", check: observed }];
     });
+    const requiredFailure = requiredFailures.length > 0;
     const verificationMutation = contentDigestBefore !== undefined && contentDigestAfter !== contentDigestBefore
       ? "Verification commands changed controller-approved delivery content; refusing to commit untested results"
       : undefined;
-    const semanticEvidenceFailure = preflightFailure || requiredFailure || !strictSemanticEvidence
+    const semanticEvidenceFailure = preflightFailure || requiredFailure || (!strictSemanticEvidence && !hasEvidenceContract)
       ? undefined
-      : anchorPreflightFailure ?? await criterionSemanticEvidenceFailure(
-        resolvedCoverage.map(({ coverage }, index) => ({ ...coverage, criterionId: coverage.criterionId ?? `criterion-${index + 1}` })),
-        checks,
-      );
+      : hasEvidenceContract
+        ? contractSemanticEvidenceFailure(input.packet, resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })), checks, input.commands)
+        : anchorPreflightFailure ?? await criterionSemanticEvidenceFailure(
+          resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })),
+          checks,
+          input.commands,
+        );
     const failure = preflightFailure ?? verificationMutation ?? (requiredFailure ? "Required verification failed" : semanticEvidenceFailure);
 
     if (failure) {
-      const failedChecks = checks.filter((check) => check.status === "failed");
-      const detailedFailure = failedChecks.length
-        ? `${failure}: ${failedChecks.map((check) => `${check.command}${check.exitCode !== undefined ? ` (exit ${check.exitCode})` : ""}${check.summary ? ` — ${check.summary}` : ""}`).join("; ")}`
+      const failedChecks = checks.filter((check) => check.status === "failed" || check.status === "skipped");
+      const checkDetails = failedChecks.map((check) => `${check.command}${check.commandId ? ` [${check.commandId}]` : ""}${check.exitCode !== undefined ? ` (exit ${check.exitCode})` : ""}${check.summary ? ` — ${check.summary}` : ""}${check.status === "skipped" ? " [skipped]" : ""}`);
+      const detailedFailure = checkDetails.length
+        ? `${failure}: ${checkDetails.join("; ")}`
         : failure;
-      const failureKind = semanticEvidenceFailure
-        ? "builder-semantic-evidence" as const
-        : requiredFailure
+      const contractBuilderFailure = contractBuilderDiagnostics.length > 0;
+      const contractBuilderReportFailure = contractBuilderDiagnostics.some(({ code }) => ["missing-criterion-id", "unknown-criterion", "missing-criterion", "duplicate-criterion", "criterion-mismatch"].includes(code));
+      const failureKind = contractValidationDiagnostics.length
+        ? "packet-contract" as const
+        : contractBuilderFailure
+          ? (contractBuilderReportFailure ? "builder-report" as const : "builder-semantic-evidence" as const)
+          : semanticEvidenceFailure
+          ? "builder-semantic-evidence" as const
+          : requiredFailure
           ? "required-check" as const
           : verificationMutation
             ? "verification-mutation" as const
@@ -235,22 +340,25 @@ export async function verifyAndCommit(
               : unexpected.length
                 ? "scope" as const
                 : undefined;
-      return blockVerification(detailedFailure, checks, deliveryChangedPaths, failureKind);
+      return blockVerification(detailedFailure, checks, deliveryChangedPaths, failureKind, contractDiagnostics);
     }
 
     if (!run.targetBranch) throw new Error("Verified run is missing its frozen target branch");
     if (!input.workspace.baseSha) throw new Error("Verified commit checkpoint requires a frozen workspace base SHA");
     const acceptanceEvidence = input.packet.payload.acceptanceCriteria.map((criterion, index) => {
-      const coverage = resolvedCoverage.find((item) => item.criterion === criterion)!.coverage;
+      const criterionId = `criterion-${index + 1}`;
+      const coverage = resolvedCoverage.find((item) => item.criterionId === criterionId)!.coverage;
       const controllerEvidence = input.subjectEvidence?.length
         ? ` Controller-observed subject evidence: ${input.subjectEvidence.join(" | ")}`
         : "";
       return {
-        criterionId: coverage.criterionId ?? `criterion-${index + 1}`,
+        criterionId,
         criterion,
         status: "passed" as const,
         evidence: `${coverage.implementation}${controllerEvidence}`,
-        ...(coverage.anchors ? { anchors: coverage.anchors } : {}),
+        ...(coverage.anchors ? {
+          anchors: normalizeAcceptanceAnchors(input.packet, criterionId, coverage.anchors),
+        } : {}),
       };
     });
     const parentHeadSha = await dependencies.git.head(input.workspace);
@@ -381,6 +489,10 @@ export async function recoverVerificationCheckpoint(
     run: RunState;
     checkpoint: DurableArtifact<"VerificationCheckpoint">;
     workspace: GitWorkspace;
+    packet?: DurableArtifact<"BuildPacket">;
+    /** Frozen packet-selected commands and runner used for crash recovery. */
+    commands?: readonly VerificationCommand[];
+    verifier?: VerificationRunner;
   },
   dependencies: {
     git: GitWorkspaceManager;
@@ -410,6 +522,50 @@ export async function recoverVerificationCheckpoint(
   }
 
   const expectedPaths = canonicalizeConcreteScopePaths(checkpoint.payload.changedPaths).sort();
+  if (!input.commands || !input.verifier) {
+    throw new Error("Retained verification checkpoint lacks a frozen executable plan; refusing to trust stale checks");
+  }
+  if (!input.commands.length || input.commands.some((command) => !command.planId)) {
+    throw new Error("Retained verification checkpoint recovery requires plan-bound verification commands");
+  }
+  if (input.packet?.payload.evidenceContract) {
+    const evidenceDiagnostics = validateEvidenceContract(input.packet.payload.evidenceContract, {
+      acceptanceCriteria: input.packet.payload.acceptanceCriteria,
+      ...(input.packet.payload.verificationRequirements ? { verificationRequirements: input.packet.payload.verificationRequirements } : {}),
+      ...(input.packet.payload.controllerGates ? { controllerGates: input.packet.payload.controllerGates } : {}),
+      commands: input.commands.map((command) => ({
+        id: command.id,
+        ...(command.evidenceCapability !== undefined ? { evidenceCapability: command.evidenceCapability } : {}),
+        ...(command.targets !== undefined ? { targets: command.targets } : {}),
+      })),
+      ...(input.packet.payload.invariantMatrices ? { invariantMatrices: input.packet.payload.invariantMatrices } : {}),
+      expectedPaths: input.packet.payload.expectedPaths,
+      ...(input.packet.payload.evidencePaths ? { evidencePaths: input.packet.payload.evidencePaths } : {}),
+    });
+    if (evidenceDiagnostics.length) {
+      throw new Error(`Recovery evidence contract validation failed: ${evidenceDiagnostics.map((diagnostic) => `[${diagnostic.code}${diagnostic.criterionId ? ` ${diagnostic.criterionId}` : ""}] ${diagnostic.message}`).join("; ")}`);
+    }
+  }
+  const beforeVerificationDigest = await deliveryContentDigest(workspace.path, expectedPaths);
+  const recoveredChecks = await input.verifier.run(input.commands);
+  const afterVerificationDigest = await deliveryContentDigest(workspace.path, expectedPaths);
+  if (beforeVerificationDigest !== afterVerificationDigest) {
+    throw new Error("Recovery verification commands changed controller-approved delivery content");
+  }
+  const requiredRecoveryFailures = input.commands.flatMap((command, index) => {
+    if (!command.required) return [];
+    const check = recoveredChecks.find((candidate) => candidate.commandId === command.id) ?? recoveredChecks[index];
+    if (!check || check.status !== "passed" || check.planId !== command.planId
+      || check.policyVersion !== command.policyVersion
+      || JSON.stringify(check.commandTargets ?? []) !== JSON.stringify(command.targets ?? [])) {
+      return [command.id];
+    }
+    return [];
+  });
+  if (requiredRecoveryFailures.length) {
+    throw new Error(`Recovery verification failed or drifted for required command(s): ${requiredRecoveryFailures.join(", ")}`);
+  }
+  let recoveryChecks = recoveredChecks;
   let headSha = await dependencies.git.head(workspace);
   if (headSha.toLowerCase() === checkpoint.payload.parentHeadSha.toLowerCase()) {
     const changed = canonicalizeConcreteScopePaths(await dependencies.git.changedPaths(workspace)).sort();
@@ -466,7 +622,7 @@ export async function recoverVerificationCheckpoint(
       changedPaths: expectedPaths,
       summary: checkpoint.payload.summary,
       acceptanceEvidence: checkpoint.payload.acceptanceEvidence,
-      checks: checkpoint.payload.checks,
+      checks: recoveryChecks,
       decisions: checkpoint.payload.decisions,
       residualRisks: checkpoint.payload.residualRisks,
     },
@@ -475,7 +631,7 @@ export async function recoverVerificationCheckpoint(
   run = attachArtifact(run, "BuildResult", buildResult.id);
   const passed = transition(run, "VERIFICATION_PASSED", { headSha });
   await dependencies.runs.commit(run.version, passed.state, passed.record);
-  return { run: passed.state, checks: [...checkpoint.payload.checks], buildResult };
+  return { run: passed.state, checks: [...recoveryChecks], buildResult };
 }
 
 function deterministicBuildResultId(checkpointId: string, headSha: string): string {
@@ -632,6 +788,100 @@ export function verificationProgressRecorder(
   };
 }
 
+function collectContractStructuralDiagnostics(input: {
+  packet: DurableArtifact<"BuildPacket">;
+  coverage: readonly BuilderSubmission["criterionCoverage"][number][];
+  commands: readonly VerificationCommand[];
+}): VerificationEvidenceDiagnostic[] {
+  const packet = input.packet.payload;
+  const contract = packet.evidenceContract;
+  if (contract?.version !== "forgedock.evidence/v1") return [];
+  const diagnostics: VerificationEvidenceDiagnostic[] = [];
+  const byId = new Map(contract.criteria.map((criterion) => [criterion.criterionId, criterion] as const));
+  const seen = new Map<string, number>();
+  const knownCriteria = new Set(packet.acceptanceCriteria.map((_, index) => `criterion-${index + 1}`));
+  for (const item of input.coverage) {
+    if (item.criterionId === undefined) {
+      diagnostics.push({ code: "missing-criterion-id", message: "Contract packet coverage must name a stable criterion ID" });
+      continue;
+    }
+    seen.set(item.criterionId, (seen.get(item.criterionId) ?? 0) + 1);
+    if (!knownCriteria.has(item.criterionId) || !byId.has(item.criterionId)) {
+      diagnostics.push({ code: "unknown-criterion", criterionId: item.criterionId, message: `Builder coverage references unknown criterion ${item.criterionId}` });
+      continue;
+    }
+    const criterionText = packet.acceptanceCriteria[Number(item.criterionId.slice("criterion-".length)) - 1];
+    if (criterionText !== item.criterion) {
+      diagnostics.push({ code: "criterion-mismatch", criterionId: item.criterionId, message: `Builder criterion text does not exactly match frozen ${item.criterionId}` });
+    }
+  }
+  for (const [criterionId, count] of seen) {
+    if (count > 1) diagnostics.push({ code: "duplicate-criterion", criterionId, message: `Builder supplied ${count} coverage entries for ${criterionId}` });
+  }
+  for (const criterion of packet.acceptanceCriteria.map((_, index) => `criterion-${index + 1}`)) {
+    if (!seen.has(criterion)) diagnostics.push({ code: "missing-criterion", criterionId: criterion, message: `Builder omitted coverage for ${criterion}` });
+  }
+
+  const commandById = new Map(input.commands.map((command) => [command.id, command] as const));
+  for (const expected of contract.criteria) {
+    const item = input.coverage.find((coverage) => coverage.criterionId === expected.criterionId);
+    if (!item) continue;
+    const anchors = item.anchors;
+    if (!anchors) {
+      if (expected.requiredCommandIds.length) {
+        diagnostics.push({ code: "missing-anchors", criterionId: expected.criterionId, message: `${expected.criterionId} is command-backed but has no typed evidence anchors` });
+      }
+      continue; // gate-only criteria are intentionally allowed to remain prose-only.
+    }
+    let paths: string[] = [];
+    try {
+      paths = canonicalizeConcreteScopePaths(anchors.paths);
+    } catch (error) {
+      diagnostics.push({ code: "invalid-evidence-path", criterionId: expected.criterionId, message: error instanceof Error ? error.message : String(error) });
+    }
+    const allowedPaths = new Set([...expected.allowedWritePaths, ...expected.allowedEvidencePaths]);
+    for (const path of paths) {
+      if (!allowedPaths.has(path)) diagnostics.push({ code: "out-of-contract-path", criterionId: expected.criterionId, message: `${expected.criterionId} cites path outside its frozen evidence contract: ${path}`, details: { path } });
+    }
+    const required = new Set(expected.requiredCommandIds);
+    const cited = new Set(anchors.verificationCommandIds);
+    for (const id of anchors.verificationCommandIds) {
+      if (!commandById.has(id)) diagnostics.push({ code: "unknown-command", criterionId: expected.criterionId, message: `${expected.criterionId} cites unknown command ID ${id}`, details: { commandId: id } });
+      else if (!required.has(id)) diagnostics.push({ code: "out-of-contract-command", criterionId: expected.criterionId, message: `${expected.criterionId} cites command ID ${id}, which is not required for that criterion`, details: { commandId: id } });
+    }
+    for (const id of expected.requiredCommandIds) {
+      if (!cited.has(id)) diagnostics.push({ code: "omitted-required-command", criterionId: expected.criterionId, message: `${expected.criterionId} omits required command ID ${id}`, details: { commandId: id } });
+    }
+    for (const id of expected.semanticCommandIds) {
+      if (!cited.has(id)) diagnostics.push({ code: "omitted-semantic-command", criterionId: expected.criterionId, message: `${expected.criterionId} omits semantic command ID ${id}`, details: { commandId: id } });
+    }
+    if (expected.requiredCommandIds.length && !expected.semanticCommandIds.length) {
+      diagnostics.push({ code: "generic-only-command", criterionId: expected.criterionId, message: `${expected.criterionId} is backed only by generic commands` });
+    }
+    for (const testId of expected.invariantTestIds) {
+      if (!anchors.testIds.includes(testId)) diagnostics.push({ code: "missing-invariant-test-id", criterionId: expected.criterionId, message: `${expected.criterionId} omits invariant root test ID ${testId}`, details: { testId } });
+    }
+  }
+  return diagnostics;
+}
+
+function normalizeAcceptanceAnchors(
+  packet: DurableArtifact<"BuildPacket">,
+  criterionId: string,
+  anchors: CriterionEvidenceAnchors,
+): CriterionEvidenceAnchors {
+  const contractCriterion = packet.payload.evidenceContract?.criteria.find(({ criterionId: id }) => id === criterionId);
+  if (!contractCriterion) return anchors;
+  return {
+    paths: [...new Set(anchors.paths)],
+    symbols: [...new Set(anchors.symbols)],
+    testIds: [...new Set([
+      ...anchors.testIds,
+      ...contractCriterion.invariantCaseIds,
+    ])],
+    verificationCommandIds: [...new Set(anchors.verificationCommandIds)],
+  };
+}
 function usesStrictSemanticEvidence(packet: DurableArtifact<"BuildPacket">): boolean {
   return packet.payload.verificationPolicyVersion === "forgedock.verification/v2";
 }
@@ -698,15 +948,50 @@ function criterionAnchorPreflightFailure(input: {
 async function criterionSemanticEvidenceFailure(
   coverage: readonly BuilderSubmission["criterionCoverage"][number][],
   checks: readonly CheckResult[],
+  commands: readonly VerificationCommand[],
 ): Promise<string | undefined> {
-  const passed = new Set(checks.filter(({ status }) => status === "passed").flatMap((check) => check.commandId ? [check.commandId] : []));
+  const failures: string[] = [];
   for (const item of coverage) {
     const id = item.criterionId!;
     const anchors = item.anchors!;
-    const failedIds = anchors.verificationCommandIds.filter((commandId) => !passed.has(commandId));
-    if (failedIds.length) return `Criterion ${id} cannot pass because its anchored controller checks did not pass: ${failedIds.join(", ")}`;
+    const failedIds = anchors.verificationCommandIds.filter((commandId) => commandStatus(commandId, commands, checks) !== "passed");
+    if (failedIds.length) failures.push(`${id}: ${failedIds.join(", ")}`);
   }
-  return undefined;
+  return failures.length ? `Criteria cannot pass because anchored controller checks did not pass: ${failures.join("; ")}` : undefined;
+}
+
+function contractSemanticEvidenceFailure(
+  packet: DurableArtifact<"BuildPacket">,
+  coverage: readonly BuilderSubmission["criterionCoverage"][number][],
+  checks: readonly CheckResult[],
+  commands: readonly VerificationCommand[],
+): string | undefined {
+  const failures: string[] = [];
+  for (const criterion of packet.payload.evidenceContract?.criteria ?? []) {
+    const item = coverage.find((entry) => entry.criterionId === criterion.criterionId);
+    if (!item?.anchors) continue; // structural preflight reports missing anchors.
+    // Every command explicitly assigned to a criterion is an acceptance gate,
+    // including commands whose catalog metadata says required=false. Semantic
+    // command IDs are an additional authority requirement, not a substitute
+    // for those generic command gates.
+    const failedIds = [...new Set([
+      ...criterion.requiredCommandIds,
+      ...criterion.semanticCommandIds,
+    ])].filter((id) => commandStatus(id, commands, checks) !== "passed");
+    if (failedIds.length) failures.push(`${criterion.criterionId}: ${failedIds.join(", ")}`);
+  }
+  return failures.length ? `Criteria cannot pass because semantic controller checks did not pass: ${failures.join("; ")}` : undefined;
+}
+
+function commandStatus(
+  commandId: string,
+  commands: readonly VerificationCommand[],
+  checks: readonly CheckResult[],
+): CheckResult["status"] | "missing" {
+  const byId = checks.find((check) => check.commandId === commandId);
+  if (byId) return byId.status;
+  const index = commands.findIndex((command) => command.id === commandId);
+  return index >= 0 ? (checks[index]?.status ?? "missing") : "missing";
 }
 
 function checkIdentity(check: CheckResult, index: number): string {
@@ -715,6 +1000,17 @@ function checkIdentity(check: CheckResult, index: number): string {
 
 function compareWithBaseline(check: CheckResult, baseline: CheckResult | undefined): CheckResult {
   if (!baseline) return check;
+  // Baselines are evidence for one exact executable plan.  Never classify a
+  // result against a check from another base SHA, policy, target expansion, or
+  // command identity (planId is minted from the frozen base SHA and command
+  // execution witness).
+  const samePlan = check.command === baseline.command
+    && check.commandId === baseline.commandId
+    && check.planId !== undefined
+    && check.planId === baseline.planId
+    && check.policyVersion === baseline.policyVersion
+    && JSON.stringify(check.commandTargets ?? []) === JSON.stringify(baseline.commandTargets ?? []);
+  if (!samePlan) return check;
   const sameKnownFailures = check.status === "failed"
     && baseline.status === "failed"
     && Boolean(check.failureSignatures?.length)

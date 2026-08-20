@@ -269,7 +269,7 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Deployment smoke test", "failed"]]);
   });
 
-  it("treats missing required-check configuration as unavailable without querying arbitrary checks", async () => {
+  it("reports missing required-check observations as an empty projection without querying arbitrary checks", async () => {
     const client = new GitHubClient();
     const calls: string[][] = [];
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
@@ -282,10 +282,49 @@ describe("GitHub promotion transport", () => {
       throw new Error(`Unexpected gh call: ${args.join(" ")}`);
     } });
     const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
-    assert.equal(gate.requiredChecksProvenance, "unavailable");
-    assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["required-checks-query", "unavailable"]]);
+    assert.equal(gate.requiredChecksProvenance, "github-none");
+    assert.equal(gate.requiredChecksHeadSha, sha);
+    assert.deepEqual(gate.requiredChecks, []);
     assert.equal(calls.filter((args) => args[0] === "pr" && args[1] === "checks").length, 1);
     assert.equal(calls.find((args) => args[0] === "pr" && args[1] === "checks")?.includes("--required"), true);
+    await assert.rejects(
+      () => client.mergePullRequest("a/b", 8, sha, "main"),
+      /GitHub reported no required checks for reviewed/,
+    );
+    assert.equal(calls.some((args) => args[0] === "pr" && args[1] === "merge"), false);
+  });
+
+  it("accepts an empty required-check response as an empty projection", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE" });
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return "[]";
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.requiredChecksProvenance, "github-none");
+    assert.equal(gate.requiredChecksHeadSha, sha);
+    assert.deepEqual(gate.requiredChecks, []);
+    assert.equal(calls.some((args) => args[0] === "api"), false);
+  });
+
+  it("keeps genuine required-check query failures unavailable", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE" });
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") throw new Error("gh: authentication failed");
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.requiredChecksProvenance, "unavailable");
+    assert.equal(gate.requiredChecksHeadSha, undefined);
+    assert.deepEqual(gate.requiredChecks.map(({ name, state }) => [name, state]), [["required-checks-query", "unavailable"]]);
   });
 
   it("rechecks exact SHA/base before merge", async () => {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFileSync, chmodSync, existsSync, mkdirSync, renameSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -42,9 +42,10 @@ export interface SqliteObservationPurgeResult {
 export class SqliteObservationStore implements ObservationStore, ObservationLayoutStore {
   readonly #database: DatabaseSync;
 
-  constructor(readonly path: string) {
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-    this.#database = new DatabaseSync(path);
+  constructor(readonly path: string, options: { readOnly?: boolean } = {}) {
+    if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
+    this.#database = new DatabaseSync(path, options.readOnly ? { readOnly: true } : {});
+    if (options.readOnly) return;
     initializeSqliteDatabase(this.#database, `
       CREATE TABLE IF NOT EXISTS observation_events (
         event_id TEXT PRIMARY KEY,
@@ -318,7 +319,22 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
   }
 
   /** Delete only the immutable event identities captured by a cleanup manifest. */
-  async purgeExactManifest(manifest: SqliteObservationPurgeManifest): Promise<SqliteObservationPurgeResult> {
+  listResetEventsForRuns(runIds: readonly string[]): SqliteObservationPurgeManifest["events"] {
+    if (!runIds.length) return [];
+    const placeholders = runIds.map(() => "?").join(",");
+    const rows = this.#database.prepare(`SELECT event_id, scope_key, identity_json FROM observation_events WHERE json_extract(identity_json, '$.forgeRunId') IN (${placeholders}) ORDER BY rowid`).all(...runIds) as Array<{ event_id: string; scope_key: string; identity_json: string }>;
+    return rows.map((row) => ({ eventId: row.event_id, scopeKey: row.scope_key, identity: JSON.parse(row.identity_json) as ObservationIdentity }));
+  }
+
+  verifyResetPurged(manifest: SqliteObservationPurgeManifest): void {
+    for (const event of manifest.events) {
+      const row = this.#database.prepare("SELECT 1 AS found FROM observation_events WHERE event_id = ?").get(event.eventId) as { found: number } | undefined;
+      if (row) throw new Error(`Reset observation purge postcondition failed: ${event.eventId}`);
+    }
+  }
+
+  async purgeExactManifest(manifest: SqliteObservationPurgeManifest, options: { allowAbsent?: boolean } = {}): Promise<SqliteObservationPurgeResult> {
+    const allowAbsent = options.allowAbsent === true;
     return this.withTransaction(() => {
       const events = manifest.events;
       const ids = events.map(({ eventId }) => eventId);
@@ -327,7 +343,10 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
       for (const expected of events) {
         const row = this.#database.prepare("SELECT scope_key, identity_json FROM observation_events WHERE event_id = ?")
           .get(expected.eventId) as { scope_key: string; identity_json: string } | undefined;
-        if (!row) throw new Error(`Observation purge manifest event is absent: ${expected.eventId}`);
+        if (!row) {
+          if (allowAbsent) continue;
+          throw new Error(`Observation purge manifest event is absent: ${expected.eventId}`);
+        }
         const identity = parseJson(row.identity_json, undefined as ObservationIdentity | undefined);
         if (row.scope_key !== expected.scopeKey || !sameObservationIdentity(identity, expected.identity)) {
           throw new Error(`Observation purge manifest identity mismatch: ${expected.eventId}`);
@@ -346,6 +365,27 @@ export class SqliteObservationStore implements ObservationStore, ObservationLayo
     });
   }
 
+  archiveResetDatabase(directory: string, prefix: string): Array<{ path: string; sha256: string; kind: "database" }> {
+    if (this.path === ":memory:") return [];
+    mkdirSync(directory, { recursive: true });
+    this.#database.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    const result: Array<{ path: string; sha256: string; kind: "database" }> = [];
+    for (const source of [this.path, `${this.path}-wal`, `${this.path}-shm`]) {
+      if (!existsSync(source)) continue;
+      const destination = `${directory}/${prefix}${source === this.path ? ".db" : source.endsWith("-wal") ? ".db-wal" : ".db-shm"}`;
+      const temporary = `${destination}.tmp-${process.pid}-${Date.now()}`;
+      if (existsSync(destination)) {
+        const existing = readFileSync(destination);
+        result.push({ path: destination, sha256: createHash("sha256").update(existing).digest("hex"), kind: "database" });
+        continue;
+      }
+      copyFileSync(source, temporary);
+      chmodSync(temporary, 0o600);
+      renameSync(temporary, destination);
+      result.push({ path: destination, sha256: createHash("sha256").update(readFileSync(destination)).digest("hex"), kind: "database" });
+    }
+    return result;
+  }
   close(): void {
     this.#database.close();
   }

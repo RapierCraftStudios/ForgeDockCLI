@@ -24,6 +24,7 @@ export async function makePullRequestCiGreen(input: { repo: string; pullRequest:
     const gate = await deps.host.getPullRequestMergeGate(input.repo, pr.number, pr.headSha, pr.baseBranch);
     const assessment = assessPullRequestCi(pr, gate, input.policy, { ...(input.featurePromotionTarget ? { featurePromotionTarget: input.featurePromotionTarget } : {}), ...(input.productionTarget ? { productionTarget: input.productionTarget } : {}) });
     if (assessment.ready) return { pullRequest: pr, attempts, fixes };
+    if (gate.requiredChecksProvenance !== "github-required" || gate.requiredChecksHeadSha?.toLowerCase() !== pr.headSha.toLowerCase()) assertPullRequestCiReady(assessment, "auto-fix", "before");
     if (!assessment.mergeable) assertPullRequestCiReady(assessment, "auto-fix", "before");
     if (!assessment.failed.length) { await wait(input.signal); continue; }
     if (attempts >= input.policy.maxFixAttempts) assertPullRequestCiReady(assessment, "auto-fix", "before");
@@ -31,7 +32,8 @@ export async function makePullRequestCiGreen(input: { repo: string; pullRequest:
     if (!deps.host.getPullRequestHeadRepository || !deps.host.getPullRequestCheckDiagnostics) throw new Error("CI auto-fix requires head-repository proof and diagnostic adapters");
     const headRepo = await deps.host.getPullRequestHeadRepository(input.repo, pr.number, pr.headSha);
     if (headRepo.isCrossRepository || headRepo.repo.toLowerCase() !== input.repo.toLowerCase()) throw new Error(`CI auto-fix refuses cross-repository PR head ${headRepo.repo}; please fix the checks and rerun /review-pr`);
-    if (["main", "master"].includes(pr.headBranch)) throw new Error(`CI auto-fix refuses protected branch ${pr.headBranch}`);
+    if (["main", "master", input.featurePromotionTarget, input.productionTarget].filter((branch): branch is string => Boolean(branch)).includes(pr.headBranch)) throw new Error(`CI auto-fix refuses protected promotion/production source branch ${pr.headBranch}`);
+    if (deps.host.isBranchProtected && await deps.host.isBranchProtected(input.repo, pr.headBranch)) throw new Error(`CI auto-fix refuses protected source branch ${pr.headBranch}`);
     const diagnostics = await deps.host.getPullRequestCheckDiagnostics(input.repo, pr.number, pr.headSha, assessment.failed.map((check) => check.name));
     const workspace = await deps.workspaces.createReview({ runId: `ci-repair-${pr.number}-${pr.headSha.slice(0, 12)}-${attempts}`, pr: pr.number, headSha: pr.headSha });
     try {

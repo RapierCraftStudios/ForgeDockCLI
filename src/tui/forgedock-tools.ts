@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -2466,12 +2466,6 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const reboundPlan = rebindDecomposedPlan(issues, executionPlan as readonly OrchestrationPlanEntry[] | undefined, issueBriefs as readonly OrchestrationBriefEntry[] | undefined, decomposedReplacements);
       executionPlan = reboundPlan.executionPlan as typeof executionPlan;
       issueBriefs = reboundPlan.issueBriefs as typeof issueBriefs;
-      await assertNoActiveOrchestrationOwnership(
-        ctx.cwd,
-        orchestrationRepository ?? options.orchestrationRepository,
-        repository?.repo,
-        issues,
-      );
       const maxParallel = Math.min(maxParallelOption ?? effective.maxParallel, Math.max(1, issues.length));
       // The native planner may propose scope, but route authority remains the
       // controller's typed GitHub read. A bound invocation produced by the
@@ -2822,16 +2816,11 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         throw new Error(`Unsupported orchestration dispatch mode: ${dispatchMode}`);
       }
 
-      // Re-check immediately before the dispatch readiness/mutation barrier;
-      // another terminal may have started a DAG while this preview or UI
-      // confirmation was waiting for the operator.
-      await assertNoActiveOrchestrationOwnership(
-        ctx.cwd,
-        orchestrationRepository ?? options.orchestrationRepository,
-        repository?.repo,
-        issues,
-      );
+      // Confirmation and previews remain read-only. At the authorized mutation
+      // boundary, reconcile expired controllers under the normal fenced claim
+      // before deciding whether this scope still has a live durable owner.
       await assertReadyBeforeMutation();
+      await reapStaleDurableOrchestrations();
       await assertNoActiveOrchestrationOwnership(
         ctx.cwd,
         orchestrationRepository ?? options.orchestrationRepository,
@@ -3167,6 +3156,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       reviewCiPromotionChecks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 100 })),
       reviewCiDeploymentChecks: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 100 })),
       reviewCiRepairPaths: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 200 })),
+      reviewCiRequiredChecksDefault: Type.Optional(Type.String({ enum: ["require", "if-present"] })),
+      reviewCiRequiredChecksTargets: Type.Optional(Type.Record(Type.String({ minLength: 1 }), Type.String({ enum: ["require", "if-present"] }))),
     }),
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -3208,6 +3199,8 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(params.reviewCiPromotionChecks !== undefined ? { reviewCiPromotionChecks: params.reviewCiPromotionChecks } : {}),
         ...(params.reviewCiDeploymentChecks !== undefined ? { reviewCiDeploymentChecks: params.reviewCiDeploymentChecks } : {}),
         ...(params.reviewCiRepairPaths !== undefined ? { reviewCiRepairPaths: params.reviewCiRepairPaths } : {}),
+        ...(params.reviewCiRequiredChecksDefault !== undefined ? { reviewCiRequiredChecksDefault: params.reviewCiRequiredChecksDefault as "require" | "if-present" } : {}),
+        ...(params.reviewCiRequiredChecksTargets !== undefined ? { reviewCiRequiredChecksTargets: params.reviewCiRequiredChecksTargets as Readonly<Record<string, "require" | "if-present">> } : {}),
       };
       const preview = Object.entries(patch).map(([key, value]) => `${key}: ${String(value)}`).join("\n");
       if (ctx.hasUI && !await ctx.ui.confirm("Update forge.yaml?", preview || "No settings supplied")) throw new Error("ForgeDock configuration update cancelled");
@@ -4060,6 +4053,13 @@ function buildIssueWorkerTask(
   ].join("\n");
 }
 
+function trustedNestedBridgeRoots(cwd: string): readonly string[] {
+  // GitWorktreeManager's managed root is sibling to the controller checkout;
+  // include the checkout itself for review-pr/promote and the managed root for
+  // orchestration issue worktrees. The bridge canonicalizes and verifies both.
+  return [cwd, join(dirname(cwd), ".forgedock-worktrees"), join(cwd, ".forgedock-worktrees")];
+}
+
 function controllerEntryAvailable(): boolean {
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
   return entry !== undefined && existsSync(entry);
@@ -4080,7 +4080,7 @@ async function startNativeControllerTask(
     const existing = tasks.findByLaunchKey(spec.launchKey);
     if (existing) return existing.id;
   }
-  const nestedBridge = await startNestedAgentBridge(pi);
+  const nestedBridge = await startNestedAgentBridge(pi, { allowedRoots: trustedNestedBridgeRoots(ctx.cwd) });
   let claimPromotionServer: OrchestrationClaimPromotionServer | undefined;
   try {
     claimPromotionServer = spec.claimPromotion
@@ -4152,7 +4152,7 @@ async function runControllerToolBackground(
   const resumeScope: BackgroundTaskResumeScope = command === "review-pr"
     ? "review-pr-rerun"
     : command === "promote" ? "promote" : "work-on";
-  const nestedBridge = await startNestedAgentBridge(pi);
+  const nestedBridge = await startNestedAgentBridge(pi, { allowedRoots: trustedNestedBridgeRoots(ctx.cwd) });
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);
@@ -4210,7 +4210,7 @@ async function runControllerTool(
   const modelArgs = includeModel ? controllerInvocationModelArgs(command, args, ctx, config) : [];
   const invocationArgs = [entry, command, ...args, ...modelArgs];
   ctx.ui.setStatus("forgedock", `◆ ${workflowCommandDisplay(command)} running`);
-  const nestedBridge = includeModel ? await startNestedAgentBridge(pi) : undefined;
+  const nestedBridge = includeModel ? await startNestedAgentBridge(pi, { allowedRoots: trustedNestedBridgeRoots(ctx.cwd) }) : undefined;
   const worker = controllerWorkerSelection(config.workerModel, config.workerThinking);
   const reviewer = splitConfiguredModel(config.reviewerModel);
   const planning = splitConfiguredModel(config.planningModel);

@@ -2,11 +2,12 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { chmod, lstat, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
 const execFileAsync = promisify(execFile);
@@ -30,7 +31,7 @@ type DependencyLease = {
   heartbeat: NodeJS.Timeout;
 };
 
-export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager {
+export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager, ManagedWorktreeResetLifecycle {
   readonly #repo: string;
   readonly #root: string;
 
@@ -46,13 +47,14 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
     const baseSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
+    const hooksPath = await this.controllerEmptyHooksPath();
     let added = false;
     try {
       await this.withRepositoryMetadataLock(async () => {
         const registeredBefore = await this.worktreeRegistered(path);
         const branchBefore = await this.branchExists(branch);
         try {
-          await this.git(["worktree", "add", "-b", branch, path, baseSha], this.#repo);
+          await this.git(["-c", `core.hooksPath=${hooksPath}`, "worktree", "add", "-b", branch, path, baseSha], this.#repo);
         } catch (error) {
           const removeWorktree = !registeredBefore && await this.worktreeRegistered(path);
           const removeBranch = !branchBefore && await this.branchExists(branch);
@@ -93,6 +95,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const fetchedBase = input.baseRef.startsWith("origin/")
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
+    const hooksPath = await this.controllerEmptyHooksPath();
     const baseSha = await this.withRepositoryMetadataLock(async () => {
       if (existsSync(path)) {
         const root = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
@@ -104,8 +107,8 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         await this.git(["worktree", "prune"], this.#repo);
         const branchExists = await this.branchExists(branch);
         await this.git(branchExists
-          ? ["worktree", "add", path, branch]
-          : ["worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
+          ? ["-c", `core.hooksPath=${hooksPath}`, "worktree", "add", path, branch]
+          : ["-c", `core.hooksPath=${hooksPath}`, "worktree", "add", "-b", branch, path, fetchedBase], this.#repo);
       }
       const configuredBaseSha = await this.configuredBaseSha(branch);
       const frozenBaseSha = input.baseSha
@@ -135,12 +138,13 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     await mkdir(dirname(path), { recursive: true });
     const fetched = await this.fetchRemoteCommit(`refs/pull/${input.pr}/head`, this.#repo);
     if (fetched !== input.headSha) throw new Error(`Fetched review SHA ${fetched} does not match PR head ${input.headSha}`);
+    const hooksPath = await this.controllerEmptyHooksPath();
     let added = false;
     try {
       await this.withRepositoryMetadataLock(async () => {
         const registeredBefore = await this.worktreeRegistered(path);
         try {
-          await this.git(["worktree", "add", "--detach", path, fetched], this.#repo);
+          await this.git(["-c", `core.hooksPath=${hooksPath}`, "worktree", "add", "--detach", path, fetched], this.#repo);
         } catch (error) {
           const removeWorktree = !registeredBefore && await this.worktreeRegistered(path);
           if (removeWorktree) {
@@ -520,6 +524,53 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     return (await this.git(["rev-parse", "HEAD"], workspace.path)).trim();
   }
 
+  async listManagedResetWorktrees(selection: { issueNumbers: readonly number[]; dagIds: readonly string[] }): Promise<Array<{ path: string; branch: string; headSha: string; dirty: string[]; managed: true }>> {
+    const output = await this.git(["worktree", "list", "--porcelain"], this.#repo);
+    const records: Array<{ path: string; branch: string; headSha: string; dirty: string[]; managed: true }> = [];
+    for (const record of output.split(/\n\s*\n/u).map((value) => value.trim()).filter(Boolean)) {
+      const path = record.match(/(?:^|\n)worktree (.+)/)?.[1];
+      const headSha = record.match(/(?:^|\n)HEAD ([0-9a-f]{40,64})/i)?.[1];
+      const branchRef = record.match(/(?:^|\n)branch refs\/heads\/(.+)/)?.[1];
+      if (!path || !headSha || !branchRef || !sameFilesystemPath(resolve(path), this.#repo) && !sameFilesystemPath(dirname(resolve(path)), dirname(this.#root))) continue;
+      if (!(branchRef.startsWith("forgedock/") || branchRef.startsWith("review/"))) continue;
+      const dirtyOutput = await this.git(["status", "--porcelain", "-z"], path);
+      const dirty = dirtyOutput.split("\0").filter(Boolean).map((entry) => entry.slice(3)).sort();
+      records.push({ path: resolve(path), branch: branchRef, headSha, dirty, managed: true });
+    }
+    return records;
+  }
+
+  async archiveDirtyManaged(worktree: { path: string; branch: string; headSha: string }): Promise<{ path: string; sha256: string; kind: "dirty-diff" } | undefined> {
+    const path = resolve(worktree.path);
+    if (!existsSync(path)) return undefined;
+    const diff = await this.git(["diff", "--binary", "HEAD", "--"], path);
+    if (!diff) return undefined;
+    const archivePath = join(process.cwd(), ".forgedock", "reset-archives", `${basename(path)}-${Date.now()}.diff`);
+    await mkdir(dirname(archivePath), { recursive: true });
+    const temporary = `${archivePath}.tmp-${process.pid}-${Date.now()}`;
+    await writeFile(temporary, diff, { encoding: "utf8", mode: 0o600 });
+    await chmod(temporary, 0o600);
+    await rename(temporary, archivePath);
+    return { path: archivePath, sha256: createHash("sha256").update(diff, "utf8").digest("hex"), kind: "dirty-diff" };
+  }
+
+  async assertAbsent(input: { path: string; branch: string; headSha: string }): Promise<void> {
+    if (existsSync(resolve(input.path))) throw new Error(`Reset worktree postcondition failed; path remains: ${input.path}`);
+  }
+
+  async removeExactManaged(input: { path: string; branch: string; headSha: string }): Promise<void> {
+    assertInside(this.#root, resolve(input.path));
+    assertSha(input.headSha, "managed worktree HEAD");
+    const path = resolve(input.path);
+    if (!existsSync(path)) return;
+    const observedRoot = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
+    const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
+    const observedHead = (await this.git(["rev-parse", "HEAD"], path)).trim();
+    if (!sameFilesystemPath(observedRoot, path) || observedBranch !== input.branch || observedHead.toLowerCase() !== input.headSha.toLowerCase()) {
+      throw new Error(`Managed worktree identity drift at ${path}`);
+    }
+    await this.remove({ path, branch: input.branch, baseRef: input.headSha, baseSha: input.headSha });
+  }
   async remove(workspace: GitWorkspace): Promise<void> {
     assertInside(this.#root, workspace.path);
     await this.withRepositoryMetadataLock(async () => {
@@ -529,6 +580,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       }
     });
   }
+
 
   private async rollbackCreatedWorktree(path: string, branch?: string): Promise<void> {
     assertInside(this.#root, path);
@@ -1024,13 +1076,14 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
 
   private async applyPinnedDependencyPatch(worktreePath: string): Promise<void> {
     // Dependency installation deliberately skips arbitrary lifecycle scripts.
-    // ForgeDock still needs its one pinned, source-controlled pi-subagents
-    // visibility patch before any controller verification command runs.
-    const pinnedPatch = join(worktreePath, "scripts", "patch-pi-subagents-visibility.mjs");
-    if (!existsSync(pinnedPatch)) return;
+    // Never load the patch from the checked-out worktree: review/issue content
+    // is untrusted and can replace that file with an arbitrary executable.
+    const trustedPatch = this.controllerPinnedPatchPath();
     try {
-      await execFileAsync(process.execPath, [pinnedPatch], {
-        cwd: worktreePath,
+      await execFileAsync(process.execPath, [trustedPatch, "--worktree", worktreePath], {
+        // The implementation is loaded from this controller checkout, while
+        // --worktree explicitly bounds its writes to the prepared worktree.
+        cwd: this.#repo,
         env: verificationEnvironment(process.env),
         encoding: "utf8",
         windowsHide: true,
@@ -1040,6 +1093,33 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       const detail = error as Error & { stderr?: string };
       throw new Error(`Pinned pi-subagents visibility patch failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
     }
+  }
+
+  private async controllerEmptyHooksPath(): Promise<string> {
+    // Git's native Windows path handling does not consistently treat the
+    // POSIX null device as a hooks directory. Use an absolute, controller-
+    // owned empty directory instead of relying on platform-specific devices.
+    const hooksPath = join(this.#repo, ".forgedock", "empty-hooks");
+    await mkdir(hooksPath, { recursive: true });
+    return hooksPath;
+  }
+
+  private controllerPinnedPatchPath(): string {
+    const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+    // Source execution resolves ../../../scripts; compiled dist execution
+    // resolves ../../../../scripts. Only a regular file in the controller
+    // installation may be used as the patch implementation.
+    const candidates = [
+      resolve(moduleDirectory, "../../../scripts/patch-pi-subagents-visibility.mjs"),
+      resolve(moduleDirectory, "../../../../scripts/patch-pi-subagents-visibility.mjs"),
+    ];
+    const candidate = candidates.find((path) => existsSync(path));
+    if (!candidate) throw new Error("Trusted ForgeDock pi-subagents visibility patch is missing from the controller installation");
+    const metadata = lstatSync(candidate);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("Trusted ForgeDock pi-subagents visibility patch must be a regular non-symlink file");
+    }
+    return candidate;
   }
 
   private async assertNoCleanFilters(workspace: GitWorkspace, paths: readonly string[]): Promise<void> {
@@ -1105,6 +1185,10 @@ async function dependencyOwnerStatus(ownerPath: string): Promise<DependencyOwner
 
 async function dependencyOwnerAlive(ownerPath: string): Promise<boolean> {
   return (await dependencyOwnerStatus(ownerPath)) === "alive";
+}
+
+function disabledHooksPath(): string {
+  return process.platform === "win32" ? "NUL" : "/dev/null";
 }
 
 function isOperationalPath(path: string): boolean {

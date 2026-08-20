@@ -8,6 +8,10 @@ export interface GitWorkspace {
   baseSha?: string;
 }
 
+export interface ManagedWorktreeResetLifecycle {
+  /** Re-read exact path/branch/HEAD identity, then force-remove only that managed worktree. */
+  removeExactManaged(input: { path: string; branch: string; headSha: string }): Promise<void>;
+}
 export interface ReviewWorkspaceManager {
   createReview(input: { runId: string; pr: number; headSha: string }): Promise<GitWorkspace>;
   remove(workspace: GitWorkspace): Promise<void>;

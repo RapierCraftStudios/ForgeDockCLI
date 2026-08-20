@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, chmodSync, renameSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
@@ -38,11 +39,13 @@ export interface SqliteRepositoryPurgeResult {
 
 export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository {
   readonly #database: DatabaseSync;
+  readonly #path: string;
   readonly #witness: LeaseWitness | undefined;
   #recoveryEpoch: number | undefined;
   #leaseFailure: string | undefined;
 
   constructor(path: string, options: { witness?: LeaseWitness; readOnly?: boolean } = {}) {
+    this.#path = path;
     this.#witness = options.witness;
     if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path, options.readOnly ? { readOnly: true } : {});
@@ -180,6 +183,74 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   listRuns(limit = 50): RunState[] {
     const rows = this.#database.prepare("SELECT state_json FROM runs ORDER BY rowid DESC LIMIT ?").all(limit);
     return rows.map((row) => JSON.parse(String((row as { state_json: string }).state_json)) as RunState);
+  }
+
+  assertResetNoLiveLeases(itemIds: readonly string[], now = Date.now()): void {
+    for (const itemId of itemIds) {
+      const row = this.#database.prepare("SELECT owner, expires_at FROM leases WHERE item_id = ?").get(itemId) as { owner: string; expires_at: number } | undefined;
+      if (row && row.expires_at > now) throw new Error(`Reset cannot fence live lease ${itemId} owned by ${row.owner} until ${new Date(row.expires_at).toISOString()}`);
+    }
+  }
+
+  assertResetNoLiveLeasePatterns(patterns: readonly string[], now = Date.now()): void {
+    const rows = this.#database.prepare("SELECT item_id, owner, expires_at FROM leases").all() as Array<{ item_id: string; owner: string; expires_at: number }>;
+    for (const row of rows) {
+      if (patterns.some((pattern) => row.item_id === pattern || row.item_id.startsWith(pattern)) && row.expires_at > now) {
+        throw new Error(`Reset cannot fence live lease ${row.item_id} owned by ${row.owner} until ${new Date(row.expires_at).toISOString()}`);
+      }
+    }
+  }
+
+  listReviewFindingPublicationFenceSnapshots(): Array<{ fenceKey: string; generation: number; snapshotSha256: string; repository?: string; pullRequest?: number }> {
+    const rows = this.#database.prepare("SELECT fence_key, generation, repository, pull_request, fence_json FROM review_finding_publication_fences ORDER BY rowid").all() as Array<{ fence_key: string; generation: number; repository: string; pull_request: number; fence_json: string }>;
+    return rows.map((row) => ({ fenceKey: row.fence_key, generation: row.generation, repository: row.repository, pullRequest: row.pull_request, snapshotSha256: createSha256(row.fence_json) }));
+  }
+
+  listResetTaskIdentities(runIds: readonly string[]): Array<{ taskId: string; runId: string; snapshotSha256: string }> {
+    const result: Array<{ taskId: string; runId: string; snapshotSha256: string }> = [];
+    for (const runId of runIds) {
+      const run = this.loadSync(runId);
+      if (!run) continue;
+      result.push({ taskId: `run:${runId}`, runId, snapshotSha256: createSha256(JSON.stringify(run)) });
+    }
+    return result;
+  }
+
+  private loadSync(runId: string): RunState | undefined {
+    const row = this.#database.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as { state_json: string } | undefined;
+    return row ? JSON.parse(row.state_json) as RunState : undefined;
+  }
+
+
+  listArtifactsForRuns(runIds: readonly string[]): Array<{ artifactId: string; subjectKey: string; kind: ArtifactKind; sha256: string }> {
+    if (!runIds.length) return [];
+    const result: Array<{ artifactId: string; subjectKey: string; kind: ArtifactKind; sha256: string }> = [];
+    for (const runId of runIds) {
+      const rows = this.#database.prepare("SELECT artifact_id, subject_key, kind, artifact_json FROM artifacts WHERE json_extract(artifact_json, '$.runId') = ? ORDER BY rowid").all(runId) as Array<{ artifact_id: string; subject_key: string; kind: ArtifactKind; artifact_json: string }>;
+      for (const row of rows) result.push({ artifactId: row.artifact_id, subjectKey: row.subject_key, kind: row.kind, sha256: createSha256(row.artifact_json) });
+    }
+    return result;
+  }
+
+  listAllLeaseSnapshots(): Array<{ itemId: string; expiresAt: number; owner: string; tokenSha256: string }> {
+    const rows = this.#database.prepare("SELECT item_id, expires_at, owner, token FROM leases ORDER BY rowid").all() as Array<{ item_id: string; expires_at: number; owner: string; token: string }>;
+    return rows.map((row) => ({ itemId: row.item_id, expiresAt: row.expires_at, owner: row.owner, tokenSha256: createSha256(row.token) }));
+  }
+  listLeaseSnapshots(itemIds: readonly string[]): Array<{ itemId: string; expiresAt: number; owner: string; tokenSha256: string }> {
+    const result: Array<{ itemId: string; expiresAt: number; owner: string; tokenSha256: string }> = [];
+    for (const itemId of itemIds) {
+      const row = this.#database.prepare("SELECT item_id, expires_at, owner, token FROM leases WHERE item_id = ?").get(itemId) as { item_id: string; expires_at: number; owner: string; token: string } | undefined;
+      if (row) result.push({ itemId: row.item_id, expiresAt: row.expires_at, owner: row.owner, tokenSha256: createSha256(row.token) });
+    }
+    return result;
+  }
+  listTelemetryIdentitiesForRuns(runIds: readonly string[]): Array<{ key: string; runId: string; taskId: string; sessionRef: string; receiptSha256: string }> {
+    const result: Array<{ key: string; runId: string; taskId: string; sessionRef: string; receiptSha256: string }> = [];
+    for (const runId of runIds) {
+      const rows = this.#database.prepare("SELECT telemetry_key, run_id, task_id, session_ref, receipt_json FROM run_telemetry WHERE run_id = ? ORDER BY rowid").all(runId) as Array<{ telemetry_key: string; run_id: string; task_id: string; session_ref: string; receipt_json: string }>;
+      for (const row of rows) result.push({ key: row.telemetry_key, runId: row.run_id, taskId: row.task_id, sessionRef: row.session_ref, receiptSha256: createSha256(row.receipt_json) });
+    }
+    return result;
   }
 
   async createOrchestration(record: OrchestrationRecord): Promise<void> {
@@ -585,7 +656,20 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
    * the repository ports deliberately: cleanup must not become a general
    * deletion primitive, and an identity mismatch aborts the whole transaction.
    */
-  async purgeExactManifest(manifest: SqliteRepositoryPurgeManifest, now = Date.now()): Promise<SqliteRepositoryPurgeResult> {
+  verifyResetPurged(ids: { runs: readonly string[]; artifacts: readonly string[]; orchestrations: readonly string[]; promotions: readonly string[]; telemetry: readonly string[]; fences: readonly string[]; leases: readonly string[] }): void {
+    const checks: Array<[string, string, readonly string[]]> = [
+      ["runs", "run_id", ids.runs], ["artifacts", "artifact_id", ids.artifacts], ["orchestrations", "orchestration_id", ids.orchestrations],
+      ["promotion_records", "promotion_id", ids.promotions], ["run_telemetry", "telemetry_key", ids.telemetry],
+      ["review_finding_publication_fences", "fence_key", ids.fences], ["leases", "item_id", ids.leases],
+    ];
+    for (const [table, column, keys] of checks) for (const key of keys) {
+      const row = this.#database.prepare(`SELECT 1 AS found FROM ${table} WHERE ${column} = ?`).get(key) as { found: number } | undefined;
+      if (row) throw new Error(`Reset purge postcondition failed; ${table} row remains: ${key}`);
+    }
+  }
+
+  async purgeExactManifest(manifest: SqliteRepositoryPurgeManifest, now = Date.now(), options: { allowAbsent?: boolean } = {}): Promise<SqliteRepositoryPurgeResult> {
+    const allowAbsent = options.allowAbsent === true;
     return withSqliteBusyRetry(() => this.inTransaction(() => {
       const runs = manifest.runs ?? [];
       const artifacts = manifest.artifacts ?? [];
@@ -604,16 +688,19 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       assertUniqueManifestValues(reviewFindingFences.map(({ fenceKey }) => fenceKey), "review finding fence");
       assertUniqueManifestValues(leases.map(({ itemId }) => itemId), "lease");
 
-      for (const row of runs) this.assertExactRow("runs", "run_id", row.runId, ["run_id"]);
-      for (const row of artifacts) this.assertExactRow("artifacts", "artifact_id", row.artifactId, ["artifact_id", "subject_key", "kind"], [row.artifactId, row.subjectKey, row.kind]);
-      for (const row of orchestrations) this.assertExactRow("orchestrations", "orchestration_id", row.orchestrationId, ["orchestration_id"]);
-      for (const row of promotions) this.assertExactRow("promotion_records", "promotion_id", row.promotionId, ["promotion_id"]);
-      for (const row of telemetry) this.assertExactRow("run_telemetry", "telemetry_key", row.telemetryKey, ["telemetry_key", "run_id", "task_id", "session_ref"], [row.telemetryKey, row.runId, row.taskId, row.sessionRef]);
-      for (const row of remediationAdmissions) this.assertExactRow("remediation_admissions", "admission_key", row.admissionKey, ["admission_key"]);
-      for (const row of reviewFindingFences) this.assertExactRow("review_finding_publication_fences", "fence_key", row.fenceKey, ["fence_key"]);
+      for (const row of runs) this.assertExactRow("runs", "run_id", row.runId, ["run_id"], undefined, allowAbsent);
+      for (const row of artifacts) this.assertExactRow("artifacts", "artifact_id", row.artifactId, ["artifact_id", "subject_key", "kind"], [row.artifactId, row.subjectKey, row.kind], allowAbsent);
+      for (const row of orchestrations) this.assertExactRow("orchestrations", "orchestration_id", row.orchestrationId, ["orchestration_id"], undefined, allowAbsent);
+      for (const row of promotions) this.assertExactRow("promotion_records", "promotion_id", row.promotionId, ["promotion_id"], undefined, allowAbsent);
+      for (const row of telemetry) this.assertExactRow("run_telemetry", "telemetry_key", row.telemetryKey, ["telemetry_key", "run_id", "task_id", "session_ref"], [row.telemetryKey, row.runId, row.taskId, row.sessionRef], allowAbsent);
+      for (const row of remediationAdmissions) this.assertExactRow("remediation_admissions", "admission_key", row.admissionKey, ["admission_key"], undefined, allowAbsent);
+      for (const row of reviewFindingFences) this.assertExactRow("review_finding_publication_fences", "fence_key", row.fenceKey, ["fence_key"], undefined, allowAbsent);
       for (const row of leases) {
         const current = this.#database.prepare("SELECT expires_at FROM leases WHERE item_id = ?").get(row.itemId) as { expires_at: number } | undefined;
-        if (!current) throw new Error(`Purge manifest lease is absent: ${row.itemId}`);
+        if (!current) {
+          if (allowAbsent) continue;
+          throw new Error(`Purge manifest lease is absent: ${row.itemId}`);
+        }
         if (current.expires_at > now) throw new Error(`Cannot purge active lease: ${row.itemId}`);
       }
 
@@ -640,13 +727,40 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     }));
   }
 
+  archiveResetDatabase(directory: string, prefix: string): Array<{ path: string; sha256: string; kind: "database" }> {
+    if (this.#path === ":memory:") return [];
+    mkdirSync(directory, { recursive: true });
+    // Checkpoint before copying so the main file plus any retained WAL set is
+    // a recoverable, self-consistent restore set. Keep WAL/SHM when present.
+    this.#database.exec("PRAGMA wal_checkpoint(PASSIVE)");
+    const result: Array<{ path: string; sha256: string; kind: "database" }> = [];
+    for (const source of [this.#path, `${this.#path}-wal`, `${this.#path}-shm`]) {
+      if (!existsSync(source)) continue;
+      const destination = `${directory}/${prefix}${source === this.#path ? ".db" : source.endsWith("-wal") ? ".db-wal" : ".db-shm"}`;
+      const temporary = `${destination}.tmp-${process.pid}-${Date.now()}`;
+      if (existsSync(destination)) {
+        const existing = readFileSync(destination);
+        result.push({ path: destination, sha256: createSha256(existing), kind: "database" });
+        continue;
+      }
+      copyFileSync(source, temporary);
+      chmodSync(temporary, 0o600);
+      renameSync(temporary, destination);
+      const bytes = readFileSync(destination);
+      result.push({ path: destination, sha256: createSha256(bytes), kind: "database" });
+    }
+    return result;
+  }
   close(): void {
     this.#database.close();
   }
 
-  private assertExactRow(table: string, keyColumn: string, key: string, columns: readonly string[], expected?: readonly (string | number)[]): void {
+  private assertExactRow(table: string, keyColumn: string, key: string, columns: readonly string[], expected?: readonly (string | number)[], allowAbsent = false): void {
     const row = this.#database.prepare(`SELECT ${columns.join(", ")} FROM ${table} WHERE ${keyColumn} = ?`).get(key) as Record<string, string | number> | undefined;
-    if (!row) throw new Error(`Purge manifest ${table} row is absent: ${key}`);
+    if (!row) {
+      if (allowAbsent) return;
+      throw new Error(`Purge manifest ${table} row is absent: ${key}`);
+    }
     if (expected && columns.some((column, index) => String(row[column]) !== String(expected[index]))) {
       throw new Error(`Purge manifest identity mismatch in ${table}: ${key}`);
     }
@@ -703,6 +817,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       throw error;
     }
   }
+}
+
+function createSha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function sameCheckpoint(left: AuthenticatedLeaseCheckpoint | undefined, right: AuthenticatedLeaseCheckpoint): boolean {

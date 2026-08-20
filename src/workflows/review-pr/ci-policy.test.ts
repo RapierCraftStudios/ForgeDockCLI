@@ -3,13 +3,51 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DEFAULT_REVIEW_CI } from "../../core/config/forgedock-config.js";
 import type { PullRequestMergeGate, PullRequestSnapshot } from "../../core/ports/forge-host.js";
-import { assessPullRequestCi, assertPullRequestCiReady, classifyPullRequest } from "./ci-policy.js";
+import { assessMergeAdmission, assessPullRequestCi, assertPullRequestCiReady, classifyPullRequest } from "./ci-policy.js";
 const pr = (headBranch: string, baseBranch: string): PullRequestSnapshot => ({ repo: "a/b", number: 8, title: "PR", body: "", url: "https://github.com/a/b/pull/8", state: "OPEN", headSha: "a".repeat(40), headBranch, baseBranch });
-const gate = (checks: PullRequestMergeGate["requiredChecks"], mergeable = true): PullRequestMergeGate => ({ repo: "a/b", pullRequest: 8, headSha: "a".repeat(40), baseBranch: "main", mergeable, requiredChecks: checks, observedAt: new Date().toISOString() });
+const gate = (checks: PullRequestMergeGate["requiredChecks"], mergeable = true): PullRequestMergeGate => ({ repo: "a/b", pullRequest: 8, headSha: "a".repeat(40), baseBranch: "main", mergeable, requiredChecksProvenance: "github-required", requiredChecksHeadSha: "a".repeat(40), requiredChecks: checks, observedAt: new Date().toISOString() });
 describe("review CI policy", () => {
   it("classifies PR kinds", () => { assert.equal(classifyPullRequest(pr("fix/a", "main")), "delivery"); assert.equal(classifyPullRequest(pr("feature/a", "staging")), "promotion"); assert.equal(classifyPullRequest(pr("staging", "main")), "deployment"); });
   it("owns only the checks selected for the PR type", () => { const a = assessPullRequestCi(pr("fix/a", "main"), gate([{ name: "build", state: "passed" }, { name: "test", state: "pending" }, { name: "release", state: "failed" }]), { ...DEFAULT_REVIEW_CI, deliveryChecks: ["build", "test"] }); assert.deepEqual(a.pending.map((x) => x.name), ["test"]); assert.equal(a.failed.length, 0); });
-  it("asks clearly and fails closed for absent exact checks", () => { const a = assessPullRequestCi(pr("fix/a", "main"), gate([{ name: "build", state: "passed" }]), { ...DEFAULT_REVIEW_CI, deliveryChecks: ["build", "release"] }); assert.throws(() => assertPullRequestCiReady(a, "ask", "after"), /Please fix.*rerun \/review-pr.*auto-fix/s); });
+  it("treats an exact GitHub empty required-check projection as advisory review evidence", () => {
+    const pullRequest = pr("staging", "main");
+    const emptyGate: PullRequestMergeGate = {
+      ...gate([]),
+      requiredChecksProvenance: "github-none",
+      requiredChecksHeadSha: pullRequest.headSha,
+    };
+    const assessment = assessPullRequestCi(pullRequest, emptyGate, { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" });
+    assert.equal(assessment.ready, true);
+    assert.deepEqual(assessment.selected, []);
+    assert.deepEqual(assessment.pending, []);
+    assert.deepEqual(assessment.failed, []);
+    assert.match(assessment.warnings[0] ?? "", /no required checks.*advisory review.*does not establish merge authority/i);
+  });
+  it("rejects stale exact github-none authority for advisory review", () => {
+    const pullRequest = pr("staging", "main");
+    const staleGate: PullRequestMergeGate = {
+      ...gate([]),
+      headSha: "b".repeat(40),
+      requiredChecksProvenance: "github-none",
+      requiredChecksHeadSha: "b".repeat(40),
+    };
+    const assessment = assessPullRequestCi(pullRequest, staleGate, { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" });
+    assert.equal(assessment.ready, false);
+    assert.equal(assessment.failed.some((check) => check.name === "required-checks-authority"), true);
+  });
+  it("rejects stale exact github-none authority for merge admission", () => {
+    const pullRequest = pr("staging", "main");
+    const staleGate: PullRequestMergeGate = {
+      ...gate([]),
+      headSha: "b".repeat(40),
+      requiredChecksProvenance: "github-none",
+      requiredChecksHeadSha: "b".repeat(40),
+    };
+    const assessment = assessMergeAdmission(pullRequest, staleGate, { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" });
+    assert.equal(assessment.ready, false);
+    assert.equal(assessment.failed.some((check) => check.name.includes("GitHub reported no required checks") || check.name.includes("not immutably bound")), true);
+  });
+
   it("fails closed for every unmatched wildcard selector", () => {
     const policy = { ...DEFAULT_REVIEW_CI, deliveryChecks: ["Pipeline *", "Release *"] };
     const unrelated = assessPullRequestCi(pr("fix/a", "main"), gate([{ name: "CI", state: "passed" }]), policy);
@@ -21,7 +59,7 @@ describe("review CI policy", () => {
     assert.throws(() => assertPullRequestCiReady(unrelated, "ask", "after"), /Pipeline \*=unavailable/);
 
     const empty = assessPullRequestCi(pr("fix/a", "main"), gate([]), { ...policy, deliveryChecks: ["Pipeline *"] });
-    assert.deepEqual(empty.failed.map((check) => check.name), ["Pipeline *"]);
+    assert.deepEqual(empty.failed.map((check) => check.name), ["Pipeline *", "required-checks-authority"]);
     assert.equal(empty.ready, false);
     assert.throws(() => assertPullRequestCiReady(empty, "ask", "after"), /Pipeline \*=unavailable/);
   });

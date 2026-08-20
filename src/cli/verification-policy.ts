@@ -16,7 +16,7 @@ export function discoverLegacyVerificationCommands(
   const scripts = manifest.scripts ?? {};
   const npm = npmInvocation();
   const commands: Array<Omit<VerificationCommand, "cwd">> = [
-    { id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 2 * 60_000, required: true, selection: "always" },
+    { id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 2 * 60_000, required: true, selection: "always", evidenceCapability: "generic" },
   ];
   for (const script of ["lint", "typecheck", "check", "build", "docs:build", "test"] as const) {
     if (!scripts[script]) continue;
@@ -52,6 +52,7 @@ export function discoverVerificationCommands(
     policyVersion: VERIFICATION_POLICY_VERSION,
     selection: "always",
     lockScope: "workspace",
+    evidenceCapability: "generic",
   }];
 
   // This repository needs compile/type integrity, but ordinary issue delivery
@@ -74,6 +75,7 @@ export function discoverVerificationCommands(
       selection: "always",
       lockScope: "workspace",
       ...(typescriptLayout ? { typescriptLayout, cleanOutputRoot: typescriptLayout.outputRoot } : {}),
+      evidenceCapability: "generic",
     });
   }
 
@@ -91,6 +93,7 @@ export function discoverVerificationCommands(
       targeting: "expected-test-paths",
       lockScope: "workspace",
       typescriptLayout,
+      evidenceCapability: "targeted-test",
     });
   }
 

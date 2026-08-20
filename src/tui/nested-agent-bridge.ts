@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SubagentDelegationV2Request, SubagentDelegationV2Response, SubagentDelegationV2Update } from "pi-subagents/delegation";
 import type { TSchema } from "typebox";
@@ -66,8 +68,19 @@ export interface NestedAgentBridge {
   close(): Promise<void>;
 }
 
-export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAgentBridge> {
+export interface NestedAgentBridgeOptions {
+  /** Existing controller checkout and managed worktree roots trusted by this bridge. */
+  allowedRoots?: readonly string[];
+}
+
+export async function startNestedAgentBridge(
+  pi: ExtensionAPI,
+  options: NestedAgentBridgeOptions = {},
+): Promise<NestedAgentBridge> {
+  const allowedRoots = canonicalAllowedRoots(options.allowedRoots ?? [process.cwd()]);
+  if (!allowedRoots.length) throw new Error("Nested agent bridge requires an existing trusted filesystem root");
   const token = crypto.randomUUID();
+  let closed = false;
   const pending = new Set<AbortController>();
   const server = createServer((request, response) => {
     const controller = new AbortController();
@@ -76,7 +89,7 @@ export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAg
     response.once("close", () => {
       if (!response.writableEnded) controller.abort(new Error("Nested agent response disconnected"));
     });
-    void handleRequest(pi, token, request, response, controller.signal)
+    void handleRequest(pi, token, allowedRoots, request, response, controller.signal)
       .finally(() => pending.delete(controller));
   });
   await new Promise<void>((resolve, reject) => {
@@ -90,21 +103,41 @@ export async function startNestedAgentBridge(pi: ExtensionAPI): Promise<NestedAg
   return {
     env: {
       FORGEDOCK_NESTED_AGENT_URL: `http://127.0.0.1:${address.port}/v1/run`,
+      FORGEDOCK_NESTED_AGENT_HEALTH_URL: `http://127.0.0.1:${address.port}/v1/health`,
       FORGEDOCK_NESTED_AGENT_TOKEN: token,
     },
-    close: () => new Promise<void>((resolve, reject) => {
-      for (const controller of pending) controller.abort(new Error("Nested agent bridge closed"));
-      server.close((error) => error ? reject(error) : resolve());
-      server.closeAllConnections();
-    }),
+    close: () => {
+      if (closed) return Promise.resolve();
+      closed = true;
+      return new Promise<void>((resolve, reject) => {
+        for (const controller of pending) controller.abort(new Error("Nested agent bridge closed"));
+        server.close((error) => {
+          const code = error instanceof Error ? (error as Error & { code?: string }).code : undefined;
+          if (error && code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+          else resolve();
+        });
+        server.closeAllConnections();
+      });
+    },
   };
 }
 
-async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingMessage, response: ServerResponse, signal: AbortSignal): Promise<void> {
+async function handleRequest(
+  pi: ExtensionAPI,
+  token: string,
+  allowedRoots: readonly string[],
+  request: IncomingMessage,
+  response: ServerResponse,
+  signal: AbortSignal,
+): Promise<void> {
   try {
-    if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
+    if (request.method !== "GET" && request.method !== "POST") return send(response, 404, { error: "Not found" });
     if (request.headers.authorization !== `Bearer ${token}`) return send(response, 401, { error: "Unauthorized" });
+    if (request.method === "GET" && request.url === "/v1/health") return send(response, 200, { ok: true, owner: "forgedock" });
+    if (request.method !== "POST" || request.url !== "/v1/run") return send(response, 404, { error: "Not found" });
     const payload = validateRequest(JSON.parse(await readBody(request)) as unknown);
+    const canonicalCwd = canonicalRequestCwd(payload.cwd, allowedRoots);
+    const scopedPayload = { ...payload, cwd: canonicalCwd };
     const announceSession = (sessionRef: string): void => {
       if (response.headersSent || !sessionRef || sessionRef.length > 256 || /[\r\n]/.test(sessionRef)) return;
       response.writeHead(200, {
@@ -125,9 +158,9 @@ async function handleRequest(pi: ExtensionAPI, token: string, request: IncomingM
         // heartbeat write must not mask the nested operation's result.
       }
     };
-    const result = payload.resumeSessionRef
-      ? await resumeDelegation(pi, payload, signal, announceSession)
-      : await delegate(pi, payload, signal, announceSession, relayProgress);
+    const result = scopedPayload.resumeSessionRef
+      ? await resumeDelegation(pi, scopedPayload, signal, announceSession)
+      : await delegate(pi, scopedPayload, signal, announceSession, relayProgress);
     send(response, 200, result);
   } catch (error) {
     send(response, 500, {
@@ -462,6 +495,38 @@ function buildTask(input: NestedAgentRequest): string {
 function agentForRole(role: AgentRole): string {
   if (role === "reviewer") return "forgedock-reviewer";
   throw new Error(`Nested delegation is not enabled for role ${role}`);
+}
+
+function canonicalAllowedRoots(roots: readonly string[]): string[] {
+  const canonical: string[] = [];
+  for (const root of roots) {
+    if (typeof root !== "string" || !root.trim()) continue;
+    try {
+      const path = realpathSync.native(resolve(root));
+      if (!statSync(path).isDirectory()) continue;
+      if (!canonical.includes(path)) canonical.push(path);
+    } catch {
+      // A trusted root must exist at bridge startup; silently omitting a bad
+      // root allows the caller to fail closed when no usable roots remain.
+    }
+  }
+  return canonical;
+}
+
+function canonicalRequestCwd(cwd: string, allowedRoots: readonly string[]): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync.native(resolve(cwd));
+    if (!statSync(canonical).isDirectory()) throw new Error("not a directory");
+  } catch {
+    throw new Error("Nested reviewer cwd must be an existing directory");
+  }
+  const trusted = allowedRoots.some((root) => {
+    const suffix = relative(root, canonical);
+    return suffix === "" || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
+  });
+  if (!trusted) throw new Error("Nested reviewer cwd is outside trusted ForgeDock roots");
+  return canonical;
 }
 
 function validateRequest(value: unknown): NestedAgentRequest {

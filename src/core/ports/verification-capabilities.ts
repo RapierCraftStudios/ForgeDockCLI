@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { VerificationCommand } from "./verification.js";
+import type { VerificationCommand, VerificationEvidenceCapability } from "./verification.js";
 
 export const MAX_VERIFICATION_TARGETS = 32;
 export const VERIFICATION_TEST_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
@@ -14,6 +14,8 @@ export interface VerificationCapability {
   allowedTestExtensions?: readonly string[];
   targetPattern?: "**/*.test.{ts,tsx,mts,cts}";
   maxTargets?: number;
+  /** Safe semantic classification; command, args, cwd, and layout are never projected. */
+  evidenceCapability?: VerificationEvidenceCapability;
 }
 
 export class VerificationCapabilityMismatchError extends Error {
@@ -38,12 +40,13 @@ export function isVerificationCapabilityMismatchError(error: unknown): error is 
 
 /** Project only safe selection facts; executable arguments remain controller-private. */
 export function projectVerificationCapabilities(
-  commands: readonly (Pick<VerificationCommand, "id"> & Partial<Pick<VerificationCommand, "required" | "selection" | "targeting" | "typescriptLayout">>)[],
+  commands: readonly (Pick<VerificationCommand, "id"> & Partial<Pick<VerificationCommand, "required" | "selection" | "targeting" | "typescriptLayout" | "evidenceCapability">>)[],
 ): VerificationCapability[] {
   return commands.map((command) => ({
     id: command.id,
     required: command.required ?? false,
     selection: command.selection ?? "available",
+    ...(command.evidenceCapability !== undefined ? { evidenceCapability: command.evidenceCapability } : {}),
     ...(command.targeting === "expected-test-paths" ? {
       targeting: command.targeting,
       ...(command.typescriptLayout?.sourceRoot !== undefined ? { allowedSourceRoot: command.typescriptLayout.sourceRoot } : {}),

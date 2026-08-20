@@ -15,7 +15,7 @@ const WORK_ON_VALUE_OPTIONS = new Set([
 ]);
 
 const REVIEW_VALUE_OPTIONS = new Set(["--repo", "--issue", "--provider", "--model", "--thinking"]);
-const RESET_VALUE_OPTIONS = new Set(["--repo", "--reason"]);
+const RESET_VALUE_OPTIONS = new Set(["--repo", "--reason", "--apply", "--manifest", "--dag", "--dags"]);
 
 export const PROMOTION_VALUE_OPTIONS = new Set(["--from", "--to", "--resume", "--repo", "--provider", "--model", "--thinking"]);
 
@@ -58,6 +58,31 @@ export function parseWorkOnIssueArgument(argv: readonly string[]): string | unde
 
 export function parseReviewPullRequestArgument(argv: readonly string[]): string | undefined {
   return firstPositionalArgument(argv, REVIEW_VALUE_OPTIONS);
+}
+
+export function parseResetIssueArguments(argv: readonly string[]): number[] {
+  const values: number[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg.startsWith("--")) {
+      if (RESET_VALUE_OPTIONS.has(arg)) index++;
+      continue;
+    }
+    for (const token of arg.split(",")) if (/^\d+$/.test(token)) values.push(Number(token));
+  }
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+export function parseResetDagArguments(argv: readonly string[]): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === "--dag" || arg === "--dags") {
+      const value = argv[++index];
+      if (value) values.push(...value.split(","));
+    }
+  }
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].sort();
 }
 
 export function parseResetIssueArgument(argv: readonly string[]): string | undefined {

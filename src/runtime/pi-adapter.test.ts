@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
+import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -328,7 +328,8 @@ test("a stale nested reviewer bridge fails closed without exposing its bearer to
   const runtime = new PiAgentRuntime({ provider: "test-provider", model: "test-model" });
   try {
     await assert.rejects(runtime.run(taskForRole("reviewer") as any), (error: any) => {
-      assert.equal(error.name, "AgentRunError");
+      assert.equal(error.name, "NestedReviewerTransportError");
+      assert.ok(error instanceof NestedReviewerTransportError);
       assert.match(error.message, /Nested reviewer transport failed/);
       assert.doesNotMatch(error.message, /stale-bridge-token|authorization|Bearer/i);
       return true;

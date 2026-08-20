@@ -147,16 +147,17 @@ describe("bundled subagent live visibility", () => {
     assert.equal(fleetStatus.collectFleetStatusEntries(state)[0]?.activeChild, "forgedock-reviewer");
   });
 
-  it("accepts a completed read-only ForgeDock review despite an earlier optional probe failure", () => {
+  it("keeps transport recovery separate from unconditional tool-budget failure", () => {
     const execution = readFileSync(resolve("node_modules/pi-subagents/src/runs/foreground/execution.ts"), "utf8");
     const delegation = readFileSync(resolve("node_modules/pi-subagents/src/slash/delegation-adapters.ts"), "utf8");
     assert.match(execution, /agent\.name === "forgedock-reviewer"[\s\S]*?structuredOutputToolInvoked[\s\S]*?detectSubagentError\(\[\]\)/);
     assert.match(execution, /completedForgeDockStructuredReview[\s\S]*?structured_output is the terminating contract[\s\S]*?result\.exitCode = 0[\s\S]*?result\.error = undefined/);
     assert.doesNotMatch(execution, /completedForgeDockStructuredReview[\s\S]{0,800}?websocket/);
-    assert.match(delegation, /toolBudgetBlocked && child\?\.structuredOutput === undefined/);
+    assert.match(delegation, /if \(child\?\.toolBudgetBlocked\) return "tool_budget_exhausted";/);
+    assert.doesNotMatch(delegation, /toolBudgetBlocked && child\?\.structuredOutput/);
   });
 
-  it("projects a schema-valid review as completed after its evidence budget blocks another read", async () => {
+  it("projects structured output plus toolBudgetBlocked as tool_budget_exhausted", async () => {
     const jiti = createJiti(import.meta.url, { interopDefault: true });
     const delegation = await jiti.import(resolve("node_modules/pi-subagents/src/slash/delegation-adapters.ts")) as {
       toSubagentDelegationV2Response(request: Record<string, unknown>, result: Record<string, unknown>, aborted: boolean): {
@@ -189,11 +190,8 @@ describe("bundled subagent live visibility", () => {
         }],
       },
     }, false);
-    assert.equal(response.status, "completed");
-    assert.deepEqual(response.result, {
-      kind: "structured",
-      value: { summary: "No blocking findings.", findings: [] },
-    });
+    assert.equal(response.status, "tool_budget_exhausted");
+    assert.equal(response.result, undefined);
   });
 
   it("keeps typed ForgeDock reviewers off the interactive supervisor channel", () => {

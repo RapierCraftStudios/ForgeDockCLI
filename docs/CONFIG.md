@@ -39,9 +39,8 @@ The default (no flags) is the annotated review screen: detection runs, AI enrich
 
 If you have both a local `claude` CLI and `ANTHROPIC_API_KEY` set and want to pin one explicitly instead of letting `init` prefer the CLI, set `FORGEDOCK_INIT_BACKEND=api` (or `=cli`, or `=none` to skip enrichment entirely). This is independent of `FORGEDOCK_BACKEND`, which controls the separate `forgedock run` engine backend.
 
----
+For the Next CLI, repository reset is explicitly two-phase: `forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--manifest path]` writes a canonical, digest-bound manifest; apply only with `forgedock-next reset --apply <manifest-digest> --manifest path`. Dry-run is read-only, and apply aborts on identity drift or live leases/workers.
 
-## Schema Overview
 
 | Section | Required | Purpose |
 |---------|----------|---------|
@@ -103,6 +102,9 @@ next:
       promotion_checks: ["*"]
       deployment_checks: ["*"]
       repair_paths: []
+      # require (default) or if-present; target overrides preserve strict defaults
+      required_checks_default: "require"
+      required_checks_targets: {"staging": "if-present"}
 ```
 
 | Field | Type | Built-in default | Behavior |
@@ -126,6 +128,8 @@ next:
 | `review.ci.promotion_checks` | string array | `["*"]` | Configured standalone promotion check selection. |
 | `review.ci.deployment_checks` | string array | `["*"]` | Configured standalone deployment check selection. |
 | `review.ci.repair_paths` | path array | `[]` | Additional bounded paths authorized for configured CI repair. |
+| `review.ci.required_checks_default` | `require` \| `if-present` | `require` | Merge/review admission requires nonempty exact-head GitHub-required checks by default; `if-present` also permits authoritative exact-head GitHub-none empty evidence. |
+| `review.ci.required_checks_targets` | branch → mode map | `{}` | Target-specific override, for example `{ "staging": "if-present" }`; unlisted and production targets remain strict. |
 
 CLI overrides include `--batching aggressive|conservative|none`,
 `--max-parallel N`, and `--dry-run|--confirm|--auto`. Preview reports selected and
@@ -134,11 +138,7 @@ requested, sampled transport, and effective caps. An explicit batch is one visib
 node/pipeline but still charges one issue slot per member; an indivisible batch
 larger than the cap may run alone to avoid deadlock.
 
-Review CI lists and `failure_action` control standalone review selection/repair only.
-They do not create merge authority. ForgeDock-triggered auto-merge still requires a
-fresh nonempty GitHub-required check set with `github-required` provenance, every
-observation passing at the exact reviewed SHA, and a mergeable exact route. A
-repository with no required checks is unavailable authority, not implicit success.
+Review CI lists and `failure_action` control standalone review selection/repair only. Required-check admission is target-aware: `require` accepts only nonempty `github-required` exact-head all-passed evidence; `if-present` additionally accepts authoritative exact-head `github-none` empty evidence. Unavailable, malformed, stale, pending, failed, and cancelled observations fail closed. Unlisted and production targets retain the strict default. Bounded repair is limited to mutable same-repository delivery branches; a repaired head requires packet-local re-verification, publication/rebinding, and a fresh independent review before merge.
 
 Batching authorization is not inferred from a model-proposed plan. With `none`, an
 already-contracted multi-member node is rejected. `conservative` remains limited to

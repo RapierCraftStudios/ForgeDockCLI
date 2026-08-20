@@ -32,6 +32,7 @@ class DeploymentHost implements ForgeHost {
   pullRequest = deploymentPr;
   pullRequestSnapshots: PullRequestSnapshot[] = [];
   requiredChecks: PullRequestMergeGate["requiredChecks"] = [{ name: "CI", state: "passed" }];
+  requiredChecksProvenance: NonNullable<PullRequestMergeGate["requiredChecksProvenance"]> = "github-required";
   mergeGateIdentity: Partial<Pick<PullRequestMergeGate, "repo" | "pullRequest" | "headSha" | "baseBranch">> = {};
   publicationFence: ReviewFindingPublicationFence | undefined;
   async beginReviewFindingPublication(input: { repo: string; pullRequest: PullRequestSnapshot; runId: string }) {
@@ -60,7 +61,7 @@ class DeploymentHost implements ForgeHost {
       baseBranch,
       ...this.mergeGateIdentity,
       mergeable: true,
-      requiredChecksProvenance: "github-required",
+      requiredChecksProvenance: this.requiredChecksProvenance,
       requiredChecksHeadSha: headSha,
       requiredChecks: [...this.requiredChecks],
       observedAt: new Date().toISOString(),
@@ -123,6 +124,82 @@ describe("issue-less deployment PR review", () => {
     assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number })).map(({ kind }) => kind), ["FindingRootLedger", "ReviewFindingProjection", "ReviewFindingProjection", "ReviewVerdict"]);
     assertNoDeploymentGate(host.publications);
     assert.equal(workspaces.removed, true);
+  });
+
+  it("runs an advisory review with a durable warning when GitHub requires no checks", async () => {
+    const host = new DeploymentHost();
+    host.requiredChecks = [];
+    host.requiredChecksProvenance = "github-none";
+    const runtime = new FakeAgentRuntime(Array.from({ length: 8 }, () => clean));
+    const workspaces = new TestWorkspaces();
+    const artifacts = new InMemoryArtifactRepository();
+    const warnings: string[] = [];
+
+    const result = await reviewExistingPullRequest(
+      { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" } } },
+      {
+        runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository(),
+        onWarning: (warning) => warnings.push(warning),
+      },
+    );
+
+    assert.equal(result.run.state, "merging");
+    assert.equal(result.verdict.payload.disposition, "approve");
+    assert.deepEqual(result.verdict.payload.checks, []);
+    assert.deepEqual(result.verdict.payload.warnings, warnings);
+    assert.match(warnings[0] ?? "", /no required checks.*advisory review.*does not establish merge authority/i);
+    assert.ok(runtime.tasks.length > 0);
+    assert.ok(host.mergeGateHeads.length >= 3);
+    assert.equal(host.mergeGateHeads.every((head) => head === sha), true);
+    assert.equal(workspaces.removed, true);
+    assert.deepEqual((await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }, "ReviewVerdict")).map(({ id }) => id), [result.verdict.id]);
+    assertNoDeploymentGate(host.publications);
+  });
+
+  it("accepts exact-head required checks that begin reporting during review", async () => {
+    const host = new DeploymentHost();
+    host.requiredChecks = [];
+    host.requiredChecksProvenance = "github-none";
+    const runtime = new FakeAgentRuntime([
+      () => {
+        host.requiredChecks = [{ name: "CI", state: "passed" }];
+        host.requiredChecksProvenance = "github-required";
+        return clean;
+      },
+      ...Array.from({ length: 7 }, () => clean),
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+
+    const result = await reviewExistingPullRequest(
+      { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" } } },
+      { runtime, host, workspaces: new TestWorkspaces(), artifacts, runs: new InMemoryRunRepository() },
+    );
+    assert.equal(result.verdict.payload.disposition, "approve");
+    assert.match(result.verdict.payload.warnings?.[0] ?? "", /no required checks.*when review started/i);
+    assert.ok(runtime.tasks.length > 0);
+  });
+
+  it("requires a rerun when required-check evidence disappears during review", async () => {
+    const host = new DeploymentHost();
+    const runtime = new FakeAgentRuntime([
+      () => {
+        host.requiredChecks = [];
+        host.requiredChecksProvenance = "github-none";
+        return clean;
+      },
+      ...Array.from({ length: 7 }, () => clean),
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" } } },
+        { runtime, host, workspaces: new TestWorkspaces(), artifacts, runs: new InMemoryRunRepository() },
+      ),
+      /required-check evidence changed.*missing or replaced checks: ci.*rerun \/review-pr/i,
+    );
+    assert.ok(runtime.tasks.length > 0);
+    assert.deepEqual(await artifacts.list({ repo: deploymentPr.repo, pr: deploymentPr.number }, "ReviewVerdict"), []);
   });
 
   it("blocks an unmatched deployment wildcard before reviewer setup", async () => {
@@ -213,7 +290,7 @@ describe("issue-less deployment PR review", () => {
     const artifacts = new InMemoryArtifactRepository();
     await assert.rejects(
       reviewExistingPullRequest(
-        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: DEFAULT_REVIEW_CI } },
+        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" } } },
         { runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository() },
       ),
       /CI=pending.*Please fix.*rerun \/review-pr/s,
@@ -266,7 +343,7 @@ describe("issue-less deployment PR review", () => {
         { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: deploymentWildcardPolicy } },
         { runtime, host, workspaces, artifacts, runs: new InMemoryRunRepository() },
       ),
-      /ForgeDock deployment PR checks are not green after independent review of the exact head: Pipeline \*=unavailable/,
+      /required-check evidence changed.*missing or replaced checks: pipeline linux.*rerun \/review-pr/i,
     );
 
     assert.ok(runtime.tasks.length > 0);
@@ -290,6 +367,22 @@ describe("issue-less deployment PR review", () => {
       ),
       /Deployment review requires an authoritative merge-gate adapter/,
     );
+  });
+
+  it("still blocks review when the required-check query is genuinely unavailable", async () => {
+    const host = new DeploymentHost();
+    host.requiredChecksProvenance = "unavailable";
+    host.requiredChecks = [{ name: "required-checks-query", state: "unavailable" }];
+    const runtime = new FakeAgentRuntime();
+
+    await assert.rejects(
+      reviewExistingPullRequest(
+        { repo: deploymentPr.repo, pr: deploymentPr.number, ci: { policy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "if-present" } } },
+        { runtime, host, workspaces: new TestWorkspaces(), artifacts: new InMemoryArtifactRepository(), runs: new InMemoryRunRepository() },
+      ),
+      /checks are not immutably bound/,
+    );
+    assert.equal(runtime.tasks.length, 0);
   });
 
   it("re-freezes an advanced head immediately before reviewer setup", async () => {

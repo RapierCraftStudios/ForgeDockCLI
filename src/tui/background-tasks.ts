@@ -59,6 +59,8 @@ export interface BackgroundTaskRecord {
   ownerPid?: number;
   /** Last durable heartbeat written by the owning TUI supervisor. */
   ownerHeartbeatAt?: string;
+  /** Non-secret process-launch witness used to reject PID reuse during adoption. */
+  ownerIncarnation?: string;
   /** Set when the owner intentionally releases the task during session teardown. */
   ownerReleasedAt?: string;
 }
@@ -82,11 +84,13 @@ interface LiveTask {
   stderrOffset: number;
   adopted: boolean;
   cleanup?: () => Promise<void>;
+  cleanupPromise?: Promise<void>;
 }
 
 export class ForgeDockBackgroundTasks {
   readonly #pi: ExtensionAPI;
   readonly #ownerId = crypto.randomUUID();
+  readonly #ownerIncarnation = processIncarnationWitness(process.pid);
   readonly #live = new Map<string, LiveTask>();
   readonly #records = new Map<string, BackgroundTaskRecord>();
   readonly #directories = new Set<string>();
@@ -260,6 +264,7 @@ export class ForgeDockBackgroundTasks {
       ...(input.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED ? {
         ownerId: this.#ownerId,
         ownerPid: process.pid,
+        ...(this.#ownerIncarnation !== undefined ? { ownerIncarnation: this.#ownerIncarnation } : {}),
         ownerHeartbeatAt: new Date().toISOString(),
       } : {}),
     };
@@ -424,25 +429,46 @@ export class ForgeDockBackgroundTasks {
     const live = [...this.#live.values()];
     if (options.cancel ?? true) {
       for (const task of live) this.cancel(task.record.id);
-      await Promise.allSettled(live.map((task) => task.cleanup?.()));
+      await Promise.allSettled(live.map((task) => this.cleanupTask(task)));
     } else {
       const persisted = this.recordsFromDisk();
+      const bridgeTasks: LiveTask[] = [];
       for (const task of live) {
         const latest = persisted.get(task.record.id);
         if (latest) task.record = latest;
         if (task.record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED
           && task.record.ownerId === this.#ownerId) {
+          // A bridge is an in-memory capability of this supervisor. Do not
+          // detach its controller: release ownership, checkpoint it as a
+          // restart interruption, and stop it before closing the bridge.
           task.record.ownerReleasedAt = new Date().toISOString();
+          task.record.status = "blocked";
+          task.record.completedAt ??= new Date().toISOString();
+          task.record.exitCode ??= 2;
+          task.record.terminalCause = TUI_RESTART_TERMINAL_CAUSE;
+          this.persist(task.record);
+          bridgeTasks.push(task);
+        } else {
+          if (task.record.status === "running") task.record.status = "detached";
+          this.persist(task.record);
         }
-        if (task.record.status === "running") {
-          task.record.status = "detached";
-        }
-        this.persist(task.record);
       }
+      // SIGINT gives the controller a chance to flush its durable checkpoint
+      // and process-signal handlers before the bounded hard-stop fallback.
+      for (const task of bridgeTasks) interruptProcessTree(task.child ?? task.record.pid);
+      await Promise.all(bridgeTasks.map((task) => waitForProcessExit(task, 5_000)));
+      await Promise.allSettled(bridgeTasks.map((task) => boundedCleanup(this.cleanupTask(task), 2_000)));
+      for (const task of bridgeTasks) this.notifyRestartRequired(task.record);
     }
     this.#live.clear();
     this.stopTicker();
     this.#ctx?.ui.setStatus("forgedock-tasks", undefined);
+  }
+
+  private cleanupTask(task: LiveTask): Promise<void> {
+    if (!task.cleanup) return Promise.resolve();
+    task.cleanupPromise ??= Promise.resolve().then(() => task.cleanup!()).catch(() => undefined);
+    return task.cleanupPromise;
   }
 
   private async finish(id: string, status: BackgroundTaskStatus, exitCode?: number, detail?: string): Promise<void> {
@@ -465,8 +491,10 @@ export class ForgeDockBackgroundTasks {
       this.persist(live.record);
       if (observationAdapter) await observationAdapter.finished(id, live.record.status, exitCode);
       this.#live.delete(id);
-      await live.cleanup?.().catch(() => undefined);
-      const terminalDetail = detail ?? (live.record.status === "completed" ? undefined : boundedTerminalError(live.record.stderrLogPath));
+      await this.cleanupTask(live);
+      const terminalDetail = detail ?? (live.record.status === "completed"
+        ? boundedTerminalWarnings(live.record.stderrLogPath)
+        : boundedTerminalError(live.record.stderrLogPath));
       const message = [`${renderRecord(live.record)}${terminalDetail ? ` — ${terminalDetail}` : ""}`, `Log: ${live.record.logPath}`, ...(live.record.stderrLogPath ? [`Error log: ${live.record.stderrLogPath}`] : [])].join("\n");
       this.#ctx?.ui.notify(message, live.record.status === "completed" ? "info" : "warning");
       try {
@@ -629,6 +657,8 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && (record.ownerId === undefined || (typeof record.ownerId === "string" && record.ownerId.length > 0 && record.ownerId.length <= 128))
     && (record.ownerPid === undefined || (Number.isInteger(record.ownerPid) && (record.ownerPid ?? 0) > 0))
     && (record.ownerHeartbeatAt === undefined || typeof record.ownerHeartbeatAt === "string")
+    && (record.ownerIncarnation === undefined || (typeof record.ownerIncarnation === "string" && record.ownerIncarnation.length > 0 && record.ownerIncarnation.length <= 256))
+    && (record.ownerIncarnation === undefined || (typeof record.ownerIncarnation === "string" && record.ownerIncarnation.length > 0 && record.ownerIncarnation.length <= 256))
     && (record.ownerReleasedAt === undefined || typeof record.ownerReleasedAt === "string")
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
 }
@@ -680,6 +710,15 @@ function isSemanticBackgroundActivity(event: ObservationEnvelopeV1): boolean {
   return false;
 }
 
+function boundedTerminalWarnings(path: string | undefined): string | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  const warnings = readFileSync(path, "utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("ForgeDock warning: "));
+  if (!warnings.length) return undefined;
+  return truncateTail(warnings.join("\n"), { maxBytes: 2_000, maxLines: 4 }).content.replace(/\s*\n\s*/g, " | ");
+}
+
 function boundedTerminalError(path: string | undefined): string | undefined { if (!path || !existsSync(path)) return undefined; const raw = readFileSync(path, "utf8").trim(); if (!raw) return undefined; return truncateTail(raw, { maxBytes: 2_000, maxLines: 8 }).content.replace(/\s*\n\s*/g, " | "); }
 
 function readLogDelta(path: string | undefined, offset: number): { text: string; nextOffset: number } | undefined {
@@ -710,6 +749,48 @@ export function renderRecord(record: BackgroundTaskRecord): string {
     ? " · resume required after TUI restart"
     : "";
   return `${record.id} · ${record.status}${record.exitCode !== undefined ? ` (exit ${record.exitCode})` : ""}${restartHint} · pid ${record.pid} · ${record.args.slice(1, 3).join(" ") || record.command}`;
+}
+
+function boundedCleanup(cleanup: Promise<void>, timeoutMs: number): Promise<void> {
+  return Promise.race([
+    cleanup,
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    }),
+  ]);
+}
+
+export function interruptProcessTree(childOrPid: ChildProcess | number): void {
+  const pid = typeof childOrPid === "number" ? childOrPid : childOrPid.pid;
+  if (!pid) return;
+  if (process.platform === "win32") {
+    if (typeof childOrPid !== "number") childOrPid.kill();
+    return;
+  }
+  try { process.kill(-pid, "SIGINT"); }
+  catch {
+    if (typeof childOrPid !== "number") childOrPid.kill("SIGINT");
+  }
+}
+
+function waitForProcessExit(task: LiveTask, timeoutMs: number): Promise<void> {
+  if (!isProcessAlive(task.record.pid)) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      task.child?.removeListener("exit", finish);
+      if (isProcessAlive(task.record.pid)) terminateProcessTree(task.child ?? task.record.pid);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    task.child?.once("exit", finish);
+    if (!isProcessAlive(task.record.pid)) finish();
+  });
 }
 
 export function terminateProcessTree(childOrPid: ChildProcess | number): void {
@@ -744,37 +825,33 @@ function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * Determine whether a bridge-bound controller still belongs to a live TUI.
- *
- * New records carry an owner identity and heartbeat. Older records have no
- * owner metadata, so retain a deliberately narrow Unix compatibility probe:
- * the controller must still be parented by a process whose command identifies
- * the ForgeDock terminal. Unknown/ambiguous records remain fail-closed.
+ * Return a non-secret process incarnation witness. Linux exposes a monotonic
+ * process start tick in /proc; on platforms without a safe local primitive we
+ * return undefined and adoption fails closed rather than trusting PID reuse.
  */
-function isBridgeOwnerLive(record: BackgroundTaskRecord, currentOwnerId: string): boolean {
-  if (record.ownerReleasedAt !== undefined) return false;
-  if (record.ownerId !== undefined || record.ownerPid !== undefined || record.ownerHeartbeatAt !== undefined) {
-    if (!record.ownerId || !record.ownerPid || !record.ownerHeartbeatAt) return false;
-    if (record.ownerId === currentOwnerId) return true;
-    if (!isProcessAlive(record.ownerPid)) return false;
-    const heartbeatAt = Date.parse(record.ownerHeartbeatAt);
-    return Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= SUPERVISOR_HEARTBEAT_TTL_MS;
+export function processIncarnationWitness(pid: number): string | undefined {
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen < 0) return undefined;
+      const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+      const startTicks = fields[19];
+      return startTicks ? `proc-start:${startTicks}` : undefined;
+    } catch {
+      return undefined;
+    }
   }
-  return legacyForgeDockParentIsLive(record.pid);
+  return undefined;
 }
 
-function legacyForgeDockParentIsLive(pid: number): boolean {
-  if (process.platform === "win32") return false;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closeParen = stat.lastIndexOf(")");
-    if (closeParen < 0) return false;
-    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
-    const parentPid = Number(fields[1]);
-    if (!Number.isInteger(parentPid) || parentPid < 2 || !isProcessAlive(parentPid)) return false;
-    const command = readFileSync(`/proc/${parentPid}/cmdline`, "utf8").replaceAll("\0", " ");
-    return /(?:^|[\s/])forgedock(?:$|\s)|(?:^|[\s/])forgedock-(?:terminal|next)(?:\.m?js)?(?:$|\s)/i.test(command);
-  } catch {
-    return false;
-  }
+function isBridgeOwnerLive(record: BackgroundTaskRecord, currentOwnerId: string): boolean {
+  if (record.ownerReleasedAt !== undefined) return false;
+  if (record.ownerId === undefined && record.ownerPid === undefined && record.ownerHeartbeatAt === undefined && record.ownerIncarnation === undefined) return false;
+  if (!record.ownerId || !record.ownerPid || !record.ownerHeartbeatAt || !record.ownerIncarnation) return false;
+  if (record.ownerId === currentOwnerId) return true;
+  if (!isProcessAlive(record.ownerPid)) return false;
+  const heartbeatAt = Date.parse(record.ownerHeartbeatAt);
+  if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt > SUPERVISOR_HEARTBEAT_TTL_MS) return false;
+  return processIncarnationWitness(record.ownerPid) === record.ownerIncarnation;
 }

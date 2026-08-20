@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { assertReviewPlan, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
+import { assertReviewPlan, computeReviewPlanId, planReviewPanel, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
   return createArtifact({
@@ -80,13 +80,41 @@ describe("evidence-backed review planning", () => {
     assert.equal(plan.budget.maxSpecialistExecutionGroups, 2);
     assert.equal(plan.budget.maxLogicalReviewerSessions, 3);
     assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 2);
-    assert.equal(plan.budget.maxToolCallsPerExecutionGroup, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP);
-    assert.ok(plan.executionGroups.every((group) => reviewerToolCallBudget(group, plan) <= MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP));
+    assert.equal(Object.hasOwn(plan.budget, "maxToolCallsPerExecutionGroup"), false);
+    assert.deepEqual(plan.budget, {
+      maxSpecialistExecutionGroups: 2,
+      maxLogicalReviewerSessions: 3,
+      maxParallelSessions: 3,
+      maxAttemptsPerExecutionGroup: 2,
+      maxReviewerAttempts: 6,
+      maxScopeAdjudicationAttempts: 2,
+      maxModelCalls: 8,
+    });
     assert.deepEqual(new Set(plan.capabilities.map(({ id }) => id)), new Set([
       "acceptance-correctness", "security", "data-integrity", "frontend", "release", "concurrency",
     ]));
     assert.ok(plan.executionGroups.slice(1).some(({ capabilities }) => capabilities.length > 1));
     assert.doesNotThrow(() => assertReviewPlan(plan));
+  });
+
+  it("keeps legacy reviewer tool quotas decodable without emitting them in new plans", () => {
+    const plan = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "+work();", packet: packet() });
+    assert.equal(Object.hasOwn(plan.budget, "maxToolCallsPerExecutionGroup"), false);
+
+    const legacy = {
+      ...plan,
+      budget: { ...plan.budget, maxToolCallsPerExecutionGroup: 48 },
+    };
+    const legacyWithId = { ...legacy, planId: computeReviewPlanId(legacy) } as ReviewPlan;
+    assert.doesNotThrow(() => assertReviewPlan(legacyWithId));
+    for (const value of [0, 65, 1.5]) {
+      const malformed = { ...plan, budget: { ...plan.budget, maxToolCallsPerExecutionGroup: value } } as unknown as ReviewPlan;
+      assert.throws(
+        () => assertReviewPlan({ ...malformed, planId: computeReviewPlanId(malformed) }),
+        /absolute budget is invalid or exceeded/,
+        `legacy maxToolCallsPerExecutionGroup=${value} must be rejected`,
+      );
+    }
   });
 
   it("does not let the hard session budget suppress an explicitly declared security capability", () => {

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { AdvertisedRemoteHeadMismatchError } from "../../core/ports/git-workspace.js";
@@ -22,7 +22,13 @@ function dependencyFailureRepository(root: string, patchSource: string): string 
   git(repo, "config", "user.name", "ForgeDock Test");
   git(repo, "config", "user.email", "forgedock@example.invalid");
   writeFileSync(join(repo, "README.md"), "base\n");
-  writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "failure-fixture", version: "1.0.0" }));
+  writeFileSync(join(repo, "package.json"), JSON.stringify({
+    name: "failure-fixture",
+    version: "1.0.0",
+    dependencies: { "pi-subagents": "file:vendor/pi-subagents" },
+  }));
+  mkdirSync(join(repo, "vendor", "pi-subagents"), { recursive: true });
+  writeFileSync(join(repo, "vendor", "pi-subagents", "package.json"), JSON.stringify({ name: "pi-subagents", version: "0.39.0" }));
   execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], {
     cwd: repo,
     stdio: "ignore",
@@ -165,7 +171,7 @@ describe("isolated Git worktrees", () => {
     assert.equal(existsSync(lockPath), false);
   });
 
-  it("rolls back issue and review worktrees retained by a failing post-checkout hook", async () => {
+  it("does not execute repository post-checkout hooks while preparing issue and review worktrees", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-hook-failure-"));
     try {
       const repo = join(root, "repo");
@@ -183,25 +189,21 @@ describe("isolated Git worktrees", () => {
       const worktreeRoot = join(root, "worktrees");
       const manager = new GitWorktreeManager(repo, worktreeRoot);
 
-      await assert.rejects(
-        () => manager.create({ runId: "run_hook_issue", issue: 73, baseRef: "HEAD" }),
-        /post-checkout|exit code|failed/i,
-      );
-      assert.equal(existsSync(join(worktreeRoot, "issue-73-run_hook_issue")), false);
-      assert.throws(() => git(repo, "show-ref", "--verify", "refs/heads/forgedock/issue-73-run_hook_issue"));
+      const issue = await manager.create({ runId: "run_hook_issue", issue: 73, baseRef: "HEAD" });
+      assert.equal(existsSync(join(repo, ".forgedock", "empty-hooks")), true, "worktree creation must use a controller-owned empty hooks directory");
+      assert.equal(existsSync(issue.path), true);
+      await manager.remove(issue);
 
-      await assert.rejects(
-        () => manager.createReview({ runId: "run_hook_review", pr: 73, headSha: git(repo, "rev-parse", "HEAD") }),
-        /post-checkout|exit code|failed/i,
-      );
-      assert.equal(existsSync(join(worktreeRoot, "review-73-run_hook_review")), false);
+      const review = await manager.createReview({ runId: "run_hook_review", pr: 73, headSha: git(repo, "rev-parse", "HEAD") });
+      assert.equal(existsSync(review.path), true);
+      await manager.remove(review);
       assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_hook_(?:issue|review)/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("rolls back a hook-failed worktree through a symlinked managed root", { skip: process.platform === "win32" }, async () => {
+  it("does not execute post-checkout hooks through a symlinked managed root", { skip: process.platform === "win32" }, async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-hook-symlink-"));
     try {
       const repo = join(root, "repo");
@@ -218,13 +220,10 @@ describe("isolated Git worktrees", () => {
       symlinkSync(realWorktrees, linkedWorktrees, "dir");
       const manager = new GitWorktreeManager(repo, linkedWorktrees);
 
-      await assert.rejects(
-        () => manager.create({ runId: "run_hook_symlink", issue: 74, baseRef: "HEAD" }),
-        /post-checkout|exit code|failed/i,
-      );
-      assert.equal(existsSync(join(realWorktrees, "issue-74-run_hook_symlink")), false);
+      const workspace = await manager.create({ runId: "run_hook_symlink", issue: 74, baseRef: "HEAD" });
+      assert.equal(existsSync(join(realWorktrees, "issue-74-run_hook_symlink")), true);
+      await manager.remove(workspace);
       assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_hook_symlink/);
-      assert.throws(() => git(repo, "show-ref", "--verify", "refs/heads/forgedock/issue-74-run_hook_symlink"));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -267,7 +266,7 @@ describe("isolated Git worktrees", () => {
 
       await assert.rejects(
         () => manager.create({ runId: "run_setup_failure", issue: 70, baseRef: "HEAD" }),
-        /pinned setup failed/i,
+        /expects pi-subagents 0\.40\.0|must not be a symlink/i,
       );
       assert.equal(existsSync(path), false);
       assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_setup_failure/);
@@ -292,7 +291,7 @@ describe("isolated Git worktrees", () => {
 
       await assert.rejects(
         () => manager.createReview({ runId: "run_review_failure", pr: 71, headSha }),
-        /review setup failed/i,
+        /expects pi-subagents 0\.40\.0|must not be a symlink/i,
       );
       assert.equal(existsSync(path), false);
       assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), /run_review_failure/);
@@ -301,27 +300,15 @@ describe("isolated Git worktrees", () => {
     }
   });
 
-  it("reports setup and rollback failures together", async () => {
+  it("rejects unsupported dependency patch inputs without executing worktree code", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-rollback-failure-"));
     try {
-      const repo = dependencyFailureRepository(root, [
-        'import { readFileSync, rmSync } from "node:fs";',
-        'const gitdir = readFileSync(".git", "utf8").replace(/^gitdir:\\s*/, "").trim();',
-        'rmSync(gitdir, { recursive: true, force: true });',
-        'throw new Error("setup destroyed registration");',
-      ].join("\n"));
+      const repo = dependencyFailureRepository(root, 'throw new Error("setup destroyed registration");\n');
       const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
 
       await assert.rejects(
         () => manager.create({ runId: "run_rollback_failure", issue: 72, baseRef: "HEAD" }),
-        (error: unknown) => {
-          assert.ok(error instanceof AggregateError);
-          assert.match(error.message, /prepare.*rollback.*failed/i);
-          assert.equal(error.errors.length, 2);
-          assert.match(String(error.errors[0]), /setup destroyed registration/i);
-          assert.match(String(error.errors[1]), /roll back managed worktree/i);
-          return true;
-        },
+        /expects pi-subagents 0\.40\.0|must not be a symlink/i,
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -424,25 +411,40 @@ describe("isolated Git worktrees", () => {
     assert.doesNotMatch(git(repo, "worktree", "list", "--porcelain"), new RegExp(workspace.branch.replaceAll("/", "\\/")));
   });
 
-  it("applies only the pinned ForgeDock dependency patch after script-free installation", async () => {
+  it("never executes a review patch script while applying the trusted pinned patch", async () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-git-patch-"));
     const repo = join(root, "repo");
     try {
       execFileSync("git", ["init", repo], { stdio: "ignore" });
       git(repo, "config", "user.name", "ForgeDock Test");
       git(repo, "config", "user.email", "forgedock@example.invalid");
-      writeFileSync(join(repo, "README.md"), "base\n");
-      writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "patch-fixture", version: "1.0.0" }));
+      const piSource = resolve("node_modules/pi-subagents");
+      const packageArchive = execFileSync("npm", ["pack", "--pack-destination", root], { cwd: piSource, encoding: "utf8", shell: process.platform === "win32" }).trim().split(/\r?\n/).pop()!;
+      cpSync(join(root, packageArchive), join(repo, packageArchive));
+      writeFileSync(join(repo, "README.md"), "base\\n");
+      writeFileSync(join(repo, "package.json"), JSON.stringify({
+        name: "patch-fixture",
+        version: "1.0.0",
+        dependencies: { "pi-subagents": `file:${packageArchive}` },
+      }));
       execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: repo, stdio: "ignore", shell: process.platform === "win32" });
       mkdirSync(join(repo, "scripts"), { recursive: true });
-      writeFileSync(join(repo, "scripts", "patch-pi-subagents-visibility.mjs"),
-        'import { mkdirSync, writeFileSync } from "node:fs"; mkdirSync("node_modules", { recursive: true }); writeFileSync("node_modules/.forgedock-patch", "applied");\n');
-      git(repo, "add", "README.md", "package.json", "package-lock.json", "scripts/patch-pi-subagents-visibility.mjs");
+      const sentinel = join(repo, "trusted-patch-sentinel");
+      writeFileSync(join(repo, "scripts", "patch-pi-subagents-visibility.mjs"), [
+        'import { writeFileSync } from "node:fs";',
+        `writeFileSync(${JSON.stringify(sentinel)}, "UNTRUSTED\\n");`,
+      ].join("\\n"));
+      git(repo, "add", "README.md", "package.json", "package-lock.json", packageArchive, "scripts");
       git(repo, "commit", "-m", "base");
 
       const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
       const workspace = await manager.create({ runId: "run_patch", issue: 15, baseRef: "HEAD" });
-      assert.equal(readFileSync(join(workspace.path, "node_modules", ".forgedock-patch"), "utf8"), "applied");
+      assert.equal(existsSync(join(workspace.path, "trusted-patch-sentinel")), false, "PR-controlled patch script must never execute");
+      assert.match(
+        readFileSync(join(workspace.path, "node_modules", "pi-subagents", "src", "shared", "types.ts"), "utf8"),
+        /dir: "temp"/,
+        "trusted pinned patch must still apply",
+      );
       await manager.remove(workspace);
     } finally {
       rmSync(root, { recursive: true, force: true });

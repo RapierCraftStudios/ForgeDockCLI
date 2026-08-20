@@ -12,7 +12,7 @@ import { SemanticIdleWatchdog } from "../../runtime/semantic-idle.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, reviewerToolCallBudget, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, findingMaterializationReason, shouldMaterializeFinding, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -86,6 +86,19 @@ export function resolveFindingIssuePolicy(explicit?: FindingIssuePolicy): Findin
   }
   if (configured && explicit !== "none") return configured as FindingIssuePolicy;
   return explicit ?? "all";
+}
+
+export class ReviewerTransportInterruptionError extends AgentExecutionInterruptedError {
+  readonly infrastructure = true as const;
+  readonly transport = true as const;
+
+  constructor(message: string, options: { sessionRef?: string; cause?: unknown } = {}) {
+    // The interruption is recoverable infrastructure, not semantic reviewer
+    // incompleteness. Keep it on the existing interruption channel so the
+    // enclosing workflow retains its checkpoint.
+    super(message, { reason: "process-tree", ...(options.sessionRef ? { sessionRef: options.sessionRef } : {}), ...(options.cause ? { cause: options.cause } : {}) });
+    this.name = "ReviewerTransportInterruptionError";
+  }
 }
 
 class ReviewWaveIncompleteError extends Error {
@@ -291,6 +304,7 @@ export async function reviewPullRequest(
     packet: DurableArtifact<"BuildPacket">;
     buildResult?: DurableArtifact<"BuildResult">;
     deployment?: DeploymentReviewEvidence;
+    warnings?: readonly string[];
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
     reviewCycle?: { current: number; total: number };
     workspace: string;
@@ -482,7 +496,6 @@ export async function reviewPullRequest(
         : undefined);
       const roleRoots = reviewerAuthority.rootsByRole.get(role) ?? [];
       const authorityBrief = reviewerAuthorityBrief(reviewerAuthority, selection, roleRoots);
-      const explorationBudget = reviewerToolCallBudget(selection, reviewPlan);
       let priorFailure: string | undefined;
       let resumeSessionRef: string | undefined;
       let completed: { executionGroupId: string; role: ReviewerRole; output: ReviewerSubmission; sessionRef: string; sessionLineage: readonly string[] } | undefined;
@@ -567,8 +580,7 @@ export async function reviewPullRequest(
               "The initial diff and exact execution-group path list are already your inventory. Do not list the checkout root, enumerate broad directories, or search the repository to rediscover them.",
               "Do not read every assigned file by default. Start from the supplied hunks, then use targeted reads/searches only to prove or disprove a concrete risk or trace one necessary dependency.",
               "Do not read generated source maps or vendored generated artifacts in full. Trace them to authored source and use bounded parity/manifest evidence.",
-              `This shard has ${explorationBudget} total read/search calls. The runtime warns before exhaustion and then blocks further browsing so you can synthesize. A clean report with findings=[] is complete; submit it instead of continuing speculative exploration.`,
-              "Conclude and submit as soon as the bounded shard has enough evidence; do not perform a repository-wide inventory.",
+              "There is no fixed tool-call quota or forced read/search cutoff for this read-only reviewer. Complete every capability in this execution group with targeted evidence as needed; a clean report with findings=[] is complete when no defect is proven.",
               "Use ls/find before reading uncertain paths. Missing optional files are evidence, not a reason to fail the review. Do not inspect worktree .git internals.",
               "Do not edit files, perform remediation, approve, merge, or write to GitHub.",
               ...(priorFailure ? [`A previous operational attempt failed (${priorFailure}); complete this bounded fallback attempt without repeating finished probes.`] : []),
@@ -580,12 +592,11 @@ export async function reviewPullRequest(
               cwd: input.workspace,
               mode: "read-only",
               scope: scopeManifestFor("build-packet", {
-                affectedFiles: [...input.packet.payload.expectedPaths, ...changedPaths],
+                affectedFiles: reviewerReadPaths(input.packet, changedPaths),
                 metadataRoots: ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json", "forge.yaml", "FORGE.md"],
               }),
             },
             tools: ["read", "grep", "find", "ls"],
-            executionBudget: { maxToolCalls: explorationBudget },
             outputSchema: ReviewerSubmissionSchema,
             modelPolicy: {
               ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -650,6 +661,18 @@ export async function reviewPullRequest(
         } catch (error) {
           if (input.signal?.aborted) throw error;
           priorFailure = error instanceof Error ? error.message : String(error);
+          if (isReviewerTransportInterruption(error)) {
+            // A dead/stale bridge is an owner-side infrastructure interruption.
+            // Refund this attempt so a fresh bridge can retry without spending
+            // semantic reviewer/remediation budget.
+            remainingReviewerAttempts++;
+            remainingModelCalls++;
+            await recordReviewProgress(`${taskId} · reviewer transport interrupted; preserving successful siblings and suspending for fresh bridge recovery`);
+            const transportOptions = error instanceof AgentRunError && error.sessionRef
+              ? { sessionRef: error.sessionRef, cause: error }
+              : { cause: error };
+            throw new ReviewerTransportInterruptionError(priorFailure, transportOptions);
+          }
           if (canResumeReviewer && error instanceof AgentRunError && error.resumable && error.sessionRef) {
             resumeSessionRef = error.sessionRef;
           } else {
@@ -663,7 +686,7 @@ export async function reviewPullRequest(
             throw error;
           }
           if (isReviewerExplorationLimitFailure(priorFailure)) {
-            await recordReviewProgress(`${taskId} · retry suppressed because the frozen read/search evidence budget was exhausted`);
+            await recordReviewProgress(`${taskId} · retry suppressed because unexpected runtime tool-budget exhaustion was reported; no ReviewVerdict will be produced`);
             throw error;
           }
           if (error instanceof AgentExecutionInterruptedError && error.drainExpired) {
@@ -715,6 +738,13 @@ export async function reviewPullRequest(
     });
     if (failedReviewers.length) {
       const failedRoles = failedGroups.map(({ executionGroupId, reason }) => `${executionGroupId}: ${reason}`);
+      const transportFailure = failedReviewers.find(({ reason }) => isReviewerTransportInterruption(reason.reason));
+      if (transportFailure) {
+        throw new ReviewerTransportInterruptionError(
+          `Reviewer transport interrupted at frozen plan ${reviewPlan.planId}; successful reviewer siblings were preserved; ${failedRoles.join(", ")}`,
+          { cause: transportFailure.reason },
+        );
+      }
       throw new ReviewWaveIncompleteError(`Review incomplete at frozen plan ${reviewPlan.planId}: ${failedRoles.join(", ")} failed after all siblings settled; successful reviewer reports were preserved and no partial approval was issued`);
     }
     const roles = [...new Set(reviewPlan.executionGroups.map((selection) => selection.role))];
@@ -958,6 +988,7 @@ export async function reviewPullRequest(
         reviewerRoles: roles,
         findings,
         checks: input.buildResult?.payload.checks ?? input.deployment?.checks ?? [],
+        ...(input.warnings?.length ? { warnings: [...new Set(input.warnings)] } : {}),
         reviewPlan,
         findingProjection: {
           policy: findingIssuePolicy,
@@ -1108,6 +1139,19 @@ async function assertPriorVerdictAuthority(
   } catch {
     throw new Error("Cannot use prior Review Verdict: the prior reviewed head is not comparable to the current pull-request revision");
   }
+}
+
+function reviewerReadPaths(
+  packet: DurableArtifact<"BuildPacket">,
+  changedPaths: readonly string[],
+): string[] {
+  // Evidence declarations are read-only additions to reviewer inventory. They
+  // are deliberately not fed into any packet write/scheduler authority.
+  return [...new Set([
+    ...packet.payload.expectedPaths,
+    ...changedPaths,
+    ...(packet.payload.evidencePaths ?? []).map(({ path }) => path),
+  ])];
 }
 
 function changedDeliveryAuthorityFacts(
@@ -1383,8 +1427,16 @@ function applyScopeAdjudication(
   });
 }
 
+export function isReviewerTransportInterruption(error: unknown): boolean {
+  if (error instanceof ReviewerTransportInterruptionError) return true;
+  if (error instanceof AgentRunError && (error as AgentRunError & { transportInterruption?: boolean }).transportInterruption === true) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return isTransientReviewerTransportFailure(message)
+    && /(?:nested reviewer|bridge|econnrefused|econnreset|connection reset|stale url|invalid endpoint|owner|ownership)/i.test(message);
+}
+
 export function isTransientReviewerTransportFailure(message: string): boolean {
-  return /websocket|socket hang up|econnreset|etimedout|timed out|transport failed|response failed|network error|overload(?:ed)?|rate.?limit|\b429\b|\b5\d\d\b|temporarily unavailable|service unavailable/i.test(message);
+  return /websocket|socket hang up|econnrefused|econnreset|connection reset|etimedout|timed out|transport failed|response failed|network error|overload(?:ed)?|rate.?limit|\b429\b|\b5\d\d\b|temporarily unavailable|service unavailable|stale (?:url|bridge)|invalid (?:url|endpoint)|ownership is unavailable/i.test(message);
 }
 
 export function isReviewerContextLimitFailure(message: string): boolean {

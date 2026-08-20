@@ -162,6 +162,21 @@ test("native background controller records output and completion without blockin
   await tasks.shutdown();
 });
 
+test("successful background tasks surface bounded ForgeDock warnings", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "console.error(['unrelated','stderr'].join(' ')); console.error('ForgeDock warning: advisory review has no required checks')"],
+    cwd,
+    ctx,
+  });
+
+  await eventually(() => assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
+  assert.match(messages[0] ?? "", /completed.*ForgeDock warning: advisory review has no required checks/s);
+  assert.doesNotMatch(messages[0] ?? "", /unrelated stderr/);
+  await tasks.shutdown();
+});
+
 test("failed native spawn is consumed without stranding a running task", async () => {
   const { cwd, tasks, ctx } = fixture();
   assert.throws(() => tasks.start({

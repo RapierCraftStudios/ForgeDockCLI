@@ -36,6 +36,12 @@ export async function publishPullRequest(
     const targetBranch = input.parentRemediation?.parentBranch ?? run.targetBranch;
     if (!targetBranch) throw new Error(`Run ${run.runId} has no frozen target branch`);
     if (!input.parentRemediation) assertWorkspaceFollowsTarget(input.workspace, targetBranch);
+    await assertTargetHeadUnchanged(
+      dependencies.host,
+      run.subject.repo,
+      targetBranch,
+      input.buildResult.payload.baseSha,
+    );
     const workspaceHead = await dependencies.git.head(input.workspace);
     if (workspaceHead !== input.buildResult.payload.headSha) {
       throw new Error(`Publication workspace head ${workspaceHead} does not match verified build ${input.buildResult.payload.headSha}`);

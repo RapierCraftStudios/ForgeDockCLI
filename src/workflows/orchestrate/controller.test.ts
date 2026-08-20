@@ -43,6 +43,10 @@ class TestExecutionAdmission implements OrchestrationExecutionAdmission {
   readonly #claims = new Map<string, string>();
   #sequence = 0;
 
+  hasClaim(orchestrationId: string): boolean {
+    return this.#claims.has(orchestrationId);
+  }
+
   async acquire(orchestrationId: string): Promise<OrchestrationExecutionClaim | undefined> {
     if (this.#claims.has(orchestrationId)) return undefined;
     const claimId = `claim-${++this.#sequence}`;
@@ -113,6 +117,40 @@ describe("OrchestrationController", () => {
     const result = await service.run(created.orchestrationId);
     assert.deepEqual(observed.sort(), [["defaulted", "owner/control"], ["explicit", "owner/work"]]);
     assert.equal(result.record.nodes.find((node) => node.id === "explicit")?.repository, "owner/work");
+  });
+
+  it("drains admitted workers and releases execution ownership after cancellation", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const admission = new TestExecutionAdmission();
+    const abort = new AbortController();
+    const started = deferred<void>();
+    const service = controller(repository, async () => {
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        abort.signal.addEventListener("abort", () => resolve(), { once: true });
+        if (abort.signal.aborted) resolve();
+      });
+      return { status: "suspended", error: "Controller process interrupted" };
+    }, {
+      executionAdmission: admission,
+      signal: abort.signal,
+    });
+
+    const running = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 1,
+      items: [item("issue-1", 1)],
+    });
+    await started.promise;
+    assert.equal(admission.hasClaim("dag-test"), true);
+
+    abort.abort(new Error("SIGTERM"));
+    await assert.rejects(running, /SIGTERM/);
+
+    const recovered = await repository.loadOrchestration("dag-test");
+    assert.equal(recovered?.status, "failed");
+    assert.equal(recovered?.nodes[0]?.status, "suspended");
+    assert.equal(admission.hasClaim("dag-test"), false);
   });
 
   it("preflights every initial frozen route before dispatch and preserves distinct routes", async () => {

@@ -4,7 +4,8 @@ import { createArtifact, type BuildPacketPayload, type InvestigationPayload } fr
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { investigateWorkItem } from "./investigate.js";
-import { prepareBuildPacket } from "./prepare.js";
+import { prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
+import { deriveEvidenceContract } from "./evidence-contract.js";
 
 const investigation: InvestigationPayload = {
   outcome: "confirmed", confidence: "high", summary: "Confirmed",
@@ -31,7 +32,7 @@ describe("Build Packet preparation", () => {
       kind: "Intent", runId: "run_packet", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
       payload: { title: "Guard updates", problem: "Updates race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
-    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
+    const scopeHints = { affectedFiles: ["src/a.ts", "test/a.test.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
     const investigated = await investigateWorkItem({
       intent, cwd: process.cwd(), scopeHints,
       planningProvider: "anthropic", planningModel: "claude-sonnet", planningThinking: "high",
@@ -89,10 +90,11 @@ describe("Build Packet preparation", () => {
       verificationCatalog: {
         commands: [{
           id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 1_000, required: true,
-          selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+          selection: "always", evidenceCapability: "generic", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
         }],
         controllerGates: [{ id: "staging-review", description: "Validate staging" }],
       },
+      scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] },
     }, { runtime, artifacts, runs });
     assert.deepEqual(prepared.packet.payload.verificationPlan, ["controller-gate:staging-review"]);
     assert.deepEqual(prepared.packet.payload.verificationRequirements?.map((requirement) => requirement.id), ["staging-review"]);
@@ -103,6 +105,11 @@ describe("Build Packet preparation", () => {
   it("rejects controller-owned verification prose before the builder can start", async () => {
     const runtime = new FakeAgentRuntime([
       investigation,
+      {
+        ...packet,
+        verificationPlan: ["Confirm no targeted test bypasses the durable admission by checking that the tests still pass"],
+        controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+      },
       {
         ...packet,
         verificationPlan: ["Confirm no targeted test bypasses the durable admission by checking that the tests still pass"],
@@ -121,6 +128,7 @@ describe("Build Packet preparation", () => {
       intent,
       investigation: investigated.investigation,
       cwd: process.cwd(),
+      scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] },
       verificationCatalog: {
         commands: [{ id: "test", command: "npm", args: ["test"] }],
         controllerGates: [{ id: "staging-review", description: "Validate staging" }],
@@ -144,6 +152,7 @@ describe("Build Packet preparation", () => {
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({
       run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(),
+      scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] },
     }, { runtime, artifacts, runs });
 
     assert.equal(prepared.run.state, "building");
@@ -156,7 +165,7 @@ describe("Build Packet preparation", () => {
     const catalog = {
       commands: [{
         id: "typescript-tests", command: "npm", args: ["test"], timeoutMs: 1_000, required: true,
-        selection: "packet" as const, targeting: "expected-test-paths" as const,
+        selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const,
         policyVersion: "forgedock.verification/v2", typescriptLayout: {
           sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest",
         },
@@ -165,11 +174,11 @@ describe("Build Packet preparation", () => {
     };
     const invalid = {
       ...packet,
-      expectedPaths: ["src/foo.test.js"],
+      expectedPaths: ["src/a.test.js"],
       verificationPlan: ["npm test"],
       verificationRequirements: [{ kind: "command" as const, id: "typescript-tests", criterionIds: ["criterion-1"], rationale: "Regression" }],
     };
-    const repaired = { ...invalid, expectedPaths: ["src/foo.test.ts"] };
+    const repaired = { ...invalid, expectedPaths: ["src/a.test.ts"] };
     const runtime = new FakeAgentRuntime([investigation, invalid, repaired]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
@@ -179,11 +188,11 @@ describe("Build Packet preparation", () => {
     });
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({
-      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog,
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog, scopeHints: { writePaths: ["src/a.test.ts"] },
     }, { runtime, artifacts, runs });
 
     assert.equal(prepared.run.state, "building");
-    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "typescript-tests", targets: ["dist/foo.test.js"] }]);
+    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "typescript-tests", targets: ["dist/a.test.js"] }]);
     assert.equal(runtime.tasks[2]?.id, "run_capability_repair:build-packet:1:capability-repair");
     assert.match(runtime.tasks[2]?.instructions ?? "", /one bounded :capability-repair attempt/);
   });
@@ -192,7 +201,7 @@ describe("Build Packet preparation", () => {
     const catalog = {
       commands: [{
         id: "typescript-tests", command: "npm", args: ["test"], timeoutMs: 1_000, required: true,
-        selection: "packet" as const, targeting: "expected-test-paths" as const,
+        selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const,
         policyVersion: "forgedock.verification/v2", typescriptLayout: {
           sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest",
         },
@@ -201,7 +210,7 @@ describe("Build Packet preparation", () => {
     };
     const invalid = {
       ...packet,
-      expectedPaths: ["src/foo.test.js"],
+      expectedPaths: ["src/a.test.js"],
       verificationPlan: ["npm test"],
       verificationRequirements: [{ kind: "command" as const, id: "typescript-tests", criterionIds: ["criterion-1"], rationale: "Regression" }],
     };
@@ -214,9 +223,10 @@ describe("Build Packet preparation", () => {
     });
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
     await assert.rejects(() => prepareBuildPacket({
-      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog,
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog, scopeHints: { writePaths: ["src/a.test.ts"] },
     }, { runtime, artifacts, runs }), /Verification capability mismatch exhausted after bounded repair/);
     assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+    assert.equal((await artifacts.list(intent.subject, "Outcome")).filter((artifact) => artifact.runId === intent.runId && artifact.kind === "Outcome" && artifact.payload.status === "blocked").length, 1);
     const blocked = await runs.load(intent.runId);
     assert.equal(blocked?.state, "blocked");
     assert.equal(runtime.tasks.length, 3);
@@ -230,7 +240,7 @@ describe("Build Packet preparation", () => {
       kind: "Intent", runId: "run_packet_discovery", subject: { repo: "a/b", issue: 130 }, producer: { role: "controller" },
       payload: { title: "Discover shared contract", problem: "Affected files to be confirmed by investigation", constraints: [], acceptanceHints: [], dependencies: [] },
     });
-    const scopeHints = { affectedFiles: [], metadataRoots: ["package.json"] } as const;
+    const scopeHints = { affectedFiles: [], writePaths: ["src/a.ts", "test/a.test.ts"], metadataRoots: ["package.json"] } as const;
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     await prepareBuildPacket({
       run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints,
@@ -259,5 +269,116 @@ describe("Build Packet preparation", () => {
     assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/a.ts", "test/a.test.ts"]);
     assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("src"));
     assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("test"));
+  });
+
+  it("persists targeted evidence contract while keeping package metadata read-only", async () => {
+    const catalog = {
+      commands: [{ id: "targeted-tests", command: "npm", args: ["test"], required: true, selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } }],
+      controllerGates: [],
+    };
+    const output = { ...packet, expectedPaths: ["src/a.test.ts"], verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "targeted-tests", criterionIds: ["criterion-1"], rationale: "Regression" }], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }], evidenceContract: { version: "forgedock.evidence/v1" as const, criteria: [{ criterionId: "criterion-1", requiredCommandIds: [], semanticCommandIds: [], controllerGateIds: [], allowedWritePaths: [], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }] }, invariantMatrices: [{ id: "forged", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "x", values: ["y"] }], testId: "invariant:forged" }], verificationCommandTargets: [{ id: "forged", targets: ["all"] }] };
+    const runtime = new FakeAgentRuntime([investigation, output]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({ kind: "Intent", runId: "run_contract", subject: { repo: "a/b", issue: 140 }, producer: { role: "controller" }, payload: { title: "Contract", problem: "Bound evidence", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog, scopeHints: { writePaths: ["src/a.test.ts"] } }, { runtime, artifacts, runs });
+    assert.deepEqual(prepared.packet.payload.evidencePaths, [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" }]);
+    assert.equal(prepared.packet.payload.evidenceContract?.version, "forgedock.evidence/v1");
+    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "targeted-tests", targets: ["dist/a.test.js"] }]);
+    assert.equal(prepared.packet.payload.invariantMatrices, undefined);
+  });
+
+  it("repairs generic-only selection when the catalog has semantic capability", async () => {
+    const catalog = { commands: [
+      { id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" },
+      { id: "targeted", command: "npm", args: ["test"], required: true, selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } },
+    ], controllerGates: [] };
+    const generic = { ...packet, verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "generic", criterionIds: ["criterion-1"], rationale: "Check" }] };
+    const repaired = { ...packet, expectedPaths: ["src/a.test.ts"], verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "targeted", criterionIds: ["criterion-1"], rationale: "Regression" }] };
+    const runtime = new FakeAgentRuntime([investigation, generic, repaired]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({ kind: "Intent", runId: "run_generic_repair", subject: { repo: "a/b", issue: 141 }, producer: { role: "controller" }, payload: { title: "Repair", problem: "Semantic proof", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: catalog, scopeHints: { writePaths: ["src/a.test.ts"] } }, { runtime, artifacts, runs });
+    assert.equal(prepared.run.state, "building");
+    assert.equal(runtime.tasks.length, 3);
+    assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "targeted", targets: ["dist/a.test.js"] }]);
+  });
+
+  it("blocks generic-only catalogs and exhausted author corrections without packets", async () => {
+    const genericCatalog = { commands: [{ id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" }], controllerGates: [] };
+    const generic = { ...packet, verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "generic", criterionIds: ["criterion-1"], rationale: "Check" }] };
+    const runtime = new FakeAgentRuntime([investigation, generic]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({ kind: "Intent", runId: "run_generic_direct", subject: { repo: "a/b", issue: 142 }, producer: { role: "controller" }, payload: { title: "Block", problem: "No semantic catalog", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: genericCatalog, scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] } }, { runtime, artifacts, runs }), /generic-only-command/);
+    assert.equal(runtime.tasks.length, 2);
+    assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+
+    const repairRuntime = new FakeAgentRuntime([investigation, generic, generic]);
+    const repairArtifacts = new InMemoryArtifactRepository();
+    const repairRuns = new InMemoryRunRepository();
+    const repairIntent = createArtifact({ kind: "Intent", runId: "run_generic_exhaust", subject: { repo: "a/b", issue: 143 }, producer: { role: "controller" }, payload: { title: "Exhaust", problem: "No semantic selection", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const repairInvestigated = await investigateWorkItem({ intent: repairIntent, cwd: process.cwd() }, { runtime: repairRuntime, artifacts: repairArtifacts, runs: repairRuns });
+    await assert.rejects(() => prepareBuildPacket({ run: repairInvestigated.run, intent: repairIntent, investigation: repairInvestigated.investigation, cwd: process.cwd(), verificationCatalog: { commands: [{ id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" }, { id: "semantic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "regression" as const, policyVersion: "forgedock.verification/v2" }], controllerGates: [] } }, { runtime: repairRuntime, artifacts: repairArtifacts, runs: repairRuns }), /exhausted after two sessions/);
+    assert.equal((await repairArtifacts.list(repairIntent.subject, "BuildPacket")).length, 0);
+  });
+
+  it("accepts gate-only criteria", async () => {
+    const runtime = new FakeAgentRuntime([investigation, { ...packet, verificationPlan: ["controller-gate:staging-review"], verificationRequirements: [{ kind: "controller-gate" as const, id: "staging-review", criterionIds: ["criterion-1"], rationale: "Controller evidence" }] }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({ kind: "Intent", runId: "run_gate", subject: { repo: "a/b", issue: 144 }, producer: { role: "controller" }, payload: { title: "Gate", problem: "Controller validates", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd() }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: { commands: [], controllerGates: [{ id: "staging-review", description: "Validate" }] }, scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] } }, { runtime, artifacts, runs });
+    assert.equal(prepared.run.state, "building");
+    assert.equal(prepared.packet.payload.evidenceContract, undefined);
+  });
+  it("revalidates exact-base evidence contracts and binds capability identity into the plan", () => {
+    const catalog = [{
+      id: "targeted", command: "node", args: ["test.mjs"], timeoutMs: 1_000, required: true,
+      selection: "packet" as const, targeting: "expected-test-paths" as const,
+      evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2",
+      typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "test" },
+    }];
+    const requirements = [{ kind: "command" as const, id: "targeted", criterionIds: ["criterion-1"], rationale: "Regression" }];
+    const targets = ["dist/a.test.js"];
+    const contract = deriveEvidenceContract({
+      acceptanceCriteria: ["Regression"], verificationRequirements: requirements, controllerGates: [],
+      commands: [{ id: "targeted", evidenceCapability: "targeted-test", targets }], invariantMatrices: [],
+      expectedPaths: ["src/a.test.ts"], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" }],
+    }).contract;
+    const packet = {
+      acceptanceCriteria: ["Regression"], expectedPaths: ["src/a.test.ts"], verificationRequirements: requirements,
+      verificationPolicyVersion: "forgedock.verification/v2", verificationCommandTargets: [{ id: "targeted", targets }],
+      controllerGates: [], invariantMatrices: [], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }],
+      evidenceContract: contract,
+    };
+    const exact = selectPacketVerificationCommands(packet, catalog, "a".repeat(40));
+    assert.equal(exact[0]?.planId, selectPacketVerificationCommands(packet, catalog, "a".repeat(40))[0]?.planId);
+
+    for (const changed of [
+      { ...packet, evidenceContract: { ...contract, criteria: contract.criteria.map((criterion) => ({ ...criterion, semanticCommandIds: [] })) } },
+      { ...packet, verificationCommandTargets: [{ id: "targeted", targets: ["dist/other.test.js"] }] },
+      { ...packet, verificationRequirements: [{ ...requirements[0]!, id: "other" }] },
+      { ...packet, evidencePaths: [{ path: "README.md", criterionIds: ["criterion-1"], role: "artifact" as const }] },
+      { ...packet, invariantMatrices: [{ id: "matrix-1", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "mode", values: ["safe"] }], testId: "invariant:matrix-1" }] },
+    ]) {
+      assert.throws(() => selectPacketVerificationCommands(changed, catalog, "a".repeat(40)), /Evidence contract revalidation failed|unavailable verification command|target drift/i);
+    }
+
+    const regressionCatalog = [{ ...catalog[0]!, evidenceCapability: "regression" as const }];
+    const regressionContract = deriveEvidenceContract({
+      acceptanceCriteria: packet.acceptanceCriteria, verificationRequirements: requirements, controllerGates: [],
+      commands: [{ id: "targeted", evidenceCapability: "regression", targets }], expectedPaths: packet.expectedPaths,
+      evidencePaths: packet.evidencePaths, invariantMatrices: [],
+    }).contract;
+    const regressionPacket = { ...packet, evidenceContract: regressionContract };
+    assert.notEqual(exact[0]?.planId, selectPacketVerificationCommands(regressionPacket, regressionCatalog, "a".repeat(40))[0]?.planId);
+    assert.throws(() => selectPacketVerificationCommands({ ...packet, evidencePaths: [{ path: "../secret", criterionIds: ["criterion-1"], role: "artifact" as const }] }, catalog, "a".repeat(40)), /invalid-evidence-path|repository-relative/);
   });
 });

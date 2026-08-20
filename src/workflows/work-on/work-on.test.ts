@@ -739,13 +739,13 @@ describe("complete work-on trajectory", () => {
       autoMerge: true,
       verification: [{
         id: "diff-check", command: "git", args: ["diff", "--check"], timeoutMs: 1_000, required: true,
-        selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+        selection: "always", evidenceCapability: "generic", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
       }, {
         id: "build", command: "npm", args: ["run", "build"], timeoutMs: 1_000, required: true,
-        selection: "always", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+        selection: "always", evidenceCapability: "invariant", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
       }, {
         id: "test", command: process.execPath, args: ["--test"], timeoutMs: 1_000, required: true,
-        selection: "packet", targeting: "expected-test-paths", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
+        selection: "packet", targeting: "expected-test-paths", evidenceCapability: "targeted-test", policyVersion: "forgedock.verification/v2", lockScope: "workspace",
         typescriptLayout: { sourceRoot: "src", outputRoot: ".forgedock/verification-dist", project: "tsconfig.json", configDigest: "fixture" },
       }],
       onClaimsPromoted: () => {
@@ -908,7 +908,9 @@ describe("complete work-on trajectory", () => {
         status: "blocked", reason: "Required verification failed: npm test (exit 1)", childIssues: [],
         failureEvidence: {
           branch: workspace.branch, workspacePath: workspace.path, builderSummary: "first attempt",
-          changedPaths: ["src/a.js"], checks: [{ command: "npm test", commandId: "test", status: "failed", durationMs: 1 }],
+          changedPaths: ["src/a.js"],
+          diagnostics: [{ code: "contract-mismatch", message: "Immutable evidence contract differs from catalog" }],
+          checks: [{ command: "npm test", commandId: "test", status: "failed", durationMs: 1 }],
         },
       },
     });
@@ -924,6 +926,8 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["builder", "reviewer"]);
     assert.match(runtime.tasks[0]?.objective ?? "", /controller verification failed/);
     assert.ok(runtime.tasks[0]?.context.some((artifact) => artifact.kind === "Outcome"));
+    assert.ok(runtime.tasks[0]?.context.some((artifact) => artifact.kind === "Outcome"
+      && artifact.payload.failureEvidence?.diagnostics?.some(({ code }) => code === "contract-mismatch")));
     assert.deepEqual(artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined
       ? [artifact.payload.failureEvidence.repairAttempt]
       : []), [1]);
@@ -1366,6 +1370,52 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual((await runs.history(verdict.runId)).map((record) => record.event).slice(-3), [
       "RESUME_COMPLETION", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("preserves a recoverable closing checkpoint across resume and completes idempotently", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const subject = { repo: "a/b", issue: 8 };
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_completion_recoverable", subject: { ...subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: { headSha: sha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    let run = createRun({ workflow: "work-on", subject, runId: verdict.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED",
+    ] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    let failClose = true;
+    host.closeIssue = async () => {
+      if (failClose) {
+        failClose = false;
+        throw new Error("TLS handshake timeout");
+      }
+      host.issueClosed = true;
+    };
+
+    await assert.rejects(resumeCompletionWorkOn({ run, verdict, pullRequest: host.snapshot, autoMerge: true, workspace }, {
+      runtime: new FakeAgentRuntime([]), artifacts, runs, git, verifier: new EndToEndVerifier(), host,
+    }), (error: unknown) => (error as { recoverable?: boolean }).recoverable === true);
+    assert.equal((await runs.load(run.runId))?.state, "closing");
+    assert.equal(git.removed, false);
+    assert.equal((await artifacts.list(subject, "Outcome")).length, 0);
+
+    const closing = await runs.load(run.runId);
+    assert.ok(closing);
+    const resumed = await resumeCompletionWorkOn({ run: closing!, verdict, pullRequest: { ...host.snapshot, state: "MERGED" }, autoMerge: true, workspace }, {
+      runtime: new FakeAgentRuntime([]), artifacts, runs, git, verifier: new EndToEndVerifier(), host,
+    });
+    assert.equal(resumed.run.state, "completed");
+    assert.equal(host.issueClosed, true);
+    assert.equal(git.removed, true);
   });
 
   it("keeps required-CI polling cancellation at the resumable merging checkpoint", async () => {

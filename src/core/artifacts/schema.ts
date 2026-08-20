@@ -103,6 +103,49 @@ export const VerificationRequirementSchema = Type.Object({
   rationale: NonEmptyString,
 });
 
+export const EvidencePathRoleSchema = Type.Union([
+  Type.Literal("implementation"), Type.Literal("source"), Type.Literal("test"),
+  Type.Literal("invariant"), Type.Literal("artifact"), Type.Literal("generated"),
+  Type.Literal("fixture"), Type.Literal("unchanged-boundary"),
+]);
+export type EvidencePathRole = Static<typeof EvidencePathRoleSchema>;
+
+/** A controller-declared, criterion-scoped path which may be read as evidence.
+ * It does not expand the packet's write scope. */
+export const EvidencePathDeclarationSchema = Type.Object({
+  path: NonEmptyString,
+  criterionIds: Type.Array(CriterionIdSchema, { minItems: 1 }),
+  role: EvidencePathRoleSchema,
+});
+export type EvidencePathDeclaration = Static<typeof EvidencePathDeclarationSchema>;
+
+export const VerificationEvidenceDiagnosticSchema = Type.Object({
+  code: NonEmptyString,
+  criterionId: Type.Optional(CriterionIdSchema),
+  message: NonEmptyString,
+  details: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+});
+export type VerificationEvidenceDiagnostic = Static<typeof VerificationEvidenceDiagnosticSchema>;
+
+export const VerificationEvidenceCriterionSchema = Type.Object({
+  criterionId: CriterionIdSchema,
+  requiredCommandIds: Type.Array(NonEmptyString),
+  semanticCommandIds: Type.Array(NonEmptyString),
+  controllerGateIds: Type.Array(NonEmptyString),
+  allowedWritePaths: Type.Array(NonEmptyString),
+  allowedEvidencePaths: Type.Array(NonEmptyString),
+  invariantRowIds: Type.Array(NonEmptyString),
+  invariantTestIds: Type.Array(NonEmptyString),
+  invariantCaseIds: Type.Array(NonEmptyString),
+});
+export type VerificationEvidenceCriterion = Static<typeof VerificationEvidenceCriterionSchema>;
+
+export const VerificationEvidenceContractSchema = Type.Object({
+  version: Type.Literal("forgedock.evidence/v1"),
+  criteria: Type.Array(VerificationEvidenceCriterionSchema, { minItems: 1 }),
+});
+export type VerificationEvidenceContract = Static<typeof VerificationEvidenceContractSchema>;
+
 export const InvariantMatrixRowSchema = Type.Object({
   id: NonEmptyString,
   criterionId: CriterionIdSchema,
@@ -132,12 +175,25 @@ export const BuildPacketPayloadSchema = Type.Object({
   verificationRequirements: Type.Optional(Type.Array(VerificationRequirementSchema, { minItems: 1 })),
   /** Controller-derived deterministic security-sensitive acceptance matrices. */
   invariantMatrices: Type.Optional(Type.Array(InvariantMatrixRowSchema, { minItems: 1 })),
+  /** Bounded, criterion-scoped read-only evidence paths; never expands write scope. */
+  evidencePaths: Type.Optional(Type.Array(EvidencePathDeclarationSchema)),
+  /** Additive controller-owned evidence contract; absent on legacy packets. */
+  evidenceContract: Type.Optional(VerificationEvidenceContractSchema),
   /** Controller-owned policy identity; absent on packets frozen before policy versioning. */
   verificationPolicyVersion: Type.Optional(NonEmptyString),
   /** Exact targets bound to packet-selected commands; absent on legacy packets. */
   verificationCommandTargets: Type.Optional(Type.Array(Type.Object({
     id: NonEmptyString,
     targets: Type.Array(NonEmptyString),
+  }))),
+  /** Additive executable identity used to reject same-ID catalog drift on resume. */
+  verificationCommandIdentities: Type.Optional(Type.Array(Type.Object({
+    id: NonEmptyString,
+    command: NonEmptyString,
+    args: Type.Array(Type.String()),
+    evidenceCapability: Type.Optional(NonEmptyString),
+    targeting: Type.Optional(NonEmptyString),
+    identityDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   }))),
   risks: Type.Array(Type.Object({
     risk: NonEmptyString,
@@ -487,6 +543,7 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   reviewerRoles: Type.Array(NonEmptyString, { minItems: 1 }),
   findings: Type.Array(FindingSchema),
   checks: Type.Array(CheckResultSchema),
+  warnings: Type.Optional(Type.Array(NonEmptyString)),
   reviewPlan: Type.Optional(ReviewPlanSchema),
   scopeAdjudication: Type.Optional(Type.Object({
     sessionRef: NonEmptyString,
@@ -555,7 +612,7 @@ export const OutcomePayloadSchema = Type.Object({
     mergeabilityReason: Type.Optional(Type.String({ maxLength: 500 })),
     /** Optional only for additive decoding; missing provenance is non-authoritative. */
     requiredChecksProvenance: Type.Optional(Type.Union([
-      Type.Literal("github-required"), Type.Literal("unavailable"),
+      Type.Literal("github-required"), Type.Literal("github-none"), Type.Literal("unavailable"),
     ])),
     /** Optional for legacy decode; absence cannot authorize a current merge. */
     requiredChecksHeadSha: Type.Optional(Sha),
@@ -585,7 +642,7 @@ export const OutcomePayloadSchema = Type.Object({
     builderSummary: NonEmptyString,
     failureKind: Type.Optional(Type.Union([
       Type.Literal("builder-semantic-evidence"), Type.Literal("builder-report"),
-      Type.Literal("required-check"), Type.Literal("scope"), Type.Literal("verification-mutation"),
+      Type.Literal("packet-contract"), Type.Literal("required-check"), Type.Literal("scope"), Type.Literal("verification-mutation"),
     ])),
     changedPaths: Type.Array(NonEmptyString),
     criterionCoverage: Type.Optional(Type.Array(Type.Object({
@@ -598,6 +655,8 @@ export const OutcomePayloadSchema = Type.Object({
     residualRisks: Type.Optional(Type.Array(Type.String())),
     repairAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
     checks: Type.Array(CheckResultSchema),
+    /** Structured controller diagnostics for additive evidence-contract failures. */
+    diagnostics: Type.Optional(Type.Array(VerificationEvidenceDiagnosticSchema)),
   })),
 });
 

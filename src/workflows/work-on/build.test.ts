@@ -31,7 +31,7 @@ describe("builder boundary", () => {
       kind: "Intent", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
       payload: { title: "Guard", problem: "Race", constraints: [], acceptanceHints: [], dependencies: [] },
     });
-    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"] } as const;
+    const scopeHints = { affectedFiles: ["src/**/*.ts"], claims: ["src/widget"], metadataRoots: ["package.json"], writePaths: ["src/a.ts"] } as const;
     const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
     const verification = [{ id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 60_000, required: true }];

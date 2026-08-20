@@ -15,7 +15,9 @@ import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFrom
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
+import { resolveReviewCiConfig, type EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
 import { assertRunTargetsBranch } from "./lane.js";
+import { assessMergeAdmission, formatPullRequestCiBlock, requiredChecksMode } from "../review-pr/ci-policy.js";
 
 export interface MergeGatePollProgress {
   attempt: number;
@@ -161,6 +163,7 @@ export async function completeWorkItem(
     pullRequest: PullRequestSnapshot;
     verdict: DurableArtifact<"ReviewVerdict">;
     autoMerge: boolean;
+    ciPolicy?: EffectiveReviewCiConfig;
     childIssues?: readonly number[];
     memberContracts?: readonly BatchMemberContract[];
     /** Abort controller shutdown or ownership cancellation without publishing a blocker. */
@@ -179,9 +182,11 @@ export async function completeWorkItem(
     leaseGuard?: { assertValid(): void };
   },
 ): Promise<{ run: RunState; awaitingHuman: boolean; outcome?: DurableArtifact<"Outcome"> }> {
-  if (input.run.state !== "merging") throw new Error(`Completion requires merging state, found ${input.run.state}`);
+  if (input.run.state !== "merging" && input.run.state !== "closing") throw new Error(`Completion requires merging or closing state, found ${input.run.state}`);
   if (input.verdict.payload.disposition !== "approve") throw new Error("Cannot complete without an approving Review Verdict");
   let run = input.run;
+  const alreadyMergedCheckpoint = run.state === "closing";
+  let mergedExactHead = alreadyMergedCheckpoint;
   try {
     assertRunTargetsBranch(run, input.pullRequest.baseBranch);
     let pullRequest = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
@@ -189,8 +194,9 @@ export async function completeWorkItem(
     if (pullRequest.headSha !== input.verdict.payload.headSha) {
       throw new Error(`Approved SHA ${input.verdict.payload.headSha} is stale; current PR head is ${pullRequest.headSha}`);
     }
-    if (pullRequest.state !== "MERGED") {
-      if (!input.autoMerge) return { run, awaitingHuman: true };
+    const ciPolicy = input.ciPolicy ?? resolveReviewCiConfig();
+    if (!alreadyMergedCheckpoint && pullRequest.state !== "MERGED" && !input.autoMerge) return { run, awaitingHuman: true };
+    if (alreadyMergedCheckpoint || pullRequest.state === "MERGED" || input.autoMerge) {
       let admissionAttempt = 0;
       while (true) {
         const admission = await waitForAuthoritativeMergeGate({
@@ -200,6 +206,7 @@ export async function completeWorkItem(
           pullRequest,
           expectedHeadSha: input.verdict.payload.headSha,
           expectedBaseBranch: run.targetBranch!,
+          policy: ciPolicy,
           pollIntervalMs: mergeGatePollInterval(input.mergeGatePollIntervalMs),
           ...(input.signal ? { signal: input.signal } : {}),
           ...(input.onMergeGatePoll ? { onPoll: input.onMergeGatePoll } : {}),
@@ -225,10 +232,23 @@ export async function completeWorkItem(
             pullRequest.number,
             input.verdict.payload.headSha,
             run.targetBranch!,
+            { requiredChecksMode: requiredChecksMode(ciPolicy, run.targetBranch!) },
           );
           break;
         } catch (error) {
-          const afterCommand = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+          let afterCommand: PullRequestSnapshot;
+          try {
+            afterCommand = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+          } catch (confirmationError) {
+            if (isRecoverableCompletionTransportFailure(confirmationError)) {
+              throw new WorkflowExecutionError(
+                `Merge command response was ambiguous for PR #${pullRequest.number}; exact merged identity requires resume`,
+                run,
+                { cause: confirmationError, recoverable: true },
+              );
+            }
+            throw confirmationError;
+          }
           if (afterCommand.state === "MERGED") {
             assertMergedPullRequestIdentity(
               afterCommand,
@@ -271,7 +291,46 @@ export async function completeWorkItem(
           await waitForMergeGatePoll(pollIntervalMs, input.signal);
         }
       }
-      pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+      try {
+        pullRequest = await dependencies.host.getPullRequest(pullRequest.repo, pullRequest.number);
+      } catch (confirmationError) {
+        if (isRecoverableCompletionTransportFailure(confirmationError)) {
+          throw new WorkflowExecutionError(
+            `Merge command response was ambiguous for PR #${pullRequest.number}; exact merged identity requires resume`,
+            run,
+            { cause: confirmationError, recoverable: true },
+          );
+        }
+        throw confirmationError;
+      }
+      assertMergedPullRequestIdentity(
+        pullRequest,
+        input.pullRequest.repo,
+        input.pullRequest.number,
+        input.verdict.payload.headSha,
+        run.targetBranch!,
+      );
+      mergedExactHead = true;
+    }
+
+    if (!mergedExactHead) {
+      assertMergedPullRequestIdentity(
+        pullRequest,
+        input.pullRequest.repo,
+        input.pullRequest.number,
+        input.verdict.payload.headSha,
+        run.targetBranch!,
+      );
+      mergedExactHead = true;
+    }
+
+    if (!alreadyMergedCheckpoint) {
+      const merged = transition(run, "MERGE_COMPLETED", { headSha: pullRequest.headSha });
+      await dependencies.runs.commit(run.version, merged.state, merged.record);
+      run = merged.state;
+    } else {
+      // A prior merge was durably committed; resume only the idempotent
+      // closure/projection side effects after revalidating exact identity.
       assertMergedPullRequestIdentity(
         pullRequest,
         input.pullRequest.repo,
@@ -280,10 +339,6 @@ export async function completeWorkItem(
         run.targetBranch!,
       );
     }
-
-    const merged = transition(run, "MERGE_COMPLETED", { headSha: pullRequest.headSha });
-    await dependencies.runs.commit(run.version, merged.state, merged.record);
-    run = merged.state;
     const issue = run.subject.issue;
     if (!issue) throw new Error("work-on completion requires an issue subject");
     const childIssues = [...new Set(input.childIssues ?? [])]
@@ -440,6 +495,13 @@ export async function completeWorkItem(
   } catch (error) {
     if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
     const reason = error instanceof Error ? error.message : String(error);
+    // MERGE_COMPLETED is already durable and the exact approved head was
+    // proved authoritative. Transport exhaustion during comment/closure
+    // projection must retain that closing checkpoint for resume, not strand
+    // the delivery as an ordinary FAIL.
+    if (mergedExactHead && isRecoverableCompletionTransportFailure(error)) {
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
     throw new WorkflowExecutionError(reason, failed.state, { cause: error });
@@ -491,6 +553,7 @@ async function waitForAuthoritativeMergeGate(input: {
   pullRequest: PullRequestSnapshot;
   expectedHeadSha: string;
   expectedBaseBranch: string;
+  policy: EffectiveReviewCiConfig;
   pollIntervalMs: number;
   signal?: AbortSignal;
   onPoll?: (progress: MergeGatePollProgress) => void | Promise<void>;
@@ -514,12 +577,19 @@ async function waitForAuthoritativeMergeGate(input: {
         input.expectedHeadSha,
         input.expectedBaseBranch,
       );
-      return { gate, pullRequest: revalidated, alreadyMerged: true };
+      const mergedAssessment = assessMergeAdmission(revalidated, gate, input.policy);
+      return {
+        gate,
+        pullRequest: revalidated,
+        ...(mergedAssessment.ready ? { alreadyMerged: true as const } : {
+          terminalReason: `Merge admission is blocked: ${formatPullRequestCiBlock(mergedAssessment, input.policy.failureAction, "after")}`,
+        }),
+      };
     }
     assertOpenPullRequestIdentity(revalidated, pullRequest.repo, pullRequest.number, input.expectedHeadSha, input.expectedBaseBranch);
     pullRequest = revalidated;
 
-    const terminalReason = terminalMergeGateFailure(gate);
+    const terminalReason = terminalMergeGateFailure(gate, pullRequest, input.policy);
     if (terminalReason) return { gate, pullRequest, terminalReason };
     const transientReason = transientMergeGateReason(gate);
     if (!transientReason) return { gate, pullRequest };
@@ -602,32 +672,23 @@ function assertMergedPullRequestIdentity(
   }
 }
 
-function terminalMergeGateFailure(gate: PullRequestMergeGate): string | undefined {
-  if (gate.requiredChecksProvenance !== "github-required"
-    || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
-    return `Merge admission is blocked for PR #${gate.pullRequest}: authoritative required checks are not immutably bound to ${gate.headSha}`;
-  }
-  if (gate.requiredChecks.length === 0) {
-    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub reported no configured required checks`;
-  }
-  const mergeability = pullRequestMergeability(gate);
-  if (mergeability === "conflicting") {
-    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub confirmed the reviewed SHA conflicts with ${gate.baseBranch}`;
-  }
-  if (mergeability === "unavailable") {
-    return `Merge admission is blocked for PR #${gate.pullRequest}: GitHub mergeability query is unavailable on ${gate.baseBranch}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
-  }
-  const terminalChecks = gate.requiredChecks.filter((check) => ["failed", "cancelled", "unavailable"].includes(check.state));
-  if (terminalChecks.length) {
-    return `Required GitHub checks failed closed for PR #${gate.pullRequest}: ${terminalChecks.map((check) => `${check.name}=${check.state}`).join(", ")}`;
-  }
-  return undefined;
+function terminalMergeGateFailure(gate: PullRequestMergeGate, pullRequest: PullRequestSnapshot, policy: EffectiveReviewCiConfig): string | undefined {
+  const assessment = assessMergeAdmission(pullRequest, gate, policy, { productionTarget: pullRequest.baseBranch });
+  if (assessment.pending.length || pullRequestMergeability(gate) === "unknown") return undefined;
+  if (assessment.ready) return undefined;
+  return `Merge admission blocked: ${formatPullRequestCiBlock(assessment, policy.failureAction, "after")}`;
 }
 
 function transientMergeGateReason(gate: PullRequestMergeGate): MergeGatePollProgress["reason"] | undefined {
   if (gate.requiredChecks.some((check) => check.state === "pending")) return "required-checks-pending";
   if (pullRequestMergeability(gate) === "unknown") return "mergeability-unknown";
   return undefined;
+}
+
+function isRecoverableCompletionTransportFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /marker remains unresolved|HTTP (?:429|5\d{2})\b/i.test(message)
+    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|temporarily unavailable|no server is currently available)/i.test(message);
 }
 
 function transientMergeAdmissionError(error: unknown): MergeGatePollProgress["reason"] | undefined {

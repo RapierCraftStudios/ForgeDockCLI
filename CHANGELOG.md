@@ -20,6 +20,11 @@
 - Review continuity now uses a durable `FindingRootLedger` and schema-v4 exact-SHA initial/closure plans. Omission does not close an open root. Controller-owned `mustFix` is distinct from final `blocking`: qualifying medium roots can remain nonblocking while still forcing `request_changes`, bounded remediation, re-verification, and closure review.
 - Dogfood readiness is now tracked as phased certification waves. Implementation and local regression evidence do not constitute a readiness claim; certification remains open.
 
+### Fixed
+
+- Standalone review now distinguishes an empty GitHub required-check projection from a failed check query: `/review-pr` dispatches exact-SHA reviewers with a visible durable warning, while direct, work-on, and promotion merge admission still require a nonempty passing required-check set.
+- Corrected the read-only reviewer contract: new plans omit per-shard tool-call quotas, reviewers continue targeted path-scoped exploration without a fixed tool-call cutoff, and unexpected runtime budget exhaustion fails closed rather than counting as completion or producing a `ReviewVerdict`.
+
 ## 1.8.1 - 2026-08-17
 
 ### Fixed

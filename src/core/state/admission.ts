@@ -56,6 +56,10 @@ export function isRepairableVerificationFailure(
 ): boolean {
   if (!packet || !outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) return false;
   const evidence = outcome.payload.failureEvidence;
+  // Packet/catalog contracts are immutable authority, not builder evidence. A
+  // typed contract failure must never be reclassified by repairAttempt or any
+  // legacy reason heuristic into retained builder repair.
+  if (evidence.failureKind === "packet-contract") return false;
   const reason = outcome.payload.reason;
   const noChanges = /^Builder produced no repository changes$/i.test(reason);
   const dispatchedRepair = evidence.repairAttempt !== undefined;

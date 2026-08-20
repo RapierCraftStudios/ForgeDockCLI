@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../artifacts/schema.js";
 import {
   decideSubjectAdmission,
+  isRepairableVerificationFailure,
   latestArtifactOfKind,
   latestDeliveryRunArtifacts,
   reviewRemediationCycleCount,
@@ -60,6 +61,7 @@ function repairOutcome(
     regression?: boolean;
     repairAttempt?: number;
     failureClass?: "command" | "infrastructure" | "timeout";
+    failureKind?: "builder-semantic-evidence" | "builder-report" | "packet-contract" | "required-check" | "scope" | "verification-mutation";
   } = {},
 ): DurableArtifact<"Outcome"> {
   const artifact = createArtifact({
@@ -76,6 +78,7 @@ function repairOutcome(
         criterionCoverage: [{ criterion: "documented", implementation: "Added documentation" }],
         decisions: [],
         residualRisks: [],
+        ...(options.failureKind !== undefined ? { failureKind: options.failureKind } : {}),
         ...(options.repairAttempt !== undefined ? { repairAttempt: options.repairAttempt } : {}),
         checks: [{
           command: "npm test",
@@ -374,6 +377,19 @@ describe("subject run admission", () => {
       assert.equal(decision.state, "building");
       assert.equal(decision.checkpoint, "build");
     }
+  });
+
+  it("never admits an explicit packet-contract failure to builder repair", () => {
+    const runId = "run_packet_contract_failure";
+    const delivery = publicationArtifacts(runId);
+    const packet = delivery.find((artifact) => artifact.kind === "BuildPacket");
+    assert.ok(packet?.kind === "BuildPacket");
+    const blocked = repairOutcome(runId, "2026-01-01T00:01:00.000Z", {
+      reason: "Builder criterion coverage is incomplete: missing documented",
+      repairAttempt: 1,
+      failureKind: "packet-contract",
+    });
+    assert.equal(isRepairableVerificationFailure(packet, blocked), false);
   });
 
   it("resumes after one durable repair dispatch but blocks after the second", () => {

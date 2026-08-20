@@ -138,9 +138,19 @@ describe("fresh-context PR review", () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
+    const packet = {
+      ...context.packet,
+      payload: {
+        ...context.packet.payload,
+        evidencePaths: [
+          { path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const },
+          { path: "src/workflows/review-pr/review.ts", criterionIds: ["criterion-1"], role: "source" as const },
+        ],
+      },
+    };
     const runtime = new FakeAgentRuntime([clean, clean]);
     const host = new FakeHost();
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet, workspace: process.cwd() }, {
       runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(result.run.state, "merging");
@@ -156,6 +166,10 @@ describe("fresh-context PR review", () => {
     assert.match(host.comments[0]?.body ?? "", /review-concurrency · concurrency · completed/);
     assert.ok(host.comments.every(({ body, marker }) => body.includes(marker) && body.includes("consolidated Review Verdict remains authoritative") && body.includes("Session lineage")));
     assert.ok(runtime.tasks.every((task) => task.workspace.mode === "read-only" && !task.tools.includes("edit")));
+    const reviewerTasks = runtime.tasks.filter((task) => task.role === "reviewer");
+    assert.ok(reviewerTasks.length > 0);
+    assert.ok(reviewerTasks.every((task) => task.workspace.scope.readRoots.includes("package.json")));
+    assert.ok(reviewerTasks.every((task) => task.workspace.scope.readRoots.includes("src/workflows/review-pr")));
   });
 
   it("executes a large review as compact bounded shards with one folded durable report", async () => {
@@ -186,10 +200,11 @@ describe("fresh-context PR review", () => {
     assert.deepEqual([...new Set(result.reviewPlan.executionGroups.map(({ role }) => role))], ["correctness", "concurrency"]);
     assert.ok(result.reviewPlan.executionGroups.every(({ scope }) => scope.length > 0 && scope.length <= 24));
     assert.ok(tasks.every((task) => task.context.length === 0));
-    assert.ok(tasks.every((task) => task.executionBudget?.maxTurns === undefined));
-    assert.ok(tasks.every((task) => Number.isSafeInteger(task.executionBudget?.maxToolCalls)));
-    assert.ok(tasks.every((task) => (task.executionBudget?.maxToolCalls ?? 0) >= 16 && (task.executionBudget?.maxToolCalls ?? 0) <= 48));
-    assert.ok(tasks.every((task) => task.instructions.includes("runtime warns before exhaustion")));
+    assert.ok(tasks.every((task) => task.executionBudget === undefined));
+    assert.ok(tasks.every((task) => task.instructions.includes("no fixed tool-call quota")));
+    assert.ok(tasks.every((task) => !task.instructions.includes("total read/search calls")));
+    assert.ok(tasks.every((task) => !task.instructions.includes("runtime warns before exhaustion")));
+    assert.ok(tasks.every((task) => task.instructions.includes("targeted evidence as needed")));
     assert.ok(tasks.every((task) => task.instructions.includes("Do not list the checkout root")));
     assert.ok(tasks.every((task) => task.objective.length < 60_000));
     assert.ok(tasks.every((task) => task.objective.includes('"totalExpectedPaths": 55')));
@@ -601,7 +616,7 @@ describe("fresh-context PR review", () => {
     assert.equal(runtime.tasks.filter((task) => task.id.endsWith(":review-correctness")).length, 1);
   });
 
-  it("does not spend a fresh reviewer attempt after the frozen evidence budget is exhausted", async () => {
+  it("fails closed on unexpected runtime tool-budget exhaustion without issuing a verdict", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -609,16 +624,22 @@ describe("fresh-context PR review", () => {
       async () => { throw new Error("Nested reviewer ended with tool_budget_exhausted"); },
       clean,
     ]);
+    const host = new FakeHost();
+    const artifactStore = new InMemoryArtifactRepository();
     await assert.rejects(
       reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
-        runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+        runtime, host, artifacts: artifactStore, runs,
       }),
       /tool_budget_exhausted/,
     );
     assert.equal(runtime.tasks.length, 2);
     assert.equal(runtime.tasks.filter((task) => task.id.endsWith(":review-correctness")).length, 1);
+    assert.equal(artifactStore.artifacts.some(({ kind }) => kind === "ReviewVerdict"), false);
+    assert.equal((await runs.load(run.runId))?.state, "blocked");
+    assert.match(host.comments[0]?.body ?? "", /wave is incomplete; no partial approval was issued/i);
     const progress = await runs.listProgress(run.runId);
-    assert.ok(progress.some(({ message }) => message.includes("evidence budget was exhausted")));
+    assert.ok(progress.some(({ message }) => message.includes("unexpected runtime tool-budget exhaustion")));
+    assert.ok(progress.some(({ message }) => message.includes("no ReviewVerdict will be produced")));
   });
 
   it("resumes an incomplete persisted reviewer once before spending a fresh session", async () => {

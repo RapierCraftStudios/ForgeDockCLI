@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { deriveSecurityInvariantMatrices, expandInvariantMatrix } from "./invariant-matrix.js";
+import { deriveSecurityInvariantMatrices, expandInvariantMatrix, invariantMatrixCaseIds, invariantMatrixIdentities } from "./invariant-matrix.js";
 
 describe("security-sensitive invariant matrices", () => {
   it("derives deterministic redaction, chunk, adapter, identity, and terminal evidence from criterion semantics", () => {
@@ -59,5 +59,15 @@ describe("security-sensitive invariant matrices", () => {
       dimensions: [{ name: "a", values }],
       testId: "invariant:matrix-prechecked",
     }, 1), /expands beyond 1 cases/);
+  });
+
+  it("centralizes stable row, test, and expanded case IDs", () => {
+    const row = {
+      id: "matrix-terminal", criterionId: "criterion-1" as const, capability: "terminal-metadata" as const,
+      dimensions: [{ name: "state", values: ["passed", "failed"] }], testId: "invariant:matrix-terminal",
+    };
+    const expectedCases = expandInvariantMatrix(row).map(({ id }) => id);
+    assert.deepEqual(invariantMatrixCaseIds([row]), [row.testId, ...expectedCases]);
+    assert.deepEqual(invariantMatrixIdentities([row]), { rowIds: [row.id], testIds: [row.testId], caseIds: expectedCases });
   });
 });

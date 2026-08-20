@@ -59,8 +59,15 @@ export async function buildWorkItem(
         "This execution is bounded. Prioritize the frozen criteria, stop broad exploration early, and submit the complete typed result before the execution ceiling; a retained checkpoint will be resumed if the ceiling is reached.",
         "Turn the Build Packet into a criterion-by-criterion implementation checklist before making changes. For every criterion, identify the invariant, all relevant callers/implementations/adapters, and the regression scenario that must remain true.",
         ...(input.priorVerificationFailure ? [
-          "This is a bounded repair of the retained implementation. First reproduce every controller-recorded failed check with the typed verify tool before editing; do not guess from its summary.",
-          "After the narrow fix, rerun the failing frozen check plus every neighboring frozen check that covers the same criterion, path, symbol, or invariant. Re-audit every still-open frozen criterion before submitting; never treat an unrelated green generic check as criterion evidence.",
+          ...((input.priorVerificationFailure.payload.failureEvidence?.checks?.length ?? 0) > 0 ? [
+            "This is a bounded repair of the in-packet implementation after executable controller verification failed. First reproduce every controller-recorded failed check, plus any skipped required check, with the typed verify tool before editing; do not guess from its summary.",
+            "After the narrow fix, rerun the failing frozen check plus every neighboring frozen check that covers the same criterion, path, symbol, or invariant. Re-audit every still-open frozen criterion before submitting; never treat an unrelated green generic check as criterion evidence.",
+          ] : [
+            "This is an evidence/report-only correction: the controller recorded no executable checks. Preserve the implementation and fix every reported evidence or coverage diagnostic; do not reproduce nonexistent checks or edit code unless the evidence proves a real gap.",
+          ]),
+          ...((input.priorVerificationFailure.payload.failureEvidence?.diagnostics?.length ?? 0) > 0 ? [
+            `Controller diagnostics are authoritative correction targets; resolve all of them together: ${JSON.stringify(input.priorVerificationFailure.payload.failureEvidence?.diagnostics)}`,
+          ] : []),
           ...(input.priorSubmission ? [`Preserve and amend the prior builder checklist/submission rather than rebuilding it from memory: ${JSON.stringify(input.priorSubmission)}`] : []),
           ...(input.priorBuilderSessionRef ? [`The prior builder session was ${input.priorBuilderSessionRef}; this runtime starts a schema-safe bounded repair session, so use the retained submission as continuity evidence.`] : []),
         ] : []),
@@ -74,8 +81,17 @@ export async function buildWorkItem(
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
         "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion.",
         "Every criterionCoverage entry must include typed anchors: concrete repository paths, stable implementation symbols, stable test/invariant-matrix IDs, and the relevant frozen verification command IDs. Prose implementation notes remain readable but cannot authorize a pass. Use only command IDs actually relevant to that criterion; generic green checks cannot substitute for missing symbol/test evidence.",
-        ...(input.packet.payload.invariantMatrices?.length ? [
+        ...(input.packet.payload.evidenceContract?.version === "forgedock.evidence/v1" ? [
+          `Evidence contract v1 (controller-frozen, compact): ${input.packet.payload.evidenceContract.criteria.map((criterion) => `${criterion.criterionId}{writePaths=${criterion.allowedWritePaths.join(",") || "none"}; evidenceOnlyPaths=${criterion.allowedEvidencePaths.join(",") || "none"}; commands=${criterion.requiredCommandIds.join(",") || "none"}; semantic=${criterion.semanticCommandIds.join(",") || "none"}; gates=${criterion.controllerGateIds.join(",") || "none"}; invariantRows=${criterion.invariantRowIds.join(",") || "none"}; invariantTests=${criterion.invariantTestIds.join(",") || "none"}}`).join(" | ")}`,
+          "Evidence-only paths are read-only: inspect them for evidence, but never modify them and never report them as changed paths unless they are also frozen expected write paths.",
+          "For invariant matrices, preserve each controller-frozen root test ID in anchors; row IDs are controller context only. Do not echo or invent expanded matrix case IDs; the controller adds those IDs only after the exact semantic command passes.",
+          "Use only the exact required and semantic command IDs and controller gate IDs listed for each criterion; generic commands cannot prove command-backed criteria. Controller gates may supplement semantic command evidence but cannot replace it.",
+        ] : []),
+        ...(input.packet.payload.evidenceContract?.version !== "forgedock.evidence/v1" && input.packet.payload.invariantMatrices?.length ? [
           `Security-sensitive acceptance matrices are controller-derived and must be exercised where applicable: ${input.packet.payload.invariantMatrices.map((row) => `${row.id} (${row.criterionId}, testId=${row.testId})`).join("; ")}. Preserve their row/test IDs in focused tests and criterion anchors.`,
+        ] : []),
+        ...(input.packet.payload.evidenceContract?.version !== "forgedock.evidence/v1" && input.packet.payload.verificationRequirements?.length ? [
+          `Use the exact frozen verification command IDs required by each criterion: ${input.packet.payload.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => `${requirement.id}=>${requirement.criterionIds.join(",")}`).join("; ") || "(none)"}.`,
         ] : []),
         "Before submitting, self-review the complete diff against every criterion and integration boundary: check callers, implementations, adapters, serialization, error/cancellation/concurrency paths, tests, and docs/configuration that the packet identifies. Do not mark a criterion covered from intent alone; cite concrete code, test, or verification evidence.",
         "Run the narrowest relevant frozen verification commands after editing, then re-read changed files for malformed edits, whitespace damage, and accidental mechanical churn.",
@@ -91,7 +107,12 @@ export async function buildWorkItem(
       workspace: {
         cwd: input.worktree,
         mode: "write",
-        scope: scopeManifestForBuildPacket(input.packet.payload.expectedPaths),
+        scope: scopeManifestForBuildPacket(
+          input.packet.payload.expectedPaths,
+          input.packet.payload.evidenceContract?.version === "forgedock.evidence/v1"
+            ? (input.packet.payload.evidencePaths ?? []).map(({ path }) => path)
+            : [],
+        ),
       },
       tools: ["read", "grep", "find", "ls", "compute", ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? ["verify" as const] : []), "edit", "write"],
       ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? {

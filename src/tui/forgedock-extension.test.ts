@@ -1447,8 +1447,10 @@ test("fresh orchestration never invokes the implicit resume tool", async () => {
   assert.equal(state.sent.some(({ content }) => /Resume orchestration|forgedock_resume_orchestration/i.test(content)), false);
 });
 
-test("orchestration preview rejects issues owned by an active durable batch DAG without writing", async () => {
+test("orchestration preview stays read-only and final admission rejects a live durable batch DAG", async () => {
   const repository = new InMemoryOrchestrationRepository();
+  const leases = new InMemoryLeaseRepository();
+  const executionAdmission = new LeaseBackedOrchestrationExecutionAdmission(leases);
   const active: OrchestrationRecord = {
     schema: "forgedock.orchestration/v1",
     orchestrationId: "dag_active_batch",
@@ -1472,13 +1474,16 @@ test("orchestration preview rejects issues owned by an active durable batch DAG 
     }],
   };
   await repository.createOrchestration(active);
+  const activeClaim = await executionAdmission.acquire(active.orchestrationId);
+  assert.ok(activeClaim);
   const state = fakePi(undefined, {
     orchestrationRepository: repository,
-    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    orchestrationExecutionAdmission: executionAdmission,
     dispatchReadinessCheck: async () => undefined,
   });
   const tool = state.tools.get("forgedock_orchestrate");
   assert.ok(tool);
+  const executionPlan = [{ issue: 900, title: "Generated batch", summary: "Already owned", dependsOn: [], claims: ["src"], labels: ["batch"] }];
   bindOrchestrationInvocation(state.pi, {
     rawArgs: "open issues",
     issueNumbers: [900],
@@ -1486,12 +1491,111 @@ test("orchestration preview rejects issues owned by an active durable batch DAG 
     noMilestone: true,
   });
 
-  await assert.rejects(() => tool.execute("active-owned-preview", {
+  const preview = await tool.execute("active-owned-preview", {
     issueNumbers: [900],
-    executionPlan: [{ issue: 900, title: "Generated batch", summary: "Already owned", dependsOn: [], claims: ["src"], labels: ["batch"] }],
+    executionPlan,
     dryRun: true,
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /active durable DAG ownership.*#900.*dag_active_batch/);
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  assert.match((preview.content[0] as { text: string }).text, /Dispatch is disabled by --dry-run/);
   assert.equal(repository.records.size, 1, "read-only preview must not create or mutate a DAG");
+
+  bindOrchestrationInvocation(state.pi, {
+    rawArgs: "open issues",
+    issueNumbers: [900],
+    repository: "a/b",
+    noMilestone: true,
+  });
+  await assert.rejects(() => tool.execute("active-owned-dispatch", {
+    issueNumbers: [900],
+    executionPlan,
+    confirmed: true,
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /active durable DAG ownership.*#900.*dag_active_batch/);
+  assert.equal((await repository.loadOrchestration(active.orchestrationId))?.status, "running");
+  await activeClaim.release();
+  await shutdownFakePi(state, commandContext());
+});
+
+test("authorized orchestration reaps an expired durable owner before final scope admission", async () => {
+  let now = Date.parse("2026-08-18T00:00:00.000Z");
+  const repository = new InMemoryOrchestrationRepository();
+  const leases = new InMemoryLeaseRepository();
+  const executionAdmission = new LeaseBackedOrchestrationExecutionAdmission(leases, {
+    now: () => now,
+    ttlMs: 1_000,
+    heartbeatMs: 500,
+  });
+  const stale: OrchestrationRecord = {
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_expired_owner",
+    repository: "a/b",
+    requestedIssueNumbers: [901],
+    issueNumbers: [901],
+    maxParallel: 1,
+    autoMerge: true,
+    executionAttempt: 1,
+    status: "running",
+    createdAt: "2026-08-18T00:00:00.000Z",
+    updatedAt: "2026-08-18T00:00:00.000Z",
+    nodes: [{
+      id: "issue-901",
+      issue: 901,
+      priority: 1,
+      dependencies: [],
+      claims: ["src"],
+      status: "running",
+      childRunIds: [],
+    }],
+  };
+  await repository.createOrchestration(stale);
+  const staleClaim = await executionAdmission.acquire(stale.orchestrationId);
+  assert.ok(staleClaim);
+  now += 1_001;
+
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: executionAdmission,
+    dispatchReadinessCheck: async () => undefined,
+  });
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { text: "started", details: { asyncId: "expired-owner-replacement" } },
+      }));
+    } else if (name === "subagents:rpc:v1:request" && data.method === "stop") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { stopped: true },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  bindOrchestrationInvocation(state.pi, {
+    rawArgs: "901",
+    issueNumbers: [901],
+    repository: "a/b",
+    noMilestone: true,
+  });
+
+  const result = await tool.execute("expired-owned-dispatch", {
+    issueNumbers: [901],
+    executionPlan: [{ issue: 901, title: "Replacement", summary: "Replace expired owner", dependsOn: [], claims: ["src"], labels: [] }],
+    confirmed: true,
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+
+  assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
+  const recovered = await repository.loadOrchestration(stale.orchestrationId);
+  assert.equal(recovered?.status, "failed");
+  assert.equal(recovered?.nodes[0]?.status, "suspended");
+  assert.equal(repository.records.size, 2, "the failed owner and fresh DAG must both remain durable");
+  await staleClaim.release();
   await shutdownFakePi(state, commandContext());
 });
 

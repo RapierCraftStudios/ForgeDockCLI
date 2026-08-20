@@ -37,6 +37,15 @@ import { DEFAULT_SEMANTIC_IDLE_MS, validateSemanticIdleMs } from "./semantic-idl
 
 export const MAX_NESTED_AGENT_RESPONSE_BYTES = 2 * 1024 * 1024;
 
+/** A reviewer transport failed before semantic review work could be evaluated. */
+export class NestedReviewerTransportError extends AgentRunError {
+  readonly transportInterruption = true as const;
+  constructor(message: string, options: { sessionRef?: string; cause?: unknown } = {}) {
+    super(message, { ...options, resumable: false });
+    this.name = "NestedReviewerTransportError";
+  }
+}
+
 /**
  * Verification commands have their own process-level timeout. Emit a
  * heartbeat well before the generic 120s semantic-idle window so a legitimate
@@ -199,6 +208,12 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async capabilities(): Promise<RuntimeCapabilities> {
+    if (process.env.FORGEDOCK_NESTED_AGENT_URL && process.env.FORGEDOCK_NESTED_AGENT_TOKEN && process.env.FORGEDOCK_NESTED_AGENT_HEALTH_URL) {
+      // Review calls capabilities immediately before constructing its frozen
+      // reviewer wave. Fail here so a dead owner is not reported as a semantic
+      // incomplete wave and no reviewer/remediation budget is spent.
+      await assertNestedReviewerBridgeHealthy();
+    }
     return {
       runtime: "pi",
       // The package's generic resume RPC appends its own acceptance contract
@@ -273,6 +288,7 @@ export class PiAgentRuntime implements AgentRuntime {
       throw new Error("Pi runtime requires a provider and model (flags, configuration, or PI_PROVIDER/PI_MODEL)");
     }
     if (task.role === "reviewer" && process.env.FORGEDOCK_NESTED_AGENT_URL && process.env.FORGEDOCK_NESTED_AGENT_TOKEN) {
+      await assertNestedReviewerBridgeHealthy({ signal: execution.controller.signal });
       const result = await runNestedReviewer(task, {
         provider,
         model: modelId,
@@ -415,6 +431,7 @@ export class PiAgentRuntime implements AgentRuntime {
         errorSummary: terminalErrorSummary(effectiveError, cancelled),
         ...(task.observability ? { observability: task.observability } : {}),
       });
+      if (effectiveError instanceof AgentRunError && (effectiveError as AgentRunError & { transportInterruption?: boolean }).transportInterruption) throw effectiveError;
       if (effectiveError instanceof AgentRunError && effectiveError.sessionRef) throw effectiveError;
       const detail = effectiveError instanceof Error ? effectiveError : new Error(String(effectiveError));
       throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: effectiveError, execution: localExecutionUsage(task, budgetState) });
@@ -739,17 +756,20 @@ async function runNestedReviewer<T>(
     const sessionRef = observedSessionRef ?? provisionalSessionRef;
     emitNestedTerminal(task, input, cancelled ? "session.cancelled" : "session.failed", sessionRef, error);
     const detail = error instanceof Error ? error : new Error(String(error));
-    throw new AgentRunError(detail.message, { sessionRef, resumable: false, cause: error });
+    throw error instanceof NestedReviewerTransportError
+      ? error
+      : new NestedReviewerTransportError(detail.message, { sessionRef, cause: error });
   }
   const payload = response.payload;
   if (response.status < 200 || response.status >= 300 || payload.output === undefined) {
     const sessionRef = observedSessionRef ?? payload.sessionRef ?? provisionalSessionRef;
     emitNestedTerminal(task, input, input.signal?.aborted ? "session.cancelled" : "session.failed", sessionRef, payload.error);
-    throw new AgentRunError(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
+    throw new (response.status >= 500 || response.status === 429 || response.status === 401 || response.status === 404
+      ? NestedReviewerTransportError
+      : AgentRunError)(payload.error ?? `Nested reviewer bridge returned HTTP ${response.status}`, {
       sessionRef,
-      // A persisted session identity remains useful evidence, but the generic
-      // bridge resume path cannot preserve this typed output contract.
       resumable: false,
+      ...(payload.error ? { cause: payload.error } : {}),
     });
   }
   const sessionRef = observedSessionRef ?? payload.sessionRef ?? provisionalSessionRef;
@@ -865,6 +885,47 @@ export function usageFromMessages(messages: readonly unknown[]): AgentUsageRecei
 
 function isRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function assertNestedReviewerBridgeHealthy(input: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<void> {
+  const configured = process.env.FORGEDOCK_NESTED_AGENT_HEALTH_URL;
+  if (!configured) return Promise.resolve();
+  let target: URL;
+  try { target = new URL(configured); }
+  catch (error) { return Promise.reject(new NestedReviewerTransportError("Nested reviewer bridge health URL is stale or invalid", { cause: error })); }
+  const token = process.env.FORGEDOCK_NESTED_AGENT_TOKEN;
+  if (!token || target.protocol !== "http:" || target.hostname !== "127.0.0.1" || target.pathname !== "/v1/health") {
+    return Promise.reject(new NestedReviewerTransportError("Nested reviewer bridge ownership is unavailable"));
+  }
+  const timeoutMs = input.timeoutMs ?? 2_000;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      error ? reject(error) : resolve();
+    };
+    const abort = () => finish(new NestedReviewerTransportError("Nested reviewer bridge health check was interrupted", { cause: input.signal?.reason }));
+    const timer = setTimeout(() => finish(new NestedReviewerTransportError("Nested reviewer bridge health check timed out")), timeoutMs);
+    const request = httpRequest(target, {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}` },
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, (response) => {
+      response.resume();
+      response.once("end", () => {
+        if (response.statusCode !== 200) finish(new NestedReviewerTransportError(`Nested reviewer bridge health check returned HTTP ${response.statusCode ?? 500}`));
+        else finish();
+      });
+      response.once("error", (error) => finish(new NestedReviewerTransportError(`Nested reviewer bridge health response failed: ${error.message}`, { cause: error })));
+    });
+    request.once("error", (error) => finish(new NestedReviewerTransportError(`Nested reviewer bridge health transport failed: ${error.message}`, { cause: error })));
+    input.signal?.addEventListener("abort", abort, { once: true });
+    if (input.signal?.aborted) abort();
+    else request.end();
+  });
 }
 
 export function postNestedAgentRequest<T>(input: {

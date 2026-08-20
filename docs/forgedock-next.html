@@ -338,13 +338,14 @@ forgedock models</pre>
     <section id="review">
       <div class="eyebrow">Workflow 2</div>
       <h2><code>review-pr</code>: independent and commit-specific</h2>
-      <p class="section-intro">Review is a frozen, budgeted, exact-SHA protocol. Controller-observed evidence selects capabilities before execution; durable semantic finding roots preserve continuity across delta review and remediation.</p>
+      <p class="section-intro">Review is a frozen, controller-budgeted, exact-SHA protocol. Controller-observed evidence selects capabilities before execution; durable semantic finding roots preserve continuity across delta review and remediation.</p>
       <div class="grid three">
         <div class="card"><span class="num">INPUT</span><h3>Clean review packet</h3><p>Original issue intent, investigation, Build Packet, PR diff, verification evidence, repository policy, route facts, and current head SHA.</p></div>
         <div class="card"><span class="num">PLAN</span><h3>Capabilities, then resources</h3><p>Acceptance/correctness is mandatory. Security, data, API, concurrency, frontend, and release capabilities are packed into at most three specialist execution groups by default; overlap may share execution but never removes a required capability. The canonical plan identity binds topology, authority context, and enforced parallel/session/model-call budgets.</p></div>
         <div class="card"><span class="num">OUTPUT</span><h3>Durable roots and one verdict</h3><p>Current findings require a stable semantic root, severity, confidence, causal evidence, typed blocker anchor, exact scope lineage, and remediation. The controller derives <code>mustFix</code>; reviewer booleans and rendered Markdown are not authority.</p></div>
       </div>
       <p><code>FindingRootLedger</code> is a durable exact-head artifact with monotonic epochs and structural root identity. Schema-v4 closure plans prove prior-to-current paths/hunks and require correctness plus every recorded owner role to assess each open, fix-attempted, or regressed root. Omission becomes <code>fix-attempted</code>, not fixed. Unproven newly discovered preexisting concerns become follow-up work rather than expanding remediation scope.</p>
+      <p class="callout">Read-only reviewers have no fixed tool-call quota or runtime tool-call cutoff. They continue targeted, path-scoped exploration until the assigned capabilities are complete; unexpected runtime budget exhaustion is a failure and never counts as review completion or produces a <code>ReviewVerdict</code>.</p>
       <h3 style="margin-top:24px">Deterministic policy, not reviewer vibes</h3>
       <div class="table-wrap"><table>
         <thead><tr><th>Condition</th><th>Controller response</th></tr></thead>

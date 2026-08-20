@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
+import { DEFAULT_REVIEW_CI } from "../../core/config/forgedock-config.js";
 import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestMergeability, type PullRequestMergeGateOptions, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import type { GitWorkspace, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryPromotionRepository, type PromotionRecord } from "../../core/ports/promotion.js";
@@ -27,6 +28,7 @@ class PromotionHost implements ForgeHost {
   mergeGateReads = 0;
   mergeGateOptions: PullRequestMergeGateOptions[] = [];
   mergeAttempts = 0;
+  mergeOptions?: { requiredChecksMode?: "require" | "if-present" } | undefined;
   mergeErrorOnce: Error | undefined;
   mergeGateErrorAtRead: number | undefined;
   pullRequest: PullRequestSnapshot | undefined;
@@ -72,8 +74,9 @@ class PromotionHost implements ForgeHost {
       observedAt: new Date().toISOString(),
     };
   }
-  async mergePullRequest(): Promise<void> {
+  async mergePullRequest(_repo: string, _number: number, _head: string, _base: string, options?: { requiredChecksMode?: "require" | "if-present" }): Promise<void> {
     this.mergeAttempts += 1;
+    this.mergeOptions = options;
     if (this.mergeErrorOnce) {
       const error = this.mergeErrorOnce;
       this.mergeErrorOnce = undefined;
@@ -153,6 +156,39 @@ describe("explicit branch promotion", () => {
     assert.equal(result.review?.disposition, "approve");
     assert.equal(result.pullRequest?.headSha, sourceSha);
     assert.equal(host.merged, true);
+  });
+
+  it("blocks authorized promotion merge when GitHub requires no checks", async () => {
+    const host = new PromotionHost();
+    host.requiredChecksProvenance = "github-none";
+    host.requiredChecks = [];
+    const deps = dependencies(host);
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+      ciPolicy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "require", requiredChecksTargets: {} },
+    }, deps);
+    assert.equal(result.phase, "blocked");
+    assert.match(result.failure ?? "", /GitHub reported no required checks for reviewed/);
+    assert.equal(host.mergeAttempts, 0);
+    assert.equal(host.merged, false);
+  });
+
+  it("merges exact github-none checks under an explicit staging if-present policy", async () => {
+    const host = new PromotionHost();
+    host.requiredChecksProvenance = "github-none";
+    host.requiredChecks = [];
+    const deps = dependencies(host);
+    const result = await promoteBranch({
+      repository: "a/b", mode: "feature", sourceBranch: "milestone/feature", targetBranch: "staging",
+      configuredPromotionTarget: "staging", configuredProductionTarget: "main", cwd: process.cwd(), verification: [command],
+      authorizeCreation: true, authorizeMerge: true,
+      ciPolicy: { ...DEFAULT_REVIEW_CI, requiredChecksDefault: "require", requiredChecksTargets: { staging: "if-present" } },
+    }, deps);
+    assert.equal(result.phase, "completed");
+    assert.equal(host.merged, true);
+    assert.deepEqual(host.mergeOptions, { requiredChecksMode: "if-present" });
   });
 
   it("refreshes transient UNKNOWN mergeability before authorized promotion merge", async () => {

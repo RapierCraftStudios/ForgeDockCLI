@@ -2,7 +2,8 @@
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
-import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
+import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type PullRequestRepairWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
@@ -27,9 +28,10 @@ import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
-import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, type VerificationResult } from "./verify.js";
+import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, type VerificationResult } from "./verify.js";
 import { recoverConflictingRevision } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
+import { makePullRequestCiGreen } from "../review-pr/fix-ci.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
@@ -49,6 +51,10 @@ export interface WorkOnDependencies {
   /** Controller-owned fencing guard checked before every dependent mutation. */
   leaseGuard?: LeaseGuard;
   onAgentEvent?: AgentEventSink;
+  /** Repository-owned target-aware CI admission policy. */
+  ciPolicy?: EffectiveReviewCiConfig;
+  /** Optional controller capability for bounded same-repository PR CI repair. */
+  ciRepairWorkspaces?: PullRequestRepairWorkspaceManager;
 }
 
 export interface WorkOnResult {
@@ -129,8 +135,23 @@ async function prepareCleanPreBuilderExecution(
   const commands = verification.map((command) => ({ ...command, cwd: refreshed.path }));
   await dependencies.git.prepareWorkspaceDependencies(refreshed);
   await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after dependency preparation");
-  const baselineChecks = input.baselineChecks
-    ? [...input.baselineChecks]
+  // Baseline evidence is reusable only when every durable check carries the
+  // exact identity of the freshly frozen command plan.  planId includes the
+  // refreshed base SHA; policy and target checks prevent same-ID catalog drift.
+  const baselineMatchesFrozenPlan = input.baselineChecks !== undefined
+    && input.baselineChecks.length === commands.length
+    && commands.every((command, index) => {
+      const check = input.baselineChecks?.find((candidate) =>
+        candidate.commandId === command.id) ?? input.baselineChecks?.[index];
+      if (!check) return false;
+      return check.commandId === command.id
+        && check.planId === command.planId
+        && check.policyVersion === command.policyVersion
+        && JSON.stringify(check.commandTargets ?? []) === JSON.stringify(command.targets ?? [])
+        && check.command === [command.command, ...command.args].join(" ");
+    });
+  const baselineChecks = baselineMatchesFrozenPlan
+    ? [...input.baselineChecks!]
     : await dependencies.verifier.run(
       commands,
       input.signal,
@@ -724,6 +745,9 @@ export async function resumeBuildWorkOn(
         run,
         checkpoint: input.verificationCheckpoint,
         workspace: input.workspace,
+        packet: input.packet,
+        commands: frozenPacketCommands(input.packet, input.verification, input.workspace),
+        verifier: dependencies.verifier,
       }, {
         git: dependencies.git,
         artifacts: dependencies.artifacts,
@@ -1022,7 +1046,87 @@ async function continueBuildDelivery(
       );
       return { run, pullRequest };
     }
-    if (run.state === "merging") break;
+    if (run.state === "merging") {
+      // Approval is bound to one exact head. If configured, repair only the
+      // mutable same-repository delivery branch before completion. A changed
+      // head invalidates the verdict and must return through independent review.
+      const repairManager = dependencies.ciRepairWorkspaces ?? repairWorkspaceManagerFromGit(dependencies.git);
+      if (repairManager && dependencies.ciPolicy?.failureAction === "auto-fix") {
+        const repaired = await makePullRequestCiGreen({
+          repo: pullRequest.repo,
+          pullRequest: pullRequest.number,
+          policy: dependencies.ciPolicy,
+          ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
+          ...(input.provider !== undefined ? { provider: input.provider } : {}),
+          ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        }, {
+          runtime: dependencies.runtime,
+          host: dependencies.host,
+          workspaces: repairManager,
+          verifier: dependencies.verifier,
+          verificationCommands: (cwd, _baseRef) => frozenPacketCommands(
+            input.packet,
+            input.verification,
+            { ...input.workspace, path: cwd },
+          ),
+          ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+        });
+        const repairedHead = repaired.pullRequest.headSha;
+        if (repairedHead.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+          // Refresh the retained packet workspace to the exact pushed head;
+          // never run packet verification against the pre-repair checkout.
+          await dependencies.git.syncToRemoteHead(input.workspace, repairedHead);
+          await assertPristineWorkspace(input.workspace, repairedHead, dependencies, "after CI repair publication");
+          // The repair agent already ran bounded diagnostics; the controller
+          // reselects only the packet's frozen commands and proves the pushed
+          // commit, scope, blobs, symlink safety, and non-mutating checks.
+          const repairedWorkspace = { ...input.workspace };
+          const reverifyCommands = frozenPacketCommands(input.packet, input.verification, repairedWorkspace);
+          const repairVerification = await verifyCommittedRepair({
+            packet: input.packet,
+            workspace: repairedWorkspace,
+            expectedHeadSha: repairedHead,
+            parentHeadSha: verdict.payload.headSha,
+            commands: reverifyCommands,
+            verifier: dependencies.verifier,
+            ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          }, dependencies.git);
+          const evidence = buildResult.payload.acceptanceEvidence;
+          if (evidence.length !== input.packet.payload.acceptanceCriteria.length
+            || evidence.some((item, index) => item.status !== "passed"
+              || item.criterion !== input.packet.payload.acceptanceCriteria[index]
+              || item.criterionId !== `criterion-${index + 1}`)) {
+            throw new Error("CI repair cannot inherit incomplete or mismatched Build Packet criterion evidence");
+          }
+          const repairedBuildResult = createArtifact({
+            kind: "BuildResult",
+            runId: buildResult.runId,
+            subject: buildResult.subject,
+            producer: { role: "controller", runtime: "forgedock" },
+            payload: {
+              ...buildResult.payload,
+              headSha: repairedHead,
+              changedPaths: repairVerification.changedPaths,
+              checks: repairVerification.checks,
+              summary: `${buildResult.payload.summary} (reverified after bounded CI repair)`,
+            },
+          });
+          await dependencies.artifacts.append(repairedBuildResult);
+          buildResult = repairedBuildResult;
+          run = attachArtifact(run, "BuildResult", repairedBuildResult.id);
+          const blocked = transition(run, "BLOCK", { reason: `CI repair changed PR head from ${verdict.payload.headSha} to ${repairedHead}; fresh independent review required` });
+          await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+          const resumed = transition(blocked.state, "RESUME_REVIEW", { headSha: repairedHead, reason: "CI repair published a new exact PR head" });
+          await dependencies.runs.commit(blocked.state.version, resumed.state, resumed.record);
+          run = resumed.state;
+          pullRequest = repaired.pullRequest;
+          priorVerdict = undefined;
+          continue;
+        }
+      }
+      break;
+    }
 
     cycle++;
     if (cycle > (input.maxRemediationCycles ?? 2)) {
@@ -1067,6 +1171,7 @@ async function continueBuildDelivery(
   assertLease(dependencies);
   const completed = await completeWorkItem({
     run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
     ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
     ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1223,6 +1328,7 @@ export async function resumeWorkOn(
     }
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1348,6 +1454,7 @@ export async function resumeReviewWorkOn(
       if (run.state === "merging") {
         const completed = await completeWorkItem({
           run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
           ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
           ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1464,6 +1571,7 @@ export async function resumeReviewWorkOn(
 
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1594,6 +1702,7 @@ export async function resumeExpandedReviewWorkOn(
     pullRequest: { ...input.pullRequest, headSha: proof.buildResult.payload.headSha },
     verdict: reviewed.verdict,
     autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
     ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
     ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1764,6 +1873,7 @@ export async function resumePublicationWorkOn(
     }
     const completed = await completeWorkItem({
       run, pullRequest, verdict, autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1806,24 +1916,28 @@ export async function resumeCompletionWorkOn(
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
   dependencies = guardMutationBoundaries(dependencies);
-  if (input.run.state !== "merging") throw new Error(`Completion resume requires merging state, found ${input.run.state}`);
+  if (input.run.state !== "merging" && input.run.state !== "closing") throw new Error(`Completion resume requires merging or closing state, found ${input.run.state}`);
   if (input.verdict.payload.disposition !== "approve"
     || input.verdict.payload.headSha !== input.pullRequest.headSha) {
     throw new Error("Completion resume requires an approving verdict for the current pull request head");
   }
   let run = input.run;
+  let retainWorkspaceForRecovery = false;
   try {
-    const resumed = transition(run, "RESUME_COMPLETION", {
-      reason: `Resuming idempotent merge and issue closure at approved head ${input.verdict.payload.headSha}`,
-      headSha: input.verdict.payload.headSha,
-    });
-    await dependencies.runs.commit(run.version, resumed.state, resumed.record);
-    run = resumed.state;
+    if (run.state === "merging") {
+      const resumed = transition(run, "RESUME_COMPLETION", {
+        reason: `Resuming idempotent merge and issue closure at approved head ${input.verdict.payload.headSha}`,
+        headSha: input.verdict.payload.headSha,
+      });
+      await dependencies.runs.commit(run.version, resumed.state, resumed.record);
+      run = resumed.state;
+    }
     const completed = await completeWorkItem({
       run,
       pullRequest: input.pullRequest,
       verdict: input.verdict,
       autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1834,6 +1948,13 @@ export async function resumeCompletionWorkOn(
     if (input.signal?.aborted) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    if (error instanceof WorkflowExecutionError && error.recoverable) {
+      // completeWorkItem has already persisted the exact merged head as the
+      // closing checkpoint. Keep it resumable instead of converting an
+      // ambiguous external side effect into FAIL.
+      retainWorkspaceForRecovery = true;
+      throw error;
+    }
     if (run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
@@ -1842,7 +1963,8 @@ export async function resumeCompletionWorkOn(
     if (run.state === "failed") await appendFailureOutcome(run, reason, dependencies);
     throw error;
   } finally {
-    if (input.workspace && !input.signal?.aborted && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
+    if (input.workspace && !input.signal?.aborted && !retainWorkspaceForRecovery
+      && run.state !== "failed" && run.state !== "blocked" && run.state !== "cancelled") {
       try { await dependencies.git.remove(input.workspace); } catch { /* stale worktree reconciliation is operational */ }
     }
   }
@@ -2033,6 +2155,7 @@ export async function resumeConflictRecoveryWorkOn(
       pullRequest,
       verdict,
       autoMerge: input.autoMerge ?? false,
+    ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
       ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
       ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -2121,6 +2244,14 @@ function canonicalWorkspacePath(path: string): string {
   const windowsPath = normalized.match(/^([a-zA-Z]):\/(.*)$/);
   if (windowsPath) return `${windowsPath[1]!.toUpperCase()}:/${windowsPath[2]!}`.toLowerCase();
   return normalized;
+}
+
+function repairWorkspaceManagerFromGit(git: GitWorkspaceManager): PullRequestRepairWorkspaceManager | undefined {
+  const candidate = git as GitWorkspaceManager & Partial<PullRequestRepairWorkspaceManager>;
+  if (typeof candidate.createReview !== "function"
+    || typeof candidate.publishPullRequestRepair !== "function"
+    || typeof candidate.head !== "function") return undefined;
+  return candidate as PullRequestRepairWorkspaceManager;
 }
 
 function assertLease(dependencies: Pick<WorkOnDependencies, "leaseGuard">): void {

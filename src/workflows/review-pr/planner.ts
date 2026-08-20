@@ -45,7 +45,7 @@ export interface ReviewBudget {
   maxParallelSessions: number;
   /** Legacy review-plan field. New reviews have no assistant-turn cutoff. */
   maxTurnsPerExecutionGroup?: number;
-  /** Absolute read/search ceiling; each shard derives a smaller scope-sized budget from it. */
+  /** Legacy review-plan field retained so older plans remain decodable. */
   maxToolCallsPerExecutionGroup?: number;
   maxAttemptsPerExecutionGroup: 2;
   maxReviewerAttempts: number;
@@ -127,11 +127,6 @@ export const MAX_REVIEW_EXECUTION_GROUP_PATHS = 24;
 export const MAX_REVIEW_EXECUTION_GROUP_DIFF_CHARS = 60_000;
 const MAX_REVIEW_EXECUTION_GROUPS = 64;
 const MAX_PARALLEL_REVIEW_SESSIONS = 4;
-/** Read/search remains available to validate a coherent shard, never for an open-ended repository audit. */
-export const MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP = 48;
-const MIN_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP = 16;
-const REVIEW_TOOL_CALL_OVERHEAD = 12;
-const REVIEW_TOOL_CALLS_PER_EXTRA_CAPABILITY = 4;
 
 const SECURITY = /\b(?:auth(?:entication|orization)?|capabilit(?:y|ies)|crypt(?:o|ographic|ography)|signature|trust root|permission|privilege|secret|credential|token|replay|tamper|revocation)\b/i;
 const DATA = /\b(?:database|migration|sql|storage|persist(?:ed|ence|ent)?|canonical(?:ization| bytes?)?|schema registry|payload schema|encoding|portable bundle|manifest|digest format)\b/i;
@@ -280,7 +275,6 @@ export function planReviewPanel(input: {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
     maxParallelSessions: Math.max(1, Math.min(policy?.maxParallelSessions ?? MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions)),
-    maxToolCallsPerExecutionGroup: MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP,
     maxAttemptsPerExecutionGroup: 2,
     maxReviewerAttempts,
     maxScopeAdjudicationAttempts,
@@ -325,16 +319,6 @@ export function planReviewPanel(input: {
     ...identity,
   };
   return deepFreeze(plan);
-}
-
-/** Derive a concrete evidence allowance entirely from frozen plan data. */
-export function reviewerToolCallBudget(group: ReviewExecutionGroup, plan: ReviewPlan): number {
-  const ceiling = plan.budget.maxToolCallsPerExecutionGroup;
-  if (ceiling === undefined) return MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP;
-  const requested = REVIEW_TOOL_CALL_OVERHEAD
-    + group.scope.length
-    + Math.max(0, group.capabilities.length - 1) * REVIEW_TOOL_CALLS_PER_EXTRA_CAPABILITY;
-  return Math.min(ceiling, Math.max(MIN_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, requested));
 }
 
 export function canonicalReviewDigest(value: unknown): string {
@@ -401,9 +385,11 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     || budget.maxParallelSessions! < 1
     || budget.maxParallelSessions! > budget.maxLogicalReviewerSessions!
     || (budget.maxTurnsPerExecutionGroup !== undefined
-      && (budget.maxTurnsPerExecutionGroup < 1 || budget.maxTurnsPerExecutionGroup > 24))
+      && (!Number.isSafeInteger(budget.maxTurnsPerExecutionGroup)
+        || budget.maxTurnsPerExecutionGroup < 1 || budget.maxTurnsPerExecutionGroup > 24))
     || (budget.maxToolCallsPerExecutionGroup !== undefined
-      && (budget.maxToolCallsPerExecutionGroup < 1 || budget.maxToolCallsPerExecutionGroup > 64))
+      && (!Number.isSafeInteger(budget.maxToolCallsPerExecutionGroup)
+        || budget.maxToolCallsPerExecutionGroup < 1 || budget.maxToolCallsPerExecutionGroup > 64))
     || budget.maxAttemptsPerExecutionGroup !== 2
     || budget.maxReviewerAttempts! < budget.maxLogicalReviewerSessions!
     || budget.maxReviewerAttempts! > budget.maxLogicalReviewerSessions! * budget.maxAttemptsPerExecutionGroup

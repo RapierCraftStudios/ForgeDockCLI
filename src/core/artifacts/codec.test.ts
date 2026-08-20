@@ -101,6 +101,7 @@ describe("artifact codec", () => {
       producer: { role: "controller", runtime: "forgedock" },
       payload: {
         headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness", "security"], checks: [],
+        warnings: ["GitHub reports no required checks; advisory review only."],
         reviewPlan: {
           riskTier: "high", specialistBudget: 3,
           selected: [
@@ -117,6 +118,8 @@ describe("artifact codec", () => {
       },
     });
     const comment = renderArtifactComment(verdict);
+    assert.match(comment, /### Warnings/);
+    assert.match(comment, /advisory review only/);
     assert.match(comment, /Review plan/);
     assert.match(comment, /security.*score 120/);
     assert.match(comment, /frontend.*below-threshold/);

@@ -89,12 +89,21 @@ export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints 
   };
 }
 
-/** Derive one deterministic read/write authority from a frozen Build Packet. */
-export function scopeManifestForBuildPacket(expectedPaths: readonly string[]): ScopeManifest {
+/** Derive one deterministic read/write authority from a frozen Build Packet.
+ * Evidence paths are additive read authority only; they never become writable paths. */
+export function scopeManifestForBuildPacket(
+  expectedPaths: readonly string[],
+  evidencePaths: readonly string[] = [],
+): ScopeManifest {
   const writePaths = canonicalizeConcreteScopePaths(expectedPaths);
+  const readOnlyPaths = canonicalizeConcreteScopePaths(evidencePaths);
   return scopeManifestFor("build-packet", {
     affectedFiles: writePaths,
-    metadataRoots: [...STANDARD_SCOPE_METADATA_ROOTS, ...scopeDiscoveryRoots(writePaths)],
+    metadataRoots: [
+      ...STANDARD_SCOPE_METADATA_ROOTS,
+      ...scopeDiscoveryRoots(writePaths),
+      ...readOnlyPaths,
+    ],
     writePaths,
   });
 }

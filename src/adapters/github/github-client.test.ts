@@ -370,6 +370,23 @@ describe("GitHub pull request admission", () => {
     assert.equal(mergeCommands, 0);
   });
 
+  it("allows exact github-none only with explicit if-present authorization", async () => {
+    let mergeCommands = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")) return JSON.stringify(pullRequestProjection(186));
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([]);
+      if (args[0] === "api" && args[1]?.includes("/check-runs")) return JSON.stringify([{ check_runs: [] }]);
+      if (args[0] === "api" && args[1]?.includes("/status?")) return JSON.stringify({ sha: headSha, statuses: [] });
+      if (args[0] === "pr" && args[1] === "merge") { mergeCommands += 1; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await assert.rejects(client.mergePullRequest("a/b", 186, headSha, "staging"), /no required checks/);
+    await client.mergePullRequest("a/b", 186, headSha, "staging", { requiredChecksMode: "if-present" });
+    assert.equal(mergeCommands, 1);
+  });
+
   it("accepts an exact merged state when the merge command reports failure after landing", async () => {
     let state: "OPEN" | "MERGED" = "OPEN";
     const client = new GitHubClient();
@@ -449,7 +466,71 @@ describe("GitHub canonical marker admission", () => {
       /canonical idempotency marker/,
     );
   });
+
+  it("reconciles a POST timeout after GitHub materializes the marker", async () => {
+    const marker = "<!-- FORGEDOCK:POST-TIMEOUT -->";
+    const comments: Array<{ body: string }> = [];
+    let posts = 0;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "runGh", { value: async (args: string[], input?: string) => {
+      if (args[0] === "api" && args[1]?.includes("/comments") && args.includes("--method") === false) {
+        return JSON.stringify([comments]);
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments") && args.includes("POST")) {
+        posts += 1;
+        comments.push({ body: (JSON.parse(input ?? "{}") as { body: string }).body });
+        throw new Error("TLS handshake timeout after materialization");
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    await client.publishIssueComment({ repo: "a/b", issue: 2, marker, body: `Update\n\n${marker}` });
+    assert.equal(posts, 1);
+    assert.equal(comments.length, 1);
+  });
+
+  it("retries a TLS handshake timeout while listing comments", async () => {
+    const marker = "<!-- FORGEDOCK:LIST-TIMEOUT -->";
+    let reads = 0;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "runGh", { value: async (args: string[]) => {
+      if (args[0] === "api" && args[1]?.includes("/comments")) {
+        reads += 1;
+        if (reads <= 2) throw new Error("TLS handshake timeout");
+        return JSON.stringify([[{ body: marker, created_at: "2026-08-20T00:00:00Z", user: { login: "bot" } }]]);
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    await client.publishIssueComment({ repo: "a/b", issue: 2, marker, body: `Update\n\n${marker}` });
+    assert.equal(reads, 3);
+  });
+
+  it("reconciles a close timeout after the issue becomes CLOSED", async () => {
+    const marker = "<!-- FORGEDOCK:CLOSE repo=a/b issue=2 -->";
+    let closed = false;
+    let closes = 0;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    Object.defineProperty(client, "runGh", { value: async (args: string[]) => {
+      if (args[0] === "api" && args[1]?.includes("/comments")) {
+        return JSON.stringify([[{ body: marker, created_at: "2026-08-20T00:00:00Z", user: { login: "bot" } }]]);
+      }
+      if (args[0] === "issue" && args[1] === "view") {
+        return JSON.stringify({ number: 2, title: "Issue", body: "", url: "https://github.test/a/b/issues/2", state: closed ? "CLOSED" : "OPEN", labels: [], milestone: null });
+      }
+      if (args[0] === "issue" && args[1] === "close") {
+        closes += 1;
+        closed = true;
+        throw new Error("HTTP 503 after close");
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    await client.closeIssue("a/b", 2, "Completed");
+    assert.equal(closes, 1);
+  });
 });
+
 
 describe("GitHub batch issue projection", () => {
   const batchBody = [
@@ -735,6 +816,7 @@ describe("GitHub review finding projection", () => {
     assert.notEqual(reviewFindingMarker("a/b", 57, firstRoot), reviewFindingMarker("a/b", 57, secondRoot));
 
     const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed" }> = [];
+    const closeComments: string[] = [];
     const closed: number[] = [];
     const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
     Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...pullRequest }) });
@@ -742,7 +824,11 @@ describe("GitHub review finding projection", () => {
       if (args[0] === "label" && args[1] === "create") return "";
       if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
       if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
-      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "api" && args[1]?.includes("/comments") && args.includes("POST")) {
+        closeComments.push(JSON.parse(body ?? "{}").body ?? "");
+        return "{}";
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return JSON.stringify([[...closeComments].map((comment) => ({ body: comment }))]);
       if (args[0] === "issue" && args[1] === "view") {
         const issue = issues.find((candidate) => candidate.number === Number(args[2]));
         if (!issue) throw new Error(`Unknown issue: ${args[2] ?? ""}`);
@@ -822,7 +908,7 @@ describe("GitHub review finding projection", () => {
         recurrenceComments.push(JSON.parse(body ?? "{}").body ?? "");
         return "{}";
       }
-      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return JSON.stringify([[...recurrenceComments].map((body) => ({ body }))]);
       if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
       if (args[0] === "issue" && args[1] === "edit" && args[2] === "88") {
         issue.title = args[args.indexOf("--title") + 1] ?? issue.title;
@@ -1512,8 +1598,8 @@ describe("GitHub remediation admission", () => {
 });
 
 describe("GitHub issue closure", () => {
-  function closeClient(closeChangesState: boolean) {
-    let state: "OPEN" | "CLOSED" = "OPEN";
+  function closeClient(closeChangesState: boolean, initialState: "OPEN" | "CLOSED" = "OPEN") {
+    let state: "OPEN" | "CLOSED" = initialState;
     const comments: Array<{ body: string }> = [];
     let closeCalls = 0;
     const client = new GitHubClient();
@@ -1542,6 +1628,13 @@ describe("GitHub issue closure", () => {
     await fixture.client.closeIssue("a/b", 2, "Done");
     assert.equal(fixture.closeCalls(), 1);
     assert.equal(fixture.comments.length, 1);
+  });
+
+  it("does not publish a close marker for an already-closed issue", async () => {
+    const fixture = closeClient(true, "CLOSED");
+    await fixture.client.closeIssue("a/b", 2, "Done");
+    assert.equal(fixture.closeCalls(), 0);
+    assert.equal(fixture.comments.length, 0);
   });
 
   it("rejects a close command that leaves authoritative GitHub state open", async () => {

@@ -2,15 +2,16 @@
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
-import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
+import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot, type PullRequestRequiredChecksProvenance } from "../../core/ports/forge-host.js";
 import type { ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime } from "../../runtime/agent-runtime.js";
 import { parseDiffPaths } from "./planner.js";
 import { reviewPullRequest, type ReviewChecks } from "./review.js";
-import { assessPullRequestCi, assertPullRequestCiReady, type PullRequestCiAssessment } from "./ci-policy.js";
+import { assessPullRequestCi, assertPullRequestCiReady, hasKnownEmptyRequiredChecks, noRequiredChecksReviewWarning, type PullRequestCiAssessment } from "./ci-policy.js";
 interface StandaloneReviewCiInput { policy: EffectiveReviewCiConfig; featurePromotionTarget?: string; productionTarget?: string; }
+interface PullRequestCiRead { gate: PullRequestMergeGate; assessment: PullRequestCiAssessment; }
 
 export async function reviewExistingPullRequest(
   input: { repo: string; pr: number; issue?: number; provider?: string; model?: string; maxReviewSpecialists?: number; signal?: AbortSignal; ci?: StandaloneReviewCiInput },
@@ -21,11 +22,12 @@ export async function reviewExistingPullRequest(
     artifacts: ArtifactRepository;
     runs: RunRepository;
     onAgentEvent?: AgentEventSink;
+    onWarning?: (warning: string) => void;
   },
 ) {
   const pullRequest = await dependencies.host.getPullRequest(input.repo, input.pr);
   assertRequestedPullRequestIdentity(input.repo, input.pr, pullRequest, "initial read");
-  if (isDeploymentPullRequest(pullRequest)) {
+  if (isDeploymentPullRequest(pullRequest, input.ci)) {
     return reviewDeploymentPullRequest({ input, pullRequest }, dependencies);
   }
   const issue = input.issue ?? linkedIssue(pullRequest.body);
@@ -33,7 +35,11 @@ export async function reviewExistingPullRequest(
   if (pullRequest.state !== "OPEN") {
     throw new Error(`Cannot start review: PR #${pullRequest.number} must be OPEN at freeze, found ${pullRequest.state}`);
   }
-  await assertInitialPullRequestCi(pullRequest, input.ci, dependencies.host);
+  const initialCi = await assertInitialPullRequestCi(pullRequest, input.ci, dependencies.host);
+  const initialNoRequiredChecks = initialCi ? hasKnownEmptyRequiredChecks(initialCi.gate) : false;
+  const initialRequiredCheckEvidence = initialCi ? requiredCheckEvidenceSnapshot(initialCi.gate) : undefined;
+  const warnings = initialCi?.assessment.warnings ?? [];
+  reportReviewWarnings(warnings, dependencies.onWarning);
   const source = await dependencies.artifacts.list({ repo: input.repo, issue });
   const { intent, investigation, packet, buildResult } = reviewArtifactsForHead(
     source,
@@ -54,7 +60,8 @@ export async function reviewExistingPullRequest(
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
-      ...(input.ci !== undefined ? { beforeVerdictPublication: () => assertFinalPullRequestCi(pullRequest, input.ci, dependencies.host) } : {}),
+      ...(warnings.length ? { warnings } : {}),
+      ...(input.ci !== undefined ? { beforeVerdictPublication: () => assertFinalPullRequestCi(pullRequest, input.ci, dependencies.host, initialNoRequiredChecks, initialRequiredCheckEvidence) } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     }, {
       runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
@@ -78,9 +85,10 @@ async function reviewDeploymentPullRequest(
     artifacts: ArtifactRepository;
     runs: RunRepository;
     onAgentEvent?: AgentEventSink;
+    onWarning?: (warning: string) => void;
   },
 ) {
-  if (!isDeploymentPullRequest(input.pullRequest)) {
+  if (!isDeploymentPullRequest(input.pullRequest, input.input.ci)) {
     throw new Error("PR does not identify its original issue and is not a staging-to-main deployment; pass --issue <number>");
   }
   if (input.pullRequest.state !== "OPEN") {
@@ -90,7 +98,7 @@ async function reviewDeploymentPullRequest(
   // reviewer setup and bind every review artifact to the actual current head.
   const frozen = await dependencies.host.getPullRequest(input.input.repo, input.input.pr);
   assertRequestedPullRequestIdentity(input.input.repo, input.input.pr, frozen, "pre-review read");
-  if (!isDeploymentPullRequest(frozen)) {
+  if (!isDeploymentPullRequest(frozen, input.input.ci)) {
     throw new Error(`Cannot start deployment review: PR #${frozen.number} no longer routes staging to main`);
   }
   if (frozen.state !== "OPEN") {
@@ -100,11 +108,16 @@ async function reviewDeploymentPullRequest(
   const changedPaths = parseDiffPaths(diff);
   if (!changedPaths.length) throw new Error("Deployment PR diff does not contain any changed paths");
   const mergeGate = await readDeploymentMergeGate(frozen, dependencies.host);
-  if (input.input.ci) assertInitialAssessment(assessmentFor(frozen, mergeGate, input.input.ci), input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
+  const initialCi = input.input.ci ? assessmentFor(frozen, mergeGate, input.input.ci) : undefined;
+  if (initialCi && input.input.ci) assertInitialAssessment(initialCi, input.input.ci.policy.failureAction); else assertDeploymentMergeGate(mergeGate);
+  const initialNoRequiredChecks = hasKnownEmptyRequiredChecks(mergeGate);
+  const initialRequiredCheckEvidence = requiredCheckEvidenceSnapshot(mergeGate);
+  const warnings = initialCi?.warnings ?? (initialNoRequiredChecks ? [noRequiredChecksReviewWarning(frozen)] : []);
+  reportReviewWarnings(warnings, dependencies.onWarning);
   const checks = toReviewChecks(mergeGate);
   let run = createRun({ workflow: "review-pr", subject: { repo: frozen.repo, pr: frozen.number } });
   run = { ...run, headSha: frozen.headSha };
-  const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks });
+  const context = createDeploymentReviewArtifacts({ run, pullRequest: frozen, changedPaths, checks, warnings });
   // Deployment reviews have no single delivery issue, so their Intent,
   // Investigation, and Build Packet are deterministic reviewer context rather
   // than workflow artifacts. Keep them in the isolated reviewer input; do not
@@ -131,7 +144,8 @@ async function reviewDeploymentPullRequest(
         // capabilities into one independent group by default so the provider
         // is not asked to process several near-identical giant contexts at once.
         maxReviewSpecialists: input.input.maxReviewSpecialists ?? 1,
-        beforeVerdictPublication: () => assertFinalDeploymentPullRequestCi(frozen, input.input.ci, dependencies.host),
+        ...(warnings.length ? { warnings } : {}),
+        beforeVerdictPublication: () => assertFinalDeploymentPullRequestCi(frozen, input.input.ci, dependencies.host, initialNoRequiredChecks, initialRequiredCheckEvidence),
         ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
       }, {
         runtime: dependencies.runtime,
@@ -146,18 +160,54 @@ async function reviewDeploymentPullRequest(
   })();
   return result;
 }
-async function assertInitialPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (ci) assertInitialAssessment(await readPullRequestCi(pr, ci, host), ci.policy.failureAction); }
+async function assertInitialPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<PullRequestCiRead | undefined> { if (!ci) return undefined; const read = await readPullRequestCi(pr, ci, host); assertInitialAssessment(read.assessment, ci.policy.failureAction); return read; }
 function assertInitialAssessment(a: PullRequestCiAssessment, action: EffectiveReviewCiConfig["failureAction"]): void { if (!a.mergeable || a.failed.length) assertPullRequestCiReady(a, action, "before"); }
-async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { if (!ci) return; const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); assertPullRequestCiReady(await readPullRequestCi(current, ci, host), ci.policy.failureAction, "after"); }
-async function readPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput, host: ForgeHost): Promise<PullRequestCiAssessment> { if (!host.getPullRequestMergeGate) throw new Error("Standalone review CI policy requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return assessmentFor(pr, gate, ci); }
+interface RequiredCheckEvidenceSnapshot {
+  provenance?: PullRequestRequiredChecksProvenance;
+  headSha?: string;
+  names: readonly string[];
+  initiallyEmpty: boolean;
+}
+
+function requiredCheckEvidenceSnapshot(gate: PullRequestMergeGate): RequiredCheckEvidenceSnapshot {
+  return {
+    ...(gate.requiredChecksProvenance !== undefined ? { provenance: gate.requiredChecksProvenance } : {}),
+    ...(gate.requiredChecksHeadSha !== undefined ? { headSha: gate.requiredChecksHeadSha.toLowerCase() } : {}),
+    names: gate.requiredChecks.map((check) => check.name.trim().toLowerCase()),
+    initiallyEmpty: hasKnownEmptyRequiredChecks(gate),
+  };
+}
+
+async function assertFinalPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost, initiallyNoRequiredChecks: boolean, initialEvidence?: RequiredCheckEvidenceSnapshot): Promise<void> {
+  if (!ci) return;
+  const current = await host.getPullRequest(pr.repo, pr.number);
+  assertPullRequestHeadStable(pr, current);
+  const read = await readPullRequestCi(current, ci, host);
+  assertRequiredCheckEvidenceRetained(initialEvidence ?? { initiallyEmpty: initiallyNoRequiredChecks, names: [] }, read.gate);
+  assertPullRequestCiReady(read.assessment, ci.policy.failureAction, "after");
+}
+async function readPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput, host: ForgeHost): Promise<PullRequestCiRead> { if (!host.getPullRequestMergeGate) throw new Error("Standalone review CI policy requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return { gate, assessment: assessmentFor(pr, gate, ci) }; }
 async function readDeploymentMergeGate(pr: PullRequestSnapshot, host: ForgeHost): Promise<PullRequestMergeGate> { if (!host.getPullRequestMergeGate) throw new Error("Deployment review requires an authoritative merge-gate adapter"); const gate = await host.getPullRequestMergeGate(pr.repo, pr.number, pr.headSha, pr.baseBranch); assertDeploymentMergeGateAuthority(gate, pr); return gate; }
-async function assertFinalDeploymentPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost): Promise<void> { const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); const gate = await readDeploymentMergeGate(current, host); if (ci) assertPullRequestCiReady(assessmentFor(current, gate, ci), ci.policy.failureAction, "after"); else assertDeploymentMergeGate(gate); }
+async function assertFinalDeploymentPullRequestCi(pr: PullRequestSnapshot, ci: StandaloneReviewCiInput | undefined, host: ForgeHost, initiallyNoRequiredChecks: boolean, initialEvidence?: RequiredCheckEvidenceSnapshot): Promise<void> { const current = await host.getPullRequest(pr.repo, pr.number); assertPullRequestHeadStable(pr, current); const gate = await readDeploymentMergeGate(current, host); assertRequiredCheckEvidenceRetained(initialEvidence ?? { initiallyEmpty: initiallyNoRequiredChecks, names: [] }, gate); if (ci) assertPullRequestCiReady(assessmentFor(current, gate, ci), ci.policy.failureAction, "after"); else assertDeploymentMergeGate(gate); }
+function assertRequiredCheckEvidenceRetained(initialEvidence: RequiredCheckEvidenceSnapshot, gate: PullRequestMergeGate): void {
+  if (initialEvidence.initiallyEmpty) return;
+  const currentNames = new Set(gate.requiredChecks.map((check) => check.name.trim().toLowerCase()));
+  const missing = initialEvidence.names.filter((name) => !currentNames.has(name));
+  if (gate.requiredChecksProvenance !== initialEvidence.provenance
+    || gate.requiredChecksHeadSha?.toLowerCase() !== initialEvidence.headSha
+    || missing.length) {
+    throw new Error(`GitHub required-check evidence changed while reviewing PR #${gate.pullRequest}; missing or replaced checks: ${missing.join(", ") || "authority"}. Rerun /review-pr against the current evidence`);
+  }
+}
 function assessmentFor(pr: PullRequestSnapshot, gate: PullRequestMergeGate, ci: StandaloneReviewCiInput): PullRequestCiAssessment { return assessPullRequestCi(pr, gate, ci.policy, { ...(ci.featurePromotionTarget ? { featurePromotionTarget: ci.featurePromotionTarget } : {}), ...(ci.productionTarget ? { productionTarget: ci.productionTarget } : {}) }); }
+function reportReviewWarnings(warnings: readonly string[], onWarning: ((warning: string) => void) | undefined): void { for (const warning of warnings) { try { onWarning?.(warning); } catch { /* Warning projection must not change review authority. */ } } }
 
 function isDeploymentPullRequest(
   pullRequest: Pick<PullRequestSnapshot, "headBranch" | "baseBranch">,
+  ci?: StandaloneReviewCiInput,
 ): boolean {
-  return pullRequest.headBranch === "staging" && pullRequest.baseBranch === "main";
+  return pullRequest.headBranch === (ci?.featurePromotionTarget ?? "staging")
+    && pullRequest.baseBranch === (ci?.productionTarget ?? "main");
 }
 
 function assertDeploymentMergeGateAuthority(gate: PullRequestMergeGate, pullRequest: PullRequestSnapshot): void {
@@ -170,14 +220,23 @@ function assertDeploymentMergeGateAuthority(gate: PullRequestMergeGate, pullRequ
       + `, received ${gate.repo}#${gate.pullRequest} ${gate.headSha} -> ${gate.baseBranch}`,
     );
   }
+  const requiredChecksHeadMatches = gate.requiredChecksHeadSha?.toLowerCase() === pullRequest.headSha.toLowerCase();
+  if (gate.requiredChecksProvenance === "github-none") {
+    if (requiredChecksHeadMatches && gate.requiredChecks.length === 0) return;
+    throw new Error(`Deployment merge-gate empty-check policy is malformed for ${pullRequest.headSha}`);
+  }
   if (gate.requiredChecksProvenance !== "github-required"
-    || gate.requiredChecksHeadSha?.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || !requiredChecksHeadMatches
     || gate.requiredChecks.length === 0) {
     throw new Error(`Deployment merge-gate checks are not immutably bound to ${pullRequest.headSha}`);
   }
 }
 
 function assertDeploymentMergeGate(gate: PullRequestMergeGate): void {
+  if (hasKnownEmptyRequiredChecks(gate)) {
+    if (pullRequestMergeability(gate) !== "mergeable") throw new Error(`Deployment PR #${gate.pullRequest} is not currently mergeable`);
+    return;
+  }
   if (gate.requiredChecksProvenance !== "github-required"
     || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
     throw new Error(`Deployment PR #${gate.pullRequest} lacks immutable commit-bound required-check provenance`);
@@ -250,18 +309,19 @@ function createDeploymentReviewArtifacts(input: {
   pullRequest: PullRequestSnapshot;
   changedPaths: readonly string[];
   checks: ReviewChecks;
+  warnings: readonly string[];
 }): {
   intent: DurableArtifact<"Intent">;
   investigation: DurableArtifact<"Investigation">;
   packet: DurableArtifact<"BuildPacket">;
 } {
-  const { pullRequest, changedPaths, checks } = input;
+  const { pullRequest, changedPaths, checks, warnings } = input;
   const subject = input.run.subject;
   const producer = { role: "deployment-review", runtime: "forgedock" };
   const target = `${pullRequest.headBranch} → ${pullRequest.baseBranch}`;
   const checkSummary = checks.length
     ? checks.map((check) => `${check.command}=${check.status}${check.summary ? ` (${check.summary})` : ""}`).join(", ")
-    : "No required GitHub check runs were reported by the host.";
+    : warnings.join(" ") || "No required GitHub check runs were reported by the host.";
   const idPrefix = `deployment-review-${pullRequest.number}-${pullRequest.headSha.slice(0, 12)}`;
   const intent = createArtifact({
     kind: "Intent", runId: input.run.runId, subject, producer,

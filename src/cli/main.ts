@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, chmodSync, renameSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
-import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
+import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
@@ -67,25 +68,33 @@ import { ControllerObservationAdapter } from "../observability/adapters.js";
 import { createForgeDockObserver, type ForgeDockObserver } from "../observability/observer.js";
 import type { RunState } from "../core/state/machine.js";
 import { discoverLegacyVerificationCommands, discoverVerificationCommands, VERIFICATION_POLICY_VERSION } from "./verification-policy.js";
-import { parseOrchestrationIssueNumbers, parseResetIssueArgument, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
+import { parseOrchestrationIssueNumbers, parseResetDagArguments, parseResetIssueArguments, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
 import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
+import { dryRunPristineReset, applyPristineReset, writeResetManifest, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetSelection } from "../workflows/reset/pristine-reset.js";
+import { installGracefulSignalHandlers } from "./process-signals.js";
 
 const args = process.argv.slice(2);
+const gracefulSignals = ["work-on", "orchestrate", "review-pr", "promote"].includes(args[0] ?? "")
+  ? installGracefulSignalHandlers()
+  : undefined;
 const mode = colorMode();
 const agentEventStream = new AgentEventStreamWriter((text) => process.stdout.write(text), mode);
 let activeObserver: ForgeDockObserver | undefined;
 
 try {
-  await main(args);
+  await main(args, gracefulSignals?.signal);
 } catch (error: unknown) {
   agentEventStream.finish();
-  const message = error instanceof Error ? error.message : String(error);
+  const interruption = gracefulSignals?.interruption;
+  const message = interruption?.message ?? (error instanceof Error ? error.message : String(error));
   console.error(`${statusGlyph("failed", mode)} ${message}`);
-  process.exitCode = 1;
+  if (!interruption) process.exitCode = 1;
 } finally {
+  gracefulSignals?.dispose();
+  if (gracefulSignals?.interruption) process.exitCode = gracefulSignals.interruption.exitCode;
   try {
     persistControllerTaskTerminal(typeof process.exitCode === "number" ? process.exitCode : 0);
   } catch {
@@ -229,7 +238,7 @@ async function materializeCliDecomposition(input: {
   return { childIssues: children, items: childItems, serializationEdges };
 }
 
-async function main(argv: string[]): Promise<void> {
+async function main(argv: string[], signal?: AbortSignal): Promise<void> {
   const command = argv[0] ?? "help";
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
@@ -261,7 +270,7 @@ async function main(argv: string[]): Promise<void> {
   let controllerFailed = false;
   try {
     if (command === "work-on") {
-      await workOn(argv.slice(1));
+      await workOn(argv.slice(1), undefined, signal);
       return;
     }
     if (command === "status") {
@@ -269,11 +278,11 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     if (command === "review-pr") {
-      await reviewPr(argv.slice(1));
+      await reviewPr(argv.slice(1), signal);
       return;
     }
     if (command === "promote") {
-      await promote(argv.slice(1));
+      await promote(argv.slice(1), signal);
       return;
     }
     if (command === "reset") {
@@ -281,7 +290,7 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     if (command === "orchestrate") {
-      await orchestrate(argv.slice(1));
+      await orchestrate(argv.slice(1), signal);
       return;
     }
     throw new Error(`Unknown command: ${command}`);
@@ -426,6 +435,7 @@ async function workOn(
     /** Abort this nested work-on when its parent orchestration loses liveness. */
     signal?: AbortSignal;
   },
+  signal?: AbortSignal,
 ): Promise<void> {
   requirePiNodeVersion();
   const issueArg = parseWorkOnIssueArgument(argv);
@@ -468,6 +478,7 @@ async function workOn(
     ...(remediationChildrenOption !== undefined ? { maxRemediationChildren: Number(remediationChildrenOption) } : {}),
   });
   const maxReviewSpecialists = configuredMaxReviewSpecialists(configuredNext, recordConfigurationError);
+  const reviewCi = resolveReviewCiConfig(configuredNext);
 
   // Dispatch readiness is an entrypoint barrier, not a worker-phase check.
   // Keep it ahead of GitHub reads that can otherwise fail early and hide the
@@ -751,13 +762,17 @@ async function workOn(
   const leaseItem = `issue-${issue.number}`;
   const leaseOwner = `work-on-${process.pid}-${crypto.randomUUID()}`;
   const leaseController = new AbortController();
-  const forwardOrchestrationAbort = () => {
+  const forwardAbort = (source: AbortSignal | undefined, fallback: string): void => {
     if (!leaseController.signal.aborted) {
-      leaseController.abort(orchestration?.signal?.reason ?? new Error("Parent orchestration worker aborted"));
+      leaseController.abort(source?.reason ?? new Error(fallback));
     }
   };
+  const forwardOrchestrationAbort = () => forwardAbort(orchestration?.signal, "Parent orchestration worker aborted");
+  const forwardProcessAbort = () => forwardAbort(signal, "ForgeDock process interrupted");
   orchestration?.signal?.addEventListener("abort", forwardOrchestrationAbort, { once: true });
+  signal?.addEventListener("abort", forwardProcessAbort, { once: true });
   if (orchestration?.signal?.aborted) forwardOrchestrationAbort();
+  if (signal?.aborted) forwardProcessAbort();
   let leaseToken: string | undefined;
   let leaseGuard: import("../core/ports/lease.js").LeaseGuard | undefined;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
@@ -919,7 +934,7 @@ async function workOn(
             });
           },
           signal: leaseController.signal,
-        }, { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent });
+        }, { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, ciPolicy: reviewCi, leaseGuard, onAgentEvent });
         const suffix = result.awaitingHuman ? ` · awaiting human merge at ${result.pullRequest?.url ?? "PR"}` : "";
         const presentation = runStatePresentation(result.run.state);
         process.stdout.write(`${statusGlyph(result.awaitingHuman ? "active" : presentation.glyph, mode)} Resumed run ${result.run.runId} · ${result.awaitingHuman ? "awaiting human merge" : presentation.label}${suffix}\n`);
@@ -1142,7 +1157,7 @@ async function workOn(
         },
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, leaseGuard, onAgentEvent };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, ciPolicy: reviewCi, ciRepairWorkspaces: git, leaseGuard, onAgentEvent };
       const result = admission.checkpoint === "conflict-recovery"
         ? await resumeConflictRecoveryWorkOn({
           run,
@@ -1348,6 +1363,7 @@ async function workOn(
   } finally {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     orchestration?.signal?.removeEventListener("abort", forwardOrchestrationAbort);
+    signal?.removeEventListener("abort", forwardProcessAbort);
     if (leaseToken) { try { store.release(leaseItem, leaseToken); } catch { /* continuity failure deliberately retains the row */ } }
     await runtime.close();
     store.close();
@@ -1355,38 +1371,301 @@ async function workOn(
 }
 
 async function resetIssue(argv: string[]): Promise<void> {
-  const issueArg = parseResetIssueArgument(argv);
-  if (!issueArg || !/^\d+$/.test(issueArg)) throw new Error("Usage: forgedock-next reset <issue-number> [--repo owner/repo] [--reason text]");
+  const issueNumbers = parseResetIssueArguments(argv);
+  const dagIds = parseResetDagArguments(argv);
+  const applyDigest = option(argv, "--apply");
+  if ((!issueNumbers.length && !dagIds.length) && applyDigest === undefined) {
+    throw new Error("Usage: forgedock-next reset <issue>... [--dag <id>[,<id>...]] --dry-run [--repo owner/repo] [--manifest path] | --apply <manifest-digest> --manifest path");
+  }
+  const suppliedManifestPath = option(argv, "--manifest");
+  const repositoryOption = option(argv, "--repo");
+  const provisionalManifestPath = suppliedManifestPath ?? join(process.cwd(), ".forgedock", `reset-${issueNumbers.join("-") || dagIds.join("-") || "selection"}.manifest.json`);
+  const manifest = applyDigest === undefined ? undefined : JSON.parse(readFileSync(provisionalManifestPath, "utf8")) as PristineResetManifest;
   const github = new GitHubClient(process.cwd());
-  const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
-  const repository = new GitHubArtifactRepository(github);
-  const all = await repository.list({ repo: issue.repo, issue: issue.number });
-  const latestRun = latestDeliveryRunArtifacts(all);
-  if (!latestRun) {
-    await github.clearWorkflowLabels(issue.repo, issue.number);
-    process.stdout.write(`Reset ${issue.repo}#${issue.number}; no durable run existed.\n`);
-    return;
+  const repository = repositoryOption ?? manifest?.repo ?? (await github.getRepository()).repo;
+  const selectedIssues = manifest?.selection.issueNumbers ?? issueNumbers;
+  const selectedDags = manifest?.selection.dagIds ?? dagIds;
+  if (applyDigest !== undefined && manifest && repository.toLowerCase() !== manifest.repo.toLowerCase()) throw new Error("Reset manifest repository does not match --repo");
+  const statePath = join(process.cwd(), ".forgedock", "state.db");
+  const sqliteModule = await import("../adapters/sqlite/sqlite-repositories.js");
+  const store = existsSync(statePath)
+    ? new sqliteModule.SqliteRepositories(statePath, applyDigest === undefined ? { readOnly: true } : {})
+    : undefined;
+  const observationPath = join(process.cwd(), ".forgedock", "observations.db");
+  const observationModule = await import("../observability/sqlite-store.js");
+  const observations = existsSync(observationPath) ? new observationModule.SqliteObservationStore(observationPath, { readOnly: applyDigest === undefined }) : undefined;
+  const selection: ResetSelection = { repo: repository, issueNumbers: selectedIssues, dagIds: selectedDags };
+  const deps = createResetCliDependencies(github, store, observations);
+  try {
+    if (applyDigest !== undefined) {
+      if (argv.includes("--dry-run")) throw new Error("Reset --apply cannot be combined with --dry-run");
+      if (!manifest) throw new Error("Reset --apply requires --manifest <path>");
+      if (issueNumbers.length && issueNumbers.some((issue) => !manifest.selection.issueNumbers.includes(issue))) throw new Error("Reset manifest does not select every requested issue");
+      if (dagIds.length && dagIds.some((dag) => !manifest.selection.dagIds.includes(dag))) throw new Error("Reset manifest does not select every requested DAG");
+      await applyPristineReset(manifest, applyDigest, deps, option(argv, "--reason") ?? "Approved pristine reset");
+      process.stdout.write(`Applied pristine reset ${manifest.digest} for ${manifest.repo}.\\n`);
+      return;
+    }
+    if (!argv.includes("--dry-run")) throw new Error("Reset is two-phase; use --dry-run to create a manifest, then --apply <manifest-digest> --manifest <path>");
+    const result = await dryRunPristineReset(selection, deps);
+    await writeResetManifest(provisionalManifestPath, result);
+    process.stdout.write(`${JSON.stringify({ manifest: provisionalManifestPath, digest: result.digest, selection: result.selection, actions: result.actions }, null, 2)}\\n`);
+  } finally {
+    observations?.close();
+    store?.close();
   }
-  const reason = option(argv, "--reason") ?? "User-requested pipeline reset before a clean rerun; prior comments remain durable audit history.";
-  const priorOutcome = latestArtifactOfKind(latestRun.artifacts, "Outcome");
-  if (priorOutcome?.payload.status !== "abandoned") {
-    await repository.append(createArtifact({
-      kind: "Outcome", runId: latestRun.runId, subject: { repo: issue.repo, issue: issue.number },
-      producer: { role: "controller", runtime: "forgedock" },
-      payload: { status: "abandoned", reason, childIssues: [] },
-    }));
-  }
-  const verdict = latestArtifactOfKind(latestRun.artifacts, "ReviewVerdict");
-  const buildResult = latestArtifactOfKind(latestRun.artifacts, "BuildResult");
-  const pr = verdict?.subject.pr
-    ? await github.getPullRequest(issue.repo, verdict.subject.pr)
-    : buildResult ? await github.findOpenPullRequest(issue.repo, buildResult.payload.branch) : undefined;
-  if (pr?.state === "OPEN") await github.closePullRequest(issue.repo, pr.number, reason);
-  await github.clearWorkflowLabels(issue.repo, issue.number);
-  process.stdout.write(`Reset ${issue.repo}#${issue.number}; run ${latestRun.runId} is abandoned and audit comments are retained.\n`);
 }
 
-async function promote(argv: string[]): Promise<void> {
+function createResetCliDependencies(github: GitHubClient, store: InstanceType<typeof import("../adapters/sqlite/sqlite-repositories.js").SqliteRepositories> | undefined, observations?: InstanceType<typeof import("../observability/sqlite-store.js").SqliteObservationStore>): ResetPlanDependencies {
+  const worktreeManager = new GitWorktreeManager(process.cwd());
+  return {
+    host: {
+      readIssue: async (repo, issue) => {
+        const value = await github.getIssue(issue, repo);
+        return { number: value.number, state: value.state, labels: value.labels, body: value.body };
+      },
+      listComments: async (repo, issue) => (await github.listIssueCommentSnapshots({ repo, issue })).flatMap((comment) => {
+        const artifacts = findArtifacts(comment.body);
+        const markerMatch = comment.body.match(/<!--\\s*FORGEDOCK:(?:REVIEWER|REVIEW-WAVE|TRAJECTORY|FIX_CI|FIX-CI)\\b[^>]*-->/i);
+        if (!comment.id || (!artifacts.length && !markerMatch)) return [];
+        const artifact = artifacts[0];
+        return [{ id: comment.id, issue, marker: artifact ? `artifact:${artifact.id}` : markerMatch![0], ...(artifact ? { runId: artifact.runId, artifactId: artifact.id } : {}), bodySha256: sha256Reset(comment.body), ...(comment.createdAt ? { occurredAt: comment.createdAt } : {}), body: comment.body, managed: true as const }];
+      }),
+      listPullRequestComments: async (repo, number) => (await github.listIssueCommentSnapshots({ repo, pr: number })).flatMap((comment) => {
+        const artifacts = findArtifacts(comment.body);
+        const markerMatch = comment.body.match(/<!--\\s*FORGEDOCK:(?:REVIEWER|REVIEW-WAVE|TRAJECTORY|FIX_CI|FIX-CI)\\b[^>]*-->/i);
+        if (!comment.id || (!artifacts.length && !markerMatch)) return [];
+        const artifact = artifacts[0];
+        return [{ id: comment.id, issue: number, pr: number, marker: artifact ? `artifact:${artifact.id}` : markerMatch![0], ...(artifact ? { runId: artifact.runId, artifactId: artifact.id } : {}), bodySha256: sha256Reset(comment.body), ...(comment.createdAt ? { occurredAt: comment.createdAt } : {}), body: comment.body, managed: true as const }];
+      }),
+      deleteComment: (repo, comment) => github.deleteIssueComment(repo, {
+        id: comment.id, issue: comment.issue, ...(comment.pr !== undefined ? { pr: comment.pr } : {}),
+        marker: comment.marker, bodySha256: comment.bodySha256,
+      }),
+      readLabels: async (repo, issue) => ({ current: (await github.getIssue(issue, repo)).labels ?? [], events: await github.listLabelEvents(repo, issue), restored: [] }),
+      restoreLabels: async (repo, issue, labels, expected) => {
+        await github.restoreWorkflowLabels(repo, issue, labels, expected);
+      },
+      readPullRequest: async (repo, number) => {
+        const pr = await github.getPullRequest(repo, number);
+        return { number: pr.number, state: pr.state, headSha: pr.headSha, headBranch: pr.headBranch, baseBranch: pr.baseBranch };
+      },
+      listPullRequests: async (target, authorization) => github.listPullRequests(target, authorization),
+      listManagedRefs: async (target, authorization) => github.listManagedRefs(target, authorization),
+      archiveSelectedEvidence: async (target, resetManifest) => {
+        const existing = existingResetArchive(`reset-${resetManifest.digest}.github.json`, "evidence");
+        if (existing) return [existing];
+        const issueEvidence = await Promise.all(resetManifest.issues.map(async (issue) => ({
+          issue: await github.getIssue(issue.number, target.repo),
+          labels: await github.listLabelEvents(target.repo, issue.number),
+          comments: await github.listIssueCommentSnapshots({ repo: target.repo, issue: issue.number }),
+        })));
+        const pullEvidence = await Promise.all(resetManifest.pullRequests.map(async (pr) => ({
+          pullRequest: await github.getPullRequest(target.repo, pr.number),
+          comments: await github.listIssueCommentSnapshots({ repo: target.repo, pr: pr.number }),
+        })));
+        return [writeResetArchive(`reset-${resetManifest.digest}.github.json`, {
+          schema: "forgedock.pristine-reset/github-evidence/v1", repo: target.repo,
+          selection: resetManifest.selection, issues: issueEvidence, pullRequests: pullEvidence,
+          refs: resetManifest.refs,
+        }, "evidence")];
+      },
+      closePullRequest: (repo, number, reason) => github.closePullRequest(repo, number, reason),
+      readRef: (repo, ref) => github.getBranchHead?.(repo, ref.replace(/^refs\/heads\//, "")),
+      deleteExactRef: (repo, ref, sha) => github.deleteExactRemoteRef(repo, ref, sha),
+    },
+    state: {
+      capture: async (target) => {
+        if (!store) return { runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [] };
+        const allRuns = store.listRuns(10_000);
+        const allDagRecords = await store.listOrchestrations(10_000);
+        const selectedDagRecords = allDagRecords.filter((dag) => target.dagIds.includes(dag.orchestrationId)
+          || (dag.repository.toLowerCase() === target.repo.toLowerCase() && dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))));
+        const dags = selectedDagRecords.map((dag) => ({ orchestrationId: dag.orchestrationId, repository: dag.repository, status: dag.status, updatedAt: dag.updatedAt, recordSha256: sha256Reset(JSON.stringify(dag)) }));
+        const dagIds = new Set(dags.map((dag) => dag.orchestrationId));
+        const dagRunIds = new Set(selectedDagRecords.flatMap((dag) => dag.nodes.flatMap((node) => [
+          ...node.childRunIds,
+          ...(node.attempts ?? []).flatMap((attempt) => attempt.runId ? [attempt.runId] : []),
+        ])));
+        const runs = allRuns.filter((run) => (run.subject.repo.toLowerCase() === target.repo.toLowerCase() && target.issueNumbers.includes(run.subject.issue ?? -1)) || dagRunIds.has(run.runId))
+          .map((run) => ({ runId: run.runId, version: run.version, state: run.state }));
+        const runIds = runs.map((run) => run.runId);
+        const selectedRunRecords = allRuns.filter((run) => runIds.includes(run.runId));
+        const selectedLocalArtifacts = (await Promise.all(selectedRunRecords.map((run) => store.list(run.subject)))).flat();
+        const authorization = {
+          pullRequestNumbers: [...new Set(selectedLocalArtifacts.map((artifact) => artifact.subject.pr).filter((number): number is number => number !== undefined))],
+          headBranches: [...new Set(selectedLocalArtifacts.flatMap((artifact) => artifact.kind === "BuildResult" ? [artifact.payload.branch] : []))],
+        };
+        const promotions = (await store.listPromotions(10_000)).filter((promotion) => promotion.repository.toLowerCase() === target.repo.toLowerCase()
+          && target.issueNumbers.some((issue) => promotion.sourceBranch.includes(`issue-${issue}`)))
+          .map((promotion) => ({ promotionId: promotion.promotionId, repository: promotion.repository, version: promotion.version, phase: promotion.phase, snapshotSha256: sha256Reset(JSON.stringify(promotion)) }));
+        const leaseIds = [...runIds, ...dags.map((dag) => `orchestration-execution:${dag.orchestrationId}`), ...target.dagIds.map((dag) => `orchestration-execution:${dag}`), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        const leaseSnapshots = store.listAllLeaseSnapshots().filter((lease) => leaseIds.includes(lease.itemId)
+          || target.dagIds.some((dag) => lease.itemId.startsWith(`orchestration:${dag}:`))
+          || runIds.some((runId) => lease.itemId.includes(runId)));
+        const taskIdentities = readResetTaskRecords(target, runIds).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
+        return {
+          runs, artifacts: store.listArtifactsForRuns(runIds),
+          tasks: taskIdentities,
+          observations: store.listTelemetryIdentitiesForRuns(runIds),
+          fences: store.listReviewFindingPublicationFenceSnapshots().filter((fence) => fence.repository?.toLowerCase() === target.repo.toLowerCase()
+            && (target.issueNumbers.includes(fence.pullRequest ?? -1) || target.dagIds.some((dag) => fence.fenceKey.includes(dag)))),
+          promotions, dags, leases: leaseSnapshots, archive: [], authorization,
+          observationEvents: observations ? observations.listResetEventsForRuns(runIds) : [],
+        };
+      },
+      purgeExactManifest: (manifest, now, options) => {
+        if (!store) throw new Error("Cannot apply a reset without a local state database");
+        return store.purgeExactManifest(manifest, now, options);
+      },
+      observationPurgeExactManifest: (manifest, options) => {
+        if (!observations) throw new Error("Cannot purge reset observations without an observation database");
+        return observations.purgeExactManifest(manifest, options);
+      },
+      archiveSnapshots: async (_target, manifest) => {
+        const archives: ResetArchiveIdentity[] = [archiveResetSnapshot(manifest)];
+        if (store) archives.push(...store.archiveResetDatabase(join(process.cwd(), ".forgedock", "reset-archives"), `reset-${manifest.digest}-state`));
+        if (observations) archives.push(...observations.archiveResetDatabase(join(process.cwd(), ".forgedock", "reset-archives"), `reset-${manifest.digest}-observations`));
+        archives.push(archiveResetTaskEvidence(manifest));
+        return archives;
+      },
+      observationVerifyPurged: async (manifest) => {
+        if (observations) observations.verifyResetPurged(manifest);
+      },
+      verifyPurged: async (manifest) => {
+        if (!store) return;
+        store.verifyResetPurged({
+          runs: manifest.runs.map((row) => row.runId), artifacts: manifest.artifacts.map((row) => row.artifactId),
+          orchestrations: manifest.dags.map((row) => row.orchestrationId), promotions: manifest.promotions.map((row) => row.promotionId),
+          telemetry: manifest.observations.map((row) => row.key), fences: manifest.fences.map((row) => row.fenceKey), leases: manifest.leases.map((row) => row.itemId),
+        });
+        const taskDirectory = join(process.cwd(), ".forgedock", "tasks");
+        for (const task of manifest.tasks) for (const suffix of [".json", ".log", ".stderr"]) {
+          if (existsSync(join(taskDirectory, `${task.taskId}${suffix}`))) throw new Error(`Reset purge postcondition failed; task file remains: ${task.taskId}${suffix}`);
+        }
+      },
+      purgeTaskFiles: async (tasks) => {
+        const directory = join(process.cwd(), ".forgedock", "tasks");
+        for (const task of tasks) {
+          const path = join(directory, `${task.taskId}.json`);
+          if (!existsSync(path)) continue;
+          const contents = readFileSync(path, "utf8");
+          if (sha256Reset(contents) !== task.snapshotSha256) throw new Error(`Reset task identity drift: ${task.taskId}`);
+          unlinkSync(path);
+          for (const suffix of [".log", ".stderr"]) {
+            const companion = join(directory, `${task.taskId}${suffix}`);
+            if (existsSync(companion)) unlinkSync(companion);
+          }
+        }
+      },
+      appendAbandonedEvidence: async (target, reason) => {
+        if (!store) throw new Error("Cannot append abandoned evidence without a local state database");
+        for (const run of store.listRuns(10_000).filter((candidate) => candidate.subject.repo.toLowerCase() === target.repo.toLowerCase() && target.issueNumbers.includes(candidate.subject.issue ?? -1))) {
+          const artifacts = await store.list(run.subject);
+          if (artifacts.some((artifact) => artifact.runId === run.runId && artifact.kind === "Outcome" && artifact.payload.status === "abandoned")) continue;
+          await store.append(createArtifact({
+            kind: "Outcome", runId: run.runId, subject: run.subject,
+            producer: { role: "controller", runtime: "forgedock" },
+            payload: { status: "abandoned", reason, childIssues: [] },
+          }));
+        }
+      },
+    },
+    workspaces: {
+      capture: async (target) => (await worktreeManager.listManagedResetWorktrees(target)).map((worktree) => ({ ...worktree })),
+      archiveDirty: async (worktree) => worktreeManager.archiveDirtyManaged(worktree),
+      removeExact: async (worktree) => worktreeManager.removeExactManaged(worktree),
+      assertAbsent: async (worktree) => worktreeManager.assertAbsent(worktree),
+    },
+    cancellation: {
+      fence: async (target, leaseIds = []) => {
+        if (!store) throw new Error("Reset apply requires a local state database to prove worker fencing");
+        const patterns = [...leaseIds, ...target.dagIds.flatMap((dag) => [`orchestration-execution:${dag}`, `orchestration:${dag}:`]), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        store.assertResetNoLiveLeasePatterns(patterns);
+      },
+      stopWorkers: async (target, leaseIds = []) => {
+        // Worker transports are process-scoped. After the fenced lease check,
+        // no live owner is permitted; stale workers cannot durably mutate and
+        // are reaped by the normal lease CAS during purge.
+        if (!store) throw new Error("Reset apply requires a local state database to stop workers safely");
+        const patterns = [...leaseIds, ...target.dagIds.flatMap((dag) => [`orchestration-execution:${dag}`, `orchestration:${dag}:`]), ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+        store.assertResetNoLiveLeasePatterns(patterns);
+        stopResetTaskProcesses(target, leaseIds);
+      },
+    },
+  };
+}
+
+function archiveResetSnapshot(manifest: PristineResetManifest): ResetArchiveIdentity {
+  return writeResetArchive(`reset-${manifest.digest}.json`, manifest, "evidence");
+}
+
+function existingResetArchive(name: string, kind: ResetArchiveIdentity["kind"]): ResetArchiveIdentity | undefined {
+  const path = join(process.cwd(), ".forgedock", "reset-archives", name);
+  if (!existsSync(path)) return undefined;
+  return { path, sha256: sha256Reset(readFileSync(path)), kind };
+}
+
+function writeResetArchive(name: string, value: unknown, kind: ResetArchiveIdentity["kind"]): ResetArchiveIdentity {
+  const directory = join(process.cwd(), ".forgedock", "reset-archives");
+  const path = join(directory, name);
+  const contents = `${JSON.stringify(value, null, 2)}\n`;
+  const digest = sha256Reset(contents);
+  if (existsSync(path)) {
+    const existing = readFileSync(path, "utf8");
+    if (sha256Reset(existing) !== digest) throw new Error(`Reset archive identity drift: ${path}`);
+  } else {
+    mkdirSync(directory, { recursive: true });
+    const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(temporary, contents, { mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+  }
+  return { path, sha256: digest, kind };
+}
+
+function archiveResetTaskEvidence(manifest: PristineResetManifest): ResetArchiveIdentity {
+  const existing = existingResetArchive(`reset-${manifest.digest}.tasks.json`, "tasks");
+  if (existing) return existing;
+  const directory = join(process.cwd(), ".forgedock", "tasks");
+  const taskFiles: Array<{ path: string; contents: string }> = [];
+  for (const task of manifest.tasks) {
+    for (const suffix of [".json", ".log", ".stderr"]) {
+      const path = join(directory, `${task.taskId}${suffix}`);
+      if (existsSync(path)) taskFiles.push({ path, contents: readFileSync(path, "utf8") });
+    }
+  }
+  return writeResetArchive(`reset-${manifest.digest}.tasks.json`, { schema: "forgedock.pristine-reset/tasks/v1", files: taskFiles }, "tasks");
+}
+
+function readResetTaskRecords(target: ResetSelection, runIds: readonly string[]): Array<{ id: string; pid?: number; status?: string; launchKey?: string; runId?: string; snapshotSha256: string }> {
+  const directory = join(process.cwd(), ".forgedock", "tasks");
+  if (!existsSync(directory)) return [];
+  const identities = [...runIds, ...target.dagIds, ...target.issueNumbers.map((issue) => `issue-${issue}`)];
+  return readdirSync(directory).filter((name) => name.endsWith(".json")).flatMap((name) => {
+    try {
+      const contents = readFileSync(join(directory, name), "utf8");
+      const value = JSON.parse(contents) as { id?: string; pid?: number; status?: string; launchKey?: string; runId?: string };
+      if (!value.id || (value.launchKey && !identities.some((identity) => value.launchKey!.includes(identity))) && (!value.runId || !runIds.includes(value.runId))) return [];
+      return [{ id: value.id, ...(value.pid !== undefined ? { pid: value.pid } : {}), ...(value.status !== undefined ? { status: value.status } : {}), ...(value.launchKey !== undefined ? { launchKey: value.launchKey } : {}), ...(value.runId !== undefined ? { runId: value.runId } : {}), snapshotSha256: sha256Reset(contents) }];
+    } catch { return []; }
+  });
+}
+
+function stopResetTaskProcesses(target: ResetSelection, runIds: readonly string[]): void {
+  for (const task of readResetTaskRecords(target, runIds)) {
+    if (!task.pid || task.pid === process.pid || !["running", "detached"].includes(task.status ?? "")) continue;
+    try { process.kill(task.pid, "SIGTERM"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+}
+
+function sha256Reset(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function promote(argv: string[], signal?: AbortSignal): Promise<void> {
   requirePiNodeVersion();
   const resumeId = option(argv, "--resume");
   const sourceOption = option(argv, "--from");
@@ -1405,6 +1684,7 @@ async function promote(argv: string[]): Promise<void> {
   if (cancel && (authorizeCreation || authorizeMerge)) throw new Error("--cancel cannot be combined with creation or merge authorization");
   const configured = readForgeDockConfig(process.cwd());
   const effective = resolveOrchestrationConfig(configured);
+  const reviewCi = resolveReviewCiConfig(configured);
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"));
   const resumeRecord = resumeId ? await store.loadPromotion(resumeId) : undefined;
@@ -1446,6 +1726,7 @@ async function promote(argv: string[]): Promise<void> {
       ...(targetBranch !== undefined ? { targetBranch } : {}),
       ...(effective.featurePromotionTarget !== undefined ? { configuredPromotionTarget: effective.featurePromotionTarget } : {}),
       ...(effective.productionTarget !== undefined ? { configuredProductionTarget: effective.productionTarget } : {}),
+      ciPolicy: reviewCi,
       cwd: process.cwd(),
       verification,
       ...(authorizeCreation ? { authorizeCreation: true } : {}),
@@ -1455,6 +1736,7 @@ async function promote(argv: string[]): Promise<void> {
       ...(model !== undefined ? { model } : {}),
       ...(cancel ? { cancel: true } : {}),
       ...(cancellationReason !== undefined ? { cancellationReason } : {}),
+      ...(signal !== undefined ? { signal } : {}),
     }, {
       host,
       promotions: store,
@@ -1505,7 +1787,7 @@ async function promote(argv: string[]): Promise<void> {
   }
 }
 
-async function reviewPr(argv: string[]): Promise<void> {
+async function reviewPr(argv: string[], signal?: AbortSignal): Promise<void> {
   requirePiNodeVersion();
   const prArg = parseReviewPullRequestArgument(argv);
   if (!prArg || !/^\d+$/.test(prArg)) throw new Error("Usage: forgedock-next review-pr <pr-number> [--repo owner/repo] [--issue number]");
@@ -1550,7 +1832,7 @@ async function reviewPr(argv: string[]): Promise<void> {
       role: "reviewer",
     });
     const workspaces = new GitWorktreeManager(process.cwd());
-    if (reviewCi.failureAction === "auto-fix") try { const fixed = await makePullRequestCiGreen({ repo, pullRequest: Number(prArg), policy: reviewCi, ...(orchestration.featurePromotionTarget ? { featurePromotionTarget: orchestration.featurePromotionTarget } : {}), ...(orchestration.productionTarget ? { productionTarget: orchestration.productionTarget } : {}), ...(provider ? { provider } : {}), ...(model ? { model } : {}) }, { runtime, host: github, workspaces, verifier: new ProcessVerificationRunner(), verificationCommands: discoverVerificationCommands, onAgentEvent: (event) => writeAgentEvent(event) }); if (fixed.attempts) process.stdout.write(`ForgeDock made PR CI green after ${fixed.attempts} repair attempt(s): ${fixed.fixes.join("; ")}\n`); } catch (error) { process.stderr.write(`ForgeDock could not safely auto-fix PR #${prArg}: ${error instanceof Error ? error.message : String(error)}\nPlease fix the listed PR CI/mechanical checks, push, then rerun /review-pr.\n`); process.exitCode = 2; return; }
+    if (reviewCi.failureAction === "auto-fix") try { const fixed = await makePullRequestCiGreen({ repo, pullRequest: Number(prArg), policy: reviewCi, ...(orchestration.featurePromotionTarget ? { featurePromotionTarget: orchestration.featurePromotionTarget } : {}), ...(orchestration.productionTarget ? { productionTarget: orchestration.productionTarget } : {}), ...(provider ? { provider } : {}), ...(model ? { model } : {}), ...(signal !== undefined ? { signal } : {}) }, { runtime, host: github, workspaces, verifier: new ProcessVerificationRunner(), verificationCommands: discoverVerificationCommands, onAgentEvent: (event) => writeAgentEvent(event) }); if (fixed.attempts) process.stdout.write(`ForgeDock made PR CI green after ${fixed.attempts} repair attempt(s): ${fixed.fixes.join("; ")}\n`); } catch (error) { process.stderr.write(`ForgeDock could not safely auto-fix PR #${prArg}: ${error instanceof Error ? error.message : String(error)}\nPlease fix the listed PR CI/mechanical checks, push, then rerun /review-pr.\n`); process.exitCode = 2; return; }
     let result: Awaited<ReturnType<typeof reviewExistingPullRequest>>;
     try { result = await reviewExistingPullRequest({
       repo, pr: Number(prArg),
@@ -1558,10 +1840,12 @@ async function reviewPr(argv: string[]): Promise<void> {
       ...(provider !== undefined ? { provider } : {}),
       ...(model !== undefined ? { model } : {}),
       ...(maxReviewSpecialists !== undefined ? { maxReviewSpecialists } : {}),
+      ...(signal !== undefined ? { signal } : {}),
       ci: { policy: reviewCi, ...(orchestration.featurePromotionTarget ? { featurePromotionTarget: orchestration.featurePromotionTarget } : {}), ...(orchestration.productionTarget ? { productionTarget: orchestration.productionTarget } : {}) },
     }, {
       runtime, host: github, workspaces, artifacts, runs,
       onAgentEvent: (event) => writeAgentEvent(event),
+      onWarning: (warning) => process.stderr.write(`ForgeDock warning: ${warning}\n`),
     }); } catch (error) { if (!(error instanceof PullRequestCiBlockedError)) throw error; process.stderr.write(`${error.message}\n`); process.exitCode = 2; return; }
     process.stdout.write(`\n${renderArtifactMarkdown(result.verdict)}\n\n`);
     const approved = result.verdict.payload.disposition === "approve";
@@ -1573,14 +1857,14 @@ async function reviewPr(argv: string[]): Promise<void> {
   }
 }
 
-async function orchestrate(argv: string[]): Promise<void> {
+async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> {
   requirePiNodeVersion();
   const issueNumbers = parseOrchestrationIssueNumbers(argv);
   const orchestrationResumeId = option(argv, "--resume");
   if (orchestrationResumeId !== undefined) {
     if (!orchestrationResumeId.trim()) throw new Error("orchestrate --resume requires a durable orchestration ID");
     if (issueNumbers.length) throw new Error("orchestrate --resume cannot be combined with a new issue selection");
-    await resumeCliOrchestration(argv, orchestrationResumeId);
+    await resumeCliOrchestration(argv, orchestrationResumeId, signal);
     return;
   }
   if (!issueNumbers.length) throw new Error("Usage: forgedock-next orchestrate <issue>... [--repo owner/repo] [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone TITLE|--no-milestone] [--scope-expansion scope-locked|recursive] [--max-remediation-cycles N] [--max-remediation-depth N] [--max-remediation-children N] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun] | forgedock-next orchestrate --resume <dag-id>");
@@ -1615,6 +1899,7 @@ async function orchestrate(argv: string[]): Promise<void> {
   if (remediationDepthValue !== undefined && !/^\d+$/.test(remediationDepthValue)) throw new Error("--max-remediation-depth must be a non-negative integer");
   if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);
+  const reviewCi = resolveReviewCiConfig(config);
   const dispatchMode = argv.includes("--confirm") || argv.includes("--auto") ? "authorized" : effective.dispatchMode;
   const dispatchAuthorized = !argv.includes("--dry-run") && (dispatchMode === "authorized" || dispatchMode === "auto");
   if (dispatchAuthorized) checkoutRoot = resolveCheckoutContext(launchCwd, targetRepository).checkoutRoot;
@@ -1874,6 +2159,7 @@ async function orchestrate(argv: string[]): Promise<void> {
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      ...(signal !== undefined ? { signal } : {}),
       transportCapacity: effective.maxParallel,
       maxDecompositionChildren: effective.maxRemediationChildren,
       maxDecompositionDepth: effective.maxRemediationDepth,
@@ -1891,6 +2177,7 @@ async function orchestrate(argv: string[]): Promise<void> {
       }),
       worker: async (item, controllerContext) => {
       const workerAbort = new AbortController();
+      const workerSignal = signal ? AbortSignal.any([workerAbort.signal, signal]) : workerAbort.signal;
       const lease = await acquireNodeLease(store, item.id, owner, 60_000, {
         binding: orchestrationNodeLeaseBinding(
           controllerContext.orchestrationId,
@@ -1900,7 +2187,7 @@ async function orchestrate(argv: string[]): Promise<void> {
         ),
         recovery: controllerContext.recovery,
         waitForLive: controllerContext.recovery !== "initial",
-        signal: workerAbort.signal,
+        signal: workerSignal,
       });
       if (!lease) throw new Error(`${item.id} already has an active ForgeDock lease`);
       const heartbeat = setInterval(() => {
@@ -1961,6 +2248,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             await workOn(resumeArgs, {
               promoteClaims: controllerContext.promoteClaims,
               recordRun: (runId) => controllerContext.recordTask({ runId }),
+              signal: workerSignal,
             });
           } catch (error) {
             const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
@@ -2012,7 +2300,7 @@ async function orchestrate(argv: string[]): Promise<void> {
             resolveVerificationCatalog: (baseSha) => discoverVerificationCommands(checkoutRoot, baseSha),
             autoMerge,
             ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-            signal: workerAbort.signal,
+            signal: workerSignal,
             scopeExpansion: parentRemediation ? "recursive" : effective.scopeExpansion,
             maxRemediationCycles: effective.maxRemediationCycles,
             maxRemediationDepth: parentRemediation?.maxRemediationDepth ?? effective.maxRemediationDepth,
@@ -2036,12 +2324,12 @@ async function orchestrate(argv: string[]): Promise<void> {
             ...(thinking !== undefined ? { thinking } : {}),
             ...planning,
           }, {
-            runtime, artifacts, runs, git, verifier, host: github, telemetry: store,
+            runtime, artifacts, runs, git, verifier, host: github, telemetry: store, ciPolicy: reviewCi,
             leaseGuard: store.guard(item.id, lease.token),
             onAgentEvent: (event) => writeAgentEvent(event, item.id),
           });
         } catch (error) {
-          if (workerAbort.signal.aborted || error instanceof LeaseContinuityError) {
+          if (workerSignal.aborted || error instanceof LeaseContinuityError) {
             workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
           }
@@ -2192,7 +2480,7 @@ async function orchestrate(argv: string[]): Promise<void> {
   }
 }
 
-async function resumeCliOrchestration(argv: string[], orchestrationId: string): Promise<void> {
+async function resumeCliOrchestration(argv: string[], orchestrationId: string, signal?: AbortSignal): Promise<void> {
   if (argv.includes("--rerun")) throw new Error("orchestrate --resume does not authorize a fresh semantic rerun; resume the durable checkpoints or create a new orchestration explicitly");
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   let configured: ReturnType<typeof readForgeDockConfig> = {};
@@ -2356,7 +2644,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         // The old controller may still have a live worker heartbeat even
         // though its orchestration lease expired. Wait for release/expiry
         // before relaunching, then read authoritative artifacts again.
-        await waitForNodeLease(store, item.id, { pollMs: 100 });
+        await waitForNodeLease(store, item.id, { pollMs: 100, ...(signal !== undefined ? { signal } : {}) });
         issueArtifacts = await artifacts.list(subject);
         reconciled = reconcileLatestRunArtifacts(issueArtifacts);
         const afterWaitClassification = reconcileAuthoritativeWorkerArtifacts({
@@ -2374,6 +2662,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      ...(signal !== undefined ? { signal } : {}),
       transportCapacity: record.maxParallel,
       maxDecompositionChildren: maxRemediationChildren,
       maxDecompositionDepth: maxRemediationDepth,
@@ -2464,6 +2753,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
         if (planningThinking) workerArgs.push("--planning-thinking", planningThinking);
         const workerLeaseItem = item.id;
         const workerAbort = new AbortController();
+        const workerSignal = signal ? AbortSignal.any([workerAbort.signal, signal]) : workerAbort.signal;
         const workerLease = await acquireNodeLease(store, workerLeaseItem, orchestrationWorkerOwner, 60_000, {
           binding: orchestrationNodeLeaseBinding(
             context.orchestrationId,
@@ -2473,7 +2763,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
           ),
           recovery: context.recovery,
           waitForLive: true,
-          signal: workerAbort.signal,
+          signal: workerSignal,
         });
         if (!workerLease) throw new Error(`${item.id} already has an active orchestration worker lease`);
         const heartbeat = setInterval(() => {
@@ -2493,10 +2783,10 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string): 
             recordRun: async (runId) => {
               await context.recordTask({ runId });
             },
-            signal: workerAbort.signal,
+            signal: workerSignal,
           });
         } catch (error) {
-          if (workerAbort.signal.aborted) {
+          if (workerSignal.aborted) {
             return { status: "suspended", error: "Orchestration worker lost liveness; worker aborted and dependents remain queued" };
           }
           if (error instanceof ClaimPromotionRecoveryError) {
@@ -2930,7 +3220,8 @@ function printHelp(): void {
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number] [--provider NAME] [--model NAME] [--thinking LEVEL]\n");
   process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");
-  process.stdout.write("  forgedock-next reset <issue> [--repo owner/repo] [--reason text]\n");
+  process.stdout.write("  forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--repo owner/repo] [--manifest path]\n");
+  process.stdout.write("  forgedock-next reset --apply <manifest-digest> --manifest path [--repo owner/repo] [--reason text]\n");
   process.stdout.write("  forgedock-next orchestrate <issues> [--repo owner/repo] [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun]\n");
   process.stdout.write("  forgedock-next orchestrate --resume <dag-id>\n");
   process.stdout.write("  forgedock-next status [--json] [--issue N --repo owner/repo | --orchestration DAG_ID | --promotions]\n\n");

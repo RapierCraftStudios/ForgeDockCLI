@@ -9,8 +9,8 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import type { BuilderSubmission } from "./build.js";
-import { recoverVerificationCheckpoint, uncoveredVerificationCommands, verifyAndCommit } from "./verify.js";
-
+import { recoverVerificationCheckpoint, uncoveredVerificationCommands, verifyAndCommit, verifyCommittedRepair } from "./verify.js";
+import { deriveEvidenceContract } from "./evidence-contract.js";
 const workspace: GitWorkspace = { path: "/tmp/worktree", branch: "forgedock/issue-1", baseRef: "main", baseSha: "0".repeat(40) };
 const submission: BuilderSubmission = {
   summary: "Implemented guard", changedPaths: ["src/a.ts"],
@@ -23,6 +23,7 @@ class FakeGit implements GitWorkspaceManager {
   commitCalls = 0;
   dependenciesPrepared = false;
   pushed = false;
+  lastRevisionBaseSha: string | undefined;
   constructor(
     readonly paths: string[],
     readonly revisionPaths: string[] = [],
@@ -30,7 +31,8 @@ class FakeGit implements GitWorkspaceManager {
   ) {}
   async create(): Promise<GitWorkspace> { return workspace; }
   async changedPaths(): Promise<string[]> { return this.committed ? [] : this.paths; }
-  async revisionChangedPaths(): Promise<string[]> {
+  async revisionChangedPaths(currentWorkspace: GitWorkspace): Promise<string[]> {
+    this.lastRevisionBaseSha = currentWorkspace.baseSha;
     return this.committed ? this.committedRevisionPaths : this.revisionPaths;
   }
   async syncToRemoteHead(): Promise<void> {}
@@ -75,7 +77,7 @@ function packet(run: RunState) {
   });
 }
 
-const command = { id: "test", command: "npm", args: ["test"], cwd: "/tmp/worktree", timeoutMs: 1000, required: true } as const;
+const command = { id: "test", command: "npm", args: ["test"], cwd: "/tmp/worktree", timeoutMs: 1000, required: true, policyVersion: "forgedock.verification/v2", planId: "plan-baseline" } as const;
 const passed: CheckResult = { command: "npm test", status: "passed", exitCode: 0, durationMs: 10, outputDigest: "b".repeat(64) };
 
 function linkDirectory(target: string, path: string): void {
@@ -83,6 +85,45 @@ function linkDirectory(target: string, path: string): void {
 }
 
 describe("verification and commit barrier", () => {
+  it("rejects a CI repair revision outside the frozen packet", async () => {
+    const run = await verifyingRun(new InMemoryRunRepository());
+    const git = new FakeGit([], ["src/a.ts", "src/out-of-packet.ts"], ["src/a.ts", "src/out-of-packet.ts"]);
+    git.committed = true;
+    await assert.rejects(
+      verifyCommittedRepair({ packet: packet(run), workspace, expectedHeadSha: "a".repeat(40), parentHeadSha: workspace.baseSha!, commands: [command], verifier: new FakeVerifier([passed]) }, git),
+      /outside the Build Packet/,
+    );
+  });
+
+  it("rejects a stale or unverified CI repair head", async () => {
+    const run = await verifyingRun(new InMemoryRunRepository());
+    const git = new FakeGit(["src/a.ts"], ["src/a.ts"]);
+    git.committed = true;
+    await assert.rejects(
+      verifyCommittedRepair({ packet: packet(run), workspace, expectedHeadSha: "a".repeat(40), parentHeadSha: "a".repeat(40), commands: [command], verifier: new FakeVerifier([passed]) }, git),
+      /no committed child revision/,
+    );
+  });
+
+  it("retains the delivery base when diffing a repaired head", async () => {
+    const run = await verifyingRun(new InMemoryRunRepository());
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-repair-base-"));
+    mkdirSync(join(directory, "src"));
+    writeFileSync(join(directory, "src", "a.ts"), "export const repaired = true;\n");
+    const deliveryWorkspace: GitWorkspace = { ...workspace, path: directory, baseSha: workspace.baseSha! };
+    const git = new FakeGit([], ["src/a.ts"], ["src/a.ts"]);
+    git.committed = true;
+    try {
+      await verifyCommittedRepair({
+        packet: packet(run), workspace: deliveryWorkspace, expectedHeadSha: "a".repeat(40),
+        parentHeadSha: workspace.baseSha!, commands: [command], verifier: new FakeVerifier([passed]),
+      }, git);
+      assert.equal(git.lastRevisionBaseSha, workspace.baseSha);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("commits only after required executable evidence passes", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
@@ -105,7 +146,7 @@ describe("verification and commit barrier", () => {
     assert.match(result.buildResult?.payload.acceptanceEvidence[0]?.evidence ?? "", /pipeline-probe.*Depends on #5/);
   });
 
-  it("reconstructs BuildResult from the exact retained commit without rerunning verification or commit", async () => {
+  it("reconstructs BuildResult from the exact retained commit after rerunning frozen verification", async () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-recovery-"));
     mkdirSync(join(directory, "src"), { recursive: true });
     writeFileSync(join(directory, "src", "a.ts"), "export const recovered = true;\n");
@@ -145,6 +186,8 @@ describe("verification and commit barrier", () => {
         run: recoveredRun,
         checkpoint,
         workspace: { ...workspace, path: directory },
+        commands: [{ ...command, cwd: directory }],
+        verifier: new FakeVerifier([{ ...passed, command: "npm test", commandId: "test", policyVersion: "forgedock.verification/v2", planId: "plan-baseline" }]),
       }, { git, artifacts: retainedArtifacts, runs: recoveredRuns });
 
       assert.equal(recovered.run.state, "publishing");
@@ -307,7 +350,7 @@ describe("verification and commit barrier", () => {
     }
   });
 
-  it("resolves criterion coverage by stable packet IDs rather than model wording", async () => {
+  it("requires exact criterion text even when stable packet IDs are present", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
@@ -321,8 +364,9 @@ describe("verification and commit barrier", () => {
       workspace,
       commands: [command],
     }, { verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
-    assert.equal(result.run.state, "publishing");
-    assert.equal(result.buildResult?.payload.acceptanceEvidence[0]?.criterion, "Preserves state");
+    assert.equal(result.run.state, "blocked");
+    assert.match(result.outcome?.payload.reason ?? "", /criterion-mismatch|criterion coverage is incomplete/);
+    assert.equal(result.buildResult, undefined);
   });
 
   it("blocks when raw committed blobs differ from the verified worktree content", async () => {
@@ -454,9 +498,9 @@ describe("verification and commit barrier", () => {
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
     const knownFailure: CheckResult = {
-      command: "npm test", status: "failed", exitCode: 1, durationMs: 12,
+      command: "npm test", commandId: "test", policyVersion: "forgedock.verification/v2", planId: "plan-baseline",
       outputDigest: "c".repeat(64), summary: "2 tests failed", failureSignatures: ["not ok - existing Windows test"],
-    };
+      status: "failed", exitCode: 1, durationMs: 12,    };
     const result = await verifyAndCommit({
       run, packet: packet(run), submission, workspace, commands: [command], baselineChecks: [knownFailure],
     }, {
@@ -705,15 +749,180 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(result.buildResult?.payload.changedPaths, ["src/a.ts"]);
   });
 
-  it("blocks paths outside the frozen Build Packet before commit", async () => {
+  it("accepts unchanged evidence-only paths but blocks their delivery modification", async () => {
+    const requirements = [{ kind: "command" as const, id: "semantic", criterionIds: ["criterion-1"], rationale: "targeted proof" }];
+    const evidencePaths = [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }];
+    const contract = deriveEvidenceContract({
+      acceptanceCriteria: ["Preserves state"], expectedPaths: ["src/a.ts"], evidencePaths,
+      verificationRequirements: requirements,
+      commands: [{ id: "semantic", evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] }],
+    }).contract;
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
-    const result = await verifyAndCommit({ run, packet: packet(run), submission, workspace, commands: [command] }, {
-      verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts", "unrelated.ts"]), artifacts, runs,
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, verificationRequirements: requirements, evidencePaths, evidenceContract: contract } };
+    const covered: BuilderSubmission = {
+      ...submission,
+      criterionCoverage: [{ criterionId: "criterion-1", criterion: "Preserves state", implementation: "Guard keeps prior state", anchors: { paths: ["package.json"], symbols: ["guard"], testIds: ["guard-test"], verificationCommandIds: ["semantic"] } }],
+    };
+    let verifierRuns = 0;
+    const semanticCommand = { ...command, id: "semantic", evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] };
+    const accepted = await verifyAndCommit({ run, packet: frozen, submission: covered, workspace, commands: [semanticCommand] }, {
+      verifier: { async run() { verifierRuns += 1; return [{ ...passed, commandId: "semantic" }]; } },
+      git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(accepted.run.state, "publishing");
+    assert.equal(verifierRuns, 1);
+    const blockedRuns = new InMemoryRunRepository();
+    const blockedArtifacts = new InMemoryArtifactRepository();
+    const blockedRun = await verifyingRun(blockedRuns);
+    let blockedVerifierRuns = 0;
+    const blocked = await verifyAndCommit({ run: blockedRun, packet: frozen, submission: { ...covered, changedPaths: ["src/a.ts", "package.json"] }, workspace, commands: [semanticCommand] }, {
+      verifier: { async run() { blockedVerifierRuns += 1; return [{ ...passed, commandId: "semantic" }]; } },
+      git: new FakeGit(["src/a.ts", "package.json"]), artifacts: blockedArtifacts, runs: blockedRuns,
+    });
+    assert.equal(blocked.run.state, "blocked");
+    assert.equal(blockedVerifierRuns, 0);
+    assert.equal(blocked.buildResult, undefined);
+    assert.equal(blockedArtifacts.artifacts.some((artifact) => artifact.kind === "BuildResult"), false);
+  });
+
+  it("collects contract diagnostics together and blocks before verifier execution", async () => {
+    const requirements = [
+      { kind: "command" as const, id: "missing-command", criterionIds: ["criterion-1"], rationale: "missing" },
+      { kind: "command" as const, id: "generic", criterionIds: ["criterion-2"], rationale: "generic" },
+    ];
+    const invariantMatrices = [{ id: "matrix", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "state", values: ["ok", "bad"] }], testId: "root-test" }];
+    const contract = deriveEvidenceContract({
+      acceptanceCriteria: ["one", "two"], expectedPaths: ["src/a.ts"], verificationRequirements: requirements,
+      invariantMatrices, commands: [{ id: "generic", evidenceCapability: "generic" as const }],
+    }).contract;
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: {
+      scope: ["x"], acceptanceCriteria: ["one", "two"], context: [], implementationPlan: ["x"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [], verificationRequirements: requirements, invariantMatrices, evidenceContract: contract,
+    } });
+    let verifierRuns = 0;
+    const result = await verifyAndCommit({
+      run, packet: frozen, submission: { summary: "x", changedPaths: ["src/a.ts"], criterionCoverage: [{ criterionId: "criterion-1", criterion: "one", implementation: "x", anchors: { paths: ["../escape"], symbols: ["x"], testIds: ["wrong-root"], verificationCommandIds: ["unknown"] } }], decisions: [], residualRisks: [] }, workspace,
+      commands: [{ ...command, id: "generic" }],
+    }, { verifier: { async run() { verifierRuns += 1; return [passed]; } }, git: new FakeGit(["src/a.ts"]), artifacts, runs });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(verifierRuns, 0);
+    assert.deepEqual(result.checks, []);
+    assert.equal(result.buildResult, undefined);
+    assert.equal(result.outcome?.payload.failureEvidence?.failureKind, "packet-contract");
+    const diagnostics = result.outcome?.payload.failureEvidence?.diagnostics ?? [];
+    assert.ok(diagnostics.length >= 5);
+    assert.ok(new Set(diagnostics.map(({ code }) => code)).size >= 4);
+  });
+
+  it("accepts invariant row test IDs and adds cases only after semantic pass", async () => {
+    const requirements = [{ kind: "command" as const, id: "invariant", criterionIds: ["criterion-1"], rationale: "matrix" }];
+    const invariantMatrices = [{ id: "matrix", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "state", values: ["ok", "bad"] }], testId: "root-test" }];
+    const contract = deriveEvidenceContract({ acceptanceCriteria: ["Preserves state"], expectedPaths: ["src/a.ts"], verificationRequirements: requirements, invariantMatrices, commands: [{ id: "invariant", evidenceCapability: "invariant" as const }] }).contract;
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, verificationRequirements: requirements, invariantMatrices, evidenceContract: contract } };
+    const invariantCommand = { ...command, id: "invariant", evidenceCapability: "invariant" as const };
+    const result = await verifyAndCommit({
+      run, packet: frozen, submission: { ...submission, criterionCoverage: [{ criterionId: "criterion-1", criterion: "Preserves state", implementation: "x", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["root-test"], verificationCommandIds: ["invariant"] } }] }, workspace,
+      commands: [invariantCommand],
+    }, { verifier: new FakeVerifier([{ ...passed, commandId: "invariant" }]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
+    assert.equal(result.run.state, "publishing");
+    const testIds = result.buildResult?.payload.acceptanceEvidence[0]?.anchors?.testIds ?? [];
+    assert.ok(testIds.includes("root-test"));
+    assert.ok(testIds.includes("root-test:case-001"));
+    assert.ok(testIds.includes("root-test:case-002"));
+  });
+  it("classifies valid-contract builder anchor defects as repairable semantic evidence", async () => {
+    const requirements = [{ kind: "command" as const, id: "semantic", criterionIds: ["criterion-1"], rationale: "targeted proof" }];
+    const semanticCommand = { ...command, id: "semantic", evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] };
+    const contract = deriveEvidenceContract({ acceptanceCriteria: ["Preserves state"], expectedPaths: ["src/a.ts"], verificationRequirements: requirements, commands: [{ id: "semantic", evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] }] }).contract;
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, verificationRequirements: requirements, evidenceContract: contract } };
+    let verifierRuns = 0;
+    const result = await verifyAndCommit({ run, packet: frozen, submission: { ...submission, criterionCoverage: [{ criterionId: "criterion-1", criterion: "Preserves state", implementation: "x" }] }, workspace, commands: [semanticCommand] }, {
+      verifier: { async run() { verifierRuns += 1; return [passed]; } }, git: new FakeGit(["src/a.ts"]), artifacts, runs,
     });
     assert.equal(result.run.state, "blocked");
-    assert.match(result.outcome?.payload.reason ?? "", /outside the Build Packet/);
-    assert.equal(result.buildResult, undefined);
+    assert.equal(verifierRuns, 0);
+    assert.equal(result.outcome?.payload.failureEvidence?.failureKind, "builder-semantic-evidence");
+    assert.deepEqual(result.checks, []);
   });
+
+  it("fails contract criteria when an optional generic command fails despite semantic success", async () => {
+    const requirements = [
+      { kind: "command" as const, id: "lint", criterionIds: ["criterion-1"], rationale: "style gate" },
+      { kind: "command" as const, id: "semantic", criterionIds: ["criterion-1"], rationale: "targeted proof" },
+    ];
+    const contract = deriveEvidenceContract({
+      acceptanceCriteria: ["Preserves state"], expectedPaths: ["src/a.ts"], verificationRequirements: requirements,
+      commands: [
+        { id: "lint", evidenceCapability: "generic" as const },
+        { id: "semantic", evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] },
+      ],
+    }).contract;
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, verificationRequirements: requirements, evidenceContract: contract } };
+    const result = await verifyAndCommit({
+      run, packet: frozen, workspace,
+      submission: { ...submission, criterionCoverage: [{ criterionId: "criterion-1", criterion: "Preserves state", implementation: "x", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-test"], verificationCommandIds: ["lint", "semantic"] } }] },
+      commands: [
+        { ...command, id: "lint", required: false, evidenceCapability: "generic" as const },
+        { ...command, id: "semantic", required: true, evidenceCapability: "targeted-test" as const, targets: ["dist/a.test.js"] },
+      ],
+    }, {
+      verifier: { async run() { return [
+        { ...passed, command: "lint", commandId: "lint", status: "failed" as const },
+        { ...passed, command: "semantic", commandId: "semantic", status: "passed" as const },
+      ]; } },
+      git: new FakeGit(["src/a.ts"]), artifacts, runs,
+    });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.buildResult, undefined);
+    assert.match(result.outcome?.payload.reason ?? "", /criterion-1.*lint/);
+    assert.equal(result.outcome?.payload.failureEvidence?.failureKind, "builder-semantic-evidence");
+  });
+
+  it("rejects ambiguous duplicate acceptance text in legacy coverage", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, acceptanceCriteria: ["same text", "same text"] } };
+    const result = await verifyAndCommit({
+      run, packet: frozen, workspace, commands: [command],
+      submission: { ...submission, criterionCoverage: [
+        { criterion: "same text", implementation: "first" },
+        { criterion: "same text", implementation: "second" },
+      ] },
+    }, { verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.buildResult, undefined);
+    assert.match(result.outcome?.payload.reason ?? "", /criterion-1|criterion-2|same text/);
+  });
+
+
+  it("permits gate-only criteria to remain prose-only", async () => {
+    const requirements = [{ kind: "controller-gate" as const, id: "staging-review", criterionIds: ["criterion-1"], rationale: "controller lifecycle" }];
+    const controllerGates = [{ id: "staging-review" as const, description: "Review staging" }];
+    const contract = deriveEvidenceContract({ acceptanceCriteria: ["Staging review"], expectedPaths: ["src/a.ts"], verificationRequirements: requirements, controllerGates, commands: [{ id: "generic", evidenceCapability: "generic" as const }] }).contract;
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = { ...packet(run), payload: { ...packet(run).payload, acceptanceCriteria: ["Staging review"], verificationRequirements: requirements, controllerGates, evidenceContract: contract } };
+    const result = await verifyAndCommit({
+      run, packet: frozen, submission: { summary: "reviewed", changedPaths: ["src/a.ts"], criterionCoverage: [{ criterionId: "criterion-1", criterion: "Staging review", implementation: "Controller gate recorded" }], decisions: [], residualRisks: [] }, workspace,
+      commands: [{ ...command, id: "generic", evidenceCapability: "generic" as const }],
+    }, { verifier: new FakeVerifier([{ ...passed, commandId: "generic" }]), git: new FakeGit(["src/a.ts"]), artifacts, runs });
+    assert.equal(result.run.state, "publishing");
+    assert.equal(result.buildResult?.payload.acceptanceEvidence[0]?.anchors, undefined);
+  });
+
 });

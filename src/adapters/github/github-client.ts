@@ -90,7 +90,12 @@ function isReadOnlyGhInvocation(args: readonly string[]): boolean {
 function isTransientGitHubReadFailure(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /HTTP (?:429|5\d{2})\b/i.test(message)
-    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|temporarily unavailable|no server is currently available)/i.test(message);
+    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|temporarily unavailable|no server is currently available)/i.test(message);
+}
+
+/** Transport failures may occur after a mutating GitHub request has committed. */
+function isTransientGitHubMutationFailure(error: unknown): boolean {
+  return isTransientGitHubReadFailure(error);
 }
 
 function waitForReadRetry(attempt: number): Promise<void> {
@@ -122,6 +127,8 @@ export function workflowLabelForState(state: RunStateName): string | undefined {
 }
 
 export interface GitHubIssueComment {
+  /** Stable GitHub comment id; absent only in legacy test doubles. */
+  id?: number;
   author: string;
   createdAt: string;
   body: string;
@@ -557,10 +564,11 @@ export class GitHubClient implements ForgeHost {
     const number = subject.pr ?? subject.issue;
     if (!number) throw new Error("GitHub artifacts require an issue or pull request number");
     const result = await this.gh(["api", `repos/${subject.repo}/issues/${number}/comments?per_page=100`, "--paginate", "--slurp"]);
-    const pages = JSON.parse(result) as Array<Array<{ body?: string; created_at?: string; html_url?: string; user?: { login?: string } }>>;
+    const pages = JSON.parse(result) as Array<Array<{ id?: number; body?: string; created_at?: string; html_url?: string; user?: { login?: string } }>>;
     return pages.flat().map((comment) => {
       const body = comment.body ?? "";
       return {
+        ...(Number.isSafeInteger(comment.id) ? { id: comment.id } : {}),
         author: comment.user?.login ?? "unknown",
         createdAt: comment.created_at ?? new Date(0).toISOString(),
         body,
@@ -568,6 +576,50 @@ export class GitHubClient implements ForgeHost {
         containsArtifact: findArtifacts(body).length > 0,
       };
     });
+  }
+
+  /** Delete only if the exact expected comment is still present and unchanged. */
+  async deleteIssueComment(repo: string, expected: { id: number; issue: number; pr?: number; marker: string; bodySha256: string }): Promise<void> {
+    if (!Number.isSafeInteger(expected.id) || expected.id < 1) throw new Error("GitHub comment id must be a positive integer");
+    let comments: GitHubIssueComment[];
+    try {
+      comments = await this.listIssueCommentSnapshots({ repo, ...(expected.pr !== undefined ? { pr: expected.pr } : { issue: expected.issue }) });
+    } catch (error) {
+      if (/404|not found/i.test(error instanceof Error ? error.message : String(error))) return;
+      throw error;
+    }
+    const current = comments.find((comment) => comment.id === expected.id);
+    if (!current) return;
+    const markerMatches = expected.marker.startsWith("artifact:")
+      ? findArtifacts(current.body).some((artifact) => `artifact:${artifact.id}` === expected.marker)
+      : hasCanonicalMarker(current.body, expected.marker);
+    if (sha256GitHubComment(current.body) !== expected.bodySha256 || !markerMatches) {
+      throw new Error(`GitHub comment ${expected.id} changed before deletion`);
+    }
+    await this.gh(["api", `repos/${repo}/issues/comments/${expected.id}`, "--method", "DELETE"]);
+  }
+
+  /** Delete one exact remote branch only when its current SHA still matches. */
+  async deleteExactRemoteRef(repo: string, ref: string, expectedSha: string): Promise<void> {
+    if (!/^refs\/heads\/(?!\/|.*\.\.)[A-Za-z0-9._\/-]+$/.test(ref)) throw new Error(`Unsafe remote ref: ${ref}`);
+    let current: string;
+    try {
+      current = await this.getBranchHead(repo, ref.slice("refs/heads/".length));
+    } catch (error) {
+      if (/HTTP 404|not found|Reference does not exist/i.test(error instanceof Error ? error.message : String(error))) return;
+      throw error;
+    }
+    if (current.toLowerCase() !== expectedSha.toLowerCase()) throw new Error(`Remote ref ${ref} changed before deletion`);
+    await this.gh(["api", `repos/${repo}/git/refs/heads/${ref.slice("refs/heads/".length)}`, "--method", "DELETE"]);
+  }
+
+  /** Return workflow labels in event order; caller performs replay. */
+  async listLabelEvents(repo: string, issue: number): Promise<Array<{ name: string; action: "labeled" | "unlabeled"; occurredAt: string; eventId: number }>> {
+    const result = await this.gh(["api", `repos/${repo}/issues/${issue}/events?per_page=100`, "--paginate", "--slurp"]);
+    const pages = JSON.parse(result) as Array<Array<{ id?: number; event?: string; created_at?: string; label?: { name?: string } }>>;
+    return pages.flat().flatMap((event) => event.event === "labeled" || event.event === "unlabeled"
+      ? [{ name: event.label?.name ?? "", action: event.event as "labeled" | "unlabeled", occurredAt: event.created_at ?? new Date(0).toISOString(), eventId: Number(event.id ?? 0) }]
+      : []).filter((event) => event.name && Number.isSafeInteger(event.eventId));
   }
 
   async postIssueComment(subject: Subject, body: string): Promise<void> {
@@ -597,17 +649,43 @@ export class GitHubClient implements ForgeHost {
       headSha: marker,
       marker: `comment:${marker}`,
     };
+
+    // Read before claiming, then read again after the claim. This makes a
+    // retry safe both when the previous caller never reached GitHub and when
+    // GitHub materialized the comment but the response was lost.
+    let comments = await this.listIssueComments(subject);
     const claim = await this.remediationAdmissions.claim(admissionKey);
-    const comments = await this.listIssueComments(subject);
     if (comments.some((comment) => hasCanonicalMarker(comment, marker))) {
       await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
       return;
     }
-    if (claim.status === "materialized") {
-      throw new RemediationMaterializationPendingError(marker);
+    comments = await this.listIssueComments(subject);
+    if (comments.some((comment) => hasCanonicalMarker(comment, marker))) {
+      await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
+      return;
     }
     if (claim.status !== "claimed") throw new RemediationMaterializationPendingError(marker);
-    await this.postIssueComment(subject, body);
+
+    try {
+      await this.postIssueComment(subject, body);
+    } catch (error) {
+      // A POST timeout is ambiguous. Never issue a second POST until an
+      // authoritative read proves the marker is absent.
+      if (!isTransientGitHubMutationFailure(error)) throw error;
+      comments = await this.listIssueComments(subject);
+      if (comments.some((comment) => hasCanonicalMarker(comment, marker))) {
+        await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
+        return;
+      }
+      throw error;
+    }
+
+    // Successful transport does not prove materialization; require the
+    // marker to be visible before completing the durable admission.
+    comments = await this.listIssueComments(subject);
+    if (!comments.some((comment) => hasCanonicalMarker(comment, marker))) {
+      throw new RemediationMaterializationPendingError(marker);
+    }
     await this.remediationAdmissions.complete(admissionKey, projectionAdmissionSnapshot(subject, marker));
   }
 
@@ -884,10 +962,11 @@ export class GitHubClient implements ForgeHost {
     const stale = reviewFindingReconciliationCandidates(await this.listAllIssues(input.repo), input);
     for (const issue of stale) {
       await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
-      await this.gh([
-        "issue", "close", String(issue.number), "--repo", input.repo, "--reason", "completed",
-        "--comment", `Superseded by the authoritative Review Verdict for PR #${input.pullRequest.number} at ${input.pullRequest.headSha}; this finding is no longer active.`,
-      ]);
+      await this.closeIssue(
+        input.repo,
+        issue.number,
+        `Superseded by the authoritative Review Verdict for PR #${input.pullRequest.number} at ${input.pullRequest.headSha}; this finding is no longer active.`,
+      );
     }
     return stale.map((issue) => issue.number);
   }
@@ -954,53 +1033,101 @@ export class GitHubClient implements ForgeHost {
 
     for (const child of ordered) {
       const marker = decompositionMarker(input.repo, input.parentIssue, child.title);
-      let issue = byMarker.get(marker);
-      if (!issue) {
-        const dependencyLines = child.dependsOn.length
-          ? child.dependsOn.map((dependency) => {
-            const resolved = materialized.get(dependency);
-            return resolved ? `- #${resolved.number} — ${resolved.title}` : `- ${dependency}`;
-          })
-          : ["- None"];
-        const body = [
-          "## Problem",
-          `Parent issue #${input.parentIssue} was decomposed because this outcome requires an independent implementation and review boundary.`,
-          "",
-          "## Intended outcome",
-          child.outcome,
-          "",
-          "## Affected files",
-          "To be confirmed by investigation.",
-          "",
-          "## Dependencies",
-          ...dependencyLines,
-          "",
-          "## Acceptance criteria",
-          `- [ ] ${child.outcome}`,
-          `- [ ] Delivery is independently verified and reviewed against parent #${input.parentIssue}.`,
-          "",
-          "## Parent",
-          `- #${input.parentIssue} — ${parent.title}`,
-          "",
-          `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`,
-        ].join("\n");
-        const args = ["issue", "create", "--repo", input.repo, "--title", child.title, "--body-file", "-"];
-        for (const label of inheritedLabels) args.push("--label", label);
-        if (inheritedMilestone) args.push("--milestone", inheritedMilestone.title);
-        const url = (await this.gh(args, body)).trim();
-        const number = Number(url.split("/").at(-1));
-        if (!Number.isSafeInteger(number) || number < 1) throw new Error(`GitHub did not return a child issue number for '${child.title}'`);
-        issue = await this.getIssue(number, input.repo);
-        byMarker.set(marker, issue);
-      } else {
-        issue = await this.getIssue(issue.number, input.repo);
-        if (inheritedMilestone && issue.milestone?.number !== inheritedMilestone.number) {
-          await this.gh([
-            "issue", "edit", String(issue.number), "--repo", input.repo,
-            "--milestone", inheritedMilestone.title,
-          ]);
-          issue = await this.getIssue(issue.number, input.repo);
+      const dependencyLines = child.dependsOn.length
+        ? child.dependsOn.map((dependency) => {
+          const resolved = materialized.get(dependency);
+          return resolved ? `- #${resolved.number} — ${resolved.title}` : `- ${dependency}`;
+        })
+        : ["- None"];
+      const body = [
+        "## Problem",
+        `Parent issue #${input.parentIssue} was decomposed because this outcome requires an independent implementation and review boundary.`,
+        "",
+        "## Intended outcome",
+        child.outcome,
+        "",
+        "## Affected files",
+        "To be confirmed by investigation.",
+        "",
+        "## Dependencies",
+        ...dependencyLines,
+        "",
+        "## Acceptance criteria",
+        `- [ ] ${child.outcome}`,
+        `- [ ] Delivery is independently verified and reviewed against parent #${input.parentIssue}.`,
+        "",
+        "## Parent",
+        `- #${input.parentIssue} — ${parent.title}`,
+        "",
+        `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`,
+      ].join("\n");
+      const admissionKey: RemediationAdmissionKey = {
+        repo: input.repo,
+        parentIssue: input.parentIssue,
+        parentPullRequest: 0,
+        headSha: marker,
+        marker: `decomposition:${marker}`,
+      };
+      const validate = (candidate: IssueSnapshot): IssueSnapshot => {
+        const markerLine = `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`;
+        const hasContractBody = canonicalBodyLines(candidate.body).some((line) => line.trim() && line !== markerLine);
+        if (candidate.title !== child.title
+          || (candidate.body.trim() !== "" && !hasCanonicalMarker(candidate.body, markerLine))
+          || (hasContractBody && !candidate.body.includes(`Parent issue #${input.parentIssue}`))) {
+          throw new Error(`Decomposition marker ${marker} resolved to an unexpected parent or child contract`);
         }
+        return candidate;
+      };
+      let issue = byMarker.get(marker);
+      const claim = await this.remediationAdmissions.claim(admissionKey);
+      if (claim.status === "materialized") {
+        issue = validate(await this.authoritativeIssueSnapshot(claim.snapshot));
+      } else if (issue) {
+        issue = validate(await this.authoritativeIssueSnapshot(issue));
+        await this.remediationAdmissions.complete(admissionKey, issue);
+      } else {
+        if (claim.status !== "claimed") {
+          const visible = (await this.listAllIssues(input.repo)).find((candidate) => candidate.state === "OPEN"
+            && hasCanonicalMarker(candidate.body, `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`));
+          if (!visible) throw new RemediationMaterializationPendingError(marker);
+          issue = validate(await this.authoritativeIssueSnapshot(visible));
+          await this.remediationAdmissions.complete(admissionKey, issue);
+        } else {
+          const args = ["issue", "create", "--repo", input.repo, "--title", child.title, "--body-file", "-"];
+          for (const label of inheritedLabels) args.push("--label", label);
+          if (inheritedMilestone) args.push("--milestone", inheritedMilestone.title);
+          let url: string;
+          try {
+            url = (await this.gh(args, body)).trim();
+          } catch (error) {
+            // A create response can be lost after GitHub materializes the
+            // issue. Reconcile the exact marker before allowing any retry.
+            const visible = (await this.listAllIssues(input.repo)).find((candidate) => candidate.state === "OPEN"
+              && hasCanonicalMarker(candidate.body, `<!-- FORGEDOCK:DECOMPOSITION ${marker} -->`));
+            if (visible) {
+              issue = validate(await this.authoritativeIssueSnapshot(visible));
+              await this.remediationAdmissions.complete(admissionKey, issue);
+            } else {
+              throw error;
+            }
+            url = "";
+          }
+          if (!issue) {
+            const number = Number(url.split("/").at(-1));
+            if (!Number.isSafeInteger(number) || number < 1) throw new Error(`GitHub did not return a child issue number for '${child.title}'`);
+            issue = validate(await this.getIssue(number, input.repo));
+            await this.remediationAdmissions.complete(admissionKey, issue);
+          }
+          byMarker.set(marker, issue);
+        }
+      }
+      if (!issue) throw new Error(`Decomposition child was not materialized: ${child.title}`);
+      if (inheritedMilestone && issue.milestone?.number !== inheritedMilestone.number) {
+        await this.gh([
+          "issue", "edit", String(issue.number), "--repo", input.repo,
+          "--milestone", inheritedMilestone.title,
+        ]);
+        issue = validate(await this.getIssue(issue.number, input.repo));
       }
       if (inheritedMilestone && issue.milestone?.number !== inheritedMilestone.number) {
         throw new Error(`Decomposition child #${issue.number} did not inherit milestone '${inheritedMilestone.title}' from parent #${input.parentIssue}`);
@@ -1319,7 +1446,6 @@ export class GitHubClient implements ForgeHost {
     const parseRequiredChecks = (result: string): PullRequestMergeGate["requiredChecks"] => {
       const parsed: unknown = JSON.parse(result);
       if (!Array.isArray(parsed)) throw new Error("GitHub required-checks response is not an array");
-      if (parsed.length === 0) throw new Error("GitHub reported no configured required checks");
       // A push run and a pull_request run can publish the same check name at
       // the same head SHA. Preserve every observation so a later success can
       // never erase a contradictory failure from the controller's merge gate.
@@ -1351,24 +1477,36 @@ export class GitHubClient implements ForgeHost {
         "--json", "name,state,link,completedAt,startedAt",
       ]);
       const requiredProjection = parseRequiredChecks(result);
-      const requiredNames = [...new Set(requiredProjection.map((check) => check.name))];
-      const [checkRuns, statuses] = await Promise.all([
-        this.gh([
-          "api", `repos/${repo}/commits/${expectedHeadSha}/check-runs?per_page=100`,
-          "--paginate", "--slurp",
-        ]),
-        this.gh(["api", `repos/${repo}/commits/${expectedHeadSha}/status?per_page=100`]),
-      ]);
-      requiredChecks = projectImmutableCommitChecks(checkRuns, statuses, expectedHeadSha, requiredNames);
-      requiredChecksProvenance = "github-required";
-      requiredChecksHeadSha = expectedHeadSha;
+      if (requiredProjection.length === 0) {
+        requiredChecks = [];
+        requiredChecksProvenance = "github-none";
+        requiredChecksHeadSha = expectedHeadSha;
+      } else {
+        const requiredNames = [...new Set(requiredProjection.map((check) => check.name))];
+        const [checkRuns, statuses] = await Promise.all([
+          this.gh([
+            "api", `repos/${repo}/commits/${expectedHeadSha}/check-runs?per_page=100`,
+            "--paginate", "--slurp",
+          ]),
+          this.gh(["api", `repos/${repo}/commits/${expectedHeadSha}/status?per_page=100`]),
+        ]);
+        requiredChecks = projectImmutableCommitChecks(checkRuns, statuses, expectedHeadSha, requiredNames);
+        requiredChecksProvenance = "github-required";
+        requiredChecksHeadSha = expectedHeadSha;
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
-      requiredChecks = [{
-        name: "required-checks-query",
-        state: "unavailable",
-        ...(detail ? { detailsUrl: detail } : {}),
-      }];
+      if (/no required checks reported/i.test(detail)) {
+        requiredChecks = [];
+        requiredChecksProvenance = "github-none";
+        requiredChecksHeadSha = expectedHeadSha;
+      } else {
+        requiredChecks = [{
+          name: "required-checks-query",
+          state: "unavailable",
+          ...(detail ? { detailsUrl: detail } : {}),
+        }];
+      }
     }
     // The checks query is PR-scoped. Re-read the PR after it so a head/base
     // race cannot attach current checks to a different reviewed revision.
@@ -1503,7 +1641,7 @@ export class GitHubClient implements ForgeHost {
     return read;
   }
 
-  async mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<void> {
+  async mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string, options?: { requiredChecksMode?: "require" | "if-present" }): Promise<void> {
     const current = await this.getPullRequest(repo, number);
     if (current.headSha !== expectedHeadSha) {
       throw new Error(`Pull request head changed: reviewed ${expectedHeadSha}, current ${current.headSha}`);
@@ -1516,7 +1654,13 @@ export class GitHubClient implements ForgeHost {
       throw new Error(`Pull request #${number} is not open (GitHub state: ${current.state})`);
     }
     const gate = await this.getPullRequestMergeGate(repo, number, expectedHeadSha, expectedBaseBranch, { refreshUnknown: true });
-    const failure = mergeGateFailure(gate);
+    if (gate.repo.toLowerCase() !== repo.toLowerCase()
+      || gate.pullRequest !== number
+      || gate.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()
+      || gate.baseBranch !== expectedBaseBranch) {
+      throw new Error(`Pull request merge-gate identity changed for #${number}; refusing merge`);
+    }
+    const failure = mergeGateFailure(gate, options?.requiredChecksMode ?? "require");
     if (failure) throw new Error(failure);
     try {
       await this.gh([
@@ -1561,11 +1705,38 @@ export class GitHubClient implements ForgeHost {
 
   async closeIssue(repo: string, number: number, reason: string): Promise<void> {
     const marker = `<!-- FORGEDOCK:CLOSE repo=${repo.toLowerCase()} issue=${number} -->`;
-    await this.publishIssueComment({ repo, issue: number, marker, body: `${reason}\n\n${marker}` });
+
+    // Prove the target before any audit comment is written. In particular, a
+    // retry for an already-closed issue must not create a fresh close marker.
     let issue = await this.getIssue(number, repo);
-    if (issue.state !== "CLOSED") {
+    if (issue.repo.toLowerCase() !== repo.toLowerCase() || issue.number !== number) {
+      throw new Error(`Issue close identified ${issue.repo}#${issue.number}, expected ${repo}#${number}`);
+    }
+    if (issue.state === "CLOSED") return;
+
+    await this.publishIssueComment({ repo, issue: number, marker, body: `${reason}\n\n${marker}` });
+
+    // The comment is a separate side effect. Revalidate identity and state
+    // before issuing the close mutation, including a concurrent close.
+    issue = await this.getIssue(number, repo);
+    if (issue.repo.toLowerCase() !== repo.toLowerCase() || issue.number !== number) {
+      throw new Error(`Issue close identified ${issue.repo}#${issue.number}, expected ${repo}#${number}`);
+    }
+    if (issue.state === "CLOSED") return;
+    try {
       await this.gh(["issue", "close", String(number), "--repo", repo]);
+    } catch (error) {
+      if (!isTransientGitHubMutationFailure(error)) throw error;
       issue = await this.getIssue(number, repo);
+      if (issue.repo.toLowerCase() !== repo.toLowerCase() || issue.number !== number) {
+        throw new Error(`Issue close identified ${issue.repo}#${issue.number}, expected ${repo}#${number}`);
+      }
+      if (issue.state === "CLOSED") return;
+      throw error;
+    }
+    issue = await this.getIssue(number, repo);
+    if (issue.repo.toLowerCase() !== repo.toLowerCase() || issue.number !== number) {
+      throw new Error(`Issue close identified ${issue.repo}#${issue.number}, expected ${repo}#${number}`);
     }
     if (issue.state !== "CLOSED") {
       throw new Error(`Issue #${number} close command completed but authoritative GitHub state is ${issue.state}`);
@@ -1637,6 +1808,37 @@ export class GitHubClient implements ForgeHost {
     return snapshot;
   }
 
+  async listManagedRefs(selection: { repo: string; issueNumbers: readonly number[]; dagIds: readonly string[] }, authorization?: { pullRequestNumbers: readonly number[]; headBranches: readonly string[] }): Promise<Array<{ name: string; kind: "remote"; sha: string; exactRef: string; managed: true }>> {
+    if (!authorization) return [];
+    const branches = new Set(authorization.headBranches.filter((branch) => /^forgedock[\/\-]/i.test(branch)));
+    if (!branches.size) return [];
+    const result = await this.gh(["api", `repos/${selection.repo}/git/matching-refs/heads/forgedock`, "--paginate", "--slurp"]);
+    const pages = JSON.parse(result) as Array<Array<{ ref?: string; object?: { sha?: string } }>>;
+    return pages.flat().flatMap((entry) => {
+      const exactRef = entry.ref;
+      const sha = entry.object?.sha;
+      const branch = exactRef?.replace(/^refs\/heads\//, "");
+      if (!exactRef || !sha || !branch || !branches.has(branch)) return [];
+      return [{ name: branch, kind: "remote" as const, sha, exactRef, managed: true as const }];
+    });
+  }
+
+  async listPullRequests(selection: { repo: string; issueNumbers: readonly number[]; dagIds: readonly string[] }, authorization?: { pullRequestNumbers: readonly number[]; headBranches: readonly string[] }): Promise<Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headSha: string; headBranch: string; baseBranch: string }>> {
+    if (!authorization) return [];
+    const numbers = new Set(authorization.pullRequestNumbers.filter((number) => Number.isSafeInteger(number) && number > 0));
+    const branches = new Set(authorization.headBranches);
+    for (const branch of branches) {
+      const listed = await this.gh(["pr", "list", "--repo", selection.repo, "--state", "all", "--head", branch, "--json", "number", "--limit", "20"]);
+      for (const value of JSON.parse(listed) as Array<{ number?: number }>) if (value.number && Number.isSafeInteger(value.number)) numbers.add(value.number);
+    }
+    const result = [] as Array<{ number: number; state: "OPEN" | "CLOSED" | "MERGED"; headSha: string; headBranch: string; baseBranch: string }>;
+    for (const number of [...numbers].sort((a, b) => a - b)) {
+      const pr = await this.getPullRequest(selection.repo, number);
+      if ((branches.size && !branches.has(pr.headBranch)) && !authorization.pullRequestNumbers.includes(number)) continue;
+      result.push({ number: pr.number, state: pr.state, headSha: pr.headSha, headBranch: pr.headBranch, baseBranch: pr.baseBranch });
+    }
+    return result;
+  }
   async findOpenPullRequest(repo: string, headBranch: string): Promise<PullRequestSnapshot | undefined> {
     const result = await this.gh([
       "pr", "list", "--repo", repo, "--state", "open", "--head", headBranch,
@@ -1652,9 +1854,49 @@ export class GitHubClient implements ForgeHost {
   }
 
   async closePullRequest(repo: string, number: number, reason: string): Promise<void> {
-    await this.gh(["pr", "close", String(number), "--repo", repo, "--comment", reason]);
+    let current = await this.getPullRequest(repo, number);
+    if (current.repo.toLowerCase() !== repo.toLowerCase() || current.number !== number) {
+      throw new Error(`Pull request close identified ${current.repo}#${current.number}, expected ${repo}#${number}`);
+    }
+    if (current.state === "CLOSED") return;
+    if (current.state === "MERGED") throw new Error(`Pull request #${number} is already MERGED; refusing to close it`);
+
+    const marker = `<!-- FORGEDOCK:PR-CLOSE repo=${repo.toLowerCase()} pr=${number} -->`;
+    await this.publishPullRequestComment({ repo, pullRequest: number, marker, body: `${reason}\n\n${marker}` });
+    current = await this.getPullRequest(repo, number);
+    if (current.repo.toLowerCase() !== repo.toLowerCase() || current.number !== number) {
+      throw new Error(`Pull request close identified ${current.repo}#${current.number}, expected ${repo}#${number}`);
+    }
+    if (current.state === "CLOSED") return;
+    if (current.state === "MERGED") throw new Error(`Pull request #${number} became MERGED; refusing to close it`);
+    try {
+      await this.gh(["pr", "close", String(number), "--repo", repo]);
+    } catch (error) {
+      if (!isTransientGitHubMutationFailure(error)) throw error;
+      current = await this.getPullRequest(repo, number);
+      if (current.state === "CLOSED") return;
+      if (current.state === "MERGED") throw new Error(`Pull request #${number} became MERGED; refusing to close it`);
+      throw error;
+    }
+    current = await this.getPullRequest(repo, number);
+    if (current.state !== "CLOSED") {
+      throw new Error(`Pull request #${number} close command completed but authoritative GitHub state is ${current.state}`);
+    }
   }
 
+  async restoreWorkflowLabels(repo: string, issue: number, labels: readonly string[], expected?: { current: readonly string[] }): Promise<void> {
+    if (expected) {
+      const current = (await this.getIssue(issue, repo)).labels ?? [];
+      const managed = (value: string) => /^(?:workflow(?::|$)|needs-human(?:$|:))/i.test(value);
+      const expectedManaged = new Set(expected.current.filter(managed));
+      const currentManaged = new Set(current.filter(managed));
+      if ([...expectedManaged].some((label) => !currentManaged.has(label)) || [...currentManaged].some((label) => !expectedManaged.has(label))) {
+        throw new Error(`GitHub labels changed before reset on #${issue}`);
+      }
+    }
+    await this.clearWorkflowLabels(repo, issue);
+    if (labels.length) await this.gh(["issue", "edit", String(issue), "--repo", repo, "--add-label", labels.join(",")]);
+  }
   async clearWorkflowLabels(repo: string, issue: number): Promise<void> {
     const labelResult = await this.gh(["issue", "view", String(issue), "--repo", repo, "--json", "labels"]);
     const current = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
@@ -2032,6 +2274,7 @@ function canonicalBodyLines(body: string): string[] {
   return canonical;
 }
 
+function sha256GitHubComment(body: string): string { return createHash("sha256").update(body, "utf8").digest("hex"); }
 function hasCanonicalMarker(body: string, marker: string): boolean {
   return marker.length > 0
     && !/[\r\n]/.test(marker)
@@ -2153,17 +2396,23 @@ function mergeCheckState(value: string | undefined): PullRequestMergeGate["requi
 }
 function githubActionsRunBelongsToRepo(value: string, repo: string): boolean { try { const url = new URL(value); const [owner, name] = repo.toLowerCase().split("/"); const parts = url.pathname.split("/").filter(Boolean).map((part) => part.toLowerCase()); return url.hostname.toLowerCase() === "github.com" && parts[0] === owner && parts[1] === name && parts[2] === "actions" && parts[3] === "runs" && /^\d+$/.test(parts[4] ?? ""); } catch { return false; } }
 
-function mergeGateFailure(gate: PullRequestMergeGate): string | undefined {
+function mergeGateFailure(gate: PullRequestMergeGate, requiredChecksMode: "require" | "if-present" = "require"): string | undefined {
   const mergeability = pullRequestMergeability(gate);
   if (mergeability === "conflicting") return `Pull request #${gate.pullRequest} is confirmed conflicting at ${gate.baseBranch} for reviewed ${gate.headSha}`;
   if (mergeability === "unknown") return `Pull request #${gate.pullRequest} mergeability is UNKNOWN at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
   if (mergeability === "unavailable") return `Pull request #${gate.pullRequest} mergeability query is unavailable at ${gate.baseBranch} for reviewed ${gate.headSha}${gate.mergeabilityReason ? ` (${gate.mergeabilityReason})` : ""}`;
+  if (gate.requiredChecksProvenance === "github-none") {
+    if (requiredChecksMode === "if-present"
+      && gate.requiredChecksHeadSha?.toLowerCase() === gate.headSha.toLowerCase()
+      && gate.requiredChecks.length === 0) return undefined;
+    return `Required GitHub checks are unavailable for PR #${gate.pullRequest}: GitHub reported no required checks for reviewed ${gate.headSha}`;
+  }
   if (gate.requiredChecksProvenance !== "github-required"
     || gate.requiredChecksHeadSha?.toLowerCase() !== gate.headSha.toLowerCase()) {
     return `Required GitHub checks are unavailable from immutable commit-bound --required provenance for PR #${gate.pullRequest}`;
   }
   if (gate.requiredChecks.length === 0) {
-    return `Required GitHub checks are unavailable for PR #${gate.pullRequest}: GitHub reported no configured required checks`;
+    return `Required GitHub checks are unavailable for PR #${gate.pullRequest}: GitHub reported no required checks for reviewed ${gate.headSha}`;
   }
   const failed = gate.requiredChecks.filter((check) => check.state !== "passed");
   if (failed.length) {
