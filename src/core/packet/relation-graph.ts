@@ -160,6 +160,14 @@ export function closeRelationGraph(graph: RelationGraph): PacketClosure {
   for (const edge of graph.edges) {
     if (!nodeById.has(edge.sourceId) || !nodeById.has(edge.targetId)) { diagnostics.push(`[dangling-edge] ${edge.id}`); continue; }
     const list = edgesBySource.get(edge.sourceId) ?? []; list.push(edge); edgesBySource.set(edge.sourceId, list);
+    // Coverage/generation facts are bidirectional relations for closure: a
+    // source seed authorizes its proven regression test/generated companion,
+    // while a test seed authorizes the implementation it covers.
+    if (edge.kind === "test-covers" || edge.kind === "generated-by") {
+      const reverse = edgesBySource.get(edge.targetId) ?? [];
+      reverse.push({ ...edge, sourceId: edge.targetId, targetId: edge.sourceId });
+      edgesBySource.set(edge.targetId, reverse);
+    }
   }
   const seedIds = graph.seeds.map((seed) => fileNodeId(seed.path));
   const seen = new Set(seedIds);
@@ -178,7 +186,7 @@ export function closeRelationGraph(graph: RelationGraph): PacketClosure {
   }
   if (frontier.length) diagnostics.push(`[graph-depth] relation closure exceeded maxDepth ${graph.limits.maxDepth}`);
   const reachable = [...seen].map((id) => nodeById.get(id)).filter((node): node is RelationNode => Boolean(node));
-  const writablePaths = reachable.filter((node) => node.kind === "file" || node.kind === "generated").map((node) => node.identity).sort();
+  const writablePaths = reachable.filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test").map((node) => node.identity).sort();
   const evidencePaths = reachable.filter((node) => node.kind === "test" || node.kind === "file" || node.kind === "generated").map((node) => node.identity).sort();
   const invariantIds = reachable.filter((node) => node.kind === "invariant").map((node) => node.identity).sort();
   const commandIds = reachable.filter((node) => node.kind === "command").map((node) => node.identity).sort();

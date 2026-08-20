@@ -355,7 +355,13 @@ async function materializePacketOutput(
   const declaredPaths = canonicalizeConcreteScopePaths(affectedFiles.filter(isConcreteScopePath));
   const investigatedPaths = canonicalizeConcreteScopePaths(investigationSurfaces.filter(isConcreteScopePath));
   const controllerPaths = canonicalizeConcreteScopePaths(controllerWriteHints.filter(isConcreteScopePath));
-  const closure = await closeExpectedWriteScope(output.expectedPaths, {
+  // Model expectedPaths are candidates only. When authoritative issue/controller
+  // seeds exist, derive the graph first and scope only its validated fixed point.
+  const graphCandidates = await deriveRelationGraphMetadata(output.expectedPaths, declaredPaths, controllerPaths, cwd, {}, undefined, baseSha);
+  const proposedPaths = graphCandidates.metadata?.writablePaths ?? output.expectedPaths;
+  const closure = graphCandidates.metadata
+    ? { expectedPaths: graphCandidates.metadata.writablePaths, diagnostics: [] as string[] }
+    : await closeExpectedWriteScope(proposedPaths, {
     issueWriteHints: declaredPaths,
     investigationWriteHints: enforceScopeClosure ? investigatedPaths : [],
     controllerWriteHints: controllerPaths,
@@ -374,6 +380,14 @@ async function materializePacketOutput(
   const expectedPaths = legacyUnhinted
     ? canonicalizeConcreteScopePaths(output.expectedPaths)
     : closure.expectedPaths;
+  if (catalog) {
+    const modelTargeted = catalog.commands.filter((command) => command.targeting === "expected-test-paths");
+    if (modelTargeted.length && output.expectedPaths.some((path) => /(?:^|\/)\S+\.test\.(?:[cm]?[jt]sx?)$/i.test(path))) {
+      // Validate model targets only as a bounded correction signal; they never
+      // become write authority (expectedPaths above came from graph closure).
+      validateVerificationTargetPaths(output.expectedPaths, modelTargeted);
+    }
+  }
   const approved = new Set<string>([
     ...expectedPaths,
     ...investigatedPaths,
@@ -384,8 +398,9 @@ async function materializePacketOutput(
     ...metadataPaths.filter(isConcreteScopePath),
   ]);
   const evidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
+  const provisionalInvariantMatrices = deriveSecurityInvariantMatrices(output);
   const verifiedOutput = catalog && (catalog.commands.length > 0 || Boolean(output.verificationRequirements?.length))
-    ? canonicalizePacketVerification(output, catalog)
+    ? canonicalizePacketVerification(output, catalog, expectedPaths, provisionalInvariantMatrices)
     : output;
   const {
     verificationPolicyVersion: _untrustedPolicyVersion,
@@ -403,7 +418,7 @@ async function materializePacketOutput(
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
     if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
-    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha);
+    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths);
     return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
@@ -451,7 +466,7 @@ async function materializePacketOutput(
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
     throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
   }
-  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha);
+  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths);
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -472,6 +487,7 @@ async function deriveRelationGraphMetadata(
   policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>,
   evidenceContract: BuildPacketPayload["evidenceContract"] | undefined,
   baseSha: string,
+  finalExpectedPaths?: readonly string[],
 ): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
   const seeds = [...new Set([...issuePaths, ...controllerPaths])].map((path) => ({
     path,
@@ -485,7 +501,11 @@ async function deriveRelationGraphMetadata(
   const graph = buildRelationGraph({ baseSha, seeds, facts, limits });
   const closure = closeRelationGraph(graph);
   if (closure.diagnostics.length) throw new PacketAuthorCorrectableError(closure.diagnostics);
-  const writablePaths = [...new Set([...closure.writablePaths, ...expectedPaths.filter((path) => issuePaths.includes(path) || controllerPaths.includes(path))])].sort();
+  const writablePaths = finalExpectedPaths
+    ? [...new Set(finalExpectedPaths)].sort()
+    : [...new Set([...closure.writablePaths, ...expectedPaths.filter((path) => issuePaths.includes(path) || controllerPaths.includes(path))])].sort();
+  const commandIds = policyMetadata.verificationCommandIdentities?.map(({ id }) => id).sort() ?? closure.commandIds;
+  const invariantIds = closure.invariantIds;
   const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
   const commandPlanDigest = graphCommandPlanDigest(policyMetadata);
   const evidenceContractDigest = graphEvidenceContractDigest(evidenceContract);
@@ -494,23 +514,25 @@ async function deriveRelationGraphMetadata(
     baseSha: graph.baseSha,
     graphDigest: graph.graphDigest,
     configDigest,
-    closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds: closure.invariantIds, commandIds: closure.commandIds }),
+    closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds, commandIds }),
     commandPlanDigest,
     evidenceContractDigest,
     writablePaths,
     evidencePaths: closure.evidencePaths,
-    invariantIds: closure.invariantIds,
-    commandIds: closure.commandIds,
+    invariantIds,
+    commandIds,
   };
   return {
     metadata,
-    checkpoint: relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, closureDigest: metadata.closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest }),
+    checkpoint: relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, invariantIds, commandIds, closureDigest: metadata.closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest }),
   };
 }
 
-function canonicalizePacketVerification(
+export function canonicalizePacketVerification(
   output: BuildPacketPayload,
   catalog: VerificationCatalog,
+  expectedPaths: readonly string[],
+  invariantMatrices: readonly InvariantMatrixRow[],
 ): BuildPacketPayload {
   const commandById = new Map(catalog.commands.map((command) => [command.id, command]));
   const gateById = new Map(catalog.controllerGates.map((gate) => [gate.id, gate]));
@@ -549,6 +571,40 @@ function canonicalizePacketVerification(
       return { kind: "command" as const, id: command.id, criterionIds, rationale: "Legacy executable requirement canonicalized before dispatch." };
     });
 
+  const completionDiagnostics: string[] = [];
+  for (const criterionId of criterionIds) {
+    const rows = invariantMatrices.filter((row) => row.criterionId === criterionId);
+    const hasCommandRequirement = requirements.some((requirement) => requirement.kind === "command" && requirement.criterionIds.includes(criterionId));
+    const hasGateRequirement = requirements.some((requirement) => requirement.kind === "controller-gate" && requirement.criterionIds.includes(criterionId));
+    if (hasGateRequirement && rows.length === 0) continue;
+    // Existing command requirements remain supplemental/model suggestions for
+    // compatibility; completion is authoritative for criteria with no command
+    // at all (the #400 missing-criterion case).
+    if (hasCommandRequirement && rows.length === 0) continue;
+    const existingSemantic = requirements.some((requirement) => requirement.kind === "command"
+      && requirement.criterionIds.includes(criterionId)
+      && isProvenSemanticCommand(commandById.get(requirement.id), rows, expectedPaths));
+    if (existingSemantic) continue;
+    const candidates = catalog.commands
+      .filter((command) => command.evidenceCapability !== undefined && command.evidenceCapability !== "generic")
+      .filter((command) => isProvenSemanticCommand(command, rows, expectedPaths))
+      .sort((left, right) => semanticCommandRank(left, rows) - semanticCommandRank(right, rows) || left.id.localeCompare(right.id));
+    const selected = candidates[0];
+    if (!selected) {
+      completionDiagnostics.push(`${criterionId}: no controller-proven targeted/path-bound/invariant command is available`);
+      continue;
+    }
+    requirements.push({
+      kind: "command",
+      id: selected.id,
+      criterionIds: [criterionId],
+      rationale: "Controller auto-completed semantic evidence from validated relation closure and catalog capability.",
+    });
+  }
+  if (completionDiagnostics.length) {
+    throw new PacketAuthorCorrectableError([`[semantic-completion] ${completionDiagnostics.join("; ")}`], true);
+  }
+
   const covered = new Set(requirements.flatMap((requirement) => requirement.criterionIds));
   const missing = criterionIds.filter((id) => !covered.has(id));
   if (missing.length) throw new PacketAuthorCorrectableError([`[missing-requirement] Build Packet verification requirements do not cover ${missing.join(", ")}`]);
@@ -569,6 +625,29 @@ function canonicalizePacketVerification(
     verificationRequirements: requirements,
     ...(canonicalGates.size ? { controllerGates: [...canonicalGates.values()] } : {}),
   };
+}
+
+function isProvenSemanticCommand(
+  command: VerificationCatalogEntry | undefined,
+  rows: readonly InvariantMatrixRow[],
+  expectedPaths: readonly string[],
+): boolean {
+  if (!command?.evidenceCapability || command.evidenceCapability === "generic") return false;
+  if (command.evidenceCapability === "invariant" && rows.length === 0) return false;
+  if ((command.evidenceCapability === "targeted-test" || command.evidenceCapability === "path-bound") && expectedPaths.length === 0) return false;
+  if (command.targeting === "expected-test-paths") {
+    if (!command.typescriptLayout || !expectedPaths.some((path) => /(?:^|\/)\S+\.test\.(?:[cm]?[jt]sx?)$/i.test(path))) return false;
+    try { return resolveVerificationTargets(expectedPaths, [command]).length > 0; } catch { return false; }
+  }
+  return command.evidenceCapability === "invariant" ? rows.length > 0 : expectedPaths.length > 0;
+}
+
+function semanticCommandRank(command: VerificationCatalogEntry, rows: readonly InvariantMatrixRow[]): number {
+  if (rows.length > 0 && command.evidenceCapability === "invariant") return 0;
+  if (command.evidenceCapability === "targeted-test") return 1;
+  if (command.evidenceCapability === "path-bound") return 2;
+  if (command.evidenceCapability === "regression") return 3;
+  return 4;
 }
 
 function matchLegacyCommand(
@@ -664,6 +743,16 @@ export function selectPacketVerificationCommands(
       commandIds: [...packet.relationGraph.commandIds].sort(),
     });
     if (closureDigest !== packet.relationGraph.closureDigest) throw new Error("[graph-drift] Frozen relation graph closure digest does not match its paths");
+    if (JSON.stringify([...packet.expectedPaths].sort()) !== JSON.stringify([...packet.relationGraph.writablePaths].sort())) throw new Error("[graph-drift] Relation graph writable closure does not match packet expectedPaths");
+    const declaredEvidence = (packet.evidencePaths ?? []).map(({ path }) => path).sort();
+    if (declaredEvidence.some((path) => !packet.relationGraph?.evidencePaths.includes(path))) throw new Error("[graph-drift] Packet evidence path is outside frozen relation graph evidence closure");
+    const currentCommandPlanDigest = graphCommandPlanDigest({
+      verificationPolicyVersion: packet.verificationPolicyVersion,
+      verificationCommandTargets: packet.verificationCommandTargets,
+      verificationCommandIdentities: packet.verificationCommandIdentities,
+    });
+    if (currentCommandPlanDigest !== packet.relationGraph.commandPlanDigest) throw new Error("[graph-drift] Frozen relation graph command-plan digest differs from packet metadata");
+    if (graphEvidenceContractDigest(packet.evidenceContract) !== packet.relationGraph.evidenceContractDigest) throw new Error("[graph-drift] Frozen relation graph evidence-contract digest differs from packet metadata");
   }
   const commandById = new Map<string, Omit<VerificationCommand, "cwd">>();
   for (const command of catalog) {
@@ -699,6 +788,11 @@ export function selectPacketVerificationCommands(
   }
   for (const command of catalog) {
     if (command.selection === "always" || command.id === "diff-check") selectedIds.add(command.id);
+  }
+  if (packet.relationGraph) {
+    const frozenCommandIds = [...packet.relationGraph.commandIds].sort();
+    const selectedCommandIds = [...selectedIds].sort();
+    if (JSON.stringify(frozenCommandIds) !== JSON.stringify(selectedCommandIds)) throw new Error("[graph-drift] Frozen relation graph command IDs do not match packet-selected commands");
   }
 
   const targetedCommands = catalog.filter((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
