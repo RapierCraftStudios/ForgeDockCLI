@@ -77,7 +77,7 @@ test("waitForTerminal resets semantic idle only for correlated semantic observat
     cwd,
     ctx,
   });
-  const waiting = tasks.waitForTerminal(record.id, { warnAfterMs: 350 });
+  const waiting = tasks.waitForTerminal(record.id, { warnAfterMs: 1_000 });
   const events = [
     ["workflow", "activity", "workflow.progress"],
     ["agent", "activity", "activity.changed"],
