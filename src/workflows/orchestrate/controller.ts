@@ -2,6 +2,8 @@
 
 import { randomUUID } from "node:crypto";
 import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
+import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
+import type { ArtifactRepository } from "../../core/ports/repositories.js";
 import {
   findDurableOrchestrationIssueConflicts,
   normalizeOrchestrationRepository,
@@ -160,6 +162,8 @@ export interface OrchestrationControllerDependencies {
   /** Maximum replacement lineage depth (root nodes are depth zero). */
   maxDecompositionDepth?: number;
   /** Available worker slots in the caller's process/RPC/subagent transport. */
+  /** Optional authoritative artifact store for generic retry checkpoints. */
+  retryArtifacts?: ArtifactRepository;
   transportCapacity: number | (() => number | Promise<number>);
   /** Optional cancellation for a run waiting on external transport capacity. */
   signal?: AbortSignal;
@@ -984,6 +988,37 @@ export class OrchestrationController {
     return requiredNode(state.record, node.id);
   }
 
+  private async persistGenericRetry(
+    state: PersistenceState,
+    item: ScheduledWorkItem,
+    attempt: OrchestrationWorkerAttemptRecord,
+    result: Exclude<ScheduleWorkerResult, void>,
+  ): Promise<Exclude<ScheduleWorkerResult, void>> {
+    if (result.status !== "retry_wait" || result.retryCheckpointId !== undefined || !this.dependencies.retryArtifacts) return result;
+    const repository = item.repository ?? state.record.repository;
+    const operationKey = result.operationKey ?? `${result.retryDomain ?? "workflow"}:${result.retryCode ?? "retryable"}`;
+    const checkpoint = await persistRetryCheckpoint({
+      artifacts: this.dependencies.retryArtifacts,
+      runId: attempt.runId ?? state.record.orchestrationId,
+      subject: { repo: repository, issue: item.issue },
+      domain: (result.retryDomain ?? "workflow") as "github" | "provider" | "workflow" | "lease" | "transport",
+      code: result.retryCode ?? "retryable",
+      phase: "orchestration",
+      operationKey,
+      semanticKey: `${repository}#${item.issue}`,
+      nodeId: item.id,
+      attemptId: attempt.attemptId,
+      artifactIds: [attempt.attemptId],
+      attempt: result.attempt ?? attempt.attempt,
+      maxAttempts: result.maxAttempts ?? 3,
+      ...(result.retryAfterMs !== undefined ? { retryAfterMs: result.retryAfterMs } : {}),
+      ...(result.nextAttemptAt !== undefined ? { nextAttemptAt: result.nextAttemptAt } : {}),
+      status: (result.attempt !== undefined && result.maxAttempts !== undefined && result.attempt >= result.maxAttempts) ? "exhausted" : "waiting",
+      cause: result.error ?? "retryable orchestration result",
+    });
+    return { ...result, retryCheckpointId: checkpoint.id };
+  }
+
   private async executePreparedWorker(
     state: PersistenceState,
     item: ScheduledWorkItem,
@@ -1004,12 +1039,14 @@ export class OrchestrationController {
       } catch (error) {
         const retry = retryResultForError(error, attempt.attempt);
         if (retry) {
-          await this.finishAttempt(state, item.id, attempt.attemptId, retry);
-          return retry;
+          const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
+          await this.finishAttempt(state, item.id, attempt.attemptId, durableRetry);
+          return durableRetry;
         }
         await this.failAttempt(state, item.id, attempt.attemptId, error);
         throw error;
       }
+      result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
       await this.finishAttempt(state, item.id, attempt.attemptId, result);
       return result;
     }
@@ -1026,12 +1063,14 @@ export class OrchestrationController {
     } catch (error) {
       const retry = retryResultForError(error, attempt.attempt);
       if (retry) {
-        await this.finishAttempt(state, item.id, attempt.attemptId, retry);
-        return retry;
+        const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
+        await this.finishAttempt(state, item.id, attempt.attemptId, durableRetry);
+        return durableRetry;
       }
       await this.failAttempt(state, item.id, attempt.attemptId, error);
       throw error;
     }
+    result = await this.persistGenericRetry(state, item, attempt, result ?? { status: "completed" });
     await this.finishAttempt(state, item.id, attempt.attemptId, result);
     return result;
   }
