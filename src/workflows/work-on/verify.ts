@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import { createArtifact, type ControllerVerificationGate, type DurableArtifact, type CriterionEvidenceAnchors, type VerificationEvidenceDiagnostic } from "../../core/artifacts/schema.js";
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -747,21 +748,52 @@ function looksLikeExecutableCandidate(candidate: string, fenced: boolean): boole
 
 export async function deliveryContentDigest(workspacePath: string, paths: readonly string[]): Promise<string> {
   const root = resolve(workspacePath);
+  let canonicalRoot: string | undefined;
+  try {
+    canonicalRoot = await realpath(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const hash = createHash("sha256");
   for (const path of [...paths].sort()) {
-    const absolute = resolve(root, path);
-    if (absolute !== root && !absolute.startsWith(`${root}${sep}`)) {
-      throw new Error(`Delivery digest path escapes the workspace: ${path}`);
+    const normalizedPath = path.replaceAll("\\", "/");
+    const segments = normalizedPath.split("/");
+    if (!normalizedPath || normalizedPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(normalizedPath) || segments.includes("..")) {
+      throw new Error(`Delivery digest path is not a safe relative path: ${path}`);
     }
+    const absolute = resolve(root, normalizedPath);
     hash.update(path).update("\0");
+    if (canonicalRoot === undefined) {
+      hash.update("deleted\0");
+      continue;
+    }
     try {
-      const stat = await lstat(absolute);
-      if (stat.isSymbolicLink()) throw new DeliveryContentLinkError(path);
-      hash.update(stat.mode & 0o111 ? "1" : "0").update("\0");
-      if (stat.isFile()) {
-        hash.update("file\0").update(await readFile(absolute)).update("\0");
-      } else {
-        throw new Error(`Delivery path is not a file or symbolic link: ${path}`);
+      // Inspect the final directory entry without following it so broken links
+      // are rejected rather than misclassified as deleted files. The descriptor
+      // open below repeats this invariant at use time for replacement races.
+      const entry = await lstat(absolute);
+      if (entry.isSymbolicLink()) throw new DeliveryContentLinkError(path);
+      // realpath checks every parent component before opening. O_NOFOLLOW then
+      // binds the final descriptor to a non-symlink inode, closing the
+      // check/use replacement window on platforms that provide the primitive.
+      const canonicalCandidate = await realpath(absolute);
+      assertCanonicalContainment(canonicalRoot, canonicalCandidate, path);
+      const noFollow = fsConstants.O_NOFOLLOW;
+      if (typeof noFollow !== "number") throw new Error("Delivery digest cannot establish no-follow descriptor semantics on this platform");
+      let handle;
+      try {
+        handle = await open(absolute, fsConstants.O_RDONLY | noFollow);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new DeliveryContentLinkError(path);
+        throw error;
+      }
+      try {
+        const stat = await handle.stat();
+        if (!stat.isFile()) throw new Error(`Delivery path is not a regular file: ${path}`);
+        hash.update(stat.mode & 0o111 ? "1" : "0").update("\0").update("file\0");
+        hash.update(await handle.readFile()).update("\0");
+      } finally {
+        await handle.close();
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -769,6 +801,19 @@ export async function deliveryContentDigest(workspacePath: string, paths: readon
     }
   }
   return hash.digest("hex");
+}
+
+function assertCanonicalContainment(canonicalRoot: string, candidate: string, path: string): void {
+  const rootKey = canonicalPathKey(canonicalRoot);
+  const candidateKey = canonicalPathKey(candidate);
+  if (candidateKey !== rootKey && !candidateKey.startsWith(`${rootKey}/`)) {
+    throw new Error(`Delivery digest path resolves outside the workspace: ${path}`);
+  }
+}
+
+function canonicalPathKey(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/\/$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 export function verificationProgressRecorder(

@@ -431,6 +431,8 @@ export interface RuntimeBudgetUsage {
   outputTokens: number;
   totalTokens: number;
   estimatedCostUsd: number;
+  executionTurns: number;
+  executionToolCalls: number;
   observedRuns: number;
   unknownUsageRuns: number;
 }
@@ -465,8 +467,37 @@ export type AgentReceiptSink = (receipt: AgentRunReceipt) => void | Promise<void
 
 /** Adds rebuildable telemetry without giving telemetry authority over workflow state. */
 /** Enforces aggregate controller budgets without making telemetry authoritative state. */
+export const DEFAULT_RUNTIME_BUDGET_LIMITS: Required<RuntimeBudgetLimits> = {
+  maxTotalTokens: 500_000,
+  maxCostUsd: 50,
+  maxTokensPerRun: 100_000,
+};
+
+export function configuredRuntimeBudgetLimits(environment: NodeJS.ProcessEnv = process.env): RuntimeBudgetLimits {
+  const read = (name: string, fallback: number): number => {
+    const raw = environment[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite number`);
+    return value;
+  };
+  return {
+    maxTotalTokens: read("FORGEDOCK_AGENT_MAX_TOTAL_TOKENS", DEFAULT_RUNTIME_BUDGET_LIMITS.maxTotalTokens),
+    maxCostUsd: read("FORGEDOCK_AGENT_MAX_COST_USD", DEFAULT_RUNTIME_BUDGET_LIMITS.maxCostUsd),
+    maxTokensPerRun: read("FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN", DEFAULT_RUNTIME_BUDGET_LIMITS.maxTokensPerRun),
+  };
+}
+
+/**
+ * Runtime construction seam shared by CLI and TUI. Keeping the budget wrapper
+ * here prevents a new production caller from accidentally bypassing limits.
+ */
+export function budgetedAgentRuntime(inner: AgentRuntime, limits = configuredRuntimeBudgetLimits()): BudgetedAgentRuntime {
+  return new BudgetedAgentRuntime(inner, limits);
+}
+
 export class BudgetedAgentRuntime implements AgentRuntime {
-  readonly #usage: RuntimeBudgetUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, estimatedCostUsd: 0, observedRuns: 0, unknownUsageRuns: 0 };
+  readonly #usage: RuntimeBudgetUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, estimatedCostUsd: 0, executionTurns: 0, executionToolCalls: 0, observedRuns: 0, unknownUsageRuns: 0 };
 
   constructor(readonly inner: AgentRuntime, readonly limits: RuntimeBudgetLimits) {}
 
@@ -479,15 +510,27 @@ export class BudgetedAgentRuntime implements AgentRuntime {
 
   async run<T>(task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>> {
     this.assertAggregateBudget(task.id);
-    const result = await this.inner.run(task, options);
+    let result: AgentRunResult<T>;
+    try {
+      result = await this.inner.run(task, options);
+    } catch (error) {
+      this.recordFailure(error, task.id);
+      throw error;
+    }
     this.record(result, task.id);
     return result;
   }
 
   async resume<T>(sessionRef: string, task: AgentTask<T>, options?: { signal?: AbortSignal; onEvent?: AgentEventSink }): Promise<AgentRunResult<T>> {
     this.assertAggregateBudget(task.id);
-    if (!this.inner.resume) throw new AgentRunError("Agent runtime cannot resume persisted sessions");
-    const result = await this.inner.resume(sessionRef, task, options);
+    let result: AgentRunResult<T>;
+    try {
+      if (!this.inner.resume) throw new AgentRunError("Agent runtime cannot resume persisted sessions");
+      result = await this.inner.resume(sessionRef, task, options);
+    } catch (error) {
+      this.recordFailure(error, task.id);
+      throw error;
+    }
     this.record(result, task.id);
     return result;
   }
@@ -510,6 +553,7 @@ export class BudgetedAgentRuntime implements AgentRuntime {
 
   private record(result: AgentRunResult<unknown>, runId: string): void {
     const usage = result.receipt?.usage;
+    this.chargeExecution(result.receipt?.execution);
     this.#usage.observedRuns += 1;
     if (!usage) {
       this.#usage.unknownUsageRuns += 1;
@@ -543,6 +587,30 @@ export class BudgetedAgentRuntime implements AgentRuntime {
     if (this.limits.maxCostUsd !== undefined && this.#usage.estimatedCostUsd > this.limits.maxCostUsd) {
       throw new AgentBudgetExceededError("maxCostUsd", this.#usage.estimatedCostUsd, this.limits.maxCostUsd);
     }
+  }
+
+  /** Failed attempts still consume provider execution and must count before the original error escapes. */
+  private recordFailure(error: unknown, runId: string): void {
+    this.#usage.observedRuns += 1;
+    const execution = error instanceof AgentRunError ? error.execution : undefined;
+    this.chargeExecution(execution);
+    if (!execution) this.#usage.unknownUsageRuns += 1;
+    const inputTokens = execution?.inputTokens ?? 0;
+    const outputTokens = execution?.outputTokens ?? 0;
+    const totalTokens = execution?.totalTokens ?? (execution?.inputTokens !== undefined || execution?.outputTokens !== undefined ? inputTokens + outputTokens : undefined);
+    this.#usage.inputTokens += inputTokens;
+    this.#usage.outputTokens += outputTokens;
+    this.#usage.totalTokens += totalTokens ?? 0;
+    this.#usage.estimatedCostUsd += execution?.estimatedCostUsd ?? 0;
+    // A failed attempt must not replace the provider's typed error with a budget
+    // diagnostic. The next run/resume is stopped by assertAggregateBudget.
+    void runId;
+  }
+
+  private chargeExecution(execution: AgentExecutionUsage | undefined): void {
+    if (!execution) return;
+    this.#usage.executionTurns += execution.turns;
+    this.#usage.executionToolCalls += execution.toolCalls;
   }
 
   private assertKnown(limit: keyof RuntimeBudgetLimits, runId: string, required: boolean): void {

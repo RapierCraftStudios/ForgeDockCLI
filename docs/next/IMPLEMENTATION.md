@@ -154,7 +154,9 @@ lost owning bridge can still require explicit DAG resume.
 ## Remaining implementation/cutover work
 
 - [ ] GitHub-backed cross-machine lease coordination.
-- [ ] Token/cost admission budgets in addition to issue-pipeline concurrency.
+- [x] Controller runtime token/cost budgets are enforced in both CLI and TUI; fulfilled and failed/resumed execution usage is charged before errors escape.
+- [x] Verification stdout/stderr is continuously drained with bounded redacted diagnostic tails, split-secret handling, and explicit truncation markers.
+- [x] Delivery content digests use canonical containment plus no-follow descriptors and descriptor `fstat` to fail closed on symlink replacement.
 - [ ] Durable cross-restart child-session attachment beyond checkpoint resume.
 - [ ] Protected-artifact implementation and conformance slices defined in
   `VERIFIABLE-WORKFLOW-AUTHORITY.md`.

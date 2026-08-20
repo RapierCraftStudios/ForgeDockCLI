@@ -20,6 +20,13 @@ const modules = [
   "dist/workflows/work-on/publish.test.js",
   "dist/workflows/work-on/complete.test.js",
   "dist/cli/verification-policy.test.js",
+  "dist/runtime/agent-runtime.test.js",
+  "dist/adapters/process/process-verifier.test.js",
+  "dist/workflows/work-on/verify.test.js",
+  "dist/workflows/work-on/lane.test.js",
+  "dist/workflows/work-on/conflict-recovery.test.js",
+  "dist/workflows/orchestrate/decomposition-dependencies.test.js",
+  "dist/core/retry.test.js",
 ];
 
 const coverage = {
@@ -31,7 +38,10 @@ const coverage = {
   "restart-and-decomposition-recovery": ["controller", "reconcile-worker", "sqlite-repositories"],
   "observation-activity": ["controller", "view-model", "observer"],
   "ci-and-idempotent-github-effects": ["publish", "complete"],
-  "scoped-verification": ["certification", "verification-policy"],
+  "scoped-verification": ["certification", "verification-policy", "process-verifier", "verify"],
+  "runtime-budgets": ["agent-runtime"],
+  "output-bounds-and-redaction": ["process-verifier"],
+  "relation-target-retry-semantics": ["decomposition-dependencies", "lane", "conflict-recovery", "retry"],
 };
 
 const arguments_ = process.argv.slice(2);

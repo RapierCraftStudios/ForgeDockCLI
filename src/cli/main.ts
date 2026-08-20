@@ -32,6 +32,7 @@ import {
   STANDARD_SCOPE_DISCOVERY_ROOTS,
   STANDARD_SCOPE_METADATA_ROOTS,
   TelemetryAgentRuntime,
+  budgetedAgentRuntime,
   type AgentEvent,
   type AgentRuntime,
   type RuntimePreflightOptions,
@@ -533,7 +534,7 @@ async function workOn(
     leaseError = error;
     leaseWitness = undefined;
   }
-  const readinessRuntime = new PiAgentRuntime({
+  const readinessRuntime = budgetedAgentRuntime(new PiAgentRuntime({
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
@@ -541,7 +542,7 @@ async function workOn(
     ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
     ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
     ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
-  });
+  }));
   try {
     await assertDispatchReady({
       checkoutRoot: process.cwd(),
@@ -2000,7 +2001,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       orchestrationLeaseError = error;
       orchestrationWitness = undefined;
     }
-    const readinessRuntime = new PiAgentRuntime({
+    const readinessRuntime = budgetedAgentRuntime(new PiAgentRuntime({
       ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
       ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
       ...(dispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: dispatchRuntime.reviewer.provider } : {}),
@@ -2009,7 +2010,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       ...(dispatchRuntime.planning.provider !== undefined ? { planningProvider: dispatchRuntime.planning.provider } : {}),
       ...(dispatchRuntime.planning.model !== undefined ? { planningModel: dispatchRuntime.planning.model } : {}),
       ...(dispatchRuntime.planning.thinking !== undefined ? { planningThinking: dispatchRuntime.planning.thinking } : {}),
-    });
+    }));
     try {
       const readiness = await assertDispatchReady({
         checkoutRoot,
@@ -2552,14 +2553,14 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
       },
     },
   });
-  const genericRuntime = !witness ? new PiAgentRuntime({
+  const genericRuntime = !witness ? budgetedAgentRuntime(new PiAgentRuntime({
     ...(genericResolution.worker.provider !== undefined ? { provider: genericResolution.worker.provider } : {}),
     ...(genericResolution.worker.model !== undefined ? { model: genericResolution.worker.model } : {}),
     ...(genericResolution.reviewer.provider !== undefined ? { reviewerProvider: genericResolution.reviewer.provider } : {}),
     ...(genericResolution.reviewer.model !== undefined ? { reviewerModel: genericResolution.reviewer.model } : {}),
     ...(genericResolution.planning.provider !== undefined ? { planningProvider: genericResolution.planning.provider } : {}),
     ...(genericResolution.planning.model !== undefined ? { planningModel: genericResolution.planning.model } : {}),
-  }) : undefined;
+  })) : undefined;
   if (genericRuntime) {
     try {
       await assertDispatchReady({
@@ -2596,7 +2597,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
     const planningProvider = orchestrationPlanString(record.plan, "planningProvider");
     const planningModel = orchestrationPlanString(record.plan, "planningModel");
     const planningThinking = orchestrationPlanThinking(record.plan, "planningThinking");
-    const resumeRuntime = new PiAgentRuntime({
+    const resumeRuntime = budgetedAgentRuntime(new PiAgentRuntime({
       ...(workerProvider !== undefined ? { provider: workerProvider } : {}),
       ...(workerModel !== undefined ? { model: workerModel } : {}),
       ...(reviewerProvider !== undefined ? { reviewerProvider } : {}),
@@ -2605,7 +2606,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
       ...(planningProvider !== undefined ? { planningProvider } : {}),
       ...(planningModel !== undefined ? { planningModel } : {}),
       ...(planningThinking !== undefined ? { planningThinking } : {}),
-    });
+    }));
     const github = new GitHubClient(process.cwd(), store);
     let checkout: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined;
     try {
@@ -3080,7 +3081,8 @@ function createCliRuntime(options: { provider?: string; model?: string; thinking
     semanticIdleMs: idleMs,
   });
   const telemetryRuntime = new TelemetryAgentRuntime(inner, (receipt) => telemetry.recordTelemetry(receipt));
-  return new LivenessRecoveringAgentRuntime(telemetryRuntime, { idleMs, retryLimit: 1 });
+  const livenessRuntime = new LivenessRecoveringAgentRuntime(telemetryRuntime, { idleMs, retryLimit: 1 });
+  return budgetedAgentRuntime(livenessRuntime);
 }
 
 function configuredSemanticIdleMs(): number {

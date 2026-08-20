@@ -10,6 +10,11 @@ import { sealVerificationEnvironment, verificationEnvironment } from "../../runt
 
 const DEFAULT_LOCK_PATH = join(tmpdir(), "forgedock-verification.lock");
 
+export const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+export const MAX_CAPTURE_CHUNKS = 1_024;
+export const MAX_REDACTION_CARRY_CHARS = 4_096;
+export const OUTPUT_TRUNCATION_MARKER = "[verification output truncated]";
+
 export class ProcessVerificationRunner implements VerificationRunner {
   readonly #lockPath: string;
   readonly #environment: NodeJS.ProcessEnv;
@@ -196,8 +201,8 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       windowsHide: true,
       detached: process.platform !== "win32",
     });
-    const chunks: Buffer[] = [];
-    const capture = (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const output = new BoundedOutputCapture();
+    const capture = (chunk: Buffer | string) => output.push(chunk);
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
     let timedOut = false;
@@ -219,9 +224,6 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       terminate();
     };
     signal?.addEventListener("abort", abort, { once: true });
-    // Do not miss cancellation fired after the run-loop pre-check but before
-    // this listener was installed. Termination still settles through the child
-    // event so no process is left behind when the promise rejects.
     if (signal?.aborted) abort();
     child.on("error", (error: NodeJS.ErrnoException) => {
       if (settled) return;
@@ -254,11 +256,11 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
         reject(abortReason);
         return;
       }
-      const output = redactVerificationOutput(Buffer.concat(chunks).toString("utf8"));
+      const renderedOutput = output.finish();
       const durationMs = Math.max(0, Math.round(performance.now() - started));
       const status = code === 0 && !timedOut ? "passed" as const : "failed" as const;
-      const summary = summarize(output, timedOut, status);
-      const failureSignatures = status === "failed" ? extractFailureSignatures(output, timedOut) : [];
+      const summary = summarize(renderedOutput.text, timedOut, status);
+      const failureSignatures = status === "failed" ? extractFailureSignatures(renderedOutput.text, timedOut) : [];
       resolve({
         ...verificationResultMetadata(spec),
         status,
@@ -267,12 +269,59 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
         } : {}),
         ...(typeof code === "number" ? { exitCode: code } : {}),
         durationMs,
-        outputDigest: createHash("sha256").update(output).digest("hex"),
+        outputDigest: renderedOutput.digest,
         ...(summary ? { summary } : {}),
         ...(failureSignatures.length ? { failureSignatures } : {}),
       });
     });
   });
+}
+
+interface CapturedOutput { text: string; digest: string; truncated: boolean }
+
+/** Drains both pipes while retaining only a redacted, bounded diagnostic tail. */
+class BoundedOutputCapture {
+  readonly #hash = createHash("sha256");
+  #carry = "";
+  #tail = "";
+  #chunks = 0;
+  #truncated = false;
+
+  push(chunk: Buffer | string): void {
+    this.#chunks += 1;
+    if (this.#chunks > MAX_CAPTURE_CHUNKS) {
+      this.#truncated = true;
+      return;
+    }
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+    for (let offset = 0; offset < text.length; offset += 64 * 1024) {
+      this.#carry += text.slice(offset, offset + 64 * 1024);
+      if (this.#carry.length <= MAX_REDACTION_CARRY_CHARS) continue;
+      const safe = this.#carry.slice(0, -MAX_REDACTION_CARRY_CHARS);
+      this.#carry = this.#carry.slice(-MAX_REDACTION_CARRY_CHARS);
+      this.#emit(safe);
+    }
+  }
+
+  finish(): CapturedOutput {
+    this.#emit(this.#carry);
+    this.#carry = "";
+    if (this.#truncated) this.#emit(`\n${OUTPUT_TRUNCATION_MARKER}\n`);
+    return { text: this.#tail, digest: this.#hash.digest("hex"), truncated: this.#truncated };
+  }
+
+  #emit(value: string): void {
+    if (!value) return;
+    const redacted = redactVerificationOutput(value);
+    if (!redacted) return;
+    this.#hash.update(redacted);
+    this.#tail += redacted;
+    const bytes = Buffer.from(this.#tail, "utf8");
+    if (bytes.byteLength > MAX_DIAGNOSTIC_BYTES) {
+      this.#truncated = true;
+      this.#tail = bytes.subarray(-MAX_DIAGNOSTIC_BYTES).toString("utf8");
+    }
+  }
 }
 
 function terminateProcessTree(child: ChildProcess): void {
@@ -319,17 +368,21 @@ function redactVerificationOutput(output: string): string {
 }
 
 function summarize(output: string, timedOut: boolean, status: "passed" | "failed"): string {
-  if (timedOut) return "Timed out";
+  const truncated = output.includes(OUTPUT_TRUNCATION_MARKER);
+  if (timedOut) return truncated ? `Timed out · ${OUTPUT_TRUNCATION_MARKER}` : "Timed out";
   const normalized = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trim();
-  if (!normalized) return "";
+  if (!normalized) return truncated ? OUTPUT_TRUNCATION_MARKER : "";
   const lines = normalized.split(/\r?\n/).filter(Boolean);
+  let summary: string;
   if (status === "failed") {
     const firstFailure = lines.findIndex((line) => /^\s*not ok\s+\d+\s+-\s+/.test(line));
-    if (firstFailure >= 0) return lines.slice(firstFailure, firstFailure + 16).join(" | ").slice(0, 1_500);
-    const nodeFailure = lines.findIndex((line) => /^\s*[✖✕]\s+failing tests:\s*$/i.test(line));
-    if (nodeFailure >= 0) return lines.slice(nodeFailure, nodeFailure + 16).join(" | ").slice(0, 1_500);
-  }
-  return lines.slice(-3).join(" | ").slice(0, 500);
+    if (firstFailure >= 0) summary = lines.slice(firstFailure, firstFailure + 16).join(" | ").slice(0, 1_500);
+    else {
+      const nodeFailure = lines.findIndex((line) => /^\s*[✖✕]\s+failing tests:\s*$/i.test(line));
+      summary = nodeFailure >= 0 ? lines.slice(nodeFailure, nodeFailure + 16).join(" | ").slice(0, 1_500) : lines.slice(-3).join(" | ").slice(0, 500);
+    }
+  } else summary = lines.slice(-3).join(" | ").slice(0, 500);
+  return truncated ? `${summary} · ${OUTPUT_TRUNCATION_MARKER}` : summary;
 }
 
 function extractFailureSignatures(output: string, timedOut: boolean): string[] {

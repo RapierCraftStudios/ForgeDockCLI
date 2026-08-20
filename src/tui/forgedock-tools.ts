@@ -73,6 +73,7 @@ import {
 import { controllerEnvironment } from "../runtime/controller-environment.js";
 import { assertDispatchReady, dispatchModelReference, resolveDispatchRuntime, type DispatchReadinessInput, type DispatchRuntimeResolutionInput, type ResolvedDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
+import { budgetedAgentRuntime } from "../runtime/agent-runtime.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import {
   startOrchestrationClaimPromotionServer,
@@ -1419,7 +1420,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         witnessError = error;
       }
     }
-    const runtime = new PiAgentRuntime({
+    const runtime = budgetedAgentRuntime(new PiAgentRuntime({
       ...(resolved.worker.provider !== undefined ? { provider: resolved.worker.provider } : {}),
       ...(resolved.worker.model !== undefined ? { model: resolved.worker.model } : {}),
       ...(resolved.reviewer.provider !== undefined ? { reviewerProvider: resolved.reviewer.provider } : {}),
@@ -1427,7 +1428,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       ...(resolved.planning.provider !== undefined ? { planningProvider: resolved.planning.provider } : {}),
       ...(resolved.planning.model !== undefined ? { planningModel: resolved.planning.model } : {}),
       ...(resolved.planning.thinking !== undefined ? { planningThinking: resolved.planning.thinking } : {}),
-    });
+    }));
     try {
       const readinessInput: DispatchReadinessInput = {
         checkoutRoot: ctx.cwd,
@@ -2536,7 +2537,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         github ??= new GitHubClient(ctx.cwd, orchestrationRepository);
         repository ??= await github.getRepository();
         if (dispatchReadinessChecked) return;
-        const readinessRuntime = new PiAgentRuntime({
+        const readinessRuntime = budgetedAgentRuntime(new PiAgentRuntime({
           ...(resolvedDispatchRuntime.worker.provider !== undefined ? { provider: resolvedDispatchRuntime.worker.provider } : {}),
           ...(resolvedDispatchRuntime.worker.model !== undefined ? { model: resolvedDispatchRuntime.worker.model } : {}),
           ...(resolvedDispatchRuntime.reviewer.provider !== undefined ? { reviewerProvider: resolvedDispatchRuntime.reviewer.provider } : {}),
@@ -2544,7 +2545,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           ...(resolvedDispatchRuntime.planning.provider !== undefined ? { planningProvider: resolvedDispatchRuntime.planning.provider } : {}),
           ...(resolvedDispatchRuntime.planning.model !== undefined ? { planningModel: resolvedDispatchRuntime.planning.model } : {}),
           ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
-        });
+        }));
         try {
           const readinessInput: DispatchReadinessInput = {
             checkoutRoot: ctx.cwd,

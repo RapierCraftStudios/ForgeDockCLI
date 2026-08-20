@@ -74,7 +74,16 @@ incompatible, or unsafe work remains singleton.
 Assembly is pure, preview is mutation-free, authoritative issue state is re-read
 after confirmation, and batch materialization is idempotent.
 
-### 1.4 Truthful observation and UI
+### 1.5 Runtime and diagnostic bounds
+
+Every production CLI and TUI runtime is wrapped in the shared budget guard. The
+configured ceilings are `FORGEDOCK_AGENT_MAX_TOTAL_TOKENS`,
+`FORGEDOCK_AGENT_MAX_COST_USD`, and `FORGEDOCK_AGENT_MAX_TOKENS_PER_RUN` (with
+safe defaults). Successful receipts and failed/resumed `AgentRunError.execution`
+are charged before a retry or resume is admitted. Verification drains both pipes
+but retains only a redacted, bounded tail and emits an explicit truncation marker;
+content digests use canonical containment and no-follow descriptors.
+
 
 The orchestration board and task views are projections, never workflow authority.
 They must distinguish:

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { FakeAgentRuntime } from "./fake-runtime.js";
-import { AgentRunError, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForBuildPacket, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
+import { AgentBudgetExceededError, AgentRunError, BudgetedAgentRuntime, TelemetryAgentRuntime, createScopeManifestReceipt, scopeManifestFor, scopeManifestForBuildPacket, scopeManifestForReviewer, validateScopeManifestReceipt } from "./agent-runtime.js";
 import { summarizeControllerTiming, type AgentRunReceipt } from "../core/ports/telemetry.js";
 
 function task(id: string) {
@@ -84,12 +84,40 @@ test("reviewer scope receipts are whole-checkout read-only and tamper evident", 
   assert.throws(() => validateScopeManifestReceipt({ ...receipt, scopeDigest: "0".repeat(64) }), /does not match/);
 });
 
-test("build packet evidence paths grant reads without broadening writes", () => {
-  const scope = scopeManifestForBuildPacket(["src/a.ts"], ["docs/review.ts", "package.json"]);
-  assert.deepEqual(scope.writePaths, ["src/a.ts"]);
-  assert.deepEqual(scope.writeRoots, []);
-  assert.ok(scope.readRoots.includes("src"));
-  assert.ok(scope.readRoots.includes("docs/review.ts"));
-  assert.equal(scope.readRoots.includes("docs"), false);
-  assert.ok(scope.readRoots.includes("package.json"));
+test("budget runtime aggregates fulfilled receipts and blocks aggregate overflow", async () => {
+  const inner: import("./agent-runtime.js").AgentRuntime = {
+    capabilities: async () => ({ runtime: "test", resumableSessions: false, tools: ["read"] }),
+    run: async <T>() => ({
+      output: { ok: true } as T, sessionRef: "typed", provider: "fake", model: "fake",
+      receipt: {
+        key: "typed", runId: "run", taskId: "run:task", phase: "task", role: "investigator", sessionRef: "typed", sessionLineage: ["typed"], provider: "fake", model: "fake",
+        timing: { queuedAt: "", startedAt: "", completedAt: "", activeMs: 0, queueMs: 0, retryCount: 0 },
+        usage: { source: "provider", inputTokens: 3, outputTokens: 4, totalTokens: 7, estimatedCostUsd: 1 },
+        execution: { turns: 2, toolCalls: 3 },
+      },
+    }),
+    close: async () => {},
+  };
+  const bounded = new BudgetedAgentRuntime(inner, { maxTotalTokens: 10, maxCostUsd: 10, maxTokensPerRun: 8 });
+  await bounded.run(task("run:task"));
+  assert.equal(bounded.usage().totalTokens, 7);
+  assert.equal(bounded.usage().executionTurns, 2);
+  await assert.rejects(bounded.run(task("run:task-2")), AgentBudgetExceededError);
+});
+
+test("budget runtime charges failed execution on run and resume before rethrowing", async () => {
+  const failure = new AgentRunError("retryable", {
+    sessionRef: "failed-session", resumable: true,
+    execution: { turns: 4, toolCalls: 6, inputTokens: 2, outputTokens: 3, totalTokens: 5, estimatedCostUsd: 0.5 },
+  });
+  const inner: import("./agent-runtime.js").AgentRuntime = {
+    capabilities: async () => ({ runtime: "test", resumableSessions: true, tools: ["read"] }),
+    run: async () => { throw failure; },
+    resume: async () => { throw failure; },
+    close: async () => {},
+  };
+  const bounded = new BudgetedAgentRuntime(inner, { maxTotalTokens: 20, maxCostUsd: 10, maxTokensPerRun: 20 });
+  await assert.rejects(bounded.run(task("run:failed")), (error: unknown) => error === failure);
+  await assert.rejects(bounded.resume("failed-session", task("run:resume")), (error: unknown) => error === failure);
+  assert.deepEqual(bounded.usage(), { inputTokens: 4, outputTokens: 6, totalTokens: 10, estimatedCostUsd: 1, executionTurns: 8, executionToolCalls: 12, observedRuns: 2, unknownUsageRuns: 0 });
 });

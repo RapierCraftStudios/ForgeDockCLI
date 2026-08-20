@@ -351,6 +351,26 @@ describe("deterministic process verification", () => {
     }], racingSignal), (error: unknown) => error === reason);
   });
 
+  it("bounds huge output and exposes an explicit truncation marker", async () => {
+    const huge = "x".repeat(200_000);
+    const [result] = await isolatedRunner().run([{
+      id: "huge-output", command: process.execPath,
+      args: ["-e", `process.stdout.write('x'.repeat(${huge.length}))`], cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.match(result?.summary ?? "", /verification output truncated/);
+    assert.ok((result?.summary?.length ?? 0) < 2_000);
+  });
+
+  it("redacts secrets split across streaming stdout and stderr chunks", async () => {
+    const script = "process.stdout.write('AUDIT_SECRET=split-');setImmediate(()=>process.stderr.write('secret-proof'));";
+    const [result] = await isolatedRunner({ ...process.env, AUDIT_SECRET: "split-secret-proof" }).run([{
+      id: "split-secret", command: process.execPath, args: ["-e", script], cwd: process.cwd(), timeoutMs: 5_000, required: true,
+    }]);
+    assert.equal(result?.status, "passed");
+    assert.doesNotMatch(result?.summary ?? "", /split-secret-proof|split-/);
+    assert.match(result?.summary ?? "", /REDACTED/);
+  });
+
   it("records spawn failures and continues through the remaining verification plan", async () => {
     const runner = isolatedRunner();
     const results = await runner.run([

@@ -45,6 +45,11 @@ export interface AgentRunReceipt {
 export interface AgentExecutionUsage {
   turns: number;
   toolCalls: number;
+  /** Provider usage may be available even when structured output fails. */
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  estimatedCostUsd?: number;
   budget?: { maxTurns?: number; maxToolCalls?: number };
   exhausted?: "maxTurns" | "maxToolCalls";
 }
