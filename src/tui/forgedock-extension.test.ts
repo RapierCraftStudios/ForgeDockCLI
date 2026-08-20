@@ -1209,6 +1209,95 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   await shutdownFakePi(state, commandContext());
 });
 
+test("dispatch admission passes a verified witness to readiness and blocks failed bootstrap", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "forgedock-dispatch-witness-"));
+  const checkout = createGitCheckout(parent, "checkout", "https://github.com/a/b.git");
+  const localDataRoot = join(parent, "local-data");
+  const validWitness = createOrBootstrapLocalLeaseWitness(checkout, { localDataRoot, environment: {} });
+  const readinessWitnesses: unknown[] = [];
+  const spawnRequests: any[] = [];
+  const state = fakePi(undefined, {
+    ensureLeaseWitness: (cwd) => {
+      assert.equal(cwd, checkout);
+      return validWitness;
+    },
+    dispatchReadinessCheck: async (input) => {
+      readinessWitnesses.push(input.leaseWitness);
+      assert.equal(input.requireLeaseWitness, true);
+      assert.equal(input.leaseWitness?.verify().state, "verified");
+      assert.equal(input.leaseError, undefined);
+    },
+  });
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      spawnRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { text: "started", details: { asyncId: "dispatch-witness-run" } },
+      }));
+    } else if (name === "subagents:rpc:v1:request" && data.method === "stop") {
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1, requestId: data.requestId, success: true, data: { stopped: true },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  process.env.FORGEDOCK_CONTROLLER_ENTRY = "C:/Forge Dock/bin/forgedock-next.mjs";
+  try {
+    await withDiscoveryGitHub({
+      getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
+      getIssue: async (number: number) => orchestrationDiscoveryIssue(number),
+      listBranches: async () => [],
+    }, async () => {
+      const tool = state.tools.get("forgedock_orchestrate");
+      assert.ok(tool);
+      bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], repository: "a/b", noMilestone: true });
+      await tool.execute("verified-dispatch-witness", {
+        issueNumbers: [7],
+        executionPlan: [{ issue: 7, title: "Seven", summary: "Witnessed dispatch", dependsOn: [], claims: ["src/a"], labels: [] }],
+        confirmed: true,
+      }, undefined, undefined, { ...commandContext(), cwd: checkout } as any);
+    });
+    assert.deepEqual(readinessWitnesses, [validWitness]);
+    assert.equal(spawnRequests.length, 1);
+  } finally {
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+    await shutdownFakePi(state, commandContext());
+  }
+
+  const blockedReadiness: unknown[] = [];
+  const blocked = fakePi(undefined, {
+    ensureLeaseWitness: () => { throw new Error("witness bootstrap failed"); },
+    dispatchReadinessCheck: async (input) => {
+      blockedReadiness.push(input.leaseError);
+      throw new Error("witness bootstrap failed");
+    },
+  });
+  try {
+    await withDiscoveryGitHub({
+      getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
+      getIssue: async (number: number) => orchestrationDiscoveryIssue(number),
+      listBranches: async () => [],
+    }, async () => {
+      const tool = blocked.tools.get("forgedock_orchestrate");
+      assert.ok(tool);
+      bindOrchestrationInvocation(blocked.pi, { rawArgs: "7", issueNumbers: [7], repository: "a/b", noMilestone: true });
+      await assert.rejects(() => tool.execute("failed-dispatch-witness", {
+        issueNumbers: [7],
+        executionPlan: [{ issue: 7, title: "Seven", summary: "Blocked", dependsOn: [], claims: ["src/a"], labels: [] }],
+        confirmed: true,
+      }, undefined, undefined, { ...commandContext(), cwd: checkout } as any), /witness bootstrap failed/);
+    });
+    assert.equal(blockedReadiness.length, 1);
+    assert.equal(blocked.emitted.some(({ event }) => event === "subagents:rpc:v1:request"), false);
+  } finally {
+    await shutdownFakePi(blocked, commandContext());
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("confirmation prompt remains read-only until the user authorizes dispatch", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "forgedock-confirm-readonly-"));
   let witnessCalls = 0;

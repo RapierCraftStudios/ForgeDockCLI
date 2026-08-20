@@ -5,6 +5,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { describe, it } from "node:test";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
@@ -112,6 +113,75 @@ describe("retained lease checkpoint witness", () => {
         /malformed|continuity/i,
       );
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("adopts a concurrently completing first-use bootstrap only after full verification", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    mkdirSync(checkout);
+    const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+    const workerModule = new URL("./lease-witness.js", import.meta.url).href;
+    const workerSource = `
+      import { parentPort, workerData } from "node:worker_threads";
+      try {
+        const { createOrBootstrapLocalLeaseWitness } = await import(workerData.moduleUrl);
+        const witness = createOrBootstrapLocalLeaseWitness(workerData.checkout, {
+          localDataRoot: workerData.localDataRoot,
+          environment: {},
+          ...(workerData.pauseAfterInstall ? {
+            onWitnessDirectoryInstalled: () => {
+              const state = new Int32Array(workerData.barrier);
+              Atomics.store(state, 0, 1);
+              Atomics.notify(state, 0);
+              while (Atomics.load(state, 1) === 0) Atomics.wait(state, 1, 0);
+            },
+          } : {}),
+        });
+        parentPort.postMessage({ epoch: witness.verify().epoch });
+      } catch (error) {
+        parentPort.postMessage({ error: error instanceof Error ? error.message : String(error) });
+      }
+    `;
+    const startWorker = (pauseAfterInstall: boolean): Worker => new Worker(workerSource, {
+      eval: true,
+      workerData: { moduleUrl: workerModule, checkout, localDataRoot, barrier, pauseAfterInstall },
+    });
+    const result = (worker: Worker): Promise<{ epoch?: number; error?: string }> => new Promise((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    const first = startWorker(true);
+    const secondPromise = new Promise<{ epoch?: number; error?: string }>((resolve, reject) => {
+      const waitForInstall = (): void => {
+        if (Atomics.load(new Int32Array(barrier), 0) === 1) {
+          const second = startWorker(false);
+          void result(second).then(resolve, reject);
+          return;
+        }
+        setTimeout(waitForInstall, 1);
+      };
+      waitForInstall();
+    });
+    try {
+      const second = await secondPromise;
+      assert.equal(second.error, undefined);
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1);
+      const firstResult = await result(first);
+      assert.equal(firstResult.error, undefined);
+      assert.equal(firstResult.epoch, 0);
+      assert.equal(second.epoch, 0);
+      const referencePath = join(checkout, ".forgedock", "lease-witness.json");
+      const reference = JSON.parse(readFileSync(referencePath, "utf8")) as Record<string, unknown>;
+      assert.equal(typeof reference.publicKeyPath, "string");
+      assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().epoch, 0);
+    } finally {
+      Atomics.store(new Int32Array(barrier), 1, 1);
+      Atomics.notify(new Int32Array(barrier), 1);
+      await first.terminate();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("bridges the historical epoch-one bootstrap only into an unused lease store", () => {

@@ -89,6 +89,8 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+const LOCAL_WITNESS_CONTENTION_ATTEMPTS = 20;
+const LOCAL_WITNESS_CONTENTION_DELAY_MS = 5;
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -114,6 +116,8 @@ interface LocalLeaseWitnessOptions {
   localDataRoot?: string;
   /** Test/embedded override. Production defaults to process.env. */
   environment?: NodeJS.ProcessEnv;
+  /** Test-only barrier for the rename-to-reference visibility window. */
+  onWitnessDirectoryInstalled?: () => void;
 }
 
 export function leaseWitnessRequirementMessage(phase: string, checkoutRoot: string): string {
@@ -190,10 +194,16 @@ export function createOrBootstrapLocalLeaseWitness(
   try {
     bootstrapLocalLeaseWitness(cwd, options);
   } catch (error) {
-    // A concurrent first-use process may have completed bootstrap after our
-    // initial lookup. Adopt it only if the complete witness now verifies.
-    const raced = createConfiguredLeaseWitness(cwd, options);
-    if (raced) return raced;
+    // A concurrent first-use process can expose the installed directory before
+    // it publishes the checkout reference. Only filesystem contention is
+    // recoverable; every candidate is still fully verified by the configured
+    // witness loader before it can be adopted.
+    if (!isLocalWitnessContention(error)) throw error;
+    for (let attempt = 0; attempt < LOCAL_WITNESS_CONTENTION_ATTEMPTS; attempt += 1) {
+      const raced = createConfiguredLeaseWitness(cwd, options);
+      if (raced) return raced;
+      if (attempt + 1 < LOCAL_WITNESS_CONTENTION_ATTEMPTS) waitForLocalWitnessContention();
+    }
     throw error;
   }
 
@@ -208,10 +218,10 @@ export function createOrBootstrapLocalLeaseWitness(
  */
 export function bootstrapLocalLeaseWitness(
   cwd: string,
-  options: Pick<LocalLeaseWitnessOptions, "localDataRoot"> = {},
+  options: Pick<LocalLeaseWitnessOptions, "localDataRoot" | "onWitnessDirectoryInstalled"> = {},
 ): LocalLeaseWitnessBootstrap {
   const paths = localWitnessPaths(cwd, options.localDataRoot);
-  if (existsSync(paths.configPath)) throw new Error(`Lease witness bootstrap already exists at ${paths.configPath}`);
+  if (existsSync(paths.configPath)) throw localWitnessContentionError(`Lease witness bootstrap already exists at ${paths.configPath}`);
   if (existsSync(paths.witnessDirectory)) return recoverLocalLeaseWitness(paths);
 
   mkdirSync(dirname(paths.witnessDirectory), { recursive: true, mode: 0o700 });
@@ -242,6 +252,7 @@ export function bootstrapLocalLeaseWitness(
     renameSync(temporaryDirectory, paths.witnessDirectory);
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
+    options.onWitnessDirectoryInstalled?.();
 
     const reference = localWitnessReference(paths);
     writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -327,6 +338,21 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function isLocalWitnessContention(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "EEXIST";
+}
+
+function localWitnessContentionError(message: string): NodeJS.ErrnoException {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = "EEXIST";
+  return error;
+}
+
+function waitForLocalWitnessContention(): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, LOCAL_WITNESS_CONTENTION_DELAY_MS);
 }
 
 function payload(epoch: number, keyId: string): Buffer {
