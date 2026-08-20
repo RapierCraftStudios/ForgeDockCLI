@@ -159,6 +159,8 @@ export const InvariantMatrixRowSchema = Type.Object({
 });
 export type InvariantMatrixRow = Static<typeof InvariantMatrixRowSchema>;
 
+const PacketDigest = Type.String({ pattern: "^[0-9a-fA-F]{64}$" });
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -195,6 +197,20 @@ export const BuildPacketPayloadSchema = Type.Object({
     targeting: Type.Optional(NonEmptyString),
     identityDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   }))),
+  /** Optional controller-owned relation closure; absent packets remain legacy/conservative. */
+  relationGraph: Type.Optional(Type.Object({
+    version: Type.Literal("forgedock.relation-graph/v1"),
+    baseSha: Sha,
+    graphDigest: PacketDigest,
+    configDigest: PacketDigest,
+    closureDigest: PacketDigest,
+    commandPlanDigest: PacketDigest,
+    evidenceContractDigest: PacketDigest,
+    writablePaths: Type.Array(NonEmptyString),
+    evidencePaths: Type.Array(NonEmptyString),
+    invariantIds: Type.Array(NonEmptyString),
+    commandIds: Type.Array(NonEmptyString),
+  })),
   risks: Type.Array(Type.Object({
     risk: NonEmptyString,
     mitigation: NonEmptyString,

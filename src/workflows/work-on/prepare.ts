@@ -31,7 +31,9 @@ import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutc
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
 import { closeExpectedWriteScope } from "./scope-closure.js";
-import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic } from "../../core/artifacts/schema.js";
+import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
+import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, type RelationGraph } from "../../core/packet/relation-graph.js";
+import { repositoryAdaptersFor } from "../../adapters/repository/index.js";
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
   & Partial<Omit<VerificationCommand, "cwd" | "id" | "command" | "args">>;
@@ -159,6 +161,7 @@ export async function prepareBuildPacket(
           input.scopeHints?.writePaths ?? [],
           input.cwd,
           input.scopeHints !== undefined,
+          input.run.headSha ?? "0000000",
         );
         break;
       } catch (error) {
@@ -185,7 +188,7 @@ export async function prepareBuildPacket(
         }
       }
     }
-    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths } = materialized!;
+    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths, relationGraph, relationGraphCheckpoint } = materialized!;
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
@@ -198,9 +201,21 @@ export async function prepareBuildPacket(
         ...(invariantMatrices.length ? { invariantMatrices } : {}),
         ...(evidencePaths.length ? { evidencePaths } : {}),
         ...(evidenceContract ? { evidenceContract } : {}),
+        ...(relationGraph ? { relationGraph } : {}),
       },
     });
     await dependencies.artifacts.append(packet);
+    if (relationGraphCheckpoint) {
+      const checkpoint = createArtifact({
+        kind: "RelationGraphCheckpoint",
+        runId: run.runId,
+        subject: run.subject,
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: relationGraphCheckpoint,
+      });
+      await dependencies.artifacts.append(checkpoint);
+      run = attachArtifact(run, "RelationGraphCheckpoint", checkpoint.id);
+    }
     run = attachArtifact(run, "BuildPacket", packet.id);
     const packetScopeManifest = scopeManifestForBuildPacket(expectedPaths, evidencePaths.map(({ path }) => path));
     const advanced = transition(run, "BUILD_PACKET_READY", {
@@ -319,6 +334,7 @@ async function materializePacketOutput(
   controllerWriteHints: readonly string[] = [],
   cwd = process.cwd(),
   enforceScopeClosure = true,
+  baseSha = "0000000",
 ): Promise<{
   expectedPaths: string[];
   evidencePaths: EvidencePathDeclaration[];
@@ -326,6 +342,8 @@ async function materializePacketOutput(
   controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "invariantMatrices" | "evidenceContract" | "evidencePaths">;
   policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>;
   invariantMatrices: ReturnType<typeof deriveSecurityInvariantMatrices>;
+  relationGraph?: BuildPacketPayload["relationGraph"];
+  relationGraphCheckpoint?: RelationGraphCheckpointPayload;
 }> {
   if (!output.expectedPaths.length) throw new PacketAuthorCorrectableError(["[write-scope] Build Packet must declare at least one concrete expected path"]);
   const criterionDuplicates = [...new Set(output.acceptanceCriteria.filter((criterion, index, criteria) => criteria.indexOf(criterion) !== index))];
@@ -376,6 +394,7 @@ async function materializePacketOutput(
     invariantMatrices: _untrustedInvariantMatrices,
     evidenceContract: _untrustedEvidenceContract,
     evidencePaths: _modelEvidencePaths,
+    relationGraph: _untrustedRelationGraph,
     ...controllerVerifiedOutput
   } = verifiedOutput;
   const policyMetadata = catalog
@@ -384,7 +403,8 @@ async function materializePacketOutput(
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
     if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
-    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
+    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha);
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
   // capability metadata on any command that will execute is a catalog defect,
@@ -431,6 +451,7 @@ async function materializePacketOutput(
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
     throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
   }
+  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha);
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -438,6 +459,52 @@ async function materializePacketOutput(
     controllerVerifiedOutput,
     policyMetadata,
     invariantMatrices,
+    ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}),
+    ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}),
+  };
+}
+
+async function deriveRelationGraphMetadata(
+  expectedPaths: readonly string[],
+  issuePaths: readonly string[],
+  controllerPaths: readonly string[],
+  cwd: string,
+  policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>,
+  evidenceContract: BuildPacketPayload["evidenceContract"] | undefined,
+  baseSha: string,
+): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
+  const seeds = [...new Set([...issuePaths, ...controllerPaths])].map((path) => ({
+    path,
+    provenance: issuePaths.includes(path) ? "issue" as const : "controller" as const,
+  }));
+  if (!seeds.length) return {};
+  const adapters = repositoryAdaptersFor(["monorepo"]);
+  const limits = { maxNodes: 10_000, maxEdges: 25_000, maxDepth: 8, maxFiles: 2_000, maxBytes: 4_000_000, maxCollateralPaths: 512 };
+  const facts = [];
+  for (const adapter of adapters) facts.push(await adapter.inspect({ cwd, limits }));
+  const graph = buildRelationGraph({ baseSha, seeds, facts, limits });
+  const closure = closeRelationGraph(graph);
+  if (closure.diagnostics.length) throw new PacketAuthorCorrectableError(closure.diagnostics);
+  const writablePaths = [...new Set([...closure.writablePaths, ...expectedPaths.filter((path) => issuePaths.includes(path) || controllerPaths.includes(path))])].sort();
+  const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
+  const commandPlanDigest = graphCommandPlanDigest(policyMetadata);
+  const evidenceContractDigest = graphEvidenceContractDigest(evidenceContract);
+  const metadata = {
+    version: "forgedock.relation-graph/v1" as const,
+    baseSha: graph.baseSha,
+    graphDigest: graph.graphDigest,
+    configDigest,
+    closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds: closure.invariantIds, commandIds: closure.commandIds }),
+    commandPlanDigest,
+    evidenceContractDigest,
+    writablePaths,
+    evidencePaths: closure.evidencePaths,
+    invariantIds: closure.invariantIds,
+    commandIds: closure.commandIds,
+  };
+  return {
+    metadata,
+    checkpoint: relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, closureDigest: metadata.closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest }),
   };
 }
 
@@ -582,11 +649,22 @@ function verificationCommandIdentityDigest(command: Pick<VerificationCommand, "c
 }
 /** Materialize the exact bounded command plan selected by one frozen packet. */
 export function selectPacketVerificationCommands(
-  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements" | "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> & Partial<Pick<BuildPacketPayload, "acceptanceCriteria" | "controllerGates" | "invariantMatrices" | "evidencePaths" | "evidenceContract">>,
+  packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements" | "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> & Partial<Pick<BuildPacketPayload, "acceptanceCriteria" | "controllerGates" | "invariantMatrices" | "evidencePaths" | "evidenceContract" | "relationGraph">>,
   catalog: readonly Omit<VerificationCommand, "cwd">[],
   baseSha: string,
 ): Array<Omit<VerificationCommand, "cwd">> {
   if (!/^[0-9a-f]{7,64}$/i.test(baseSha)) throw new Error(`Cannot freeze verification plan for invalid base SHA ${baseSha}`);
+  if (packet.relationGraph) {
+    if (packet.relationGraph.baseSha.toLowerCase() !== baseSha.toLowerCase()) throw new Error("[graph-drift] Frozen relation graph base SHA differs from selected revision");
+    const closureDigest = digestRelation({
+      graphDigest: packet.relationGraph.graphDigest,
+      writablePaths: [...packet.relationGraph.writablePaths].sort(),
+      evidencePaths: [...packet.relationGraph.evidencePaths].sort(),
+      invariantIds: [...packet.relationGraph.invariantIds].sort(),
+      commandIds: [...packet.relationGraph.commandIds].sort(),
+    });
+    if (closureDigest !== packet.relationGraph.closureDigest) throw new Error("[graph-drift] Frozen relation graph closure digest does not match its paths");
+  }
   const commandById = new Map<string, Omit<VerificationCommand, "cwd">>();
   for (const command of catalog) {
     if (commandById.has(command.id)) throw new Error(`Verification catalog contains duplicate command ID '${command.id}'`);
