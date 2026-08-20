@@ -9,7 +9,7 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { recoverConflictingRevision } from "./conflict-recovery.js";
+import { recoverConflictingRevision, resolvePacketConflictsForPacket } from "./conflict-recovery.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { resumeConflictRecoveryWorkOn } from "./work-on.js";
 
@@ -460,5 +460,47 @@ describe("approved target-conflict recovery", () => {
     assert.equal(retried.run.state, "reviewing");
     assert.equal(git.pushCalls, 2, "typed publication restart retries the existing delivery safely");
     assert.ok(!(await runs.history(run.runId)).some((record) => record.event === "VERIFICATION_FAILED"));
+  });
+});
+
+describe("pre-review packet conflict admission", () => {
+  it("resolves packet-owned conflicts without a PR or prior verdict", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await blockedRun(runs);
+    const values = fixture(run);
+    const runtime = new FakeAgentRuntime([{
+      summary: "resolved before review",
+      changedPaths: ["src/allowed.ts"],
+      criterionCoverage: [{ criterion: "works", implementation: "target-compatible resolution" }],
+      decisions: [],
+      residualRisks: [],
+    }]);
+    const result = await resolvePacketConflictsForPacket({
+      run, intent: values.intent, investigation: values.investigation, packet: values.packet,
+      buildResult: values.buildResult, workspace: { ...workspace }, conflictPaths: ["src/allowed.ts"],
+    }, {
+      runtime, artifacts, runs, git: new FakeGit(["src/allowed.ts"], targetSha),
+      verifier: { run: async () => [passed] }, host: hostFor(targetSha),
+    });
+    assert.deepEqual(result.changedPaths, ["src/allowed.ts"]);
+    assert.equal(runtime.tasks.length, 1);
+    assert.doesNotMatch(JSON.stringify(runtime.tasks[0]?.context ?? []), /approve|mergeGate/i);
+  });
+
+  it("rejects packet conflict admission outside frozen scope before dispatch", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await blockedRun(runs);
+    const values = fixture(run);
+    const runtime = new FakeAgentRuntime([]);
+    await assert.rejects(() => resolvePacketConflictsForPacket({
+      run, intent: values.intent, investigation: values.investigation, packet: values.packet,
+      buildResult: values.buildResult, workspace: { ...workspace }, conflictPaths: ["src/outside.ts"],
+    }, {
+      runtime, artifacts, runs, git: new FakeGit(["src/outside.ts"], targetSha),
+      verifier: { run: async () => [passed] }, host: hostFor(targetSha),
+    }), /outside the Build Packet/);
+    assert.equal(runtime.tasks.length, 0);
   });
 });

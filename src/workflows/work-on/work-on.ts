@@ -31,7 +31,7 @@ import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
 import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, deliveryContentDigest, type VerificationResult } from "./verify.js";
-import { recoverConflictingRevision, resolvePacketConflicts } from "./conflict-recovery.js";
+import { recoverConflictingRevision, resolvePacketConflicts, resolvePacketConflictsForPacket } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { makePullRequestCiGreen } from "../review-pr/fix-ci.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
@@ -122,15 +122,46 @@ export async function resumeTargetAdvanceWorkOn(
   await dependencies.runs.commit(run.version, resumed.state, resumed.record);
   run = resumed.state;
   const targetRepository = pullRequest?.repo ?? input.run.subject.repo;
-  const targetSha = await dependencies.host.getBranchHead(targetRepository, checkpoint.targetBranch);
+  const getBranchHead = dependencies.host.getBranchHead;
+  const scheduleTargetRetry = async (error: unknown, phase: "integrated" | "verified" | "target-read"): Promise<never> => {
+    const reason = error instanceof Error ? error.message : String(error);
+    const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => undefined);
+    const observedTargetSha = observed && /^[0-9a-f]{7,64}$/i.test(observed) ? observed : checkpoint.sourceBaseSha;
+    const attempt = checkpoint.attempt.number + 1;
+    await persistTargetAdvanceCheckpoint({
+      run, packet: input.packet, buildResult: input.buildResult, workspace: input.workspace,
+      targetBranch: checkpoint.targetBranch, observedTargetSha, phase,
+      attempt, maxAttempts: checkpoint.attempt.max, artifacts: dependencies.artifacts,
+    });
+    if (attempt > checkpoint.attempt.max) {
+      const blocked = transition(run, "BLOCK", { reason: `Target advancement recovery exhausted after ${checkpoint.attempt.max} attempts: ${reason}` });
+      await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+      throw new WorkflowExecutionError(blocked.record.reason ?? reason, blocked.state, { cause: error, recoverable: false });
+    }
+    const recovery = transition(run, "TARGET_ADVANCE_DETECTED", { reason });
+    const wait = transition(recovery.state, "RETRY_WAIT_SCHEDULED", { reason });
+    await dependencies.runs.commit(run.version, recovery.state, recovery.record);
+    await dependencies.runs.commit(recovery.state.version, wait.state, wait.record);
+    throw new WorkflowExecutionError(reason, wait.state, { cause: error, recoverable: true });
+  };
+  const targetSha = await getBranchHead(targetRepository, checkpoint.targetBranch);
   if (!/^[0-9a-f]{7,64}$/i.test(targetSha)) throw new Error("Authoritative target read is not a Git SHA");
   if (targetSha.toLowerCase() === checkpoint.sourceBaseSha.toLowerCase()) {
     throw new Error(`Target ${checkpoint.targetBranch} has not advanced beyond ${checkpoint.sourceBaseSha}`);
   }
-  const integrated = await dependencies.git.integrateRemoteBase(input.workspace, {
-    expectedHeadSha: checkpoint.sourceHeadSha,
-    expectedBaseSha: targetSha,
-  });
+  let integrated;
+  try {
+    integrated = await dependencies.git.integrateRemoteBase(input.workspace, {
+      expectedHeadSha: checkpoint.sourceHeadSha,
+      expectedBaseSha: targetSha,
+    });
+  } catch (error) {
+    const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => targetSha);
+    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase()) {
+      return scheduleTargetRetry(error, "integrated");
+    }
+    throw error;
+  }
   let workspace = integrated.workspace;
   await persistTargetAdvanceCheckpoint({
     run, packet: input.packet, buildResult: input.buildResult, workspace,
@@ -143,29 +174,40 @@ export async function resumeTargetAdvanceWorkOn(
   const outside = conflictPaths.filter((path) => !expectedPaths.has(path));
   if (outside.length) throw new Error(`Target merge conflicts outside frozen packet: ${outside.join(", ")}`);
   if (conflictPaths.length) {
-    if (!pullRequest) throw new Error("Conflict recovery without an existing PR requires a packet-scoped resolver admission checkpoint");
-    const existingPullRequest = pullRequest;
-    if (!dependencies.git.unmergedPaths || !dependencies.git.stageConflictResolutions || !input.priorVerdict) {
-      throw new Error("Target conflict recovery cannot prove resolver admission or index completion");
-    }
-    const resolved = await resolvePacketConflicts({
-      input: {
+    const resolved = await (pullRequest
+      ? (!dependencies.git.unmergedPaths || !dependencies.git.stageConflictResolutions || !input.priorVerdict
+        ? (() => { throw new Error("Target conflict recovery cannot prove resolver admission or index completion"); })()
+        : resolvePacketConflicts({
+          input: {
+            run, intent: input.intent, investigation: input.investigation, packet: input.packet,
+            buildResult: input.buildResult, verdict: input.priorVerdict, pullRequest,
+            workspace, commands: input.verification.map((command) => ({ ...command, cwd: workspace.path })),
+            mergeGate: { repo: pullRequest.repo, mergeability: "conflicting", mergeable: false, headSha: checkpoint.sourceHeadSha, baseBranch: checkpoint.targetBranch, pullRequest: pullRequest.number, requiredChecks: [], observedAt: new Date().toISOString() },
+            ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          },
+          workspace,
+          conflictPaths,
+          dependencies: {
+            runtime: dependencies.runtime, artifacts: dependencies.artifacts, runs: dependencies.runs,
+            git: dependencies.git, verifier: dependencies.verifier, host: dependencies.host,
+            ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
+          },
+        }))
+      : resolvePacketConflictsForPacket({
         run, intent: input.intent, investigation: input.investigation, packet: input.packet,
-        buildResult: input.buildResult, verdict: input.priorVerdict, pullRequest: existingPullRequest,
-        workspace, commands: input.verification.map((command) => ({ ...command, cwd: workspace.path })),
-        mergeGate: { repo: existingPullRequest.repo, mergeability: "conflicting", mergeable: false, headSha: checkpoint.sourceHeadSha, baseBranch: checkpoint.targetBranch, pullRequest: existingPullRequest.number, requiredChecks: [], observedAt: new Date().toISOString() },
+        buildResult: input.buildResult, workspace, conflictPaths,
+        ...(input.priorVerdict !== undefined ? { priorVerdict: input.priorVerdict } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      },
-      workspace,
-      conflictPaths,
-      dependencies: {
+      }, {
         runtime: dependencies.runtime, artifacts: dependencies.artifacts, runs: dependencies.runs,
         git: dependencies.git, verifier: dependencies.verifier, host: dependencies.host,
         ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
-      },
-    });
+      }));
     const reported = canonicalizeConcreteScopePaths(resolved.changedPaths).sort();
     if (JSON.stringify(reported) !== JSON.stringify(conflictPaths)) throw new Error("Conflict resolver report does not exactly match unmerged paths");
+    if (!dependencies.git.stageConflictResolutions || !dependencies.git.unmergedPaths) {
+      throw new Error("Target conflict recovery cannot prove index completion");
+    }
     await dependencies.git.stageConflictResolutions(workspace, conflictPaths);
     const unresolved = canonicalizeConcreteScopePaths(await dependencies.git.unmergedPaths(workspace)).sort();
     if (unresolved.length) throw new Error(`Unmerged paths remain after packet conflict resolution: ${unresolved.join(", ")}`);
@@ -184,25 +226,24 @@ export async function resumeTargetAdvanceWorkOn(
     : input.verification;
   const frozenVerification = selectPacketVerificationCommands(input.packet.payload, catalog, targetSha);
   const commands = frozenVerification.map((command) => ({ ...command, cwd: workspace.path }));
-  const checks = await dependencies.verifier.run(commands, input.signal);
+  let checks: CheckResult[];
+  try {
+    checks = await dependencies.verifier.run(commands, input.signal);
+  } catch (error) {
+    const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => targetSha);
+    if (error instanceof TargetBranchAdvancedError || observed.toLowerCase() !== targetSha.toLowerCase()) {
+      return scheduleTargetRetry(error, "verified");
+    }
+    throw error;
+  }
   if (commands.some((command, index) => command.required && checks[index]?.status !== "passed")) throw new Error("Frozen verification plan failed after target recovery");
   let postTarget: string;
   try {
-    postTarget = await dependencies.host.getBranchHead(targetRepository, checkpoint.targetBranch);
+    postTarget = await getBranchHead(targetRepository, checkpoint.targetBranch);
     if (postTarget.toLowerCase() !== targetSha.toLowerCase()) throw new TargetBranchAdvancedError(checkpoint.targetBranch, targetSha, postTarget);
   } catch (error) {
-    if (!(error instanceof TargetBranchAdvancedError)) throw error;
-    await persistTargetAdvanceCheckpoint({
-      run, packet: input.packet, buildResult: input.buildResult, workspace,
-      targetBranch: checkpoint.targetBranch, observedTargetSha: error.observedBaseSha,
-      phase: "target-read", attempt: checkpoint.attempt.number + 1, maxAttempts: checkpoint.attempt.max,
-      artifacts: dependencies.artifacts,
-    });
-    const recovery = transition(run, "TARGET_ADVANCE_DETECTED", { reason: error.message });
-    const wait = transition(recovery.state, "RETRY_WAIT_SCHEDULED", { reason: error.message });
-    await dependencies.runs.commit(run.version, recovery.state, recovery.record);
-    await dependencies.runs.commit(recovery.state.version, wait.state, wait.record);
-    throw new WorkflowExecutionError(error.message, wait.state, { cause: error, recoverable: true });
+    if (error instanceof TargetBranchAdvancedError) return scheduleTargetRetry(error, "target-read");
+    throw error;
   }
   const postHead = await dependencies.git.head(workspace);
   if (postHead.toLowerCase() !== newHead.toLowerCase() || (await dependencies.git.changedPaths(workspace)).length) throw new Error("Retained workspace mutated during target recovery verification");
@@ -216,7 +257,7 @@ export async function resumeTargetAdvanceWorkOn(
       checkpoint: "verified-commit", branch: workspace.branch, targetBranch: checkpoint.targetBranch, baseSha: targetSha,
       parentHeadSha: checkpoint.sourceHeadSha, changedPaths, pendingChangedPaths: changedPaths,
       verifiedContentDigest: freshContentDigest, commitMessage: `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`,
-      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: [],
+      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: freshTargetRecoveryEvidence(input.packet, input.buildResult, checks, changedPaths, expectedPaths),
       checks, decisions: [`Target recovery rebased ${checkpoint.sourceHeadSha} onto ${targetSha}.`], residualRisks: [],
     },
   });
@@ -245,7 +286,41 @@ export async function resumeTargetAdvanceWorkOn(
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
   return { run: reviewed.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
 }
-
+function freshTargetRecoveryEvidence(
+  packet: DurableArtifact<"BuildPacket">,
+  sourceBuild: DurableArtifact<"BuildResult">,
+  checks: readonly CheckResult[],
+  changedPaths: readonly string[],
+  expectedPaths: ReadonlySet<string>,
+): DurableArtifact<"VerificationCheckpoint">["payload"]["acceptanceEvidence"] {
+  const source = sourceBuild.payload.acceptanceEvidence;
+  if (source.length !== packet.payload.acceptanceCriteria.length) {
+    throw new Error("Target recovery cannot establish fresh criterion evidence from an incomplete prior evidence plan");
+  }
+  const passedCommands = new Set(checks.filter((check) => check.status === "passed").map((check) => check.commandId).filter((id): id is string => id !== undefined));
+  const observedPaths = new Set(changedPaths);
+  return packet.payload.acceptanceCriteria.map((criterion, index) => {
+    const criterionId = `criterion-${index + 1}`;
+    const evidence = source.find((item) => item.criterionId === criterionId && item.criterion === criterion && item.status === "passed");
+    if (!evidence || !evidence.evidence.trim() || !evidence.anchors) {
+      throw new Error(`Target recovery cannot revalidate criterion evidence for ${criterionId} without semantic anchors`);
+    }
+    const anchors = evidence.anchors;
+    if (anchors.paths.some((path) => !expectedPaths.has(path) || !observedPaths.has(path))) {
+      throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors`);
+    }
+    if (anchors.verificationCommandIds.some((id) => !passedCommands.has(id))) {
+      throw new Error(`Target recovery criterion ${criterionId} has stale verification command anchors`);
+    }
+    return {
+      criterionId,
+      criterion,
+      status: "passed" as const,
+      evidence: `${evidence.evidence} Fresh controller rerun at the recovered target base passed.`,
+      anchors,
+    };
+  });
+}
 
 interface ScopeExpansionOptions {
   scopeExpansion?: "scope-locked" | "recursive";

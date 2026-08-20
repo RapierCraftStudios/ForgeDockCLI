@@ -49,6 +49,56 @@ export interface ConflictRecoveryResult {
 }
 
 /**
+ * Minimal packet-scoped resolver admission used before a delivery has a PR or
+ * an authoritative review verdict. This context deliberately contains no
+ * merge-gate or approval authority; it only permits the remediator to repair
+ * the exact regular-text paths reported by the Git adapter.
+ */
+export interface PacketConflictResolutionInput {
+  run: RunState;
+  intent: DurableArtifact<"Intent">;
+  investigation: DurableArtifact<"Investigation">;
+  packet: DurableArtifact<"BuildPacket">;
+  buildResult: DurableArtifact<"BuildResult">;
+  workspace: GitWorkspace;
+  conflictPaths: readonly string[];
+  priorVerdict?: DurableArtifact<"ReviewVerdict">;
+  provider?: string;
+  model?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Resolve packet-owned merge conflicts without requiring a PR, review verdict,
+ * or merge gate. Publication and fresh controller verification remain owned by
+ * the caller. The optional verdict is context only and is never treated as
+ * admission evidence.
+ */
+export async function resolvePacketConflictsForPacket(
+  input: PacketConflictResolutionInput,
+  dependencies: ConflictRecoveryDependencies,
+): Promise<BuilderSubmission> {
+  const conflictPaths = canonicalizeConcreteScopePaths(input.conflictPaths).sort();
+  if (!conflictPaths.length) throw new Error("Packet conflict resolver requires at least one authorized path");
+  const expected = new Set(canonicalizeConcreteScopePaths(input.packet.payload.expectedPaths));
+  const outside = conflictPaths.filter((path) => !expected.has(path));
+  if (outside.length) throw new Error(`Packet conflict resolver received paths outside the Build Packet: ${outside.join(", ")}`);
+  return runPacketConflictResolver({
+    run: input.run,
+    intent: input.intent,
+    investigation: input.investigation,
+    packet: input.packet,
+    buildResult: input.buildResult,
+    workspace: input.workspace,
+    conflictPaths,
+    ...(input.priorVerdict !== undefined ? { priorVerdict: input.priorVerdict } : {}),
+    ...(input.provider !== undefined ? { provider: input.provider } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  }, dependencies);
+}
+
+/**
  * Adapter-owned merge checkpoint state. The Git adapter verifies this state
  * from exact merge parents; the workflow only decides whether a second local
  * commit would be a duplicate.
@@ -350,26 +400,51 @@ export async function resolvePacketConflicts(input: {
   conflictPaths: readonly string[];
   dependencies: ConflictRecoveryDependencies;
 }): Promise<BuilderSubmission> {
-  const { input: recovery, workspace, conflictPaths, dependencies } = input;
+  return runPacketConflictResolver({
+    run: input.input.run,
+    intent: input.input.intent,
+    investigation: input.input.investigation,
+    packet: input.input.packet,
+    buildResult: input.input.buildResult,
+    workspace: input.workspace,
+    conflictPaths: input.conflictPaths,
+    priorVerdict: input.input.verdict,
+    ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),
+    ...(input.input.model !== undefined ? { model: input.input.model } : {}),
+    ...(input.input.signal !== undefined ? { signal: input.input.signal } : {}),
+  }, input.dependencies);
+}
+
+type PacketConflictResolverExecution = Omit<PacketConflictResolutionInput, "conflictPaths"> & {
+  conflictPaths: readonly string[];
+};
+
+async function runPacketConflictResolver(
+  recovery: PacketConflictResolverExecution,
+  dependencies: ConflictRecoveryDependencies,
+): Promise<BuilderSubmission> {
+  const context: Array<DurableArtifact<"Intent"> | DurableArtifact<"Investigation"> | DurableArtifact<"BuildPacket"> | DurableArtifact<"BuildResult"> | DurableArtifact<"ReviewVerdict">> = [recovery.intent, recovery.investigation, recovery.packet, recovery.buildResult];
+  if (recovery.priorVerdict !== undefined) context.push(recovery.priorVerdict);
   const result = await dependencies.runtime.run<BuilderSubmission>({
     id: `${recovery.run.runId}:conflict-resolver:${recovery.run.attempt}`,
     role: "remediator",
-    objective: `Resolve only the target-branch merge conflicts in ${conflictPaths.join(", ")} while preserving the frozen Build Packet and approved delivery intent.`,
+    objective: `Resolve only the target-branch merge conflicts in ${recovery.conflictPaths.join(", ")} while preserving the frozen Build Packet and delivery intent.`,
     instructions: [
       "The controller has an exact target merge in progress. Resolve only the listed unmerged paths; do not broaden scope.",
-      `Authorized unmerged paths: ${conflictPaths.join(", ")}`,
+      `Authorized unmerged paths: ${recovery.conflictPaths.join(", ")}`,
       "Do not invoke GitHub, run git commands, commit, push, merge, or alter workflow state. The controller owns the merge commit and publication.",
-      "Preserve the Build Packet acceptance criteria and the approved delivery behavior. Resolve conflicts using the target changes only where required for a coherent tested revision.",
+      "Do not infer or invent review approval, merge-gate, or acceptance authority. The controller will perform fresh verification and review.",
+      "Preserve the Build Packet acceptance criteria and delivery behavior. Resolve conflicts using target changes only where required for a coherent tested revision.",
       "Before submitting, inspect the complete diff and report exactly the authorized unmerged paths in changedPaths.",
     ].join("\n"),
-    context: [recovery.intent, recovery.investigation, recovery.packet, recovery.buildResult, recovery.verdict],
+    context,
     workspace: {
-      cwd: workspace.path,
+      cwd: recovery.workspace.path,
       mode: "write",
       scope: scopeManifestFor("remediation", {
-        affectedFiles: conflictPaths,
-        writePaths: conflictPaths,
-        metadataRoots: [...STANDARD_SCOPE_METADATA_ROOTS, ...scopeDiscoveryRoots(conflictPaths)],
+        affectedFiles: recovery.conflictPaths,
+        writePaths: recovery.conflictPaths,
+        metadataRoots: [...STANDARD_SCOPE_METADATA_ROOTS, ...scopeDiscoveryRoots(recovery.conflictPaths)],
       }),
     },
     tools: ["read", "grep", "find", "ls", "edit", "write"],
