@@ -1536,11 +1536,17 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         const dagIds = new Set(dags.map((dag) => dag.orchestrationId));
         const nodeSelection = selectResetDagNodes(selectedDagRecords, target);
         const dagRunIds = new Set(nodeSelection.selected.flatMap(({ node }) => resetNodeRunIds(node)));
-        const preservedNodes = nodeSelection.preserved.map(({ dag, node, reason }) => ({
-          orchestrationId: dag.orchestrationId, nodeId: node.id, issue: node.issue,
-          memberIssues: [...new Set([node.issue, ...(node.memberIssues ?? [])])].sort((a, b) => a - b),
-          status: node.status, runIds: resetNodeRunIds(node), reason,
-        }));
+        const preservedNodes = nodeSelection.preserved.map(({ dag, node, reason }) => {
+          const memberIssues = [...new Set([node.issue, ...(node.memberIssues ?? [])])].sort((a, b) => a - b);
+          const inferredRunIds = allRuns
+            .filter((run) => run.subject.repo.toLowerCase() === dag.repository.toLowerCase() && memberIssues.includes(run.subject.issue ?? -1))
+            .map((run) => run.runId);
+          return {
+            orchestrationId: dag.orchestrationId, nodeId: node.id, issue: node.issue,
+            memberIssues, status: node.status,
+            runIds: [...new Set([...resetNodeRunIds(node), ...inferredRunIds])].sort(), reason,
+          };
+        });
         const preservedRunIds = [...new Set(preservedNodes.flatMap((node) => node.runIds))].sort();
         const selectedNodeRunIds = new Set(dagRunIds);
         if (preservedRunIds.some((runId) => selectedNodeRunIds.has(runId))) {
@@ -1549,8 +1555,10 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         const missingPreservedRuns = preservedRunIds.filter((runId) => !allRuns.some((run) => run.runId === runId));
         if (missingPreservedRuns.length) throw new Error(`Reset preservation evidence is incomplete; run rows were not found: ${missingPreservedRuns.join(", ")}`);
         const preservedArtifactIds = [...new Set(store.listArtifactsForRuns(preservedRunIds).map((artifact) => artifact.artifactId))].sort();
-        const runs = allRuns.filter((run) => dagRunIds.has(run.runId)
-          || (!selectedDagRecords.length && run.subject.repo.toLowerCase() === target.repo.toLowerCase() && target.issueNumbers.includes(run.subject.issue ?? -1)))
+        const selectedIssuesFromNodes = new Set(nodeSelection.selected.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]));
+        const preservedRunSet = new Set(preservedRunIds);
+        const runs = allRuns.filter((run) => !preservedRunSet.has(run.runId) && (dagRunIds.has(run.runId)
+          || (run.subject.repo.toLowerCase() === target.repo.toLowerCase() && selectedIssuesFromNodes.has(run.subject.issue ?? -1))))
           .map((run) => ({ runId: run.runId, version: run.version, state: run.state }));
         const runIds = runs.map((run) => run.runId);
         const selectedRunRecords = allRuns.filter((run) => runIds.includes(run.runId));
