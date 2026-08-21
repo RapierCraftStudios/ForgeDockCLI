@@ -925,8 +925,9 @@ export function selectPacketVerificationCommands(
     }
   }
   const actualTargets = selected.map((command) => ({ id: command.id, targets: [...(command.targets ?? [])] }));
-  if (packet.verificationCommandTargets
-    && JSON.stringify(actualTargets) !== JSON.stringify(packet.verificationCommandTargets)) {
+  const frozenExecutableTargets = packet.verificationCommandTargets?.map(({ id, targets }) => ({ id, targets: [...targets] }));
+  if (frozenExecutableTargets
+    && JSON.stringify(actualTargets) !== JSON.stringify(frozenExecutableTargets)) {
     policyDiagnostics.push("[target-drift] Frozen verification command targets do not match the executable packet-selected plan");
   }
   if (!hasFrozenEvidenceContract) {

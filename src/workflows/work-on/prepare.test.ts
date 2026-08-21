@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -409,6 +410,8 @@ describe("Build Packet preparation", () => {
     }];
     const requirements = [{ kind: "command" as const, id: "targeted", criterionIds: ["criterion-1"], rationale: "Regression" }];
     const targets = ["dist/a.test.js"];
+    const sourceTargets = ["src/a.test.ts"];
+    const targetDigest = createHash("sha256").update(JSON.stringify({ sourceTargets, targets })).digest("hex");
     const contract = deriveEvidenceContract({
       acceptanceCriteria: ["Regression"], verificationRequirements: requirements, controllerGates: [],
       commands: [{ id: "targeted", evidenceCapability: "targeted-test", targets }], invariantMatrices: [],
@@ -416,7 +419,7 @@ describe("Build Packet preparation", () => {
     }).contract;
     const packet = {
       acceptanceCriteria: ["Regression"], expectedPaths: ["src/a.test.ts"], verificationRequirements: requirements,
-      verificationPolicyVersion: "forgedock.verification/v2", verificationCommandTargets: [{ id: "targeted", targets }],
+      verificationPolicyVersion: "forgedock.verification/v2", verificationCommandTargets: [{ id: "targeted", sourceTargets, targets, targetDigest }],
       controllerGates: [], invariantMatrices: [], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }],
       evidenceContract: contract,
     };
@@ -426,6 +429,7 @@ describe("Build Packet preparation", () => {
     for (const changed of [
       { ...packet, evidenceContract: { ...contract, criteria: contract.criteria.map((criterion) => ({ ...criterion, semanticCommandIds: [] })) } },
       { ...packet, verificationCommandTargets: [{ id: "targeted", targets: ["dist/other.test.js"] }] },
+      { ...packet, verificationCommandTargets: [{ id: "targeted", sourceTargets, targets, targetDigest: "0".repeat(64) }] },
       { ...packet, verificationRequirements: [{ ...requirements[0]!, id: "other" }] },
       { ...packet, evidencePaths: [{ path: "README.md", criterionIds: ["criterion-1"], role: "artifact" as const }] },
       { ...packet, invariantMatrices: [{ id: "matrix-1", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "mode", values: ["safe"] }], testId: "invariant:matrix-1" }] },
