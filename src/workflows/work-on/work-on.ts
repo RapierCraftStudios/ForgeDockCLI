@@ -580,6 +580,10 @@ export async function resumeTargetAdvanceWorkOn(
       && (artifact.payload.status === "failed" || artifact.payload.status === "blocked"));
     const current = await guarded.runs.load(input.run.runId) ?? input.run;
     if (existing) {
+      // Preserve a typed terminal error already produced by the inner recovery
+      // path (notably target-advance-exhausted); only synthesize lineage when
+      // a restart re-enters the same checkpoint with a raw exception.
+      if (error instanceof WorkflowExecutionError && !error.recoverable) throw error;
       // A restart may re-enter the same checkpoint after the terminal append;
       // preserve exactly one Outcome and return the original cause/lineage.
       throw new WorkflowExecutionError(existing.payload.reason, current, {
