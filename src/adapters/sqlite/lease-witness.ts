@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -89,6 +90,9 @@ export function createSignedLeaseCheckpoint(epoch: number, privateKey: KeyLike, 
 
 const LOCAL_WITNESS_SCHEMA = "forgedock.lease-witness-local/v1" as const;
 const LOCAL_WITNESS_CONFIG = join(".forgedock", "lease-witness.json");
+const LOCAL_WITNESS_PUBLICATION_RETRY_ATTEMPTS = 50;
+const LOCAL_WITNESS_PUBLICATION_RETRY_DELAY_MS = 5;
+const LOCAL_WITNESS_PUBLICATION_RACE = Symbol("forgedock lease-witness publication race");
 
 interface LocalLeaseWitnessReference {
   schema: typeof LOCAL_WITNESS_SCHEMA;
@@ -192,6 +196,11 @@ export function createOrBootstrapLocalLeaseWitness(
   } catch (error) {
     // A concurrent first-use process may have completed bootstrap after our
     // initial lookup. Adopt it only if the complete witness now verifies.
+    // The directory publication can precede the checkout reference by a
+    // small, intentional window, so only that marked EEXIST is retried.
+    if (isWitnessDirectoryPublicationRace(error)) {
+      return retryLocalWitnessPublication(cwd, options, error);
+    }
     const raced = createConfiguredLeaseWitness(cwd, options);
     if (raced) return raced;
     throw error;
@@ -239,12 +248,21 @@ export function bootstrapLocalLeaseWitness(
     // retained witness one epoch newer before the database has any history.
     writeCheckpoint(temporaryCheckpoint, createSignedLeaseCheckpoint(0, privateKey, paths.keyId));
     if (witness.verify().state !== "verified") throw new LeaseContinuityError("newly seeded local witness could not be verified");
-    renameSync(temporaryDirectory, paths.witnessDirectory);
+    try {
+      renameSync(temporaryDirectory, paths.witnessDirectory);
+    } catch (error) {
+      // Preserve the original fs error while identifying this exact expected
+      // publication race to the bounded first-use retry path.
+      if (isErrnoException(error) && error.code === "EEXIST") {
+        Object.defineProperty(error, LOCAL_WITNESS_PUBLICATION_RACE, { value: true });
+      }
+      throw error;
+    }
     installed = true;
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
 
     const reference = localWitnessReference(paths);
-    writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    publishLocalWitnessReference(paths.configPath, reference);
     return localWitnessBootstrapResult(paths, false);
   } catch (error) {
     if (existsSync(temporaryDirectory)) rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -274,7 +292,7 @@ function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): 
   });
 
   const reference = localWitnessReference(paths);
-  writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  publishLocalWitnessReference(paths.configPath, reference);
   return localWitnessBootstrapResult(paths, true);
 }
 
@@ -327,6 +345,49 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function publishLocalWitnessReference(configPath: string, reference: LocalLeaseWitnessReference): void {
+  // A wx destination is visible before writeFileSync has finished. Write the
+  // complete reference under a unique name first, then create the checkout
+  // name with linkSync. linkSync is an atomic no-replace operation on the same
+  // filesystem, so readers see either no reference or a complete reference;
+  // an existing reference is never overwritten.
+  const temporaryPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(reference, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    linkSync(temporaryPath, configPath);
+  } finally {
+    if (existsSync(temporaryPath)) rmSync(temporaryPath, { force: true });
+  }
+}
+
+function retryLocalWitnessPublication(
+  cwd: string,
+  options: LocalLeaseWitnessOptions,
+  originalError: unknown,
+): RetainedCheckpointWitness {
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < LOCAL_WITNESS_PUBLICATION_RETRY_ATTEMPTS; attempt += 1) {
+    if (attempt > 0) Atomics.wait(waiter, 0, 0, LOCAL_WITNESS_PUBLICATION_RETRY_DELAY_MS);
+    const configured = createConfiguredLeaseWitness(cwd, options);
+    if (configured) return configured;
+  }
+  // Do not replace the bootstrap failure with a timeout or an unverified
+  // directory; callers retain the original fail-closed error.
+  throw originalError;
+}
+
+function isWitnessDirectoryPublicationRace(error: unknown): boolean {
+  return isErrnoException(error) && error[LOCAL_WITNESS_PUBLICATION_RACE] === true;
+}
+
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException & Record<typeof LOCAL_WITNESS_PUBLICATION_RACE, boolean> {
+  return typeof error === "object" && error !== null && "code" in error;
 }
 
 function payload(epoch: number, keyId: string): Buffer {
