@@ -8,7 +8,7 @@ import { reconcileArtifacts } from "../../core/state/reconcile.js";
 import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
-import type { CheckResult, VerificationRunner } from "../../core/ports/verification.js";
+import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import type { AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
@@ -290,6 +290,75 @@ const acceptAdjudication = (task: AgentTask<unknown>) => ({
 });
 
 describe("complete work-on trajectory", () => {
+  it("resolves the verification catalog from the fetched workspace base before freezing the packet", async () => {
+    const baseB = "b".repeat(40);
+    class FetchedBaseGit extends EndToEndGit {
+      override async create(input: { baseRef: string }): Promise<GitWorkspace> {
+        this.createdFrom = input.baseRef;
+        return { ...workspace, baseSha: baseB };
+      }
+      override async fastForwardToRemoteTarget(current: GitWorkspace): Promise<GitWorkspace> {
+        this.refreshes += 1;
+        return { ...current, baseSha: baseB };
+      }
+    }
+    class FetchedBaseHost extends EndToEndHost {
+      override async getBranchHead(): Promise<string> { return baseB; }
+    }
+    class CapturingVerifier implements VerificationRunner {
+      commands: string[][] = [];
+      async run(commands: readonly Omit<VerificationCommand, "cwd">[]): Promise<CheckResult[]> {
+        this.commands = commands.map((command) => [command.command, ...command.args]);
+        return commands.map((command) => ({
+          command: [command.command, ...command.args].join(" "), commandId: command.id,
+          status: "passed" as const, exitCode: 0, durationMs: 1, outputDigest: "f".repeat(64),
+          planId: command.planId, policyVersion: command.policyVersion,
+          ...(command.targets ? { commandTargets: [...command.targets] } : {}),
+        }));
+      }
+    }
+    const stale = [{
+      id: "test", command: process.execPath, args: ["stale-authority"], timeoutMs: 1_000, required: true,
+      selection: "always" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const,
+      policyVersion: "forgedock.verification/v2", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "fixture" },
+    }];
+    const fresh = [{ ...stale[0]!, args: ["fetched-authority"] }];
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      {
+        ...packet, expectedPaths: ["src/a.js", "src/a.test.ts"], verificationPlan: ["test"],
+        verificationRequirements: [{ kind: "command", id: "test", criterionIds: ["criterion-1"], rationale: "Run targeted regression" }],
+      },
+      submission,
+      { summary: "Approved", findings: [] },
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new FetchedBaseGit();
+    const verifier = new CapturingVerifier();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_fetched_catalog", subject: { repo: "a/b", issue: 426 }, producer: { role: "controller" },
+      payload: { title: "Fetched authority", problem: "Catalog drift", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const result = await workOn({
+      intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: stale,
+      resolveVerificationCatalog: (baseSha) => {
+        assert.equal(baseSha, baseB);
+        return fresh;
+      },
+    }, {
+      runtime, artifacts, runs, git, verifier, host: new FetchedBaseHost(),
+    });
+    assert.equal(result.run.state, "completed");
+    const persisted = artifacts.artifacts.find((artifact) => artifact.kind === "BuildPacket");
+    assert.equal(persisted?.kind, "BuildPacket");
+    if (persisted?.kind === "BuildPacket") {
+      assert.equal(persisted.payload.verificationCommandIdentities?.[0]?.args[0], "fetched-authority");
+    }
+    assert.ok(verifier.commands.some((command) => command.includes("fetched-authority")));
+    assert.equal(verifier.commands.some((command) => command.includes("stale-authority")), false);
+  });
+
   it("rejects a closed issue before creating a fresh workspace or dispatching an agent", async () => {
     const runtime = new FakeAgentRuntime([]);
     const artifacts = new InMemoryArtifactRepository();

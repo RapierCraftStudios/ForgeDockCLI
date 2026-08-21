@@ -830,6 +830,7 @@ export async function workOn(
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   };
   let workspace: GitWorkspace | undefined;
+  let verification = input.verification;
   let run: RunState | undefined;
   let claimPromotionSuspended = false;
   let claimPromotionPending = false;
@@ -859,7 +860,11 @@ export async function workOn(
       baseRef: `origin/${deliveryBranch}`,
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
-    await dependencies.verifier.recoverOperationalOutput?.(input.verification.map((command) => ({ ...command, cwd: workspace!.path })));
+    if (input.resolveVerificationCatalog) {
+      if (!workspace.baseSha) throw new Error("Workspace creation did not return an exact base SHA for verification catalog resolution");
+      verification = await input.resolveVerificationCatalog(workspace.baseSha);
+    }
+    await dependencies.verifier.recoverOperationalOutput?.(verification.map((command) => ({ ...command, cwd: workspace!.path })));
     const laneTarget = input.parentRemediation
       ? { ...runTargetForLane(input.lane, input.productionTarget), targetBranch: input.parentRemediation.parentBranch }
       : runTargetForLane(input.lane, input.productionTarget);
@@ -907,7 +912,7 @@ export async function workOn(
       ...runtimeOptions,
       ...planningOptions,
       verificationCatalog: {
-        commands: input.verification.map((command) => ({ ...command })),
+        commands: verification.map((command) => ({ ...command })),
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
@@ -922,7 +927,7 @@ export async function workOn(
       packet: prepared.packet,
       workspace,
       baseBranch: deliveryBranch,
-      verification: input.verification,
+      verification,
       ...(input.resolveVerificationCatalog !== undefined ? { resolveVerificationCatalog: input.resolveVerificationCatalog } : {}),
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
@@ -1025,6 +1030,7 @@ export async function resumeEarlyWorkOn(
 ): Promise<WorkOnResult> {
   dependencies = guardMutationBoundaries(dependencies);
   let run = input.run;
+  let verification = input.verification;
   let investigation = input.investigation;
   let workspace = input.workspace;
   let claimPromotionSuspended = false;
@@ -1040,6 +1046,10 @@ export async function resumeEarlyWorkOn(
   try {
     assertLease(dependencies);
     assertRunTargetsBranch(run, input.baseBranch);
+    if (input.resolveVerificationCatalog) {
+      if (!workspace.baseSha) throw new Error("Resumed workspace does not retain an exact base SHA for verification catalog resolution");
+      verification = await input.resolveVerificationCatalog(workspace.baseSha);
+    }
     if (input.checkpoint === "investigation") {
       if (run.state !== "investigating") {
         throw new Error(`Investigation checkpoint requires investigating state, found ${run.state}`);
@@ -1105,7 +1115,7 @@ export async function resumeEarlyWorkOn(
       ...(input.planningThinking !== undefined ? { planningThinking: input.planningThinking } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       verificationCatalog: {
-        commands: input.verification.map((command) => ({ ...command })),
+        commands: verification.map((command) => ({ ...command })),
         controllerGates: CONTROLLER_VERIFICATION_GATES,
       },
     }, agentDependencies);
@@ -1120,7 +1130,7 @@ export async function resumeEarlyWorkOn(
       packet: prepared.packet,
       workspace,
       baseBranch: input.baseBranch,
-      verification: input.verification,
+      verification,
       ...(input.resolveVerificationCatalog !== undefined ? { resolveVerificationCatalog: input.resolveVerificationCatalog } : {}),
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
