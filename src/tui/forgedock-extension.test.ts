@@ -18,7 +18,7 @@ import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
-import { decompositionChildNodeId, parseDecompositionNodeId } from "../workflows/orchestrate/decomposition-dependencies.js";
+import { decompositionChildNodeId, decompositionIssueRouteKey, parseDecompositionNodeId } from "../workflows/orchestrate/decomposition-dependencies.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
@@ -2317,6 +2317,7 @@ test("repository-qualified decomposition IDs preserve same-number root and child
   assert.equal(qualified, "issue-owner%2Fparent-7");
   assert.deepEqual(parseDecompositionNodeId(qualified), { repository: "owner/parent", issue: 7 });
   assert.deepEqual(parseDecompositionNodeId("issue-7"), { issue: 7 });
+  assert.notEqual(decompositionIssueRouteKey("owner/root", 7), decompositionIssueRouteKey("owner/parent", 7));
 });
 
 test("visible decomposition keeps non-root repository identity on initial and resumed materialization", async () => {
@@ -2329,7 +2330,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
     runId: "run-visible-remote-decomposition",
     subject: { repo: "owner/work", issue: 42 },
     producer: { role: "controller", runtime: "forgedock" },
-    payload: { status: "decomposed", reason: "Split work", childIssues: ["#7 Child"] },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#7 Child", "#8 Child"] },
   });
   const github = {
     async getRepository(repo: string) {
@@ -2342,7 +2343,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
         repo,
         number: issue,
         title: `Child ${issue}`,
-        body: "",
+        body: issue === 8 ? "## Dependencies\n- #7 Child" : "",
         url: `https://github.test/${repo}/issues/${issue}`,
         state: "OPEN" as const,
         labels: [],
@@ -2410,27 +2411,31 @@ test("visible decomposition keeps non-root repository identity on initial and re
   const initial = await materializeVisibleDecomposition(input);
   assert.deepEqual(repositoryReads, ["owner/work"]);
   assert.deepEqual(artifactReads, [{ repo: "owner/work", issue: 42 }]);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }]);
-  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }, { repo: "owner/work", issue: 8 }]);
+  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }, { repo: "owner/work", branch: "work-main" }]);
   assert.equal(initial?.items[0]?.id, "issue-owner%2Fwork-7");
   assert.notEqual(initial?.items[0]?.id, "issue-7");
   assert.equal(initial?.items[0]?.repository, "owner/work");
   assert.equal(initial?.items[0]?.targetBranch, "work-main");
   assert.deepEqual(initial?.items[0]?.dependencies, []);
+  assert.equal(initial?.items[1]?.id, "issue-owner%2Fwork-8");
+  assert.deepEqual(initial?.items[1]?.dependencies, ["issue-owner%2Fwork-7"]);
 
   repositoryReads.length = 0;
   artifactReads.length = 0;
   issueReads.length = 0;
   branchReads.length = 0;
-  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [7] });
+  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [7, 8] });
   assert.deepEqual(repositoryReads, ["owner/work"]);
   assert.deepEqual(artifactReads, []);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }]);
-  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }, { repo: "owner/work", issue: 8 }]);
+  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }, { repo: "owner/work", branch: "work-main" }]);
   assert.equal(resumed?.items[0]?.id, "issue-owner%2Fwork-7");
   assert.equal(resumed?.items[0]?.repository, "owner/work");
   assert.equal(resumed?.items[0]?.targetBranch, "work-main");
   assert.deepEqual(resumed?.items[0]?.dependencies, []);
+  assert.equal(resumed?.items[1]?.id, "issue-owner%2Fwork-8");
+  assert.deepEqual(resumed?.items[1]?.dependencies, ["issue-owner%2Fwork-7"]);
 });
 
 test("visible decomposition fails closed when a concurrent child read rejects", async () => {

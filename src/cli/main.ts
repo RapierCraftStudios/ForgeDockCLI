@@ -78,6 +78,7 @@ import { discoverLegacyVerificationCommands, discoverVerificationCommands, VERIF
 import { parseOrchestrationIssueNumbers, parseResetDagArguments, parseResetIssueArguments, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
 import {
   decompositionChildNodeId,
+  decompositionIssueRouteKey,
   issueNumberFromDecompositionNodeId,
   mapDecompositionDependencies,
 } from "../workflows/orchestrate/decomposition-dependencies.js";
@@ -167,7 +168,7 @@ async function materializeCliDecomposition(input: {
   node: Readonly<OrchestrationNodeRecord>;
   item: ScheduledWorkItem;
   childIssues?: readonly number[];
-  routedIssues?: Map<number, { issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
+  routedIssues?: Map<string, { issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
 }): Promise<{
   childIssues: readonly number[];
   items: readonly ScheduledWorkItem[];
@@ -206,7 +207,7 @@ async function materializeCliDecomposition(input: {
       input.effective.featurePromotionTarget,
       input.effective.productionTarget,
     );
-    input.routedIssues?.set(issue.number, { issue, lane });
+    input.routedIssues?.set(decompositionIssueRouteKey(effectiveParentRepository, issue.number), { issue, lane });
     const affectedFiles = affectedFilesFromIssueBody(issue.body);
     const labels = issue.labels ?? [];
     const priority = labels.some((label) => /(?:^|:)P0$/i.test(label)) ? 0
@@ -2164,9 +2165,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       await provisionMissingMilestoneBranches(issueSnapshots, repository.defaultBranch, github);
       milestoneBranches = await github.listBranches(repository.repo, "milestone/");
     }
-    const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
+    const routedIssues = new Map<string, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
     for (const issue of issueSnapshots) {
-      routedIssues.set(issue.number, {
+      routedIssues.set(decompositionIssueRouteKey(repository.repo, issue.number), {
         issue,
         lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget, {
           ...(allowMissingMilestoneBranch ? { allowMissingMilestoneBranch: true } : {}),
@@ -2178,8 +2179,8 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       .filter((lane) => lane.resolution !== "planned-canonical")
       .map((lane) => lane.targetBranch))], (branch) => github.getBranchHead(repository.repo, branch));
     const items: BatchableWorkItem[] = baseItems.map((item) => {
-      const observed = requiredIssueRoute(routedIssues, item.issue).issue;
-      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+      const observed = requiredIssueRoute(routedIssues, item.issue, item.repository ?? repository.repo).issue;
+      const lane = requiredIssueRoute(routedIssues, item.issue, item.repository ?? repository.repo).lane;
       const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
       const affectedFiles = affectedFilesFromIssueBody(observed.body);
       const claims = [...new Set([...item.claims, ...affectedFiles])];
@@ -2220,7 +2221,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
   if (argv.includes("--dry-run") || dispatchMode === "preview") {
     process.stdout.write(`ForgeDock orchestration preview · dispatch_mode=${effective.dispatchMode}\n`);
     for (const item of proposed.items) {
-      const route = routedIssues.get(item.issue);
+      const route = routedIssues.get(decompositionIssueRouteKey(item.repository ?? repository.repo, item.issue));
       const lane = route?.lane;
       const target = item.targetBranch ?? lane?.targetBranch ?? "unknown-target";
       process.stdout.write(`${item.id} · ${item.lane ?? lane?.kind ?? "unknown-lane"} → ${target} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
@@ -2274,21 +2275,24 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         groups: assembly.groups,
         items,
         host: github,
-        expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, {
-          targetBranch: value.lane.targetBranch,
-          lane: value.lane.kind,
-          ...(value.lane.kind === "feature" && value.lane.promotionTarget !== undefined ? { promotionTarget: value.lane.promotionTarget } : {}),
-          ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-        }])),      })
+        expectedRoutes: new Map(items.map((item) => {
+          const lane = requiredIssueRoute(routedIssues, item.issue, item.repository ?? repository.repo).lane;
+          return [item.issue, {
+            targetBranch: lane.targetBranch,
+            lane: lane.kind,
+            ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+          }] as const;
+        })),      })
       : { groups: [], materialized: [], validatedItems: items };
     const contracted = materializedResult.validatedItems;
     for (const materialized of materializedResult.materialized) {
       const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
       const member = group?.members[0];
       if (group && member) {
-        const lane = requiredIssueRoute(routedIssues, member.issue).lane;
+        const lane = requiredIssueRoute(routedIssues, member.issue, member.repository ?? repository.repo).lane;
         const batchIssue = await github.getIssue(materialized.issue, repository.repo);
-        routedIssues.set(materialized.issue, { issue: batchIssue, lane });
+        routedIssues.set(decompositionIssueRouteKey(repository.repo, materialized.issue), { issue: batchIssue, lane });
       }
     }
     const scheduleItems = materializeClaimDependencies(contracted);
@@ -2352,7 +2356,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       try {
         const subject = { repo: repository.repo, issue: item.issue };
         const issueArtifacts = await artifacts.list(subject);
-        const admission = decideSubjectAdmission(issueArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue).lane.targetBranch });
+        const admission = decideSubjectAdmission(issueArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue, item.repository ?? repository.repo).lane.targetBranch });
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
           outcomes.set(item.id, admission.state);
@@ -2417,7 +2421,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
         }
-        const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
+        const { issue, lane } = requiredIssueRoute(routedIssues, item.issue, item.repository ?? repository.repo);
         const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
         const batchMembers = item.memberIssues ? [...item.memberIssues] : [];
         const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
@@ -3104,9 +3108,9 @@ function projectRunsToGitHub(runs: RunRepository, github: GitHubClient): RunRepo
   );
 }
 
-function requiredIssueRoute<T>(routes: ReadonlyMap<number, T>, issue: number): T {
-  const route = routes.get(issue);
-  if (!route) throw new Error(`Issue #${issue} has no authoritative lane classification`);
+function requiredIssueRoute<T>(routes: ReadonlyMap<string, T>, issue: number, repository: string): T {
+  const route = routes.get(decompositionIssueRouteKey(repository, issue));
+  if (!route) throw new Error(`Issue ${repository}#${issue} has no authoritative lane classification`);
   return route;
 }
 

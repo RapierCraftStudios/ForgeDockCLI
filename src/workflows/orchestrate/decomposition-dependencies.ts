@@ -20,6 +20,17 @@ export function decompositionChildNodeId(repository: string, issue: number): str
   return `issue-${encodeURIComponent(normalizedRepository)}-${issue}`;
 }
 
+/**
+ * Mutable route state must use the same repository-qualified identity as the
+ * materialized child node, while retaining a distinct key for legacy roots.
+ */
+export function decompositionIssueRouteKey(repository: string, issue: number): string {
+  const normalizedRepository = normalizeOrchestrationRepository(repository);
+  if (!normalizedRepository) throw new Error("Issue route repository must not be empty");
+  if (!Number.isSafeInteger(issue) || issue < 1) throw new Error(`Invalid issue route issue: ${issue}`);
+  return `${normalizedRepository}#${issue}`;
+}
+
 export interface ParsedDecompositionNodeId {
   issue: number;
   repository?: string;
