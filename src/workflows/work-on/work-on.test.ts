@@ -895,10 +895,18 @@ describe("complete work-on trajectory", () => {
   });
 
   it("retains the worktree after exhausting two automatic verification repairs", async () => {
-    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, submission]);
+    const diagnosis: VerificationDiagnosis = {
+      rootCause: "The required check remains failed after both bounded repairs.",
+      sourceAnchors: [{ path: "src/workflows/work-on/work-on.test.ts", location: "repair cap regression", evidence: "The frozen test file anchors the bounded failure." }],
+      reproducer: "Run the required check after the first repair.",
+      failureSignatureMapping: "required-check",
+      rejectedPreviousHypotheses: ["The failure is not transient because it persists across repairs."],
+      minimalFixGuidance: "Make the smallest source-backed repair.",
+    };
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, diagnosis, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
-    const git = new EndToEndGit();
+    const git = new DiagnosticGit();
     const host = new EndToEndHost();
     const intent = createArtifact({
       kind: "Intent", runId: "run_blocked", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
@@ -918,7 +926,7 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(outcomes.flatMap((outcome) => outcome.kind === "Outcome" && outcome.payload.failureEvidence?.repairAttempt !== undefined
       ? [outcome.payload.failureEvidence.repairAttempt]
       : []), [1, 2]);
-    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.failureEvidence?.workspacePath : undefined, workspace.path);
+    assert.equal(outcomes[0]?.kind === "Outcome" ? outcomes[0].payload.failureEvidence?.workspacePath : undefined, process.cwd());
     assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 3);
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-3), [
       "BUILD_COMPLETED", "VERIFICATION_FAILED", "VERIFICATION_REPAIR_EXHAUSTED",
@@ -982,11 +990,19 @@ describe("complete work-on trajectory", () => {
     assert.ok(attemptTwo?.payload.failureEvidence?.diagnostics?.some(({ code }) => code === "verification-diagnosis"));
   });
 
-  it("skips diagnosis when the repaired failure signature changes and keeps the two-repair cap", async () => {
-    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, submission]);
+  it("diagnoses a changed repaired failure signature before the final repair", async () => {
+    const diagnosis: VerificationDiagnosis = {
+      rootCause: "The first repair changed the failing executable check without resolving the underlying issue.",
+      sourceAnchors: [{ path: "src/workflows/work-on/work-on.test.ts", location: "changed-signature regression", evidence: "The frozen test file is the concrete transition anchor." }],
+      reproducer: "The repaired workspace changes the failure from first to changed.",
+      failureSignatureMapping: "test|failed|||changed",
+      rejectedPreviousHypotheses: ["The first failure was transient; the changed signature demonstrates the repair altered the failure mode instead."],
+      minimalFixGuidance: "Inspect the transition and make the smallest source-backed correction.",
+    };
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, diagnosis, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
-    const git = new EndToEndGit();
+    const git = new DiagnosticGit();
     const host = new EndToEndHost();
     let index = 0;
     const verifier: VerificationRunner = {
@@ -997,9 +1013,36 @@ describe("complete work-on trajectory", () => {
     };
     const result = await workOn({ intent: createWorkOnIntent("run_changed_diagnosis"), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(result.run.state, "blocked");
-    assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 0);
+    const diagnosisTasks = runtime.tasks.filter((task) => task.id.includes("verification-diagnosis"));
+    assert.equal(diagnosisTasks.length, 1);
+    assert.deepEqual(diagnosisTasks[0]?.tools, ["read", "grep", "find", "ls", "verify"]);
+    assert.equal(diagnosisTasks[0]?.workspace.mode, "read-only");
+    const finalBuilder = runtime.tasks.filter((task) => task.role === "builder").at(-1);
+    assert.match(finalBuilder?.instructions ?? "", /verification failure transition/);
+    assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
     assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 3);
     assert.deepEqual(artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined ? [artifact.payload.failureEvidence.repairAttempt] : []), [1, 2]);
+  });
+  it("diagnoses a report-only to executable failure transition before the final repair", async () => {
+    const diagnosis: VerificationDiagnosis = {
+      rootCause: "Review remediation changed the failure from a report-only mismatch to an executable test failure.",
+      sourceAnchors: [{ path: "src/workflows/work-on/work-on.test.ts", location: "report transition regression", evidence: "The frozen test captures the transition." }],
+      reproducer: "Submit an incorrect change report, then observe the executable test failure.",
+      failureSignatureMapping: "test|failed|||changed",
+      rejectedPreviousHypotheses: ["The report-only failure was not a transient test timeout; the executable failure confirms a distinct transition."],
+      minimalFixGuidance: "Reconcile the report and executable failure with the smallest in-scope fix.",
+    };
+    const reportOnlySubmission = { ...submission, changedPaths: ["src/not-observed.ts"] };
+    const runtime = new FakeAgentRuntime([investigation, packet, reportOnlySubmission, submission, diagnosis, submission]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new DiagnosticGit();
+    const host = new EndToEndHost();
+    const verifier: VerificationRunner = { async run() { return [{ command: "npm test", commandId: "test", status: "failed", failureSignatures: ["changed"], durationMs: 10 }]; } };
+    const result = await workOn({ intent: createWorkOnIntent("run_report_transition"), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
+    assert.match(runtime.tasks.filter((task) => task.role === "builder").at(-1)?.instructions ?? "", /report-only failure/);
   });
   it("rejects malformed and out-of-scope diagnosis before a final builder", async () => {
     for (const [label, diagnosis] of [["malformed", {}], ["out-of-scope", {

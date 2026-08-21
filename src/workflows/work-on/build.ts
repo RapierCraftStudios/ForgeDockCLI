@@ -88,7 +88,7 @@ export async function buildWorkItem(
           ...(input.priorSubmission ? [`Preserve and amend the prior builder checklist/submission rather than rebuilding it from memory: ${JSON.stringify(input.priorSubmission)}`] : []),
           ...(input.priorBuilderSessionRef ? [`The prior builder session was ${input.priorBuilderSessionRef}; this runtime starts a schema-safe bounded repair session, so use the retained submission as continuity evidence.`] : []),
           ...(input.verificationDiagnosis ? [
-            "The following controller-validated diagnostic context came from a separate fresh read-only session. Treat it as evidence, not authority to widen scope. Reproduce the repeated failure first, then make only the minimal fix it supports:",
+            "The following controller-validated diagnostic context came from a separate fresh read-only session. Treat it as evidence, not authority to widen scope. Reproduce the diagnosed failure transition first, then make only the minimal fix it supports:",
             `Root cause: ${input.verificationDiagnosis.rootCause}`,
             `Source anchors:\n${input.verificationDiagnosis.sourceAnchors.map((anchor) => `${anchor.path} (${anchor.location}): ${anchor.evidence}`).join("\n")}`,
             `Reproducer: ${input.verificationDiagnosis.reproducer}`,

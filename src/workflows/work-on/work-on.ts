@@ -1230,7 +1230,7 @@ async function appendVerificationRepairCheckpoint(
             ...(failureEvidence.diagnostics ?? []),
             {
               code: "verification-diagnosis",
-              message: "Controller-validated ephemeral diagnosis for the repeated verification failure",
+              message: "Controller-validated ephemeral diagnosis for the verification failure transition",
               details: { diagnosis },
             },
           ],
@@ -1271,7 +1271,7 @@ function checkSignature(check: CheckResult): string {
   ].join("|");
 }
 
-function canonicalFailedRequiredCheckSignatures(
+function canonicalFailedCheckSignatures(
   outcome: DurableArtifact<"Outcome">,
   commands: readonly VerificationCommand[],
 ): string[] {
@@ -1285,7 +1285,6 @@ function canonicalFailedRequiredCheckSignatures(
         : requiredCommands.has(check.command)))
     .map(checkSignature);
   if (signatures.length) return [...new Set(signatures)].sort();
-  if ((outcome.payload.failureEvidence?.checks ?? []).length > 0) return [];
   const evidence = outcome.payload.failureEvidence;
   const reportOnly = [evidence?.failureKind ?? "", ...(evidence?.diagnostics ?? []).map(({ code }) => code)].filter(Boolean);
   return [...new Set(reportOnly)].sort();
@@ -1302,7 +1301,7 @@ function diagnosisScope(packet: DurableArtifact<"BuildPacket">) {
 async function validateVerificationDiagnosis(
   diagnosis: VerificationDiagnosis,
   packet: DurableArtifact<"BuildPacket">,
-  repeatedSignatures: readonly string[],
+  currentSignatures: readonly string[],
   workspacePath: string,
 ): Promise<VerificationDiagnosis> {
   if (!Check(VerificationDiagnosisSchema, diagnosis)) throw new Error("Verification diagnosis failed its bounded schema");
@@ -1333,13 +1332,13 @@ async function validateVerificationDiagnosis(
       throw new Error(`Verification diagnosis anchor is not a regular in-scope file: ${anchor.path} (${error instanceof Error ? error.message : String(error)})`);
     }
   }
-  if (!repeatedSignatures.length || repeatedSignatures.some((signature) => !diagnosis.failureSignatureMapping.includes(signature))) {
-    throw new Error("Verification diagnosis does not map every repeated failure signature");
+  if (!currentSignatures.length || currentSignatures.some((signature) => !diagnosis.failureSignatureMapping.includes(signature))) {
+    throw new Error("Verification diagnosis does not map every current failure signature");
   }
   return diagnosis;
 }
 
-async function diagnoseRepeatedVerificationFailure(
+async function diagnoseVerificationTransition(
   input: {
     run: RunState;
     intent: DurableArtifact<"Intent">;
@@ -1356,7 +1355,7 @@ async function diagnoseRepeatedVerificationFailure(
     signal?: AbortSignal;
   },
   dependencies: WorkOnDependencies,
-  repeatedSignatures: readonly string[],
+  currentSignatures: readonly string[],
 ): Promise<VerificationDiagnosis> {
   const summarize = (failure: DurableArtifact<"Outcome">) => (failure.payload.failureEvidence?.checks ?? [])
     .map((check) => `${check.commandId ?? check.command}: ${check.status}; class=${check.failureClass ?? ""}; signatures=${(check.failureSignatures ?? []).join(",")}; summary=${check.summary ?? ""}`)
@@ -1364,16 +1363,17 @@ async function diagnoseRepeatedVerificationFailure(
   const result = await dependencies.runtime.run<VerificationDiagnosis>({
     id: `${input.run.runId}:verification-diagnosis:${input.run.attempt}`,
     role: "investigator",
-    objective: "Diagnose one repeated controller verification failure without editing the workspace.",
+    objective: "Diagnose one controller verification failure transition without editing the workspace.",
     instructions: [
       "This is a fresh read-only diagnostic session. Use only read, grep, find, ls, and the frozen verify tool; never edit, write, commit, or invoke GitHub.",
       "Inspect only packet expected paths, packet evidence paths, and packet metadata/read scope. Produce source-backed root cause evidence, not guesses.",
-      `The exact repeated failed-check signatures are:\n${repeatedSignatures.join("\n")}`,
+      `The current failed-check/report signatures are:\n${currentSignatures.join("\n")}`,
+      `The prior failed-check/report signatures were:\n${canonicalFailedCheckSignatures(input.priorFailure, input.commands).join("\n") || "(none)"}`,
       `Current failure checks:\n${summarize(input.currentFailure)}`,
       `Prior failure checks:\n${summarize(input.priorFailure)}`,
       `Prior builder submission/hypotheses/diff evidence:\n${JSON.stringify(input.submission)}\n${JSON.stringify(input.priorFailure.payload.failureEvidence)}`,
       ...(input.repairContext?.length ? [`Retained packet context:\n${JSON.stringify(input.repairContext)}`] : []),
-      "Explicitly reject previous builder hypotheses that the inspected source disproves. Explain how the reproducer maps to every exact repeated signature and give only minimal fix guidance; do not make the fix.",
+      "Explain any transition from the prior failure to the current failure. Explicitly reject previous builder hypotheses that the inspected source disproves. Explain how the reproducer maps to every exact current signature and give only minimal fix guidance; do not make the fix.",
     ].join("\n"),
     context: [input.intent, input.investigation, input.packet, ...(input.repairContext ?? []), input.priorFailure, input.currentFailure],
     workspace: { cwd: input.workspace.path, mode: "read-only", scope: diagnosisScope(input.packet) },
@@ -1389,7 +1389,7 @@ async function diagnoseRepeatedVerificationFailure(
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
   });
-  return validateVerificationDiagnosis(result.output, input.packet, repeatedSignatures, input.workspace.path);
+  return validateVerificationDiagnosis(result.output, input.packet, currentSignatures, input.workspace.path);
 }
 
 export async function resumeBuildWorkOn(
@@ -1443,7 +1443,7 @@ export async function resumeBuildWorkOn(
       verificationDiagnosis = await validateVerificationDiagnosis(
         verificationDiagnosis,
         input.packet,
-        canonicalFailedRequiredCheckSignatures(priorVerificationFailure, input.verification.map((command) => ({ ...command, cwd: input.workspace.path }))),
+        canonicalFailedCheckSignatures(priorVerificationFailure, input.verification.map((command) => ({ ...command, cwd: input.workspace.path }))),
         input.workspace.path,
       );
     }
@@ -1640,21 +1640,14 @@ async function verifyWithBuilderRepairs(
     }
 
     const nextRepairAttempt = repairAttempts + 1;
-    const repeatedSignatures = priorFailureForSignature
-      ? canonicalFailedRequiredCheckSignatures(verified.outcome!, input.commands)
-      : [];
-    const priorSignatures = priorFailureForSignature
-      ? canonicalFailedRequiredCheckSignatures(priorFailureForSignature, input.commands)
-      : [];
-    const repeatedFailure = repairAttempts === 1
+    const currentSignatures = canonicalFailedCheckSignatures(verified.outcome!, input.commands);
+    const shouldDiagnose = repairAttempts === 1
       && priorFailureForSignature !== undefined
-      && repeatedSignatures.length > 0
-      && repeatedSignatures.length === priorSignatures.length
-      && repeatedSignatures.every((signature, index) => signature === priorSignatures[index]);
-    if (repeatedFailure && !diagnosisAttempted) {
+      && currentSignatures.length > 0;
+    if (shouldDiagnose && !diagnosisAttempted) {
       diagnosisAttempted = true;
       try {
-        verificationDiagnosis = await diagnoseRepeatedVerificationFailure({
+        verificationDiagnosis = await diagnoseVerificationTransition({
           run,
           intent: input.intent,
           investigation: input.investigation,
@@ -1666,7 +1659,7 @@ async function verifyWithBuilderRepairs(
           ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
           commands: input.commands,
           ...runtimeOptions,
-        }, dependencies, repeatedSignatures);
+        }, dependencies, currentSignatures);
       } catch (error) {
         if (isRecoverableAgentExecutionError(error)) {
           const reason = error instanceof Error ? error.message : String(error);
@@ -1680,7 +1673,7 @@ async function verifyWithBuilderRepairs(
       verified.outcome!,
       nextRepairAttempt,
       dependencies,
-      repeatedFailure ? verificationDiagnosis : undefined,
+      shouldDiagnose ? verificationDiagnosis : undefined,
     );
     priorFailureForSignature = checkpoint.outcome;
     run = checkpoint.run;
@@ -1696,7 +1689,7 @@ async function verifyWithBuilderRepairs(
       investigation: input.investigation,
       packet: input.packet,
       priorVerificationFailure: checkpoint.outcome,
-      ...(repeatedFailure && verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
+      ...(shouldDiagnose && verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
       priorSubmission: submission,
       ...(builderSessionRef !== undefined ? { priorBuilderSessionRef: builderSessionRef } : {}),
       ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
