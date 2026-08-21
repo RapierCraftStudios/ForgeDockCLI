@@ -10,6 +10,7 @@ export type LsToolInput = Static<typeof lsSchema>;
 export interface LsToolDetails {
     truncation?: TruncationResult;
     entryLimitReached?: number;
+    entryCount?: number;
 }
 /**
  * Pluggable operations for the ls tool.
