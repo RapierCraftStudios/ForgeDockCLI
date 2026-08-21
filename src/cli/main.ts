@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
-import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
+import {
+  normalizeOrchestrationRepository,
+  orchestrationNodeRepository,
+  type OrchestrationNodeRecord,
+  type OrchestrationRecord,
+} from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
@@ -71,7 +76,11 @@ import { createForgeDockObserver, type ForgeDockObserver } from "../observabilit
 import type { RunState } from "../core/state/machine.js";
 import { discoverLegacyVerificationCommands, discoverVerificationCommands, VERIFICATION_POLICY_VERSION } from "./verification-policy.js";
 import { parseOrchestrationIssueNumbers, parseResetDagArguments, parseResetIssueArguments, parseReviewPullRequestArgument, parseWorkOnIssueArgument } from "./argument-parser.js";
-import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
+import {
+  decompositionChildNodeId,
+  issueNumberFromDecompositionNodeId,
+  mapDecompositionDependencies,
+} from "../workflows/orchestrate/decomposition-dependencies.js";
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
@@ -164,29 +173,34 @@ async function materializeCliDecomposition(input: {
   items: readonly ScheduledWorkItem[];
   serializationEdges?: readonly { predecessor: string; successor: string; overlappingClaims: readonly string[] }[];
 } | undefined> {
+  const effectiveParentRepository = input.node.repository ?? input.item.repository ?? input.repository;
+  const authoritativeRepository = await input.github.getRepository(effectiveParentRepository);
+  const effectiveParentRepositoryKey = normalizeOrchestrationRepository(effectiveParentRepository);
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
-    const artifacts = await input.artifacts.list({ repo: input.repository, issue: input.item.issue });
+    const artifacts = await input.artifacts.list({ repo: effectiveParentRepository, issue: input.item.issue });
     const reconciled = reconcileLatestRunArtifacts(artifacts);
     if (reconciled.state !== "decomposed") return undefined;
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
   const dependencyNodes = [
-    ...input.orchestration.nodes.map((candidate) => ({
-      id: candidate.id,
-      issue: candidate.issue,
-      ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
-    })),
-    ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
+    ...input.orchestration.nodes
+      .filter((candidate) => orchestrationNodeRepository(input.orchestration, candidate) === effectiveParentRepositoryKey)
+      .map((candidate) => ({
+        id: candidate.id,
+        issue: candidate.issue,
+        ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
+      })),
+    ...children.map((issue) => ({ id: decompositionChildNodeId(effectiveParentRepository, issue), issue, memberIssues: [issue] })),
   ];
-  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
+  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
   const childItems: ScheduledWorkItem[] = [];
   for (const issue of snapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
     const lane = await resolveIssueLane(
       issue,
-      input.defaultBranch,
+      authoritativeRepository.defaultBranch || input.defaultBranch,
       input.github,
       input.effective.fastLaneTarget,
       input.effective.featurePromotionTarget,
@@ -202,12 +216,12 @@ async function materializeCliDecomposition(input: {
     const sourcePullRequest = /^\*\*Source:\*\*\s*PR\s+#(\d+)\b/im.exec(issue.body)?.[1];
     const defectClass = /<!--\s*FORGE:CLASS:\s*([A-Za-z0-9_-]+)\s*-->/i.exec(issue.body)?.[1];
     childItems.push({
-      id: `issue-${issue.number}`,
+      id: decompositionChildNodeId(effectiveParentRepository, issue.number),
       issue: issue.number,
       priority,
       dependencies: mapDecompositionDependencies(issue.number, issue.body, dependencyNodes),
-      claims: affectedFiles.length ? [...affectedFiles] : [`component:${input.repository}`],
-      repository: input.repository,
+      claims: affectedFiles.length ? [...affectedFiles] : [`component:${effectiveParentRepository}`],
+      repository: effectiveParentRepository,
       targetBranch: lane.targetBranch,
       lane: lane.kind,
       ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2363,7 +2377,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           });
           clearInterval(heartbeat);
           store.release(item.id, lease.token);
-          const resumeArgs = [String(item.issue), "--repo", repository.repo, "--resume"];
+          const resumeArgs = [String(item.issue), "--repo", item.repository ?? repository.repo, "--resume"];
           const dependencies = item.dependencies.map(issueNumberFromScheduledId);
           if (dependencies.length) resumeArgs.push("--depends-on", dependencies.join(","));
           resumeArgs.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
@@ -2888,7 +2902,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           throw new Error(`#${item.issue} has terminal state ${current.state} without a supported orchestration result`);
         }
         if (current.action === "block") throw new Error(current.reason);
-        const workerArgs = [String(item.issue), "--repo", record.repository];
+        const workerArgs = [String(item.issue), "--repo", item.repository ?? record.repository];
         const dependencies = item.dependencies.map(issueNumberFromScheduledId);
         if (dependencies.length) workerArgs.push("--depends-on", dependencies.join(","));
         workerArgs.push(record.autoMerge ? "--auto-merge" : "--no-auto-merge");
@@ -3374,9 +3388,7 @@ function option(argv: string[], name: string): string | undefined {
 }
 
 function issueNumberFromScheduledId(id: string): number {
-  const match = /^issue-(\d+)$/.exec(id);
-  if (!match) throw new Error(`Invalid scheduled issue dependency: ${id}`);
-  return Number(match[1]);
+  return issueNumberFromDecompositionNodeId(id);
 }
 
 function parseIssueNumbers(value: string | undefined): number[] {

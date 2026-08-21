@@ -54,7 +54,11 @@ import {
 } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
-import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
+import {
+  decompositionChildNodeId,
+  issueNumberFromDecompositionNodeId,
+  mapDecompositionDependencies,
+} from "../workflows/orchestrate/decomposition-dependencies.js";
 import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
@@ -1193,7 +1197,7 @@ export async function materializeVisibleDecomposition(input: {
         issue: candidate.issue,
         ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
       })),
-    ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
+    ...children.map((issue) => ({ id: decompositionChildNodeId(effectiveParentRepository, issue), issue, memberIssues: [issue] })),
   ];
   const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
   const childItems: VisibleOrchestrationItem[] = [];
@@ -1212,7 +1216,7 @@ export async function materializeVisibleDecomposition(input: {
     const sourcePullRequest = sourcePullRequestFromIssueBody(issue.body);
     const defectClass = defectClassFromIssueBody(issue.body);
     childItems.push({
-      id: `issue-${issue.number}`,
+      id: decompositionChildNodeId(effectiveParentRepository, issue.number),
       issue: issue.number,
       priority: priorityFromIssueLabels(issue.labels ?? []),
       dependencies,
@@ -3738,9 +3742,7 @@ function itemRouteLabel(item: Pick<ScheduledWorkItem, "repository" | "targetBran
 }
 
 function issueNumberFromId(id: string): number {
-  const match = /^issue-(\d+)$/.exec(id);
-  if (!match) throw new Error(`Invalid issue dependency id: ${id}`);
-  return Number(match[1]);
+  return issueNumberFromDecompositionNodeId(id);
 }
 
 export function shouldResumeObservedItem(_labels: readonly string[], sameSessionRetry: boolean): boolean {

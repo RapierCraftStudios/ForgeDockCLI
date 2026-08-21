@@ -18,6 +18,7 @@ import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
+import { decompositionChildNodeId, parseDecompositionNodeId } from "../workflows/orchestrate/decomposition-dependencies.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
 import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
@@ -2311,6 +2312,13 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   await delegator.shutdown();
 });
 
+test("repository-qualified decomposition IDs preserve same-number root and child identity", () => {
+  const qualified = decompositionChildNodeId("  Owner/Parent  ", 7);
+  assert.equal(qualified, "issue-owner%2Fparent-7");
+  assert.deepEqual(parseDecompositionNodeId(qualified), { repository: "owner/parent", issue: 7 });
+  assert.deepEqual(parseDecompositionNodeId("issue-7"), { issue: 7 });
+});
+
 test("visible decomposition keeps non-root repository identity on initial and resumed materialization", async () => {
   const repositoryReads: string[] = [];
   const artifactReads: Array<{ repo: string; issue: number }> = [];
@@ -2321,7 +2329,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
     runId: "run-visible-remote-decomposition",
     subject: { repo: "owner/work", issue: 42 },
     producer: { role: "controller", runtime: "forgedock" },
-    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 Child"] },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#7 Child"] },
   });
   const github = {
     async getRepository(repo: string) {
@@ -2334,7 +2342,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
         repo,
         number: issue,
         title: `Child ${issue}`,
-        body: issue === 100 ? "## Prerequisites\n- Requires #7." : "",
+        body: "",
         url: `https://github.test/${repo}/issues/${issue}`,
         state: "OPEN" as const,
         labels: [],
@@ -2364,9 +2372,9 @@ test("visible decomposition keeps non-root repository identity on initial and re
     orchestration: {
       nodes: [
         {
-          id: "valid-prerequisite",
+          id: "issue-7",
           issue: 7,
-          repository: "  Owner/WORK  ",
+          repository: "owner/root",
           priority: 1,
           dependencies: [],
           claims: [],
@@ -2402,24 +2410,27 @@ test("visible decomposition keeps non-root repository identity on initial and re
   const initial = await materializeVisibleDecomposition(input);
   assert.deepEqual(repositoryReads, ["owner/work"]);
   assert.deepEqual(artifactReads, [{ repo: "owner/work", issue: 42 }]);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }]);
   assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.equal(initial?.items[0]?.id, "issue-owner%2Fwork-7");
+  assert.notEqual(initial?.items[0]?.id, "issue-7");
   assert.equal(initial?.items[0]?.repository, "owner/work");
   assert.equal(initial?.items[0]?.targetBranch, "work-main");
-  assert.deepEqual(initial?.items[0]?.dependencies, ["valid-prerequisite"]);
+  assert.deepEqual(initial?.items[0]?.dependencies, []);
 
   repositoryReads.length = 0;
   artifactReads.length = 0;
   issueReads.length = 0;
   branchReads.length = 0;
-  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [100] });
+  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [7] });
   assert.deepEqual(repositoryReads, ["owner/work"]);
   assert.deepEqual(artifactReads, []);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 7 }]);
   assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.equal(resumed?.items[0]?.id, "issue-owner%2Fwork-7");
   assert.equal(resumed?.items[0]?.repository, "owner/work");
   assert.equal(resumed?.items[0]?.targetBranch, "work-main");
-  assert.deepEqual(resumed?.items[0]?.dependencies, ["valid-prerequisite"]);
+  assert.deepEqual(resumed?.items[0]?.dependencies, []);
 });
 
 test("visible decomposition fails closed when a concurrent child read rejects", async () => {
@@ -2430,7 +2441,7 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
     },
     async getIssue(issue: number) {
       issueReads.push(issue);
-      if (issue === 101) throw new Error("child read failed");
+      if (issue === 8) throw new Error("child read failed");
       return {
         repo: "owner/work",
         number: issue,
@@ -2458,7 +2469,15 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
       status: "running",
       createdAt: "now",
       updatedAt: "now",
-      nodes: [],
+      nodes: [{
+        id: "issue-7",
+        issue: 7,
+        repository: "owner/root",
+        priority: 1,
+        dependencies: [],
+        claims: [],
+        memberIssues: [7],
+      }],
     },
     node: { id: "parent", issue: 42, repository: "owner/work" },
     item: {
@@ -2474,7 +2493,7 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
       title: "Parent",
       summary: "Parent",
     },
-    childIssues: [100, 101],
+    childIssues: [7, 8],
   } as any;
   const durableBefore = structuredClone(input.orchestration);
 
@@ -2482,7 +2501,7 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
     () => materializeVisibleDecomposition(input),
     /child read failed/,
   );
-  assert.deepEqual(issueReads.sort((left, right) => left - right), [100, 101]);
+  assert.deepEqual(issueReads.sort((left, right) => left - right), [7, 8]);
   assert.deepEqual(input.orchestration, durableBefore);
 });
 
