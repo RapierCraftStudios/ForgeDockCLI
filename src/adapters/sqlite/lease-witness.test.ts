@@ -2,8 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -18,11 +18,27 @@ import {
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
 
+type ConcurrentChildRole = "winner" | "loser";
+
+interface MaterialDigests {
+  checkpoint: string;
+  publicKey: string;
+  privateKey: string;
+}
+
 interface ConcurrentChildResult {
   ok: boolean;
+  role?: ConcurrentChildRole;
   state?: string;
+  epoch?: number;
   reference?: Record<string, unknown>;
+  materialDigests?: MaterialDigests;
   error?: string;
+}
+
+interface ConcurrentChildHandle {
+  result: Promise<{ code: number | null; output: ConcurrentChildResult }>;
+  terminate: () => void;
 }
 
 function runConcurrentFirstUseChild(input: {
@@ -30,32 +46,91 @@ function runConcurrentFirstUseChild(input: {
   localDataRoot: string;
   barrier: string;
   ready: string;
-}): Promise<{ code: number | null; output: ConcurrentChildResult }> {
+  role: ConcurrentChildRole;
+  witnessDirectory: string;
+  winnerInstalled: string;
+  winnerRelease: string;
+  loserPreRename: string;
+  loserRelease: string;
+  loserRace: string;
+}): ConcurrentChildHandle {
   const moduleUrl = new URL("./lease-witness.js", import.meta.url).href;
   const source = `
-    import { existsSync, readFileSync, writeFileSync } from "node:fs";
-    import { createOrBootstrapLocalLeaseWitness } from ${JSON.stringify(moduleUrl)};
+    import fs, { existsSync, readFileSync, writeFileSync } from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    import { createHash } from "node:crypto";
     const input = ${JSON.stringify(input)};
     const waiter = new Int32Array(new SharedArrayBuffer(4));
+    const waitFor = (path) => {
+      while (!existsSync(path)) Atomics.wait(waiter, 0, 0, 2);
+    };
+    const digest = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+    const materialDigests = (directory) => ({
+      checkpoint: digest(directory + "/checkpoint.json"),
+      publicKey: digest(directory + "/public.pem"),
+      privateKey: digest(directory + "/private.pem"),
+    });
+    const originalRenameSync = fs.renameSync.bind(fs);
+    fs.renameSync = (source, destination) => {
+      const isPublicationRename = typeof source === "string"
+        && typeof destination === "string"
+        && source.startsWith(input.witnessDirectory + ".tmp-")
+        && destination === input.witnessDirectory;
+      if (!isPublicationRename) return originalRenameSync(source, destination);
+      if (input.role === "winner") {
+        originalRenameSync(source, destination);
+        writeFileSync(input.winnerInstalled, JSON.stringify({ role: input.role, materialDigests: materialDigests(destination) }));
+        waitFor(input.winnerRelease);
+        return;
+      }
+      writeFileSync(input.loserPreRename, "pre-rename");
+      waitFor(input.winnerInstalled);
+      waitFor(input.loserRelease);
+      try {
+        return originalRenameSync(source, destination);
+      } catch (error) {
+        const collisionCode = error && typeof error === "object" && "code" in error ? error.code : undefined;
+        if (collisionCode === "EEXIST" || collisionCode === "ENOTEMPTY") {
+          // A populated directory collision is ENOTEMPTY on this platform.
+          // Normalize only the interposed competing rename so production's
+          // publication-race marker and bounded retry path are exercised.
+          writeFileSync(input.loserRace, JSON.stringify({ code: "EEXIST" }));
+          const normalized = new Error(error instanceof Error ? error.message : String(error));
+          normalized.code = "EEXIST";
+          throw normalized;
+        }
+        throw error;
+      }
+    };
+    syncBuiltinESMExports();
+    const { createOrBootstrapLocalLeaseWitness } = await import(${JSON.stringify(moduleUrl)});
     writeFileSync(input.ready, "ready");
-    while (!existsSync(input.barrier)) Atomics.wait(waiter, 0, 0, 2);
+    waitFor(input.barrier);
     try {
       const witness = createOrBootstrapLocalLeaseWitness(input.checkout, { localDataRoot: input.localDataRoot, environment: {} });
+      const snapshot = witness.verify();
       const reference = JSON.parse(readFileSync(input.checkout + "/.forgedock/lease-witness.json", "utf8"));
-      process.stdout.write(JSON.stringify({ ok: true, state: witness.verify().state, reference }));
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        role: input.role,
+        state: snapshot.state,
+        epoch: snapshot.epoch,
+        reference,
+        materialDigests: materialDigests(input.witnessDirectory),
+      }));
     } catch (error) {
-      process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      process.stdout.write(JSON.stringify({ ok: false, role: input.role, error: error instanceof Error ? error.message : String(error) }));
       process.exitCode = 1;
     }
   `;
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+  const childProcess = spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+  const result = new Promise<{ code: number | null; output: ConcurrentChildResult }>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    child.once("error", reject);
-    child.once("close", (code) => {
+    childProcess.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    childProcess.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    childProcess.once("error", reject);
+    childProcess.once("close", (code) => {
       try {
         const output = JSON.parse(stdout) as ConcurrentChildResult;
         if (!output.ok && stderr) output.error = `${output.error ?? "child failed"}: ${stderr.trim()}`;
@@ -65,14 +140,15 @@ function runConcurrentFirstUseChild(input: {
       }
     });
   });
+  return { result, terminate: () => { childProcess.kill(); } };
 }
 
-async function waitForFiles(paths: string[]): Promise<void> {
+async function waitForFiles(paths: string[], message = "concurrent witness children did not become ready"): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (!paths.every(existsSync) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert.equal(paths.every(existsSync), true, "concurrent witness children did not become ready");
+  assert.equal(paths.every(existsSync), true, message);
 }
 
 describe("retained lease checkpoint witness", () => {
@@ -156,26 +232,104 @@ describe("retained lease checkpoint witness", () => {
     const localDataRoot = join(root, "local-data");
     const barrier = join(root, "start");
     const ready = [join(root, "ready-1"), join(root, "ready-2")];
+    const winnerInstalled = join(root, "winner-installed");
+    const winnerRelease = join(root, "winner-release");
+    const loserPreRename = join(root, "loser-pre-rename");
+    const loserRelease = join(root, "loser-release");
+    const loserRace = join(root, "loser-race");
     mkdirSync(checkout);
+    const canonicalCheckout = realpathSync.native(checkout);
+    const checkoutDigest = createHash("sha256").update(canonicalCheckout, "utf8").digest("hex");
+    const witnessDirectory = join(localDataRoot, "ForgeDock", "lease-witnesses", checkoutDigest);
+    const children: ConcurrentChildHandle[] = [];
     try {
-      const children = ready.map((readyPath) => runConcurrentFirstUseChild({ checkout, localDataRoot, barrier, ready: readyPath }));
-      await waitForFiles(ready);
+      children.push(runConcurrentFirstUseChild({
+        checkout,
+        localDataRoot,
+        barrier,
+        ready: ready[0]!,
+        role: "winner",
+        witnessDirectory,
+        winnerInstalled,
+        winnerRelease,
+        loserPreRename,
+        loserRelease,
+        loserRace,
+      }));
+      children.push(runConcurrentFirstUseChild({
+        checkout,
+        localDataRoot,
+        barrier,
+        ready: ready[1]!,
+        role: "loser",
+        witnessDirectory,
+        winnerInstalled,
+        winnerRelease,
+        loserPreRename,
+        loserRelease,
+        loserRace,
+      }));
+      await waitForFiles(ready, "concurrent witness children did not become ready");
       writeFileSync(barrier, "start");
-      const results = await Promise.all(children);
+      await waitForFiles(
+        [winnerInstalled, loserPreRename],
+        "concurrent witness children did not reach the role-aware rename handshake",
+      );
+
+      // Release the competing rename first. The winner remains paused after
+      // directory publication, so this marker proves that the loser observed
+      // EEXIST before the checkout reference could be published.
+      assert.equal(existsSync(winnerRelease), false);
+      writeFileSync(loserRelease, "release");
+      await waitForFiles([loserRace], "loser did not observe the publication-race EEXIST");
+      assert.equal(existsSync(winnerRelease), false);
+      assert.deepEqual(JSON.parse(readFileSync(loserRace, "utf8")), { code: "EEXIST" });
+      writeFileSync(winnerRelease, "release");
+
+      const results = await Promise.all(children.map((child) => child.result));
       for (const result of results) {
         assert.equal(result.code, 0, result.output.error);
         assert.equal(result.output.ok, true, result.output.error);
         assert.equal(result.output.state, "verified");
+        assert.equal(result.output.epoch, 0);
         assert.doesNotMatch(result.output.error ?? "", /EEXIST/);
         assert.ok(result.output.reference);
+        assert.ok(result.output.materialDigests);
       }
-      const references = results.map((result) => result.output.reference);
-      assert.equal(references[0]?.checkoutDigest, references[1]?.checkoutDigest);
-      assert.equal(references[0]?.checkpointPath, references[1]?.checkpointPath);
-      assert.equal(references[0]?.publicKeyPath, references[1]?.publicKeyPath);
-      assert.equal(references[0]?.privateKeyPath, references[1]?.privateKeyPath);
+
+      const winner = results.find((result) => result.output.role === "winner");
+      const loser = results.find((result) => result.output.role === "loser");
+      assert.ok(winner);
+      assert.ok(loser);
+      const winnerManifest = JSON.parse(readFileSync(winnerInstalled, "utf8")) as {
+        role: ConcurrentChildRole;
+        materialDigests: MaterialDigests;
+      };
+      assert.equal(winnerManifest.role, "winner");
+      assert.deepEqual(winner?.output.materialDigests, winnerManifest.materialDigests);
+      assert.deepEqual(loser?.output.materialDigests, winnerManifest.materialDigests);
+      assert.deepEqual(loser?.output.reference, winner?.output.reference);
+
+      const expectedReference = {
+        schema: "forgedock.lease-witness-local/v1",
+        checkoutDigest,
+        checkpointPath: join(witnessDirectory, "checkpoint.json"),
+        publicKeyPath: join(witnessDirectory, "public.pem"),
+        privateKeyPath: join(witnessDirectory, "private.pem"),
+        keyId: `forgedock-local-${checkoutDigest.slice(0, 16)}`,
+      };
+      assert.deepEqual(winner?.output.reference, expectedReference);
       assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().state, "verified");
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally {
+      // Always open the child gates before terminating children, including
+      // assertion failures while the loser or winner is paused.
+      writeFileSync(barrier, "cleanup");
+      writeFileSync(loserRelease, "cleanup");
+      writeFileSync(winnerRelease, "cleanup");
+      for (const child of children) child.terminate();
+      await Promise.allSettled(children.map((child) => child.result));
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("creates the local witness on first use without weakening corrupt-state checks", () => {
