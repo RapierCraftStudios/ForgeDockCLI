@@ -155,6 +155,18 @@ describe("direct target recovery integration", () => {
     assert.equal((await fixture.artifacts.list(subject, "RetryCheckpoint")).length, 1);
     assert.equal((await fixture.artifacts.list(subject, "Outcome")).length, 1);
   });
+  it("authenticates a legacy checkpoint against the retained workspace base", async () => {
+    const runId = "target-legacy-base";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const legacyBuild = { ...b, payload: { ...b.payload, baseSha: undefined } } as unknown as typeof b;
+    const legacyWorkspace = { ...workspace, baseSha: sourceBase };
+    const checkpoint = await persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: legacyBuild, workspace: legacyWorkspace, targetBranch: "main", observedTargetSha: targetBase, artifacts: fixture.artifacts });
+    assert.ok(checkpoint);
+    const tamperedWorkspace = { ...legacyWorkspace, baseSha: targetBase };
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: legacyBuild, workspace: tamperedWorkspace, verification: [command] }, deps(fixture).dependencies), /source base/);
+  });
+
   it("rejects forged source base and checkpoint attempt bounds before Git mutation", async () => {
     const runId = "target-authority";
     const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);

@@ -86,7 +86,7 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
     throw new Error("Target recovery packet/build/intent identity does not match the admitted run");
   }
   const checkpointBaseSha = checkpoint.payload.sourceBaseSha.toLowerCase();
-  const expectedBaseSha = (buildResult.payload.baseSha ?? checkpoint.payload.sourceBaseSha).toLowerCase();
+  const expectedBaseSha = (buildResult.payload.baseSha ?? workspace.baseSha ?? buildResult.payload.headSha).toLowerCase();
   const { number: recoveryAttempt, max: recoveryMax } = checkpoint.payload.attempt;
   if (checkpointBaseSha !== expectedBaseSha) {
     throw new Error("Target recovery checkpoint source base does not match the retained build/fallback base");

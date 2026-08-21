@@ -658,7 +658,7 @@ export async function runSchedule(
               // deadline arrives; dependents remain queued meanwhile.
               queuedCount++;
               const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
-              const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+              const wake = waitForRetry(delay).then(() => {
                 retryWakeups.delete(item.id);
                 if (status.get(item.id) !== "retry_wait") return;
                 status.set(item.id, "queued");

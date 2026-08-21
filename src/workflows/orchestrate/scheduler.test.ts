@@ -905,6 +905,21 @@ it("aborts a long retry wait without dispatching", async () => {
   assert.equal(calls, 0);
 });
 
+it("aborts a dynamic retry result wait without redispatching", async () => {
+  const signal = new AbortController();
+  let calls = 0;
+  const execution = runSchedule([
+    { id: "dynamic-retry", issue: 1, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls++;
+    return { status: "retry_wait", nextAttemptAt: new Date(Date.now() + 60_000).toISOString(), attempt: 1, maxAttempts: 3 };
+  }, { signal: signal.signal });
+  await waitFor(() => calls === 1);
+  signal.abort(new Error("cancel dynamic retry wait"));
+  await assert.rejects(execution, /cancel dynamic retry wait/);
+  assert.equal(calls, 1);
+});
+
 it("aborts a long target recovery wait without redispatching", async () => {
   const signal = new AbortController();
   let calls = 0;
