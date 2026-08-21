@@ -312,7 +312,8 @@ describe("complete work-on trajectory", () => {
         return commands.map((command) => ({
           command: [command.command, ...command.args].join(" "), commandId: command.id,
           status: "passed" as const, exitCode: 0, durationMs: 1, outputDigest: "f".repeat(64),
-          planId: command.planId, policyVersion: command.policyVersion,
+          ...(command.planId !== undefined ? { planId: command.planId } : {}),
+          ...(command.policyVersion !== undefined ? { policyVersion: command.policyVersion } : {}),
           ...(command.targets ? { commandTargets: [...command.targets] } : {}),
         }));
       }
