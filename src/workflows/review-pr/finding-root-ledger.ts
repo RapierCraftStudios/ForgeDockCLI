@@ -176,15 +176,12 @@ function semanticFamily(value: string): string {
 }
 
 function structurallyEquivalent(left: FindingRoot, right: ReturnType<typeof structuralFindingRoot>): boolean {
-  const familyMatches = [
-    familyEquivalent(left.invariantFamily, right.invariantFamily),
-    familyEquivalent(left.failureFamily, right.failureFamily),
-    familyEquivalent(left.triggerFamily, right.triggerFamily),
-  ].filter(Boolean).length;
   return left.component === right.component
     && intersects(left.criterionIds, right.criterionIds)
     && intersects(left.symbols, right.symbols)
-    && familyMatches >= 2;
+    && familyEquivalent(left.invariantFamily, right.invariantFamily)
+    && familyEquivalent(left.failureFamily, right.failureFamily)
+    && familyEquivalent(left.triggerFamily, right.triggerFamily);
 }
 
 function familyEquivalent(left: string, right: string): boolean {
