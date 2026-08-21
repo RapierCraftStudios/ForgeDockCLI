@@ -31,7 +31,7 @@ describe("mustFix remediation", () => {
     const common = { runId: run.runId, subject: run.subject };
     const intent = createArtifact({ ...common, kind: "Intent", producer: { role: "controller" }, payload: { title: "Guard", problem: "Guard fails", constraints: [], acceptanceHints: [], dependencies: [] } });
     const investigation = createArtifact({ ...common, kind: "Investigation", producer: { role: "investigator" }, payload: { outcome: "confirmed", confidence: "high", summary: "confirmed", evidence: [{ claim: "gap", source: "src/a.ts", detail: "guard misses case" }], affectedSurfaces: ["src/a.ts"], risks: [], recommendation: "fix" } });
-    const packet = createArtifact({ ...common, kind: "BuildPacket", producer: { role: "packet-author" }, payload: { scope: ["Guard"], acceptanceCriteria: ["Guard remains correct"], context: [], implementationPlan: ["Fix guard"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
+    const packet = createArtifact({ ...common, kind: "BuildPacket", producer: { role: "packet-author" }, payload: { scope: ["Guard"], acceptanceCriteria: ["Guard remains correct"], context: [], implementationPlan: ["Fix guard"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [], evidenceContract: { version: "forgedock.evidence/v1", criteria: [{ criterionId: "criterion-1", requiredCommandIds: ["test"], semanticCommandIds: ["lint"], controllerGateIds: [], allowedWritePaths: [], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }] } } });
     const buildResult = createArtifact({ ...common, kind: "BuildResult", producer: { role: "controller" }, payload: { branch: "fix", targetBranch: "main", headSha: "a".repeat(40), changedPaths: ["src/a.ts"], summary: "built", acceptanceEvidence: [{ criterion: "Guard remains correct", status: "passed", evidence: "legacy" }], checks: [], decisions: [], residualRisks: [] } });
     const verdict = createArtifact({ ...common, kind: "ReviewVerdict", subject: { ...run.subject, pr: 1 }, producer: { role: "controller" }, payload: {
       headSha: "a".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], checks: [], findings: [{
@@ -43,13 +43,16 @@ describe("mustFix remediation", () => {
     const verifier: VerificationRunner = { async run() { return []; } };
     const result = await remediateReview({
       run, intent, investigation, packet, buildResult, verdict, worktree: "/tmp/work",
-      verification: [{ id: "test", command: "npm", args: ["test"], cwd: "/tmp/work", timeoutMs: 1_000, required: true }], verificationRunner: verifier,
+      verification: [
+        { id: "test", command: "npm", args: ["test"], cwd: "/tmp/work", timeoutMs: 1_000, required: true },
+        { id: "lint", command: "npm", args: ["run", "lint"], cwd: "/tmp/work", timeoutMs: 1_000, required: false },
+      ], verificationRunner: verifier,
     }, { runtime, runs, verifier });
     assert.equal(result.run.state, "verifying");
     assert.equal(runtime.tasks.length, 1);
     assert.match(runtime.tasks[0]?.objective ?? "", /medium-root|root-medium/);
     assert.ok(runtime.tasks[0]?.tools.includes("verify"));
-    assert.deepEqual(runtime.tasks[0]?.verificationGate, { requiredCommandIds: ["test"] });
+    assert.deepEqual(runtime.tasks[0]?.verificationGate, { requiredCommandIds: ["lint", "test"] });
   });
 
   it("bounds clusters without silently dropping roots", () => {

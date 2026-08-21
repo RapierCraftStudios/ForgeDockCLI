@@ -61,6 +61,17 @@ export function verificationHeartbeatIntervalMs(timeoutMs: number, semanticIdleM
   return Math.max(1, Math.min(DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, Math.floor(timeoutMs / 2), Math.floor(semanticIdleMs / 2)));
 }
 
+const MAX_VERIFICATION_TIMER_MS = 2_147_483_647;
+
+export function verificationInvocationTimeoutMs(commands: readonly Pick<VerificationCommand, "timeoutMs">[]): number {
+  let total = 0;
+  for (const command of commands) {
+    if (!Number.isSafeInteger(command.timeoutMs) || command.timeoutMs < 1) continue;
+    total = Math.min(MAX_VERIFICATION_TIMER_MS, total + command.timeoutMs);
+  }
+  return Math.max(1, total);
+}
+
 export interface VerificationReceipt {
   commandId: string;
   generation: number;
@@ -116,7 +127,7 @@ export function createVerificationTool<T>(
   return defineTool({
     name: "verify",
     label: "Run approved verification",
-    description: "Run exactly one controller-approved verification command by its frozen ID in the assigned worktree.",
+    description: "Run a controller-approved verification command by its frozen ID in the assigned worktree, including any earlier frozen prerequisites.",
     promptSnippet: "Run a frozen verification command for implementation feedback",
     promptGuidelines: ["Pass only a command ID from the approved verification list; never invent commands or arguments."],
     parameters: Type.Object({ commandId: Type.String({ minLength: 1 }) }),
@@ -128,7 +139,11 @@ export function createVerificationTool<T>(
       if (resolve(command.cwd) !== resolve(task.workspace.cwd)) {
         throw new Error(`Verification command '${commandId}' is bound to a different worktree`);
       }
-      const heartbeatIntervalMs = verificationHeartbeatIntervalMs(command.timeoutMs, semanticIdleMs);
+      const commandIndex = task.verification.commands.findIndex((candidate) => candidate.id === commandId);
+      if (commandIndex < 0) throw new Error(`Verification command '${commandId}' is not in the frozen controller-approved plan`);
+      const invocation = task.verification.commands.slice(0, commandIndex + 1);
+      const invocationTimeoutMs = verificationInvocationTimeoutMs(invocation);
+      const heartbeatIntervalMs = verificationHeartbeatIntervalMs(invocationTimeoutMs, semanticIdleMs);
       const startedGeneration = state?.mutationGeneration;
       const startedAt = Date.now();
       let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -142,7 +157,7 @@ export function createVerificationTool<T>(
       if (heartbeatIntervalMs !== undefined) {
         heartbeatTimer = setInterval(() => {
           const elapsedMs = Math.max(0, Date.now() - startedAt);
-          if (elapsedMs >= command.timeoutMs) {
+          if (elapsedMs >= invocationTimeoutMs) {
             stopHeartbeat();
             return;
           }
@@ -153,20 +168,33 @@ export function createVerificationTool<T>(
             toolCallId,
             tool: "verify",
             elapsedMs,
-            timeoutMs: command.timeoutMs,
+            timeoutMs: invocationTimeoutMs,
             ...(task.observability ? { observability: task.observability } : {}),
           });
         }, heartbeatIntervalMs);
         // The command runner owns timeout enforcement. Stop producing
-        // liveness evidence at that bound so a broken runner still reaches the
-        // generic fail-closed watchdog instead of living forever on synthetic
-        // heartbeats.
-        heartbeatStopTimer = setTimeout(stopHeartbeat, command.timeoutMs);
+        // liveness evidence at the aggregate invocation bound so a broken runner still reaches the
+        // liveness watchdog instead of living forever on synthetic heartbeats.
+        heartbeatStopTimer = setTimeout(stopHeartbeat, invocationTimeoutMs);
       }
       try {
-        const result = (await task.verification.runner.run([command], signal))[0];
+        // A TypeScript test can consume the compiler output produced by an
+        // earlier frozen command. Process runners intentionally prepare and
+        // clean operational output around each invocation, so running only the
+        // requested command makes that dependency disappear between tool calls.
+        // Replay the ordered prefix in one invocation; this keeps the staging
+        // lifetime shared while preserving the exact frozen command boundary.
+        const results = await task.verification.runner.run(invocation, signal);
+        const resultById = new Map<string, CheckResult>();
+        for (const [index, candidateResult] of results.entries()) {
+          const expected = invocation[index];
+          if (!expected) throw new Error(`Verification returned an unexpected result for command '${candidateResult.commandId}'`);
+          assertExactVerificationResult(expected, candidateResult);
+          if (!candidateResult.commandId) throw new Error(`Verification returned an unnamed result for command '${expected.id}'`);
+          resultById.set(candidateResult.commandId, candidateResult);
+        }
+        const result = resultById.get(commandId);
         if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
-        assertExactVerificationResult(command, result);
         // A cancellation/timeout or a mutation racing this command can never
         // produce a receipt, even if the runner happened to return a green row.
         if (signal?.aborted) {
@@ -174,10 +202,15 @@ export function createVerificationTool<T>(
         } else if (state !== undefined && startedGeneration !== state.mutationGeneration) {
           state.receipts.delete(commandId);
           throw new Error(`Verification command '${commandId}' became stale because the workspace changed during verification; rerun it after the latest edit`);
-        } else if (state !== undefined && result.status === "passed") {
-          state.receipts.set(commandId, { commandId, generation: state.mutationGeneration });
         } else if (state !== undefined) {
-          state.receipts.delete(commandId);
+          for (const candidate of invocation) {
+            const candidateResult = resultById.get(candidate.id);
+            if (candidateResult?.status === "passed") {
+              state.receipts.set(candidate.id, { commandId: candidate.id, generation: state.mutationGeneration });
+            } else {
+              state.receipts.delete(candidate.id);
+            }
+          }
         }
         if (signal?.aborted) throw signal.reason ?? new Error("Verification was cancelled");
         return {

@@ -30,12 +30,12 @@ export function deriveBuilderVerificationGate(
   commands: readonly VerificationCommand[],
   priorFailure?: DurableArtifact<"Outcome">,
 ): { requiredCommandIds: readonly string[] } {
-  const requiredIds = new Set(commands.filter((command) => command.required).map((command) => command.id));
+  const commandIds = new Set(commands.map((command) => command.id));
   if (priorFailure !== undefined) {
     const failed = (priorFailure.payload.failureEvidence?.checks ?? [])
       .filter((check) => (check.status === "failed" || check.status === "skipped")
         && check.commandId !== undefined
-        && requiredIds.has(check.commandId))
+        && commandIds.has(check.commandId))
       .map((check) => check.commandId!);
     return { requiredCommandIds: [...new Set(failed)].sort() };
   }
@@ -50,7 +50,7 @@ export function deriveBuilderVerificationGate(
   }
   // Legacy packets have no semantic contract. Requiring every frozen required
   // command is the conservative fallback; anchors and prose are never used.
-  return { requiredCommandIds: [...requiredIds].sort() };
+  return { requiredCommandIds: [...commands.filter((command) => command.required).map((command) => command.id)].sort() };
 }
 
 /** Ephemeral, controller-validated context for the final bounded repair only. */

@@ -13,7 +13,7 @@ import {
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
-import { BuilderSubmissionSchema, type BuilderSubmission } from "./build.js";
+import { BuilderSubmissionSchema, deriveBuilderVerificationGate, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export async function remediateReview(
@@ -41,7 +41,7 @@ export async function remediateReview(
       && (finding.mustFix ?? finding.blocking));
   if (!findings.length) throw new Error("Remediation requires at least one open controller-accepted mustFix root");
   const verificationGate = input.verification?.length && (input.verificationRunner ?? dependencies.verifier)
-    ? { requiredCommandIds: [...new Set(input.verification.filter((command) => command.required).map((command) => command.id))].sort() }
+    ? deriveBuilderVerificationGate(input.packet, input.verification)
     : undefined;
   const clusters = clusterMustFixFindings(findings);
   let run = input.run;

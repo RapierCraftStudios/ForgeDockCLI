@@ -56,10 +56,39 @@ const reportOnlyFailure = createArtifact({
 describe("builder verification gate derivation", () => {
   const packetArtifact = createArtifact({ kind: "BuildPacket", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "packet-author" }, payload: packet });
   const commands = [{ id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 1_000, required: true }];
+  it("retains frozen optional failures referenced by the evidence contract", () => {
+    const contractedPacket = createArtifact({
+      kind: "BuildPacket", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "packet-author" },
+      payload: {
+        ...packet,
+        evidenceContract: {
+          version: "forgedock.evidence/v1",
+          criteria: [{ criterionId: "criterion-1", requiredCommandIds: ["test"], semanticCommandIds: ["lint"], controllerGateIds: [], allowedWritePaths: [], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }],
+        },
+      },
+    });
+    const commands = [
+      { id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 1_000, required: true },
+      { id: "lint", command: "npm", args: ["run", "lint"], cwd: process.cwd(), timeoutMs: 1_000, required: false },
+    ];
+    const failure = createArtifact({
+      kind: "Outcome", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
+      payload: { status: "blocked", reason: "optional semantic check failed", childIssues: [], failureEvidence: {
+        branch: "forgedock/issue-1", workspacePath: process.cwd(), builderSummary: "failure", changedPaths: ["src/a.ts"],
+        checks: [
+          { command: "npm run lint", commandId: "lint", status: "failed", durationMs: 1 },
+          { command: "unknown", commandId: "unknown", status: "failed", durationMs: 1 },
+        ],
+      } },
+    });
+    assert.deepEqual(deriveBuilderVerificationGate(contractedPacket, commands, failure), { requiredCommandIds: ["lint"] });
+  });
+
   it("leaves report-only repairs with an empty gate", () => {
     assert.deepEqual(deriveBuilderVerificationGate(packetArtifact, commands, reportOnlyFailure), { requiredCommandIds: [] });
   });
 });
+
 
 describe("builder boundary", () => {
   it("permits worktree edits but withholds shell and GitHub authority", async () => {

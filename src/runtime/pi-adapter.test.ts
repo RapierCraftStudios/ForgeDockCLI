@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationRuntimeState, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
+import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationRuntimeState, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs, verificationInvocationTimeoutMs } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -170,6 +170,8 @@ test("verification heartbeat stays inside the command bound and generic idle win
   assert.equal(verificationHeartbeatIntervalMs(1), 1);
   assert.equal(verificationHeartbeatIntervalMs(0), undefined);
   assert.equal(verificationHeartbeatIntervalMs(Number.POSITIVE_INFINITY), undefined);
+  assert.equal(verificationInvocationTimeoutMs([{ timeoutMs: 400 }, { timeoutMs: 500 }]), 900);
+  assert.equal(verificationInvocationTimeoutMs([{ timeoutMs: Number.MAX_SAFE_INTEGER }, { timeoutMs: Number.MAX_SAFE_INTEGER }]), 2_147_483_647);
 });
 
 test("production verify tool emits progress while its runner is pending and stops after settlement", async () => {
@@ -257,6 +259,47 @@ test("verification receipts require exact frozen metadata and latest mutation ge
   result = { ...result, commandTargets: ["src/a.test.ts"], status: "failed" };
   await tool.execute("verify-4", { commandId: "test" }, undefined, undefined, {} as never);
   assert.equal(state.receipts.size, 0);
+});
+
+test("verification replays frozen prerequisites in one staging invocation", async () => {
+  const commands = [
+    { id: "build", command: "node", args: ["build.js"], cwd: process.cwd(), timeoutMs: 500, required: true, policyVersion: "p", planId: "plan" },
+    { id: "test", command: "node", args: ["test.js"], cwd: process.cwd(), timeoutMs: 500, required: true, policyVersion: "p", planId: "plan", targets: ["src/a.test.ts"] },
+  ] as const;
+  const calls: string[][] = [];
+  const resultFor = (command: typeof commands[number]) => ({
+    commandId: command.id,
+    command: [command.command, ...command.args].join(" "),
+    policyVersion: command.policyVersion,
+    planId: command.planId,
+    commandTargets: "targets" in command ? command.targets : [],
+    status: "passed" as const,
+    durationMs: 1,
+  });
+  const task = {
+    id: "run:builder:verify-prefix",
+    role: "builder" as const,
+    objective: "verify",
+    instructions: "verify",
+    context: [],
+    workspace: { cwd: process.cwd(), mode: "write" as const, scope: scopeManifestFor("build-packet", { affectedFiles: ["src/a.test.ts"] }) },
+    tools: ["verify" as const],
+    verification: {
+      commands,
+      runner: { run: async (invocation: readonly typeof commands[number][]) => {
+        calls.push(invocation.map((command) => command.id));
+        return invocation.map(resultFor);
+      } },
+    },
+    outputSchema: Type.Object({ summary: Type.String() }),
+    modelPolicy: {},
+  } as any;
+  const state = createVerificationRuntimeState();
+  const tool = createVerificationTool(task, () => undefined, 20, randomUUID(), state)!;
+  await tool.execute("verify-build", { commandId: "build" }, undefined, undefined, {} as never);
+  await tool.execute("verify-test", { commandId: "test" }, undefined, undefined, {} as never);
+  assert.deepEqual(calls, [["build"], ["build", "test"]]);
+  assert.deepEqual([...state.receipts.keys()], ["build", "test"]);
 });
 
 test("nested reviewer transport does not depend on fetch or an implicit wall-clock timeout", async () => {
