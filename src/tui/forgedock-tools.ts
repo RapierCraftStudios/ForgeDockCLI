@@ -1157,6 +1157,35 @@ function decompositionChildIssuesFromArtifacts(
   });
 }
 
+export async function resolveFreshVisibleDecomposition(input: {
+  github: GitHubClient;
+  artifacts: { list(subject: { repo: string; issue: number }): Promise<readonly DurableArtifact[]> };
+  readyRepository: { repo: string; defaultBranch: string };
+  effective: EffectiveOrchestrationConfig;
+  orchestration: Readonly<OrchestrationRecord>;
+  node: Readonly<OrchestrationNodeRecord>;
+  item: VisibleOrchestrationItem;
+  childIssues?: readonly number[];
+}): Promise<{
+  childIssues: readonly number[];
+  items: readonly VisibleOrchestrationItem[];
+  serializationEdges?: readonly ClaimSerializationEdge[];
+} | undefined> {
+  const repository = input.node.repository ?? input.item.repository ?? input.readyRepository.repo;
+  const authoritativeRepository = await input.github.getRepository(repository);
+  return materializeVisibleDecomposition({
+    github: input.github,
+    artifacts: input.artifacts,
+    repository,
+    defaultBranch: authoritativeRepository.defaultBranch,
+    effective: input.effective,
+    orchestration: input.orchestration,
+    node: input.node,
+    item: input.item,
+    ...(input.childIssues !== undefined ? { childIssues: input.childIssues } : {}),
+  });
+}
+
 async function materializeVisibleDecomposition(input: {
   github: GitHubClient;
   artifacts: { list(subject: { repo: string; issue: number }): Promise<readonly DurableArtifact[]> };
@@ -2941,11 +2970,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         },
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         serializationEdges: schedule.edges,
-        resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeVisibleDecomposition({
+        resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => resolveFreshVisibleDecomposition({
           github: readyGithub,
           artifacts,
-          repository: readyRepository.repo,
-          defaultBranch: readyRepository.defaultBranch,
+          readyRepository,
           effective,
           orchestration: durable,
           node,

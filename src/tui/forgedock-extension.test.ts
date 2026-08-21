@@ -9,13 +9,14 @@ import { after, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
-import { readForgeDockConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
+import { readForgeDockConfig, resolveOrchestrationConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
 import { DEFAULT_REMOTE_READ_CONCURRENCY } from "../core/concurrency.js";
 import { GitHubClient } from "../adapters/github/github-client.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
 import type { OrchestrationRecord } from "../core/ports/orchestration.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
+import { OrchestrationController } from "../workflows/orchestrate/controller.js";
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
 import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOCK_NATIVE_WORKFLOW_MESSAGE, FORGEDOCK_READY_STATUS, isLifecycleControllerShellCommand } from "./forgedock-extension.js";
@@ -37,6 +38,7 @@ import {
   orchestrationTransportKey,
   type ControllerTaskSpec,
   type OrchestrationTransportIdentity,
+  resolveFreshVisibleDecomposition,
   VisibleDagDelegator,
 } from "./forgedock-tools.js";
 
@@ -1999,6 +2001,159 @@ test("fresh-rerun authorization cannot be converted back into checkpoint resume"
   assert.deepEqual(resolveIssueWorkerRecovery([], true, "resume"), { rerun: false, resume: true });
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:in-review", "needs-human"], false, "initial"), { rerun: false, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
+});
+
+test("invariant:matrix-terminal-metadata-ca334548a691 fresh decomposition keeps non-root repository metadata isolated", async () => {
+  const repositoryReads: string[] = [];
+  const artifactReads: Array<{ repo: string; issue: number }> = [];
+  const issueReads: Array<{ repo: string | undefined; issue: number }> = [];
+  const branchReads: Array<{ repo: string; branch: string }> = [];
+  const github = {
+    async getRepository(repo?: string) {
+      repositoryReads.push(repo ?? "<root>");
+      if (repo !== "owner/work") throw new Error(`unexpected repository lookup ${repo ?? "<root>"}`);
+      return { repo, defaultBranch: "work-default" };
+    },
+    async getIssue(issue: number, repo?: string) {
+      issueReads.push({ issue, repo });
+      return {
+        repo: repo ?? "owner/work",
+        number: issue,
+        title: `Child ${issue}`,
+        body: "",
+        url: `https://github.test/owner/work/issues/${issue}`,
+        state: "OPEN" as const,
+        labels: [],
+        comments: [],
+      };
+    },
+    async getBranchHead(repo: string, branch: string) {
+      branchReads.push({ repo, branch });
+      return "a".repeat(40);
+    },
+  } as unknown as GitHubClient;
+  const artifacts = {
+    async list(subject: { repo: string; issue: number }) {
+      artifactReads.push(subject);
+      return [createArtifact({
+        kind: "Outcome",
+        runId: "non-root-decomposition-run",
+        subject: { repo: "owner/work", issue: 7 },
+        producer: { role: "controller", runtime: "forgedock" },
+        payload: { status: "decomposed", reason: "Split work", childIssues: ["#8 Child", "#9 Child"] },
+      })];
+    },
+  };
+  const node = {
+    id: "parent",
+    issue: 7,
+    priority: 1,
+    dependencies: [],
+    claims: [],
+    repository: "owner/work",
+    status: "skipped",
+    childRunIds: [],
+    attempts: [],
+  } as any;
+  const item = {
+    id: "parent",
+    issue: 7,
+    priority: 1,
+    dependencies: [],
+    claims: [],
+    repository: "owner/work",
+    labels: [],
+    affectedFiles: [],
+    memberIssues: [7],
+    title: "Parent",
+    summary: "Parent",
+  } as any;
+  const expansion = await resolveFreshVisibleDecomposition({
+    github,
+    artifacts,
+    readyRepository: { repo: "owner/control", defaultBranch: "control-default" },
+    effective: resolveOrchestrationConfig({}),
+    orchestration: { nodes: [node] } as any,
+    node,
+    item,
+  });
+
+  assert.deepEqual(repositoryReads, ["owner/work"]);
+  assert.deepEqual(artifactReads, [{ repo: "owner/work", issue: 7 }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 8 }, { repo: "owner/work", issue: 9 }]);
+  assert.deepEqual(branchReads, [
+    { repo: "owner/work", branch: "work-default" },
+    { repo: "owner/work", branch: "work-default" },
+  ]);
+  assert.deepEqual(expansion?.childIssues, [8, 9]);
+  assert.deepEqual(expansion?.items.map((child) => ({
+    issue: child.issue,
+    repository: child.repository,
+    targetBranch: child.targetBranch,
+    claims: child.claims,
+  })), [
+    { issue: 8, repository: "owner/work", targetBranch: "work-default", claims: ["component:repository"] },
+    { issue: 9, repository: "owner/work", targetBranch: "work-default", claims: ["component:repository"] },
+  ]);
+
+  let failedArtifactReads = 0;
+  let failedIssueReads = 0;
+  const failingGithub = {
+    async getRepository(repo?: string): Promise<{ repo: string; defaultBranch: string }> {
+      throw new Error(`authoritative lookup failed for ${repo}`);
+    },
+    async getIssue() { failedIssueReads++; throw new Error("child issue read must not run"); },
+  } as unknown as GitHubClient;
+  await assert.rejects(
+    () => resolveFreshVisibleDecomposition({
+      github: failingGithub,
+      artifacts: { list: async () => { failedArtifactReads++; return []; } },
+      readyRepository: { repo: "owner/control", defaultBranch: "control-default" },
+      effective: resolveOrchestrationConfig({}),
+      orchestration: { nodes: [node] } as any,
+      node,
+      item,
+    }),
+    /authoritative lookup failed/,
+  );
+  assert.equal(failedArtifactReads, 0);
+  assert.equal(failedIssueReads, 0);
+});
+
+test("fresh decomposition preserves the durable parent-repository rejection invariant", async () => {
+  const started: string[] = [];
+  const controller = new OrchestrationController({
+    repository: new InMemoryOrchestrationRepository(),
+    executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    transportCapacity: 1,
+    worker: async (scheduled) => {
+      started.push(scheduled.id);
+      return scheduled.id === "parent"
+        ? { status: "skipped", error: "authoritative child scope required", childIssues: [8] }
+        : undefined;
+    },
+    resolveDecomposition: async ({ childIssues }) => ({
+      childIssues: childIssues ?? [],
+      items: [{ id: "child-8", issue: 8, priority: 1, dependencies: [], claims: [], repository: "owner/control" }],
+    }),
+  });
+
+  await assert.rejects(
+    () => controller.createAndRun({
+      repository: "owner/work",
+      maxParallel: 1,
+      items: [{
+        id: "parent",
+        issue: 7,
+        priority: 1,
+        dependencies: [],
+        claims: [],
+        repository: "owner/work",
+      }],
+    }),
+    /must remain in parent repository owner\/work/,
+  );
+  assert.deepEqual(started, ["parent"]);
 });
 
 test("visible DAG persists its durable parent record and terminal node state", async () => {
