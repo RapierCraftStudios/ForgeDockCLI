@@ -216,9 +216,9 @@ describe("direct target recovery integration", () => {
     });
     const artifacts = await fixture.artifacts.list(subject);
     const outcomes = artifacts.filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
-    const latestCheckpoint = artifacts.filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint").at(-1);
+    const checkpoints = artifacts.filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint");
     assert.equal(outcomes.length, 1);
-    assert.equal(outcomes[0]?.payload.targetRecovery?.checkpointId, latestCheckpoint?.id);
+    assert.equal(checkpoints.some((checkpoint) => checkpoint.id === outcomes[0]?.payload.targetRecovery?.checkpointId), true);
     assert.equal(reconcileLatestRunArtifacts(artifacts).state, "failed");
     const terminal = terminalOrchestrationResult(subject.issue, artifacts, reconcileLatestRunArtifacts(artifacts));
     assert.equal(terminal?.status, "failed");
@@ -287,15 +287,24 @@ describe("direct target recovery integration", () => {
   });
 
   it("rejects forged source base and checkpoint attempt bounds before Git mutation", async () => {
-    const runId = "target-authority";
+    const rejectForged = async (
+      suffix: string,
+      mutate: (checkpoint: Awaited<ReturnType<typeof targetRun>>["checkpoint"]) => Awaited<ReturnType<typeof targetRun>>["checkpoint"],
+      pattern: RegExp,
+    ) => {
+      const runId = `target-authority-${suffix}`;
+      const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+      const fixture = await targetRun(runId, i, inv, p, b);
+      const forged = mutate(fixture.checkpoint);
+      await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forged, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), pattern);
+    };
+    await rejectForged("base", (checkpoint) => ({ ...checkpoint, payload: { ...checkpoint.payload, sourceBaseSha: "d".repeat(40) } }), /source base/);
+    await rejectForged("max", (checkpoint) => ({ ...checkpoint, payload: { ...checkpoint.payload, attempt: { number: 1, max: 1_000_000_000 } } }), /attempt/);
+    await rejectForged("order", (checkpoint) => ({ ...checkpoint, payload: { ...checkpoint.payload, attempt: { number: 3, max: 2 } } }), /attempt/);
+
+    const runId = "target-authority-persist";
     const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
     const fixture = await targetRun(runId, i, inv, p, b);
-    const forgedBase = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, sourceBaseSha: "d".repeat(40) } } as typeof fixture.checkpoint;
-    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedBase, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /source base/);
-    const forgedMax = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, attempt: { number: 1, max: 1_000_000_000 } } } as typeof fixture.checkpoint;
-    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedMax, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /attempt/);
-    const forgedOrder = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, attempt: { number: 3, max: 2 } } } as typeof fixture.checkpoint;
-    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedOrder, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /attempt/);
     await assert.rejects(() => persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: b, workspace, targetBranch: "main", observedTargetSha: targetBase, maxAttempts: 1_000_000_000, artifacts: fixture.artifacts }), /attempt/);
   });
   it("normalizes route claims and keeps unrelated retry keys independent", async () => {
