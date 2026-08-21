@@ -486,7 +486,7 @@ async function resumeTargetAdvanceWorkOnInternal(
       checkpoint: "verified-commit", branch: workspace.branch, targetBranch: checkpoint.targetBranch, baseSha: targetSha,
       parentHeadSha: checkpoint.sourceHeadSha, changedPaths, pendingChangedPaths: changedPaths,
       verifiedContentDigest: freshContentDigest, commitMessage: `forge: synchronize issue ${run.subject.issue ?? "work item"} with ${checkpoint.targetBranch}`,
-      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: freshTargetRecoveryEvidence(input.packet, input.buildResult, checks, changedPaths, expectedPaths, frozenVerification),
+      summary: `Fresh target-recovery verification for ${newHead}.`, acceptanceEvidence: await freshTargetRecoveryEvidence(input.packet, input.buildResult, checks, changedPaths, expectedPaths, frozenVerification, workspace.path),
       checks, decisions: [`Target recovery rebased ${checkpoint.sourceHeadSha} onto ${targetSha}.`], residualRisks: [],
     },
   });
@@ -652,14 +652,15 @@ export async function resumeTargetAdvanceWorkOn(
   }
 }
 
-function freshTargetRecoveryEvidence(
+async function freshTargetRecoveryEvidence(
   packet: DurableArtifact<"BuildPacket">,
   sourceBuild: DurableArtifact<"BuildResult">,
   checks: readonly CheckResult[],
   changedPaths: readonly string[],
   expectedPaths: ReadonlySet<string>,
   verification: readonly Omit<VerificationCommand, "cwd">[],
-): DurableArtifact<"VerificationCheckpoint">["payload"]["acceptanceEvidence"] {
+  workspacePath: string,
+): Promise<DurableArtifact<"VerificationCheckpoint">["payload"]["acceptanceEvidence"]> {
   const source = sourceBuild.payload.acceptanceEvidence;
   if (source.length !== packet.payload.acceptanceCriteria.length) {
     throw new Error("Target recovery cannot establish fresh criterion evidence from an incomplete prior evidence plan");
@@ -672,21 +673,63 @@ function freshTargetRecoveryEvidence(
   const passedCommands = new Set(checks.filter((check) => check.status === "passed").map((check) => check.commandId).filter((id): id is string => id !== undefined));
   const observedPaths = new Set(changedPaths);
   const contractById = new Map((packet.payload.evidenceContract?.criteria ?? []).map((criterion) => [criterion.criterionId, criterion]));
-  return packet.payload.acceptanceCriteria.map((criterion, index) => {
+  return Promise.all(packet.payload.acceptanceCriteria.map(async (criterion, index) => {
     const criterionId = `criterion-${index + 1}`;
     const evidence = source.find((item) => item.criterionId === criterionId && item.criterion === criterion && item.status === "passed");
     if (!evidence || !evidence.evidence.trim() || !evidence.anchors) {
       throw new Error(`Target recovery cannot revalidate criterion evidence for ${criterionId} without semantic anchors`);
     }
     const anchors = evidence.anchors;
-    if (anchors.paths.some((path) => !expectedPaths.has(path) || !observedPaths.has(path))) {
-      throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors`);
+    // Resolve the frozen criterion contract before validating any model-supplied
+    // path.  Write and evidence paths have deliberately different proof rules.
+    const contract = contractById.get(criterionId);
+    if (strictSemantic && !contract) throw new Error(`Target recovery criterion ${criterionId} lacks a frozen evidence contract`);
+    if (!contract) {
+      if (anchors.paths.some((path) => !expectedPaths.has(path) || !observedPaths.has(path))) {
+        throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors`);
+      }
+    } else {
+      const allowedWritePaths = new Set(contract.allowedWritePaths);
+      const allowedEvidencePaths = new Set(contract.allowedEvidencePaths);
+    const declaredEvidencePaths = new Set((packet.payload.evidencePaths ?? [])
+      .filter((declaration) => declaration.criterionIds.includes(criterionId))
+      .map((declaration) => canonicalizeConcreteScopePaths([declaration.path])[0]));
+    for (const path of anchors.paths) {
+      let canonicalPath: string;
+      try {
+        canonicalPath = canonicalizeConcreteScopePaths([path])[0]!;
+      } catch (error) {
+        throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors: ${path} (${error instanceof Error ? error.message : String(error)})`);
+      }
+      if (canonicalPath !== path) {
+        throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors: ${path} is not canonical`);
+      }
+      const isWrite = allowedWritePaths.has(path);
+      const isEvidence = allowedEvidencePaths.has(path);
+      if (!isWrite && !isEvidence) {
+        throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors: ${path} is not authorized by the frozen evidence contract`);
+      }
+      if (isEvidence && (!declaredEvidencePaths.has(path) || !await recoveredEvidenceFile(workspacePath, path))) {
+        throw new Error(`Target recovery criterion ${criterionId} has deleted, symlink, or drifted evidence path: ${path}`);
+      }
+      if (isWrite && !expectedPaths.has(path)) {
+        throw new Error(`Target recovery criterion ${criterionId} has stale or out-of-scope path anchors: ${path} is outside the Build Packet write scope`);
+      }
+      if (isWrite && !observedPaths.has(path) && !isEvidence) {
+        throw new Error(`Target recovery criterion ${criterionId} has a write anchor absent from the recovered revision; target may already have converged, but exact source BuildResult content proof is unavailable: ${path}`);
+      }
+      // A path appearing in both sets is accepted as a write only when the
+      // recovered diff proves it.  Otherwise the explicit evidence role may
+      // validate the unchanged file, but it never waives write proof.
+      if (isEvidence && isWrite && observedPaths.has(path)) continue;
+      if (isEvidence && !isWrite && observedPaths.has(path)) {
+        throw new Error(`Target recovery criterion ${criterionId} has evidence-only path in the recovered write revision: ${path}`);
+      }
+      }
     }
     if (strictSemantic && (anchors.symbols.length === 0 || anchors.testIds.length === 0)) {
       throw new Error(`Target recovery criterion ${criterionId} lacks proven symbols or test IDs`);
     }
-    const contract = contractById.get(criterionId);
-    if (strictSemantic && !contract) throw new Error(`Target recovery criterion ${criterionId} lacks a frozen evidence contract`);
     const requiredIds = contract?.requiredCommandIds ?? [];
     const semanticIds = contract?.semanticCommandIds ?? [];
     const anchoredIds = new Set(anchors.verificationCommandIds);
@@ -720,7 +763,24 @@ function freshTargetRecoveryEvidence(
       evidence: `${evidence.evidence} Fresh controller rerun at the recovered target base passed.`,
       anchors,
     };
-  });
+  }));
+}
+
+async function recoveredEvidenceFile(workspacePath: string, path: string): Promise<boolean> {
+  try {
+    const root = await realpath(workspacePath);
+    const absolute = resolve(root, path);
+    const relativePath = relative(root, absolute);
+    if (!relativePath || isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${sep}`)) return false;
+    const entry = await lstat(absolute);
+    if (!entry.isFile() || entry.isSymbolicLink()) return false;
+    const canonical = await realpath(absolute);
+    const canonicalRelative = relative(root, canonical);
+    return canonical === absolute && Boolean(canonicalRelative) && !isAbsolute(canonicalRelative)
+      && canonicalRelative !== ".." && !canonicalRelative.startsWith(`..${sep}`);
+  } catch {
+    return false;
+  }
 }
 
 interface ScopeExpansionOptions {

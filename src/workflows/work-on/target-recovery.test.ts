@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -83,7 +84,7 @@ function deps(fixture: Awaited<ReturnType<typeof targetRun>>, git = new GitFake(
   return { fixture, git, dependencies: { runtime: new FakeAgentRuntime([{ summary: "Approved", findings: [] }]), artifacts: fixture.artifacts, runs: fixture.runs, git, verifier: new Verifier(), host: host(git) } as never };
 }
 
-describe("direct target recovery integration", () => {
+describe("direct target recovery integration", { concurrency: false }, () => {
   it("integrates an initially un-PRed target and creates fresh verification/build evidence and review", async () => {
     const runId = "target-success"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
     const fixture = await targetRun(runId, i, inv, p, b); const { git, dependencies } = deps(fixture);
@@ -94,6 +95,50 @@ describe("direct target recovery integration", () => {
     assert.equal((await fixture.artifacts.list(subject, "BuildResult")).length, 2);
     assert.equal((await fixture.artifacts.list({ ...subject, pr: 7 }, "ReviewVerdict")).length, 1);
   });
+  it("accepts unchanged contract evidence boundaries without expanding the recovered write revision", async () => {
+    const runId = "target-evidence-boundaries";
+    const i = intent(runId); const inv = investigation(runId);
+    const basePacket = packet(runId);
+    const p = {
+      ...basePacket,
+      payload: {
+        ...basePacket.payload,
+        evidencePaths: [
+          { path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const },
+          { path: "tsconfig.json", criterionIds: ["criterion-1"], role: "unchanged-boundary" as const },
+        ],
+        verificationRequirements: [{ kind: "command" as const, id: "test", criterionIds: ["criterion-1"], rationale: "regression" }],
+        evidenceContract: {
+          version: "forgedock.evidence/v1" as const,
+          criteria: [{ criterionId: "criterion-1", requiredCommandIds: ["test"], semanticCommandIds: ["test"], controllerGateIds: [],
+            allowedWritePaths: ["src/a.ts"], allowedEvidencePaths: ["package.json", "tsconfig.json"],
+            invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }],
+        },
+      },
+    } as typeof basePacket;
+    const baseBuild = build(runId);
+    const b = {
+      ...baseBuild,
+      payload: {
+        ...baseBuild.payload,
+        acceptanceEvidence: [{ ...baseBuild.payload.acceptanceEvidence[0]!, anchors: {
+          paths: ["src/a.ts", "package.json", "tsconfig.json"], symbols: ["guard"], testIds: ["guard-test"], verificationCommandIds: ["test"],
+        } }],
+      },
+    } as typeof baseBuild;
+    await mkdir(`${workspace.path}/src`, { recursive: true });
+    await writeFile(`${workspace.path}/src/a.ts`, "guard();\n");
+    await writeFile(`${workspace.path}/package.json`, "{}\n");
+    await writeFile(`${workspace.path}/tsconfig.json`, "{}\n");
+    try {
+      const fixture = await targetRun(runId, i, inv, p, b);
+      const result = await resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: fixture.checkpoint, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [{ ...command, evidenceCapability: "targeted-test", targets: ["src/a.ts"] }] }, deps(fixture).dependencies);
+      assert.equal(result.pullRequest?.baseBranch, "main");
+    } finally {
+      await rm(workspace.path, { recursive: true, force: true });
+    }
+  });
+
   it("resolves reviewed checkpoints by matching fresh verdict disposition", async () => {
     const reviewed = async (runId: string, disposition: "approve" | "request_changes") => {
       const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId); const fixture = await targetRun(runId, i, inv, p, b);
