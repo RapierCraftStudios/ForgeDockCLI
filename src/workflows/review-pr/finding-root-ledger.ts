@@ -113,9 +113,9 @@ export function structuralFindingRoot(
   const invariantSource = finding.impact?.affectedInvariant?.trim()
     ? finding.impact.affectedInvariant
     : `${finding.intentRelevance}\n${finding.matchedAcceptanceCriteria?.join("\n") ?? ""}`;
-  const invariantFamily = semanticFamily(invariantSource);
-  const failureFamily = semanticFamily(`${finding.causalRoot ?? ""}\n${finding.title}\n${finding.remediation}`);
-  const triggerFamily = semanticFamily(`${finding.impact?.trigger ?? ""}\n${finding.evidence}`);
+  const invariantFamily = semanticFamily(invariantSource, "invariant");
+  const failureFamily = semanticFamily(`${finding.causalRoot ?? ""}\n${finding.title}\n${finding.remediation}`, "failure");
+  const triggerFamily = semanticFamily(`${finding.impact?.trigger ?? ""}\n${finding.evidence}`, "trigger");
   const structuralKey = [criterionIds.join("|"), component, symbols.join("|"), invariantFamily, failureFamily, triggerFamily].join("\n");
   return {
     rootId: `root-${createHash("sha256").update(structuralKey).digest("hex").slice(0, 20)}`,
@@ -157,22 +157,63 @@ function symbolsForFinding(finding: LedgerFinding): string[] {
     : [componentForFinding(finding).split("/").at(-1) ?? "component"];
 }
 
-/** Domain vocabulary collapses wording churn while preserving distinct triggers. */
-function semanticFamily(value: string): string {
+/**
+ * Explicit vocabulary for the three independent semantic dimensions. Keep this
+ * matrix deliberately small: words such as "stream" and "terminal" often
+ * describe incidental context, not another causal family. A family is added
+ * only when its vocabulary is explicit, and the complete family set remains
+ * part of identity (adapter+terminal is not terminal alone).
+ */
+type SemanticDimension = "invariant" | "failure" | "trigger";
+interface VocabularyEntry { name: string; pattern: RegExp; }
+const NORMALIZATION_VOCABULARY: Record<SemanticDimension, readonly VocabularyEntry[]> = {
+  invariant: [
+    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
+    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
+    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
+    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
+    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
+    { name: "backpressure", pattern: /backpressure|queue/ },
+    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
+    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+  ],
+  failure: [
+    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
+    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
+    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
+    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
+    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
+    { name: "backpressure", pattern: /backpressure|queue/ },
+    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
+    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+  ],
+  trigger: [
+    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
+    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
+    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
+    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
+    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
+    { name: "backpressure", pattern: /backpressure|queue/ },
+    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
+    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+  ],
+};
+
+function semanticFamily(value: string, dimension: SemanticDimension): string {
   const text = value.toLowerCase();
-  const families: Array<[string, RegExp]> = [
-    ["redaction-grammar", /redact|credential|secret|token|password|marker|userinfo/],
-    ["chunk-boundary", /chunk|split|fragment|continuation|stream/],
-    ["adapter-lifecycle", /adapter|lifecycle|recreat|producer|cleanup|terminal/],
-    ["identity-isolation", /identity|session|nodeid|pisession|collision|interleav|isolation/],
-    ["terminal-metadata", /terminal|completed|failed|cancelled|metadata|ordering/],
-    ["backpressure", /backpressure|drop|queue|fail.closed/],
-    ["authority-binding", /authority|head sha|revision|route|binding/],
-    ["criterion-evidence", /criterion|acceptance evidence|verification command|check id/],
-  ];
-  const matched = families.filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
-  if (matched.length) return matched.slice(0, 3).join("+");
-  return text.replace(/[^a-z0-9]+/g, " ").split(" ").filter((token) => token.length > 2 || /^\d+$/.test(token)).sort().slice(0, 8).join("-") || "unspecified";
+  const matched = NORMALIZATION_VOCABULARY[dimension]
+    .filter(({ pattern }) => pattern.test(text))
+    .map(({ name }) => name);
+  // Boundary words in prose commonly qualify a domain family ("credential
+  // chunk", "identity stream"). Treat them as an independent trigger only
+  // in the trigger dimension, where that distinction is causal.
+  const hasExplicitBoundary = /\b(?:chunk|split|fragment)\b/.test(text);
+  const normalized = matched.length <= 1 || (dimension === "trigger" && hasExplicitBoundary)
+    ? matched
+    : matched.filter((family) => family !== "chunk-boundary");
+  if (normalized.length) return normalized.join("+");
+  return text.replace(/[^a-z0-9]+/g, " ").split(" ")
+    .filter((token) => token.length > 2 || /^\d+$/.test(token)).sort().slice(0, 8).join("-") || "unspecified";
 }
 
 function structurallyEquivalent(left: FindingRoot, right: ReturnType<typeof structuralFindingRoot>): boolean {
@@ -184,15 +225,15 @@ function structurallyEquivalent(left: FindingRoot, right: ReturnType<typeof stru
     && familyEquivalent(left.triggerFamily, right.triggerFamily);
 }
 
+/** Compare complete canonical family sets; partial overlap collapses triggers. */
 function familyEquivalent(left: string, right: string): boolean {
   if (left === right) return true;
-  const canonical = new Set([
-    "redaction-grammar", "chunk-boundary", "adapter-lifecycle", "identity-isolation",
-    "terminal-metadata", "backpressure", "authority-binding", "criterion-evidence",
-  ]);
+  const canonical = new Set(NORMALIZATION_VOCABULARY.invariant.map(({ name }) => name));
   const leftFamilies = left.split("+").filter((family) => canonical.has(family));
   const rightFamilies = right.split("+").filter((family) => canonical.has(family));
-  return leftFamilies.some((family) => rightFamilies.includes(family));
+  if (leftFamilies.length === 0 || rightFamilies.length === 0) return false;
+  return leftFamilies.length === rightFamilies.length
+    && leftFamilies.every((family) => rightFamilies.includes(family));
 }
 
 function cloneRoot(root: FindingRoot): FindingRoot {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
-import { openLedgerFindings, reconcileFindingRootLedger } from "./finding-root-ledger.js";
+import { openLedgerFindings, reconcileFindingRootLedger, structuralFindingRoot } from "./finding-root-ledger.js";
 
 const runId = "run-root-ledger";
 const subject = { repo: "a/b", issue: 364 };
@@ -97,6 +97,46 @@ describe("durable finding root ledger", () => {
     });
     assert.deepEqual(next.map(({ rootId }) => rootId), initial.map(({ rootId }) => rootId));
     assert.ok(next.every((root) => root.aliases.length >= 2));
+  });
+
+  it("exposes stable normalized dimensions for each supported paraphrase family", () => {
+    const dimensions = (value: Finding) => {
+      const normalized = structuralFindingRoot(value, packet);
+      return {
+        criterionIds: normalized.criterionIds,
+        component: normalized.component,
+        symbols: normalized.symbols,
+        invariantFamily: normalized.invariantFamily,
+        failureFamily: normalized.failureFamily,
+        triggerFamily: normalized.triggerFamily,
+      };
+    };
+    for (const family of ["marker", "identity", "terminal"] as const) {
+      const original = dimensions(finding(`${family}-original`, family));
+      const paraphrase = dimensions(finding(`${family}-paraphrase`, family, true));
+      assert.deepEqual(paraphrase, original, `${family} paraphrase changed a structural dimension`);
+    }
+    assert.equal(dimensions(finding("marker-diagnostic", "marker")).invariantFamily, "redaction-grammar");
+    assert.equal(dimensions(finding("identity-diagnostic", "identity")).invariantFamily, "identity-isolation+adapter-lifecycle");
+    assert.equal(dimensions(finding("terminal-diagnostic", "terminal")).triggerFamily, "terminal-metadata");
+  });
+
+  it("does not alias a complete trigger family to a partial family", () => {
+    const terminal = finding("terminal-only", "terminal");
+    const combined = {
+      ...terminal,
+      id: "adapter-terminal",
+      evidence: `${terminal.evidence} ControllerObservationAdapter.emit() recreates the producer.`,
+      impact: { ...terminal.impact!, trigger: `${terminal.impact!.trigger} during adapter lifecycle recreation.` },
+    };
+    const initial = reconcileFindingRootLedger({ packet, findings: [terminal], headSha: head1 });
+    const previous = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: initial },
+    });
+    const next = reconcileFindingRootLedger({ previous, packet, findings: [combined], headSha: head2 });
+    assert.equal(next.length, 2);
+    assert.deepEqual(new Set(next.map((root) => root.triggerFamily)), new Set(["terminal-metadata", "terminal-metadata+adapter-lifecycle"]));
   });
 
   it("carries omitted open roots until explicit closure evidence exists", () => {
