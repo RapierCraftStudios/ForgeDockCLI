@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
+import { relative, resolve, sep, isAbsolute } from "node:path";
 import { Check } from "typebox/value";
 import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
@@ -17,7 +19,7 @@ import {
 } from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
-import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestForBuildPacket, STANDARD_SCOPE_METADATA_ROOTS } from "../../runtime/agent-runtime.js";
+import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestForBuildPacket, STANDARD_SCOPE_METADATA_ROOTS, isRecoverableAgentExecutionError } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { buildWorkItem, type BuilderSubmission, VerificationDiagnosisSchema, type VerificationDiagnosis } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
@@ -1297,11 +1299,12 @@ function diagnosisScope(packet: DurableArtifact<"BuildPacket">) {
   return { readRoots: scope.readRoots, writeRoots: [], source: scope.source } as const;
 }
 
-function validateVerificationDiagnosis(
+async function validateVerificationDiagnosis(
   diagnosis: VerificationDiagnosis,
   packet: DurableArtifact<"BuildPacket">,
   repeatedSignatures: readonly string[],
-): VerificationDiagnosis {
+  workspacePath: string,
+): Promise<VerificationDiagnosis> {
   if (!Check(VerificationDiagnosisSchema, diagnosis)) throw new Error("Verification diagnosis failed its bounded schema");
   const scope = diagnosisScope(packet);
   const allowed = new Set([
@@ -1315,6 +1318,20 @@ function validateVerificationDiagnosis(
     }
     const inReadRoot = scope.readRoots.some((root) => anchor.path === root || anchor.path.startsWith(`${root}/`));
     if (!allowed.has(anchor.path) && !inReadRoot) throw new Error(`Verification diagnosis anchor is outside packet read scope: ${anchor.path}`);
+    const absolute = resolve(workspacePath, anchor.path);
+    let entry;
+    try {
+      entry = await lstat(absolute);
+      if (!entry.isFile() || entry.isSymbolicLink()) throw new Error("not a regular file");
+      const root = await realpath(workspacePath);
+      const canonical = await realpath(absolute);
+      const withinWorkspace = relative(root, canonical);
+      if (!withinWorkspace || isAbsolute(withinWorkspace) || withinWorkspace === ".." || withinWorkspace.startsWith(`..${sep}`)) {
+        throw new Error("resolves outside workspace");
+      }
+    } catch (error) {
+      throw new Error(`Verification diagnosis anchor is not a regular in-scope file: ${anchor.path} (${error instanceof Error ? error.message : String(error)})`);
+    }
   }
   if (!repeatedSignatures.length || repeatedSignatures.some((signature) => !diagnosis.failureSignatureMapping.includes(signature))) {
     throw new Error("Verification diagnosis does not map every repeated failure signature");
@@ -1372,7 +1389,7 @@ async function diagnoseRepeatedVerificationFailure(
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
   });
-  return validateVerificationDiagnosis(result.output, input.packet, repeatedSignatures);
+  return validateVerificationDiagnosis(result.output, input.packet, repeatedSignatures, input.workspace.path);
 }
 
 export async function resumeBuildWorkOn(
@@ -1423,10 +1440,11 @@ export async function resumeBuildWorkOn(
     let priorVerificationFailure = input.priorVerificationFailure;
     let verificationDiagnosis = diagnosisFromOutcome(priorVerificationFailure);
     if (verificationDiagnosis !== undefined && priorVerificationFailure !== undefined) {
-      verificationDiagnosis = validateVerificationDiagnosis(
+      verificationDiagnosis = await validateVerificationDiagnosis(
         verificationDiagnosis,
         input.packet,
         canonicalFailedRequiredCheckSignatures(priorVerificationFailure, input.verification.map((command) => ({ ...command, cwd: input.workspace.path }))),
+        input.workspace.path,
       );
     }
     let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
@@ -1635,19 +1653,27 @@ async function verifyWithBuilderRepairs(
       && repeatedSignatures.every((signature, index) => signature === priorSignatures[index]);
     if (repeatedFailure && !diagnosisAttempted) {
       diagnosisAttempted = true;
-      verificationDiagnosis = await diagnoseRepeatedVerificationFailure({
-        run,
-        intent: input.intent,
-        investigation: input.investigation,
-        packet: input.packet,
-        workspace: input.workspace,
-        currentFailure: verified.outcome!,
-        priorFailure: priorFailureForSignature!,
-        submission,
-        ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
-        commands: input.commands,
-        ...runtimeOptions,
-      }, dependencies, repeatedSignatures);
+      try {
+        verificationDiagnosis = await diagnoseRepeatedVerificationFailure({
+          run,
+          intent: input.intent,
+          investigation: input.investigation,
+          packet: input.packet,
+          workspace: input.workspace,
+          currentFailure: verified.outcome!,
+          priorFailure: priorFailureForSignature!,
+          submission,
+          ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
+          commands: input.commands,
+          ...runtimeOptions,
+        }, dependencies, repeatedSignatures);
+      } catch (error) {
+        if (isRecoverableAgentExecutionError(error)) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+        }
+        throw error;
+      }
     }
     const checkpoint = await appendVerificationRepairCheckpoint(
       run,

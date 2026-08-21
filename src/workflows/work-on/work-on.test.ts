@@ -14,7 +14,7 @@ import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
-import type { BuilderSubmission } from "./build.js";
+import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 
@@ -86,6 +86,10 @@ class EndToEndGit implements GitWorkspaceManager {
   async head(): Promise<string> { return sha; }
   async remove(): Promise<void> { this.removed = true; }
 }
+class DiagnosticGit extends EndToEndGit {
+  override async create(): Promise<GitWorkspace> { return { ...workspace, path: process.cwd() }; }
+}
+
 class SequencedEndToEndGit extends EndToEndGit {
   #index = 0;
   constructor(readonly pathSequence: readonly (readonly string[])[]) { super(); }
@@ -941,6 +945,58 @@ describe("complete work-on trajectory", () => {
       ? [artifact.payload.failureEvidence.repairAttempt]
       : []);
     assert.deepEqual(repairAttempts, [1]);
+  });
+
+  it("diagnoses one repeated timeout signature before the final repair", async () => {
+    const diagnosis: VerificationDiagnosis = {
+      rootCause: `A literal join("\\n") leaves the escaped separator in the generated command input.`,
+      sourceAnchors: [{ path: "src/workflows/work-on/work-on.test.ts", location: "diagnosis regression", evidence: "The frozen test file is the concrete reproducer anchor." }],
+      reproducer: "The frozen npm test command repeats the timeout.",
+      failureSignatureMapping: `test|failed|timeout||join("\\n")`,
+      rejectedPreviousHypotheses: ["The first builder blamed a transient provider timeout; the same frozen signature disproves that."],
+      minimalFixGuidance: "Replace only the literal separator and rerun the frozen check.",
+    };
+    const failure: CheckResult = {
+      command: "npm", commandId: "test", status: "failed", failureClass: "timeout", failureSignatures: [`join("\\n")`], durationMs: 10,
+    };
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, diagnosis, submission]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new DiagnosticGit();
+    const host = new EndToEndHost();
+    const verifier: VerificationRunner = { async run() { return [failure]; } };
+    const result = await workOn({ intent: createWorkOnIntent("run_repeated_diagnosis"), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
+    assert.equal(result.run.state, "blocked");
+    const diagnosisTasks = runtime.tasks.filter((task) => task.role === "investigator" && task.id.includes("verification-diagnosis"));
+    assert.equal(diagnosisTasks.length, 1);
+    assert.deepEqual(diagnosisTasks[0]?.tools, ["read", "grep", "find", "ls", "verify"]);
+    assert.equal(diagnosisTasks[0]?.workspace.mode, "read-only");
+    assert.deepEqual(diagnosisTasks[0]?.workspace.scope.writeRoots, []);
+    assert.equal(diagnosisTasks[0]?.workspace.scope.writePaths, undefined);
+    const finalBuilder = runtime.tasks.filter((task) => task.role === "builder").at(-1);
+    assert.match(finalBuilder?.instructions ?? "", /literal join/);
+    assert.match(finalBuilder?.instructions ?? "", /Rejected previous hypotheses/);
+    assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
+    const attemptTwo = artifacts.artifacts.find((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt === 2);
+    assert.equal(attemptTwo?.kind, "Outcome");
+    assert.ok(attemptTwo?.payload.failureEvidence?.diagnostics?.some(({ code }) => code === "verification-diagnosis"));
+  });
+
+  it("rejects malformed and out-of-scope diagnosis before a final builder", async () => {
+    for (const [label, diagnosis] of [["malformed", {}], ["out-of-scope", {
+      rootCause: "bad", sourceAnchors: [{ path: "outside.ts", location: "x", evidence: "bad" }], reproducer: "x",
+      failureSignatureMapping: "test|failed|timeout||first", rejectedPreviousHypotheses: ["bad"], minimalFixGuidance: "bad",
+    }]] as const) {
+      const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, diagnosis]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const git = new DiagnosticGit();
+      const host = new EndToEndHost();
+      const verifier: VerificationRunner = { async run() { return [{ command: "npm", commandId: "test", status: "failed", failureClass: "timeout", failureSignatures: ["first"], durationMs: 10 }]; } };
+      await assert.rejects(() => workOn({ intent: createWorkOnIntent(`run_bad_diagnosis_${label}`), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host }));
+      assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 2);
+      assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
+    }
   });
 
   it("repairs a verification failure automatically without another CLI invocation", async () => {

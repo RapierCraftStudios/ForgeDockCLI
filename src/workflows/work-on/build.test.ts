@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { buildWorkItem, type BuilderSubmission } from "./build.js";
+import { buildWorkItem, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
 import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 
@@ -22,6 +22,27 @@ const submission: BuilderSubmission = {
   decisions: [], residualRisks: [],
 };
 
+const diagnosis: VerificationDiagnosis = {
+  rootCause: "The source joins lines with a literal escape instead of a newline.",
+  sourceAnchors: [{ path: "src/workflows/work-on/build.ts", location: "buildWorkItem", evidence: "The repair prompt is assembled here." }],
+  reproducer: "npm test reproduces the timeout signature.",
+  failureSignatureMapping: "test|failed|timeout||",
+  rejectedPreviousHypotheses: ["The timeout was caused by a transient provider failure."],
+  minimalFixGuidance: "Change only the line-join formatting and rerun the frozen check.",
+};
+
+const priorFailure = createArtifact({
+  kind: "Outcome", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
+  payload: {
+    status: "blocked", reason: "Required verification failed", childIssues: [],
+    failureEvidence: {
+      branch: "forgedock/issue-1", workspacePath: process.cwd(), builderSummary: "Timed out",
+      changedPaths: ["src/a.ts"], checks: [{ command: "npm test", commandId: "test", status: "failed", failureClass: "timeout", durationMs: 1 }],
+    },
+  },
+});
+
+
 describe("builder boundary", () => {
   it("permits worktree edits but withholds shell and GitHub authority", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet, submission]);
@@ -38,6 +59,7 @@ describe("builder boundary", () => {
     const verifier = { async run() { return []; } };
     const built = await buildWorkItem({
       run: prepared.run, intent, investigation: investigated.investigation, packet: prepared.packet, scopeHints, worktree: process.cwd(),
+      priorVerificationFailure: priorFailure, verificationDiagnosis: diagnosis,
       verification, verificationRunner: verifier,
     }, { runtime, runs, verifier });
 
@@ -46,6 +68,10 @@ describe("builder boundary", () => {
     assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "verify", "edit", "write"]);
     assert.equal(runtime.tasks[2]?.verification?.commands[0]?.id, "test");
     assert.match(runtime.tasks[2]?.instructions ?? "", /test=npm test/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /Root cause: The source joins lines/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /Rejected previous hypotheses/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /buildWorkItem/);
+    assert.match(runtime.tasks[2]?.instructions ?? "", /minimal fix/);
     assert.match(runtime.tasks[2]?.instructions ?? "", /criterion-by-criterion implementation checklist/);
     assert.match(runtime.tasks[2]?.instructions ?? "", /self-review the complete diff/);
     assert.ok(!runtime.tasks[2]?.tools.includes("bash"));
