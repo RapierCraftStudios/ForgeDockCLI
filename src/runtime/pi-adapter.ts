@@ -16,6 +16,8 @@ import {
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
+import { CheckResultSchema } from "../core/artifacts/schema.js";
+import type { CheckResult, VerificationCommand, VerificationRunner } from "../core/ports/verification.js";
 import { splitConfiguredModel, type ThinkingLevel } from "../core/config/forgedock-config.js";
 import { runIdFromTaskId, type AgentExecutionUsage, type AgentRunReceipt, type AgentUsageReceipt } from "../core/ports/telemetry.js";
 import { loadForgeGuidance } from "../core/config/project-memory.js";
@@ -59,12 +61,57 @@ export function verificationHeartbeatIntervalMs(timeoutMs: number, semanticIdleM
   return Math.max(1, Math.min(DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, Math.floor(timeoutMs / 2), Math.floor(semanticIdleMs / 2)));
 }
 
+export interface VerificationReceipt {
+  commandId: string;
+  generation: number;
+}
+
+export interface VerificationRuntimeState {
+  mutationGeneration: number;
+  readonly receipts: Map<string, VerificationReceipt>;
+}
+
+export function createVerificationRuntimeState(): VerificationRuntimeState {
+  return { mutationGeneration: 0, receipts: new Map() };
+}
+
+function invalidateVerificationReceipts(state: VerificationRuntimeState): void {
+  state.mutationGeneration += 1;
+  state.receipts.clear();
+}
+
+function exactCommandText(command: VerificationCommand): string {
+  return [command.command, ...command.args].join(" ");
+}
+
+function exactArray(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
+}
+
+function assertExactVerificationResult(command: VerificationCommand, result: CheckResult): void {
+  if (!Check(CheckResultSchema, result)) throw new Error(`Verification command '${command.id}' returned a malformed check result`);
+  const mismatches: string[] = [];
+  if (result.commandId !== command.id) mismatches.push("command ID");
+  if (result.command !== exactCommandText(command)) mismatches.push("command and arguments");
+  if (result.policyVersion !== command.policyVersion) mismatches.push("policy version");
+  if (result.planId !== command.planId) mismatches.push("plan ID");
+  if (!exactArray(result.commandTargets, command.targets)) mismatches.push("targets");
+  if (!exactArray(result.coveredBy, command.coveredBy)) mismatches.push("coveredBy");
+  if (mismatches.length) throw new Error(`Verification command '${command.id}' returned stale or inexact metadata: ${mismatches.join(", ")}`);
+}
+
 /**
  * Build the controller-approved verification tool used by production Pi
  * sessions. Exported so its liveness contract can be exercised without a live
  * provider session.
  */
-export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSink, semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS, logicalStreamId = crypto.randomUUID()) {
+export function createVerificationTool<T>(
+  task: AgentTask<T>,
+  emit: AgentEventSink,
+  semanticIdleMs = DEFAULT_SEMANTIC_IDLE_MS,
+  logicalStreamId = crypto.randomUUID(),
+  state?: VerificationRuntimeState,
+) {
   if (!task.tools.includes("verify")) return undefined;
   return defineTool({
     name: "verify",
@@ -82,6 +129,7 @@ export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSi
         throw new Error(`Verification command '${commandId}' is bound to a different worktree`);
       }
       const heartbeatIntervalMs = verificationHeartbeatIntervalMs(command.timeoutMs, semanticIdleMs);
+      const startedGeneration = state?.mutationGeneration;
       const startedAt = Date.now();
       let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
       let heartbeatStopTimer: ReturnType<typeof setTimeout> | undefined;
@@ -118,10 +166,27 @@ export function createVerificationTool<T>(task: AgentTask<T>, emit: AgentEventSi
       try {
         const result = (await task.verification.runner.run([command], signal))[0];
         if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
+        assertExactVerificationResult(command, result);
+        // A cancellation/timeout or a mutation racing this command can never
+        // produce a receipt, even if the runner happened to return a green row.
+        if (signal?.aborted) {
+          state?.receipts.delete(commandId);
+        } else if (state !== undefined && startedGeneration !== state.mutationGeneration) {
+          state.receipts.delete(commandId);
+          throw new Error(`Verification command '${commandId}' became stale because the workspace changed during verification; rerun it after the latest edit`);
+        } else if (state !== undefined && result.status === "passed") {
+          state.receipts.set(commandId, { commandId, generation: state.mutationGeneration });
+        } else if (state !== undefined) {
+          state.receipts.delete(commandId);
+        }
+        if (signal?.aborted) throw signal.reason ?? new Error("Verification was cancelled");
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ id: commandId, ...result }) }],
           details: result,
         };
+      } catch (error) {
+        state?.receipts.delete(commandId);
+        throw error;
       } finally {
         stopHeartbeat();
       }
@@ -305,6 +370,7 @@ export class PiAgentRuntime implements AgentRuntime {
     if (!model) throw new Error(`Pi model not found: ${provider}/${modelId}`);
 
     let submitted: T | undefined;
+    const verificationState = createVerificationRuntimeState();
     const usageMessages: unknown[] = [];
     let retryCount = 0;
     const submitTool = defineTool({
@@ -316,6 +382,14 @@ export class PiAgentRuntime implements AgentRuntime {
       parameters: task.outputSchema,
       async execute(_toolCallId, params) {
         if (submitted !== undefined) throw new Error("Artifact was already submitted");
+        const requiredCommandIds = task.verificationGate?.requiredCommandIds ?? [];
+        const missing = requiredCommandIds.filter((commandId) => {
+          const receipt = verificationState.receipts.get(commandId);
+          return receipt?.generation !== verificationState.mutationGeneration;
+        });
+        if (missing.length) {
+          throw new Error(`Artifact submission requires successful current-generation verification for command IDs: ${missing.join(", ")}. Run each exact frozen command after the latest edit and retry.`);
+        }
         submitted = params as T;
         emit({ type: "artifact.submitted", logicalStreamId, taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
         return {
@@ -327,10 +401,12 @@ export class PiAgentRuntime implements AgentRuntime {
     });
 
     const resourceLoader = createTaskResourceLoader(task);
-    const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope);
+    const sandboxedTools = await createSandboxedTools(task.workspace.cwd, task.tools, task.workspace.scope, {
+      afterMutation: () => invalidateVerificationReceipts(verificationState),
+    });
     throwIfAborted(execution.controller.signal);
     const semanticIdleMs = this.#semanticIdleMs;
-    const verificationTool = createVerificationTool(task, emit, semanticIdleMs, logicalStreamId);
+    const verificationTool = createVerificationTool(task, emit, semanticIdleMs, logicalStreamId, verificationState);
     const agentDir = this.#options.agentDir ?? getAgentDir();
     const { session } = await createAgentSession({
       cwd: task.workspace.cwd,
@@ -1185,5 +1261,15 @@ function assertToolPolicy<T>(task: AgentTask<T>): void {
   }
   if (grants.has("verify") && (!task.verification || !task.verification.commands.length)) {
     throw new Error(`Verification-enabled task ${task.id} has no frozen controller-approved command plan`);
+  }
+  if (task.verificationGate !== undefined) {
+    const ids = task.verificationGate.requiredCommandIds;
+    if (new Set(ids).size !== ids.length || ids.some((id) => typeof id !== "string" || !id.length)) {
+      throw new Error(`Task ${task.id} verification gate must contain unique non-empty command IDs`);
+    }
+    if (ids.length && (!grants.has("verify") || !task.verification
+      || ids.some((id) => !task.verification!.commands.some((command) => command.id === id)))) {
+      throw new Error(`Task ${task.id} verification gate references commands that are not executable by its frozen verify tool`);
+    }
   }
 }

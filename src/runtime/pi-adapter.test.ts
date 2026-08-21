@@ -2,10 +2,11 @@
 
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
+import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationRuntimeState, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -172,8 +173,8 @@ test("verification heartbeat stays inside the command bound and generic idle win
 });
 
 test("production verify tool emits progress while its runner is pending and stops after settlement", async () => {
-  let completeVerification!: (results: Array<{ command: string; status: "passed"; exitCode: number; durationMs: number }>) => void;
-  const pendingVerification = new Promise<Array<{ command: string; status: "passed"; exitCode: number; durationMs: number }>>((resolve) => {
+  let completeVerification!: (results: Array<{ command: string; commandId: string; status: "passed"; exitCode: number; durationMs: number }>) => void;
+  const pendingVerification = new Promise<Array<{ command: string; commandId: string; status: "passed"; exitCode: number; durationMs: number }>>((resolve) => {
     completeVerification = resolve;
   });
   const events: AgentEvent[] = [];
@@ -220,11 +221,42 @@ test("production verify tool emits progress while its runner is pending and stop
     timeoutMs: 500,
   });
 
-  completeVerification([{ command: "npm test", status: "passed", exitCode: 0, durationMs: 15 }]);
+  completeVerification([{ command: "npm test", commandId: "test", status: "passed", exitCode: 0, durationMs: 15 }]);
   await execution;
   const progressAtSettlement = events.filter((event) => event.type === "tool.progress").length;
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(events.filter((event) => event.type === "tool.progress").length, progressAtSettlement);
+});
+
+test("verification receipts require exact frozen metadata and latest mutation generation", async () => {
+  const command = { id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 500, required: true, policyVersion: "policy-1", targets: ["src/a.test.ts"], planId: "plan-1", coveredBy: ["suite"] } as const;
+  const state = createVerificationRuntimeState();
+  let result: any = { command: "npm test", commandId: "test", policyVersion: "policy-1", commandTargets: ["src/a.test.ts"], planId: "plan-1", coveredBy: ["suite"], status: "passed", durationMs: 1 };
+  const task = {
+    id: "run:builder:verify-receipt",
+    role: "builder" as const,
+    objective: "verify",
+    instructions: "verify",
+    context: [],
+    workspace: { cwd: process.cwd(), mode: "write" as const, scope: scopeManifestFor("build-packet", { affectedFiles: ["src/a.test.ts"] }) },
+    tools: ["verify" as const],
+    verification: { commands: [command], runner: { run: async () => [result] } },
+    outputSchema: Type.Object({ summary: Type.String() }),
+    modelPolicy: {},
+  } as any;
+  const tool = createVerificationTool(task, () => undefined, 20, randomUUID(), state)!;
+  await tool.execute("verify-1", { commandId: "test" }, undefined, undefined, {} as never);
+  assert.deepEqual(state.receipts.get("test"), { commandId: "test", generation: 0 });
+  state.mutationGeneration += 1;
+  assert.deepEqual(state.receipts.get("test"), { commandId: "test", generation: 0 });
+  await tool.execute("verify-2", { commandId: "test" }, undefined, undefined, {} as never);
+  assert.deepEqual(state.receipts.get("test"), { commandId: "test", generation: 1 });
+  result = { ...result, commandTargets: ["src/other.test.ts"] };
+  await assert.rejects(() => tool.execute("verify-3", { commandId: "test" }, undefined, undefined, {} as never), /metadata|stale/i);
+  assert.equal(state.receipts.size, 0);
+  result = { ...result, commandTargets: ["src/a.test.ts"], status: "failed" };
+  await tool.execute("verify-4", { commandId: "test" }, undefined, undefined, {} as never);
+  assert.equal(state.receipts.size, 0);
 });
 
 test("nested reviewer transport does not depend on fetch or an implicit wall-clock timeout", async () => {

@@ -24,6 +24,35 @@ export const BuilderSubmissionSchema = Type.Object({
 });
 export type BuilderSubmission = Static<typeof BuilderSubmissionSchema>;
 
+/** Controller-only gate for the bounded builder; never inferred from model prose. */
+export function deriveBuilderVerificationGate(
+  packet: DurableArtifact<"BuildPacket">,
+  commands: readonly VerificationCommand[],
+  priorFailure?: DurableArtifact<"Outcome">,
+): { requiredCommandIds: readonly string[] } {
+  const requiredIds = new Set(commands.filter((command) => command.required).map((command) => command.id));
+  if (priorFailure !== undefined) {
+    const failed = (priorFailure.payload.failureEvidence?.checks ?? [])
+      .filter((check) => (check.status === "failed" || check.status === "skipped")
+        && check.commandId !== undefined
+        && requiredIds.has(check.commandId))
+      .map((check) => check.commandId!);
+    return { requiredCommandIds: [...new Set(failed)].sort() };
+  }
+  const contract = packet.payload.evidenceContract;
+  if (contract?.version === "forgedock.evidence/v1") {
+    return {
+      requiredCommandIds: [...new Set(contract.criteria.flatMap((criterion) => [
+        ...criterion.requiredCommandIds,
+        ...criterion.semanticCommandIds,
+      ]))].sort(),
+    };
+  }
+  // Legacy packets have no semantic contract. Requiring every frozen required
+  // command is the conservative fallback; anchors and prose are never used.
+  return { requiredCommandIds: [...requiredIds].sort() };
+}
+
 /** Ephemeral, controller-validated context for the final bounded repair only. */
 export const VerificationDiagnosisSchema = Type.Object({
   rootCause: Type.String({ minLength: 1, maxLength: 2_000 }),
@@ -74,6 +103,10 @@ export async function buildWorkItem(
   dependencies: { runtime: AgentRuntime; runs: RunRepository; onAgentEvent?: AgentEventSink; verifier?: VerificationRunner },
 ): Promise<{ run: RunState; submission: BuilderSubmission; sessionRef: string }> {
   if (input.run.state !== "building") throw new Error(`Build requires building state, found ${input.run.state}`);
+  const frozenCommands = input.verification ?? [];
+  const verificationGate = frozenCommands.length && (input.verificationRunner ?? dependencies.verifier)
+    ? deriveBuilderVerificationGate(input.packet, frozenCommands, input.priorVerificationFailure)
+    : undefined;
   let run = input.run;
   try {
     const result = await dependencies.runtime.run<BuilderSubmission>({
@@ -157,6 +190,7 @@ export async function buildWorkItem(
       ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? {
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
+      ...(verificationGate !== undefined ? { verificationGate } : {}),
       outputSchema: BuilderSubmissionSchema,
       executionBudget: WORK_ON_EXECUTION_BUDGETS.builder,
       modelPolicy: {

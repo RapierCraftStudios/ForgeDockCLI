@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { buildWorkItem, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
+import { buildWorkItem, deriveBuilderVerificationGate, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
 import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 
@@ -41,7 +41,25 @@ const priorFailure = createArtifact({
     },
   },
 });
+const reportOnlyFailure = createArtifact({
+  kind: "Outcome", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "controller" },
+  payload: {
+    status: "blocked", reason: "Evidence correction", childIssues: [],
+    failureEvidence: {
+      branch: "forgedock/issue-1", workspacePath: process.cwd(), builderSummary: "Report only",
+      changedPaths: ["src/a.ts"], diagnostics: [{ code: "evidence-gap", message: "Missing anchor" }], checks: [],
+    },
+  },
+});
 
+
+describe("builder verification gate derivation", () => {
+  const packetArtifact = createArtifact({ kind: "BuildPacket", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "packet-author" }, payload: packet });
+  const commands = [{ id: "test", command: "npm", args: ["test"], cwd: process.cwd(), timeoutMs: 1_000, required: true }];
+  it("leaves report-only repairs with an empty gate", () => {
+    assert.deepEqual(deriveBuilderVerificationGate(packetArtifact, commands, reportOnlyFailure), { requiredCommandIds: [] });
+  });
+});
 
 describe("builder boundary", () => {
   it("permits worktree edits but withholds shell and GitHub authority", async () => {
@@ -67,6 +85,7 @@ describe("builder boundary", () => {
     assert.equal(built.submission.summary, "Added the guard");
     assert.deepEqual(runtime.tasks[2]?.tools, ["read", "grep", "find", "ls", "compute", "verify", "edit", "write"]);
     assert.equal(runtime.tasks[2]?.verification?.commands[0]?.id, "test");
+    assert.deepEqual(runtime.tasks[2]?.verificationGate, { requiredCommandIds: ["test"] });
     assert.match(runtime.tasks[2]?.instructions ?? "", /test=npm test/);
     assert.match(runtime.tasks[2]?.instructions ?? "", /Root cause: The source joins lines/);
     assert.match(runtime.tasks[2]?.instructions ?? "", /Rejected previous hypotheses/);

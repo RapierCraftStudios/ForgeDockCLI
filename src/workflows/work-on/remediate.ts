@@ -40,6 +40,9 @@ export async function remediateReview(
       && finding.scopeDisposition !== "follow_up"
       && (finding.mustFix ?? finding.blocking));
   if (!findings.length) throw new Error("Remediation requires at least one open controller-accepted mustFix root");
+  const verificationGate = input.verification?.length && (input.verificationRunner ?? dependencies.verifier)
+    ? { requiredCommandIds: [...new Set(input.verification.filter((command) => command.required).map((command) => command.id))].sort() }
+    : undefined;
   const clusters = clusterMustFixFindings(findings);
   let run = input.run;
   try {
@@ -89,6 +92,7 @@ export async function remediateReview(
       ...(input.verification?.length && (input.verificationRunner ?? dependencies.verifier) ? {
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
+      ...(verificationGate !== undefined ? { verificationGate } : {}),
       outputSchema: BuilderSubmissionSchema,
       executionBudget: WORK_ON_EXECUTION_BUDGETS.remediator,
       modelPolicy: {

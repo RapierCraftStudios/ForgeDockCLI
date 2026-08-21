@@ -25,8 +25,10 @@ import { isConcreteScopePath, type ScopeManifest, type ToolGrant } from "./agent
  * and symlink escapes.
  */
 /** Test-only synchronization; it supplies no filesystem operation or authorization decision. */
-type SandboxMutationTestAdapter = {
+export type SandboxMutationTestAdapter = {
   beforeMutation?: (kind: "file" | "directory", candidate: string) => void | Promise<void>;
+  /** Called only after a file mutation completed successfully. Directory creation is not a mutation receipt boundary. */
+  afterMutation?: (kind: "file", candidate: string) => void | Promise<void>;
 };
 
 export async function createSandboxedTools(
@@ -433,12 +435,15 @@ export class WorkspaceGuard {
 
   async writeFile(path: string, content: string): Promise<void> {
     const handle = await this.writable(path);
+    let succeeded = false;
     try {
       await handle.truncate(0);
       await handle.writeFile(content, "utf8");
+      succeeded = true;
     } finally {
       await closeFileHandle(handle);
     }
+    if (succeeded) await this.afterMutation("file", this.lexical(path));
   }
 
   async makeDirectory(path: string): Promise<void> {
@@ -452,6 +457,10 @@ export class WorkspaceGuard {
 
   private async beforeMutation(kind: "file" | "directory", candidate: string): Promise<void> {
     await this.testAdapter?.beforeMutation?.(kind, candidate);
+  }
+
+  private async afterMutation(kind: "file", candidate: string): Promise<void> {
+    await this.testAdapter?.afterMutation?.(kind, candidate);
   }
 
   private async assertWritableCandidate(candidate: string): Promise<void> {

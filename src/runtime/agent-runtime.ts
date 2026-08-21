@@ -274,6 +274,10 @@ export interface AgentTask<_T> {
     commands: readonly VerificationCommand[];
     runner: VerificationRunner;
   };
+  /** Controller-frozen command IDs that must have current-generation passed receipts before submission. */
+  verificationGate?: {
+    requiredCommandIds: readonly string[];
+  };
   outputSchema: TSchema;
   modelPolicy: ModelPolicy;
 }

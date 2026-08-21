@@ -134,6 +134,27 @@ describe("runtime workspace confinement", () => {
     }
   });
 
+  it("reports only successful file mutations after the write completes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-mutation-callback-"));
+    try {
+      if (!safeMutationSupportAvailable()) return;
+      writeFileSync(join(root, "file.txt"), "before\n");
+      const mutations: string[] = [];
+      const tools = await createSandboxedTools(root, ["write"], undefined, {
+        afterMutation: (kind, candidate) => { mutations.push(`${kind}:${candidate}`); },
+      });
+      const write = tools.find((tool) => tool.name === "write");
+      assert.ok(write);
+      await write.execute("successful", { path: "file.txt", content: "after\n" }, undefined, undefined, {} as never);
+      assert.equal(mutations.length, 1);
+      writeFileSync(join(root, "not-a-directory"), "file\n");
+      await assert.rejects(write.execute("failed", { path: "not-a-directory/child.txt", content: "nope" }, undefined, undefined, {} as never));
+      assert.equal(mutations.length, 1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a static symlink through the public write tool", async () => {
     const parent = mkdtempSync(join(tmpdir(), "forgedock-public-symlink-"));
     const root = join(parent, "worktree");

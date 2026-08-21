@@ -49,6 +49,7 @@ describe("mustFix remediation", () => {
     assert.equal(runtime.tasks.length, 1);
     assert.match(runtime.tasks[0]?.objective ?? "", /medium-root|root-medium/);
     assert.ok(runtime.tasks[0]?.tools.includes("verify"));
+    assert.deepEqual(runtime.tasks[0]?.verificationGate, { requiredCommandIds: ["test"] });
   });
 
   it("bounds clusters without silently dropping roots", () => {
