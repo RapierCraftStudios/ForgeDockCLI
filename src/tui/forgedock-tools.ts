@@ -4094,7 +4094,7 @@ async function startNativeControllerTask(
   ctx: ExtensionContext,
   entryOverride?: string | null,
 ): Promise<string> {
-  const entry = entryOverride ?? resolveControllerEntry();
+  const entry = resolveControllerEntry(entryOverride);
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   // The caller has crossed the typed dispatch-readiness barrier. Only now may
   // persisted native tasks be adopted or terminalized for recovery.
