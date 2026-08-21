@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { canonicalizePacketVerification } from "./prepare.js";
+import { canonicalizePacketVerification, selectPacketVerificationCommands } from "./prepare.js";
 import type { BuildPacketPayload } from "../../core/artifacts/schema.js";
 
 const layout = { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "a".repeat(64) };
@@ -30,6 +30,30 @@ describe("controller semantic completion regressions #393 #394 #399 #400", () =>
       kind: "command", id: "targeted-tests", criterionIds: ["criterion-3"],
       rationale: "Controller auto-completed semantic evidence from validated relation closure and catalog capability.",
     });
+  });
+
+  it("keeps relation graph metadata nonblocking unless strict rollout is enabled", () => {
+    const canonical = canonicalizePacketVerification(packet(), catalog, ["src/foo.test.ts"], []);
+    const shadowPacket = {
+      ...canonical,
+      relationGraph: {
+        version: "forgedock.relation-graph/v1" as const,
+        baseSha: "a".repeat(40), graphDigest: "b".repeat(64), configDigest: "b".repeat(64),
+        closureDigest: "b".repeat(64), commandPlanDigest: "b".repeat(64), evidenceContractDigest: "b".repeat(64),
+        checkpointId: `relation-graph:${"b".repeat(64)}`, checkpointDigest: "b".repeat(64),
+        writablePaths: [], evidencePaths: [], invariantIds: [], commandIds: ["wrong-command"],
+      },
+    };
+    const executableCatalog = catalog.commands.map((command) => ({ ...command, timeoutMs: 1_000 }));
+    assert.doesNotThrow(() => selectPacketVerificationCommands(shadowPacket, executableCatalog, "a".repeat(40)));
+    const previous = process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+    process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = "1";
+    try {
+      assert.throws(() => selectPacketVerificationCommands(shadowPacket, executableCatalog, "a".repeat(40)), /graph-drift/);
+    } finally {
+      if (previous === undefined) delete process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+      else process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = previous;
+    }
   });
 
   it("#393/#394/#399 fail once with one controller diagnostic when semantic proof is unavailable", () => {
