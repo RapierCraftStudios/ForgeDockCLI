@@ -75,7 +75,7 @@ export function discoverVerificationCommands(
   // exist in package.json. Prefer one bounded compile gate.
   const compile = discoverTypeIntegrityCommand(scripts);
   const compiler = compile ? resolveTypeScriptCompiler(cwd, typescriptProject(compile.args)) : undefined;
-  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, baseIdentity, compile.args, scripts, compiler) : undefined;
+  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, compile.args, scripts, compiler) : undefined;
   const explicitlyNoEmit = compile?.args.some((argument) => argument === "--noEmit" || argument === "--no-emit") ?? false;
   if (compile && !typescriptLayout && !explicitlyNoEmit) {
     throw new Error(`Refusing emitting TypeScript verification without a safe project layout: ${compile.id}`);
@@ -164,7 +164,6 @@ function discoverTypeIntegrityCommand(
 function discoverTypeScriptLayout(
   cwd: string,
   baseRef: string | undefined,
-  baseIdentity: string,
   compileArgs: readonly string[],
   scripts: Record<string, string>,
   compiler: string | undefined,
@@ -188,7 +187,8 @@ function discoverTypeScriptLayout(
   if (!sourceRoot || !configuredOutput || configuredOutput === ".") return undefined;
   const outputName = basename(configuredOutput);
   const configDigest = createHash("sha256").update(JSON.stringify({
-    baseIdentity, project, source, compiler, scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
+    policyVersion: VERIFICATION_POLICY_VERSION,
+    project, source, compiler, scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
   })).digest("hex").slice(0, 24);
   const outputRoot = join(dirname(configuredOutput), `.${outputName}.forgedock-verification-${configDigest}`).replaceAll("\\", "/");
   return {

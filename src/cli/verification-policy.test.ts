@@ -60,6 +60,28 @@ describe("verification policy discovery", () => {
     const branchCatalog = discoverVerificationCommands(repo, "origin/staging");
     const shaCatalog = discoverVerificationCommands(repo, sha);
     assert.deepEqual(shaCatalog, branchCatalog);
+    writeFileSync(join(repo, "unrelated.txt"), "target advance\n");
+    git(repo, "add", "unrelated.txt");
+    git(repo, "commit", "-m", "unrelated target advance");
+    const advancedSha = git(repo, "rev-parse", "HEAD");
+    const advancedCatalog = discoverVerificationCommands(repo, advancedSha);
+    assert.notEqual(advancedCatalog[0]?.planId, shaCatalog[0]?.planId);
+    assert.deepEqual(
+      advancedCatalog.map(({ planId: _planId, ...command }) => command),
+      shaCatalog.map(({ planId: _planId, ...command }) => command),
+    );
+    assert.equal(
+      advancedCatalog.find(({ id }) => id === "build")?.typescriptLayout?.outputRoot,
+      shaCatalog.find(({ id }) => id === "build")?.typescriptLayout?.outputRoot,
+    );
+    writeTypeScriptConfig(repo, { outDir: "build-dist" });
+    git(repo, "add", "tsconfig.json");
+    git(repo, "commit", "-m", "config authority drift");
+    const changedConfigCatalog = discoverVerificationCommands(repo, git(repo, "rev-parse", "HEAD"));
+    assert.notEqual(
+      changedConfigCatalog.find(({ id }) => id === "build")?.typescriptLayout?.outputRoot,
+      shaCatalog.find(({ id }) => id === "build")?.typescriptLayout?.outputRoot,
+    );
     const packet = {
       expectedPaths: ["src-marker.ts", "src/feature.test.ts"],
       verificationRequirements: [{ kind: "command" as const, id: "test", criterionIds: ["criterion"], rationale: "canonical identity" }],
