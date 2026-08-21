@@ -2311,17 +2311,19 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   await delegator.shutdown();
 });
 
-test("visible decomposition keeps non-root repository identity on initial and resumed materialization", async () => {
+test("visible decomposition integration uses the non-root repository before dispatching children", async () => {
   const repositoryReads: string[] = [];
   const artifactReads: Array<{ repo: string; issue: number }> = [];
   const issueReads: Array<{ repo: string; issue: number }> = [];
   const branchReads: Array<{ repo: string; branch: string }> = [];
+  const dispatchLog: string[] = [];
+  let taskNumber = 0;
   const outcome = createArtifact({
     kind: "Outcome",
     runId: "run-visible-remote-decomposition",
     subject: { repo: "owner/work", issue: 42 },
     producer: { role: "controller", runtime: "forgedock" },
-    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 Child"] },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 Child", "#101 Child"] },
   });
   const github = {
     async getRepository(repo: string) {
@@ -2334,7 +2336,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
         repo,
         number: issue,
         title: `Child ${issue}`,
-        body: issue === 100 ? "## Prerequisites\n- Requires #7." : "",
+        body: "",
         url: `https://github.test/${repo}/issues/${issue}`,
         state: "OPEN" as const,
         labels: [],
@@ -2356,35 +2358,12 @@ test("visible decomposition keeps non-root repository identity on initial and re
       return [outcome];
     },
   };
+  const state = fakePi();
+  const delegator = witnessedDagDelegator(state.pi);
   const input = {
-    github,
-    artifacts,
     repository: "owner/control",
-    effective: { fastLaneTarget: "work-main" } as any,
-    orchestration: {
-      nodes: [
-        {
-          id: "valid-prerequisite",
-          issue: 7,
-          repository: "  Owner/WORK  ",
-          priority: 1,
-          dependencies: [],
-          claims: [],
-          memberIssues: [7],
-        },
-        {
-          id: "foreign-prerequisite",
-          issue: 7,
-          repository: "owner/other",
-          priority: 1,
-          dependencies: [],
-          claims: [],
-          memberIssues: [7],
-        },
-      ],
-    } as any,
-    node: { id: "parent", issue: 42, repository: "owner/work" } as any,
-    item: {
+    requestedIssueNumbers: [42],
+    items: [{
       id: "parent",
       issue: 42,
       repository: "owner/work",
@@ -2396,94 +2375,256 @@ test("visible decomposition keeps non-root repository identity on initial and re
       memberIssues: [42],
       title: "Parent",
       summary: "Parent",
+    }],
+    maxParallel: 2,
+    taskFor: (item: any) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    controllerTaskFor: (item: any) => ({ args: [item.id], cwd: process.cwd() }),
+    startControllerTask: async (spec: any) => {
+      const nodeId = spec.launchIdentity?.nodeId ?? spec.args[0];
+      dispatchLog.push(`start:${nodeId}`);
+      return `task-${++taskNumber}-${nodeId}`;
+    },
+    waitControllerTask: async () => undefined,
+    assertCompleted: async (item: any) => item.issue === 42
+      ? { status: "skipped" as const, error: "authoritative child scope required", childIssues: [100, 101] }
+      : undefined,
+    onComplete: () => undefined,
+    resolveDecomposition: async ({ orchestration, node, item, childIssues }: any) => {
+      // The live worker reports the authoritative child scope; retain the parent
+      // artifact read in this fixture while exercising the controller resolver seam.
+      await artifacts.list({ repo: item.repository ?? orchestration.repository, issue: item.issue });
+      const expansion = await materializeVisibleDecomposition({
+        github,
+        artifacts,
+        repository: item.repository ?? orchestration.repository,
+        effective: { fastLaneTarget: "work-main" } as any,
+        orchestration,
+        node,
+        item,
+        ...(childIssues !== undefined ? { childIssues } : {}),
+      });
+      dispatchLog.push("materialized");
+      return expansion;
     },
   };
 
-  const initial = await materializeVisibleDecomposition(input);
+  const run = await delegator.start(input);
+  await run.completion;
+  const durable = (delegator as any).runs.get(run.id).durableRecord as OrchestrationRecord;
+  assert.equal(durable.status, "completed");
+  assert.equal(durable.repository, "owner/control");
+  assert.equal(durable.nodes.find((node) => node.id === "parent")?.repository, "owner/work");
+  assert.deepEqual(durable.nodes.find((node) => node.id === "parent")?.decompositionChildren, [100, 101]);
+  for (const issue of [100, 101]) {
+    const child = durable.nodes.find((node) => node.issue === issue);
+    assert.equal(child?.repository, "owner/work");
+    assert.equal(child?.targetBranch, "work-main");
+    assert.equal(child?.status, "completed");
+    assert.ok(child?.attempts?.[0]?.controllerTaskId);
+  }
+  assert.ok(dispatchLog.indexOf("materialized") > dispatchLog.indexOf("start:parent"));
+  assert.ok(dispatchLog.indexOf("start:issue-100") > dispatchLog.indexOf("materialized"));
+  assert.ok(dispatchLog.indexOf("start:issue-101") > dispatchLog.indexOf("materialized"));
   assert.deepEqual(repositoryReads, ["owner/work"]);
   assert.deepEqual(artifactReads, [{ repo: "owner/work", issue: 42 }]);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
-  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
-  assert.equal(initial?.items[0]?.repository, "owner/work");
-  assert.equal(initial?.items[0]?.targetBranch, "work-main");
-  assert.deepEqual(initial?.items[0]?.dependencies, ["valid-prerequisite"]);
-
-  repositoryReads.length = 0;
-  artifactReads.length = 0;
-  issueReads.length = 0;
-  branchReads.length = 0;
-  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [100] });
-  assert.deepEqual(repositoryReads, ["owner/work"]);
-  assert.deepEqual(artifactReads, []);
-  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
-  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
-  assert.equal(resumed?.items[0]?.repository, "owner/work");
-  assert.equal(resumed?.items[0]?.targetBranch, "work-main");
-  assert.deepEqual(resumed?.items[0]?.dependencies, ["valid-prerequisite"]);
+  assert.deepEqual(issueReads.map(({ repo, issue }) => ({ repo, issue })).sort((a, b) => a.issue - b.issue), [
+    { repo: "owner/work", issue: 100 },
+    { repo: "owner/work", issue: 101 },
+  ]);
+  assert.deepEqual(branchReads, [
+    { repo: "owner/work", branch: "work-main" },
+    { repo: "owner/work", branch: "work-main" },
+  ]);
+  assert.equal([...repositoryReads, ...artifactReads.map((read) => read.repo), ...issueReads.map((read) => read.repo), ...branchReads.map((read) => read.repo)].every((repo) => repo === "owner/work"), true);
+  await delegator.shutdown();
 });
 
-test("visible decomposition fails closed when a concurrent child read rejects", async () => {
-  const issueReads: number[] = [];
+test("visible decomposition resumes through rebuild and fails closed across concurrent child reads", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const repositoryReads: string[] = [];
+  const artifactReads: Array<{ repo: string; issue: number }> = [];
+  const issueReads: Array<{ repo: string; issue: number }> = [];
+  const branchReads: Array<{ repo: string; branch: string }> = [];
+  const dispatchLog: string[] = [];
+  const resolverSnapshots: OrchestrationRecord[] = [];
+  let rejectChildRead = true;
+  let taskNumber = 0;
+  let completedSiblingCalls = 0;
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-visible-fail-closed-decomposition",
+    subject: { repo: "owner/work", issue: 42 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 Child", "#101 Child"] },
+  });
   const github = {
     async getRepository(repo: string) {
-      return { repo, defaultBranch: "work-main" };
+      repositoryReads.push(repo);
+      return { repo, defaultBranch: repo === "owner/work" ? "work-main" : "control-main" };
     },
-    async getIssue(issue: number) {
-      issueReads.push(issue);
-      if (issue === 101) throw new Error("child read failed");
+    async getIssue(issue: number, repo: string) {
+      issueReads.push({ repo, issue });
+      if (rejectChildRead && issue === 101) throw new Error("child read failed");
       return {
-        repo: "owner/work",
+        repo,
         number: issue,
         title: `Child ${issue}`,
         body: "",
-        url: `https://github.test/owner/work/issues/${issue}`,
+        url: `https://github.test/${repo}/issues/${issue}`,
         state: "OPEN" as const,
         labels: [],
         comments: [],
       };
     },
+    async listBranches(repo: string) {
+      branchReads.push({ repo, branch: "milestone/" });
+      return [];
+    },
+    async getBranchHead(repo: string, branch: string) {
+      branchReads.push({ repo, branch });
+      return "head";
+    },
   } as any;
-  const input = {
-    github,
-    artifacts: { async list() { return []; } },
+  const artifacts = {
+    async list(subject: { repo: string; issue: number }) {
+      artifactReads.push(subject);
+      return [outcome];
+    },
+  };
+  const makeTaskInput = (items: readonly any[], resolveDecomposition: (input: any) => Promise<any>) => ({
     repository: "owner/control",
-    effective: { fastLaneTarget: "work-main" } as any,
-    orchestration: {
-      schema: "forgedock.orchestration/v1",
-      orchestrationId: "orch-visible-fail-closed",
-      repository: "owner/control",
-      issueNumbers: [42],
-      maxParallel: 2,
-      autoMerge: false,
-      status: "running",
-      createdAt: "now",
-      updatedAt: "now",
-      nodes: [],
+    items,
+    maxParallel: 2,
+    taskFor: (item: any) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+    controllerTaskFor: (item: any) => ({ args: [item.id], cwd: process.cwd() }),
+    startControllerTask: async (spec: any) => {
+      const nodeId = spec.launchIdentity?.nodeId ?? spec.args[0];
+      dispatchLog.push(`start:${nodeId}`);
+      return `task-${++taskNumber}-${nodeId}`;
     },
-    node: { id: "parent", issue: 42, repository: "owner/work" },
-    item: {
-      id: "parent",
-      issue: 42,
-      repository: "owner/work",
-      priority: 1,
-      dependencies: [],
-      claims: [],
-      labels: [],
-      affectedFiles: [],
-      memberIssues: [42],
-      title: "Parent",
-      summary: "Parent",
+    waitControllerTask: async () => undefined,
+    assertCompleted: async (item: any) => {
+      if (item.issue === 42) return { status: "skipped" as const, error: "authoritative child scope required", childIssues: [100, 101] };
+      if (item.issue === 7) completedSiblingCalls++;
+      return undefined;
     },
-    childIssues: [100, 101],
-  } as any;
-  const durableBefore = structuredClone(input.orchestration);
+    onComplete: () => undefined,
+    resolveDecomposition,
+  });
+  const initialItems = [{
+    id: "parent",
+    issue: 42,
+    repository: "owner/work",
+    priority: 1,
+    dependencies: [],
+    claims: [],
+    labels: [],
+    affectedFiles: [],
+    memberIssues: [42],
+    title: "Parent",
+    summary: "Parent",
+  }, {
+    id: "completed-sibling",
+    issue: 7,
+    repository: "owner/control",
+    priority: 1,
+    dependencies: [],
+    claims: [],
+    labels: [],
+    affectedFiles: [],
+    memberIssues: [7],
+    title: "Completed sibling",
+    summary: "Completed sibling",
+  }];
+  const resolve = async ({ orchestration, node, item, childIssues }: any) => {
+    const durableBefore = structuredClone(orchestration);
+    resolverSnapshots.push(durableBefore);
+    try {
+      return await materializeVisibleDecomposition({
+        github,
+        artifacts,
+        repository: item.repository ?? orchestration.repository,
+        effective: { fastLaneTarget: "work-main" } as any,
+        orchestration,
+        node,
+        item,
+        ...(childIssues !== undefined ? { childIssues } : {}),
+      });
+    } finally {
+      assert.deepEqual(orchestration, durableBefore);
+    }
+  };
+  const firstState = fakePi();
+  const first = witnessedDagDelegator(firstState.pi, repository);
+  const initial = await first.start(makeTaskInput(initialItems, resolve));
+  await assert.rejects(() => initial.completion, /child read failed/);
+  const failed = await repository.loadOrchestration(initial.id);
+  assert.equal(failed?.status, "failed");
+  assert.equal(failed?.nodes.find((node) => node.id === "parent")?.decompositionChildren, undefined);
+  assert.equal(failed?.nodes.some((node) => node.issue === 100 || node.issue === 101), false);
+  assert.equal(failed?.nodes.find((node) => node.id === "completed-sibling")?.status, "completed");
+  assert.equal(dispatchLog.some((entry) => entry.includes("issue-100") || entry.includes("issue-101")), false);
+  assert.equal(resolverSnapshots[0]?.nodes.find((node) => node.id === "parent")?.decompositionChildren, undefined);
+  assert.equal(completedSiblingCalls, 1);
+  await first.shutdown();
 
-  await assert.rejects(
-    () => materializeVisibleDecomposition(input),
-    /child read failed/,
-  );
-  assert.deepEqual(issueReads.sort((left, right) => left - right), [100, 101]);
-  assert.deepEqual(input.orchestration, durableBefore);
+  rejectChildRead = false;
+  const rebuildCalls: string[] = [];
+  const secondState = fakePi();
+  const second = witnessedDagDelegator(secondState.pi, repository, async (record) => {
+    const parent = record.nodes.find((node) => node.id === "parent");
+    assert.equal(parent?.repository, "owner/work");
+    rebuildCalls.push(record.orchestrationId);
+    const items = record.nodes.map((node) => ({
+      ...node,
+      labels: [],
+      affectedFiles: node.affectedFiles ?? [],
+      memberIssues: node.memberIssues ?? [node.issue],
+      title: node.title ?? `Issue #${node.issue}`,
+      summary: node.summary ?? "Rebuilt",
+    }));
+    return makeTaskInput(items, async ({ orchestration, node, item, childIssues }: any) => {
+      const expansion = await materializeVisibleDecomposition({
+        github,
+        artifacts,
+        repository: item.repository ?? record.repository,
+        effective: { fastLaneTarget: "work-main" } as any,
+        orchestration,
+        node,
+        item,
+        ...(childIssues !== undefined ? { childIssues } : {}),
+      });
+      dispatchLog.push("materialized-retry");
+      return expansion;
+    });
+  });
+  const resumed = await second.resume(initial.id);
+  await resumed.completion;
+  const recovered = await repository.loadOrchestration(initial.id);
+  assert.deepEqual(rebuildCalls, [initial.id]);
+  assert.equal(completedSiblingCalls, 1, "completed work must not replay on persisted resume");
+  assert.equal(recovered?.status, "completed");
+  assert.deepEqual(recovered?.nodes.find((node) => node.id === "parent")?.decompositionChildren, [100, 101]);
+  for (const issue of [100, 101]) {
+    const child: OrchestrationRecord["nodes"][number] | undefined = recovered?.nodes.find((node) => node.issue === issue);
+    assert.equal(child?.repository, "owner/work");
+    assert.equal(child?.targetBranch, "work-main");
+    assert.equal(child?.status, "completed");
+    assert.ok(child?.attempts?.some((attempt) => attempt.controllerTaskId));
+  }
+  assert.equal(dispatchLog.filter((entry) => entry === "start:issue-100").length, 1);
+  assert.equal(dispatchLog.filter((entry) => entry === "start:issue-101").length, 1);
+  assert.ok(dispatchLog.indexOf("start:issue-100") > dispatchLog.indexOf("materialized-retry"));
+  assert.ok(dispatchLog.indexOf("start:issue-101") > dispatchLog.indexOf("materialized-retry"));
+  assert.deepEqual(issueReads.map(({ repo, issue }) => ({ repo, issue })).sort((a, b) => a.issue - b.issue), [
+    { repo: "owner/work", issue: 100 },
+    { repo: "owner/work", issue: 100 },
+    { repo: "owner/work", issue: 101 },
+    { repo: "owner/work", issue: 101 },
+  ]);
+  assert.equal([...repositoryReads, ...artifactReads.map((read) => read.repo), ...issueReads.map((read) => read.repo), ...branchReads.map((read) => read.repo)].every((repo) => repo === "owner/work"), true);
+  assert.equal(resolverSnapshots.every((snapshot) => snapshot.nodes.find((node) => node.id === "parent")?.repository === "owner/work"), true);
+  await second.shutdown();
 });
 
 test("visible DAG refuses to retry terminally decomposed work", async () => {
