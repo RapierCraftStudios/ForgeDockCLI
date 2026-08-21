@@ -465,7 +465,6 @@ async function materializePacketOutput(
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
-    if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
     const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
     return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
@@ -488,7 +487,6 @@ async function materializePacketOutput(
   const selectedCommands = selectedCatalogCommands(controllerVerifiedOutput, catalog.commands);
   const hasExplicitEvidenceCapabilities = selectedCommands.every((command) => command.evidenceCapability !== undefined);
   if (policyMetadata.verificationPolicyVersion !== "forgedock.verification/v2" || !hasExplicitEvidenceCapabilities) {
-    if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
     return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
   }
   const targetById = new Map((policyMetadata.verificationCommandTargets ?? []).map(({ id, targets }) => [id, targets]));
@@ -508,11 +506,11 @@ async function materializePacketOutput(
     evidencePaths: evidence.declarations,
   };
   const derivation = deriveEvidenceContract(derivationInput);
-  const diagnostics = [...evidence.diagnostics, ...derivation.diagnostics.map(diagnosticText)];
-  if (diagnostics.length) {
+  const derivationDiagnostics = derivation.diagnostics.map(diagnosticText);
+  if (derivationDiagnostics.length) {
     const semanticAvailable = catalog.commands.some((command) => command.evidenceCapability !== undefined && command.evidenceCapability !== "generic");
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
-    throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
+    throw new PacketAuthorCorrectableError(derivationDiagnostics, semanticNeeded && !semanticAvailable);
   }
   const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
   return {

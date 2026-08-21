@@ -135,8 +135,10 @@ describe("Build Packet preparation", () => {
         payload: { title: "Unrelated evidence", problem: "Reject scope escape", constraints: [], acceptanceHints: [], dependencies: [] },
       });
       const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
-      await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs }), /evidence-scope/);
-      assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+      const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs });
+      assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/fix.ts"]);
+      assert.equal(prepared.packet.payload.evidencePaths, undefined);
+      assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -166,8 +168,9 @@ describe("Build Packet preparation", () => {
         payload: { title: "Evidence bytes", problem: "Bound read authority", constraints: [], acceptanceHints: [], dependencies: [] },
       });
       const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
-      await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs }), /evidence-byte-limit/);
-      assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+      const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs });
+      assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/fix.ts"]);
+      assert.deepEqual(prepared.packet.payload.evidencePaths?.map(({ path }) => path), names.slice(0, 4).map((name) => `scripts/${name}`));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -495,7 +498,7 @@ describe("Build Packet preparation", () => {
       commands: [{ id: "targeted-tests", command: "npm", args: ["test"], required: true, selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } }],
       controllerGates: [],
     };
-    const output = { ...packet, expectedPaths: ["src/a.test.ts"], verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "targeted-tests", criterionIds: ["criterion-1"], rationale: "Regression" }], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }], evidenceContract: { version: "forgedock.evidence/v1" as const, criteria: [{ criterionId: "criterion-1", requiredCommandIds: [], semanticCommandIds: [], controllerGateIds: [], allowedWritePaths: [], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }] }, invariantMatrices: [{ id: "forged", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "x", values: ["y"] }], testId: "invariant:forged" }], verificationCommandTargets: [{ id: "forged", targets: ["all"] }] };
+    const output = { ...packet, expectedPaths: ["src/a.test.ts"], verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "targeted-tests", criterionIds: ["criterion-1"], rationale: "Regression" }], evidencePaths: [{ path: "package.json", criterionIds: ["criterion-1"], role: "artifact" as const }, { path: "src/tui/generated-tools.test.ts", criterionIds: ["criterion-1"], role: "test" as const }], evidenceContract: { version: "forgedock.evidence/v1" as const, criteria: [{ criterionId: "criterion-1", requiredCommandIds: [], semanticCommandIds: [], controllerGateIds: [], allowedWritePaths: [], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }] }, invariantMatrices: [{ id: "forged", criterionId: "criterion-1", capability: "terminal-metadata" as const, dimensions: [{ name: "x", values: ["y"] }], testId: "invariant:forged" }], verificationCommandTargets: [{ id: "forged", targets: ["all"] }] };
     const runtime = new FakeAgentRuntime([investigation, output]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
