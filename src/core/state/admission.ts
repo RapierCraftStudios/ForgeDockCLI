@@ -54,7 +54,7 @@ export function isRepairableVerificationFailure(
   packet: DurableArtifact<"BuildPacket"> | undefined,
   outcome: DurableArtifact<"Outcome"> | undefined,
 ): boolean {
-  if (!packet || !outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) return false;
+  if (!packet || !outcome || (outcome.payload.status !== "blocked" && outcome.payload.status !== "repairing") || !outcome.payload.failureEvidence) return false;
   const evidence = outcome.payload.failureEvidence;
   // Packet/catalog contracts are immutable authority, not builder evidence. A
   // typed contract failure must never be reclassified by repairAttempt or any
@@ -315,7 +315,7 @@ export function decideSubjectAdmission(
   // clocks so equal/skewed timestamps cannot replay superseded failures.
   const sequencedOutcome = latestOutcomeIndex >= 0 ? latest.artifacts[latestOutcomeIndex] : undefined;
   const verificationFailureOutcome = sequencedOutcome?.kind === "Outcome"
-    && sequencedOutcome.payload.status === "blocked"
+    && (sequencedOutcome.payload.status === "blocked" || sequencedOutcome.payload.status === "repairing")
     && sequencedOutcome.payload.failureEvidence !== undefined
     ? sequencedOutcome
     : undefined;

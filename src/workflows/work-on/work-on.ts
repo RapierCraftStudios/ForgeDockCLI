@@ -36,7 +36,7 @@ import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.
 import { publishPullRequest } from "./publish.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { remediateReview } from "./remediate.js";
-import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, deliveryContentDigest, type VerificationResult } from "./verify.js";
+import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, deliveryContentDigest, VerificationDiagnosisCallbackError, type VerificationResult } from "./verify.js";
 import { recoverConflictingRevision, resolvePacketConflicts, resolvePacketConflictsForPacket } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
 import { makePullRequestCiGreen } from "../review-pr/fix-ci.js";
@@ -1393,7 +1393,7 @@ async function appendVerificationRepairCheckpoint(
     subject: run.subject,
     producer: { role: "controller", runtime: "forgedock" },
     payload: {
-      status: "blocked",
+      status: "repairing",
       reason: `Verification repair attempt ${repairAttempt} dispatched: ${failure.payload.reason}`,
       ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
       ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
@@ -1418,13 +1418,12 @@ async function appendVerificationRepairCheckpoint(
     id: deterministicOutcomeId(
       run.runId,
       run.subject,
-      `blocked:verification-repair:${repairAttempt}:supersedes:${failure.id}`,
+      `repairing:verification-repair:${repairAttempt}:supersedes:${failure.id}`,
     ),
   });
   await dependencies.artifacts.append(outcome);
   return { run: attachArtifact(run, "Outcome", outcome.id), outcome };
 }
-
 
 function diagnosisFromOutcome(outcome: DurableArtifact<"Outcome"> | undefined): VerificationDiagnosis | undefined {
   const diagnostic = outcome?.payload.failureEvidence?.diagnostics?.find(({ code }) => code === "verification-diagnosis");
@@ -1594,7 +1593,6 @@ async function diagnoseVerificationTransition(
   });
   return validateVerificationDiagnosis(result.output, input.packet, currentSignatures, input.workspace.path);
 }
-
 export async function resumeBuildWorkOn(
   input: {
     run: RunState;
@@ -1798,6 +1796,7 @@ async function verifyWithBuilderRepairs(
     commands: readonly VerificationCommand[];
     baselineChecks?: readonly CheckResult[];
     subjectEvidence?: readonly string[];
+    automaticRepair?: boolean;
     provider?: string;
     model?: string;
     signal?: AbortSignal;
@@ -1810,7 +1809,6 @@ async function verifyWithBuilderRepairs(
   let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
   let priorFailureForSignature = input.priorVerificationFailure;
   let verificationDiagnosis = input.verificationDiagnosis;
-  let diagnosisAttempted = verificationDiagnosis !== undefined;
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
@@ -1818,7 +1816,11 @@ async function verifyWithBuilderRepairs(
   };
   try {
     while (true) {
-      const verified = await verifyAndCommit({
+      const shouldDiagnose = repairAttempts === 1
+        && priorFailureForSignature !== undefined;
+      let verified: VerificationResult;
+      try {
+        verified = await verifyAndCommit({
         run,
         packet: input.packet,
         submission,
@@ -1826,15 +1828,100 @@ async function verifyWithBuilderRepairs(
       commands: input.commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
       ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+      ...(input.automaticRepair !== false && repairAttempts < MAX_VERIFICATION_REPAIR_ATTEMPTS
+        ? {
+          automaticRepair: {
+            attempt: repairAttempts + 1,
+            ...(shouldDiagnose ? {
+              enrichFailure: async (currentFailure: DurableArtifact<"Outcome">) => {
+                const currentSignatures = canonicalFailedCheckSignatures(currentFailure, input.commands);
+                if (currentSignatures.length === 0) return [];
+                try {
+                  verificationDiagnosis = await diagnoseVerificationTransition({
+                    run,
+                    intent: input.intent,
+                    investigation: input.investigation,
+                    packet: input.packet,
+                    workspace: input.workspace,
+                    currentFailure,
+                    priorFailure: priorFailureForSignature!,
+                    submission,
+                    ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
+                    commands: input.commands,
+                    ...runtimeOptions,
+                  }, dependencies, canonicalFailedCheckSignatures(currentFailure, input.commands));
+                } catch (error) {
+                  const reason = error instanceof Error ? error.message : String(error);
+                  throw new VerificationDiagnosisCallbackError(
+                    reason,
+                    isRecoverableAgentExecutionError(error),
+                    currentFailure,
+                    { cause: error },
+                  );
+                }
+                return [{
+                  code: "verification-diagnosis",
+                  message: "Controller-validated ephemeral diagnosis for the verification failure transition",
+                  details: { diagnosis: verificationDiagnosis },
+                }];
+              },
+            } : {}),
+          },
+        }
+        : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
-    }, {
-      verifier: dependencies.verifier,
-      git: dependencies.git,
-      artifacts: dependencies.artifacts,
-      runs: dependencies.runs,
-    });
-    run = verified.run;
-    if (verified.buildResult || !isRepairableVerificationFailure(input.packet, verified.outcome)) return verified;
+      }, {
+        verifier: dependencies.verifier,
+        git: dependencies.git,
+        artifacts: dependencies.artifacts,
+        runs: dependencies.runs,
+      });
+      } catch (error) {
+        if (error instanceof VerificationDiagnosisCallbackError) {
+          if (error.recoverable) {
+            throw new WorkflowExecutionError(error.message, run, {
+              cause: error,
+              recoverable: true,
+            });
+          }
+          const candidateEvidence = error.candidate.payload.failureEvidence;
+          if (!candidateEvidence) throw new Error("Verification diagnosis failure requires durable candidate evidence");
+          const terminalOutcome = createArtifact({
+            ...error.candidate,
+            payload: {
+              ...error.candidate.payload,
+              status: "blocked",
+              reason: error.message,
+              failureEvidence: {
+                ...candidateEvidence,
+                diagnostics: [
+                  ...(candidateEvidence.diagnostics ?? []),
+                  {
+                    code: "verification-diagnosis-validation",
+                    message: error.message,
+                    details: { reason: error.message },
+                  },
+                ],
+              },
+            },
+          }, {
+            id: deterministicOutcomeId(
+              run.runId,
+              run.subject,
+              `blocked:verification-diagnosis:${error.candidate.id}`,
+            ),
+          });
+          await dependencies.artifacts.append(terminalOutcome);
+          run = attachArtifact(run, "Outcome", terminalOutcome.id);
+          const blocked = transition(run, "VERIFICATION_FAILED", { reason: error.message });
+          await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+          run = blocked.state;
+          throw new WorkflowExecutionError(error.message, run, { cause: error });
+        }
+        throw error;
+      }
+      run = verified.run;
+      if (verified.buildResult || !isRepairableVerificationFailure(input.packet, verified.outcome)) return verified;
 
     if (repairAttempts >= MAX_VERIFICATION_REPAIR_ATTEMPTS) {
       const reason = `Verification repair budget exhausted after ${MAX_VERIFICATION_REPAIR_ATTEMPTS} repair attempt(s)`;
@@ -1844,56 +1931,22 @@ async function verifyWithBuilderRepairs(
     }
 
     const nextRepairAttempt = repairAttempts + 1;
-    const currentSignatures = canonicalFailedCheckSignatures(verified.outcome!, input.commands);
-    const shouldDiagnose = repairAttempts === 1
-      && priorFailureForSignature !== undefined
-      && currentSignatures.length > 0;
-    if (shouldDiagnose && !diagnosisAttempted) {
-      diagnosisAttempted = true;
-      try {
-        verificationDiagnosis = await diagnoseVerificationTransition({
-          run,
-          intent: input.intent,
-          investigation: input.investigation,
-          packet: input.packet,
-          workspace: input.workspace,
-          currentFailure: verified.outcome!,
-          priorFailure: priorFailureForSignature!,
-          submission,
-          ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
-          commands: input.commands,
-          ...runtimeOptions,
-        }, dependencies, currentSignatures);
-      } catch (error) {
-        if (isRecoverableAgentExecutionError(error)) {
-          const reason = error instanceof Error ? error.message : String(error);
-          throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
-        }
-        throw error;
-      }
+    priorFailureForSignature = verified.outcome!;
+    if (run.state === "blocked") {
+      const repair = transition(run, "VERIFICATION_REPAIR_REQUESTED", {
+        reason: `Repairing retained verification failure ${nextRepairAttempt} of ${MAX_VERIFICATION_REPAIR_ATTEMPTS}`,
+      });
+      await dependencies.runs.commit(run.version, repair.state, repair.record);
+      run = repair.state;
     }
-    const checkpoint = await appendVerificationRepairCheckpoint(
-      run,
-      verified.outcome!,
-      nextRepairAttempt,
-      dependencies,
-      shouldDiagnose ? verificationDiagnosis : undefined,
-    );
-    priorFailureForSignature = checkpoint.outcome;
-    run = checkpoint.run;
-    const repair = transition(run, "VERIFICATION_REPAIR_REQUESTED", {
-      reason: `Repairing retained verification failure ${nextRepairAttempt} of ${MAX_VERIFICATION_REPAIR_ATTEMPTS}`,
-    });
-    await dependencies.runs.commit(run.version, repair.state, repair.record);
-    run = repair.state;
     repairAttempts = nextRepairAttempt;
     const repaired = await buildWorkItem({
       run,
       intent: input.intent,
       investigation: input.investigation,
       packet: input.packet,
-      priorVerificationFailure: checkpoint.outcome,
-      ...(shouldDiagnose && verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
+      priorVerificationFailure: verified.outcome!,
+      ...(verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
       priorSubmission: submission,
       ...(builderSessionRef !== undefined ? { priorBuilderSessionRef: builderSessionRef } : {}),
       ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
@@ -2010,6 +2063,7 @@ async function continueBuildDelivery(
     commands,
     ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
     ...(input.subjectEvidence !== undefined ? { subjectEvidence: input.subjectEvidence } : {}),
+    automaticRepair: commands.length > 0,
     ...runtimeOptions,
   }, dependencies);
   run = initialVerification.run;

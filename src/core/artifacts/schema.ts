@@ -611,6 +611,8 @@ export const OutcomePayloadSchema = Type.Object({
     Type.Literal("merged"),
     Type.Literal("invalid"),
     Type.Literal("decomposed"),
+    /** Nonterminal verification repair checkpoint; never a terminal Outcome. */
+    Type.Literal("repairing"),
     Type.Literal("blocked"),
     Type.Literal("failed"),
     Type.Literal("abandoned"),

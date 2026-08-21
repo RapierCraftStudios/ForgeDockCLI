@@ -9,6 +9,7 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationCommandProgress, VerificationRunner } from "../../core/ports/verification.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
+import { isRepairableVerificationFailure } from "../../core/state/admission.js";
 import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import type { BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
@@ -106,6 +107,18 @@ export async function verifyCommittedRepair(
 }
 
 
+export class VerificationDiagnosisCallbackError extends Error {
+  readonly recoverable: boolean;
+  readonly candidate: DurableArtifact<"Outcome">;
+
+  constructor(message: string, recoverable: boolean, candidate: DurableArtifact<"Outcome">, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "VerificationDiagnosisCallbackError";
+    this.recoverable = recoverable;
+    this.candidate = candidate;
+  }
+}
+
 export async function verifyAndCommit(
   input: {
     run: RunState;
@@ -115,6 +128,11 @@ export async function verifyAndCommit(
     commands: readonly VerificationCommand[];
     baselineChecks?: readonly CheckResult[];
     subjectEvidence?: readonly string[];
+    /** Mark repairable failures as a nonterminal checkpoint for automatic repair. */
+    automaticRepair?: {
+      attempt: number;
+      enrichFailure?: (candidate: DurableArtifact<"Outcome">) => Promise<readonly VerificationEvidenceDiagnostic[]>;
+    };
     signal?: AbortSignal;
   },
   dependencies: {
@@ -133,7 +151,7 @@ export async function verifyAndCommit(
     failureKind?: "builder-semantic-evidence" | "builder-report" | "required-check" | "scope" | "verification-mutation" | "packet-contract",
     diagnostics?: readonly VerificationEvidenceDiagnostic[],
   ): Promise<VerificationResult> => {
-    const outcome = createArtifact({
+    const candidate = createArtifact({
       kind: "Outcome",
       runId: run.runId,
       subject: run.subject,
@@ -161,11 +179,30 @@ export async function verifyAndCommit(
         },
       },
     });
+    const repairing = input.automaticRepair !== undefined
+      && isRepairableVerificationFailure(input.packet, candidate);
+    const enrichedDiagnostics = repairing && input.automaticRepair?.enrichFailure
+      ? await input.automaticRepair.enrichFailure(candidate)
+      : [];
+    const outcome = repairing
+      ? createArtifact({
+        ...candidate,
+        payload: {
+          ...candidate.payload,
+          status: "repairing",
+          failureEvidence: {
+            ...candidate.payload.failureEvidence!,
+            repairAttempt: input.automaticRepair!.attempt,
+            ...(enrichedDiagnostics.length ? { diagnostics: [...enrichedDiagnostics] } : {}),
+          },
+        },
+      })
+      : candidate;
     await dependencies.artifacts.append(outcome);
     run = attachArtifact(run, "Outcome", outcome.id);
-    const blocked = transition(run, "VERIFICATION_FAILED", { reason });
-    await dependencies.runs.commit(run.version, blocked.state, blocked.record);
-    run = blocked.state;
+    const next = transition(run, repairing ? "VERIFICATION_REPAIR_REQUESTED" : "VERIFICATION_FAILED", { reason });
+    await dependencies.runs.commit(run.version, next.state, next.record);
+    run = next.state;
     return { run, checks, outcome };
   };
   try {
@@ -503,6 +540,7 @@ export async function verifyAndCommit(
     await dependencies.runs.commit(run.version, passed.state, passed.record);
     return { run: passed.state, checks, buildResult };
   } catch (error) {
+    if (error instanceof VerificationDiagnosisCallbackError) throw error;
     if (input.signal?.aborted) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const failed = transition(run, "FAIL", { reason });

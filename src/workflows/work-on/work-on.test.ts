@@ -9,11 +9,12 @@ import { attachArtifact, createRun, transition } from "../../core/state/machine.
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
-import type { AgentTask } from "../../runtime/agent-runtime.js";
+import { AgentExecutionInterruptedError, type AgentTask } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { scopeManifestForBuildPacket } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
+import { terminalOrchestrationResult } from "../orchestrate/terminal-result.js";
 import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { WorkflowExecutionError } from "./investigate.js";
@@ -923,7 +924,8 @@ describe("complete work-on trajectory", () => {
     assert.equal(result.run.state, "blocked");
     assert.equal(git.removed, false);
     const outcomes = artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome");
-    assert.equal(outcomes.length, 5);
+    assert.equal(outcomes.length, 3);
+    assert.deepEqual(outcomes.map((outcome) => outcome.kind === "Outcome" ? outcome.payload.status : undefined), ["repairing", "repairing", "blocked"]);
     assert.deepEqual(outcomes.flatMap((outcome) => outcome.kind === "Outcome" && outcome.payload.failureEvidence?.repairAttempt !== undefined
       ? [outcome.payload.failureEvidence.repairAttempt]
       : []), [1, 2]);
@@ -1067,10 +1069,62 @@ describe("complete work-on trajectory", () => {
       if (!(error instanceof WorkflowExecutionError)) throw new Error("expected WorkflowExecutionError");
       assert.match(error.message, label === "malformed" ? /bounded schema|malformed|required properties/ : /outside packet read scope/);
       assert.equal(error.run.state, "blocked");
-      assert.equal((await runs.history(`run_bad_diagnosis_${label}`)).some((record) => record.event === "FAIL"), false, "diagnosis reason must not be masked by a stale FAIL commit");
+      const history = await runs.history(`run_bad_diagnosis_${label}`);
+      const durable = await runs.load(`run_bad_diagnosis_${label}`);
+      assert.equal(history.some((record) => record.event === "FAIL"), false, "diagnosis reason must not be masked by a stale FAIL commit");
+      assert.equal(history.at(-1)?.event, "VERIFICATION_FAILED");
+      assert.equal(durable?.version, history.length, "blocked diagnosis must commit exactly once");
+      const outcomes = artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome");
+      const latestOutcome = outcomes.at(-1);
+      assert.equal(outcomes.length, 2, "diagnosis validation must add one terminal Outcome without duplicating the attempt");
+      assert.equal(latestOutcome?.payload.status, "blocked");
+      assert.equal(latestOutcome?.payload.reason, error.message);
+      assert.equal(latestOutcome?.payload.failureEvidence?.repairAttempt, undefined);
+      const reconciled = reconcileArtifacts(artifacts.artifacts);
+      assert.equal(reconciled.state, "blocked");
+      assert.ok(terminalOrchestrationResult(8, artifacts.artifacts, reconciled));
       assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 2);
       assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
     }
+  });
+
+  it("retains the verifying checkpoint on recoverable diagnosis interruption", async () => {
+    const runtime = new FakeAgentRuntime([
+      investigation,
+      packet,
+      submission,
+      submission,
+      new AgentExecutionInterruptedError("diagnosis provider interrupted", {
+        reason: "cancelled",
+        resumable: true,
+      }),
+    ]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new DiagnosticGit();
+    const host = new EndToEndHost();
+    const verifier: VerificationRunner = {
+      async run() {
+        return [{ command: "npm", commandId: "test", status: "failed", failureClass: "timeout", failureSignatures: ["first"], durationMs: 10 }];
+      },
+    };
+    let error: unknown;
+    try {
+      await workOn({ intent: createWorkOnIntent("run_recoverable_diagnosis"), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
+      assert.fail("expected diagnosis interruption");
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error instanceof WorkflowExecutionError);
+    if (!(error instanceof WorkflowExecutionError)) throw new Error("expected WorkflowExecutionError");
+    assert.equal(error.recoverable, true);
+    assert.equal(error.run.state, "verifying");
+    const durable = await runs.load("run_recoverable_diagnosis");
+    const history = await runs.history("run_recoverable_diagnosis");
+    assert.equal(durable?.version, error.run.version);
+    assert.equal(durable?.version, history.length);
+    assert.equal(history.some((record) => record.event === "FAIL"), false);
+    assert.equal(artifacts.artifacts.filter((artifact) => artifact.kind === "Outcome").length, 1);
   });
 
   it("repairs a verification failure automatically without another CLI invocation", async () => {

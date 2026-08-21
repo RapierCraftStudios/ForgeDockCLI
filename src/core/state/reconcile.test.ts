@@ -20,6 +20,28 @@ describe("GitHub artifact reconciliation", () => {
     assert.equal(reconcileArtifacts([intent, investigation, packet, build, verdict]).state, "merging");
   });
 
+  it("projects an automatic verification repair as active instead of blocked", () => {
+    const repair = createArtifact({
+      ...common,
+      kind: "Outcome",
+      payload: {
+        status: "repairing",
+        reason: "Verification repair attempt 1 dispatched",
+        childIssues: [],
+        failureEvidence: {
+          branch: "fix",
+          workspacePath: "/tmp/forgedock/run_reconcile",
+          builderSummary: "needs repair",
+          changedPaths: ["a"],
+          checks: [{ command: "test", status: "failed", durationMs: 1 }],
+          repairAttempt: 1,
+        },
+      },
+    });
+    const reconciled = reconcileArtifacts([intent, investigation, packet, repair]);
+    assert.equal(reconciled.state, "building");
+  });
+
   it("keeps a terminal Investigation recoverable until its Outcome is durable", () => {
     for (const investigationOutcome of ["invalid", "decompose"] as const) {
       const terminalInvestigation = createArtifact({

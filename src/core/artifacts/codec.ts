@@ -98,7 +98,9 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 }
 
 export function renderArtifactMarkdown(artifact: DurableArtifact): string {
-  const heading = `## ForgeDock · ${splitKind(artifact.kind)}`;
+  const heading = artifact.kind === "Outcome" && artifact.payload.status === "repairing"
+    ? "## ForgeDock · Verification Repair Checkpoint"
+    : `## ForgeDock · ${splitKind(artifact.kind)}`;
   const meta = `Run \`${artifact.runId}\` · artifact \`${artifact.id}\``;
 
   switch (artifact.kind) {

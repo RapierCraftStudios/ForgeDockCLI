@@ -161,11 +161,12 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     && build !== undefined
     && buildIndex > lastArtifactIndex(ordered, "ReviewVerdict");
 
-  const interruptedOutcomeSuperseded = (outcome?.payload.status === "blocked" || outcome?.payload.status === "failed")
+  const interruptedOutcomeSuperseded = (outcome?.payload.status === "blocked" || outcome?.payload.status === "repairing" || outcome?.payload.status === "failed")
     && build !== undefined
     && buildIndex > outcomeIndex;
   if (!checkpointIsLatest && outcome && !interruptedOutcomeSuperseded) {
-    state = outcome.payload.status === "merged" ? "completed"
+    state = outcome.payload.status === "repairing" ? "building"
+      : outcome.payload.status === "merged" ? "completed"
       : outcome.payload.status === "invalid" ? "invalid"
         : outcome.payload.status === "decomposed" ? "decomposed"
           : outcome.payload.status === "failed" ? "failed"

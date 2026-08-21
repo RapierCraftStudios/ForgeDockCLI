@@ -1127,7 +1127,7 @@ async function workOn(
         }
       } else {
         outcome = latestArtifactOfKind(runArtifacts, "Outcome");
-        if (!outcome || outcome.payload.status !== "blocked" || !outcome.payload.failureEvidence) {
+        if (!outcome || (outcome.payload.status !== "blocked" && outcome.payload.status !== "repairing") || !outcome.payload.failureEvidence) {
           throw new Error(`Run ${resumeRunId} does not contain complete retained verification evidence`);
         }
         // Failure evidence contains a human-readable path, but that path may
@@ -1167,7 +1167,7 @@ async function workOn(
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
         run, intent: intentArtifact, investigation, packet, workspace: workspace!,
-        ...(admission.checkpoint === "build" && latestOutcome?.payload.status === "blocked" && latestOutcome.payload.failureEvidence
+        ...(admission.checkpoint === "build" && (latestOutcome?.payload.status === "blocked" || latestOutcome?.payload.status === "repairing") && latestOutcome.payload.failureEvidence
           ? {
             priorVerificationFailure: latestOutcome,
             priorVerificationRepairAttempts,
