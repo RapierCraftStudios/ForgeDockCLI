@@ -506,6 +506,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now(), options?: LeaseAcquisitionOptions): Lease | undefined {
+    const binding = normalizeLeaseBinding(options?.binding);
     return this.inTransaction(() => {
       // The retained checkpoint is advanced before the SQLite epoch is
       // committed. Serialize verification with that entire two-store update
@@ -523,7 +524,6 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       if (recoveredRow) this.#database.prepare("DELETE FROM leases WHERE item_id = ?").run(itemId);
       else this.#database.prepare("DELETE FROM leases WHERE item_id = ? AND expires_at <= ?").run(itemId, now);
       const token = crypto.randomUUID();
-      const binding = normalizeLeaseBinding(options?.binding);
       const result = this.#database.prepare(`
         INSERT INTO leases (item_id, owner, token, binding, epoch, acquired_at, heartbeat_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(item_id) DO NOTHING
