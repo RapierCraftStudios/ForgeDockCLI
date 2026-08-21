@@ -62,6 +62,8 @@ describe("GitHub read retry boundary", () => {
       "Promote release", "Legacy promotion body",
     );
     assert.equal(result?.number, 17);
+    const routeOnly = await client.findOpenPromotionPullRequest("a/b", "release/candidate", "main");
+    assert.equal(routeOnly?.number, 17);
   });
 
   it("retries gh CLI connection guidance as a transient read failure", async () => {

@@ -1735,7 +1735,10 @@ export class GitHubClient implements ForgeHost {
       if (value.number && Number.isSafeInteger(value.number)) {
         const pullRequest = await this.getPullRequest(repo, value.number);
         if (pullRequest.state !== "OPEN" || pullRequest.headBranch !== headBranch || pullRequest.baseBranch !== baseBranch) continue;
-        if (operationMarker !== undefined && pullRequest.body.includes(operationMarker)) return pullRequest;
+        // Preserve the original public route lookup semantics when no marker
+        // contract is requested by the caller.
+        if (operationMarker === undefined) return pullRequest;
+        if (pullRequest.body.includes(operationMarker)) return pullRequest;
         // Adopt a legacy PR only when its complete identity matches. A PR on
         // the same route with different content is ambiguous and must not be
         // silently reused or duplicated.
