@@ -2570,6 +2570,7 @@ test("visible decomposition resumes through rebuild and fails closed across conc
 
   rejectChildRead = false;
   const rebuildCalls: string[] = [];
+  const rebuildRepositorySelections: string[] = [];
   const secondState = fakePi();
   const second = witnessedDagDelegator(secondState.pi, repository, async (record) => {
     const parent = record.nodes.find((node) => node.id === "parent");
@@ -2584,10 +2585,13 @@ test("visible decomposition resumes through rebuild and fails closed across conc
       summary: node.summary ?? "Rebuilt",
     }));
     return makeTaskInput(items, async ({ orchestration, node, item, childIssues }: any) => {
+      const selectedRepository = item.repository ?? record.repository;
+      rebuildRepositorySelections.push(selectedRepository);
+      assert.equal(selectedRepository, "owner/work", "persisted rebuild must select the visible item's repository before the orchestration root");
       const expansion = await materializeVisibleDecomposition({
         github,
         artifacts,
-        repository: item.repository ?? record.repository,
+        repository: selectedRepository,
         effective: { fastLaneTarget: "work-main" } as any,
         orchestration,
         node,
@@ -2602,6 +2606,7 @@ test("visible decomposition resumes through rebuild and fails closed across conc
   await resumed.completion;
   const recovered = await repository.loadOrchestration(initial.id);
   assert.deepEqual(rebuildCalls, [initial.id]);
+  assert.deepEqual(rebuildRepositorySelections, ["owner/work"], "persisted resume must observe the item-to-root repository fallback boundary");
   assert.equal(completedSiblingCalls, 1, "completed work must not replay on persisted resume");
   assert.equal(recovered?.status, "completed");
   assert.deepEqual(recovered?.nodes.find((node) => node.id === "parent")?.decompositionChildren, [100, 101]);
