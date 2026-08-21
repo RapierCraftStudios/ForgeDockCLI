@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { readdir, stat } from "node:fs/promises";
+import { join, relative } from "node:path";
 import type { VerificationCommand, VerificationEvidenceCapability } from "./verification.js";
 
 export const MAX_VERIFICATION_TARGETS = 32;
@@ -64,8 +66,9 @@ export function isExpectedTestPath(path: string): boolean {
 export function resolveVerificationTargets(
   expectedPaths: readonly string[],
   targetedCommands: readonly Pick<VerificationCommand, "id" | "typescriptLayout">[],
+  readOnlyPaths: readonly string[] = [],
 ): string[] {
-  const sourcePaths = expectedPaths.filter(isExpectedTestPath);
+  const sourcePaths = [...new Set([...expectedPaths, ...readOnlyPaths].filter(isExpectedTestPath))];
   if (!targetedCommands.length || !sourcePaths.length) return [];
   const layouts = targetedCommands.map((command) => command.typescriptLayout).filter((layout): layout is NonNullable<typeof layout> => Boolean(layout));
   if (layouts.length !== targetedCommands.length) {
@@ -123,6 +126,75 @@ export function validateVerificationTargetPaths(
       `Build Packet selects ${sourcePaths.length} test paths; targeted verification is bounded to ${MAX_VERIFICATION_TARGETS}`,
     );
   }
+}
+
+export async function resolveReadOnlyVerificationSources(
+  candidates: readonly string[],
+  targetedCommands: readonly Pick<VerificationCommand, "id" | "typescriptLayout">[],
+  cwd: string,
+): Promise<string[]> {
+  if (!targetedCommands.length) return [];
+  const layouts = targetedCommands.map((command) => command.typescriptLayout).filter((layout): layout is NonNullable<typeof layout> => Boolean(layout));
+  if (layouts.length !== targetedCommands.length || layouts.some((candidate) => JSON.stringify(candidate) !== JSON.stringify(layouts[0]))) {
+    throw new Error("Targeted verification commands disagree on source/output layout");
+  }
+  const layout = layouts[0]!;
+  const sourceRoot = layout.sourceRoot.replaceAll("\\", "/").replace(/\/$/, "");
+  const files = await boundedTestFiles(join(cwd, sourceRoot), MAX_VERIFICATION_TARGETS * 8);
+  const normalizedFiles = files.map((file) => `${sourceRoot}/${file}`.replace(/^\.\//, ""));
+  const selected = new Set<string>();
+  for (const raw of candidates) {
+    const candidate = raw.replaceAll("\\", "/").replace(/^\.\//, "");
+    if (!isExpectedTestPath(candidate)) continue;
+    if (!candidate.includes("/")) {
+      const matches = normalizedFiles.filter((file) => file.split("/").at(-1) === candidate);
+      if (matches.length !== 1) {
+        if (matches.length > 1) throw new Error(`Ambiguous read-only verification target '${raw}'`);
+        if (matches.length === 0) throw new Error(`Missing read-only verification target '${raw}'`);
+      }
+      selected.add(matches[0]!);
+    } else if (normalizedFiles.includes(candidate)) selected.add(candidate);
+    else throw new Error(`Missing read-only verification target '${raw}'`);
+  }
+  const sourcePaths = [...selected];
+  validateVerificationTargetPaths(sourcePaths, targetedCommands);
+  return sourcePaths;
+}
+
+export async function resolveReadOnlyVerificationTargets(
+  candidates: readonly string[],
+  targetedCommands: readonly Pick<VerificationCommand, "id" | "typescriptLayout">[],
+  cwd: string,
+): Promise<string[]> {
+  const sources = await resolveReadOnlyVerificationSources(candidates, targetedCommands, cwd);
+  return resolveVerificationTargets([], targetedCommands, sources);
+}
+
+async function boundedTestFiles(root: string, limit: number): Promise<string[]> {
+  const result: string[] = [];
+  let bytes = 0;
+  const maxBytes = 4_000_000;
+  async function visit(directory: string, depth: number): Promise<void> {
+    if (depth > 12 || result.length >= limit || bytes >= maxBytes) return;
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (result.length >= limit || entry.name.startsWith(".")) continue;
+      const absolute = join(directory, entry.name);
+      if (entry.isDirectory()) { await visit(absolute, depth + 1); continue; }
+      if (!entry.isFile() || !isExpectedTestPath(entry.name)) continue;
+      try {
+        const fileStat = await stat(absolute);
+        if (fileStat.isFile() && fileStat.size <= maxBytes - bytes) {
+          bytes += fileStat.size;
+          result.push(relative(root, absolute).replaceAll("\\", "/"));
+        }
+      } catch { /* disappear during scan */ }
+    }
+  }
+  await visit(root, 0);
+  return result;
 }
 
 function compiledTestTarget(

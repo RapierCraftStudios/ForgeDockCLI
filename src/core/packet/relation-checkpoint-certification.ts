@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { BuildPacketPayload, RelationGraphCheckpointPayload } from "../artifacts/schema.js";
-import { repositoryAdaptersFor, type RepositoryAdapter } from "../../adapters/repository/bounded-adapter.js";
+import { repositoryAdaptersFor, detectRepositoryLanguages, type RepositoryAdapter } from "../../adapters/repository/bounded-adapter.js";
 import {
   buildRelationGraph,
   closeRelationGraph,
@@ -57,7 +57,7 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   assertEqualPaths(checkpointClosure.invariantIds, checkpoint.invariantIds, "invariant closure");
   assertAuthorizedSubset(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
 
-  const adapters = input.adapters ?? repositoryAdaptersFor(["monorepo"]);
+  const adapters = input.adapters ?? repositoryAdaptersFor(await detectRepositoryLanguages(input.cwd));
   const facts = [];
   for (const adapter of adapters) facts.push(await adapter.inspect({ cwd: input.cwd, limits: checkpoint.limits }));
   const fresh = buildRelationGraph({ baseSha: input.baseSha, seeds: checkpoint.seeds, facts, limits: checkpoint.limits });

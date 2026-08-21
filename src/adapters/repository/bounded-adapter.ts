@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { join as pathJoin, relative } from "node:path";
 import { canonicalRelationPath, digestRelation, fileNodeId, nodeId, type RelationEdge, type RelationGraphLimits, type RelationNode } from "../../core/packet/relation-graph.js";
 
@@ -104,6 +104,21 @@ export function adapterForLanguage(language: string): RepositoryAdapter {
   const [id, languages] = aliases[normalized];
   const profile = LANGUAGE_PROFILES[id as keyof typeof LANGUAGE_PROFILES] ?? LANGUAGE_PROFILES.monorepo;
   return new BoundedRepositoryAdapter(id, languages, profile.extensions, profile.manifests);
+}
+
+export async function detectRepositoryLanguages(cwd: string): Promise<string[]> {
+  const present = new Set<string>();
+  const checks: readonly [string, string][] = [
+    ["package.json", "typescript"], ["tsconfig.json", "typescript"],
+    ["pyproject.toml", "python"], ["setup.py", "python"], ["requirements.txt", "python"],
+    ["go.mod", "go"], ["Cargo.toml", "rust"], ["pom.xml", "jvm"], ["build.gradle", "jvm"],
+  ];
+  for (const [manifest, language] of checks) {
+    try { await access(`${cwd}/${manifest}`); present.add(language); } catch { /* absent */ }
+  }
+  if (present.size === 0) return ["monorepo"];
+  if (present.size > 1) throw new UnsupportedRepositoryLayoutError(`ambiguous:${[...present].sort().join(",")}`);
+  return [...present];
 }
 
 export function repositoryAdaptersFor(languages: readonly string[], configuredTargets: readonly string[] = []): RepositoryAdapter[] {

@@ -394,6 +394,10 @@ export async function verifyAndCommit(
         summary: input.submission.summary,
         acceptanceEvidence,
         checks,
+        ...(input.packet.payload.verificationCommandTargets ? {
+          verificationCommandTargets: input.packet.payload.verificationCommandTargets.map(({ id, targets, targetDigest }) => ({ id, targets, ...(targetDigest ? { targetDigest } : {}) })),
+          verificationCommandPlanDigest: createHash("sha256").update(JSON.stringify(input.packet.payload.verificationCommandTargets)).digest("hex"),
+        } : {}),
         decisions: input.submission.decisions,
         residualRisks: input.submission.residualRisks,
       },
@@ -528,6 +532,17 @@ export async function recoverVerificationCheckpoint(
   }
   if (!input.commands.length || input.commands.some((command) => !command.planId)) {
     throw new Error("Retained verification checkpoint recovery requires plan-bound verification commands");
+  }
+  if (checkpoint.payload.verificationCommandTargets) {
+    const frozen = checkpoint.payload.verificationCommandTargets;
+    const actual = input.commands.map((command) => ({ id: command.id, targets: [...(command.targets ?? [])] }));
+    if (JSON.stringify(actual) !== JSON.stringify(frozen.map(({ id, targets }) => ({ id, targets })))) {
+      throw new Error("Retained verification checkpoint command targets drifted; refusing recovery");
+    }
+    if (checkpoint.payload.verificationCommandPlanDigest
+      !== createHash("sha256").update(JSON.stringify(frozen)).digest("hex")) {
+      throw new Error("Retained verification checkpoint command-target digest is invalid");
+    }
   }
   if (input.packet?.payload.evidenceContract) {
     const evidenceDiagnostics = validateEvidenceContract(input.packet.payload.evidenceContract, {

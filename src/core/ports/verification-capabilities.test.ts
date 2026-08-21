@@ -2,7 +2,10 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { projectVerificationCapabilities } from "./verification-capabilities.js";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { projectVerificationCapabilities, resolveReadOnlyVerificationSources } from "./verification-capabilities.js";
 import type { VerificationCommand } from "./verification.js";
 
 describe("verification capability projection", () => {
@@ -22,5 +25,12 @@ describe("verification capability projection", () => {
     });
     assert.equal(JSON.stringify(projected).includes("secret.test.js"), false);
     assert.equal(JSON.stringify(projected).includes("/private/work"), false);
+  });
+  it("resolves a unique bare read-only test surface without granting write scope", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-target-"));
+    await mkdir(join(cwd, "src", "nested"), { recursive: true });
+    await writeFile(join(cwd, "src", "nested", "pi-runtime-tool-renderers.test.ts"), "export {};\n");
+    const command = { id: "targeted", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } };
+    assert.deepEqual(await resolveReadOnlyVerificationSources(["pi-runtime-tool-renderers.test.ts"], [command], cwd), ["src/nested/pi-runtime-tool-renderers.test.ts"]);
   });
 });

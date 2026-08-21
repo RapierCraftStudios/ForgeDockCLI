@@ -6,7 +6,9 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import type { VerificationCommand } from "../../core/ports/verification.js";
 import {
   isVerificationCapabilityMismatchError,
+  isExpectedTestPath,
   projectVerificationCapabilities,
+  resolveReadOnlyVerificationSources,
   resolveVerificationTargets,
   validateVerificationTargetPaths,
 } from "../../core/ports/verification-capabilities.js";
@@ -33,7 +35,7 @@ import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract
 import { closeExpectedWriteScope } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
 import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
-import { repositoryAdaptersFor } from "../../adapters/repository/index.js";
+import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters/repository/index.js";
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
   & Partial<Omit<VerificationCommand, "cwd" | "id" | "command" | "args">>;
@@ -398,8 +400,15 @@ async function materializePacketOutput(
   ]);
   const evidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
   const provisionalInvariantMatrices = deriveSecurityInvariantMatrices(output);
+  const semanticReadOnlySources = catalog
+    ? await resolveReadOnlyVerificationSources(
+      [...investigationSurfaces, ...evidence.declarations.map(({ path }) => path)],
+      selectedCatalogCommands(output, catalog.commands).filter((command) => command.targeting === "expected-test-paths"),
+      cwd,
+    )
+    : [];
   const verifiedOutput = catalog && (catalog.commands.length > 0 || Boolean(output.verificationRequirements?.length))
-    ? canonicalizePacketVerification(output, catalog, expectedPaths, provisionalInvariantMatrices)
+    ? canonicalizePacketVerification(output, catalog, expectedPaths, provisionalInvariantMatrices, semanticReadOnlySources)
     : output;
   const {
     verificationPolicyVersion: _untrustedPolicyVersion,
@@ -412,7 +421,7 @@ async function materializePacketOutput(
     ...controllerVerifiedOutput
   } = verifiedOutput;
   const policyMetadata = catalog
-    ? packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands)
+    ? await packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands, [...investigationSurfaces, ...evidence.declarations.map(({ path }) => path)], cwd)
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
@@ -513,7 +522,7 @@ async function deriveRelationGraphMetadata(
     provenance: issuePaths.includes(path) ? "issue" as const : "controller" as const,
   }));
   if (!seeds.length) return {};
-  const adapters = repositoryAdaptersFor(["monorepo"]);
+  const adapters = repositoryAdaptersFor(await detectRepositoryLanguages(cwd));
   const limits = { maxNodes: 10_000, maxEdges: 25_000, maxDepth: 8, maxFiles: 2_000, maxBytes: 4_000_000, maxCollateralPaths: 512 };
   const facts = [];
   for (const adapter of adapters) facts.push(await adapter.inspect({ cwd, limits }));
@@ -582,10 +591,12 @@ export function canonicalizePacketVerification(
   catalog: VerificationCatalog,
   expectedPaths: readonly string[],
   invariantMatrices: readonly InvariantMatrixRow[],
+  semanticReadOnlySources: readonly string[] = [],
 ): BuildPacketPayload {
   const commandById = new Map(catalog.commands.map((command) => [command.id, command]));
   const gateById = new Map(catalog.controllerGates.map((gate) => [gate.id, gate]));
   const criterionIds = output.acceptanceCriteria.map((_, index) => `criterion-${index + 1}`);
+  const semanticPaths = [...new Set([...expectedPaths, ...semanticReadOnlySources])];
   const requirements: VerificationRequirement[] = output.verificationRequirements?.length
     ? output.verificationRequirements.map((requirement) => {
       if (!requirement.criterionIds.every((id) => criterionIds.includes(id))) {
@@ -623,23 +634,25 @@ export function canonicalizePacketVerification(
   const completionDiagnostics: string[] = [];
   for (const criterionId of criterionIds) {
     const rows = invariantMatrices.filter((row) => row.criterionId === criterionId);
-    const hasCommandRequirement = requirements.some((requirement) => requirement.kind === "command" && requirement.criterionIds.includes(criterionId));
     const hasGateRequirement = requirements.some((requirement) => requirement.kind === "controller-gate" && requirement.criterionIds.includes(criterionId));
     if (hasGateRequirement && rows.length === 0) continue;
-    // Existing command requirements remain supplemental/model suggestions for
-    // compatibility; completion is authoritative for criteria with no command
-    // at all (the #400 missing-criterion case).
-    if (hasCommandRequirement && rows.length === 0) continue;
-    const existingSemantic = requirements.some((requirement) => requirement.kind === "command"
+    const hasGenericRequirement = requirements.some((requirement) => requirement.kind === "command"
       && requirement.criterionIds.includes(criterionId)
-      && isProvenSemanticCommand(commandById.get(requirement.id), rows, expectedPaths));
-    if (existingSemantic) continue;
+      && commandById.get(requirement.id)?.evidenceCapability === "generic");
+    const hasSemanticRequirement = requirements.some((requirement) => requirement.kind === "command"
+      && requirement.criterionIds.includes(criterionId)
+      && isProvenSemanticCommand(commandById.get(requirement.id), rows, semanticPaths));
+    if (hasSemanticRequirement) continue;
     const candidates = catalog.commands
       .filter((command) => command.evidenceCapability !== undefined && command.evidenceCapability !== "generic")
-      .filter((command) => isProvenSemanticCommand(command, rows, expectedPaths))
+      .filter((command) => isProvenSemanticCommand(command, rows, semanticPaths))
       .sort((left, right) => semanticCommandRank(left, rows) - semanticCommandRank(right, rows) || left.id.localeCompare(right.id));
     const selected = candidates[0];
     if (!selected) {
+      if (hasGenericRequirement) {
+        completionDiagnostics.push(`${criterionId}: generic-only-command; no controller-proven semantic verification target is available`);
+        continue;
+      }
       completionDiagnostics.push(`${criterionId}: no controller-proven targeted/path-bound/invariant command is available`);
       continue;
     }
@@ -739,10 +752,12 @@ function selectedCatalogCommands(
   return catalog.filter((command) => ids.has(command.id));
 }
 
-function packetVerificationPolicyMetadata(
+async function packetVerificationPolicyMetadata(
   packet: Pick<BuildPacketPayload, "expectedPaths" | "verificationRequirements">,
   catalog: readonly VerificationCatalogEntry[],
-): Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> {
+  readOnlyCandidates: readonly string[] = [],
+  cwd = process.cwd(),
+): Promise<Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities">> {
   const selected = selectedCatalogCommands(packet, catalog);
   if (!selected.length) return {};
   const policyVersions = [...new Set(selected.map((command) => command.policyVersion).filter((value): value is string => Boolean(value)))];
@@ -750,13 +765,21 @@ function packetVerificationPolicyMetadata(
   if (additionalPolicyVersions.length) throw new Error("Selected verification catalog mixes incompatible policy versions");
   const targeted = selected.filter((command) => command.targeting === "expected-test-paths");
   if (targeted.length) validateVerificationTargetPaths(packet.expectedPaths, targeted);
-  const expectedTestPaths = targeted.length ? resolveVerificationTargets(packet.expectedPaths, targeted) : [];
+  const readOnlySourcePaths = targeted.length
+    ? await resolveReadOnlyVerificationSources(readOnlyCandidates, targeted, cwd)
+    : [];
+  const sourceTestPaths = [...new Set([...packet.expectedPaths.filter(isExpectedTestPath), ...readOnlySourcePaths])];
+  const expectedTestPaths = targeted.length ? resolveVerificationTargets(packet.expectedPaths, targeted, readOnlySourcePaths) : [];
   return {
     ...(policyVersion !== undefined ? { verificationPolicyVersion: policyVersion } : {}),
-    verificationCommandTargets: selected.map((command) => ({
-      id: command.id,
-      targets: command.targeting === "expected-test-paths" ? expectedTestPaths : [],
-    })),
+    verificationCommandTargets: selected.map((command) => {
+      const targets = command.targeting === "expected-test-paths" ? expectedTestPaths : [];
+      return {
+        id: command.id,
+        targets,
+        ...(targets.length && readOnlySourcePaths.length ? { sourceTargets: sourceTestPaths, targetDigest: createHash("sha256").update(JSON.stringify({ sourceTargets: sourceTestPaths, targets })).digest("hex") } : {}),
+      };
+    }),
     verificationCommandIdentities: selected.map((command) => ({
       id: command.id,
       command: command.command,
@@ -843,15 +866,31 @@ export function selectPacketVerificationCommands(
     if (JSON.stringify(frozenCommandIds) !== JSON.stringify(selectedCommandIds)) throw new Error("[graph-drift] Frozen relation graph command IDs do not match packet-selected commands");
   }
 
+  const frozenTargetById = new Map((packet.verificationCommandTargets ?? []).map((entry) => [entry.id, entry]));
   const targetedCommands = catalog.filter((command) => selectedIds.has(command.id) && command.targeting === "expected-test-paths");
   const hasFrozenEvidenceContract = packet.evidenceContract?.version === "forgedock.evidence/v1";
   const selectionDiagnostics: string[] = [];
   let expectedTestPaths: string[] = [];
   try {
-    if (targetedCommands.length) validateVerificationTargetPaths(packet.expectedPaths, targetedCommands);
+    if (targetedCommands.length && !packet.verificationCommandTargets) validateVerificationTargetPaths(packet.expectedPaths, targetedCommands);
     expectedTestPaths = targetedCommands.length
-      ? resolveVerificationTargets(packet.expectedPaths, targetedCommands)
+      ? packet.verificationCommandTargets
+        ? [...new Set(targetedCommands.flatMap((command) => frozenTargetById.get(command.id)?.targets ?? []))]
+        : resolveVerificationTargets(packet.expectedPaths, targetedCommands)
       : [];
+    for (const command of targetedCommands) {
+      const frozen = frozenTargetById.get(command.id);
+      if (!frozen && hasFrozenEvidenceContract) selectionDiagnostics.push(`[target-drift] Missing frozen targets for verification command '${command.id}'`);
+      if (frozen && !frozen.sourceTargets) {
+        const legacyTargets = resolveVerificationTargets(packet.expectedPaths, [command]);
+        if (JSON.stringify(legacyTargets) !== JSON.stringify(frozen.targets)) selectionDiagnostics.push(`[target-drift] Frozen verification command '${command.id}' targets differ from its legacy source paths`);
+      }
+      if (frozen?.targetDigest) {
+        const sourceTargets = frozen.sourceTargets ?? [];
+        const digest = createHash("sha256").update(JSON.stringify({ sourceTargets, targets: frozen.targets })).digest("hex");
+        if (digest !== frozen.targetDigest) selectionDiagnostics.push(`[target-drift] Frozen targets for '${command.id}' have an invalid digest`);
+      }
+    }
   } catch (error) {
     if (!hasFrozenEvidenceContract) throw error;
     selectionDiagnostics.push(`[target-drift] ${error instanceof Error ? error.message : String(error)}`);

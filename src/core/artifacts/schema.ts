@@ -187,6 +187,9 @@ export const BuildPacketPayloadSchema = Type.Object({
   verificationCommandTargets: Type.Optional(Type.Array(Type.Object({
     id: NonEmptyString,
     targets: Type.Array(NonEmptyString),
+    /** Source/read-only targets used to derive compiled targets; never write authority. */
+    sourceTargets: Type.Optional(Type.Array(NonEmptyString)),
+    targetDigest: Type.Optional(PacketDigest),
   }))),
   /** Additive executable identity used to reject same-ID catalog drift on resume. */
   verificationCommandIdentities: Type.Optional(Type.Array(Type.Object({
@@ -301,6 +304,13 @@ export const VerificationCheckpointPayloadSchema = Type.Object({
     anchors: Type.Optional(CriterionEvidenceAnchorsSchema),
   })),
   checks: Type.Array(CheckResultSchema, { minItems: 1 }),
+  /** Frozen semantic command targets retained for crash recovery. */
+  verificationCommandTargets: Type.Optional(Type.Array(Type.Object({
+    id: NonEmptyString,
+    targets: Type.Array(NonEmptyString),
+    targetDigest: Type.Optional(PacketDigest),
+  }))),
+  verificationCommandPlanDigest: Type.Optional(PacketDigest),
   decisions: Type.Array(Type.String()),
   residualRisks: Type.Array(Type.String()),
 });
