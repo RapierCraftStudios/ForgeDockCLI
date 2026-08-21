@@ -105,7 +105,7 @@ describe("Build Packet preparation", () => {
     }
   });
 
-  it("fails closed for packet evidence unrelated to validated Investigation sources", async () => {
+  it("drops packet evidence unrelated to validated Investigation sources", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-unrelated-evidence-"));
     try {
       await mkdir(join(cwd, "scripts"), { recursive: true });
@@ -144,7 +144,7 @@ describe("Build Packet preparation", () => {
     }
   });
 
-  it("rejects evidence whose individually valid files exceed the aggregate byte bound", async () => {
+  it("bounds aggregate evidence by retaining only files within the byte limit", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-byte-bound-"));
     try {
       await mkdir(join(cwd, "scripts"), { recursive: true });
