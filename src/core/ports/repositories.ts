@@ -3,7 +3,7 @@
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "./forge-host.js";
-import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueNumbers, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
   repo: string;
@@ -176,8 +176,7 @@ export class InMemoryOrchestrationRepository implements OrchestrationRepository 
     if (record.status === "running") {
       const conflicts = findRunningOrchestrationIssueConflicts(
         [...this.records.values()],
-        record.repository,
-        orchestrationRecordIssueNumbers(record),
+        orchestrationRecordIssueIdentities(record),
       );
       if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     }
@@ -204,8 +203,7 @@ export class InMemoryOrchestrationRepository implements OrchestrationRepository 
     if (record.status === "running") {
       const conflicts = findRunningOrchestrationIssueConflicts(
         [...this.records.values()].filter((candidate) => candidate.orchestrationId !== record.orchestrationId),
-        record.repository,
-        orchestrationRecordIssueNumbers(record),
+        orchestrationRecordIssueIdentities(record),
       );
       if (conflicts.length) throw new OrchestrationIssueOwnershipConflictError(conflicts);
     }

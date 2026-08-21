@@ -166,3 +166,122 @@ test("in-memory orchestration insert permits overlapping terminal history", asyn
     status: "completed",
   })));
 });
+
+test("in-memory create admits only one concurrent owner of a qualified remote node", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const proposal = (orchestrationId: string, rootIssue: number): OrchestrationRecord => record({
+    orchestrationId,
+    repository: "owner/control",
+    requestedIssueNumbers: [rootIssue],
+    issueNumbers: [rootIssue],
+    nodes: [node({ id: `${orchestrationId}-remote-700`, repository: "OWNER/WORK", issue: 700 })],
+  });
+  const outcomes = await Promise.allSettled([
+    repository.createOrchestration(proposal("dag_contender_a", 2)),
+    repository.createOrchestration(proposal("dag_contender_b", 3)),
+  ]);
+
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+  assert.ok(rejected);
+  assert.ok(rejected.reason instanceof OrchestrationIssueOwnershipConflictError);
+  const winnerId = outcomes[0]?.status === "fulfilled" ? "dag_contender_a" : "dag_contender_b";
+  assert.deepEqual(rejected.reason.conflicts, [{
+    orchestrationId: winnerId,
+    repository: "owner/work",
+    issueNumbers: [700],
+  }]);
+  assert.equal(repository.records.size, 1);
+});
+
+test("in-memory create isolates equal issue numbers across root and remote repositories", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  await repository.createOrchestration(record({
+    orchestrationId: "dag_remote_owner",
+    repository: "owner/control",
+    requestedIssueNumbers: [1],
+    issueNumbers: [1],
+    nodes: [node({ id: "remote-7", repository: "owner/work", issue: 7 })],
+  }));
+
+  await assert.doesNotReject(repository.createOrchestration(record({
+    orchestrationId: "dag_root-7",
+    repository: "owner/control",
+    requestedIssueNumbers: [7],
+    issueNumbers: [7],
+    nodes: [node({ id: "root-7", issue: 7 })],
+  })));
+});
+
+test("in-memory create ignores terminal ownership history for qualified identities", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  await repository.createOrchestration(record({
+    orchestrationId: "dag_terminal_remote",
+    repository: "owner/control",
+    requestedIssueNumbers: [800],
+    issueNumbers: [800],
+    status: "completed",
+    nodes: [node({ id: "terminal-801", repository: "owner/work", issue: 801, status: "completed" })],
+  }));
+
+  await assert.doesNotReject(repository.createOrchestration(record({
+    orchestrationId: "dag_running_remote",
+    repository: "owner/control",
+    requestedIssueNumbers: [800],
+    issueNumbers: [800],
+    nodes: [node({ id: "running-801", repository: "owner/work", issue: 801 })],
+  })));
+});
+
+test("in-memory save rejects qualified member and decomposition ownership atomically", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  await repository.createOrchestration(record({
+    orchestrationId: "dag_member_owner",
+    repository: "owner/control",
+    requestedIssueNumbers: [400],
+    issueNumbers: [400],
+    nodes: [node({ id: "member-owner", repository: "owner/work", issue: 500, memberIssues: [501] })],
+  }));
+  await repository.createOrchestration(record({
+    orchestrationId: "dag_decomposition_owner",
+    repository: "owner/control",
+    requestedIssueNumbers: [600],
+    issueNumbers: [600],
+    nodes: [node({ id: "decomposition-owner", repository: "owner/work", issue: 610, decompositionChildren: [611] })],
+  }));
+  await repository.createOrchestration(record({
+    orchestrationId: "dag_candidate",
+    repository: "owner/control",
+    requestedIssueNumbers: [410],
+    issueNumbers: [410],
+    nodes: [node({ id: "candidate", repository: "owner/work", issue: 510 })],
+  }));
+
+  const candidate = (await repository.loadOrchestration("dag_candidate"))!;
+  const beforeMemberUpdate = structuredClone(candidate);
+  candidate.nodes[0]!.memberIssues = [501];
+  await assert.rejects(repository.saveOrchestration(candidate), (error: unknown) => {
+    if (!(error instanceof OrchestrationIssueOwnershipConflictError)) return false;
+    assert.deepEqual(error.conflicts, [{
+      orchestrationId: "dag_member_owner",
+      repository: "owner/work",
+      issueNumbers: [501],
+    }]);
+    return true;
+  });
+  assert.deepEqual(await repository.loadOrchestration("dag_candidate"), beforeMemberUpdate);
+
+  const candidateForDecomposition = (await repository.loadOrchestration("dag_candidate"))!;
+  const beforeDecompositionUpdate = structuredClone(candidateForDecomposition);
+  candidateForDecomposition.nodes[0]!.decompositionChildren = [611];
+  await assert.rejects(repository.saveOrchestration(candidateForDecomposition), (error: unknown) => {
+    if (!(error instanceof OrchestrationIssueOwnershipConflictError)) return false;
+    assert.deepEqual(error.conflicts, [{
+      orchestrationId: "dag_decomposition_owner",
+      repository: "owner/work",
+      issueNumbers: [611],
+    }]);
+    return true;
+  });
+  assert.deepEqual(await repository.loadOrchestration("dag_candidate"), beforeDecompositionUpdate);
+});
