@@ -7,6 +7,7 @@ const runId = "run-root-ledger";
 const subject = { repo: "a/b", issue: 364 };
 const head1 = "a".repeat(40);
 const head2 = "b".repeat(40);
+const head3 = "c".repeat(40);
 const packet = createArtifact({
   kind: "BuildPacket", runId, subject, producer: { role: "packet-author" }, payload: {
     scope: ["Preserve sensitive observation invariants"],
@@ -159,41 +160,60 @@ describe("durable finding root ledger", () => {
   it("keeps distinct trigger families independently assessable across epochs", () => {
     const alpha = findingWithTrigger("trigger-a", "trigger-alpha");
     const beta = findingWithTrigger("trigger-b", "trigger-beta");
-    const initial = reconcileFindingRootLedger({ packet, findings: [alpha, beta], headSha: head1 });
-    assert.equal(initial.length, 2);
-    const alphaRoot = initial.find((root) => root.representative.id === "trigger-a")!;
-    const betaRoot = initial.find((root) => root.representative.id === "trigger-b")!;
-    assert.notEqual(alphaRoot.rootId, betaRoot.rootId);
-    assert.deepEqual(new Set(initial.flatMap((root) => root.findingIds)), new Set(["trigger-a", "trigger-b"]));
-    assert.deepEqual(new Set(openLedgerFindings(initial).map((finding) => finding.id)), new Set(["trigger-a", "trigger-b"]));
+    const initial = reconcileFindingRootLedger({ packet, findings: [alpha], headSha: head1 });
+    assert.equal(initial.length, 1);
+    const alphaRoot = initial[0]!;
 
     const previous = createArtifact({
       kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
       payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: initial },
     });
-    const fixedAlpha = reconcileFindingRootLedger({
-      previous, packet, findings: [],
-      assessments: [{ rootId: alphaRoot.rootId, status: "fixed", evidence: "alpha trigger fixed" }],
-      headSha: head2,
-    });
-    assert.equal(fixedAlpha.find((root) => root.rootId === alphaRoot.rootId)?.state, "fixed");
-    assert.equal(fixedAlpha.find((root) => root.rootId === betaRoot.rootId)?.state, "fix-attempted");
-    assert.deepEqual(openLedgerFindings(fixedAlpha).map((finding) => finding.rootId), [betaRoot.rootId]);
-    assert.equal(openLedgerFindings(fixedAlpha)[0]?.id, "trigger-b");
+    const betaEpoch = reconcileFindingRootLedger({ previous, packet, findings: [beta], headSha: head2 });
+    assert.equal(betaEpoch.length, 2);
+    const betaRoot = betaEpoch.find((root) => root.representative.id === "trigger-b")!;
+    assert.notEqual(alphaRoot.rootId, betaRoot.rootId);
+    assert.equal(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.representative.id, "trigger-a");
+    assert.equal(betaRoot.representative.id, "trigger-b");
+    assert.deepEqual(new Set(betaEpoch.flatMap((root) => root.findingIds)), new Set(["trigger-a", "trigger-b"]));
+    assert.deepEqual(new Set(betaEpoch.map((root) => root.triggerFamily)), new Set([alphaRoot.triggerFamily, betaRoot.triggerFamily]));
+    assert.notEqual(alphaRoot.triggerFamily, betaRoot.triggerFamily);
+    assert.deepEqual(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.component, betaRoot.component);
+    assert.deepEqual(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.criterionIds, betaRoot.criterionIds);
+    assert.deepEqual(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.symbols, betaRoot.symbols);
+    assert.deepEqual(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.invariantFamily, betaRoot.invariantFamily);
+    assert.deepEqual(betaEpoch.find((root) => root.rootId === alphaRoot.rootId)?.failureFamily, betaRoot.failureFamily);
+    assert.deepEqual(new Set(openLedgerFindings(betaEpoch).map((finding) => finding.id)), new Set(["trigger-a", "trigger-b"]));
 
     const repeatedPrevious = createArtifact({
       kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
-      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head2, epoch: 2, roots: fixedAlpha },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head2, epoch: 2, roots: betaEpoch },
     });
     const repeated = reconcileFindingRootLedger({
       previous: repeatedPrevious, packet,
       findings: [findingWithTrigger("trigger-a-repeat", "trigger-alpha"), findingWithTrigger("trigger-b-repeat", "trigger-beta")],
       headSha: head2,
     });
-    assert.equal(repeated.length, 2);
-    assert.deepEqual(repeated.map((root) => root.rootId), initial.map((root) => root.rootId));
-    assert.deepEqual(new Set(repeated.flatMap((root) => root.findingIds)), new Set(["trigger-a", "trigger-b", "trigger-a-repeat", "trigger-b-repeat"]));
+    assert.deepEqual(repeated.map((root) => root.rootId).sort(), [alphaRoot.rootId, betaRoot.rootId].sort());
+    assert.ok(repeated.every((root) => root.state === "open"));
+    assert.deepEqual(repeated.find((root) => root.rootId === alphaRoot.rootId)?.findingIds, ["trigger-a", "trigger-a-repeat"]);
+    assert.deepEqual(repeated.find((root) => root.rootId === betaRoot.rootId)?.findingIds, ["trigger-b", "trigger-b-repeat"]);
     assert.deepEqual(new Set(openLedgerFindings(repeated).map((finding) => finding.id)), new Set(["trigger-a-repeat", "trigger-b-repeat"]));
+
+    const repeatedArtifact = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head2, epoch: 3, roots: repeated },
+    });
+    const fixedAlpha = reconcileFindingRootLedger({
+      previous: repeatedArtifact, packet, findings: [findingWithTrigger("trigger-b-final", "trigger-beta")],
+      assessments: [{ rootId: alphaRoot.rootId, status: "fixed", evidence: "alpha trigger fixed" }],
+      headSha: head3,
+    });
+    assert.equal(fixedAlpha.find((root) => root.rootId === alphaRoot.rootId)?.state, "fixed");
+    assert.equal(fixedAlpha.find((root) => root.rootId === betaRoot.rootId)?.state, "open");
+    assert.deepEqual(fixedAlpha.find((root) => root.rootId === alphaRoot.rootId)?.findingIds, ["trigger-a", "trigger-a-repeat"]);
+    assert.deepEqual(fixedAlpha.find((root) => root.rootId === betaRoot.rootId)?.findingIds, ["trigger-b", "trigger-b-repeat", "trigger-b-final"]);
+    assert.deepEqual(openLedgerFindings(fixedAlpha).map((finding) => finding.rootId), [betaRoot.rootId]);
+    assert.equal(openLedgerFindings(fixedAlpha)[0]?.id, "trigger-b-final");
   });
 
   it("ignores reviewer-supplied root IDs when selecting structural roots", () => {
