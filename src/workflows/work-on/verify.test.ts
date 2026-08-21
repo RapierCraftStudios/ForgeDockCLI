@@ -199,6 +199,55 @@ describe("verification and commit barrier", () => {
     }
   });
 
+  it("recovers a frozen target projection and rejects a tampered projection digest", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-target-projection-"));
+    mkdirSync(join(directory, "src"), { recursive: true });
+    writeFileSync(join(directory, "src", "a.ts"), "export const recovered = true;\n");
+    try {
+      const firstRuns = new InMemoryRunRepository();
+      const run = await verifyingRun(firstRuns);
+      const basePacket = packet(run);
+      const targetedPacket = createArtifact({
+        ...basePacket,
+        payload: {
+          ...basePacket.payload,
+          verificationCommandTargets: [{ id: "test", sourceTargets: ["src/a.test.ts"], targets: ["dist/a.test.js"] }],
+        },
+      });
+      const targetedCommand = { ...command, cwd: directory, targets: ["dist/a.test.js"] };
+      const retainedArtifacts = new InMemoryArtifactRepository();
+      const crashAfterCommit = {
+        append: async (artifact: DurableArtifact) => {
+          if (artifact.kind === "BuildResult") throw new Error("simulated target-projection crash");
+          await retainedArtifacts.append(artifact);
+        },
+        list: retainedArtifacts.list.bind(retainedArtifacts),
+      };
+      const git = new FakeGit(["src/a.ts"]);
+      await assert.rejects(verifyAndCommit({
+        run, packet: targetedPacket, submission, workspace: { ...workspace, path: directory }, commands: [targetedCommand],
+      }, { verifier: new FakeVerifier([passed]), git, artifacts: crashAfterCommit, runs: firstRuns }), /simulated target-projection crash/);
+      const checkpoint = retainedArtifacts.artifacts.find(
+        (artifact): artifact is DurableArtifact<"VerificationCheckpoint"> => artifact.kind === "VerificationCheckpoint",
+      );
+      assert.ok(checkpoint);
+      assert.equal((checkpoint.payload.verificationCommandTargets?.[0] as { sourceTargets?: unknown } | undefined)?.sourceTargets, undefined, "checkpoint uses one canonical compiled-target projection");
+      const recoveredRuns = new InMemoryRunRepository();
+      const recoveredRun = await verifyingRun(recoveredRuns, run.runId);
+      const recovered = await recoverVerificationCheckpoint({
+        run: recoveredRun, checkpoint, workspace: { ...workspace, path: directory },
+        commands: [targetedCommand], verifier: new FakeVerifier([{ ...passed, commandId: "test", planId: "plan-baseline", policyVersion: "forgedock.verification/v2", commandTargets: ["dist/a.test.js"] }]),
+      }, { git, artifacts: retainedArtifacts, runs: recoveredRuns });
+      assert.equal(recovered.run.state, "publishing");
+      const tampered = { ...checkpoint, payload: { ...checkpoint.payload, verificationCommandPlanDigest: "0".repeat(64) } };
+      await assert.rejects(recoverVerificationCheckpoint({
+        run: recoveredRun, checkpoint: tampered, workspace: { ...workspace, path: directory },
+        commands: [targetedCommand], verifier: new FakeVerifier([]),
+      }, { git, artifacts: retainedArtifacts, runs: new InMemoryRunRepository() }), /command-target digest is invalid/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
   it("keeps a real regular-file delivery on the publishing path", async () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-verify-regular-"));
     mkdirSync(join(directory, "src"), { recursive: true });

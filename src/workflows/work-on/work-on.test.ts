@@ -169,8 +169,17 @@ const investigation: InvestigationPayload = {
 };
 const packet: BuildPacketPayload = {
   scope: ["Add guard"], acceptanceCriteria: ["Guard runs"], context: [], implementationPlan: ["Edit src/a.js"],
-  expectedPaths: ["src/a.js"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+  expectedPaths: ["src/a.js", "src/workflows/work-on/work-on.test.ts"], verificationPlan: ["npm test"],
+  verificationRequirements: [{ kind: "command", id: "test", criterionIds: ["criterion-1"], rationale: "Run the proven regression target" }],
+  risks: [], outOfScope: [],
 };
+const targetedTestVerification = {
+  id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true,
+  selection: "always" as const, targeting: "expected-test-paths" as const,
+  evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2", lockScope: "workspace" as const,
+  typescriptLayout: { sourceRoot: "src", outputRoot: ".forgedock/verification-dist", project: "tsconfig.json", configDigest: "fixture" },
+};
+const { verificationRequirements: _legacyRequirements, ...legacyPacket } = packet;
 
 function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>, reviewedHeadSha = sha) {
   return planReviewPanel({
@@ -294,7 +303,7 @@ describe("complete work-on trajectory", () => {
     });
 
     await assert.rejects(
-      workOn({ intent, repoPath: process.cwd(), lane: fastLane, verification: [] }, {
+      workOn({ intent, repoPath: process.cwd(), lane: fastLane, verification: [targetedTestVerification] }, {
         runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host,
       }),
       /Issue #8 is already closed; refusing to start fresh work/,
@@ -321,7 +330,7 @@ describe("complete work-on trajectory", () => {
     });
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(result.run.state, "invalid");
     assert.equal(host.issueClosed, true);
@@ -350,7 +359,7 @@ describe("complete work-on trajectory", () => {
         intent,
         repoPath: process.cwd(),
         lane: fastLane,
-        verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+        verification: [targetedTestVerification],
         onClaimsPromoted: async () => { throw new ClaimPromotionConflictError("issue-8", ["issue-9"]); },
       }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }),
       ClaimPromotionConflictError,
@@ -375,7 +384,7 @@ describe("complete work-on trajectory", () => {
       intent,
       repoPath: process.cwd(),
       lane: fastLane,
-      verification: [],
+      verification: [targetedTestVerification],
       onClaimsPromoted: async () => { throw ambiguity; },
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }), (error: unknown) => error === ambiguity);
 
@@ -429,10 +438,10 @@ describe("complete work-on trajectory", () => {
         observeClaims(claims);
         await claimAdmission;
       },
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
-    assert.deepEqual(await claimsObserved, ["src/a.js"]);
+    assert.deepEqual(await claimsObserved, packet.expectedPaths);
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
     releaseClaims();
     const resumed = await resumedPromise;
@@ -451,7 +460,7 @@ describe("complete work-on trajectory", () => {
     let promotedPaths: readonly string[] | undefined;
 
     await assert.rejects(workOn({
-      intent, repoPath: process.cwd(), lane: fastLane, verification: [],
+      intent, repoPath: process.cwd(), lane: fastLane, verification: [targetedTestVerification],
       onClaimsPromoted: (paths) => {
         promotedPaths = paths;
         throw conflict;
@@ -480,7 +489,7 @@ describe("complete work-on trajectory", () => {
       priorArtifacts: [fixture.intent, fixture.investigationArtifact],
       workspace,
       baseBranch: "main",
-      verification: [],
+      verification: [targetedTestVerification],
       onClaimsPromoted: (paths) => {
         promotedPaths = paths;
         throw conflict;
@@ -511,7 +520,7 @@ describe("complete work-on trajectory", () => {
       packet: fixture.packetArtifact,
       workspace,
       baseBranch: "main",
-      verification: [],
+      verification: [targetedTestVerification],
       onClaimsPromoted: (paths) => {
         promotedPaths = paths;
         throw conflict;
@@ -562,7 +571,7 @@ describe("complete work-on trajectory", () => {
       workspace,
       baseBranch: "main",
       autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
       onClaimsPromoted: () => { claimsPromoted = true; },
     }, {
       runtime, artifacts: fixture.artifacts, runs: fixture.runs, git,
@@ -588,7 +597,7 @@ describe("complete work-on trajectory", () => {
       packet: fixture.packetArtifact,
       workspace,
       baseBranch: "main",
-      verification: [],
+      verification: [targetedTestVerification],
       preflightedPacketClaims: ["src/not-the-packet.ts"],
       onClaimsPromoted: () => { promoted = true; },
     }, {
@@ -610,7 +619,7 @@ describe("complete work-on trajectory", () => {
     const callbackError = new Error("promotion sink failed");
 
     await assert.rejects(workOn({
-      intent, repoPath: process.cwd(), lane: fastLane, verification: [],
+      intent, repoPath: process.cwd(), lane: fastLane, verification: [targetedTestVerification],
       onClaimsPromoted: () => { throw callbackError; },
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }), (error: unknown) => {
       assert.equal(error, callbackError);
@@ -646,7 +655,7 @@ describe("complete work-on trajectory", () => {
       priorArtifacts: [fixture.intent, fixture.investigationArtifact],
       workspace,
       baseBranch: "main",
-      verification: [],
+      verification: [targetedTestVerification],
       onClaimsPromoted: () => { throw callbackError; },
     }, {
       runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
@@ -685,7 +694,7 @@ describe("complete work-on trajectory", () => {
       workspace,
       baseBranch: "main",
       autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
       onClaimsPromoted: (paths) => { promoted.push([...paths]); },
     }, {
       runtime, artifacts: fixture.artifacts, runs: fixture.runs, git: fixture.git,
@@ -826,7 +835,7 @@ describe("complete work-on trajectory", () => {
     };
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(result.run.state, "blocked");
     assert.equal(git.removed, false);
@@ -854,7 +863,7 @@ describe("complete work-on trajectory", () => {
     });
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(result.run.state, "completed");
     assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 2);
@@ -885,7 +894,7 @@ describe("complete work-on trajectory", () => {
     };
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(result.run.state, "completed");
     assert.equal(verificationCalls, 3);
@@ -946,7 +955,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumeBuildWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, priorVerificationFailure,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
@@ -1012,7 +1021,7 @@ describe("complete work-on trajectory", () => {
       workspace,
       baseBranch: "main",
       autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
@@ -1052,7 +1061,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumePublicationWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
@@ -1104,7 +1113,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumePublicationWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
@@ -1162,7 +1171,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumePublicationWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
     assert.equal(host.findingIssues, 1, "the blocked review must preserve its accepted root as a durable issue");
@@ -1238,7 +1247,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumePublicationWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier, host });
     assert.equal(
       resumed.run.state,
@@ -1296,7 +1305,7 @@ describe("complete work-on trajectory", () => {
     const resumed = await resumeReviewWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
       pullRequest: host.snapshot, workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
@@ -1358,7 +1367,7 @@ describe("complete work-on trajectory", () => {
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
       pullRequest: host.snapshot, workspace, baseBranch: "main", autoMerge: true,
       maxRemediationCycles: 2, priorRemediationCycles: 2,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "blocked");
@@ -1529,7 +1538,7 @@ describe("complete work-on trajectory", () => {
   });
 
   it("resumes retained verification without replaying investigation, packet authoring, or build", async () => {
-    const initialRuntime = new FakeAgentRuntime([investigation, packet, submission]);
+    const initialRuntime = new FakeAgentRuntime([investigation, legacyPacket, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
@@ -1550,11 +1559,14 @@ describe("complete work-on trajectory", () => {
     assert.ok(investigationArtifact?.kind === "Investigation");
     assert.ok(packetArtifact?.kind === "BuildPacket");
     assert.ok(outcome?.kind === "Outcome");
+    const resumedPacket = createArtifact({
+      kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet,
+    });
     const resumedRuntime = new FakeAgentRuntime([{ summary: "Approved", findings: [] }]);
     const resumed = await resumeWorkOn({
-      run: blocked.run, intent, investigation: investigationArtifact, packet: packetArtifact, outcome,
+      run: blocked.run, intent, investigation: investigationArtifact, packet: resumedPacket, outcome,
       workspace, baseBranch: "main", autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "completed");
@@ -1565,7 +1577,7 @@ describe("complete work-on trajectory", () => {
   });
 
   it("preserves the remediation budget when verification resumes after a failed remediation", async () => {
-    const initialRuntime = new FakeAgentRuntime([investigation, packet, submission]);
+    const initialRuntime = new FakeAgentRuntime([investigation, legacyPacket, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
@@ -1593,6 +1605,9 @@ describe("complete work-on trajectory", () => {
       title: "Guard is still incomplete", evidence: "One accepted case is missing", location: "src/a.js:1",
       intentRelevance: "The frozen criterion requires it", remediation: "Complete the guard",
     };
+    const resumedPacket = createArtifact({
+      kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet,
+    });
     const resumedRuntime = new FakeAgentRuntime([
       { summary: "Changes still required", findings: [finding] },
       acceptAdjudication,
@@ -1601,14 +1616,14 @@ describe("complete work-on trajectory", () => {
       run: blocked.run,
       intent,
       investigation: investigationArtifact,
-      packet: packetArtifact,
+      packet: resumedPacket,
       outcome,
       workspace,
       baseBranch: "main",
       autoMerge: true,
       maxRemediationCycles: 1,
       priorRemediationCycles: 1,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "blocked");
@@ -1641,7 +1656,7 @@ describe("complete work-on trajectory", () => {
     });
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(result.run.state, "completed");
@@ -1670,7 +1685,7 @@ describe("complete work-on trajectory", () => {
       repoPath: process.cwd(),
       lane: fastLane,
       autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
       parentRemediation: {
         parentRunId: "run_parent",
         parentIssue: 8,
@@ -1714,7 +1729,7 @@ describe("complete work-on trajectory", () => {
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
       scopeExpansion: "recursive", remediationDepth: 1, maxRemediationDepth: 2, maxRemediationChildren: 2,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
       parentRemediation: {
         parentRunId: "run_parent", parentIssue: 8, parentPullRequest: 11,
         parentBranch: "forgedock/parent", parentHeadSha: sha,
@@ -1741,7 +1756,7 @@ describe("complete work-on trajectory", () => {
     });
     const result = await workOn({
       intent, repoPath: process.cwd(), lane: fastLane, autoMerge: true,
-      verification: [{ id: "test", command: "npm", args: ["test"], timeoutMs: 60_000, required: true }],
+      verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(result.run.state, "completed");

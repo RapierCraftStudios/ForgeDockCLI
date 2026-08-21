@@ -15,6 +15,27 @@ import { WorkflowExecutionError } from "./investigate.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
 import { validateEvidenceContract } from "./evidence-contract.js";
 
+type PersistedVerificationCommandTarget = {
+  id: string;
+  targets: readonly string[];
+  targetDigest?: string;
+};
+
+/** The checkpoint projection is the digest authority; keep creation and recovery byte-identical. */
+function persistedVerificationCommandTargets(
+  targets: readonly PersistedVerificationCommandTarget[],
+): { id: string; targets: string[]; targetDigest?: string }[] {
+  return targets.map(({ id, targets: commandTargets, targetDigest }) => ({
+    id,
+    targets: [...commandTargets],
+    ...(targetDigest !== undefined ? { targetDigest } : {}),
+  }));
+}
+
+function verificationCommandTargetsDigest(targets: readonly PersistedVerificationCommandTarget[]): string {
+  return createHash("sha256").update(JSON.stringify(persistedVerificationCommandTargets(targets))).digest("hex");
+}
+
 export interface VerificationResult {
   run: RunState;
   checks: CheckResult[];
@@ -395,8 +416,8 @@ export async function verifyAndCommit(
         acceptanceEvidence,
         checks,
         ...(input.packet.payload.verificationCommandTargets ? {
-          verificationCommandTargets: input.packet.payload.verificationCommandTargets.map(({ id, targets, targetDigest }) => ({ id, targets, ...(targetDigest ? { targetDigest } : {}) })),
-          verificationCommandPlanDigest: createHash("sha256").update(JSON.stringify(input.packet.payload.verificationCommandTargets)).digest("hex"),
+          verificationCommandTargets: persistedVerificationCommandTargets(input.packet.payload.verificationCommandTargets),
+          verificationCommandPlanDigest: verificationCommandTargetsDigest(input.packet.payload.verificationCommandTargets),
         } : {}),
         decisions: input.submission.decisions,
         residualRisks: input.submission.residualRisks,
@@ -540,7 +561,7 @@ export async function recoverVerificationCheckpoint(
       throw new Error("Retained verification checkpoint command targets drifted; refusing recovery");
     }
     if (checkpoint.payload.verificationCommandPlanDigest
-      !== createHash("sha256").update(JSON.stringify(frozen)).digest("hex")) {
+      !== verificationCommandTargetsDigest(frozen)) {
       throw new Error("Retained verification checkpoint command-target digest is invalid");
     }
   }
