@@ -357,13 +357,10 @@ async function materializePacketOutput(
   const declaredPaths = canonicalizeConcreteScopePaths(affectedFiles.filter(isConcreteScopePath));
   const investigatedPaths = canonicalizeConcreteScopePaths(investigationSurfaces.filter(isConcreteScopePath));
   const controllerPaths = canonicalizeConcreteScopePaths(controllerWriteHints.filter(isConcreteScopePath));
-  // Model expectedPaths are candidates only. When authoritative issue/controller
-  // seeds exist, derive the graph first and scope only its validated fixed point.
-  const graphCandidates = await deriveRelationGraphMetadata(output.expectedPaths, declaredPaths, controllerPaths, cwd, {}, undefined, baseSha);
-  const proposedPaths = graphCandidates.metadata?.writablePaths ?? output.expectedPaths;
-  const closure = graphCandidates.metadata
-    ? { expectedPaths: graphCandidates.metadata.writablePaths, diagnostics: [] as string[] }
-    : await closeExpectedWriteScope(proposedPaths, {
+  // The controller's proven scope closure remains delivery authority. The
+  // repository relation graph is collected in shadow mode and must not replace
+  // or broaden this boundary until its production canary period completes.
+  const closure = await closeExpectedWriteScope(output.expectedPaths, {
     issueWriteHints: declaredPaths,
     investigationWriteHints: enforceScopeClosure ? investigatedPaths : [],
     controllerWriteHints: controllerPaths,
@@ -420,7 +417,7 @@ async function materializePacketOutput(
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
     if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
-    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
+    const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
     return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
@@ -468,7 +465,7 @@ async function materializePacketOutput(
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
     throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
   }
-  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
+  const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -479,6 +476,25 @@ async function materializePacketOutput(
     ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}),
     ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}),
   };
+}
+
+async function deriveRelationGraphMetadataShadow(
+  expectedPaths: readonly string[],
+  issuePaths: readonly string[],
+  controllerPaths: readonly string[],
+  cwd: string,
+  policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>,
+  evidenceContract: BuildPacketPayload["evidenceContract"] | undefined,
+  baseSha: string,
+  finalExpectedPaths?: readonly string[],
+  finalEvidencePaths: readonly string[] = [],
+): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
+  try {
+    return await deriveRelationGraphMetadata(expectedPaths, issuePaths, controllerPaths, cwd, policyMetadata, evidenceContract, baseSha, finalExpectedPaths, finalEvidencePaths);
+  } catch (error) {
+    if (process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT === "1") throw error;
+    return {};
+  }
 }
 
 async function deriveRelationGraphMetadata(

@@ -97,6 +97,33 @@ describe("Build Packet preparation", () => {
     }
   });
 
+  it("keeps unobserved relation evidence advisory during rollout", async () => {
+    const advisoryInvestigation: InvestigationPayload = {
+      ...investigation,
+      affectedSurfaces: ["src/adapters/sqlite/sqlite-repositories.ts", "FORGE.md"],
+      evidence: [{ claim: "Contract", source: "FORGE.md", detail: "Read-only repository guidance" }],
+    };
+    const advisoryPacket: BuildPacketPayload = {
+      ...packet,
+      expectedPaths: ["src/adapters/sqlite/sqlite-repositories.ts"],
+      evidencePaths: [{ path: "FORGE.md", criterionIds: ["criterion-1"], role: "source" }],
+    };
+    const runtime = new FakeAgentRuntime([advisoryInvestigation, advisoryPacket]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_relation_advisory", subject: { repo: "a/b", issue: 102 }, producer: { role: "controller" },
+      payload: { title: "Advisory graph", problem: "Graph scan is bounded", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const scopeHints = { affectedFiles: ["src/adapters/sqlite/sqlite-repositories.ts"], writePaths: ["src/adapters/sqlite/sqlite-repositories.ts"] } as const;
+    const investigated = await investigateWorkItem({ intent, cwd: process.cwd(), scopeHints }, { runtime, artifacts, runs });
+    const prepared = await prepareBuildPacket({
+      run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), baseSha: "f".repeat(40), scopeHints,
+    }, { runtime, artifacts, runs });
+    assert.equal(prepared.run.state, "building");
+    assert.deepEqual(prepared.packet.payload.evidencePaths?.map(({ path }) => path), ["FORGE.md"]);
+  });
+
   it("canonicalizes typed verification requirements against the controller catalog", async () => {
     const runtime = new FakeAgentRuntime([
       investigation,
