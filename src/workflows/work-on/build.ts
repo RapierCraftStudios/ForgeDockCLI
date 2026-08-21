@@ -33,7 +33,18 @@ export const VerificationDiagnosisSchema = Type.Object({
     evidence: Type.String({ minLength: 1, maxLength: 1_500 }),
   }), { minItems: 1, maxItems: 4 }),
   reproducer: Type.String({ minLength: 1, maxLength: 1_500 }),
-  failureSignatureMapping: Type.String({ minLength: 1, maxLength: 2_000 }),
+  /**
+   * New diagnoses map bounded controller-issued signature IDs to explanations.
+   * Keep accepting the legacy prose form so retained checkpoints remain
+   * decodable; the controller validates either form against the exact IDs.
+   */
+  failureSignatureMapping: Type.Union([
+    Type.String({ minLength: 1, maxLength: 2_000 }),
+    Type.Array(Type.Object({
+      signatureId: Type.String({ pattern: "^sig-[0-9a-f]{16}$" }),
+      mapping: Type.String({ minLength: 1, maxLength: 600 }),
+    }), { minItems: 1, maxItems: 32 }),
+  ]),
   rejectedPreviousHypotheses: Type.Array(Type.String({ minLength: 1, maxLength: 600 }), { minItems: 1, maxItems: 4 }),
   minimalFixGuidance: Type.String({ minLength: 1, maxLength: 1_500 }),
 });
@@ -92,7 +103,9 @@ export async function buildWorkItem(
             `Root cause: ${input.verificationDiagnosis.rootCause}`,
             `Source anchors:\n${input.verificationDiagnosis.sourceAnchors.map((anchor) => `${anchor.path} (${anchor.location}): ${anchor.evidence}`).join("\n")}`,
             `Reproducer: ${input.verificationDiagnosis.reproducer}`,
-            `Failure signature mapping: ${input.verificationDiagnosis.failureSignatureMapping}`,
+            `Failure signature mapping: ${typeof input.verificationDiagnosis.failureSignatureMapping === "string"
+              ? input.verificationDiagnosis.failureSignatureMapping
+              : input.verificationDiagnosis.failureSignatureMapping.map(({ signatureId, mapping }) => `${signatureId}: ${mapping}`).join("\n")}`,
             `Rejected previous hypotheses:\n${input.verificationDiagnosis.rejectedPreviousHypotheses.join("\n") || "(none)"}`,
             `Minimal fix guidance: ${input.verificationDiagnosis.minimalFixGuidance}`,
           ] : []),

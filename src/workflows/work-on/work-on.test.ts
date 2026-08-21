@@ -16,6 +16,7 @@ import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-t
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
+import { WorkflowExecutionError } from "./investigate.js";
 import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
@@ -1055,7 +1056,18 @@ describe("complete work-on trajectory", () => {
       const git = new DiagnosticGit();
       const host = new EndToEndHost();
       const verifier: VerificationRunner = { async run() { return [{ command: "npm", commandId: "test", status: "failed", failureClass: "timeout", failureSignatures: ["first"], durationMs: 10 }]; } };
-      await assert.rejects(() => workOn({ intent: createWorkOnIntent(`run_bad_diagnosis_${label}`), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host }));
+      let error: unknown;
+      try {
+        await workOn({ intent: createWorkOnIntent(`run_bad_diagnosis_${label}`), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
+        assert.fail("expected diagnosis validation to reject");
+      } catch (caught) {
+        error = caught;
+      }
+      assert.ok(error instanceof WorkflowExecutionError);
+      if (!(error instanceof WorkflowExecutionError)) throw new Error("expected WorkflowExecutionError");
+      assert.match(error.message, label === "malformed" ? /bounded schema|malformed|required properties/ : /outside packet read scope/);
+      assert.equal(error.run.state, "blocked");
+      assert.equal((await runs.history(`run_bad_diagnosis_${label}`)).some((record) => record.event === "FAIL"), false, "diagnosis reason must not be masked by a stale FAIL commit");
       assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 2);
       assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 1);
     }

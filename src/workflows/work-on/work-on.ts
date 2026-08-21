@@ -1388,6 +1388,20 @@ function checkSignature(check: CheckResult): string {
   ].join("|");
 }
 
+/**
+ * Diagnosis prompts must not require the model to reproduce an unbounded log
+ * signature verbatim. These IDs are deterministic, short, and still bound to
+ * the complete controller-canonical signature.
+ */
+function verificationSignatureId(signature: string): string {
+  return `sig-${createHash("sha256").update(signature).digest("hex").slice(0, 16)}`;
+}
+
+function diagnosisMappingIds(mapping: VerificationDiagnosis["failureSignatureMapping"]): Set<string> {
+  if (typeof mapping === "string") return new Set(mapping.match(/sig-[0-9a-f]{16}/g) ?? []);
+  return new Set(mapping.map(({ signatureId }) => signatureId));
+}
+
 function canonicalFailedCheckSignatures(
   outcome: DurableArtifact<"Outcome">,
   commands: readonly VerificationCommand[],
@@ -1449,8 +1463,19 @@ async function validateVerificationDiagnosis(
       throw new Error(`Verification diagnosis anchor is not a regular in-scope file: ${anchor.path} (${error instanceof Error ? error.message : String(error)})`);
     }
   }
-  if (!currentSignatures.length || currentSignatures.some((signature) => !diagnosis.failureSignatureMapping.includes(signature))) {
-    throw new Error("Verification diagnosis does not map every current failure signature");
+  const mappedIds = diagnosisMappingIds(diagnosis.failureSignatureMapping);
+  const legacyMapping = typeof diagnosis.failureSignatureMapping === "string"
+    ? diagnosis.failureSignatureMapping
+    : "";
+  const unmapped = currentSignatures.filter((signature) => {
+    const id = verificationSignatureId(signature);
+    // The legacy fallback is intentionally retained for durable diagnoses
+    // written before bounded IDs existed. New structured mappings use IDs.
+    return !mappedIds.has(id) && !legacyMapping.includes(signature);
+  });
+  if (!currentSignatures.length || unmapped.length) {
+    const missing = unmapped.map(verificationSignatureId).join(", ");
+    throw new Error(`Verification diagnosis does not map every current failure signature (missing IDs: ${missing || "none"})`);
   }
   return diagnosis;
 }
@@ -1484,7 +1509,8 @@ async function diagnoseVerificationTransition(
     instructions: [
       "This is a fresh read-only diagnostic session. Use only read, grep, find, ls, and the frozen verify tool; never edit, write, commit, or invoke GitHub.",
       "Inspect only packet expected paths, packet evidence paths, and packet metadata/read scope. Produce source-backed root cause evidence, not guesses.",
-      `The current failed-check/report signatures are:\n${currentSignatures.join("\n")}`,
+      `The current failed-check/report signature IDs (map every ID exactly in failureSignatureMapping) are:\n${currentSignatures.map(verificationSignatureId).join("\n")}`,
+      `Human-readable current failure signature context (do not copy this as the mapping key):\n${currentSignatures.join("\n")}`,
       `The prior failed-check/report signatures were:\n${canonicalFailedCheckSignatures(input.priorFailure, input.commands).join("\n") || "(none)"}`,
       `Current failure checks:\n${summarize(input.currentFailure)}`,
       `Prior failure checks:\n${summarize(input.priorFailure)}`,
@@ -1730,11 +1756,12 @@ async function verifyWithBuilderRepairs(
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
   };
-  while (true) {
-    const verified = await verifyAndCommit({
-      run,
-      packet: input.packet,
-      submission,
+  try {
+    while (true) {
+      const verified = await verifyAndCommit({
+        run,
+        packet: input.packet,
+        submission,
       workspace: input.workspace,
       commands: input.commands,
       ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
@@ -1823,6 +1850,23 @@ async function verifyWithBuilderRepairs(
     run = repaired.run;
     submission = repaired.submission;
     builderSessionRef = repaired.sessionRef;
+    }
+  } catch (error) {
+    // verifyAndCommit may have durably advanced the run before diagnosis or
+    // another repair-stage operation throws. Never let callers retain the
+    // stale run they passed into this helper.
+    const errorRun = error instanceof WorkflowExecutionError ? error.run : undefined;
+    const latestRun = errorRun && errorRun.version >= run.version ? errorRun : run;
+    if (error instanceof WorkflowExecutionError && errorRun === latestRun) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    const recoverable = error instanceof WorkflowExecutionError
+      ? error.recoverable
+      : isRecoverableAgentExecutionError(error);
+    throw new WorkflowExecutionError(reason, latestRun, {
+      cause: error,
+      recoverable,
+      ...(error instanceof WorkflowExecutionError ? { retryDisposition: error.retryDisposition } : {}),
+    });
   }
 }
 
