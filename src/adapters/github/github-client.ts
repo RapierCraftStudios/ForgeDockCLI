@@ -25,7 +25,7 @@ import type {
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository } from "../../core/ports/repositories.js";
 import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
-import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
+import { classifyRetryableError, deterministicOperationKey, retryBackoffMs } from "../../core/retry.js";
 import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
@@ -457,7 +457,8 @@ export class GitHubClient implements ForgeHost {
   constructor(
     readonly cwd = process.cwd(),
     readonly remediationAdmissions: RemediationAdmissionRepository & Partial<ReviewFindingPublicationFenceRepository> = new InMemoryRemediationAdmissionRepository(),
-    readonly refreshAuth?: () => Promise<boolean>,
+    readonly refreshAuth?: (signal?: AbortSignal) => Promise<boolean>,
+    readonly signal?: AbortSignal,
   ) {
     this.commandCwd = cwd;
   }
@@ -1388,10 +1389,20 @@ export class GitHubClient implements ForgeHost {
     if (!input.headBranch || !input.baseBranch || input.headBranch === input.baseBranch) {
       throw new Error("Promotion pull request requires distinct source and target branches");
     }
+    const operationInput = {
+      repo: input.repo,
+      headBranch: input.headBranch,
+      baseBranch: input.baseBranch,
+      title: input.title,
+      body: input.body,
+    };
+    const operationKey = deterministicOperationKey("github.pull-request.create", operationInput);
+    const operationMarker = `<!-- FORGEDOCK:PR-CREATE operation=${operationKey} -->`;
+    const requestBody = input.body.includes(operationMarker) ? input.body : `${input.body}\n\n${operationMarker}`;
     // PR creation is non-atomic with the response. Reconcile the exact branch
     // route before replaying, including after a lost response.
     const reconcile = async (): Promise<PullRequestSnapshot | undefined> => {
-      const candidate = await this.findOpenPromotionPullRequest(input.repo, input.headBranch, input.baseBranch);
+      const candidate = await this.findOpenPromotionPullRequest(input.repo, input.headBranch, input.baseBranch, operationMarker);
       if (!candidate) return undefined;
       if (candidate.headBranch !== input.headBranch || candidate.baseBranch !== input.baseBranch) {
         throw new Error(`Existing pull request route does not match ${input.headBranch} -> ${input.baseBranch}`);
@@ -1400,19 +1411,13 @@ export class GitHubClient implements ForgeHost {
     };
     return reconcileBeforeReplay({
       operation: "github.pull-request.create",
-      input: {
-        repo: input.repo,
-        headBranch: input.headBranch,
-        baseBranch: input.baseBranch,
-        title: input.title,
-        body: input.body,
-      },
+      input: operationInput,
       reconcile,
       mutate: async () => {
         const url = (await this.gh([
           "pr", "create", "--repo", input.repo, "--head", input.headBranch, "--base", input.baseBranch,
           "--title", input.title, "--body-file", "-",
-        ], input.body)).trim();
+        ], requestBody)).trim();
         if (!url) throw new Error("GitHub did not return a pull request URL");
         const number = Number(url.split("/").at(-1));
         if (!Number.isSafeInteger(number) || number < 1) throw new Error("GitHub returned an invalid pull request URL");
@@ -1706,7 +1711,7 @@ export class GitHubClient implements ForgeHost {
     }
   }
 
-  async findOpenPromotionPullRequest(repo: string, headBranch: string, baseBranch: string): Promise<PullRequestSnapshot | undefined> {
+  async findOpenPromotionPullRequest(repo: string, headBranch: string, baseBranch: string, operationMarker?: string): Promise<PullRequestSnapshot | undefined> {
     const result = await this.gh([
       "pr", "list", "--repo", repo, "--state", "open", "--head", headBranch, "--base", baseBranch,
       "--json", "number", "--limit", "10",
@@ -1715,7 +1720,8 @@ export class GitHubClient implements ForgeHost {
     for (const value of values) {
       if (value.number && Number.isSafeInteger(value.number)) {
         const pullRequest = await this.getPullRequest(repo, value.number);
-        if (pullRequest.state === "OPEN" && pullRequest.headBranch === headBranch && pullRequest.baseBranch === baseBranch) return pullRequest;
+        if (pullRequest.state === "OPEN" && pullRequest.headBranch === headBranch && pullRequest.baseBranch === baseBranch
+          && (operationMarker === undefined || pullRequest.body.includes(operationMarker))) return pullRequest;
       }
     }
     return undefined;
@@ -1989,14 +1995,18 @@ export class GitHubClient implements ForgeHost {
   private async gh(args: string[], input?: string): Promise<string> {
     const readOnly = isReadOnlyGhInvocation(args);
     const run = () => readOnly
-      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), { hostKey: "github.com", maxAttempts: MAX_READ_ATTEMPTS })
-      : this.runGh(args, input);
+      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), {
+          hostKey: "github.com",
+          maxAttempts: MAX_READ_ATTEMPTS,
+          ...(this.signal !== undefined ? { signal: this.signal } : {}),
+        })
+      : this.runGh(args, input, this.signal);
     try {
       return await run();
     } catch (error) {
       if (!readOnly || this.authRefreshAttempted || !isGitHubAuthenticationFailure(error)) throw error;
       this.authRefreshAttempted = true;
-      const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))();
+      const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))(this.signal);
       if (!refreshed) throw error;
       return run();
     }

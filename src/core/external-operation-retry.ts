@@ -174,6 +174,8 @@ export interface ExternalOperationRetryOptions {
   now?: () => number;
   /** Maximum shared gate delay, independent of per-call retry bounds. */
   maxGateDelayMs?: number;
+  /** Security ceiling for untrusted server cooldowns; defaults to fifteen minutes. */
+  maxRetryAfterMs?: number;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -214,10 +216,14 @@ export async function withExternalOperationRetry<T>(
       }
       const exponential = Math.min(maxDelayMs, baseDelayMs * (2 ** (attempt - 1)));
       const retryAfter = classification.retryAfterMs;
-      const bounded = retryAfter === undefined ? exponential : Math.min(maxDelayMs, Math.max(exponential, retryAfter));
-      if (options.hostKey !== undefined) setAdmission(options, retryAfter ?? bounded);
+      const retryAfterCeiling = options.maxRetryAfterMs ?? 15 * 60_000;
+      const boundedRetryAfter = retryAfter === undefined
+        ? undefined
+        : Math.min(retryAfterCeiling, Math.max(0, retryAfter));
+      const bounded = boundedRetryAfter === undefined ? exponential : Math.max(exponential, boundedRetryAfter);
+      if (options.hostKey !== undefined) setAdmission(options, boundedRetryAfter ?? bounded);
       const jitter = bounded * jitterRatio * ((random() * 2) - 1);
-      await sleep(Math.max(0, Math.min(maxDelayMs, bounded + jitter)), options.signal);
+      await sleep(Math.max(0, boundedRetryAfter ?? 0, bounded + jitter), options.signal);
     }
   }
   throw new Error("External operation retry loop terminated unexpectedly");
@@ -236,7 +242,7 @@ function setAdmission(options: ExternalOperationRetryOptions, delayMs: number): 
   const key = options.hostKey;
   if (key === undefined) return;
   const now = options.now ?? Date.now;
-  const bounded = Math.max(0, Math.min(options.maxGateDelayMs ?? 60_000, delayMs));
+  const bounded = Math.max(0, Math.min(options.maxGateDelayMs ?? 15 * 60_000, delayMs));
   const until = now() + bounded;
   externalAdmissionUntil.set(key, Math.max(externalAdmissionUntil.get(key) ?? 0, until));
 }

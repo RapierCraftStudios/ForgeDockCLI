@@ -62,7 +62,8 @@ export function classifyRetryableError(error: unknown, options: RetryClassifierO
   // A provider may lose the response after committing work. Session lineage is
   // the authority for resume; this is intentionally true even without a status.
   if (resumableSession && sessionRef !== undefined) retryable = true;
-  if (PERMANENT_WORDS.test(cause.message) && !(status !== undefined && (status >= 500 || RETRYABLE_STATUS.has(status)))) {
+  if (PERMANENT_WORDS.test(cause.message) && !externalRetryable
+    && !(status !== undefined && (status >= 500 || RETRYABLE_STATUS.has(status)))) {
     retryable = status === 401 && options.authenticationRefreshAvailable === true;
   }
 
@@ -84,6 +85,8 @@ export interface RetryBackoffOptions {
   maxMs?: number;
   jitterRatio?: number;
   retryAfterMs?: number;
+  /** Security ceiling for untrusted server cooldowns; defaults to fifteen minutes. */
+  maxRetryAfterMs?: number;
   operationKey?: string;
 }
 
@@ -93,16 +96,19 @@ export function retryBackoffMs(attempt: number, options: RetryBackoffOptions = {
   const base = options.baseMs ?? 250;
   const maximum = options.maxMs ?? 60_000;
   const ratio = options.jitterRatio ?? 0.2;
-  if (![base, maximum, ratio].every(Number.isFinite) || base < 0 || maximum < base || ratio < 0 || ratio > 1) {
+  const serverCeiling = options.maxRetryAfterMs ?? 15 * 60_000;
+  if (![base, maximum, ratio, serverCeiling].every(Number.isFinite)
+    || base < 0 || maximum < base || ratio < 0 || ratio > 1 || serverCeiling < 0) {
     throw new Error("invalid retry backoff options");
   }
-  const retryAfter = options.retryAfterMs;
+  const retryAfter = options.retryAfterMs === undefined ? 0 : Math.max(0, options.retryAfterMs);
+  const serverDelay = Math.min(serverCeiling, retryAfter);
   const exponential = Math.min(maximum, base * 2 ** Math.min(attempt - 1, 30));
-  const serverDelay = retryAfter === undefined ? 0 : Math.max(0, retryAfter);
   const floor = Math.max(exponential, serverDelay);
+  const upperBound = Math.max(maximum, serverDelay);
   const seed = options.operationKey === undefined ? 0.5 : deterministicUnit(`${options.operationKey}\n${attempt}`);
   const jitter = 1 - ratio + seed * 2 * ratio;
-  return Math.min(maximum, Math.max(serverDelay, Math.round(floor * jitter)));
+  return Math.min(upperBound, Math.max(serverDelay, Math.round(floor * jitter)));
 }
 
 /** Stable key for an external mutation; use it in checkpoints and reconciliation. */

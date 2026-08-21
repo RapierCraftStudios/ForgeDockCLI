@@ -6,8 +6,8 @@ export interface AuthoritativeMutation<T> {
   operation: string;
   input: unknown;
   /** Read remote truth by deterministic identity, never by title alone. */
-  reconcile(): Promise<T | undefined>;
-  mutate(): Promise<T>;
+  reconcile(operationKey: string): Promise<T | undefined>;
+  mutate(operationKey: string): Promise<T>;
 }
 
 /**
@@ -17,12 +17,12 @@ export interface AuthoritativeMutation<T> {
  */
 export async function reconcileBeforeReplay<T>(mutation: AuthoritativeMutation<T>): Promise<T> {
   const operationKey = deterministicOperationKey(mutation.operation, mutation.input);
-  const existing = await mutation.reconcile();
+  const existing = await mutation.reconcile(operationKey);
   if (existing !== undefined) return existing;
   try {
-    return await mutation.mutate();
+    return await mutation.mutate(operationKey);
   } catch (error) {
-    const committed = await mutation.reconcile();
+    const committed = await mutation.reconcile(operationKey);
     if (committed !== undefined) return committed;
     throw error;
   }

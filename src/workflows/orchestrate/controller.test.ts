@@ -5,13 +5,14 @@ import type {
   OrchestrationExecutionClaim,
   OrchestrationRecord,
 } from "../../core/ports/orchestration.js";
-import { InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
+import { InMemoryArtifactRepository, InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
 import {
   OrchestrationController,
   type OrchestrationControllerDependencies,
   type OrchestrationWorkerContext,
   type OrchestrationWorkOnWorker,
 } from "./controller.js";
+import { ExternalOperationRetryError } from "../../core/external-operation-retry.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies, type ScheduledWorkItem } from "./scheduler.js";
 
 interface Deferred<T> {
@@ -93,6 +94,34 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, message: s
     await new Promise<void>((resolve) => setTimeout(resolve, 2));
   }
 }
+
+  it("durably redrives a pre-RunState external exhaustion without duplicate attempt identity", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    let launches = 0;
+    let finalCause: Error | undefined;
+    const service = controller(repository, async () => {
+      launches++;
+      if (launches === 1) {
+        finalCause = new Error("HTTP 503: unavailable");
+        throw new ExternalOperationRetryError("External operation failed after 3 attempts (http): HTTP 503: unavailable", {
+          attempts: 3,
+          failures: [finalCause, finalCause, finalCause],
+          classification: { kind: "http", status: 503 },
+          cause: finalCause,
+        });
+      }
+    }, { retryArtifacts: artifacts });
+    const result = await service.createAndRun({ repository: "owner/repo", maxParallel: 1, items: [item("one", 1)] });
+    const node = result.record.nodes[0]!;
+    assert.equal(launches, 2);
+    assert.equal(node.status, "completed");
+    assert.equal(node.attempts?.length, 2);
+    assert.notEqual(node.attempts?.[0]?.attemptId, node.attempts?.[1]?.attemptId);
+    assert.equal(node.attempts?.[0]?.error?.includes("HTTP 503: unavailable"), true);
+    assert.equal((await artifacts.list({ repo: "owner/repo", issue: 1 })).length, 1);
+    assert.equal(finalCause?.message, "HTTP 503: unavailable");
+  });
 
 describe("OrchestrationController", () => {
   it("persists and restores per-node repository identity, defaulting new legacy-shaped input", async () => {

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
+import { mkdtemp, chmod, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
@@ -49,6 +52,45 @@ describe("GitHub read retry boundary", () => {
 
     assert.deepEqual(await client.getRepository("a/b"), { repo: "a/b", defaultBranch: "main" });
     assert.equal(attempts, 2);
+  });
+
+  it("aborts during GitHub read backoff without another attempt", async () => {
+    const controller = new AbortController();
+    let attempts = 0;
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository(), undefined, controller.signal);
+    Object.defineProperty(client, "runGh", { value: async () => {
+      attempts += 1;
+      setTimeout(() => controller.abort(new Error("caller cancelled")), 5);
+      throw new Error("HTTP 503: unavailable");
+    } });
+    await assert.rejects(client.getRepository("a/b"), /caller cancelled/);
+    assert.equal(attempts, 1);
+  });
+
+  it("aborts an in-flight gh child process", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "forgedock-gh-"));
+    const executable = join(directory, process.platform === "win32" ? "gh.cmd" : "gh");
+    const previousPath = process.env.PATH;
+    try {
+      if (process.platform === "win32") {
+        await writeFile(executable, "@echo off\r\nping 127.0.0.1 -n 30 >NUL\r\n", "utf8");
+      } else {
+        await writeFile(executable, "#!/bin/sh\nsleep 30\n", "utf8");
+        await chmod(executable, 0o755);
+      }
+      process.env.PATH = `${directory}${process.platform === "win32" ? ";" : ":"}${previousPath ?? ""}`;
+      const controller = new AbortController();
+      const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository(), undefined, controller.signal);
+      const started = Date.now();
+      const pending = client.getRepository("a/b");
+      setTimeout(() => controller.abort(new Error("caller cancelled")), 50);
+      await assert.rejects(pending, /caller cancelled|aborted|AbortError/i);
+      assert.ok(Date.now() - started < 2_000);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("bounds retries for a persistently unavailable read", async () => {

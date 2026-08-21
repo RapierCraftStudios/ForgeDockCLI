@@ -569,7 +569,7 @@ async function workOn(
       ...(leaseWitness !== undefined ? { leaseWitness } : {}),
       ...(leaseError !== undefined ? { leaseError } : {}),
       runtime: readinessRuntime,
-      githubProbe: async () => await new GitHubClient(process.cwd()).getRepository(),
+      githubProbe: async () => await new GitHubClient(process.cwd(), undefined, undefined, signal).getRepository(),
     });
   } finally {
     await readinessRuntime.close();
@@ -577,7 +577,7 @@ async function workOn(
   if (!leaseWitness) throw new Error("Authenticated lease witness is required before work-on dispatch");
 
   process.stdout.write(`${renderHeader({ subtitle: through === "investigate" ? "work-on · investigation barrier" : "work-on · controlled delivery" })}\n\n`);
-  let github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd(), undefined, undefined, signal);
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
@@ -712,7 +712,7 @@ async function workOn(
   const store = new SqliteRepositories(join(process.cwd(), ".forgedock", "state.db"), { witness: leaseWitness });
   // All remediation callers in this controller share the durable admission
   // repository, including a later --resume invocation in another process.
-  github = new GitHubClient(process.cwd(), store);
+  github = new GitHubClient(process.cwd(), store, undefined, signal);
   authoritativeArtifacts = new GitHubArtifactRepository(github);
   const baseArtifacts = dryRun ? store : new CachedArtifactRepository(authoritativeArtifacts, store);
   const artifacts = activeObserver
@@ -1829,7 +1829,7 @@ async function promote(argv: string[], signal?: AbortSignal): Promise<void> {
       : "Feature promotion requires --from <milestone/branch> and configured feature_promotion_target (or --to)");
   }
   if (sourceBranch && targetBranch && sourceBranch === targetBranch) throw new Error("Promotion source and target branches must differ");
-  const host = new GitHubClient(process.cwd(), store);
+  const host = new GitHubClient(process.cwd(), store, undefined, signal);
   const repository = await host.getRepository(option(argv, "--repo"));
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(host), store);
   const targetForChecks = targetBranch ?? resumeRecord?.targetBranch;
@@ -1922,7 +1922,7 @@ async function reviewPr(argv: string[], signal?: AbortSignal): Promise<void> {
   const prArg = parseReviewPullRequestArgument(argv);
   if (!prArg || !/^\d+$/.test(prArg)) throw new Error("Usage: forgedock-next review-pr <pr-number> [--repo owner/repo] [--issue number]");
   process.stdout.write(`${renderHeader({ subtitle: "review-pr · fresh context · SHA anchored" })}\n\n`);
-  let github = new GitHubClient(process.cwd());
+  let github = new GitHubClient(process.cwd(), undefined, undefined, signal);
   const localRepository = await github.getRepository();
   const repo = option(argv, "--repo") ?? localRepository.repo;
   if (repo !== localRepository.repo) throw new Error(`Current checkout is ${localRepository.repo}; review workspace for ${repo} is unavailable here`);
@@ -1945,7 +1945,7 @@ async function reviewPr(argv: string[], signal?: AbortSignal): Promise<void> {
     join(process.cwd(), ".forgedock", "state.db"),
     reviewWitness ? { witness: reviewWitness } : {},
   );
-  github = new GitHubClient(process.cwd(), store);
+  github = new GitHubClient(process.cwd(), store, undefined, signal);
   const artifacts = new CachedArtifactRepository(new GitHubArtifactRepository(github), store);
   // Standalone review is advisory and read-only. Its operational state must not
   // replace the issue delivery controller's workflow-label projection.
@@ -2034,7 +2034,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
   const dispatchAuthorized = !argv.includes("--dry-run") && (dispatchMode === "authorized" || dispatchMode === "auto");
   if (dispatchAuthorized) checkoutRoot = resolveCheckoutContext(launchCwd, targetRepository).checkoutRoot;
   process.stdout.write(`${renderHeader({ subtitle: "orchestrate · dependencies · claims · bounded concurrency" })}\n\n`);
-  let github = new GitHubClient(checkoutRoot);
+  let github = new GitHubClient(checkoutRoot, undefined, undefined, signal);
   const provider = option(argv, "--provider");
   const model = option(argv, "--model");
   const thinkingOption = option(argv, "--thinking");
@@ -2226,7 +2226,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
   const { SqliteRepositories } = await import("../adapters/sqlite/sqlite-repositories.js");
   if (!orchestrationWitness) throw new Error(leaseWitnessRequirementMessage("before orchestrate dispatch", checkoutRoot));
   const store = new SqliteRepositories(join(checkoutRoot, ".forgedock", "state.db"), { witness: orchestrationWitness });
-  github = new GitHubClient(checkoutRoot, store);
+  github = new GitHubClient(checkoutRoot, store, undefined, signal);
   const runtime = createCliRuntime({
     ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
     ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
@@ -2689,7 +2689,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
         requireLeaseWitness: true,
         ...(witnessError !== undefined ? { leaseError: witnessError } : {}),
         runtime: genericRuntime,
-        githubProbe: async () => await new GitHubClient(process.cwd()).getRepository(),
+        githubProbe: async () => await new GitHubClient(process.cwd(), undefined, undefined, signal).getRepository(),
       });
     } finally {
       await genericRuntime.close();
@@ -2720,7 +2720,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
       ...(planningModel !== undefined ? { planningModel } : {}),
       ...(planningThinking !== undefined ? { planningThinking } : {}),
     }));
-    const github = new GitHubClient(process.cwd(), store);
+    const github = new GitHubClient(process.cwd(), store, undefined, signal);
     let checkout: Awaited<ReturnType<GitHubClient["getRepository"]>> | undefined;
     try {
       await assertDispatchReady({
