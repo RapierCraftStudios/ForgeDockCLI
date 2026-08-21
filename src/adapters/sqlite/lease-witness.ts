@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -261,7 +262,7 @@ export function bootstrapLocalLeaseWitness(
     if (process.platform !== "win32") chmodSync(paths.witnessDirectory, 0o700);
 
     const reference = localWitnessReference(paths);
-    writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    publishLocalWitnessReference(paths.configPath, reference);
     return localWitnessBootstrapResult(paths, false);
   } catch (error) {
     if (existsSync(temporaryDirectory)) rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -291,7 +292,7 @@ function recoverLocalLeaseWitness(paths: ReturnType<typeof localWitnessPaths>): 
   });
 
   const reference = localWitnessReference(paths);
-  writeFileSync(paths.configPath, `${JSON.stringify(reference, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  publishLocalWitnessReference(paths.configPath, reference);
   return localWitnessBootstrapResult(paths, true);
 }
 
@@ -344,6 +345,25 @@ function localWitnessBootstrapResult(
     privateKeyPath: paths.privateKeyPath,
     keyId: paths.keyId,
   };
+}
+
+function publishLocalWitnessReference(configPath: string, reference: LocalLeaseWitnessReference): void {
+  // A wx destination is visible before writeFileSync has finished. Write the
+  // complete reference under a unique name first, then create the checkout
+  // name with linkSync. linkSync is an atomic no-replace operation on the same
+  // filesystem, so readers see either no reference or a complete reference;
+  // an existing reference is never overwritten.
+  const temporaryPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(reference, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    linkSync(temporaryPath, configPath);
+  } finally {
+    if (existsSync(temporaryPath)) rmSync(temporaryPath, { force: true });
+  }
 }
 
 function retryLocalWitnessPublication(
