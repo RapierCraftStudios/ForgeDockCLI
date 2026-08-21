@@ -880,6 +880,20 @@ it("completes a 1,000-node mixed-route fleet with bounded recovery concurrency",
   assert.equal(attempts.size, 1_000);
 });
 
+it("uses durable target recovery attempt metadata across restart", async () => {
+  let calls = 0;
+  const result = await runSchedule([
+    { id: "resumed", issue: 1, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls += 1;
+    return calls === 1
+      ? { status: "target_recovery", attempt: 2, maxAttempts: 3 }
+      : { status: "target_recovery", attempt: 3, maxAttempts: 3 };
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.status.get("resumed"), "failed");
+});
+
 describe("worker leases", () => {
   it("prevents duplicate ownership and permits stale lease recovery", () => {
     const leases = new InMemoryLeaseRepository();

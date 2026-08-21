@@ -5,10 +5,12 @@ import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/po
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { VerificationRunner } from "../../core/ports/verification.js";
 import { attachArtifact, createRun, transition, type RunState } from "../../core/state/machine.js";
+import { reconcileLatestRunArtifacts } from "../../core/state/reconcile.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 import { resumeTargetAdvanceWorkOn } from "./work-on.js";
 import { WorkflowExecutionError } from "./investigate.js";
+import { terminalOrchestrationResult } from "../orchestrate/terminal-result.js";
 
 const sourceBase = "a".repeat(40);
 const targetBase = "b".repeat(40);
@@ -105,6 +107,15 @@ describe("direct target recovery integration", () => {
     assert.equal(checkpoint?.payload.sourceVerdictId, verdict.id);
     const wrongVerdict = createArtifact({ kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "reviewer" }, payload: { ...verdict.payload } }, { id: "wrong-verdict" });
     await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b, priorVerdict: wrongVerdict, workspace, verification: [command] }, deps(fixture).dependencies), /source verdict/);
+  });
+  it("propagates durable target checkpoint attempt bounds to terminal recovery", async () => {
+    const runId = "target-terminal-attempt";
+    const fixture = await targetRun(runId, intent(runId), investigation(runId), packet(runId), build(runId));
+    const reconciled = reconcileLatestRunArtifacts(await fixture.artifacts.list(subject));
+    const result = terminalOrchestrationResult(subject.issue, await fixture.artifacts.list(subject), reconciled);
+    assert.equal(result?.status, "target_recovery");
+    assert.equal(result?.attempt, fixture.checkpoint.payload.attempt.number);
+    assert.equal(result?.maxAttempts, fixture.checkpoint.payload.attempt.max);
   });
   it("persists a retry checkpoint and exposes its exact identity on target movement", async () => {
     const runId = "target-retry"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId); const fixture = await targetRun(runId, i, inv, p, b);

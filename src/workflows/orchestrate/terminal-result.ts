@@ -23,6 +23,7 @@ export function terminalOrchestrationResult(
         ? `durable target recovery checkpoint ${checkpoint.id} is resumable at ${checkpoint.payload.phase}/${checkpoint.payload.attempt.number}`
         : "durable target recovery checkpoint retained and resumable",
       ...(checkpoint ? { targetAdvanceCheckpointId: checkpoint.id } : {}),
+      ...(checkpoint ? { attempt: checkpoint.payload.attempt.number, maxAttempts: checkpoint.payload.attempt.max } : {}),
       retryable: true,
     };
   }

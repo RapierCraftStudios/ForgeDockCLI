@@ -360,7 +360,10 @@ export async function runSchedule(
   const running = new Map<string, Promise<void>>();
   const retryWakeups = new Map<string, Promise<void>>();
   const targetRecoveryWakeups = new Map<string, Promise<void>>();
+  const targetRecoveryWakeQueue: Array<{ itemId: string; at: number; resolve: () => void }> = [];
+  let targetRecoveryWakeTimer: ReturnType<typeof setTimeout> | undefined;
   const targetRecoveryAttempts = new Map<string, number>();
+  const targetRecoveryMaxAttempts = new Map<string, number>();
   let occupiedIssueSlots = 0;
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const queuedWaitReasonChanges = new Set<string>();
@@ -374,6 +377,25 @@ export async function runSchedule(
       ...(waitReasons.size ? { waitReasons: new Map(waitReasons) } : {}),
     });
   };
+  const armTargetRecoveryWakeTimer = (): void => {
+    if (targetRecoveryWakeTimer !== undefined) clearTimeout(targetRecoveryWakeTimer);
+    const first = targetRecoveryWakeQueue[0];
+    if (!first) {
+      targetRecoveryWakeTimer = undefined;
+      return;
+    }
+    targetRecoveryWakeTimer = setTimeout(() => {
+      targetRecoveryWakeTimer = undefined;
+      const now = Date.now();
+      while (targetRecoveryWakeQueue.length && targetRecoveryWakeQueue[0]!.at <= now) targetRecoveryWakeQueue.shift()?.resolve();
+      armTargetRecoveryWakeTimer();
+    }, Math.max(0, first.at - Date.now()));
+  };
+  const scheduleTargetRecoveryWake = (itemId: string, at: number): Promise<void> => new Promise<void>((resolve) => {
+    targetRecoveryWakeQueue.push({ itemId, at, resolve });
+    targetRecoveryWakeQueue.sort((left, right) => left.at - right.at);
+    armTargetRecoveryWakeTimer();
+  });
   const updateQueuedWaitReason = (itemId: string, next: WaitReason | undefined, announce = true): void => {
     const previous = waitReasons.get(itemId);
     if (sameWaitReason(previous, next)) return;
@@ -552,9 +574,13 @@ export async function runSchedule(
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
           if (outcome.status === "target_recovery") {
-            const attempt = (targetRecoveryAttempts.get(item.id) ?? 0) + 1;
+            const legacyAttempt = (targetRecoveryAttempts.get(item.id) ?? 0) + 1;
+            const attempt = outcome.attempt ?? legacyAttempt;
             targetRecoveryAttempts.set(item.id, attempt);
-            const maxAttempts = outcome.maxAttempts ?? 3;
+            const maxAttempts = outcome.maxAttempts
+              ?? targetRecoveryMaxAttempts.get(item.id)
+              ?? 3;
+            targetRecoveryMaxAttempts.set(item.id, maxAttempts);
             status.set(item.id, "target_recovery");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             const nextAttemptAt = outcome.nextAttemptAt
@@ -576,8 +602,7 @@ export async function runSchedule(
               // through a timer before re-admitting the same node so repeated
               // target movement cannot spin a hot synchronous loop.
               queuedCount++;
-              const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
-              const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+              const wake = scheduleTargetRecoveryWake(item.id, Date.parse(nextAttemptAt)).then(() => {
                 targetRecoveryWakeups.delete(item.id);
                 if (status.get(item.id) !== "target_recovery") return;
                 status.set(item.id, "queued");
