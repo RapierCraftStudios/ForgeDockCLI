@@ -140,6 +140,37 @@ describe("Build Packet preparation", () => {
     }
   });
 
+  it("rejects evidence whose individually valid files exceed the aggregate byte bound", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-byte-bound-"));
+    try {
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      const names = ["one.mjs", "two.mjs", "three.mjs", "four.mjs", "five.mjs"];
+      for (const name of names) await writeFile(join(cwd, "scripts", name), "x".repeat(1_000_000));
+      const evidenceInvestigation: InvestigationPayload = {
+        ...investigation,
+        affectedSurfaces: [],
+        evidence: [{ claim: "Generated sources", source: "No concrete repository location", detail: "Generated source" }],
+      };
+      const evidencePacket: BuildPacketPayload = {
+        ...packet,
+        expectedPaths: ["src/fix.ts"],
+        evidencePaths: names.map((name) => ({ path: `scripts/${name}`, criterionIds: ["criterion-1"], role: "generated" as const })),
+      };
+      const runtime = new FakeAgentRuntime([evidenceInvestigation, evidencePacket, evidencePacket]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_evidence_byte_bound", subject: { repo: "arbitrary/repository", issue: 405 }, producer: { role: "controller" },
+        payload: { title: "Evidence bytes", problem: "Bound read authority", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs }), /evidence-byte-limit/);
+      assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("binds production packet relation authority to the exact frozen workspace base", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-packet-base-"));
     const baseSha = "f".repeat(40);

@@ -32,7 +32,7 @@ import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
-import { closeExpectedWriteScope, resolveInvestigationEvidenceSources, validateFrozenReadOnlyFile } from "./scope-closure.js";
+import { closeExpectedWriteScope, INVESTIGATION_EVIDENCE_LIMITS, resolveInvestigationEvidenceSources, validateFrozenReadOnlyFile } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
 import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
 import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters/repository/index.js";
@@ -416,11 +416,25 @@ async function materializePacketOutput(
   const canonicalEvidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
   const validEvidence: EvidencePathDeclaration[] = [];
   const evidenceDiagnostics = [...canonicalEvidence.diagnostics];
+  const validatedEvidencePaths = new Set<string>();
+  let evidenceBytes = 0;
   for (const declaration of canonicalEvidence.declarations) {
+    if (!validatedEvidencePaths.has(declaration.path) && validatedEvidencePaths.size >= INVESTIGATION_EVIDENCE_LIMITS.maxFiles) {
+      evidenceDiagnostics.push(`[evidence-file-limit] Evidence paths are bounded to ${INVESTIGATION_EVIDENCE_LIMITS.maxFiles} files`);
+      continue;
+    }
     const size = await validateFrozenReadOnlyFile(declaration.path, cwd, packetAuthorReadRoots);
     if (size === undefined) {
       evidenceDiagnostics.push(`[evidence-file] Evidence path '${declaration.path}' is not a safe regular file inside the frozen packet-author read scope`);
       continue;
+    }
+    if (evidenceBytes + (validatedEvidencePaths.has(declaration.path) ? 0 : size) > INVESTIGATION_EVIDENCE_LIMITS.maxTotalBytes) {
+      evidenceDiagnostics.push(`[evidence-byte-limit] Evidence paths exceed the ${INVESTIGATION_EVIDENCE_LIMITS.maxTotalBytes}-byte frozen read bound at '${declaration.path}'`);
+      continue;
+    }
+    if (!validatedEvidencePaths.has(declaration.path)) {
+      evidenceBytes += size;
+      validatedEvidencePaths.add(declaration.path);
     }
     validEvidence.push(declaration);
   }
