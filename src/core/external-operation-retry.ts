@@ -208,7 +208,7 @@ export async function withExternalOperationRetry<T>(
       failures.push(error);
       if (attempt >= maxAttempts) {
         throw new ExternalOperationRetryError(
-          `External operation failed after ${attempt} attempt${attempt === 1 ? "" : "s"} (${classification.kind})`,
+          `External operation failed after ${attempt} attempt${attempt === 1 ? "" : "s"} (${classification.kind}): ${boundedErrorMessage(error)}`,
           { attempts: attempt, failures, classification, cause: error },
         );
       }
@@ -332,8 +332,14 @@ function classifyOne(error: unknown): ExternalFaultClassification | undefined {
   if (/\bECONNRESET\b|socket hang up|connection reset/i.test(message)) return { kind: "connection-reset" };
   if (/\bECONNREFUSED\b|connection refused/i.test(message)) return { kind: "connection-refused" };
   if (/\b(?:TLS|SSL|CERT_HAS_EXPIRED|certificate)\b/i.test(message)) return { kind: "tls" };
+  if (/error connecting to api\.github\.com[\s\S]*check your internet connection/i.test(message)) return { kind: "network" };
   if (/\b(?:fetch failed|network error|network is unreachable|socket|connectivity)\b/i.test(message)) return { kind: "network" };
   return undefined;
+}
+
+function boundedErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 2_000 ? `${message.slice(0, 1_997)}...` : message;
 }
 
 function isRetryableHttpStatus(status: number): boolean {

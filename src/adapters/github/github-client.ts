@@ -1989,7 +1989,7 @@ export class GitHubClient implements ForgeHost {
   private async gh(args: string[], input?: string): Promise<string> {
     const readOnly = isReadOnlyGhInvocation(args);
     const run = () => readOnly
-      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), { hostKey: "github.com" })
+      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), { hostKey: "github.com", maxAttempts: MAX_READ_ATTEMPTS })
       : this.runGh(args, input);
     try {
       return await run();

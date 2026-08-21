@@ -101,6 +101,26 @@ describe("external-operation retry", () => {
     clearExternalOperationAdmission("test-host");
   });
 
+  it("classifies GitHub's exact connectivity guidance as transient network", () => {
+    assert.deepEqual(
+      classifyExternalFault(new Error("error connecting to api.github.com\\ncheck your internet connection or try again")),
+      { kind: "network" },
+    );
+  });
+
+  it("keeps the bounded final cause in exhaustion messages and cause chain", async () => {
+    const final = new Error("HTTP 503: unavailable");
+    await assert.rejects(
+      withExternalOperationRetry(async () => { throw final; }, { maxAttempts: 3, jitterRatio: 0, sleep: async () => {} }),
+      (error: unknown) => {
+        assert.ok(error instanceof ExternalOperationRetryError);
+        assert.match(error.message, /HTTP 503: unavailable/);
+        assert.equal(error.cause, final);
+        return true;
+      },
+    );
+  });
+
   it("keeps a typed wrapper's root cause", () => {
     const original = new Error("socket");
     const error = new ExternalOperationError("socket failed", { kind: "network" }, { cause: original });
