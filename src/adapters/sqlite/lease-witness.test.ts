@@ -44,7 +44,7 @@ interface ConcurrentChildHandle {
 function runConcurrentFirstUseChild(input: {
   checkout: string;
   localDataRoot: string;
-  barrier: string;
+  start: string;
   ready: string;
   role: ConcurrentChildRole;
   witnessDirectory: string;
@@ -105,7 +105,7 @@ function runConcurrentFirstUseChild(input: {
     syncBuiltinESMExports();
     const { createOrBootstrapLocalLeaseWitness } = await import(${JSON.stringify(moduleUrl)});
     writeFileSync(input.ready, "ready");
-    waitFor(input.barrier);
+    waitFor(input.start);
     try {
       const witness = createOrBootstrapLocalLeaseWitness(input.checkout, { localDataRoot: input.localDataRoot, environment: {} });
       const snapshot = witness.verify();
@@ -230,7 +230,8 @@ describe("retained lease checkpoint witness", () => {
     const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
     const checkout = join(root, "checkout");
     const localDataRoot = join(root, "local-data");
-    const barrier = join(root, "start");
+    const winnerStart = join(root, "winner-start");
+    const loserStart = join(root, "loser-start");
     const ready = [join(root, "ready-1"), join(root, "ready-2")];
     const winnerInstalled = join(root, "winner-installed");
     const winnerRelease = join(root, "winner-release");
@@ -239,14 +240,15 @@ describe("retained lease checkpoint witness", () => {
     const loserRace = join(root, "loser-race");
     mkdirSync(checkout);
     const canonicalCheckout = realpathSync.native(checkout);
-    const checkoutDigest = createHash("sha256").update(canonicalCheckout, "utf8").digest("hex");
+    const canonicalIdentity = process.platform === "win32" ? canonicalCheckout.toLowerCase() : canonicalCheckout;
+    const checkoutDigest = createHash("sha256").update(canonicalIdentity, "utf8").digest("hex");
     const witnessDirectory = join(localDataRoot, "ForgeDock", "lease-witnesses", checkoutDigest);
     const children: ConcurrentChildHandle[] = [];
     try {
       children.push(runConcurrentFirstUseChild({
         checkout,
         localDataRoot,
-        barrier,
+        start: winnerStart,
         ready: ready[0]!,
         role: "winner",
         witnessDirectory,
@@ -259,7 +261,7 @@ describe("retained lease checkpoint witness", () => {
       children.push(runConcurrentFirstUseChild({
         checkout,
         localDataRoot,
-        barrier,
+        start: loserStart,
         ready: ready[1]!,
         role: "loser",
         witnessDirectory,
@@ -270,11 +272,16 @@ describe("retained lease checkpoint witness", () => {
         loserRace,
       }));
       await waitForFiles(ready, "concurrent witness children did not become ready");
-      writeFileSync(barrier, "start");
-      await waitForFiles(
-        [winnerInstalled, loserPreRename],
-        "concurrent witness children did not reach the role-aware rename handshake",
-      );
+
+      // Admit the loser first. It pauses inside the competing rename before
+      // the winner is admitted, making the pre-rename handshake deterministic.
+      writeFileSync(loserStart, "start");
+      await waitForFiles([loserPreRename], "loser did not reach the pre-rename handshake");
+
+      // Now admit the winner. It installs the directory and pauses before
+      // publishing the checkout reference.
+      writeFileSync(winnerStart, "start");
+      await waitForFiles([winnerInstalled], "winner did not install the witness directory");
 
       // Release the competing rename first. The winner remains paused after
       // directory publication, so this marker proves that the loser observed
@@ -323,7 +330,8 @@ describe("retained lease checkpoint witness", () => {
     } finally {
       // Always open the child gates before terminating children, including
       // assertion failures while the loser or winner is paused.
-      writeFileSync(barrier, "cleanup");
+      writeFileSync(loserStart, "cleanup");
+      writeFileSync(winnerStart, "cleanup");
       writeFileSync(loserRelease, "cleanup");
       writeFileSync(winnerRelease, "cleanup");
       for (const child of children) child.terminate();
