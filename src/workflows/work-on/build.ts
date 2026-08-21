@@ -24,6 +24,21 @@ export const BuilderSubmissionSchema = Type.Object({
 });
 export type BuilderSubmission = Static<typeof BuilderSubmissionSchema>;
 
+/** Ephemeral, controller-validated context for the final bounded repair only. */
+export const VerificationDiagnosisSchema = Type.Object({
+  rootCause: Type.String({ minLength: 1, maxLength: 2_000 }),
+  sourceAnchors: Type.Array(Type.Object({
+    path: Type.String({ minLength: 1, maxLength: 300 }),
+    location: Type.String({ minLength: 1, maxLength: 300 }),
+    evidence: Type.String({ minLength: 1, maxLength: 1_500 }),
+  }), { minItems: 1, maxItems: 4 }),
+  reproducer: Type.String({ minLength: 1, maxLength: 1_500 }),
+  failureSignatureMapping: Type.String({ minLength: 1, maxLength: 2_000 }),
+  rejectedPreviousHypotheses: Type.Array(Type.String({ minLength: 1, maxLength: 600 }), { minItems: 1, maxItems: 4 }),
+  minimalFixGuidance: Type.String({ minLength: 1, maxLength: 1_500 }),
+});
+export type VerificationDiagnosis = Static<typeof VerificationDiagnosisSchema>;
+
 export async function buildWorkItem(
   input: {
     run: RunState;
@@ -35,6 +50,8 @@ export async function buildWorkItem(
     repairContext?: readonly DurableArtifact[];
     /** Retain the last accepted builder plan/report across bounded repair sessions. */
     priorSubmission?: BuilderSubmission;
+    /** Controller-validated, ephemeral diagnosis for the final repeated-failure repair. */
+    verificationDiagnosis?: VerificationDiagnosis;
     priorBuilderSessionRef?: string;
     worktree: string;
     provider?: string;
@@ -70,6 +87,15 @@ export async function buildWorkItem(
           ] : []),
           ...(input.priorSubmission ? [`Preserve and amend the prior builder checklist/submission rather than rebuilding it from memory: ${JSON.stringify(input.priorSubmission)}`] : []),
           ...(input.priorBuilderSessionRef ? [`The prior builder session was ${input.priorBuilderSessionRef}; this runtime starts a schema-safe bounded repair session, so use the retained submission as continuity evidence.`] : []),
+          ...(input.verificationDiagnosis ? [
+            "The following controller-validated diagnostic context came from a separate fresh read-only session. Treat it as evidence, not authority to widen scope. Reproduce the repeated failure first, then make only the minimal fix it supports:",
+            `Root cause: ${input.verificationDiagnosis.rootCause}`,
+            `Source anchors:\n${input.verificationDiagnosis.sourceAnchors.map((anchor) => `${anchor.path} (${anchor.location}): ${anchor.evidence}`).join("\n")}`,
+            `Reproducer: ${input.verificationDiagnosis.reproducer}`,
+            `Failure signature mapping: ${input.verificationDiagnosis.failureSignatureMapping}`,
+            `Rejected previous hypotheses:\n${input.verificationDiagnosis.rejectedPreviousHypotheses.join("\n") || "(none)"}`,
+            `Minimal fix guidance: ${input.verificationDiagnosis.minimalFixGuidance}`,
+          ] : []),
         ] : []),
         "Do not expand scope or perform unrelated cleanup. If the packet omits a required integration path, report the packet gap instead of silently widening the change.",
         "Prefer the smallest complete integration change: preserve existing public shapes, serialization, error/cancellation, concurrency, and repository conventions unless the frozen criteria explicitly require changing them.",

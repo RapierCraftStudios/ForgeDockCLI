@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { Check } from "typebox/value";
 import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host.js";
@@ -16,9 +17,9 @@ import {
 } from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
-import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
+import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestForBuildPacket, STANDARD_SCOPE_METADATA_ROOTS } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
-import { buildWorkItem, type BuilderSubmission } from "./build.js";
+import { buildWorkItem, type BuilderSubmission, VerificationDiagnosisSchema, type VerificationDiagnosis } from "./build.js";
 import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 import {
   deterministicOutcomeId,
@@ -45,6 +46,7 @@ import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, ru
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint, TARGET_RECOVERY_MAX_ATTEMPTS } from "./target-recovery.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
+import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export { repositoryPathFromLocation } from "../review-pr/scope.js";
 
@@ -1202,6 +1204,7 @@ async function appendVerificationRepairCheckpoint(
   failure: DurableArtifact<"Outcome">,
   repairAttempt: number,
   dependencies: Pick<WorkOnDependencies, "artifacts">,
+  diagnosis?: VerificationDiagnosis,
 ): Promise<{ run: RunState; outcome: DurableArtifact<"Outcome"> }> {
   const failureEvidence = failure.payload.failureEvidence;
   if (!failureEvidence) throw new Error("Verification repair requires durable failure evidence");
@@ -1217,7 +1220,20 @@ async function appendVerificationRepairCheckpoint(
       ...(run.promotionTarget ? { promotionTarget: run.promotionTarget } : {}),
       ...(run.productionTarget ? { productionTarget: run.productionTarget } : {}),
       childIssues: [],
-      failureEvidence: { ...failureEvidence, repairAttempt },
+      failureEvidence: {
+        ...failureEvidence,
+        repairAttempt,
+        ...(diagnosis ? {
+          diagnostics: [
+            ...(failureEvidence.diagnostics ?? []),
+            {
+              code: "verification-diagnosis",
+              message: "Controller-validated ephemeral diagnosis for the repeated verification failure",
+              details: { diagnosis },
+            },
+          ],
+        } : {}),
+      },
     },
   }, {
     id: deterministicOutcomeId(
@@ -1228,6 +1244,135 @@ async function appendVerificationRepairCheckpoint(
   });
   await dependencies.artifacts.append(outcome);
   return { run: attachArtifact(run, "Outcome", outcome.id), outcome };
+}
+
+
+function diagnosisFromOutcome(outcome: DurableArtifact<"Outcome"> | undefined): VerificationDiagnosis | undefined {
+  const diagnostic = outcome?.payload.failureEvidence?.diagnostics?.find(({ code }) => code === "verification-diagnosis");
+  if (!diagnostic) return undefined;
+  const details = diagnostic.details;
+  const candidate = details && typeof details === "object" && !Array.isArray(details)
+    ? (details as { diagnosis?: unknown }).diagnosis
+    : undefined;
+  if (candidate === undefined) throw new Error("Persisted verification diagnosis is missing");
+  if (!Check(VerificationDiagnosisSchema, candidate)) throw new Error("Persisted verification diagnosis is malformed");
+  return candidate as VerificationDiagnosis;
+}
+
+function checkSignature(check: CheckResult): string {
+  return [
+    check.commandId ?? check.command,
+    check.status,
+    check.failureClass ?? "",
+    check.exitCode === undefined ? "" : String(check.exitCode),
+    [...(check.failureSignatures ?? [])].sort().join(","),
+  ].join("|");
+}
+
+function canonicalFailedRequiredCheckSignatures(
+  outcome: DurableArtifact<"Outcome">,
+  commands: readonly VerificationCommand[],
+): string[] {
+  const required = commands.filter((command) => command.required);
+  const requiredIds = new Set(required.map((command) => command.id));
+  const requiredCommands = new Set(required.map((command) => command.command));
+  const signatures = (outcome.payload.failureEvidence?.checks ?? [])
+    .filter((check) => check.status !== "passed" && (check.failureSignatures?.length || check.failureClass !== undefined)
+      && (check.commandId !== undefined
+        ? requiredIds.has(check.commandId)
+        : requiredCommands.has(check.command)))
+    .map(checkSignature);
+  if (signatures.length) return [...new Set(signatures)].sort();
+  if ((outcome.payload.failureEvidence?.checks ?? []).length > 0) return [];
+  const evidence = outcome.payload.failureEvidence;
+  const reportOnly = [evidence?.failureKind ?? "", ...(evidence?.diagnostics ?? []).map(({ code }) => code)].filter(Boolean);
+  return [...new Set(reportOnly)].sort();
+}
+
+function diagnosisScope(packet: DurableArtifact<"BuildPacket">) {
+  const scope = scopeManifestForBuildPacket(
+    packet.payload.expectedPaths,
+    (packet.payload.evidencePaths ?? []).map(({ path }) => path),
+  );
+  return { readRoots: scope.readRoots, writeRoots: [], source: scope.source } as const;
+}
+
+function validateVerificationDiagnosis(
+  diagnosis: VerificationDiagnosis,
+  packet: DurableArtifact<"BuildPacket">,
+  repeatedSignatures: readonly string[],
+): VerificationDiagnosis {
+  if (!Check(VerificationDiagnosisSchema, diagnosis)) throw new Error("Verification diagnosis failed its bounded schema");
+  const scope = diagnosisScope(packet);
+  const allowed = new Set([
+    ...canonicalizeConcreteScopePaths(packet.payload.expectedPaths),
+    ...canonicalizeConcreteScopePaths((packet.payload.evidencePaths ?? []).map(({ path }) => path)),
+    ...STANDARD_SCOPE_METADATA_ROOTS,
+  ]);
+  for (const anchor of diagnosis.sourceAnchors) {
+    if (!isConcreteScopePath(anchor.path) || canonicalizeConcreteScopePaths([anchor.path])[0] !== anchor.path) {
+      throw new Error(`Verification diagnosis anchor is not a canonical concrete path: ${anchor.path}`);
+    }
+    const inReadRoot = scope.readRoots.some((root) => anchor.path === root || anchor.path.startsWith(`${root}/`));
+    if (!allowed.has(anchor.path) && !inReadRoot) throw new Error(`Verification diagnosis anchor is outside packet read scope: ${anchor.path}`);
+  }
+  if (!repeatedSignatures.length || repeatedSignatures.some((signature) => !diagnosis.failureSignatureMapping.includes(signature))) {
+    throw new Error("Verification diagnosis does not map every repeated failure signature");
+  }
+  return diagnosis;
+}
+
+async function diagnoseRepeatedVerificationFailure(
+  input: {
+    run: RunState;
+    intent: DurableArtifact<"Intent">;
+    investigation: DurableArtifact<"Investigation">;
+    packet: DurableArtifact<"BuildPacket">;
+    workspace: GitWorkspace;
+    currentFailure: DurableArtifact<"Outcome">;
+    priorFailure: DurableArtifact<"Outcome">;
+    submission: BuilderSubmission;
+    repairContext?: readonly DurableArtifact[];
+    commands: readonly VerificationCommand[];
+    provider?: string;
+    model?: string;
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+  repeatedSignatures: readonly string[],
+): Promise<VerificationDiagnosis> {
+  const summarize = (failure: DurableArtifact<"Outcome">) => (failure.payload.failureEvidence?.checks ?? [])
+    .map((check) => `${check.commandId ?? check.command}: ${check.status}; class=${check.failureClass ?? ""}; signatures=${(check.failureSignatures ?? []).join(",")}; summary=${check.summary ?? ""}`)
+    .join("\n");
+  const result = await dependencies.runtime.run<VerificationDiagnosis>({
+    id: `${input.run.runId}:verification-diagnosis:${input.run.attempt}`,
+    role: "investigator",
+    objective: "Diagnose one repeated controller verification failure without editing the workspace.",
+    instructions: [
+      "This is a fresh read-only diagnostic session. Use only read, grep, find, ls, and the frozen verify tool; never edit, write, commit, or invoke GitHub.",
+      "Inspect only packet expected paths, packet evidence paths, and packet metadata/read scope. Produce source-backed root cause evidence, not guesses.",
+      `The exact repeated failed-check signatures are:\n${repeatedSignatures.join("\n")}`,
+      `Current failure checks:\n${summarize(input.currentFailure)}`,
+      `Prior failure checks:\n${summarize(input.priorFailure)}`,
+      `Prior builder submission/hypotheses/diff evidence:\n${JSON.stringify(input.submission)}\n${JSON.stringify(input.priorFailure.payload.failureEvidence)}`,
+      ...(input.repairContext?.length ? [`Retained packet context:\n${JSON.stringify(input.repairContext)}`] : []),
+      "Explicitly reject previous builder hypotheses that the inspected source disproves. Explain how the reproducer maps to every exact repeated signature and give only minimal fix guidance; do not make the fix.",
+    ].join("\n"),
+    context: [input.intent, input.investigation, input.packet, ...(input.repairContext ?? []), input.priorFailure, input.currentFailure],
+    workspace: { cwd: input.workspace.path, mode: "read-only", scope: diagnosisScope(input.packet) },
+    tools: ["read", "grep", "find", "ls", "verify"],
+    verification: { commands: input.commands, runner: dependencies.verifier },
+    outputSchema: VerificationDiagnosisSchema,
+    executionBudget: WORK_ON_EXECUTION_BUDGETS.investigator,
+    modelPolicy: {
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
+    },
+  }, {
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
+  });
+  return validateVerificationDiagnosis(result.output, input.packet, repeatedSignatures);
 }
 
 export async function resumeBuildWorkOn(
@@ -1276,6 +1421,14 @@ export async function resumeBuildWorkOn(
   let retainWorkspaceForRecovery = false;
   try {
     let priorVerificationFailure = input.priorVerificationFailure;
+    let verificationDiagnosis = diagnosisFromOutcome(priorVerificationFailure);
+    if (verificationDiagnosis !== undefined && priorVerificationFailure !== undefined) {
+      verificationDiagnosis = validateVerificationDiagnosis(
+        verificationDiagnosis,
+        input.packet,
+        canonicalFailedRequiredCheckSignatures(priorVerificationFailure, input.verification.map((command) => ({ ...command, cwd: input.workspace.path }))),
+      );
+    }
     let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
     if (priorVerificationFailure) {
       const dispatchedAttempt = priorVerificationFailure.payload.failureEvidence?.repairAttempt;
@@ -1375,6 +1528,7 @@ export async function resumeBuildWorkOn(
       ...(executionBaseline !== undefined ? { baselineChecks: executionBaseline } : {}),
       run,
       priorVerificationRepairAttempts: repairAttempts,
+      ...(verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
       ...(priorVerificationFailure ? { priorVerificationFailure } : {}),
     }, dependencies);
     run = result.run;
@@ -1417,6 +1571,8 @@ async function verifyWithBuilderRepairs(
     builderSessionRef?: string;
     repairContext?: readonly DurableArtifact[];
     priorVerificationRepairAttempts?: number;
+    priorVerificationFailure?: DurableArtifact<"Outcome">;
+    verificationDiagnosis?: VerificationDiagnosis;
     workspace: GitWorkspace;
     commands: readonly VerificationCommand[];
     baselineChecks?: readonly CheckResult[];
@@ -1431,6 +1587,9 @@ async function verifyWithBuilderRepairs(
   let submission = input.submission;
   let builderSessionRef = input.builderSessionRef;
   let repairAttempts = input.priorVerificationRepairAttempts ?? 0;
+  let priorFailureForSignature = input.priorVerificationFailure;
+  let verificationDiagnosis = input.verificationDiagnosis;
+  let diagnosisAttempted = verificationDiagnosis !== undefined;
   const runtimeOptions = {
     ...(input.provider !== undefined ? { provider: input.provider } : {}),
     ...(input.model !== undefined ? { model: input.model } : {}),
@@ -1463,12 +1622,41 @@ async function verifyWithBuilderRepairs(
     }
 
     const nextRepairAttempt = repairAttempts + 1;
+    const repeatedSignatures = priorFailureForSignature
+      ? canonicalFailedRequiredCheckSignatures(verified.outcome!, input.commands)
+      : [];
+    const priorSignatures = priorFailureForSignature
+      ? canonicalFailedRequiredCheckSignatures(priorFailureForSignature, input.commands)
+      : [];
+    const repeatedFailure = repairAttempts === 1
+      && priorFailureForSignature !== undefined
+      && repeatedSignatures.length > 0
+      && repeatedSignatures.length === priorSignatures.length
+      && repeatedSignatures.every((signature, index) => signature === priorSignatures[index]);
+    if (repeatedFailure && !diagnosisAttempted) {
+      diagnosisAttempted = true;
+      verificationDiagnosis = await diagnoseRepeatedVerificationFailure({
+        run,
+        intent: input.intent,
+        investigation: input.investigation,
+        packet: input.packet,
+        workspace: input.workspace,
+        currentFailure: verified.outcome!,
+        priorFailure: priorFailureForSignature!,
+        submission,
+        ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
+        commands: input.commands,
+        ...runtimeOptions,
+      }, dependencies, repeatedSignatures);
+    }
     const checkpoint = await appendVerificationRepairCheckpoint(
       run,
       verified.outcome!,
       nextRepairAttempt,
       dependencies,
+      repeatedFailure ? verificationDiagnosis : undefined,
     );
+    priorFailureForSignature = checkpoint.outcome;
     run = checkpoint.run;
     const repair = transition(run, "VERIFICATION_REPAIR_REQUESTED", {
       reason: `Repairing retained verification failure ${nextRepairAttempt} of ${MAX_VERIFICATION_REPAIR_ATTEMPTS}`,
@@ -1482,6 +1670,7 @@ async function verifyWithBuilderRepairs(
       investigation: input.investigation,
       packet: input.packet,
       priorVerificationFailure: checkpoint.outcome,
+      ...(repeatedFailure && verificationDiagnosis !== undefined ? { verificationDiagnosis } : {}),
       priorSubmission: submission,
       ...(builderSessionRef !== undefined ? { priorBuilderSessionRef: builderSessionRef } : {}),
       ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
@@ -1510,6 +1699,7 @@ async function continueBuildDelivery(
     scopeHints?: ScopeHints;
     priorVerificationFailure?: DurableArtifact<"Outcome">;
     priorVerificationRepairAttempts?: number;
+    verificationDiagnosis?: VerificationDiagnosis;
     repairContext?: readonly DurableArtifact[];
     workspace: GitWorkspace;
     baseBranch: string;
@@ -1552,6 +1742,7 @@ async function continueBuildDelivery(
     run, intent: input.intent, investigation: input.investigation, packet: input.packet,
     ...(input.scopeHints !== undefined ? { scopeHints: input.scopeHints } : {}),
     ...(input.priorVerificationFailure !== undefined ? { priorVerificationFailure: input.priorVerificationFailure } : {}),
+    ...(input.verificationDiagnosis !== undefined ? { verificationDiagnosis: input.verificationDiagnosis } : {}),
     ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
     worktree: input.workspace.path,
     verification: commands,
@@ -1573,6 +1764,8 @@ async function continueBuildDelivery(
     builderSessionRef: built.sessionRef,
     ...(input.repairContext !== undefined ? { repairContext: input.repairContext } : {}),
     priorVerificationRepairAttempts: input.priorVerificationRepairAttempts ?? 0,
+    ...(input.priorVerificationFailure !== undefined ? { priorVerificationFailure: input.priorVerificationFailure } : {}),
+    ...(input.verificationDiagnosis !== undefined ? { verificationDiagnosis: input.verificationDiagnosis } : {}),
     workspace: input.workspace,
     commands,
     ...(input.baselineChecks !== undefined ? { baselineChecks: input.baselineChecks } : {}),
