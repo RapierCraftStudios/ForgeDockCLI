@@ -420,7 +420,7 @@ async function materializePacketOutput(
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
     if (evidence.diagnostics.length) throw new PacketAuthorCorrectableError(evidence.diagnostics);
-    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths);
+    const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
     return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
@@ -468,7 +468,7 @@ async function materializePacketOutput(
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
     throw new PacketAuthorCorrectableError(diagnostics, semanticNeeded && !semanticAvailable);
   }
-  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths);
+  const graphAuthority = await deriveRelationGraphMetadata(expectedPaths, declaredPaths, controllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -490,6 +490,7 @@ async function deriveRelationGraphMetadata(
   evidenceContract: BuildPacketPayload["evidenceContract"] | undefined,
   baseSha: string,
   finalExpectedPaths?: readonly string[],
+  finalEvidencePaths: readonly string[] = [],
 ): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
   const seeds = [...new Set([...issuePaths, ...controllerPaths])].map((path) => ({
     path,
@@ -526,13 +527,18 @@ async function deriveRelationGraphMetadata(
   if (writablePaths.some((path) => !closure.writablePaths.includes(path))) {
     throw new PacketAuthorCorrectableError(["[graph-closure] Packet writable paths exceed the authoritative relation closure"]);
   }
+  const missingEvidence = finalEvidencePaths.filter((path) => !availableFiles.has(path));
+  if (missingEvidence.length) {
+    throw new PacketAuthorCorrectableError([`[graph-evidence] Packet evidence paths lack authoritative repository bytes: ${missingEvidence.sort().join(", ")}`]);
+  }
+  const evidencePaths = [...new Set([...closure.evidencePaths, ...finalEvidencePaths])].sort();
   const commandIds = policyMetadata.verificationCommandIdentities?.map(({ id }) => id).sort() ?? closure.commandIds;
   const invariantIds = closure.invariantIds;
   const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
   const commandPlanDigest = graphCommandPlanDigest(policyMetadata);
   const evidenceContractDigest = graphEvidenceContractDigest(evidenceContract);
-  const closureDigest = digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths: closure.evidencePaths, invariantIds, commandIds });
-  const checkpoint = relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, invariantIds, commandIds, closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest });
+  const closureDigest = digestRelation({ graphDigest: graph.graphDigest, writablePaths, evidencePaths, invariantIds, commandIds });
+  const checkpoint = relationGraphCheckpointPayload({ graph, closure: { ...closure, writablePaths, evidencePaths, invariantIds, commandIds, closureDigest }, configDigest, commandPlanDigest, evidenceContractDigest });
   const checkpointId = checkpoint.checkpointId ?? relationGraphCheckpointId(checkpoint.checkpointDigest ?? "");
   const checkpointDigest = checkpoint.checkpointDigest ?? "";
   const metadata = {
@@ -546,7 +552,7 @@ async function deriveRelationGraphMetadata(
     checkpointId,
     checkpointDigest,
     writablePaths,
-    evidencePaths: closure.evidencePaths,
+    evidencePaths,
     invariantIds,
     commandIds,
   };

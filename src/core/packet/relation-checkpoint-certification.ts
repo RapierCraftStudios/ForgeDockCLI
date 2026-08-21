@@ -53,7 +53,7 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   const checkpointClosure = closeRelationGraph(graph);
   if (checkpointClosure.diagnostics.length) throw new Error(checkpointClosure.diagnostics.join("\n"));
   assertEqualPaths(checkpointClosure.writablePaths, checkpoint.writablePaths, "writable closure");
-  assertEqualPaths(checkpointClosure.evidencePaths, checkpoint.evidencePaths, "evidence closure");
+  assertAuthorizedSubset(checkpointClosure.evidencePaths, checkpoint.evidencePaths, "evidence closure");
   assertEqualPaths(checkpointClosure.invariantIds, checkpoint.invariantIds, "invariant closure");
   assertAuthorizedSubset(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
 
@@ -65,7 +65,7 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   const freshClosure = closeRelationGraph(fresh);
   if (freshClosure.diagnostics.length) throw new Error(freshClosure.diagnostics.join("\n"));
   assertEqualPaths(freshClosure.writablePaths, checkpoint.writablePaths, "fresh writable closure");
-  assertEqualPaths(freshClosure.evidencePaths, checkpoint.evidencePaths, "fresh evidence closure");
+  assertAuthorizedSubset(freshClosure.evidencePaths, checkpoint.evidencePaths, "fresh evidence closure");
   assertEqualPaths(freshClosure.invariantIds, checkpoint.invariantIds, "fresh invariant closure");
   assertAuthorizedSubset(freshClosure.commandIds, checkpoint.commandIds, "fresh command closure");
 

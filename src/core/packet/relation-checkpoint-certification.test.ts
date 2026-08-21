@@ -16,6 +16,7 @@ describe("relation checkpoint certification", () => {
     try {
       await writeFile(join(cwd, "src-a.ts"), "import './src-b.js';");
       await writeFile(join(cwd, "src-b.js"), "export const b = true;");
+      await writeFile(join(cwd, "evidence-only.ts"), "export const evidence = true;");
       const adapter = adapterForLanguage("typescript");
       const facts = [await adapter.inspect({ cwd, limits })];
       const seedNode = facts[0]!.nodes.find((node) => node.identity === "src-a.ts")!;
@@ -27,10 +28,12 @@ describe("relation checkpoint certification", () => {
         verificationCommandTargets: [{ id: "build", targets: [] }],
         verificationCommandIdentities: [{ id: "build", command: "npm", args: ["run", "build"], evidenceCapability: "generic" as const, identityDigest: digestRelation("npm run build") }],
       };
+      const authoritativeEvidencePaths = [...new Set([...closure.evidencePaths, "evidence-only.ts"])].sort();
       const authoritativeClosure = {
         ...closure,
+        evidencePaths: authoritativeEvidencePaths,
         commandIds: ["build"],
-        closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths: closure.writablePaths, evidencePaths: closure.evidencePaths, invariantIds: closure.invariantIds, commandIds: ["build"] }),
+        closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths: closure.writablePaths, evidencePaths: authoritativeEvidencePaths, invariantIds: closure.invariantIds, commandIds: ["build"] }),
       };
       const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
       const commandPlanDigest = graphCommandPlanDigest(commandPlan);
@@ -44,7 +47,8 @@ describe("relation checkpoint certification", () => {
           writablePaths: authoritativeClosure.writablePaths, evidencePaths: authoritativeClosure.evidencePaths,
           invariantIds: authoritativeClosure.invariantIds, commandIds: authoritativeClosure.commandIds,
         },
-        expectedPaths: authoritativeClosure.writablePaths, evidencePaths: [],
+        expectedPaths: authoritativeClosure.writablePaths,
+        evidencePaths: [{ path: "evidence-only.ts", criterionIds: ["criterion-1"], role: "source" as const }],
         ...commandPlan,
       };
       await certifyRelationGraphCheckpoint({ checkpoint, packet, cwd, baseSha: "a".repeat(40), adapters: [adapter] });

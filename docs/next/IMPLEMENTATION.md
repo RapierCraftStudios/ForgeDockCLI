@@ -23,6 +23,10 @@ implementation boundary, not live dogfood readiness; the certification ledger is
   normative source for protected evidence, identity, capabilities, events, leases,
   bundles, compatibility, and tamper-evidence limits. The current v2 artifacts are
   legacy-unverified and do not become protected evidence through documentation.
+- RelationGraph checkpoints currently run in shadow mode: they are persisted and
+  certified for diagnostics, but graph drift does not block delivery unless
+  `FORGEDOCK_STRICT_RELATION_CHECKPOINT=1`. Proven packet scope, command identities,
+  evidence contracts, content digests, and exact-SHA review/merge remain blocking.
 - No phase or release is called ready until its required tests and live
   certification evidence pass at one immutable candidate SHA.
 

@@ -713,19 +713,27 @@ async function assertPristineWorkspace(
   }
 }
 
-async function certifyPacketRelationAuthority(
+export async function certifyPacketRelationAuthority(
   packet: DurableArtifact<"BuildPacket">,
   cwd: string,
   baseSha: string,
   artifacts: ArtifactRepository,
 ): Promise<void> {
   if (!packet.payload.relationGraph) return;
-  const checkpoints = await artifacts.list(packet.subject, "RelationGraphCheckpoint");
-  const bound = checkpoints.find((artifact): artifact is DurableArtifact<"RelationGraphCheckpoint"> =>
-    artifact.kind === "RelationGraphCheckpoint" && artifact.id === packet.payload.relationGraph?.checkpointId
-      && artifact.payload.checkpointDigest === packet.payload.relationGraph?.checkpointDigest);
-  if (!bound) throw new Error("[graph-authority] Exact relation graph checkpoint is missing or tampered");
-  await certifyRelationGraphCheckpoint({ checkpoint: bound.payload, packet: packet.payload, cwd, baseSha });
+  try {
+    const checkpoints = await artifacts.list(packet.subject, "RelationGraphCheckpoint");
+    const bound = checkpoints.find((artifact): artifact is DurableArtifact<"RelationGraphCheckpoint"> =>
+      artifact.kind === "RelationGraphCheckpoint" && artifact.id === packet.payload.relationGraph?.checkpointId
+        && artifact.payload.checkpointDigest === packet.payload.relationGraph?.checkpointDigest);
+    if (!bound) throw new Error("[graph-authority] Exact relation graph checkpoint is missing or tampered");
+    await certifyRelationGraphCheckpoint({ checkpoint: bound.payload, packet: packet.payload, cwd, baseSha });
+  } catch (error) {
+    // Relation-graph certification is intentionally shadow-only until the
+    // production adapter matrix has completed its canary period. Existing
+    // packet scope, frozen command identities, evidence contracts, content
+    // digests and exact-SHA review/merge remain blocking authority.
+    if (process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT === "1") throw error;
+  }
 }
 
 function frozenPacketCommands(

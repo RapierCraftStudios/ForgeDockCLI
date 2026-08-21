@@ -16,7 +16,7 @@ import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-t
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import type { BuilderSubmission } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
-import { repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
+import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
@@ -33,6 +33,34 @@ describe("durable workspace identity", () => {
       true,
     );
     assert.equal(workspacePathsEquivalent("/tmp/work", "/tmp/WORK"), false);
+  });
+});
+
+describe("relation checkpoint rollout mode", () => {
+  it("keeps graph certification advisory by default and strict only when explicitly enabled", async () => {
+    const digest = "a".repeat(64);
+    const relationPacket = createArtifact({
+      kind: "BuildPacket", runId: "run_relation_shadow", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: {
+        ...packet,
+        relationGraph: {
+          version: "forgedock.relation-graph/v1", baseSha: sha, graphDigest: digest, configDigest: digest,
+          closureDigest: digest, commandPlanDigest: digest, evidenceContractDigest: digest,
+          checkpointId: `relation-graph:${digest}`, checkpointDigest: digest,
+          writablePaths: packet.expectedPaths, evidencePaths: [], invariantIds: [], commandIds: [],
+        },
+      },
+    });
+    const artifacts = new InMemoryArtifactRepository();
+    await assert.doesNotReject(certifyPacketRelationAuthority(relationPacket, process.cwd(), sha, artifacts));
+    const previous = process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+    process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = "1";
+    try {
+      await assert.rejects(certifyPacketRelationAuthority(relationPacket, process.cwd(), sha, artifacts), /checkpoint is missing/);
+    } finally {
+      if (previous === undefined) delete process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+      else process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = previous;
+    }
   });
 });
 
