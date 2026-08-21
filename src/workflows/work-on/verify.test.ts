@@ -477,7 +477,7 @@ describe("verification and commit barrier", () => {
     assert.equal(result.buildResult, undefined);
   });
 
-  it("rejects a remediation report that omits retained committed paths", async () => {
+  it("normalizes a remediation report that omits retained committed paths", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
@@ -494,9 +494,8 @@ describe("verification and commit barrier", () => {
       artifacts,
       runs,
     });
-    assert.equal(result.run.state, "blocked");
-    assert.match(result.outcome?.payload.reason ?? "", /delivery revision.*omitted docs\/contract\.md/i);
-    assert.equal(result.buildResult, undefined);
+    assert.equal(result.run.state, "publishing");
+    assert.deepEqual(result.buildResult?.payload.changedPaths, ["docs/contract.md", "src/a.ts"]);
   });
 
   it("blocks when verification mutates an allowed file after observing it", async () => {
@@ -769,7 +768,31 @@ describe("verification and commit barrier", () => {
     assert.deepEqual(result.outcome?.payload.failureEvidence?.checks, []);
   });
 
-  it("blocks an inaccurate builder change report before verification", async () => {
+  it("normalizes a builder report that omits controller-observed retained paths", async () => {
+    const runs = new InMemoryRunRepository();
+    const artifacts = new InMemoryArtifactRepository();
+    const run = await verifyingRun(runs);
+    const frozen = packet(run);
+    const controllerObservedPaths = ["src/tui/forgedock-extension.test.ts", "src/workflows/orchestrate/controller.ts"];
+    const result = await verifyAndCommit({
+      run,
+      packet: { ...frozen, payload: { ...frozen.payload, expectedPaths: controllerObservedPaths } },
+      // Reproduce #421: the builder reported only one path after the complete
+      // controller-observed revision was already present in the worktree.
+      submission: { ...submission, changedPaths: [controllerObservedPaths[0]!] },
+      workspace,
+      commands: [command],
+    }, {
+      verifier: new FakeVerifier([passed]),
+      git: new FakeGit(controllerObservedPaths),
+      artifacts,
+      runs,
+    });
+    assert.equal(result.run.state, "publishing");
+    assert.deepEqual(result.buildResult?.payload.changedPaths, controllerObservedPaths);
+  });
+
+  it("rejects a builder report that fabricates a changed path", async () => {
     const runs = new InMemoryRunRepository();
     const artifacts = new InMemoryArtifactRepository();
     const run = await verifyingRun(runs);
@@ -778,7 +801,7 @@ describe("verification and commit barrier", () => {
       verifier: new FakeVerifier([passed]), git: new FakeGit(["src/a.ts"]), artifacts, runs,
     });
     assert.equal(result.run.state, "blocked");
-    assert.match(result.outcome?.payload.reason ?? "", /change report does not match.*omitted src\/a\.ts.*reported unchanged src\/other\.ts/);
+    assert.match(result.outcome?.payload.reason ?? "", /change report does not match.*reported unchanged src\/other\.ts/);
     assert.equal(result.buildResult, undefined);
   });
 

@@ -167,7 +167,7 @@ export async function buildWorkItem(
         ] : []),
         "Before submitting, self-review the complete diff against every criterion and integration boundary: check callers, implementations, adapters, serialization, error/cancellation/concurrency paths, tests, and docs/configuration that the packet identifies. Do not mark a criterion covered from intent alone; cite concrete code, test, or verification evidence.",
         "Run the narrowest relevant frozen verification commands after editing, then re-read changed files for malformed edits, whitespace damage, and accidental mechanical churn.",
-        "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles; the controller rejects incomplete or mismatched path and criterion reports.",
+        "Report the complete delivery revision relative to its frozen base, including retained committed paths from earlier build or remediation cycles. The controller normalizes omitted paths to its scoped Git observation, but rejects fabricated reported paths.",
       ].join("\n"),
       context: [
         input.intent,

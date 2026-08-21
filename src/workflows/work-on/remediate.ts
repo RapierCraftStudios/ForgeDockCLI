@@ -69,8 +69,8 @@ export async function remediateReview(
         "Use the pure compute tool when an accepted criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, commit, push, merge, or alter workflow state.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns publication; your check result is feedback, not controller evidence.",
-        "Report the complete current delivery revision: carry forward prior Build Result paths and criterion evidence, then add or revise the paths and criteria changed by this remediation.",
-        "The controller rejects partial changed-path or criterion reports, re-runs every required verification command, and starts a fresh review at the new SHA.",
+        "Report the complete current delivery revision: carry forward prior Build Result paths and criterion evidence, then add or revise the paths and criteria changed by this remediation. The controller normalizes omitted in-scope paths to its scoped Git observation, but rejects fabricated reported paths.",
+        "The controller re-runs every required verification command and starts a fresh review at the new SHA.",
       ].join("\n"),
       context: [input.intent, input.investigation, input.packet, input.buildResult, input.verdict],
       workspace: {

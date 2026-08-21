@@ -198,13 +198,15 @@ export async function verifyAndCommit(
       invalidChangeReport = error instanceof Error ? error.message : String(error);
     }
     const observedPathSet = new Set(deliveryChangedPaths);
-    const reportedPathSet = new Set(reportedPaths);
-    const omittedFromReport = deliveryChangedPaths.filter((path) => !reportedPathSet.has(path));
     const notObserved = reportedPaths.filter((path) => !observedPathSet.has(path));
+    // Controller-observed Git paths are authoritative. A builder can omit a
+    // path while describing a complete revision (notably after remediation),
+    // so omissions are normalized to the observed set below rather than
+    // spending a repair attempt. A fabricated path remains fail-closed.
     const changeReportFailure = invalidChangeReport
       ? `Builder change report does not match the controller-observed delivery revision: ${invalidChangeReport}`
-      : omittedFromReport.length || notObserved.length
-        ? `Builder change report does not match the controller-observed delivery revision:${omittedFromReport.length ? ` omitted ${omittedFromReport.join(", ")}` : ""}${notObserved.length ? ` reported unchanged ${notObserved.join(", ")}` : ""}`
+      : notObserved.length
+        ? `Builder change report does not match the controller-observed delivery revision: reported unchanged ${notObserved.join(", ")}`
         : undefined;
 
     const frozenCriteria = input.packet.payload.acceptanceCriteria;
@@ -448,7 +450,6 @@ export async function verifyAndCommit(
     ).sort();
     const committedUnexpected = revisionChangedPaths.filter((path) => !expectedPaths.has(path));
     const committedPathSet = new Set(revisionChangedPaths);
-    const committedOmittedFromReport = revisionChangedPaths.filter((path) => !reportedPathSet.has(path));
     const committedNotObserved = reportedPaths.filter((path) => !committedPathSet.has(path));
     let committedWorktreeDigest: string;
     try {
@@ -466,8 +467,8 @@ export async function verifyAndCommit(
       );
     const committedRevisionFailure = committedUnexpected.length
       ? `Committed delivery revision contains paths outside the Build Packet: ${committedUnexpected.join(", ")}`
-      : committedOmittedFromReport.length || committedNotObserved.length
-        ? `Committed delivery revision does not match the controller-approved builder report:${committedOmittedFromReport.length ? ` omitted ${committedOmittedFromReport.join(", ")}` : ""}${committedNotObserved.length ? ` reported absent ${committedNotObserved.join(", ")}` : ""}`
+      : committedNotObserved.length
+        ? `Committed delivery revision contains fabricated builder paths: ${committedNotObserved.join(", ")}`
         : contentDigestAfter !== committedWorktreeDigest
           ? "Post-commit workspace content does not match the controller-verified delivery content"
           : !committedBlobsMatch
