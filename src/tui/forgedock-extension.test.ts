@@ -11,7 +11,7 @@ import { renderArtifactComment } from "../core/artifacts/codec.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
 import { DEFAULT_REMOTE_READ_CONCURRENCY } from "../core/concurrency.js";
-import { GitHubClient } from "../adapters/github/github-client.js";
+import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
 import type { OrchestrationRecord } from "../core/ports/orchestration.js";
 import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
@@ -72,6 +72,7 @@ function fakePi(
     orchestrationRepository: new InMemoryOrchestrationRepository(),
     orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
     dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: null,
   },
 ): FakePiState {
   const tools = new Map<string, ToolDefinition>();
@@ -218,6 +219,22 @@ function createGitCheckout(parent: string, name: string, remote: string): string
   execFileSync("git", ["init", "--quiet"], { cwd: checkout, stdio: "ignore" });
   execFileSync("git", ["remote", "add", "origin", remote], { cwd: checkout, stdio: "ignore" });
   return checkout;
+}
+
+interface TempWorkspaceFixture {
+  workspace: string;
+  root: string;
+  child: string;
+}
+
+/** A real workspace parent with two sibling checkouts and distinct GitHub identities. */
+function createTempWorkspaceFixture(): TempWorkspaceFixture {
+  const workspace = mkdtempSync(join(tmpdir(), "forgedock-orchestration-workspace-"));
+  return {
+    workspace,
+    root: createGitCheckout(workspace, "root", "https://github.com/a/b.git"),
+    child: createGitCheckout(workspace, "child", "https://github.com/c/d.git"),
+  };
 }
 
 test("commands lazily activate separate semantic native tools without loading Markdown specs", async () => {
@@ -984,7 +1001,166 @@ test("ForgeDock issue children receive only the typed mutation tool", async () =
   }
 });
 
+test("fresh non-root orchestration preserves repository transport and completion subjects", async () => {
+  const fixture = createTempWorkspaceFixture();
+  const nativeEntry = join(fixture.root, "controller.mjs");
+  writeFileSync(nativeEntry, "process.exit(0);\n");
+  const completionSubjects: Array<{ repo: string; issue?: number }> = [];
+  const originalList = (GitHubArtifactRepository.prototype as any).list;
+  const merged = createArtifact({
+    kind: "Outcome",
+    runId: "fresh-non-root-completion",
+    subject: { repo: "c/d", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "merged", reason: "Completed", finalSha: "a".repeat(40), targetBranch: "main", childIssues: [] },
+  });
+  (GitHubArtifactRepository.prototype as any).list = async function (subject: { repo: string; issue: number }) {
+    completionSubjects.push({ repo: subject.repo, issue: subject.issue });
+    return subject.repo.toLowerCase() === "c/d" ? [merged] : [];
+  };
+  const run = async (controllerEntryPath: string | null, native: boolean) => {
+    const state = fakePi(undefined, {
+      orchestrationRepository: new InMemoryOrchestrationRepository(),
+      orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+      dispatchReadinessCheck: async () => undefined,
+      controllerEntryPath,
+    });
+    const piRequests: any[] = [];
+    const originalEmit = state.pi.events.emit.bind(state.pi.events);
+    state.pi.events.emit = ((name: string, data: any) => {
+      originalEmit(name, data);
+      if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+        piRequests.push(data);
+        queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+          version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "fresh-non-root-pi" } },
+        }));
+      }
+    }) as typeof state.pi.events.emit;
+    const tool = state.tools.get("forgedock_orchestrate");
+    assert.ok(tool);
+    bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], repository: "c/d", noMilestone: true });
+    const beforeSubjects = completionSubjects.length;
+    const result = await tool.execute(`fresh-${native ? "native" : "pi"}`, {
+      issueNumbers: [7],
+      executionPlan: [{ issue: 7, title: "Child", summary: "Child work", dependsOn: [], claims: ["src/child"], labels: [], repository: "c/d" }],
+      confirmed: true,
+    }, undefined, undefined, { ...commandContext(), cwd: fixture.workspace, hasUI: false } as any);
+    assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
+    if (!native) {
+      assert.equal(piRequests.length, 1);
+      assert.equal(piRequests[0].params.cwd, fixture.child);
+      assert.match(piRequests[0].params.task, /"repo":"c\/d"/);
+      originalEmit("subagent:async-complete", { runId: "fresh-non-root-pi" });
+    }
+    for (let attempt = 0; attempt < 100 && completionSubjects.length === beforeSubjects; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(completionSubjects.length > beforeSubjects, "completion must inspect the child repository subject");
+    if (native) {
+      const tasks = state.tools.get("forgedock_tasks");
+      assert.ok(tasks);
+      const listed = await tasks.execute("fresh-native-list", { action: "list" }, undefined, undefined, { ...commandContext(), cwd: fixture.workspace } as any);
+      const records = (listed.details as { records: Array<{ args: string[]; cwd: string }> }).records;
+      const child = records.find((record) => record.args.includes("c/d"));
+      assert.ok(child);
+      assert.equal(child.cwd, fixture.child);
+      assert.equal(child.args[0], nativeEntry);
+    }
+    await shutdownFakePi(state, commandContext());
+  };
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  try {
+    process.env.FORGEDOCK_CONTROLLER_ENTRY = nativeEntry;
+    await run(null, false);
+    await run(nativeEntry, true);
+    const newSubjects = completionSubjects;
+    assert.ok(newSubjects.length >= 2);
+    assert.ok(newSubjects.every((subject) => subject.repo.toLowerCase() === "c/d"), "root subjects must never be used for child completion");
+    assert.equal(newSubjects.some((subject) => subject.repo.toLowerCase() === "a/b"), false);
+  } finally {
+    (GitHubArtifactRepository.prototype as any).list = originalList;
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+    rmSync(fixture.workspace, { recursive: true, force: true });
+  }
+});
+
+
+test("durable resume direct transport keeps its explicit controller entry", async () => {
+  const fixture = createTempWorkspaceFixture();
+  const entry = join(fixture.child, "resume-controller.mjs");
+  const ambientEntry = join(fixture.root, "ambient-controller.mjs");
+  writeFileSync(entry, "setTimeout(() => process.exit(0), 150);\n");
+  writeFileSync(ambientEntry, "process.exit(0);\n");
+  const repository = new InMemoryOrchestrationRepository();
+  const timestamp = new Date(0).toISOString();
+  await repository.createOrchestration({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "durable-explicit-entry",
+    repository: "c/d",
+    requestedIssueNumbers: [7],
+    issueNumbers: [7],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "failed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    nodes: [{
+      id: "issue-7", issue: 7, repository: "c/d", title: "Child", summary: "Child work",
+      priority: 1, dependencies: [], claims: [],
+      status: "failed", childRunIds: [], attempts: [], memberIssues: [7],
+    }],
+  });
+  const originalRepository = GitHubClient.prototype.getRepository;
+  const originalIssue = GitHubClient.prototype.getIssue;
+  const originalBranchHead = GitHubClient.prototype.getBranchHead;
+  const originalBranches = GitHubClient.prototype.listBranches;
+  GitHubClient.prototype.getRepository = (async () => ({ repo: "c/d", defaultBranch: "main" })) as typeof GitHubClient.prototype.getRepository;
+  GitHubClient.prototype.getIssue = (async (issue, repo) => ({
+    repo: repo ?? "c/d", number: issue, title: "Child", body: "Child work", url: `https://github.test/c/d/issues/${issue}`,
+    state: "OPEN" as const, labels: [], comments: [],
+  })) as typeof GitHubClient.prototype.getIssue;
+  GitHubClient.prototype.getBranchHead = (async () => "a".repeat(40)) as typeof GitHubClient.prototype.getBranchHead;
+  GitHubClient.prototype.listBranches = (async () => []) as typeof GitHubClient.prototype.listBranches;
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: entry,
+  });
+  const context = { ...commandContext(), cwd: fixture.workspace, mode: "rpc" } as any;
+  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  try {
+    process.env.FORGEDOCK_CONTROLLER_ENTRY = ambientEntry;
+    const resume = state.tools.get("forgedock_resume_orchestration");
+    assert.ok(resume);
+    await resume.execute("resume-explicit-entry", { orchestrationId: "durable-explicit-entry" }, undefined, undefined, context);
+    const tasks = state.tools.get("forgedock_tasks");
+    assert.ok(tasks);
+    let record: { args: string[]; cwd: string } | undefined;
+    for (let attempt = 0; attempt < 40 && !record; attempt++) {
+      const listed = await tasks.execute("resume-entry-list", { action: "list" }, undefined, undefined, context);
+      record = (listed.details as { records: Array<{ args: string[]; cwd: string }> }).records.find((candidate) => candidate.args[0] === entry);
+      if (!record) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(record);
+    assert.equal(record.cwd, fixture.child);
+    assert.ok(record.args.includes("c/d"));
+  } finally {
+    await shutdownFakePi(state, context);
+    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
+    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
+    GitHubClient.prototype.getRepository = originalRepository;
+    GitHubClient.prototype.getIssue = originalIssue;
+    GitHubClient.prototype.getBranchHead = originalBranchHead;
+    GitHubClient.prototype.listBranches = originalBranches;
+    rmSync(fixture.workspace, { recursive: true, force: true });
+  }
+});
+
+
 test("orchestrate starts only the live DAG ready set without static batch phases", async () => {
+  const fixture = createTempWorkspaceFixture();
   let readinessChecks = 0;
   const state = fakePi(undefined, {
     orchestrationRepository: new InMemoryOrchestrationRepository(),
@@ -1030,7 +1206,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
       maxRemediationChildren: 8,
       confirmed: true,
       workerModel: "openai-codex/gpt-worker",
-    }, undefined, undefined, commandContext() as any);
+    }, undefined, undefined, { ...commandContext(), cwd: fixture.root } as any);
     assert.match((result.content[0] as { text: string }).text, /started streaming DAG/);
     assert.match((result.content[0] as { text: string }).text, /Initial ready set: #7/);
     assert.match((result.content[0] as { text: string }).text, /DAG nodes: 2/);
@@ -1060,6 +1236,7 @@ test("orchestrate starts only the live DAG ready set without static batch phases
   assert.match(spawnRequest.params.task, /Implement the accepted bounded behavior/);
   assert.match(spawnRequest.params.task, /contact_supervisor/);
   await shutdownFakePi(state, commandContext());
+  rmSync(fixture.workspace, { recursive: true, force: true });
 });
 
 test("headless orchestration requires explicit dispatch authorization", async () => {
@@ -1145,6 +1322,7 @@ test("native promotion exposes an explicit mutation-aware entrypoint", async () 
 });
 
 test("orchestration preview exposes a single-use continuation checkpoint", async () => {
+  const fixture = createTempWorkspaceFixture();
   const state = fakePi();
   const spawnRequests: any[] = [];
   const originalEmit = state.pi.events.emit.bind(state.pi.events);
@@ -1167,7 +1345,7 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   const preview = await tool.execute("preview-checkpoint", {
     issueNumbers: [7],
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  }, undefined, undefined, { ...commandContext(), cwd: fixture.root, hasUI: false } as any);
   const previewDetails = preview.details as { previewToken?: string };
   assert.match(previewDetails.previewToken ?? "", /^[0-9a-f-]{36}$/);
   assert.match((preview.content[0] as { text: string }).text, /confirmation checkpoint/);
@@ -1204,10 +1382,11 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   const continued = await tool.execute("confirmed-checkpoint", {
     issueNumbers: [7],
     confirmed: true,
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
+  }, undefined, undefined, { ...commandContext(), cwd: fixture.root, hasUI: false } as any);
   assert.match((continued.content[0] as { text: string }).text, /started streaming DAG/);
   assert.equal(spawnRequests.length, 1);
   await shutdownFakePi(state, commandContext());
+  rmSync(fixture.workspace, { recursive: true, force: true });
 });
 
 test("confirmation prompt remains read-only until the user authorizes dispatch", async () => {
@@ -1242,7 +1421,8 @@ test("confirmation prompt remains read-only until the user authorizes dispatch",
 });
 
 test("confirm-mode orchestration provisions and re-reads a missing milestone branch before dispatch", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "forgedock-confirm-milestone-"));
+  const fixture = createTempWorkspaceFixture();
+  const cwd = fixture.root;
   const branchNames = new Set<string>();
   const branchEvents: string[] = [];
   let listBranchesCalls = 0;
@@ -1324,12 +1504,13 @@ test("confirm-mode orchestration provisions and re-reads a missing milestone bra
     GitHubClient.prototype.listBranches = originalListBranches;
     GitHubClient.prototype.getBranchHead = originalGetBranchHead;
     GitHubClient.prototype.createBranch = originalCreateBranch;
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(fixture.workspace, { recursive: true, force: true });
   }
 });
 
 test("preview continuation carries the full frozen runtime contract into the child controller invocation", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "forgedock-preview-runtime-"));
+  const fixture = createTempWorkspaceFixture();
+  const cwd = fixture.root;
   updateForgeDockConfig(cwd, {
     workerModel: "worker/old-model", workerThinking: "high",
     reviewerModel: "reviewer/old-model", reviewerThinking: "medium",
@@ -1372,7 +1553,7 @@ test("preview continuation carries the full frozen runtime contract into the chi
     assert.doesNotMatch(task, /(?:worker|reviewer|planner)\/new-model/);
   } finally {
     await shutdownFakePi(state, ctx);
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(fixture.workspace, { recursive: true, force: true });
   }
 });
 
@@ -2526,11 +2707,9 @@ test("direct work-on defaults to a native non-blocking controller task", async (
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
   const entry = join(root, "controller.mjs");
   writeFileSync(entry, "setTimeout(() => console.log('controller done'), 50);\n");
-  const state = fakePi();
+  const state = fakePi(undefined, { controllerEntryPath: entry, dispatchReadinessCheck: async () => undefined });
   const ctx = { ...commandContext(), cwd: root, mode: "rpc" } as any;
   await state.handlers.get("session_start")?.[0]?.({}, ctx);
-  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
-  process.env.FORGEDOCK_CONTROLLER_ENTRY = entry;
   try {
     const tool = state.tools.get("forgedock_work_on");
     assert.ok(tool);
@@ -2555,20 +2734,17 @@ test("direct work-on defaults to a native non-blocking controller task", async (
     assert.equal((listed.details as { records: Array<{ id: string; status: string }> }).records.find((record) => record.id === details.taskId)?.status, "completed");
   } finally {
     await shutdownFakePi(state, ctx);
-    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
-    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
   }
 });
+
 
 test("background review and promotion tasks persist truthful restart scopes", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-recovery-scope-"));
   const entry = join(root, "controller.mjs");
   writeFileSync(entry, "setTimeout(() => process.exit(0), 50);\n");
-  const state = fakePi();
+  const state = fakePi(undefined, { controllerEntryPath: entry, dispatchReadinessCheck: async () => undefined });
   const ctx = { ...commandContext(), cwd: root, mode: "rpc" } as any;
   await state.handlers.get("session_start")?.[0]?.({}, ctx);
-  const previous = process.env.FORGEDOCK_CONTROLLER_ENTRY;
-  process.env.FORGEDOCK_CONTROLLER_ENTRY = entry;
   const taskIds: string[] = [];
   try {
     for (const [toolName, params, expectedScope] of [
@@ -2594,8 +2770,6 @@ test("background review and promotion tasks persist truthful restart scopes", as
     }
   } finally {
     await shutdownFakePi(state, ctx);
-    if (previous === undefined) delete process.env.FORGEDOCK_CONTROLLER_ENTRY;
-    else process.env.FORGEDOCK_CONTROLLER_ENTRY = previous;
   }
 });
 

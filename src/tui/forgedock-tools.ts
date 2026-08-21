@@ -1384,9 +1384,14 @@ export interface ForgeDockToolRegistrationOptions {
   ensureLeaseWitness?: (cwd: string) => LeaseWitness;
   /** Explicit test/embedder doctor seam. Production must leave this undefined. */
   dispatchReadinessCheck?: (input: DispatchReadinessInput) => Promise<void>;
+  /** Explicit fresh-run controller entry; null disables native transport. */
+  controllerEntryPath?: string | null;
 }
 
 export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolRegistrationOptions = {}): ForgeDockBackgroundTasks {
+  // Preserve an explicit embedder/test transport choice for durable resumes;
+  // undefined intentionally retains production ambient-environment behavior.
+  const registeredControllerEntryPath = options.controllerEntryPath;
   const backgroundTasks = new ForgeDockBackgroundTasks(pi);
   const planningSessions = new PlanningSessionStore();
   const confirmedPlanningPackets = new Map<string, PlanningPacket>();
@@ -1462,12 +1467,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
   const dagDelegator = new VisibleDagDelegator(
     pi,
     () => orchestrationRepository ?? options.orchestrationRepository,
-    (record) => rebuildVisibleDagInput(orchestrationCwd, record),
+    (record) => rebuildVisibleDagInput(orchestrationCwd, record, options.controllerEntryPath),
     {
       setLimit: (maxTasks) => backgroundTasks.setLimit(maxTasks),
       start: async (spec) => {
         if (!orchestrationContext) throw new Error("ForgeDock orchestration context is unavailable for direct controller dispatch");
-        return startNativeControllerTask(pi, backgroundTasks, spec, orchestrationContext);
+        return startNativeControllerTask(pi, backgroundTasks, spec, orchestrationContext, registeredControllerEntryPath);
       },
       wait: async (taskId) => await backgroundTasks.waitForTerminal(taskId),
       stop: (taskId) => { try { backgroundTasks.cancel(taskId); } catch { /* task already terminal */ } },
@@ -1656,7 +1661,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       }
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
-        ? runControllerToolBackground(pi, backgroundTasks, "work-on", args, ctx)
+        ? runControllerToolBackground(pi, backgroundTasks, "work-on", args, ctx, options.controllerEntryPath)
         : runControllerTool(pi, "work-on", args, signal, onUpdate, ctx, true, options.getObservationSink?.());
     },
   });
@@ -1679,7 +1684,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.repo) args.push("--repo", params.repo);
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
-        ? runControllerToolBackground(pi, backgroundTasks, "review-pr", args, ctx)
+        ? runControllerToolBackground(pi, backgroundTasks, "review-pr", args, ctx, options.controllerEntryPath)
         : runControllerTool(pi, "review-pr", args, signal, onUpdate, ctx, true, options.getObservationSink?.());
     },
   });
@@ -1717,7 +1722,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.model) args.push("--model", params.model);
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
-        ? runControllerToolBackground(pi, backgroundTasks, "promote", args, ctx)
+        ? runControllerToolBackground(pi, backgroundTasks, "promote", args, ctx, options.controllerEntryPath)
         : runControllerTool(pi, "promote", args, signal, onUpdate, ctx);
     },
   });
@@ -2242,6 +2247,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     executionMode: "sequential",
     async execute(_id, params, signal, onUpdate, ctx) {
       const launchCwd = ctx.cwd;
+      // Capture transport selection for this invocation. Reading the process
+      // environment later would let concurrent TUI/test invocations change a
+      // fresh DAG from Pi to native (or vice versa) between discovery and launch.
+      const controllerEntry = resolveControllerEntry(options.controllerEntryPath);
       const livePreview = getOrchestrationPreview(pi);
       const previewCheckpoint = params.previewToken
         ? loadOrchestrationPreview(pi, params.previewToken)
@@ -2951,7 +2960,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeVisibleDecomposition({
           github: readyGithub,
           artifacts,
-          repository: readyRepository.repo,
+          repository: item.repository ?? readyRepository.repo,
           effective,
           orchestration: durable,
           node,
@@ -2960,12 +2969,14 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         }),
         taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
+          const itemRepository = item.repository ?? readyRepository.repo;
+          const itemCheckout = resolveCheckoutContext(ctx.cwd, itemRepository);
           return {
             agent: "forgedock-issue-worker",
             task: buildIssueWorkerTask(
               item.issue,
               {
-                repository: repository!.repo,
+                repository: itemRepository,
                 autoMerge,
                 batching: effective.batchingPolicy,
                 scopeExpansion: effective.scopeExpansion,
@@ -2984,16 +2995,18 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
               },
             { issue: item.issue, title: item.title, summary: item.summary },
             ),
-            cwd: ctx.cwd,
+            cwd: itemCheckout.checkoutRoot,
             ...(workerModel ? { model: workerModel } : {}),
           };
         },
-        ...(controllerEntryAvailable() ? {
+        ...(controllerEntry !== undefined ? {
           controllerTaskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => {
             const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
+            const itemRepository = item.repository ?? readyRepository.repo;
+            const itemCheckout = resolveCheckoutContext(ctx.cwd, itemRepository);
             return {
               args: buildIssueWorkerControllerArgs(item.issue, {
-                repository: repository!.repo,
+                repository: itemRepository,
                 autoMerge,
                 scopeExpansion: effective.scopeExpansion,
                 maxRemediationCycles: effective.maxRemediationCycles,
@@ -3009,24 +3022,25 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
                 ...(resolvedPlanningModel !== undefined ? { planningModel: resolvedPlanningModel } : {}),
                 ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
               }),
-              cwd: ctx.cwd,
+              cwd: itemCheckout.checkoutRoot,
               env: {
                 FORGEDOCK_ORCHESTRATION_NODE: item.id,
                 FORGEDOCK_ORCHESTRATION_ISSUE: String(item.issue),
               },
             };
           },
-          startControllerTask: (spec: ControllerTaskSpec) => startNativeControllerTask(pi, backgroundTasks, spec, ctx),
+          startControllerTask: (spec: ControllerTaskSpec) => startNativeControllerTask(pi, backgroundTasks, spec, ctx, controllerEntry),
           waitControllerTask: async (taskId: string) => await backgroundTasks.waitForTerminal(taskId),
         } : {}),
         assertCompleted: async (item) => {
-          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: readyRepository.repo, issue: item.issue }));
+          const itemRepository = item.repository ?? readyRepository.repo;
+          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: itemRepository, issue: item.issue }));
           if (reconciled.state === "completed") return;
           if (reconciled.state === "invalid") {
             return { status: "invalid", error: `#${item.issue} was classified invalid; no delivery work was performed` };
           }
           if (reconciled.state === "decomposed") {
-            const issueArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: item.issue });
+            const issueArtifacts = await artifacts.list({ repo: itemRepository, issue: item.issue });
             return {
               status: "skipped",
               error: `#${item.issue} decomposed into authoritative child work`,
@@ -3036,7 +3050,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
-          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: readyRepository.repo, issue: item.issue }), reconciled);
+          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: itemRepository, issue: item.issue }), reconciled);
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
         },
@@ -3753,7 +3767,7 @@ export function resolveIssueWorkerRecovery(
   return { rerun: false, resume: shouldResumeObservedItem(labels, recovery === "resume") };
 }
 
-async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord): Promise<VisibleDagInput> {
+async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord, controllerEntryOverride?: string | null): Promise<VisibleDagInput> {
   if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
   const config = readForgeDockConfig(cwd);
   const frozenScopeExpansion = orchestrationMetadataString(record.plan, "scopeExpansion");
@@ -3836,7 +3850,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
       return materializeVisibleDecomposition({
         github,
         artifacts,
-        repository: record.repository,
+        repository: item.repository ?? record.repository,
         effective,
         orchestration: durable,
         node,
@@ -3844,7 +3858,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
         ...(childIssues !== undefined ? { childIssues } : {}),
       });
     },
-    ...(controllerEntryAvailable() ? {
+    ...(resolveControllerEntry(controllerEntryOverride) !== undefined ? {
       controllerTaskFor: (item, recovery, adjudicationReason, resolveConflict) => {
         const policy = resolveIssueWorkerRecovery([], false, recovery);
         const itemRepository = item.repository ?? record.repository;
@@ -4067,9 +4081,10 @@ function trustedNestedBridgeRoots(cwd: string): readonly string[] {
   return [cwd, join(dirname(cwd), ".forgedock-worktrees"), join(cwd, ".forgedock-worktrees")];
 }
 
-function controllerEntryAvailable(): boolean {
+function resolveControllerEntry(override?: string | null): string | undefined {
+  if (override !== undefined) return override && existsSync(override) ? override : undefined;
   const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
-  return entry !== undefined && existsSync(entry);
+  return entry !== undefined && existsSync(entry) ? entry : undefined;
 }
 
 async function startNativeControllerTask(
@@ -4077,8 +4092,9 @@ async function startNativeControllerTask(
   tasks: ForgeDockBackgroundTasks,
   spec: ControllerTaskSpec,
   ctx: ExtensionContext,
+  entryOverride?: string | null,
 ): Promise<string> {
-  const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  const entry = entryOverride ?? resolveControllerEntry();
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   // The caller has crossed the typed dispatch-readiness barrier. Only now may
   // persisted native tasks be adopted or terminalized for recovery.
@@ -4151,8 +4167,9 @@ async function runControllerToolBackground(
   command: Exclude<WorkflowCommand, "status">,
   args: string[],
   ctx: ExtensionContext,
+  entryOverride?: string | null,
 ) {
-  const entry = process.env.FORGEDOCK_CONTROLLER_ENTRY;
+  const entry = resolveControllerEntry(entryOverride);
   if (!entry) throw new Error("ForgeDock controller entry is unavailable. Launch through the forgedock command.");
   const config = readForgeDockConfig(ctx.cwd);
   const modelArgs = controllerInvocationModelArgs(command, args, ctx, config);
