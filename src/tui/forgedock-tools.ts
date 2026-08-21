@@ -25,6 +25,8 @@ import type {
 } from "../core/ports/orchestration.js";
 import {
   findDurableOrchestrationIssueConflicts,
+  normalizeOrchestrationRepository,
+  orchestrationNodeRepository,
   OrchestrationIssueOwnershipConflictError,
 } from "../core/ports/orchestration.js";
 import type { LeaseWitness } from "../core/ports/lease.js";
@@ -1182,12 +1184,15 @@ export async function materializeVisibleDecomposition(input: {
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
+  const effectiveParentRepositoryKey = normalizeOrchestrationRepository(effectiveParentRepository);
   const dependencyNodes = [
-    ...input.orchestration.nodes.map((candidate) => ({
-      id: candidate.id,
-      issue: candidate.issue,
-      ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
-    })),
+    ...input.orchestration.nodes
+      .filter((candidate) => orchestrationNodeRepository(input.orchestration, candidate) === effectiveParentRepositoryKey)
+      .map((candidate) => ({
+        id: candidate.id,
+        issue: candidate.issue,
+        ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
+      })),
     ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
   ];
   const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
