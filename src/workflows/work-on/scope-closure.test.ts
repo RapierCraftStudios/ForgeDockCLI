@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
-import { closeExpectedWriteScope } from "./scope-closure.js";
+import { closeExpectedWriteScope, resolveInvestigationEvidenceSources } from "./scope-closure.js";
 
 // Frozen-workspace relation fixture: this literal is intentionally read by the
 // scope-closure test below, just as a config regression test would reference it.
@@ -109,6 +112,69 @@ describe("scope closure", () => {
     });
     assert.deepEqual(result.expectedPaths, ["docs/CONFIG.md"]);
     assert.deepEqual(result.rejectedPaths, []);
+  });
+
+  it("resolves generated script/config evidence from path-and-line locations without write authority", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-"));
+    try {
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      await mkdir(join(cwd, "config"), { recursive: true });
+      await writeFile(join(cwd, "scripts/stage-generated.mjs"), "export default true;\n");
+      await writeFile(join(cwd, "config/runtime.json"), "{}\n");
+      const paths = await resolveInvestigationEvidenceSources([
+        "scripts/stage-generated.mjs:9-21",
+        "config/runtime.json:1-1",
+      ], cwd);
+      assert.deepEqual(paths, ["config/runtime.json", "scripts/stage-generated.mjs"]);
+      const closure = await closeExpectedWriteScope(paths, { investigationWriteHints: paths });
+      assert.deepEqual(closure.expectedPaths, []);
+      assert.deepEqual(closure.rejectedPaths, paths);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects missing, outside-root, directory, and symlink evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-invalid-"));
+    const outside = await mkdtemp(join(tmpdir(), "forgedock-evidence-outside-"));
+    try {
+      await mkdir(join(cwd, "nested"), { recursive: true });
+      await writeFile(join(cwd, "nested/real.mjs"), "ok\n");
+      await writeFile(join(outside, "outside.mjs"), "outside\n");
+      await symlink(join(outside, "outside.mjs"), join(cwd, "nested/link.mjs"));
+      const paths = await resolveInvestigationEvidenceSources([
+        "nested/real.mjs:1",
+        "nested/real.mjs:not-lines",
+        "nested/missing.mjs:1",
+        "nested:1",
+        "nested/link.mjs:1",
+        `${outside}/outside.mjs:1`,
+        "BuildPacket art_deadbeef.payload.changedPaths:1",
+      ], cwd);
+      assert.deepEqual(paths, ["nested/real.mjs"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds evidence source count and bytes", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-bounds-"));
+    try {
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      await writeFile(join(cwd, "scripts/large.mjs"), "x".repeat(32));
+      await writeFile(join(cwd, "scripts/small.mjs"), "x\n");
+      assert.deepEqual(await resolveInvestigationEvidenceSources(
+        ["scripts/large.mjs:1", "scripts/small.mjs:1"], cwd,
+        { maxSourceLocations: 64, maxPathLength: 512, maxFiles: 64, maxFileBytes: 16, maxTotalBytes: 16 },
+      ), ["scripts/small.mjs"]);
+      assert.deepEqual(await resolveInvestigationEvidenceSources(
+        ["scripts/large.mjs:1", "scripts/small.mjs:2"], cwd,
+        { maxSourceLocations: 1, maxPathLength: 512, maxFiles: 64, maxFileBytes: 16, maxTotalBytes: 16 },
+      ), []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("bounds collateral admission", async () => {

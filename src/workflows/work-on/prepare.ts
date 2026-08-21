@@ -32,7 +32,7 @@ import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
-import { closeExpectedWriteScope } from "./scope-closure.js";
+import { closeExpectedWriteScope, resolveInvestigationEvidenceSources } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
 import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
 import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters/repository/index.js";
@@ -81,11 +81,18 @@ export async function prepareBuildPacket(
   if (input.run.state !== "preparing") throw new Error(`Build Packet requires preparing state, found ${input.run.state}`);
   let run = input.run;
   let authorCorrectableAttempted = false;
+  const investigationEvidencePaths = await resolveInvestigationEvidenceSources(
+    input.investigation.payload.evidence.map(({ source }) => source),
+    input.cwd,
+  );
   try {
     const affectedScope = [
       ...(input.scopeHints?.affectedFiles ?? []),
       ...(input.scopeHints?.writePaths ?? []),
       ...input.investigation.payload.affectedSurfaces,
+      // Investigation evidence is an independent read-only discovery surface;
+      // it must never enter the write-scope closure below.
+      ...investigationEvidencePaths,
     ];
     const packetTask: AgentTask<BuildPacketPayload> = {
       id: `${run.runId}:build-packet:${run.attempt}`,
@@ -161,6 +168,7 @@ export async function prepareBuildPacket(
           input.verificationCatalog,
           input.scopeHints?.affectedFiles ?? [],
           input.investigation.payload.affectedSurfaces,
+          input.investigation.payload.evidence.map(({ source }) => source),
           input.scopeHints?.metadataRoots ?? [],
           input.scopeHints?.writePaths ?? [],
           input.cwd,
@@ -334,6 +342,7 @@ async function materializePacketOutput(
   catalog: VerificationCatalog | undefined,
   affectedFiles: readonly string[],
   investigationSurfaces: readonly string[] = [],
+  investigationEvidenceSources: readonly string[] = [],
   metadataPaths: readonly string[] = [],
   controllerWriteHints: readonly string[] = [],
   cwd = process.cwd(),
@@ -358,6 +367,7 @@ async function materializePacketOutput(
   }
   const declaredPaths = canonicalizeConcreteScopePaths(affectedFiles.filter(isConcreteScopePath));
   const investigatedPaths = canonicalizeConcreteScopePaths(investigationSurfaces.filter(isConcreteScopePath));
+  const investigationEvidencePaths = await resolveInvestigationEvidenceSources(investigationEvidenceSources, cwd);
   const controllerPaths = canonicalizeConcreteScopePaths(controllerWriteHints.filter(isConcreteScopePath));
   // The controller's proven scope closure remains delivery authority. The
   // repository relation graph is collected in shadow mode and must not replace
@@ -394,6 +404,7 @@ async function materializePacketOutput(
     ...investigatedPaths,
     ...declaredPaths,
     ...controllerPaths,
+    ...investigationEvidencePaths,
     ...scopeDiscoveryRoots([...expectedPaths, ...investigatedPaths, ...declaredPaths, ...controllerPaths]),
     ...STANDARD_SCOPE_METADATA_ROOTS,
     ...metadataPaths.filter(isConcreteScopePath),

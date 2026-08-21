@@ -1,13 +1,101 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { readFile, realpath } from "node:fs/promises";
-import { resolve, relative, isAbsolute, posix } from "node:path";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { resolve, relative, isAbsolute, posix, join } from "node:path";
+import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { canonicalizeConcreteScopePaths, isConcreteScopePath } from "../../runtime/agent-runtime.js";
 
 const COLLATERAL_LIMIT = 16;
 const MAX_RELATION_READS = 32;
 const MAX_RELATION_BYTES = 128 * 1024;
 const TEST_SUFFIX = /(?:\.test|\.spec|\.fixture)$/i;
+
+/**
+ * Resolve only controller-observed Investigation evidence locations into
+ * read-only packet paths. These bounds deliberately apply before any path can
+ * enter packet evidence or an agent read scope.
+ */
+export interface InvestigationEvidenceLimits {
+  maxSourceLocations: number;
+  maxPathLength: number;
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+}
+
+export const INVESTIGATION_EVIDENCE_LIMITS: InvestigationEvidenceLimits = {
+  maxSourceLocations: 64,
+  maxPathLength: 512,
+  maxFiles: 64,
+  maxFileBytes: 1_048_576,
+  maxTotalBytes: 4_000_000,
+};
+
+export async function resolveInvestigationEvidenceSources(
+  sources: readonly string[],
+  cwd: string,
+  limits: InvestigationEvidenceLimits = INVESTIGATION_EVIDENCE_LIMITS,
+): Promise<string[]> {
+  const selected = new Set<string>();
+  let root: string;
+  try {
+    root = await realpath(resolve(cwd));
+    const rootStat = await lstat(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
+  } catch {
+    return [];
+  }
+  let totalBytes = 0;
+  for (const source of sources.slice(0, limits.maxSourceLocations)) {
+    const extracted = repositoryPathFromLocation(source);
+    if (!extracted || !safeEvidenceLocation(source, extracted) || extracted.length > limits.maxPathLength) continue;
+    let path: string;
+    try {
+      path = canonicalizeConcreteScopePaths([extracted])[0] ?? "";
+    } catch {
+      continue;
+    }
+    if (!path || path.length > limits.maxPathLength || selected.has(path)) continue;
+    if (selected.size >= limits.maxFiles) break;
+    const absolute = resolve(root, path);
+    const lexicalRelative = relative(root, absolute).replaceAll("\\", "/");
+    if (!lexicalRelative || lexicalRelative.startsWith("../") || isAbsolute(lexicalRelative)) continue;
+    try {
+      // Check every component, not just the leaf: an internal symlink must not
+      // redirect a controller-approved source to another checkout.
+      let current = root;
+      let safe = true;
+      for (const segment of path.split("/")) {
+        current = join(current, segment);
+        const entry = await lstat(current);
+        if (entry.isSymbolicLink()) { safe = false; break; }
+      }
+      if (!safe) continue;
+      const entry = await lstat(absolute);
+      if (!entry.isFile() || entry.isSymbolicLink() || entry.size > limits.maxFileBytes) continue;
+      const canonical = await realpath(absolute);
+      const canonicalRelative = relative(root, canonical).replaceAll("\\", "/");
+      if (!canonicalRelative || canonicalRelative.startsWith("../") || isAbsolute(canonicalRelative)) continue;
+      if (totalBytes + entry.size > limits.maxTotalBytes) continue;
+      totalBytes += entry.size;
+      selected.add(path);
+    } catch {
+      // Missing, disappearing, malformed, or inaccessible sources are advisory
+      // only and therefore cannot become packet authority.
+    }
+  }
+  return [...selected].sort();
+}
+
+function safeEvidenceLocation(source: string, path: string): boolean {
+  const normalized = source.replaceAll("\\", "/").trim();
+  const index = normalized.indexOf(path);
+  if (index < 0 || (index > 0 && !/[\s`(]/.test(normalized[index - 1]!))) return false;
+  const suffix = normalized.slice(index + path.length).trimStart();
+  if (suffix.startsWith(":")) return /^:\d+(?::\d+)?(?:-\d+)?(?:\b|$)/.test(suffix);
+  if (suffix.startsWith("#")) return /^#L?\d+(?:-L?\d+)?(?:\b|$)/i.test(suffix);
+  return suffix.length === 0 || /^[`),\s]/.test(suffix);
+}
 
 export interface ScopeClosureInput {
   /** Concrete paths declared by the issue/controller and therefore direct authority. */

@@ -70,6 +70,69 @@ describe("Build Packet preparation", () => {
     ]);
   });
 
+  it("accepts generated-source Investigation evidence as read-only without changing expected paths", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-generated-evidence-"));
+    try {
+      await mkdir(join(cwd, "generated"), { recursive: true });
+      await writeFile(join(cwd, "generated/runner.mjs"), "export const generated = true;\n");
+      const evidenceInvestigation: InvestigationPayload = {
+        ...investigation,
+        affectedSurfaces: [],
+        evidence: [{ claim: "Generated runner", source: "generated/runner.mjs:9-21", detail: "Generated source" }],
+      };
+      const evidencePacket: BuildPacketPayload = {
+        ...packet,
+        expectedPaths: ["src/fix.ts"],
+        evidencePaths: [{ path: "generated/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }],
+      };
+      const runtime = new FakeAgentRuntime([evidenceInvestigation, evidencePacket]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_generated_evidence", subject: { repo: "arbitrary/repository", issue: 403 }, producer: { role: "controller" },
+        payload: { title: "Generated evidence", problem: "Read generated source", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs });
+      assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/fix.ts"]);
+      assert.deepEqual(prepared.packet.payload.evidencePaths, [{ path: "generated/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }]);
+      assert.deepEqual(prepared.run.scopeManifest?.writePaths, ["src/fix.ts"]);
+      assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("generated"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for packet evidence unrelated to validated Investigation sources", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-unrelated-evidence-"));
+    try {
+      await mkdir(join(cwd, "generated"), { recursive: true });
+      await writeFile(join(cwd, "generated/runner.mjs"), "export const generated = true;\n");
+      const evidenceInvestigation: InvestigationPayload = {
+        ...investigation,
+        affectedSurfaces: [],
+        evidence: [{ claim: "Generated runner", source: "generated/runner.mjs:9-21", detail: "Generated source" }],
+      };
+      const evidencePacket: BuildPacketPayload = {
+        ...packet,
+        expectedPaths: ["src/fix.ts"],
+        evidencePaths: [{ path: "generated/unrelated.mjs", criterionIds: ["criterion-1"], role: "generated" }],
+      };
+      const runtime = new FakeAgentRuntime([evidenceInvestigation, evidencePacket, evidencePacket]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_unrelated_evidence", subject: { repo: "arbitrary/repository", issue: 404 }, producer: { role: "controller" },
+        payload: { title: "Unrelated evidence", problem: "Reject scope escape", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs }), /evidence-scope/);
+      assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("binds production packet relation authority to the exact frozen workspace base", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-packet-base-"));
     const baseSha = "f".repeat(40);
