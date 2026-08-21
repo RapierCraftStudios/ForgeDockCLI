@@ -169,7 +169,15 @@ describe("deterministic process verification", () => {
         id: "after-cleanup-failure", command: process.execPath, args: ["-e", ""], cwd: directory,
         timeoutMs: 5_000, required: true,
       }]);
-      assert.equal(second[0]?.status, "passed");
+      const precedenceLayout = stagingLayout(directory, "primary-failure");
+      precedenceLayout.outputRoot = ".dist.forgedock-verification-primary-failure";
+      const precedenceMarker = join(directory, precedenceLayout.outputRoot, precedenceLayout.markerName);
+      const precedence = await new ProcessVerificationRunner({ lockPath }).run([{
+        ...stagedCommand(directory, "primary-failure", ["-e", "require('node:fs').unlinkSync(process.argv[1]);process.exit(9)", precedenceMarker], precedenceLayout),
+        lockScope: "machine-global",
+      }]);
+      assert.equal(precedence[0]?.status, "failed");
+      assert.equal(precedence[0]?.exitCode, 9);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

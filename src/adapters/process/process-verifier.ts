@@ -26,19 +26,30 @@ export class ProcessVerificationRunner implements VerificationRunner {
 
   async prepareOperationalOutput(commands: readonly VerificationCommand[]): Promise<void> {
     const prepared = new Map<string, { token: string; markerName: string; identity: string; root: string }>();
+    let primaryError: unknown;
     let cleanupError: unknown;
     try {
       for (const command of commands) {
         validateTypeScriptConfiguration(command);
         prepareOperationalOutput(command, prepared);
       }
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
       for (const [root, ownership] of prepared) {
         try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
-        catch (error) { cleanupError ??= error; }
+        catch (error) {
+          if (error instanceof DeferredCleanupError && primaryError !== undefined) {
+            attachCleanupDiagnostic(primaryError, error);
+          } else cleanupError ??= error;
+        }
+      }
+      if (cleanupError !== undefined) {
+        if (primaryError !== undefined) attachCleanupDiagnostic(primaryError, cleanupError);
+        else throw cleanupError;
       }
     }
-    if (cleanupError !== undefined) throw cleanupError;
   }
 
   async recoverOperationalOutput(commands: readonly VerificationCommand[]): Promise<void> {
@@ -78,6 +89,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
       if (releaseGlobal) bufferedGlobalProgress.push(progress);
       else await emitProgress(onProgress, progress);
     };
+    let primaryError: unknown;
     try {
       for (const [index, command] of commands.entries()) {
         if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted");
@@ -102,6 +114,9 @@ export class ProcessVerificationRunner implements VerificationRunner {
           : undefined;
         const result = await runOne(command, this.#environment, signal, ownership);
         results.push(result);
+        if (result.status === "failed" && primaryError === undefined) {
+          primaryError = new Error(result.summary ?? `Verification command failed: ${result.commandId}`);
+        }
         await reportCommandProgress({
           phase: "command-completed",
           commandId: command.id,
@@ -112,19 +127,40 @@ export class ProcessVerificationRunner implements VerificationRunner {
         });
       }
       return results;
+    } catch (error) {
+      primaryError = error;
+      throw error;
     } finally {
       let cleanupError: unknown;
       for (const [root, ownership] of preparedOutputs) {
         try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
-        catch (error) { cleanupError ??= error; }
+        catch (error) {
+          if (error instanceof DeferredCleanupError && primaryError !== undefined) {
+            attachCleanupDiagnostic(primaryError, error);
+          } else cleanupError ??= error;
+        }
         finally { preparedOutputs.delete(root); }
       }
       try { await releaseGlobalLock(); }
-      finally { if (cleanupError !== undefined) throw cleanupError; }
+      catch (error) { cleanupError ??= error; }
+      if (cleanupError !== undefined) {
+        if (primaryError !== undefined) attachCleanupDiagnostic(primaryError, cleanupError);
+        else throw cleanupError;
+      }
     }
   }
 }
 
+class DeferredCleanupError extends Error {
+  readonly deferred = true;
+}
+
+function attachCleanupDiagnostic(primary: unknown, cleanup: unknown): void {
+  if (!primary || (typeof primary !== "object" && typeof primary !== "function")) return;
+  const message = cleanup instanceof Error ? cleanup.message : String(cleanup);
+  try { Object.defineProperty(primary, "verificationCleanupDiagnostic", { value: message.slice(0, 1_000), configurable: true }); }
+  catch { /* diagnostics never replace the primary failure */ }
+}
 function validateTypeScriptConfiguration(command: VerificationCommand): void {
   if (!command.typescriptLayout) return;
   const markerName = command.typescriptLayout.markerName;
@@ -161,11 +197,16 @@ function prepareOperationalOutput(command: VerificationCommand, prepared: Map<st
     || output === configured) throw new Error(`Unsafe verification output cleanup path: ${outputRelative}`);
   validateRegularComponents(workspace, output, "staging output");
   validateRegularComponents(workspace, configured, "configured output");
-  const existingToken = prepared.get(output);
-  if (existingToken) return;
-  recoverStaleOperationalOutput(command);
   const markerName = layout.markerName ?? ".forgedock-verification-marker.json";
   const identity = layout.stagingIdentity ?? `${command.planId ?? "unbound"}:${layout.configDigest}`;
+  const existingToken = prepared.get(output);
+  if (existingToken) {
+    if (existingToken.markerName !== markerName || existingToken.identity !== identity || existingToken.root !== output) {
+      throw new Error(`Verification staging identity collision refused: ${output}`);
+    }
+    return;
+  }
+  recoverStaleOperationalOutput(command);
   const token = randomUUID();
   const pending = join(dirname(output), `.${basename(output)}.forgedock-verification-pending-${token}`);
   mkdirSync(pending, { recursive: false, mode: 0o700 });
@@ -294,6 +335,16 @@ function isLiveProcessGroup(pgid: number): boolean {
   }
 }
 
+async function waitForProcessTreeQuiescence(pid: number | undefined, pgid: number | undefined, timeoutMs = 2_500): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const livePid = pid !== undefined && isLivePid(pid);
+    const liveGroup = pgid !== undefined && isLiveProcessGroup(pgid);
+    if (!livePid && !liveGroup) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return (pid !== undefined && isLivePid(pid)) || (pgid !== undefined && isLiveProcessGroup(pgid));
+}
 function updateOperationalMarker(root: string, markerName: string, identity: string, token: string, childPid?: number): void {
   const markerPath = join(root, markerName);
   const current = readOperationalMarker(markerPath);
@@ -313,7 +364,7 @@ function clearOperationalMarker(root: string, markerName: string, identity: stri
   const marker = readOperationalMarker(join(root, markerName));
   if (!marker || marker.childPid !== childPid) throw new Error(`Verification staging marker changed unexpectedly: ${root}`);
   if ((marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) || (marker.childPid !== undefined && isLivePid(marker.childPid))) {
-    throw new Error(`Verification staging child is still active: ${root}`);
+    throw new DeferredCleanupError(`Verification staging child is still active: ${root}`);
   }
   updateOperationalMarker(root, markerName, identity, token);
 }
@@ -325,7 +376,7 @@ function cleanupOperationalOutput(root: string, token: string, markerName: strin
   const marker = readOperationalMarker(markerPath);
   if (!marker || marker.schema !== "forgedock.verification-output/v1" || marker.token !== token) throw new Error(`Verification staging marker changed unexpectedly: ${root}`);
   if ((marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) || (marker.childPid !== undefined && isLivePid(marker.childPid))) {
-    throw new Error(`Verification staging child is still active: ${root}`);
+    throw new DeferredCleanupError(`Verification staging child is still active: ${root}`);
   }
   rmSync(root, { recursive: true, force: false });
 }
@@ -472,6 +523,7 @@ function runOne(
     if (ownership && child.pid) {
       try { updateOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
       catch (error) {
+        child.once("error", () => { /* close settles the rejected marker publication */ });
         child.once("close", () => reject(error));
         terminateProcessTree(child);
         if (child.exitCode !== null) reject(error);
@@ -502,14 +554,16 @@ function runOne(
     };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    child.on("error", (error: NodeJS.ErrnoException) => {
+    child.on("error", async (error: NodeJS.ErrnoException) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      if (ownership) {
+      const quiescent = await waitForProcessTreeQuiescence(child.pid, process.platform === "win32" ? undefined : child.pid);
+      let markerCleanupError: unknown;
+      if (ownership && quiescent) {
         try { clearOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
-        catch (markerError) { reject(markerError); return; }
+        catch (markerError) { markerCleanupError = markerError; }
       }
       if (cancelled) {
         reject(abortReason);
@@ -528,14 +582,16 @@ function runOne(
         failureSignatures: [summary],
       });
     });
-    child.on("close", (code) => {
+    child.on("close", async (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      if (ownership) {
+      const quiescent = await waitForProcessTreeQuiescence(child.pid, process.platform === "win32" ? undefined : child.pid);
+      let markerCleanupError: unknown;
+      if (ownership && quiescent) {
         try { clearOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
-        catch (error) { reject(error); return; }
+        catch (markerError) { markerCleanupError = markerError; }
       }
       if (cancelled) {
         reject(abortReason);
