@@ -982,6 +982,25 @@ describe("complete work-on trajectory", () => {
     assert.ok(attemptTwo?.payload.failureEvidence?.diagnostics?.some(({ code }) => code === "verification-diagnosis"));
   });
 
+  it("skips diagnosis when the repaired failure signature changes and keeps the two-repair cap", async () => {
+    const runtime = new FakeAgentRuntime([investigation, packet, submission, submission, submission]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    let index = 0;
+    const verifier: VerificationRunner = {
+      async run() {
+        index += 1;
+        return [{ command: "npm test", commandId: "test", status: "failed", failureSignatures: [index === 2 ? "first" : "changed"], durationMs: 10 }];
+      },
+    };
+    const result = await workOn({ intent: createWorkOnIntent("run_changed_diagnosis"), repoPath: process.cwd(), lane: fastLane, autoMerge: true, verification: [targetedTestVerification] }, { runtime, artifacts, runs, git, verifier, host });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(runtime.tasks.filter((task) => task.id.includes("verification-diagnosis")).length, 0);
+    assert.equal(runtime.tasks.filter((task) => task.role === "builder").length, 3);
+    assert.deepEqual(artifacts.artifacts.flatMap((artifact) => artifact.kind === "Outcome" && artifact.payload.failureEvidence?.repairAttempt !== undefined ? [artifact.payload.failureEvidence.repairAttempt] : []), [1, 2]);
+  });
   it("rejects malformed and out-of-scope diagnosis before a final builder", async () => {
     for (const [label, diagnosis] of [["malformed", {}], ["out-of-scope", {
       rootCause: "bad", sourceAnchors: [{ path: "outside.ts", location: "x", evidence: "bad" }], reproducer: "x",
