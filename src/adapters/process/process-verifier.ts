@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve as resolvePath, sep } from "node:path";
 import { tmpdir } from "node:os";
 import type { CheckResult, VerificationCommand, VerificationProgressCallback, VerificationRunner } from "../../core/ports/verification.js";
 import { sealVerificationEnvironment, verificationEnvironment } from "../../runtime/controller-environment.js";
@@ -24,11 +24,41 @@ export class ProcessVerificationRunner implements VerificationRunner {
     this.#environment = sealVerificationEnvironment(options.environment ?? process.env);
   }
 
+  async prepareOperationalOutput(commands: readonly VerificationCommand[]): Promise<void> {
+    const prepared = new Map<string, { token: string; markerName: string; identity: string; root: string }>();
+    let cleanupError: unknown;
+    try {
+      for (const command of commands) {
+        validateTypeScriptConfiguration(command);
+        prepareOperationalOutput(command, prepared);
+      }
+    } finally {
+      for (const [root, ownership] of prepared) {
+        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
+        catch (error) { cleanupError ??= error; }
+      }
+    }
+    if (cleanupError !== undefined) throw cleanupError;
+  }
+
+  async recoverOperationalOutput(commands: readonly VerificationCommand[]): Promise<void> {
+    const recovered = new Set<string>();
+    for (const command of commands) {
+      if (!command.typescriptLayout) continue;
+      const root = resolvePath(command.cwd, command.typescriptLayout.outputRoot);
+      if (recovered.has(root)) continue;
+      validateTypeScriptConfiguration(command);
+      recoverStaleOperationalOutput(command);
+      recovered.add(root);
+    }
+  }
+
   async run(
     commands: readonly VerificationCommand[],
     signal?: AbortSignal,
     onProgress?: VerificationProgressCallback,
   ): Promise<CheckResult[]> {
+    const preparedOutputs = new Map<string, { token: string; markerName: string; identity: string; root: string }>();
     const results: CheckResult[] = [];
     const bufferedGlobalProgress: Parameters<VerificationProgressCallback>[0][] = [];
     let releaseGlobal: (() => void) | undefined;
@@ -65,8 +95,12 @@ export class ProcessVerificationRunner implements VerificationRunner {
           index,
           total: commands.length,
         });
-        cleanOperationalOutput(command);
-        const result = await runOne(command, this.#environment, signal);
+        validateTypeScriptConfiguration(command);
+        prepareOperationalOutput(command, preparedOutputs);
+        const ownership = command.typescriptLayout
+          ? preparedOutputs.get(resolvePath(command.cwd, command.typescriptLayout.outputRoot))
+          : undefined;
+        const result = await runOne(command, this.#environment, signal, ownership);
         results.push(result);
         await reportCommandProgress({
           phase: "command-completed",
@@ -79,27 +113,221 @@ export class ProcessVerificationRunner implements VerificationRunner {
       }
       return results;
     } finally {
-      await releaseGlobalLock();
+      let cleanupError: unknown;
+      for (const [root, ownership] of preparedOutputs) {
+        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
+        catch (error) { cleanupError ??= error; }
+        finally { preparedOutputs.delete(root); }
+      }
+      try { await releaseGlobalLock(); }
+      finally { if (cleanupError !== undefined) throw cleanupError; }
     }
   }
 }
 
-function cleanOperationalOutput(command: VerificationCommand): void {
-  if (command.typescriptLayout) {
-    const configPath = resolve(command.cwd, command.typescriptLayout.project);
-    const digest = createHash("sha256").update(readFileSync(configPath)).digest("hex").slice(0, 16);
-    if (digest !== command.typescriptLayout.configDigest) {
-      throw new Error(`Frozen TypeScript configuration changed before verification: ${command.typescriptLayout.project}`);
+function validateTypeScriptConfiguration(command: VerificationCommand): void {
+  if (!command.typescriptLayout) return;
+  const markerName = command.typescriptLayout.markerName;
+  if (markerName !== undefined && (!markerName || markerName === "." || markerName === ".." || markerName.includes("/") || markerName.includes("\\"))) {
+    throw new Error(`Unsafe verification output marker name: ${markerName}`);
+  }
+  const configPath = resolvePath(command.cwd, command.typescriptLayout.project);
+  const configRelative = relative(resolvePath(command.cwd), configPath);
+  if (!configRelative || configRelative === ".." || configRelative.startsWith(`..${sep}`)) {
+    throw new Error(`Unsafe TypeScript project path: ${command.typescriptLayout.project}`);
+  }
+  validateProjectComponents(resolvePath(command.cwd), configPath);
+  const configStat = tryLstat(configPath);
+  if (!configStat || configStat.isSymbolicLink() || !configStat.isFile()) {
+    throw new Error(`Unsafe TypeScript project path: ${command.typescriptLayout.project}`);
+  }
+  const digest = createHash("sha256").update(readFileSync(configPath)).digest("hex").slice(0, 16);
+  if (digest !== command.typescriptLayout.configDigest) {
+    throw new Error(`Frozen TypeScript configuration changed before verification: ${command.typescriptLayout.project}`);
+  }
+}
+
+function prepareOperationalOutput(command: VerificationCommand, prepared: Map<string, { token: string; markerName: string; identity: string; root: string }>): void {
+  const layout = command.typescriptLayout;
+  if (!layout) return;
+  const workspace = resolvePath(command.cwd);
+  const outputRelative = command.cleanOutputRoot ?? layout.outputRoot;
+  const output = resolvePath(workspace, outputRelative);
+  const configured = resolvePath(workspace, layout.configuredOutputRoot ?? "");
+  const relativeOutput = relative(workspace, output).replaceAll("\\", "/");
+  const relativeConfigured = relative(workspace, configured).replaceAll("\\", "/");
+  if (!relativeOutput || relativeOutput === ".." || relativeOutput.startsWith("../") || relativeOutput.includes("/../")
+    || !relativeConfigured || relativeConfigured === ".." || relativeConfigured.startsWith("../") || relativeConfigured.includes("/../")
+    || output === configured) throw new Error(`Unsafe verification output cleanup path: ${outputRelative}`);
+  validateRegularComponents(workspace, output, "staging output");
+  validateRegularComponents(workspace, configured, "configured output");
+  const existingToken = prepared.get(output);
+  if (existingToken) return;
+  recoverStaleOperationalOutput(command);
+  const markerName = layout.markerName ?? ".forgedock-verification-marker.json";
+  const identity = layout.stagingIdentity ?? `${command.planId ?? "unbound"}:${layout.configDigest}`;
+  const token = randomUUID();
+  const pending = join(dirname(output), `.${basename(output)}.forgedock-verification-pending-${token}`);
+  mkdirSync(pending, { recursive: false, mode: 0o700 });
+  try {
+    const descriptor = openSync(join(pending, markerName), "wx", 0o600);
+    try { writeFileSync(descriptor, JSON.stringify({ schema: "forgedock.verification-output/v1", identity, pid: process.pid, token })); }
+    finally { closeSync(descriptor); }
+    renameSync(pending, output);
+  } catch (error) {
+    try { rmSync(pending, { recursive: true, force: false }); } catch { /* preserve the original publication failure */ }
+    throw error;
+  }
+  prepared.set(output, { token, markerName, identity, root: output });
+}
+
+function recoverStaleOperationalOutput(command: VerificationCommand): void {
+  const layout = command.typescriptLayout;
+  if (!layout) return;
+  const workspace = resolvePath(command.cwd);
+  const outputRelative = command.cleanOutputRoot ?? layout.outputRoot;
+  const output = resolvePath(workspace, outputRelative);
+  const configured = resolvePath(workspace, layout.configuredOutputRoot ?? "");
+  const relativeOutput = relative(workspace, output).replaceAll("\\", "/");
+  const relativeConfigured = relative(workspace, configured).replaceAll("\\", "/");
+  if (!relativeOutput || relativeOutput === ".." || relativeOutput.startsWith("../") || relativeOutput.includes("/../")
+    || !relativeConfigured || relativeConfigured === ".." || relativeConfigured.startsWith("../") || relativeConfigured.includes("/../")
+    || output === configured) throw new Error(`Unsafe verification output cleanup path: ${outputRelative}`);
+  validateRegularComponents(workspace, output, "staging output");
+  validateRegularComponents(workspace, configured, "configured output");
+  const markerName = layout.markerName ?? ".forgedock-verification-marker.json";
+  const identity = layout.stagingIdentity ?? `${command.planId ?? "unbound"}:${layout.configDigest}`;
+  recoverPendingOperationalOutput(dirname(output), `.${basename(output)}.forgedock-verification-pending-`, markerName, identity);
+  const stat = tryLstat(output);
+  if (!stat) return;
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Verification staging collision is not a regular directory: ${output}`);
+  const marker = readOperationalMarker(join(output, markerName));
+  if (!marker || marker.identity !== identity || marker.schema !== "forgedock.verification-output/v1" || typeof marker.token !== "string" || !Number.isSafeInteger(marker.pid)) {
+    throw new Error(`Unknown verification staging collision refused: ${output}`);
+  }
+  if (isLivePid(marker.pid!)) throw new Error(`Active verification staging collision refused: ${output}`);
+  if (marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) throw new Error(`Active verification child process group refused: ${output}`);
+  if (marker.childPid !== undefined && isLivePid(marker.childPid)) throw new Error(`Active verification child refused: ${output}`);
+  rmSync(output, { recursive: true, force: false });
+}
+function recoverPendingOperationalOutput(parent: string, prefix: string, markerName: string, identity: string): void {
+  let entries: string[];
+  try { entries = readdirSync(parent); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  for (const entry of entries.filter((name) => name.startsWith(prefix)).slice(0, 16)) {
+    const pending = join(parent, entry);
+    const stat = tryLstat(pending);
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Verification pending staging collision refused: ${pending}`);
+    const marker = readOperationalMarker(join(pending, markerName));
+    if (!marker) continue;
+    if (marker.schema !== "forgedock.verification-output/v1" || marker.identity !== identity || typeof marker.token !== "string" || !Number.isSafeInteger(marker.pid)) continue;
+    if (isLivePid(marker.pid!) || (marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) || (marker.childPid !== undefined && isLivePid(marker.childPid))) {
+      throw new Error(`Active verification pending staging collision refused: ${pending}`);
+    }
+    rmSync(pending, { recursive: true, force: false });
+  }
+}
+
+function validateRegularComponents(workspace: string, target: string, label: string): void {
+  const rel = relative(workspace, target);
+  const components = rel.split(sep);
+  let current = workspace;
+  for (const component of components.slice(0, -1)) {
+    current = join(current, component);
+    const stat = tryLstat(current);
+    if (!stat) throw new Error(`Verification ${label} parent does not exist: ${current}`);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Verification ${label} path component is unsafe: ${current}`);
+  }
+  const stat = tryLstat(target);
+  if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error(`Verification ${label} is unsafe: ${target}`);
+}
+
+function validateProjectComponents(workspace: string, target: string): void {
+  const rel = relative(workspace, target);
+  const components = rel.split(sep);
+  let current = workspace;
+  for (const component of components) {
+    current = join(current, component);
+    const stat = tryLstat(current);
+    if (!stat) throw new Error(`TypeScript project path does not exist: ${target}`);
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && component !== components.at(-1))) {
+      throw new Error(`TypeScript project path is unsafe: ${target}`);
     }
   }
-  if (!command.cleanOutputRoot) return;
-  const workspace = resolve(command.cwd);
-  const output = resolve(workspace, command.cleanOutputRoot);
-  const relativeOutput = relative(workspace, output).replaceAll("\\", "/");
-  if (!relativeOutput.startsWith(".forgedock/verification-") || relativeOutput.includes("..")) {
-    throw new Error(`Unsafe verification output cleanup path: ${command.cleanOutputRoot}`);
+}
+function tryLstat(path: string): ReturnType<typeof lstatSync> | undefined {
+  try { return lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
-  rmSync(output, { recursive: true, force: true });
+}
+
+function readOperationalMarker(path: string): { schema?: string; identity?: string; pid?: number; token?: string; childPid?: number; childPgid?: number } | undefined {
+  try {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Verification marker is not a regular file: ${path}`);
+    return JSON.parse(readFileSync(path, "utf8")) as { schema?: string; identity?: string; pid?: number; token?: string };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function isLivePid(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+}
+
+function isLiveProcessGroup(pgid: number): boolean {
+  if (process.platform === "win32") return isLivePid(pgid);
+  try { process.kill(-pgid, 0); return true; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw error;
+  }
+}
+
+function updateOperationalMarker(root: string, markerName: string, identity: string, token: string, childPid?: number): void {
+  const markerPath = join(root, markerName);
+  const current = readOperationalMarker(markerPath);
+  if (!current || current.schema !== "forgedock.verification-output/v1" || current.identity !== identity || current.token !== token) {
+    throw new Error(`Verification staging marker changed unexpectedly: ${root}`);
+  }
+  const next = { schema: current.schema, identity: current.identity, pid: current.pid, token: current.token, ...(childPid === undefined ? {} : { childPid, ...(process.platform === "win32" ? {} : { childPgid: childPid }) }) };
+  if (childPid === undefined) delete (next as { childPid?: number; childPgid?: number }).childPid;
+  if (childPid === undefined) delete (next as { childPid?: number; childPgid?: number }).childPgid;
+  const temporary = join(root, `.${markerName}.update-${randomUUID()}`);
+  const descriptor = openSync(temporary, "wx", 0o600);
+  try { writeFileSync(descriptor, JSON.stringify(next)); }
+  finally { closeSync(descriptor); }
+  renameSync(temporary, markerPath);
+}
+function clearOperationalMarker(root: string, markerName: string, identity: string, token: string, childPid?: number): void {
+  const marker = readOperationalMarker(join(root, markerName));
+  if (!marker || marker.childPid !== childPid) throw new Error(`Verification staging marker changed unexpectedly: ${root}`);
+  if ((marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) || (marker.childPid !== undefined && isLivePid(marker.childPid))) {
+    throw new Error(`Verification staging child is still active: ${root}`);
+  }
+  updateOperationalMarker(root, markerName, identity, token);
+}
+
+function cleanupOperationalOutput(root: string, token: string, markerName: string): void {
+  const stat = lstatSync(root);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Verification staging root changed unexpectedly: ${root}`);
+  const markerPath = join(root, markerName);
+  const marker = readOperationalMarker(markerPath);
+  if (!marker || marker.schema !== "forgedock.verification-output/v1" || marker.token !== token) throw new Error(`Verification staging marker changed unexpectedly: ${root}`);
+  if ((marker.childPgid !== undefined && isLiveProcessGroup(marker.childPgid)) || (marker.childPid !== undefined && isLivePid(marker.childPid))) {
+    throw new Error(`Verification staging child is still active: ${root}`);
+  }
+  rmSync(root, { recursive: true, force: false });
 }
 
 async function emitProgress(
@@ -111,7 +339,7 @@ async function emitProgress(
 }
 
 async function acquireVerificationLock(path: string, signal?: AbortSignal): Promise<() => void> {
-  const token = crypto.randomUUID();
+  const token = randomUUID();
   while (true) {
     if (signal?.aborted) throw signal.reason ?? new Error("Verification aborted while waiting for the machine-wide verification lease");
     try {
@@ -173,6 +401,26 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function validateCommandTargets(spec: VerificationCommand): void {
+  if (spec.targeting !== "expected-test-paths") return;
+  const workspace = resolvePath(spec.cwd);
+  for (const target of spec.targets ?? []) {
+    if (!target || target.startsWith("/") || /^[A-Za-z]:[\\/]/.test(target)) throw new Error(`Verification target must be workspace-relative: ${target}`);
+    const absolute = resolvePath(workspace, target);
+    const rel = relative(workspace, absolute);
+    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || rel.split(sep).some((part) => part === "..")) throw new Error(`Verification target escapes workspace: ${target}`);
+    let current = workspace;
+    for (const component of rel.split(sep).slice(0, -1)) {
+      current = join(current, component);
+      const parent = tryLstat(current);
+      if (!parent) throw new Error(`Verification test target parent does not exist: ${target}`);
+      if (parent.isSymbolicLink() || !parent.isDirectory()) throw new Error(`Verification test target path is unsafe: ${target}`);
+    }
+    const stat = tryLstat(absolute);
+    if (!stat) throw new Error(`Verification targeted test does not exist: ${target}`);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Verification targeted test is not a regular file: ${target}`);
+  }
+}
 function verificationResultMetadata(spec: VerificationCommand): Pick<
   CheckResult,
   "command" | "commandId" | "policyVersion" | "commandTargets" | "coveredBy" | "planId"
@@ -187,9 +435,29 @@ function verificationResultMetadata(spec: VerificationCommand): Pick<
   };
 }
 
-function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CheckResult> {
+function runOne(
+  spec: VerificationCommand,
+  environment: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+  ownership?: { token: string; markerName: string; identity: string; root: string },
+): Promise<CheckResult> {
   return new Promise((resolve, reject) => {
     const started = performance.now();
+    try {
+      validateCommandTargets(spec);
+    } catch (error) {
+      const summary = error instanceof Error ? error.message : String(error);
+      resolve({
+        ...verificationResultMetadata(spec),
+        status: "failed",
+        failureClass: "infrastructure",
+        durationMs: Math.max(0, Math.round(performance.now() - started)),
+        outputDigest: createHash("sha256").update(summary).digest("hex"),
+        summary,
+        failureSignatures: [summary],
+      });
+      return;
+    }
     let settled = false;
     let cancelled = false;
     let abortReason: unknown;
@@ -201,6 +469,15 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       windowsHide: true,
       detached: process.platform !== "win32",
     });
+    if (ownership && child.pid) {
+      try { updateOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
+      catch (error) {
+        child.once("close", () => reject(error));
+        terminateProcessTree(child);
+        if (child.exitCode !== null) reject(error);
+        return;
+      }
+    }
     const output = new BoundedOutputCapture();
     const capture = (chunk: Buffer | string) => output.push(chunk);
     child.stdout.on("data", capture);
@@ -230,6 +507,10 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      if (ownership) {
+        try { clearOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
+        catch (markerError) { reject(markerError); return; }
+      }
       if (cancelled) {
         reject(abortReason);
         return;
@@ -252,6 +533,10 @@ function runOne(spec: VerificationCommand, environment: NodeJS.ProcessEnv, signa
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
+      if (ownership) {
+        try { clearOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
+        catch (error) { reject(error); return; }
+      }
       if (cancelled) {
         reject(abortReason);
         return;

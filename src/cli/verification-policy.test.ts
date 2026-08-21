@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
@@ -18,6 +18,8 @@ function writeTypeScriptConfig(repo: string, overrides: Record<string, unknown> 
     compilerOptions: { rootDir: "src", outDir: "dist", ...overrides },
     include: ["src/**/*.ts"],
   }));
+  mkdirSync(join(repo, "node_modules", "typescript", "bin"), { recursive: true });
+  writeFileSync(join(repo, "node_modules", "typescript", "bin", "tsc"), "// test compiler\n");
 }
 
 describe("verification policy discovery", () => {
@@ -105,14 +107,55 @@ describe("verification policy discovery", () => {
     assert.deepEqual(plan.map(({ id }) => id), ["diff-check", "build", "test"]);
     assert.equal(plan.find(({ id }) => id === "build")?.command, process.execPath);
     assert.equal(plan.find(({ id }) => id === "build")?.evidenceCapability, "generic");
-    assert.deepEqual(plan.find(({ id }) => id === "build")?.args, [
-      "node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--outDir", ".forgedock/verification-dist",
-    ]);
-    assert.deepEqual(plan.find(({ id }) => id === "test")?.targets, [".forgedock/verification-dist/feature.test.js"]);
+    const buildArgs = plan.find(({ id }) => id === "build")?.args ?? [];
+    assert.equal(buildArgs.slice(0, 3).join(" "), "node_modules/typescript/bin/tsc -p tsconfig.json");
+    const stagingOutput = buildArgs.at(-1);
+    assert.match(stagingOutput ?? "", /^\.dist\.forgedock-verification-[0-9a-f]{24}$/);
+    assert.deepEqual(plan.find(({ id }) => id === "test")?.targets, [`${stagingOutput}/feature.test.js`]);
     assert.equal(plan.find(({ id }) => id === "test")?.evidenceCapability, "targeted-test");
-    assert.deepEqual(plan.find(({ id }) => id === "test")?.args.slice(-1), [".forgedock/verification-dist/feature.test.js"]);
+    assert.deepEqual(plan.find(({ id }) => id === "test")?.args.slice(-1), [`${stagingOutput}/feature.test.js`]);
     assert.equal(plan.some(({ id }) => id === "docs:build" || id === "lint"), false);
     assert.ok(plan.every(({ policyVersion, planId }) => policyVersion === "forgedock.verification/v2" && Boolean(planId)));
+  });
+
+  it("fails closed for unsupported emitting layouts and retains explicit noEmit gates", () => {
+    const repo = mkdtempSync(join(tmpdir(), "forgedock-policy-unsafe-layout-"));
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json", test: "node --test" } }));
+    writeTypeScriptConfig(repo, { rootDir: undefined });
+    git(repo, "add", "package.json", "tsconfig.json");
+    git(repo, "commit", "-m", "unsafe layout");
+    assert.throws(() => discoverVerificationCommands(repo, "HEAD"), /without a safe project layout/);
+
+    writeFileSync(join(repo, "tsconfig.json"), JSON.stringify({ compilerOptions: { noEmit: true }, include: ["src/**/*.ts"] }));
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json --noEmit", test: "node --test" } }));
+    git(repo, "add", "package.json", "tsconfig.json");
+    git(repo, "commit", "-m", "no emit");
+    const noEmit = discoverVerificationCommands(repo, "HEAD");
+    assert.equal(noEmit.find(({ id }) => id === "build")?.typescriptLayout, undefined);
+    assert.equal(noEmit.find(({ id }) => id === "test"), undefined);
+  });
+
+  it("derives monorepo TypeScript staging beside the project output", () => {
+    const repo = mkdtempSync(join(tmpdir(), "forgedock-policy-monorepo-"));
+    mkdirSync(join(repo, "packages", "foo"), { recursive: true });
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({ scripts: { build: "tsc -p packages/foo/tsconfig.json" } }));
+    mkdirSync(join(repo, "node_modules", "typescript", "bin"), { recursive: true });
+    writeFileSync(join(repo, "node_modules", "typescript", "bin", "tsc"), "// test compiler\n");
+    writeFileSync(join(repo, "packages", "foo", "tsconfig.json"), JSON.stringify({ compilerOptions: { rootDir: "src", outDir: "dist" }, include: ["src/**/*.ts"] }));
+    mkdirSync(join(repo, "packages", "foo", "node_modules", "typescript", "bin"), { recursive: true });
+    writeFileSync(join(repo, "packages", "foo", "node_modules", "typescript", "bin", "tsc"), "// package compiler\n");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "monorepo");
+    const build = discoverVerificationCommands(repo, "HEAD").find(({ id }) => id === "build");
+    assert.equal(build?.args[0], "packages/foo/node_modules/typescript/bin/tsc");
+    assert.equal(build?.typescriptLayout?.project, "packages/foo/tsconfig.json");
+    assert.match(build?.typescriptLayout?.outputRoot ?? "", /^packages\/foo\/\.dist\.forgedock-verification-[0-9a-f]{24}$/);
   });
 
   it("rejects unknown packet commands and unsafe targeted broadening", () => {

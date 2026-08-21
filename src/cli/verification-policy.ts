@@ -2,8 +2,8 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { VerificationCommand } from "../core/ports/verification.js";
 
 export const VERIFICATION_POLICY_VERSION = "forgedock.verification/v2";
@@ -59,13 +59,18 @@ export function discoverVerificationCommands(
   // must not inherit docs, lint, or full-suite scripts merely because they
   // exist in package.json. Prefer one bounded compile gate.
   const compile = discoverTypeIntegrityCommand(scripts);
-  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, compile.args) : undefined;
-  if (compile) {
+  const compiler = compile ? resolveTypeScriptCompiler(cwd, typescriptProject(compile.args)) : undefined;
+  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, compile.args, scripts, compiler) : undefined;
+  const explicitlyNoEmit = compile?.args.some((argument) => argument === "--noEmit" || argument === "--no-emit") ?? false;
+  if (compile && !typescriptLayout && !explicitlyNoEmit) {
+    throw new Error(`Refusing emitting TypeScript verification without a safe project layout: ${compile.id}`);
+  }
+  if (compile && (typescriptLayout || explicitlyNoEmit)) {
     commands.push({
       id: compile.id,
       command: process.execPath,
       args: [
-        "node_modules/typescript/bin/tsc",
+        compiler!,
         ...compile.args,
         ...(typescriptLayout ? ["--outDir", typescriptLayout.outputRoot] : []),
       ],
@@ -101,6 +106,34 @@ export function discoverVerificationCommands(
   return commands.map((command) => ({ ...command, planId: catalogId }));
 }
 
+function typescriptProject(args: readonly string[]): string {
+  const index = args.findIndex((argument) => argument === "-p" || argument === "--project");
+  return index >= 0 && args[index + 1] ? args[index + 1]! : "tsconfig.json";
+}
+
+function resolveTypeScriptCompiler(cwd: string, project: string): string {
+  const workspace = resolve(cwd);
+  let directory = resolve(workspace, dirname(project));
+  const candidates: string[] = [];
+  while (directory.startsWith(workspace)) {
+    candidates.push(join(directory, "node_modules", "typescript", "bin", "tsc"));
+    if (directory === workspace) break;
+    directory = dirname(directory);
+  }
+  for (const candidate of candidates) {
+    try {
+      const stat = lstatSync(candidate);
+      const resolvedCandidate = realpathSync(candidate);
+      if (!stat.isSymbolicLink() && stat.isFile()) {
+        const relativeCompiler = relative(workspace, resolvedCandidate).replaceAll("\\", "/");
+        if (relativeCompiler && !relativeCompiler.startsWith("../")) return relativeCompiler;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error(`Unable to resolve a repository-local TypeScript compiler for ${project}`);
+}
 function discoverTypeIntegrityCommand(
   scripts: Record<string, string>,
 ): { id: "typecheck" | "check" | "build"; args: string[] } | undefined {
@@ -117,12 +150,14 @@ function discoverTypeScriptLayout(
   cwd: string,
   baseRef: string | undefined,
   compileArgs: readonly string[],
-): { sourceRoot: string; outputRoot: string; project: string; configDigest: string } | undefined {
+  scripts: Record<string, string>,
+  compiler: string | undefined,
+): { sourceRoot: string; outputRoot: string; project: string; configDigest: string; configuredOutputRoot: string; stagingIdentity: string; markerName: string } | undefined {
   if (compileArgs.includes("--noEmit") || compileArgs.includes("--no-emit")) return undefined;
   const projectIndex = compileArgs.findIndex((argument) => argument === "-p" || argument === "--project");
   const project = projectIndex >= 0 ? compileArgs[projectIndex + 1] : "tsconfig.json";
   if (!project || !/^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_./-]+\.json$/.test(project)) return undefined;
-  let config: { extends?: unknown; compilerOptions?: { rootDir?: unknown; outDir?: unknown; noEmit?: unknown } };
+  let config: { extends?: unknown; references?: unknown; compilerOptions?: { rootDir?: unknown; outDir?: unknown; noEmit?: unknown } };
   let source: string;
   try {
     source = readRepositoryFile(cwd, project, baseRef);
@@ -130,15 +165,24 @@ function discoverTypeScriptLayout(
   } catch {
     return undefined;
   }
-  if (config.extends !== undefined || config.compilerOptions?.noEmit === true) return undefined;
-  const sourceRoot = normalizedLayoutRoot(config.compilerOptions?.rootDir);
-  const configuredOutput = normalizedLayoutRoot(config.compilerOptions?.outDir);
-  if (!sourceRoot || !configuredOutput) return undefined;
+  if (config.extends !== undefined || config.references !== undefined || config.compilerOptions?.noEmit === true) return undefined;
+  const projectDir = dirname(project);
+  const sourceRoot = typeof config.compilerOptions?.rootDir === "string" ? normalizedLayoutRoot(join(projectDir, config.compilerOptions.rootDir)) : undefined;
+  const configuredOutput = typeof config.compilerOptions?.outDir === "string" ? normalizedLayoutRoot(join(projectDir, config.compilerOptions.outDir)) : undefined;
+  if (!sourceRoot || !configuredOutput || configuredOutput === ".") return undefined;
+  const outputName = basename(configuredOutput);
+  const configDigest = createHash("sha256").update(JSON.stringify({
+    baseRef: baseRef ?? "working-tree", project, source, compiler, scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
+  })).digest("hex").slice(0, 24);
+  const outputRoot = join(dirname(configuredOutput), `.${outputName}.forgedock-verification-${configDigest}`).replaceAll("\\", "/");
   return {
     sourceRoot,
-    outputRoot: ".forgedock/verification-dist",
+    outputRoot,
     project,
     configDigest: createHash("sha256").update(source).digest("hex").slice(0, 16),
+    configuredOutputRoot: configuredOutput,
+    stagingIdentity: configDigest,
+    markerName: ".forgedock-verification-marker.json",
   };
 }
 

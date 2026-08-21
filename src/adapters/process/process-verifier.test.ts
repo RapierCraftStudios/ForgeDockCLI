@@ -1,11 +1,44 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 import { ProcessVerificationRunner, windowsTaskkillSucceeded } from "./process-verifier.js";
+
+function stagingLayout(cwd: string, identity = "test-staging-identity") {
+  const source = JSON.stringify({ compilerOptions: { rootDir: "src", outDir: "dist" }, include: ["src/**/*.ts"] });
+  writeFileSync(join(cwd, "tsconfig.json"), source);
+  return {
+    sourceRoot: "src",
+    outputRoot: ".dist.forgedock-verification-test",
+    configuredOutputRoot: "dist",
+    project: "tsconfig.json",
+    configDigest: createHash("sha256").update(source).digest("hex").slice(0, 16),
+    stagingIdentity: identity,
+    markerName: ".forgedock-verification-marker.json",
+  };
+}
+
+function stagedCommand(cwd: string, id: string, args: string[], layout: ReturnType<typeof stagingLayout>) {
+  return {
+    id, command: process.execPath, args, cwd, timeoutMs: 5_000, required: true,
+    lockScope: "workspace" as const, cleanOutputRoot: layout.outputRoot,
+    typescriptLayout: layout,
+  };
+}
+
+function localCompiler(): string | undefined {
+  let directory = process.cwd();
+  while (true) {
+    const candidate = join(directory, "node_modules", "typescript", "bin", "tsc");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
+}
 
 describe("deterministic process verification", () => {
   it("treats nonzero or indeterminate taskkill status as a failed tree termination", () => {
@@ -30,6 +63,176 @@ describe("deterministic process verification", () => {
     assert.equal(result?.exitCode, 0);
     assert.match(result?.outputDigest ?? "", /^[0-9a-f]{64}$/);
     assert.match(result?.summary ?? "", /verified/);
+  });
+
+  it("does not duplicate frozen targets and continues after malformed targets", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-targets-"));
+    writeFileSync(join(directory, "target.test.js"), "");
+    try {
+      const results = await isolatedRunner().run([
+        {
+          id: "malformed-target", command: process.execPath, args: ["-e", ""], cwd: directory,
+          timeoutMs: 5_000, required: true, lockScope: "workspace", targeting: "expected-test-paths",
+          targets: ["../escape.test.js"],
+        },
+        {
+          id: "single-target", command: process.execPath,
+          args: ["-e", "if(process.argv.filter((value)=>value==='target.test.js').length!==1) process.exit(31)", "target.test.js"],
+          cwd: directory, timeoutMs: 5_000, required: true, lockScope: "workspace",
+          targeting: "expected-test-paths", targets: ["target.test.js"],
+        },
+      ]);
+      assert.equal(results[0]?.status, "failed");
+      assert.equal(results[0]?.failureClass, "infrastructure");
+      assert.equal(results[1]?.status, "passed");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps configured output untouched and removes staging after success and failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-output-"));
+    mkdirSync(join(directory, "dist"));
+    const sentinel = join(directory, "dist", "sentinel.txt");
+    writeFileSync(sentinel, "tracked-output");
+    const layout = stagingLayout(directory);
+    try {
+      const runner = isolatedRunner();
+      const passed = await runner.run([stagedCommand(directory, "success", ["-e", ""], layout)]);
+      assert.equal(passed[0]?.status, "passed");
+      assert.equal(readFileSync(sentinel, "utf8"), "tracked-output");
+      assert.equal(existsSync(join(directory, layout.outputRoot)), false);
+      const failed = await runner.run([stagedCommand(directory, "failure", ["-e", "process.exit(7)"], layout)]);
+      assert.equal(failed[0]?.status, "failed");
+      assert.equal(existsSync(join(directory, layout.outputRoot)), false);
+      const spawned = await runner.run([{
+        ...stagedCommand(directory, "spawn-failure", [], layout), command: "forgedock-command-that-does-not-exist",
+      }]);
+      assert.equal(spawned[0]?.status, "failed");
+      assert.equal(existsSync(join(directory, layout.outputRoot)), false);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("compiles a real TS project into sibling staging and runs an outside-root import", async () => {
+    const compiler = localCompiler();
+    if (!compiler) return;
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-ts-project-"));
+    mkdirSync(join(directory, "src"), { recursive: true });
+    mkdirSync(join(directory, "vendor"), { recursive: true });
+    mkdirSync(join(directory, "dist"), { recursive: true });
+    writeFileSync(join(directory, "dist", "sentinel.txt"), "unchanged");
+    writeFileSync(join(directory, "package.json"), JSON.stringify({ type: "module" }));
+    writeFileSync(join(directory, "vendor", "helper.js"), "import { readFileSync } from 'node:fs'; import { dirname, join } from 'node:path'; import { fileURLToPath } from 'node:url'; const marker = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../.dist.forgedock-verification-real/.forgedock-verification-marker.json'), 'utf8')); export const value = 42; export const markerFenced = Boolean(marker.childPid);\n");
+    writeFileSync(join(directory, "vendor", "helper.d.ts"), "export const value: number; export const markerFenced: boolean;\n");
+    writeFileSync(join(directory, "src", "outside.test.ts"), "import { value, markerFenced } from '../vendor/helper.js'; if (value !== 42 || !markerFenced) throw new Error('staging marker was not fenced');\n");
+    const config = JSON.stringify({ compilerOptions: { rootDir: "src", outDir: "dist", module: "NodeNext", moduleResolution: "NodeNext", target: "ES2022" }, include: ["src/**/*.ts"] });
+    writeFileSync(join(directory, "tsconfig.json"), config);
+    const layout = { sourceRoot: "src", outputRoot: ".dist.forgedock-verification-real", configuredOutputRoot: "dist", project: "tsconfig.json", configDigest: createHash("sha256").update(config).digest("hex").slice(0, 16), stagingIdentity: "real-ts-project", markerName: ".forgedock-verification-marker.json" };
+    const target = `${layout.outputRoot}/outside.test.js`;
+    try {
+      const targetedTest = {
+        id: "targeted-test", command: process.execPath, args: ["--test", "--test-concurrency=4", target], cwd: directory,
+        timeoutMs: 5_000, required: true, lockScope: "workspace" as const, targeting: "expected-test-paths" as const,
+        targets: [target], typescriptLayout: layout,
+      };
+      const results = await new ProcessVerificationRunner({ lockPath: join(directory, "lock") }).run([
+        { ...stagedCommand(directory, "compile", [compiler, "-p", "tsconfig.json", "--outDir", layout.outputRoot], layout), args: [compiler, "-p", "tsconfig.json", "--outDir", layout.outputRoot] },
+        targetedTest,
+      ]);
+      assert.equal(results[0]?.status, "passed");
+      assert.equal(results[1]?.status, "passed");
+      assert.equal(readFileSync(join(directory, "dist", "sentinel.txt"), "utf8"), "unchanged");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("removes staging after abort and still releases the machine lock after cleanup failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-abort-"));
+    const lockPath = join(directory, "machine.lock");
+    const layout = stagingLayout(directory);
+    const controller = new AbortController();
+    try {
+      const run = new ProcessVerificationRunner({ lockPath }).run([stagedCommand(
+        directory, "abort", ["-e", "setInterval(()=>{},1000)"], layout,
+      )], controller.signal);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      controller.abort(new Error("stop verification"));
+      await assert.rejects(run, /stop verification/);
+      assert.equal(existsSync(join(directory, layout.outputRoot)), false);
+
+      const cleanupLayout = stagingLayout(directory, "cleanup-failure");
+      const marker = join(directory, cleanupLayout.outputRoot, cleanupLayout.markerName);
+      const first = new ProcessVerificationRunner({ lockPath }).run([{ ...stagedCommand(
+        directory, "cleanup-failure", ["-e", "require('node:fs').unlinkSync(process.argv[1])", marker], cleanupLayout,
+      ), lockScope: "machine-global" }]);
+      await assert.rejects(first, /marker changed unexpectedly/);
+      const second = await new ProcessVerificationRunner({ lockPath }).run([{
+        id: "after-cleanup-failure", command: process.execPath, args: ["-e", ""], cwd: directory,
+        timeoutMs: 5_000, required: true,
+      }]);
+      assert.equal(second[0]?.status, "passed");
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("keeps concurrent runs on one runner ownership-isolated", async () => {
+    const first = mkdtempSync(join(tmpdir(), "forgedock-verifier-concurrent-a-"));
+    const second = mkdtempSync(join(tmpdir(), "forgedock-verifier-concurrent-b-"));
+    const firstLayout = stagingLayout(first, "concurrent-a");
+    const secondLayout = stagingLayout(second, "concurrent-b");
+    try {
+      const runner = new ProcessVerificationRunner({ lockPath: join(tmpdir(), `forgedock-${randomUUID()}.lock`) });
+      const [a, b] = await Promise.all([
+        runner.run([stagedCommand(first, "a", ["-e", "setTimeout(()=>{},250)"], firstLayout)]),
+        runner.run([stagedCommand(second, "b", ["-e", "setTimeout(()=>{},250)"], secondLayout)]),
+      ]);
+      assert.equal(a[0]?.status, "passed");
+      assert.equal(b[0]?.status, "passed");
+      assert.equal(existsSync(join(first, firstLayout.outputRoot)), false);
+      assert.equal(existsSync(join(second, secondLayout.outputRoot)), false);
+    } finally {
+      rmSync(first, { recursive: true, force: true });
+      rmSync(second, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers only exact stale markers and refuses unknown or live collisions", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-collision-"));
+    const layout = stagingLayout(directory, "collision-identity");
+    const output = join(directory, layout.outputRoot);
+    const marker = join(output, layout.markerName);
+    try {
+      mkdirSync(output, { recursive: true });
+      writeFileSync(marker, JSON.stringify({ schema: "forgedock.verification-output/v1", identity: layout.stagingIdentity, pid: 99999999, token: "stale" }));
+      const runner = isolatedRunner();
+      await runner.recoverOperationalOutput([stagedCommand(directory, "recover", ["-e", ""], layout)]);
+      const pending = join(directory, `.${layout.outputRoot.split("/").at(-1)}.forgedock-verification-pending-crash`);
+      mkdirSync(pending, { recursive: true });
+      writeFileSync(join(pending, layout.markerName), JSON.stringify({ schema: "forgedock.verification-output/v1", identity: layout.stagingIdentity, pid: 99999999, token: "pending" }));
+      await runner.recoverOperationalOutput([stagedCommand(directory, "pending", ["-e", ""], layout)]);
+      assert.equal(existsSync(pending), false);
+      const unmarked = join(directory, `.${layout.outputRoot.split("/").at(-1)}.forgedock-verification-pending-unmarked`);
+      mkdirSync(unmarked, { recursive: true });
+      writeFileSync(join(unmarked, "unknown.txt"), "do not delete");
+      await runner.recoverOperationalOutput([stagedCommand(directory, "unmarked", ["-e", ""], layout)]);
+      assert.equal(existsSync(unmarked), true);
+      rmSync(unmarked, { recursive: true, force: false });
+      const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { cwd: directory, stdio: "ignore" });
+      mkdirSync(output, { recursive: true });
+      writeFileSync(marker, JSON.stringify({ schema: "forgedock.verification-output/v1", identity: layout.stagingIdentity, pid: 99999999, token: "child-live", childPid: child.pid, childPgid: child.pid }));
+      await assert.rejects(runner.recoverOperationalOutput([stagedCommand(directory, "child-live", ["-e", ""], layout)]), /child|collision/i);
+      child.kill();
+      await new Promise<void>((resolve) => child.once("close", () => resolve()));
+      await runner.recoverOperationalOutput([stagedCommand(directory, "child-dead", ["-e", ""], layout)]);
+      assert.equal(existsSync(output), false);
+
+      rmSync(output, { recursive: true, force: true });
+      mkdirSync(output, { recursive: true });
+      writeFileSync(join(output, "unknown.txt"), "unknown");
+      await assert.rejects(runner.prepareOperationalOutput([stagedCommand(directory, "unknown", ["-e", ""], layout)]), /Unknown verification staging collision/);
+      rmSync(output, { recursive: true, force: true });
+      symlinkSync(join(directory, "missing-target"), output);
+      await assert.rejects(runner.recoverOperationalOutput([stagedCommand(directory, "dangling", ["-e", ""], layout)]), /unsafe|collision/i);
+      assert.equal(lstatSync(output).isSymbolicLink(), true);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it("executes every required command even when coverage metadata is present", async () => {

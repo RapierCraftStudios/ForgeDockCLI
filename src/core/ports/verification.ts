@@ -29,7 +29,15 @@ export interface VerificationCommand {
   /** Controller-owned target expansion; never inferred from package script text. */
   targeting?: "expected-test-paths";
   /** Proven frozen TypeScript source/output mapping for targeted tests. */
-  typescriptLayout?: { sourceRoot: string; outputRoot: string; project: string; configDigest: string };
+  typescriptLayout?: {
+    sourceRoot: string;
+    outputRoot: string;
+    project: string;
+    configDigest: string;
+    configuredOutputRoot?: string;
+    stagingIdentity?: string;
+    markerName?: string;
+  };
   /** Operational output directory removed immediately before this command. */
   cleanOutputRoot?: string;
   /** Old commands default to the conservative machine-global lease. */
@@ -55,4 +63,8 @@ export interface VerificationRunner {
     signal?: AbortSignal,
     onProgress?: VerificationProgressCallback,
   ): Promise<CheckResult[]>;
+  /** Prepare controller-owned compiler output before workspace cleanliness gates. */
+  prepareOperationalOutput?(commands: readonly VerificationCommand[]): Promise<void>;
+  /** Remove only stale directories carrying an exact controller marker. */
+  recoverOperationalOutput?(commands: readonly VerificationCommand[]): Promise<void>;
 }

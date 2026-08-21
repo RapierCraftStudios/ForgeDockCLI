@@ -859,6 +859,7 @@ export async function workOn(
       baseRef: `origin/${deliveryBranch}`,
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
+    await dependencies.verifier.recoverOperationalOutput?.(input.verification.map((command) => ({ ...command, cwd: workspace!.path })));
     const laneTarget = input.parentRemediation
       ? { ...runTargetForLane(input.lane, input.productionTarget), targetBranch: input.parentRemediation.parentBranch }
       : runTargetForLane(input.lane, input.productionTarget);

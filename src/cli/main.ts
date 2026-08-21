@@ -941,6 +941,7 @@ async function workOn(
         const workspace = await git.recover({ runId: resumeRunId, issue: issue.number, baseRef: `origin/${deliveryTargetBranch}` });
         if (!workspace.baseSha) throw new Error("Early recovery requires an exact workspace base SHA");
         const verification = discoverVerificationCommands(process.cwd(), workspace.baseSha);
+        await verifier.recoverOperationalOutput?.(verification.map((command) => ({ ...command, cwd: workspace.path })));
         process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
         const result = await resumeEarlyWorkOn({
           checkpoint: admission.checkpoint,
@@ -1159,6 +1160,9 @@ async function workOn(
       if (admission.checkpoint !== "completion") {
         if (!workspace?.baseSha) throw new Error("Durable verification recovery requires an exact workspace base SHA");
         verification = discoverDurableVerification(process.cwd(), workspace.baseSha);
+      }
+      if (admission.checkpoint !== "completion" && workspace) {
+        await verifier.recoverOperationalOutput?.(verification.map((command) => ({ ...command, cwd: workspace!.path })));
       }
       process.stdout.write(`${statusGlyph("active", mode)} Resuming ${resumeRunId} from its durable ${admission.checkpoint} checkpoint; completed semantic phases will not replay\n`);
       const common = {
