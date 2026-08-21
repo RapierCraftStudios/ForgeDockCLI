@@ -132,7 +132,7 @@ function isBasenameCompanion(candidate: string, hints: readonly string[]): boole
 
 function isTestLike(path: string): boolean {
   const basename = path.split("/").at(-1) ?? "";
-  const withoutExtension = basename.replace(/\.[^.]+$/, "");
+  const withoutExtension = basename.replace(/\.d\.[^.]+$/i, "").replace(/\.[^.]+$/, "");
   return TEST_SUFFIX.test(withoutExtension);
 }
 
@@ -219,6 +219,6 @@ function stripModuleExtension(path: string): string {
 
 function logicalBasename(path: string): string {
   const basename = path.split("/").at(-1) ?? "";
-  const withoutExtension = basename.replace(/\.[^.]+$/, "");
+  const withoutExtension = basename.replace(/\.d\.[^.]+$/i, "").replace(/\.[^.]+$/, "");
   return withoutExtension.replace(TEST_SUFFIX, "").toLowerCase();
 }

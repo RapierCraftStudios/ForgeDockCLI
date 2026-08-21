@@ -45,6 +45,14 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
+  it("recognizes multi-extension declaration companions", async () => {
+    const result = await closeExpectedWriteScope(["vendor/pi-runtime/dist/core/tools/ls.d.ts"], {
+      issueWriteHints: ["vendor/pi-runtime/dist/core/tools/ls.js"],
+    });
+    assert.deepEqual(result.expectedPaths, ["vendor/pi-runtime/dist/core/tools/ls.d.ts", "vendor/pi-runtime/dist/core/tools/ls.js"]);
+    assert.deepEqual(result.rejectedPaths, []);
+  });
+
   it("proves collateral tests through normalized relative TypeScript imports", async () => {
     const result = await closeExpectedWriteScope([
       "src/workflows/orchestrate/scheduler.test.ts",

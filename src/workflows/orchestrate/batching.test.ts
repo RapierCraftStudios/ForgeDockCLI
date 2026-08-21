@@ -169,13 +169,16 @@ describe("orchestration work-unit batching", () => {
     const body = [
       "## Affected Files",
       "- `src/workflows/orchestrate/node-lease.ts` — src/workflows/orchestrate/node-lease.ts:34-42; src/core/ports/lease.ts:4-13; src/adapters/sqlite/sqlite-repositories.ts:442-448",
+      "- `vendor/pi-runtime/dist/core/tools/ls.js` — declaration mismatch at vendor/pi-runtime/dist/core/tools/ls.d.ts:10-13",
       "## Evidence",
       "Do not authorize src/unrelated/outside.ts from another section.",
     ].join("\n");
     assert.deepEqual(affectedFilesFromIssueBody(body), [
       "src/workflows/orchestrate/node-lease.ts",
+      "vendor/pi-runtime/dist/core/tools/ls.js",
       "src/core/ports/lease.ts",
       "src/adapters/sqlite/sqlite-repositories.ts",
+      "vendor/pi-runtime/dist/core/tools/ls.d.ts",
     ]);
   });
 

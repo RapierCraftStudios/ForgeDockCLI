@@ -22,19 +22,30 @@ describe("relation checkpoint certification", () => {
       const seeds = [{ path: "src-a.ts", provenance: "issue" as const, contentDigest: seedNode.digest! }];
       const graph = buildRelationGraph({ baseSha: "a".repeat(40), seeds, facts, limits });
       const closure = closeRelationGraph(graph);
+      const commandPlan = {
+        verificationPolicyVersion: "forgedock.verification/v2",
+        verificationCommandTargets: [{ id: "build", targets: [] }],
+        verificationCommandIdentities: [{ id: "build", command: "npm", args: ["run", "build"], evidenceCapability: "generic" as const, identityDigest: digestRelation("npm run build") }],
+      };
+      const authoritativeClosure = {
+        ...closure,
+        commandIds: ["build"],
+        closureDigest: digestRelation({ graphDigest: graph.graphDigest, writablePaths: closure.writablePaths, evidencePaths: closure.evidencePaths, invariantIds: closure.invariantIds, commandIds: ["build"] }),
+      };
       const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
-      const commandPlanDigest = graphCommandPlanDigest({});
+      const commandPlanDigest = graphCommandPlanDigest(commandPlan);
       const evidenceContractDigest = graphEvidenceContractDigest(undefined);
-      const checkpoint = relationGraphCheckpointPayload({ graph, closure, configDigest, commandPlanDigest, evidenceContractDigest });
+      const checkpoint = relationGraphCheckpointPayload({ graph, closure: authoritativeClosure, configDigest, commandPlanDigest, evidenceContractDigest });
       const packet = {
         relationGraph: {
           version: "forgedock.relation-graph/v1" as const, baseSha: graph.baseSha, graphDigest: graph.graphDigest,
-          configDigest, closureDigest: closure.closureDigest, commandPlanDigest, evidenceContractDigest,
+          configDigest, closureDigest: authoritativeClosure.closureDigest, commandPlanDigest, evidenceContractDigest,
           checkpointId: checkpoint.checkpointId, checkpointDigest: checkpoint.checkpointDigest,
-          writablePaths: closure.writablePaths, evidencePaths: closure.evidencePaths,
-          invariantIds: closure.invariantIds, commandIds: closure.commandIds,
+          writablePaths: authoritativeClosure.writablePaths, evidencePaths: authoritativeClosure.evidencePaths,
+          invariantIds: authoritativeClosure.invariantIds, commandIds: authoritativeClosure.commandIds,
         },
-        expectedPaths: closure.writablePaths, evidencePaths: [],
+        expectedPaths: authoritativeClosure.writablePaths, evidencePaths: [],
+        ...commandPlan,
       };
       await certifyRelationGraphCheckpoint({ checkpoint, packet, cwd, baseSha: "a".repeat(40), adapters: [adapter] });
       await writeFile(join(cwd, "src-b.js"), "export const b = false;");

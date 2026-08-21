@@ -55,7 +55,7 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   assertEqualPaths(checkpointClosure.writablePaths, checkpoint.writablePaths, "writable closure");
   assertEqualPaths(checkpointClosure.evidencePaths, checkpoint.evidencePaths, "evidence closure");
   assertEqualPaths(checkpointClosure.invariantIds, checkpoint.invariantIds, "invariant closure");
-  assertEqualPaths(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
+  assertAuthorizedSubset(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
 
   const adapters = input.adapters ?? repositoryAdaptersFor(["monorepo"]);
   const facts = [];
@@ -67,7 +67,7 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   assertEqualPaths(freshClosure.writablePaths, checkpoint.writablePaths, "fresh writable closure");
   assertEqualPaths(freshClosure.evidencePaths, checkpoint.evidencePaths, "fresh evidence closure");
   assertEqualPaths(freshClosure.invariantIds, checkpoint.invariantIds, "fresh invariant closure");
-  assertEqualPaths(freshClosure.commandIds, checkpoint.commandIds, "fresh command closure");
+  assertAuthorizedSubset(freshClosure.commandIds, checkpoint.commandIds, "fresh command closure");
 
   const expectedClosureDigest = digestRelation({ graphDigest: checkpoint.graphDigest, writablePaths: checkpoint.writablePaths, evidencePaths: checkpoint.evidencePaths, invariantIds: checkpoint.invariantIds, commandIds: checkpoint.commandIds });
   if (expectedClosureDigest !== checkpoint.closureDigest) throw new Error("[graph-tamper] Relation graph closure digest does not match its paths");
@@ -96,6 +96,12 @@ export function checkpointGraph(checkpoint: RelationGraphCheckpointPayload): Rel
     limits: { ...checkpoint.limits },
     graphDigest: checkpoint.graphDigest,
   };
+}
+
+function assertAuthorizedSubset(actual: readonly string[], authority: readonly string[], label: string): void {
+  const allowed = new Set(authority);
+  const unexpected = [...new Set(actual)].filter((value) => !allowed.has(value)).sort();
+  if (unexpected.length) throw new Error(`[graph-drift] Relation graph ${label} exceeds its frozen authority: ${unexpected.join(", ")}`);
 }
 
 function assertEqualPaths(actual: readonly string[], expected: readonly string[], label: string): void {

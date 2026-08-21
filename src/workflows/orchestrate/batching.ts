@@ -333,7 +333,7 @@ export function affectedFilesFromIssueBody(body: string): string[] {
   // additional controller-authorized callers/tests as plain source locations
   // after an em dash. Retain every concrete repository path in this scoped
   // section instead of silently granting only the first Markdown token.
-  const plain = [...section.matchAll(/\b((?:src|test|tests|docs|scripts|packages|bin|commands|agents)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+)(?=[:\s,;)])/g)]
+  const plain = [...section.matchAll(/\b([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+\.[A-Za-z0-9]+)(?=[:\s,;)])/g)]
     .map((match) => match[1]!.trim());
   return unique([...backticked, ...plain].map(normalizeAffectedPath).filter((path): path is string => path !== undefined));
 }
