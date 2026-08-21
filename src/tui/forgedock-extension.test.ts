@@ -2320,6 +2320,16 @@ test("repository-qualified decomposition IDs preserve same-number root and child
   assert.notEqual(decompositionIssueRouteKey("owner/root", 7), decompositionIssueRouteKey("owner/parent", 7));
 });
 
+test("CLI route state isolates same-number root and decomposition child routes", () => {
+  const routes = new Map<string, { repository: string; lane: string }>();
+  routes.set(decompositionIssueRouteKey("owner/root", 7), { repository: "owner/root", lane: "root-main" });
+  routes.set(decompositionIssueRouteKey(" OWNER/PARENT ", 7), { repository: "owner/parent", lane: "parent-main" });
+
+  assert.deepEqual(routes.get(decompositionIssueRouteKey("owner/root", 7)), { repository: "owner/root", lane: "root-main" });
+  assert.deepEqual(routes.get(decompositionIssueRouteKey("owner/parent", 7)), { repository: "owner/parent", lane: "parent-main" });
+  assert.equal(routes.size, 2);
+});
+
 test("visible decomposition keeps non-root repository identity on initial and resumed materialization", async () => {
   const repositoryReads: string[] = [];
   const artifactReads: Array<{ repo: string; issue: number }> = [];
