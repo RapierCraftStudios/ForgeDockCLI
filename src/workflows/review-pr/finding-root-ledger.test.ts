@@ -42,7 +42,7 @@ function finding(id: string, family: "marker" | "identity" | "terminal", paraphr
     } : {
       title: "Controller adapter streams collide after producer recreation",
       causalRoot: "adapter identity isolation omits session owner",
-      evidence: "ControllerObservationAdapter.emit() shares continuation state after lifecycle recreation.",
+      evidence: "ControllerObservationAdapter.emit() shares lifecycle state after lifecycle recreation.",
       trigger: "Two interleaved node identities use the default producer.",
       invariant: "Adapter identity isolation survives lifecycle refresh.",
     },
@@ -137,6 +137,117 @@ describe("durable finding root ledger", () => {
     const next = reconcileFindingRootLedger({ previous, packet, findings: [combined], headSha: head2 });
     assert.equal(next.length, 2);
     assert.deepEqual(new Set(next.map((root) => root.triggerFamily)), new Set(["terminal-metadata", "terminal-metadata+adapter-lifecycle"]));
+  });
+
+  it("keeps current adapter-only and terminal-only roots distinct", () => {
+    const terminal = finding("terminal-only-current", "terminal");
+    const adapter = {
+      ...terminal,
+      id: "adapter-only-current",
+      evidence: "observeAgentEvent() uses adapter lifecycle recreation.",
+      impact: { ...terminal.impact!, trigger: "Adapter lifecycle recreation." },
+    };
+    const initial = reconcileFindingRootLedger({ packet, findings: [terminal], headSha: head1 });
+    const previous = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: initial },
+    });
+    const next = reconcileFindingRootLedger({ previous, packet, findings: [adapter], headSha: head2 });
+    assert.equal(next.length, 2);
+    assert.deepEqual(new Set(next.map((root) => root.triggerFamily)), new Set(["terminal-metadata", "adapter-lifecycle"]));
+  });
+
+  it("reads legacy family encodings when reconciling a persisted root", () => {
+    const terminal = finding("legacy-terminal", "terminal");
+    const current = reconcileFindingRootLedger({ packet, findings: [terminal], headSha: head1 });
+    const persisted = {
+      ...current[0]!,
+      rootId: "root-legacy-terminal",
+      structuralKey: "legacy-terminal-key",
+      invariantFamily: "adapter-lifecycle+terminal-metadata",
+      failureFamily: "adapter-lifecycle+terminal-metadata",
+      triggerFamily: "adapter-lifecycle+terminal-metadata",
+    };
+    const previous = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: [persisted] },
+    });
+    const next = reconcileFindingRootLedger({ previous, packet, findings: [terminal], headSha: head2 });
+    assert.equal(next.length, 1);
+    assert.equal(next[0]?.rootId, "root-legacy-terminal");
+  });
+
+  it("matches actual old canonical stream, cleanup, and drop encodings", () => {
+    for (const [word, oldFamily] of [["stream", "chunk-boundary"], ["cleanup", "adapter-lifecycle"], ["drop", "backpressure"], ["fail-closed", "backpressure"]] as const) {
+      const value = {
+        ...finding(`legacy-${word}`, "marker"),
+        title: word,
+        causalRoot: word,
+        evidence: word,
+        remediation: word,
+        intentRelevance: word,
+        impact: { ...finding(`legacy-${word}-base`, "marker").impact!, affectedInvariant: word, trigger: word },
+      };
+      const current = reconcileFindingRootLedger({ packet, findings: [value], headSha: head1 });
+      const persisted = {
+        ...current[0]!, rootId: `root-old-${word}`, structuralKey: `old-${word}`,
+        invariantFamily: oldFamily, failureFamily: oldFamily, triggerFamily: oldFamily,
+      };
+      const previous = createArtifact({
+        kind: "FindingRootLedger", runId, subject: { ...subject, pr: 369 }, producer: { role: "controller" },
+        payload: { checkpoint: "finding-root-ledger", pullRequest: 369, headSha: head1, epoch: 1, roots: [persisted] },
+      });
+      const next = reconcileFindingRootLedger({ previous, packet, findings: [value], headSha: head2 });
+      assert.equal(next.length, 1, word);
+      assert.equal(next[0]?.rootId, `root-old-${word}`);
+    }
+  });
+
+  it("does not classify substring lookalikes as vocabulary families", () => {
+    const lookalike = {
+      ...finding("lookalike", "marker"),
+      title: "router and tokenizer wording",
+      causalRoot: "enqueue path routes a tokenizer result",
+      evidence: "router enqueue tokenizer",
+      remediation: "Apply the observed correction.",
+      intentRelevance: "A prose-only diagnostic.",
+      impact: {
+        ...finding("lookalike-base", "marker").impact!,
+        affectedInvariant: "router enqueue tokenizer",
+        trigger: "router enqueue tokenizer",
+      },
+    };
+    const normalized = structuralFindingRoot(lookalike, packet);
+    assert.match(normalized.invariantFamily, /router/);
+    assert.doesNotMatch(normalized.invariantFamily, /authority-binding|backpressure|redaction-grammar/);
+    assert.doesNotMatch(normalized.triggerFamily, /authority-binding|backpressure|redaction-grammar/);
+  });
+
+  it("retains unknown fallback suffix identity beyond the bounded prefix", () => {
+    const base = finding("unknown-base", "marker");
+    const make = (suffix: string) => ({
+      ...base,
+      id: `unknown-${suffix}`,
+      title: "Unclassified observation",
+      causalRoot: "unclassified observation",
+      remediation: "Apply the observed correction.",
+      impact: { ...base.impact!, affectedInvariant: "unclassified observation", trigger: `alpha bravo charlie delta echo foxtrot golf hotel ${suffix}` },
+      evidence: "normalizeObservationDraft() observes an unclassified event.",
+    });
+    const first = structuralFindingRoot(make("india"), packet);
+    const second = structuralFindingRoot(make("juliett"), packet);
+    assert.notEqual(first.triggerFamily, second.triggerFamily);
+    const ordered = "alpha bravo charlie delta echo foxtrot golf hotel india";
+    const reordered = {
+      ...make("india"),
+      impact: { ...make("india").impact!, trigger: ordered.split(" ").reverse().join(" ") },
+    };
+    assert.equal(first.triggerFamily, structuralFindingRoot(reordered, packet).triggerFamily);
+    const long = (suffix: string) => ({
+      ...make("india"),
+      impact: { ...make("india").impact!, trigger: `alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike november oscar papa ${suffix}` },
+    });
+    assert.notEqual(structuralFindingRoot(long("quebec"), packet).triggerFamily, structuralFindingRoot(long("romeo"), packet).triggerFamily);
   });
 
   it("carries omitted open roots until explicit closure evidence exists", () => {

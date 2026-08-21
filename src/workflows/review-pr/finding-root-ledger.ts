@@ -33,9 +33,11 @@ export function reconcileFindingRootLedger(input: {
 
   for (const finding of input.findings) {
     const structural = structuralFindingRoot(finding, input.packet);
-    const root = prior.get(structural.rootId)
-      ?? aliases.get(structural.structuralKey)
-      ?? [...prior.values()].find((candidate) => structurallyEquivalent(candidate, structural));
+    const legacyStructural = legacyStructuralFindingRoot(finding, input.packet);
+    const candidates = [structural, legacyStructural];
+    const root = candidates.map((candidate) => prior.get(candidate.rootId)).find(isFindingRoot)
+      ?? candidates.map((candidate) => aliases.get(candidate.structuralKey)).find(isFindingRoot)
+      ?? [...prior.values()].find((candidate) => candidates.some((alternative) => structurallyEquivalent(candidate, alternative)));
     const state = finding.scopeDisposition === "rejected" ? "rejected"
       : finding.scopeDisposition === "follow_up" ? "follow-up"
         : root?.state === "fixed" ? "regressed" : "open";
@@ -107,15 +109,31 @@ export function structuralFindingRoot(
   finding: LedgerFinding,
   packet: DurableArtifact<"BuildPacket">,
 ): Pick<FindingRoot, "rootId" | "structuralKey" | "criterionIds" | "component" | "symbols" | "invariantFamily" | "failureFamily" | "triggerFamily"> {
+  return structuralFindingRootWithFamily(finding, packet, (value, dimension) => semanticFamily(value, dimension));
+}
+
+/** Reconstruct the pre-61 identity only for matching historical roots. */
+function legacyStructuralFindingRoot(
+  finding: LedgerFinding,
+  packet: DurableArtifact<"BuildPacket">,
+): ReturnType<typeof structuralFindingRoot> {
+  return structuralFindingRootWithFamily(finding, packet, (value) => legacySemanticFamily(value));
+}
+
+function structuralFindingRootWithFamily(
+  finding: LedgerFinding,
+  packet: DurableArtifact<"BuildPacket">,
+  family: (value: string, dimension: SemanticDimension) => string,
+): ReturnType<typeof structuralFindingRoot> {
   const criterionIds = criterionIdsForFinding(finding, packet);
   const component = componentForFinding(finding);
   const symbols = symbolsForFinding(finding);
   const invariantSource = finding.impact?.affectedInvariant?.trim()
     ? finding.impact.affectedInvariant
     : `${finding.intentRelevance}\n${finding.matchedAcceptanceCriteria?.join("\n") ?? ""}`;
-  const invariantFamily = semanticFamily(invariantSource, "invariant");
-  const failureFamily = semanticFamily(`${finding.causalRoot ?? ""}\n${finding.title}\n${finding.remediation}`, "failure");
-  const triggerFamily = semanticFamily(`${finding.impact?.trigger ?? ""}\n${finding.evidence}`, "trigger");
+  const invariantFamily = family(invariantSource, "invariant");
+  const failureFamily = family(`${finding.causalRoot ?? ""}\n${finding.title}\n${finding.remediation}`, "failure");
+  const triggerFamily = family(`${finding.impact?.trigger ?? ""}\n${finding.evidence}`, "trigger");
   const structuralKey = [criterionIds.join("|"), component, symbols.join("|"), invariantFamily, failureFamily, triggerFamily].join("\n");
   return {
     rootId: `root-${createHash("sha256").update(structuralKey).digest("hex").slice(0, 20)}`,
@@ -168,34 +186,34 @@ type SemanticDimension = "invariant" | "failure" | "trigger";
 interface VocabularyEntry { name: string; pattern: RegExp; }
 const NORMALIZATION_VOCABULARY: Record<SemanticDimension, readonly VocabularyEntry[]> = {
   invariant: [
-    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
-    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
-    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
-    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
-    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
-    { name: "backpressure", pattern: /backpressure|queue/ },
-    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
-    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+    { name: "redaction-grammar", pattern: /\b(?:redact|redacts|redacted|redacting|redaction|credential|credentials|secret|secrets|token|tokens|tokenized|tokenization|password|passwords|marker|markers|userinfo)\b/ },
+    { name: "identity-isolation", pattern: /\b(?:identity|identities|session|sessions|nodeid|nodeids|pisession|pisessions|collision|collisions|interleav|interleaved|interleaving|isolation|isolated)\b/ },
+    { name: "terminal-metadata", pattern: /\b(?:terminal|terminals|completed|complete|completes|failed|failure|cancelled|canceled|metadata|ordering|ordered)\b/ },
+    { name: "adapter-lifecycle", pattern: /\b(?:adapter|adapters|lifecycle|lifecycles|recreate|recreates|recreated|recreating|recreation|recreations|producer|producers)\b/ },
+    { name: "chunk-boundary", pattern: /\b(?:chunk|chunks|split|splits|splitter|fragment|fragments|continuation|continuations)\b/ },
+    { name: "backpressure", pattern: /\b(?:backpressure|queue|queues|queued|queuing)\b/ },
+    { name: "authority-binding", pattern: /\b(?:authority|authorities|head sha|revision|revisions|route|routes|routed|routing|binding|bindings)\b/ },
+    { name: "criterion-evidence", pattern: /\b(?:criterion|criteria|acceptance evidence|verification command|check id)\b/ },
   ],
   failure: [
-    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
-    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
-    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
-    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
-    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
-    { name: "backpressure", pattern: /backpressure|queue/ },
-    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
-    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+    { name: "redaction-grammar", pattern: /\b(?:redact|redacts|redacted|redacting|redaction|credential|credentials|secret|secrets|token|tokens|tokenized|tokenization|password|passwords|marker|markers|userinfo)\b/ },
+    { name: "identity-isolation", pattern: /\b(?:identity|identities|session|sessions|nodeid|nodeids|pisession|pisessions|collision|collisions|interleav|interleaved|interleaving|isolation|isolated)\b/ },
+    { name: "terminal-metadata", pattern: /\b(?:terminal|terminals|completed|complete|completes|failed|failure|cancelled|canceled|metadata|ordering|ordered)\b/ },
+    { name: "adapter-lifecycle", pattern: /\b(?:adapter|adapters|lifecycle|lifecycles|recreate|recreates|recreated|recreating|recreation|recreations|producer|producers)\b/ },
+    { name: "chunk-boundary", pattern: /\b(?:chunk|chunks|split|splits|splitter|fragment|fragments|continuation|continuations)\b/ },
+    { name: "backpressure", pattern: /\b(?:backpressure|queue|queues|queued|queuing)\b/ },
+    { name: "authority-binding", pattern: /\b(?:authority|authorities|head sha|revision|revisions|route|routes|routed|routing|binding|bindings)\b/ },
+    { name: "criterion-evidence", pattern: /\b(?:criterion|criteria|acceptance evidence|verification command|check id)\b/ },
   ],
   trigger: [
-    { name: "redaction-grammar", pattern: /redact|credential|secret|token|password|marker|userinfo/ },
-    { name: "chunk-boundary", pattern: /chunk|split|fragment|continuation/ },
-    { name: "identity-isolation", pattern: /identity|session|nodeid|pisession|collision|interleav|isolation/ },
-    { name: "terminal-metadata", pattern: /terminal|completed|failed|cancelled|metadata|ordering/ },
-    { name: "adapter-lifecycle", pattern: /adapter|lifecycle|recreat|producer/ },
-    { name: "backpressure", pattern: /backpressure|queue/ },
-    { name: "authority-binding", pattern: /authority|head sha|revision|route|binding/ },
-    { name: "criterion-evidence", pattern: /criterion|acceptance evidence|verification command|check id/ },
+    { name: "redaction-grammar", pattern: /\b(?:redact|redacts|redacted|redacting|redaction|credential|credentials|secret|secrets|token|tokens|tokenized|tokenization|password|passwords|marker|markers|userinfo)\b/ },
+    { name: "chunk-boundary", pattern: /\b(?:chunk|chunks|split|splits|splitter|fragment|fragments|continuation|continuations)\b/ },
+    { name: "identity-isolation", pattern: /\b(?:identity|identities|session|sessions|nodeid|nodeids|pisession|pisessions|collision|collisions|interleav|interleaved|interleaving|isolation|isolated)\b/ },
+    { name: "terminal-metadata", pattern: /\b(?:terminal|terminals|completed|complete|completes|failed|failure|cancelled|canceled|metadata|ordering|ordered)\b/ },
+    { name: "adapter-lifecycle", pattern: /\b(?:adapter|adapters|lifecycle|lifecycles|recreate|recreates|recreated|recreating|recreation|recreations|producer|producers)\b/ },
+    { name: "backpressure", pattern: /\b(?:backpressure|queue|queues|queued|queuing)\b/ },
+    { name: "authority-binding", pattern: /\b(?:authority|authorities|head sha|revision|revisions|route|routes|routed|routing|binding|bindings)\b/ },
+    { name: "criterion-evidence", pattern: /\b(?:criterion|criteria|acceptance evidence|verification command|check id)\b/ },
   ],
 };
 
@@ -207,11 +225,34 @@ function semanticFamily(value: string, dimension: SemanticDimension): string {
   // Boundary words in prose commonly qualify a domain family ("credential
   // chunk", "identity stream"). Treat them as an independent trigger only
   // in the trigger dimension, where that distinction is causal.
-  const hasExplicitBoundary = /\b(?:chunk|split|fragment)\b/.test(text);
+  const hasExplicitBoundary = /\b(?:chunk|chunks|split|splits|splitter|fragment|fragments|continuation|continuations)\b/.test(text);
   const normalized = matched.length <= 1 || (dimension === "trigger" && hasExplicitBoundary)
     ? matched
     : matched.filter((family) => family !== "chunk-boundary");
   if (normalized.length) return normalized.join("+");
+  const tokens = text.replace(/[^a-z0-9]+/g, " ").split(" ")
+    .filter((token) => token.length > 2 || /^\d+$/.test(token)).sort();
+  if (tokens.length === 0) return "unspecified";
+  // Keep the fallback bounded without making tokens after an arbitrary prefix
+  // invisible to identity. The digest makes every discarded suffix relevant.
+  return `${tokens.slice(0, 16).join("-")}-${createHash("sha256").update(tokens.join("\n")).digest("hex").slice(0, 16)}`;
+}
+
+/** Exact pre-61 vocabulary, used only as a compatibility candidate. */
+function legacySemanticFamily(value: string): string {
+  const text = value.toLowerCase();
+  const families: Array<[string, RegExp]> = [
+    ["redaction-grammar", /redact|credential|secret|token|password|marker|userinfo/],
+    ["chunk-boundary", /chunk|split|fragment|continuation|stream/],
+    ["adapter-lifecycle", /adapter|lifecycle|recreat|producer|cleanup|terminal/],
+    ["identity-isolation", /identity|session|nodeid|pisession|collision|interleav|isolation/],
+    ["terminal-metadata", /terminal|completed|failed|cancelled|metadata|ordering/],
+    ["backpressure", /backpressure|drop|queue|fail.closed/],
+    ["authority-binding", /authority|head sha|revision|route|binding/],
+    ["criterion-evidence", /criterion|acceptance evidence|verification command|check id/],
+  ];
+  const matched = families.filter(([, pattern]) => pattern.test(text)).map(([name]) => name);
+  if (matched.length) return matched.slice(0, 3).join("+");
   return text.replace(/[^a-z0-9]+/g, " ").split(" ")
     .filter((token) => token.length > 2 || /^\d+$/.test(token)).sort().slice(0, 8).join("-") || "unspecified";
 }
@@ -241,4 +282,5 @@ function cloneRoot(root: FindingRoot): FindingRoot {
 }
 function intersects(left: readonly string[], right: readonly string[]): boolean { return left.some((value) => right.includes(value)); }
 function unique<T>(values: readonly T[]): T[] { return [...new Set(values)]; }
+function isFindingRoot(value: FindingRoot | undefined): value is FindingRoot { return value !== undefined; }
 function isString(value: string | undefined): value is string { return typeof value === "string" && value.trim().length > 0; }
