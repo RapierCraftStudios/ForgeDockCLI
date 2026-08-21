@@ -527,11 +527,13 @@ async function deriveRelationGraphMetadata(
   if (writablePaths.some((path) => !closure.writablePaths.includes(path))) {
     throw new PacketAuthorCorrectableError(["[graph-closure] Packet writable paths exceed the authoritative relation closure"]);
   }
-  const missingEvidence = finalEvidencePaths.filter((path) => !availableFiles.has(path));
-  if (missingEvidence.length) {
-    throw new PacketAuthorCorrectableError([`[graph-evidence] Packet evidence paths lack authoritative repository bytes: ${missingEvidence.sort().join(", ")}`]);
-  }
-  const evidencePaths = [...new Set([...closure.evidencePaths, ...finalEvidencePaths])].sort();
+  // RelationGraph is shadow authority during rollout. Evidence declarations
+  // already passed controller read-scope validation above; an adapter reaching
+  // its bounded scan limit must not turn an existing read-only evidence path
+  // into a packet-author failure. Include only graph-observed evidence here and
+  // retain the complete packet evidence contract independently.
+  const graphObservedEvidence = finalEvidencePaths.filter((path) => availableFiles.has(path));
+  const evidencePaths = [...new Set([...closure.evidencePaths, ...graphObservedEvidence])].sort();
   const commandIds = policyMetadata.verificationCommandIdentities?.map(({ id }) => id).sort() ?? closure.commandIds;
   const invariantIds = closure.invariantIds;
   const configDigest = graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits });
