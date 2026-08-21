@@ -356,9 +356,9 @@ export class ForgeDockBackgroundTasks {
           const events = await this.#observationQuery.query({
             controllerTaskId: id,
             ...(observationCursorInitialized && observationCursor !== undefined ? { cursor: observationCursor } : {}),
-            ...(!observationCursorInitialized ? { newestFirst: true, limit: 1 } : { limit: 500 }),
+            ...(!observationCursorInitialized ? { newestFirst: false, limit: 500 } : { limit: 500 }),
           });
-          const chronological = observationCursorInitialized ? events : [...events].reverse();
+          const chronological = events;
           if (events.length) observationCursor = chronological.at(-1)?.eventId;
           semanticActivity = chronological.some((event) => isSemanticBackgroundActivity(event)
             && (observationCursorInitialized || event.ingestedAt >= waitStartedAt));
