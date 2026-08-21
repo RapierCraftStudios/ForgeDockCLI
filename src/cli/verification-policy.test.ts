@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import { selectPacketVerificationCommands } from "../workflows/work-on/prepare.js";
-import { discoverLegacyVerificationCommands, discoverVerificationCommands } from "./verification-policy.js";
+import { discoverLegacyVerificationCommands, discoverVerificationCommands, resolveCanonicalBaseIdentity } from "./verification-policy.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -37,6 +37,37 @@ describe("verification policy discovery", () => {
     assert.deepEqual(commands.map(({ id }) => id), ["diff-check"]);
     assert.equal(commands[0]?.selection, "always");
     assert.equal(commands[0]?.evidenceCapability, "generic");
+  });
+
+  it("canonicalizes branch and commit base identities for catalog and selected plans", () => {
+    const repo = mkdtempSync(join(tmpdir(), "forgedock-policy-canonical-base-"));
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    git(repo, "config", "user.name", "ForgeDock Test");
+    git(repo, "config", "user.email", "forgedock@example.invalid");
+    writeFileSync(join(repo, "package.json"), JSON.stringify({
+      scripts: { build: "tsc -p tsconfig.json", test: "node --test" },
+    }));
+    writeTypeScriptConfig(repo);
+    writeFileSync(join(repo, "src-marker.ts"), "export {};\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "feature.test.ts"), "");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "canonical base");
+    git(repo, "branch", "origin/staging");
+    const sha = git(repo, "rev-parse", "HEAD");
+    assert.equal(resolveCanonicalBaseIdentity(repo), "working-tree");
+
+    const branchCatalog = discoverVerificationCommands(repo, "origin/staging");
+    const shaCatalog = discoverVerificationCommands(repo, sha);
+    assert.deepEqual(shaCatalog, branchCatalog);
+    const packet = {
+      expectedPaths: ["src-marker.ts", "src/feature.test.ts"],
+      verificationRequirements: [{ kind: "command" as const, id: "test", criterionIds: ["criterion"], rationale: "canonical identity" }],
+    };
+    assert.deepEqual(
+      selectPacketVerificationCommands(packet, branchCatalog, sha),
+      selectPacketVerificationCommands(packet, shaCatalog, sha),
+    );
   });
 
   it("keeps broad lint and documentation scripts out of ordinary issue execution", () => {

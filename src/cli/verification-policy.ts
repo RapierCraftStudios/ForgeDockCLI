@@ -8,10 +8,24 @@ import type { VerificationCommand } from "../core/ports/verification.js";
 
 export const VERIFICATION_POLICY_VERSION = "forgedock.verification/v2";
 
+export function resolveCanonicalBaseIdentity(cwd: string, baseRef?: string): string {
+  if (!baseRef) return "working-tree";
+  const output = execFileSync(
+    "git",
+    ["rev-parse", "--verify", `${baseRef}^{commit}`],
+    { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+  ).trim().toLowerCase();
+  if (!/^[0-9a-f]{40,64}$/.test(output)) {
+    throw new Error(`Git base reference did not resolve to a commit: ${baseRef}`);
+  }
+  return output;
+}
+
 export function discoverLegacyVerificationCommands(
   cwd: string,
   baseRef?: string,
 ): Array<Omit<VerificationCommand, "cwd">> {
+  const baseIdentity = resolveCanonicalBaseIdentity(cwd, baseRef);
   const manifest = readPackageManifest(cwd, baseRef);
   const scripts = manifest.scripts ?? {};
   const npm = npmInvocation();
@@ -29,7 +43,7 @@ export function discoverLegacyVerificationCommands(
     });
   }
   if (commands.length === 1) throw new Error("Legacy durable verification plan has no compatible package command");
-  const planId = createVerificationPlanId(baseRef, scripts, commands, "forgedock.verification/v1");
+  const planId = createVerificationPlanId(baseIdentity, scripts, commands, "forgedock.verification/v1");
   return commands.map((command) => ({ ...command, planId }));
 }
 
@@ -41,6 +55,7 @@ export function discoverVerificationCommands(
   cwd: string,
   baseRef?: string,
 ): Array<Omit<VerificationCommand, "cwd">> {
+  const baseIdentity = resolveCanonicalBaseIdentity(cwd, baseRef);
   const manifest = readPackageManifest(cwd, baseRef);
   const scripts = manifest.scripts ?? {};
   const commands: Array<Omit<VerificationCommand, "cwd">> = [{
@@ -60,7 +75,7 @@ export function discoverVerificationCommands(
   // exist in package.json. Prefer one bounded compile gate.
   const compile = discoverTypeIntegrityCommand(scripts);
   const compiler = compile ? resolveTypeScriptCompiler(cwd, typescriptProject(compile.args)) : undefined;
-  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, compile.args, scripts, compiler) : undefined;
+  const typescriptLayout = compile ? discoverTypeScriptLayout(cwd, baseRef, baseIdentity, compile.args, scripts, compiler) : undefined;
   const explicitlyNoEmit = compile?.args.some((argument) => argument === "--noEmit" || argument === "--no-emit") ?? false;
   if (compile && !typescriptLayout && !explicitlyNoEmit) {
     throw new Error(`Refusing emitting TypeScript verification without a safe project layout: ${compile.id}`);
@@ -102,7 +117,7 @@ export function discoverVerificationCommands(
     });
   }
 
-  const catalogId = createVerificationPlanId(baseRef, scripts, commands);
+  const catalogId = createVerificationPlanId(baseIdentity, scripts, commands);
   return commands.map((command) => ({ ...command, planId: catalogId }));
 }
 
@@ -149,6 +164,7 @@ function discoverTypeIntegrityCommand(
 function discoverTypeScriptLayout(
   cwd: string,
   baseRef: string | undefined,
+  baseIdentity: string,
   compileArgs: readonly string[],
   scripts: Record<string, string>,
   compiler: string | undefined,
@@ -172,7 +188,7 @@ function discoverTypeScriptLayout(
   if (!sourceRoot || !configuredOutput || configuredOutput === ".") return undefined;
   const outputName = basename(configuredOutput);
   const configDigest = createHash("sha256").update(JSON.stringify({
-    baseRef: baseRef ?? "working-tree", project, source, compiler, scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
+    baseIdentity, project, source, compiler, scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
   })).digest("hex").slice(0, 24);
   const outputRoot = join(dirname(configuredOutput), `.${outputName}.forgedock-verification-${configDigest}`).replaceAll("\\", "/");
   return {
@@ -204,7 +220,7 @@ function isNodeTestScript(source: string): boolean {
 }
 
 function createVerificationPlanId(
-  baseRef: string | undefined,
+  baseIdentity: string,
   scripts: Record<string, string>,
   commands: readonly Pick<VerificationCommand, "id" | "command" | "args" | "timeoutMs" | "required">[],
   policyVersion = VERIFICATION_POLICY_VERSION,
@@ -212,7 +228,7 @@ function createVerificationPlanId(
   return createHash("sha256")
     .update(JSON.stringify({
       policyVersion,
-      baseRef: baseRef ?? "working-tree",
+      baseIdentity,
       scripts: Object.fromEntries(Object.keys(scripts).sort().map((key) => [key, scripts[key]])),
       commands,
     }))
