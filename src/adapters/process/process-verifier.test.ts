@@ -469,22 +469,29 @@ describe("deterministic process verification", () => {
     const directory = mkdtempSync(join(tmpdir(), "forgedock-verifier-independent-"));
     const lockPath = join(directory, "verification.lock");
     const progress: string[] = [];
+    const markers = [join(directory, "left.started"), join(directory, "right.started")];
     const run = (id: string) => new ProcessVerificationRunner({ lockPath }).run([{
       id,
       command: process.execPath,
-      args: ["-e", "setTimeout(()=>process.exit(0),300)"],
+      args: ["-e", [
+        "const fs=require('node:fs');",
+        "const [own,left,right]=process.argv.slice(1);",
+        "fs.writeFileSync(own,'started');",
+        "const deadline=Date.now()+3000;",
+        "const timer=setInterval(()=>{",
+        "if(fs.existsSync(left)&&fs.existsSync(right)){clearInterval(timer);process.exit(0);}",
+        "if(Date.now()>=deadline){clearInterval(timer);process.exit(9);}",
+        "},10);",
+      ].join(""), id === "left" ? markers[0]! : markers[1]!, ...markers],
       cwd: directory,
       timeoutMs: 5_000,
       required: true,
       lockScope: "workspace" as const,
     }], undefined, (event) => { progress.push(`${id}:${event.phase}`); });
     try {
-      const started = performance.now();
       const [left, right] = await Promise.all([run("left"), run("right")]);
-      const elapsed = performance.now() - started;
       assert.equal(left[0]?.status, "passed");
       assert.equal(right[0]?.status, "passed");
-      assert.ok(elapsed < 550, `independent checks took ${elapsed}ms and appear serialized`);
       assert.deepEqual(progress.filter((entry) => entry.endsWith("command-started")).sort(), [
         "left:command-started", "right:command-started",
       ]);
