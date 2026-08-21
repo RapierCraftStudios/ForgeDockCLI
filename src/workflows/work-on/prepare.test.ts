@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket, selectPacketVerificationCommands, canonicalizePacketVerification } from "./prepare.js";
 import { deriveEvidenceContract } from "./evidence-contract.js";
+import { discoverVerificationCommands } from "../../cli/verification-policy.js";
 
 const investigation: InvestigationPayload = {
   outcome: "confirmed", confidence: "high", summary: "Confirmed",
@@ -260,6 +262,63 @@ describe("Build Packet preparation", () => {
     assert.deepEqual(prepared.packet.payload.verificationRequirements?.map((requirement) => requirement.id), ["staging-review"]);
     assert.equal(prepared.packet.payload.verificationPolicyVersion, "forgedock.verification/v2");
     assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "diff-check", targets: [] }]);
+  });
+
+  it("persists branch-frozen command identities and revalidates them against the exact base SHA", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-canonical-packet-"));
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(join(cwd, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json", test: "node --test" } }));
+      await writeFile(join(cwd, "tsconfig.json"), JSON.stringify({ compilerOptions: { rootDir: "src", outDir: "dist" }, include: ["src/**/*.ts"] }));
+      await mkdir(join(cwd, "node_modules/typescript/bin"), { recursive: true });
+      await writeFile(join(cwd, "node_modules/typescript/bin/tsc"), "// test compiler\n");
+      await writeFile(join(cwd, "src/a.ts"), "export {};\n");
+      await writeFile(join(cwd, "src/a.test.ts"), "import 'node:test';\n");
+      execFileSync("git", ["init", cwd], { stdio: "ignore" });
+      execFileSync("git", ["-C", cwd, "config", "user.name", "ForgeDock Test"], { stdio: "ignore" });
+      execFileSync("git", ["-C", cwd, "config", "user.email", "forgedock@example.invalid"], { stdio: "ignore" });
+      execFileSync("git", ["-C", cwd, "add", "."], { stdio: "ignore" });
+      execFileSync("git", ["-C", cwd, "commit", "-m", "freeze packet"], { stdio: "ignore" });
+      execFileSync("git", ["-C", cwd, "branch", "origin/staging"], { stdio: "ignore" });
+      const baseSha = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const branchCatalog = discoverVerificationCommands(cwd, "origin/staging");
+      const exactCatalog = discoverVerificationCommands(cwd, baseSha);
+      assert.deepEqual(exactCatalog, branchCatalog);
+
+      const runtime = new FakeAgentRuntime([
+        { ...investigation, evidence: [{ claim: "Source", source: "src/a.ts", detail: "Source" }], affectedSurfaces: ["src/a.ts"] },
+        {
+          ...packet,
+          expectedPaths: ["src/a.ts", "src/a.test.ts"],
+          verificationPlan: ["build", "test"],
+          verificationRequirements: [
+            { kind: "command", id: "build", criterionIds: ["criterion-1"], rationale: "Compile" },
+            { kind: "command", id: "test", criterionIds: ["criterion-1"], rationale: "Targeted test" },
+          ],
+        },
+      ]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_canonical_packet", subject: { repo: "arbitrary/repository", issue: 25 }, producer: { role: "controller" },
+        payload: { title: "Canonical packet", problem: "Freeze exact verification", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      const prepared = await prepareBuildPacket({
+        run: investigated.run, intent, investigation: investigated.investigation, cwd, baseSha,
+        scopeHints: { affectedFiles: ["src/a.ts", "src/a.test.ts"], writePaths: ["src/a.ts", "src/a.test.ts"] },
+        verificationCatalog: { commands: branchCatalog, controllerGates: [] },
+      }, { runtime, artifacts, runs });
+      const frozen = prepared.packet.payload;
+      assert.ok(frozen.verificationCommandIdentities?.length);
+      assert.ok(frozen.verificationCommandTargets?.some(({ id }) => id === "test"));
+      const branchPlan = selectPacketVerificationCommands(frozen, branchCatalog, baseSha);
+      const exactPlan = selectPacketVerificationCommands(frozen, exactCatalog, baseSha);
+      assert.deepEqual(exactPlan, branchPlan);
+      assert.equal(frozen.verificationCommandIdentities?.find(({ id }) => id === "test")?.args.at(-1), "--test-concurrency=4");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("rejects controller-owned verification prose before the builder can start", async () => {
