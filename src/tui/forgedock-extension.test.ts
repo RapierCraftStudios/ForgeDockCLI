@@ -34,6 +34,7 @@ import {
   resolveRoutedOrchestrationScope,
   sourcePullRequestFromIssueBody,
   isOrchestrationPreviewConfirmationPrompt,
+  materializeVisibleDecomposition,
   orchestrationTransportKey,
   type ControllerTaskSpec,
   type OrchestrationTransportIdentity,
@@ -2127,6 +2128,94 @@ test("visible DAG resume retries failed nodes without replaying completed nodes"
   assert.deepEqual(recoveryModes, ["initial", "resume"]);
   assert.deepEqual(results, ["failed", "completed"]);
   await delegator.shutdown();
+});
+
+test("visible decomposition keeps non-root repository identity on initial and resumed materialization", async () => {
+  const repositoryReads: string[] = [];
+  const artifactReads: Array<{ repo: string; issue: number }> = [];
+  const issueReads: Array<{ repo: string; issue: number }> = [];
+  const branchReads: Array<{ repo: string; branch: string }> = [];
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run-visible-remote-decomposition",
+    subject: { repo: "owner/work", issue: 42 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 Child"] },
+  });
+  const github = {
+    async getRepository(repo: string) {
+      repositoryReads.push(repo);
+      return { repo, defaultBranch: repo === "owner/work" ? "work-main" : "control-main" };
+    },
+    async getIssue(issue: number, repo: string) {
+      issueReads.push({ repo, issue });
+      return {
+        repo,
+        number: issue,
+        title: `Child ${issue}`,
+        body: "",
+        url: `https://github.test/${repo}/issues/${issue}`,
+        state: "OPEN" as const,
+        labels: [],
+        comments: [],
+      };
+    },
+    async listBranches(repo: string) {
+      branchReads.push({ repo, branch: "milestone/" });
+      return [];
+    },
+    async getBranchHead(repo: string, branch: string) {
+      branchReads.push({ repo, branch });
+      return "head";
+    },
+  } as any;
+  const artifacts = {
+    async list(subject: { repo: string; issue: number }) {
+      artifactReads.push(subject);
+      return [outcome];
+    },
+  };
+  const input = {
+    github,
+    artifacts,
+    repository: "owner/control",
+    effective: { fastLaneTarget: "work-main" } as any,
+    orchestration: { nodes: [] } as any,
+    node: { id: "parent", issue: 42, repository: "owner/work" } as any,
+    item: {
+      id: "parent",
+      issue: 42,
+      repository: "owner/work",
+      priority: 1,
+      dependencies: [],
+      claims: [],
+      labels: [],
+      affectedFiles: [],
+      memberIssues: [42],
+      title: "Parent",
+      summary: "Parent",
+    },
+  };
+
+  const initial = await materializeVisibleDecomposition(input);
+  assert.deepEqual(repositoryReads, ["owner/work"]);
+  assert.deepEqual(artifactReads, [{ repo: "owner/work", issue: 42 }]);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
+  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.equal(initial?.items[0]?.repository, "owner/work");
+  assert.equal(initial?.items[0]?.targetBranch, "work-main");
+
+  repositoryReads.length = 0;
+  artifactReads.length = 0;
+  issueReads.length = 0;
+  branchReads.length = 0;
+  const resumed = await materializeVisibleDecomposition({ ...input, childIssues: [100] });
+  assert.deepEqual(repositoryReads, ["owner/work"]);
+  assert.deepEqual(artifactReads, []);
+  assert.deepEqual(issueReads, [{ repo: "owner/work", issue: 100 }]);
+  assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
+  assert.equal(resumed?.items[0]?.repository, "owner/work");
+  assert.equal(resumed?.items[0]?.targetBranch, "work-main");
 });
 
 test("visible DAG refuses to retry terminally decomposed work", async () => {

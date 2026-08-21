@@ -1157,11 +1157,11 @@ function decompositionChildIssuesFromArtifacts(
   });
 }
 
-async function materializeVisibleDecomposition(input: {
+export async function materializeVisibleDecomposition(input: {
   github: GitHubClient;
   artifacts: { list(subject: { repo: string; issue: number }): Promise<readonly DurableArtifact[]> };
+  /** Legacy orchestration-root fallback for records without per-node identity. */
   repository: string;
-  defaultBranch: string;
   effective: EffectiveOrchestrationConfig;
   orchestration: Readonly<OrchestrationRecord>;
   node: Readonly<OrchestrationNodeRecord>;
@@ -1172,9 +1172,11 @@ async function materializeVisibleDecomposition(input: {
   items: readonly VisibleOrchestrationItem[];
   serializationEdges?: readonly ClaimSerializationEdge[];
 } | undefined> {
+  const effectiveParentRepository = input.node.repository ?? input.item.repository ?? input.repository;
+  const authoritativeRepository = await input.github.getRepository(effectiveParentRepository);
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
-    const artifacts = await input.artifacts.list({ repo: input.repository, issue: input.item.issue });
+    const artifacts = await input.artifacts.list({ repo: effectiveParentRepository, issue: input.item.issue });
     const reconciled = reconcileLatestRunArtifacts(artifacts);
     if (reconciled.state !== "decomposed") return undefined;
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
@@ -1188,13 +1190,13 @@ async function materializeVisibleDecomposition(input: {
     })),
     ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
   ];
-  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
+  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
   const childItems: VisibleOrchestrationItem[] = [];
   for (const issue of childSnapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
     const lane = await resolveIssueLane(
       issue,
-      input.defaultBranch,
+      authoritativeRepository.defaultBranch,
       input.github,
       input.effective.fastLaneTarget,
       input.effective.featurePromotionTarget,
@@ -1210,7 +1212,7 @@ async function materializeVisibleDecomposition(input: {
       priority: priorityFromIssueLabels(issue.labels ?? []),
       dependencies,
       claims: [...new Set([...affectedFiles, ...(affectedFiles.length ? [] : ["component:repository"])])],
-      repository: input.repository,
+      repository: effectiveParentRepository,
       targetBranch: lane.targetBranch,
       lane: lane.kind,
       ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2945,7 +2947,6 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           github: readyGithub,
           artifacts,
           repository: readyRepository.repo,
-          defaultBranch: readyRepository.defaultBranch,
           effective,
           orchestration: durable,
           node,
@@ -3827,12 +3828,10 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord)
       };
     },
     resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => {
-      const itemRepository = item.repository ?? record.repository;
       return materializeVisibleDecomposition({
         github,
         artifacts,
-        repository: itemRepository,
-        defaultBranch: (await github.getRepository(itemRepository)).defaultBranch,
+        repository: record.repository,
         effective,
         orchestration: durable,
         node,
