@@ -101,7 +101,7 @@ describe("direct target recovery integration", () => {
       const verdict = createArtifact({ kind: "ReviewVerdict", runId, subject, producer: { role: "reviewer" }, payload: { disposition, headSha: recoveredHead, baseBranch: "main", reviewerRoles: ["reviewer"], findings: [], checks: [] } });
       await fixture.artifacts.append(fresh);
       await fixture.artifacts.append(verdict);
-      await persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: fresh, sourceBuildResult: b, workspace, targetBranch: "main", observedTargetSha: targetBase, phase: "reviewed", verdict, artifacts: fixture.artifacts });
+      await persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: fresh, sourceBuildResult: b, workspace, targetBranch: "main", observedTargetSha: targetBase, phase: "reviewed", verdict, freshBuildResultId: fresh.id, integrationHeadSha: recoveredHead, artifacts: fixture.artifacts });
       return await fixture.artifacts.list(subject);
     };
     const admissionState = (artifacts: readonly DurableArtifact[]) => {
@@ -118,11 +118,23 @@ describe("direct target recovery integration", () => {
     assert.equal(changesReconciled.state, "remediating");
     assert.equal(admissionState(changes), "remediating");
     const missingVerdict = approved.filter((artifact) => artifact.kind !== "ReviewVerdict");
+    const missingReconciled = reconcileLatestRunArtifacts(missingVerdict);
+    assert.equal(missingReconciled.state, "blocked");
+    assert.match(missingReconciled.warnings.join(" "), /matching fresh ReviewVerdict/);
+    const missingAdmission = decideSubjectAdmission(missingVerdict);
+    assert.equal(missingAdmission.action, "block");
+    assert.equal(missingAdmission.state, "blocked");
+    assert.match(missingAdmission.reason, /matching fresh ReviewVerdict/);
     const mismatchedVerdict = approved.map((artifact) => artifact.kind === "ReviewVerdict"
       ? { ...artifact, payload: { ...artifact.payload, headSha: "e".repeat(40) } }
       : artifact);
-    assert.notEqual(reconcileLatestRunArtifacts(mismatchedVerdict).state, "merging");
-    assert.notEqual(admissionState(mismatchedVerdict), "merging");
+    const mismatchedReconciled = reconcileLatestRunArtifacts(mismatchedVerdict);
+    assert.equal(mismatchedReconciled.state, "blocked");
+    assert.match(mismatchedReconciled.warnings.join(" "), /matching fresh ReviewVerdict/);
+    const mismatchedAdmission = decideSubjectAdmission(mismatchedVerdict);
+    assert.equal(mismatchedAdmission.action, "block");
+    assert.equal(mismatchedAdmission.state, "blocked");
+    assert.match(mismatchedAdmission.reason, /matching fresh ReviewVerdict/);
   });
 
   it("rejects direct resume of an already reviewed checkpoint", async () => {

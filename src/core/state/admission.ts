@@ -2,7 +2,7 @@
 
 import type { DurableArtifact } from "../artifacts/schema.js";
 import type { CheckResult } from "../ports/verification.js";
-import { reconcileArtifacts } from "./reconcile.js";
+import { reconcileArtifacts, validateReviewedTargetCheckpoint } from "./reconcile.js";
 import { terminalStates, type RunStateName } from "./machine.js";
 
 export type SubjectAdmissionDecision =
@@ -107,6 +107,18 @@ export function decideSubjectAdmission(
   if (!latest) return { action: "start" };
 
   const reconciled = reconcileArtifacts(latest.artifacts);
+  const latestTargetCheckpoint = latestArtifactOfKind(latest.artifacts, "TargetAdvanceCheckpoint");
+  if (latestTargetCheckpoint?.payload.phase === "reviewed") {
+    const validation = validateReviewedTargetCheckpoint(latest.artifacts, latestTargetCheckpoint);
+    if (!validation.valid) {
+      return {
+        action: "block",
+        runId: latest.runId,
+        state: "blocked",
+        reason: validation.reason!,
+      };
+    }
+  }
   const latestOutcome = latestArtifactOfKind(latest.artifacts, "Outcome");
   const latestArtifact = latest.artifacts.at(-1);
   // `reset` appends an abandoned Outcome as explicit authorization to leave

@@ -16,6 +16,45 @@ export interface ReconciledSubjectState extends ReconciledSemanticState {
   runId?: string;
 }
 
+export interface ReviewedTargetCheckpointValidation {
+  valid: boolean;
+  reason?: string;
+}
+
+/** Validate the receipts required before a reviewed target checkpoint can advance. */
+export function validateReviewedTargetCheckpoint(
+  artifacts: readonly DurableArtifact[],
+  checkpoint: DurableArtifact<"TargetAdvanceCheckpoint">,
+): ReviewedTargetCheckpointValidation {
+  if (checkpoint.payload.phase !== "reviewed") return { valid: true };
+  const freshId = checkpoint.payload.freshBuildResultId;
+  if (!freshId) return { valid: false, reason: "Reviewed target checkpoint is missing its fresh BuildResult receipt" };
+  const fresh = artifacts.find((artifact): artifact is DurableArtifact<"BuildResult"> =>
+    artifact.kind === "BuildResult" && artifact.id === freshId && artifact.runId === checkpoint.runId);
+  if (!fresh) return { valid: false, reason: "Reviewed target checkpoint fresh BuildResult receipt is missing" };
+  const expectedHead = (checkpoint.payload.integrationHeadSha
+    ?? checkpoint.payload.mergeHeadSha
+    ?? checkpoint.payload.pushedHeadSha
+    ?? checkpoint.payload.sourceHeadSha).toLowerCase();
+  const expectedBase = checkpoint.payload.observedTargetSha.toLowerCase();
+  if (fresh.payload.baseSha === undefined
+    || fresh.payload.headSha.toLowerCase() !== expectedHead
+    || fresh.payload.baseSha.toLowerCase() !== expectedBase) {
+    return { valid: false, reason: "Reviewed target checkpoint fresh BuildResult receipt does not match its head/base" };
+  }
+  const freshIndex = artifacts.indexOf(fresh);
+  const verdict = latestArtifactOfKind(artifacts, "ReviewVerdict");
+  const verdictIndex = verdict ? artifacts.indexOf(verdict) : -1;
+  if (!verdict || verdict.runId !== checkpoint.runId || verdictIndex <= freshIndex
+    || verdict.payload.headSha.toLowerCase() !== fresh.payload.headSha.toLowerCase()
+    || verdict.payload.baseBranch !== checkpoint.payload.targetBranch
+    || (checkpoint.payload.pullRequest !== undefined && verdict.subject.pr !== checkpoint.payload.pullRequest)
+    || (verdict.payload.disposition !== "approve" && verdict.payload.disposition !== "request_changes")) {
+    return { valid: false, reason: "Reviewed target checkpoint is missing a matching fresh ReviewVerdict head/disposition" };
+  }
+  return { valid: true };
+}
+
 export function reconcileLatestRunArtifacts(artifacts: readonly DurableArtifact[]): ReconciledSubjectState {
   let latestRunId: string | undefined;
   for (const artifact of artifacts) {
@@ -46,6 +85,9 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const remediationCheckpoint = latest.get("RemediationBlocked") as DurableArtifact<"RemediationBlocked"> | undefined;
   const targetAdvanceCheckpoint = latest.get("TargetAdvanceCheckpoint") as DurableArtifact<"TargetAdvanceCheckpoint"> | undefined;
   const retryCheckpoint = latest.get("RetryCheckpoint") as DurableArtifact<"RetryCheckpoint"> | undefined;
+  const reviewedTargetValidation = targetAdvanceCheckpoint?.payload.phase === "reviewed"
+    ? validateReviewedTargetCheckpoint(ordered, targetAdvanceCheckpoint)
+    : { valid: true };
   const build = latest.get("BuildResult") as DurableArtifact<"BuildResult"> | undefined;
   const packet = latest.get("BuildPacket") as DurableArtifact<"BuildPacket"> | undefined;
   const investigation = latest.get("Investigation") as DurableArtifact<"Investigation"> | undefined;
@@ -89,6 +131,9 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const nonterminalCheckpoint = retryCheckpointIndex > targetAdvanceCheckpointIndex ? retryCheckpoint : targetAdvanceCheckpoint;
   const nonterminalCheckpointIndex = Math.max(retryCheckpointIndex, targetAdvanceCheckpointIndex);
   let state: RunStateName = "queued";
+  if (targetAdvanceCheckpoint?.payload.phase === "reviewed" && !reviewedTargetValidation.valid) {
+    warnings.push(reviewedTargetValidation.reason!);
+  }
   const checkpointIsLatest = (remediationCheckpoint !== undefined
     && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex))
     || (nonterminalCheckpoint !== undefined
@@ -152,6 +197,9 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   } else if (!checkpointIsLatest && intent) {
     state = "investigating";
   }
+  if (targetAdvanceCheckpoint?.payload.phase === "reviewed" && !reviewedTargetValidation.valid) {
+    state = "blocked";
+  }
   return {
     state,
     warnings,
@@ -160,6 +208,17 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     ...(targetAdvanceCheckpoint ? { targetAdvanceCheckpoint } : {}),
     ...(retryCheckpoint ? { retryCheckpoint } : {}),
   };
+}
+
+function latestArtifactOfKind<K extends DurableArtifact["kind"]>(
+  artifacts: readonly DurableArtifact[],
+  kind: K,
+): Extract<DurableArtifact, { kind: K }> | undefined {
+  for (let index = artifacts.length - 1; index >= 0; index -= 1) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === kind) return artifact as Extract<DurableArtifact, { kind: K }>;
+  }
+  return undefined;
 }
 
 function artifactOrderingKey(artifact: DurableArtifact): string {
