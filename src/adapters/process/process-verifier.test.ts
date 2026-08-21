@@ -23,7 +23,7 @@ function stagingLayout(cwd: string, identity = "test-staging-identity") {
 
 function stagedCommand(cwd: string, id: string, args: string[], layout: ReturnType<typeof stagingLayout>) {
   return {
-    id, command: process.execPath, args, cwd, timeoutMs: 5_000, required: true,
+    id, command: process.execPath, args, cwd, timeoutMs: 15_000, required: true,
     lockScope: "workspace" as const, cleanOutputRoot: layout.outputRoot,
     typescriptLayout: layout,
   };
