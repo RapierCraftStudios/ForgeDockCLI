@@ -32,7 +32,7 @@ import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
-import { closeExpectedWriteScope, resolveInvestigationEvidenceSources } from "./scope-closure.js";
+import { closeExpectedWriteScope, resolveInvestigationEvidenceSources, validateFrozenReadOnlyFile } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
 import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
 import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters/repository/index.js";
@@ -94,6 +94,15 @@ export async function prepareBuildPacket(
       // it must never enter the write-scope closure below.
       ...investigationEvidencePaths,
     ];
+    const packetAuthorScope = scopeManifestFor("issue-hints", {
+      affectedFiles: affectedScope,
+      ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
+      metadataRoots: [
+        ...STANDARD_SCOPE_DISCOVERY_ROOTS,
+        ...STANDARD_SCOPE_METADATA_ROOTS,
+        ...scopeDiscoveryRoots(affectedScope),
+      ],
+    });
     const packetTask: AgentTask<BuildPacketPayload> = {
       id: `${run.runId}:build-packet:${run.attempt}`,
       role: "packet-author",
@@ -123,15 +132,7 @@ export async function prepareBuildPacket(
       workspace: {
         cwd: input.cwd,
         mode: "read-only",
-        scope: scopeManifestFor("issue-hints", {
-          affectedFiles: affectedScope,
-          ...(input.scopeHints?.claims ? { claims: [...input.scopeHints.claims] } : {}),
-          metadataRoots: [
-            ...STANDARD_SCOPE_DISCOVERY_ROOTS,
-            ...STANDARD_SCOPE_METADATA_ROOTS,
-            ...scopeDiscoveryRoots(affectedScope),
-          ],
-        }),
+        scope: packetAuthorScope,
       },
       tools: ["read", "grep", "find", "ls"],
       executionBudget: WORK_ON_EXECUTION_BUDGETS.packetAuthor,
@@ -169,6 +170,7 @@ export async function prepareBuildPacket(
           input.scopeHints?.affectedFiles ?? [],
           input.investigation.payload.affectedSurfaces,
           input.investigation.payload.evidence.map(({ source }) => source),
+          packetAuthorScope.readRoots,
           input.scopeHints?.metadataRoots ?? [],
           input.scopeHints?.writePaths ?? [],
           input.cwd,
@@ -343,6 +345,7 @@ async function materializePacketOutput(
   affectedFiles: readonly string[],
   investigationSurfaces: readonly string[] = [],
   investigationEvidenceSources: readonly string[] = [],
+  packetAuthorReadRoots: readonly string[] = [],
   metadataPaths: readonly string[] = [],
   controllerWriteHints: readonly string[] = [],
   cwd = process.cwd(),
@@ -405,11 +408,23 @@ async function materializePacketOutput(
     ...declaredPaths,
     ...controllerPaths,
     ...investigationEvidencePaths,
+    ...packetAuthorReadRoots,
     ...scopeDiscoveryRoots([...expectedPaths, ...investigatedPaths, ...declaredPaths, ...controllerPaths]),
     ...STANDARD_SCOPE_METADATA_ROOTS,
     ...metadataPaths.filter(isConcreteScopePath),
   ]);
-  const evidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
+  const canonicalEvidence = canonicalizeEvidenceDeclarations(output.evidencePaths, output.acceptanceCriteria.length, approved);
+  const validEvidence: EvidencePathDeclaration[] = [];
+  const evidenceDiagnostics = [...canonicalEvidence.diagnostics];
+  for (const declaration of canonicalEvidence.declarations) {
+    const size = await validateFrozenReadOnlyFile(declaration.path, cwd, packetAuthorReadRoots);
+    if (size === undefined) {
+      evidenceDiagnostics.push(`[evidence-file] Evidence path '${declaration.path}' is not a safe regular file inside the frozen packet-author read scope`);
+      continue;
+    }
+    validEvidence.push(declaration);
+  }
+  const evidence = { declarations: validEvidence, diagnostics: evidenceDiagnostics };
   const provisionalInvariantMatrices = deriveSecurityInvariantMatrices(output);
   const semanticReadOnlySources = catalog
     ? await resolveReadOnlyVerificationSources(

@@ -31,20 +31,62 @@ export const INVESTIGATION_EVIDENCE_LIMITS: InvestigationEvidenceLimits = {
   maxTotalBytes: 4_000_000,
 };
 
+/** Validate a concrete path against one frozen read scope and checkout. */
+export async function validateFrozenReadOnlyFile(
+  path: string,
+  cwd: string,
+  allowedReadRoots: readonly string[],
+  limits: InvestigationEvidenceLimits = INVESTIGATION_EVIDENCE_LIMITS,
+): Promise<number | undefined> {
+  let candidate: string;
+  try {
+    candidate = canonicalizeConcreteScopePaths([path])[0] ?? "";
+  } catch {
+    return undefined;
+  }
+  if (!candidate || candidate.length > limits.maxPathLength || !pathWithinReadRoots(candidate, allowedReadRoots)) return undefined;
+  let root: string;
+  try {
+    root = await realpath(resolve(cwd));
+    const rootStat = await lstat(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return undefined;
+  } catch {
+    return undefined;
+  }
+  const absolute = resolve(root, candidate);
+  const lexicalRelative = relative(root, absolute).replaceAll("\\", "/");
+  if (!lexicalRelative || lexicalRelative.startsWith("../") || isAbsolute(lexicalRelative)) return undefined;
+  try {
+    let current = root;
+    for (const segment of candidate.split("/")) {
+      current = join(current, segment);
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink()) return undefined;
+    }
+    const entry = await lstat(absolute);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size > limits.maxFileBytes) return undefined;
+    const canonical = await realpath(absolute);
+    const canonicalRelative = relative(root, canonical).replaceAll("\\", "/");
+    if (!canonicalRelative || canonicalRelative.startsWith("../") || isAbsolute(canonicalRelative)) return undefined;
+    return entry.size;
+  } catch {
+    return undefined;
+  }
+}
+
+function pathWithinReadRoots(path: string, roots: readonly string[]): boolean {
+  return roots.some((root) => {
+    const normalized = root.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/$/, "") || ".";
+    return normalized === "." || path === normalized || path.startsWith(`${normalized}/`);
+  });
+}
+
 export async function resolveInvestigationEvidenceSources(
   sources: readonly string[],
   cwd: string,
   limits: InvestigationEvidenceLimits = INVESTIGATION_EVIDENCE_LIMITS,
 ): Promise<string[]> {
   const selected = new Set<string>();
-  let root: string;
-  try {
-    root = await realpath(resolve(cwd));
-    const rootStat = await lstat(root);
-    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
-  } catch {
-    return [];
-  }
   let totalBytes = 0;
   for (const source of sources.slice(0, limits.maxSourceLocations)) {
     const extracted = repositoryPathFromLocation(source);
@@ -57,32 +99,10 @@ export async function resolveInvestigationEvidenceSources(
     }
     if (!path || path.length > limits.maxPathLength || selected.has(path)) continue;
     if (selected.size >= limits.maxFiles) break;
-    const absolute = resolve(root, path);
-    const lexicalRelative = relative(root, absolute).replaceAll("\\", "/");
-    if (!lexicalRelative || lexicalRelative.startsWith("../") || isAbsolute(lexicalRelative)) continue;
-    try {
-      // Check every component, not just the leaf: an internal symlink must not
-      // redirect a controller-approved source to another checkout.
-      let current = root;
-      let safe = true;
-      for (const segment of path.split("/")) {
-        current = join(current, segment);
-        const entry = await lstat(current);
-        if (entry.isSymbolicLink()) { safe = false; break; }
-      }
-      if (!safe) continue;
-      const entry = await lstat(absolute);
-      if (!entry.isFile() || entry.isSymbolicLink() || entry.size > limits.maxFileBytes) continue;
-      const canonical = await realpath(absolute);
-      const canonicalRelative = relative(root, canonical).replaceAll("\\", "/");
-      if (!canonicalRelative || canonicalRelative.startsWith("../") || isAbsolute(canonicalRelative)) continue;
-      if (totalBytes + entry.size > limits.maxTotalBytes) continue;
-      totalBytes += entry.size;
-      selected.add(path);
-    } catch {
-      // Missing, disappearing, malformed, or inaccessible sources are advisory
-      // only and therefore cannot become packet authority.
-    }
+    const size = await validateFrozenReadOnlyFile(path, cwd, ["."], limits);
+    if (size === undefined || totalBytes + size > limits.maxTotalBytes) continue;
+    totalBytes += size;
+    selected.add(path);
   }
   return [...selected].sort();
 }

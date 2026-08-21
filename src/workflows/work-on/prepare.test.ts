@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -73,17 +73,17 @@ describe("Build Packet preparation", () => {
   it("accepts generated-source Investigation evidence as read-only without changing expected paths", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-generated-evidence-"));
     try {
-      await mkdir(join(cwd, "generated"), { recursive: true });
-      await writeFile(join(cwd, "generated/runner.mjs"), "export const generated = true;\n");
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      await writeFile(join(cwd, "scripts/runner.mjs"), "export const generated = true;\n");
       const evidenceInvestigation: InvestigationPayload = {
         ...investigation,
         affectedSurfaces: [],
-        evidence: [{ claim: "Generated runner", source: "generated/runner.mjs:9-21", detail: "Generated source" }],
+        evidence: [{ claim: "Generated runner", source: "No concrete repository location", detail: "Generated source" }],
       };
       const evidencePacket: BuildPacketPayload = {
         ...packet,
         expectedPaths: ["src/fix.ts"],
-        evidencePaths: [{ path: "generated/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }],
+        evidencePaths: [{ path: "scripts/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }],
       };
       const runtime = new FakeAgentRuntime([evidenceInvestigation, evidencePacket]);
       const artifacts = new InMemoryArtifactRepository();
@@ -95,9 +95,9 @@ describe("Build Packet preparation", () => {
       const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
       const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd }, { runtime, artifacts, runs });
       assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/fix.ts"]);
-      assert.deepEqual(prepared.packet.payload.evidencePaths, [{ path: "generated/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }]);
+      assert.deepEqual(prepared.packet.payload.evidencePaths, [{ path: "scripts/runner.mjs", criterionIds: ["criterion-1"], role: "generated" }]);
       assert.deepEqual(prepared.run.scopeManifest?.writePaths, ["src/fix.ts"]);
-      assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("generated"));
+      assert.ok(runtime.tasks[1]?.workspace.scope.readRoots.includes("scripts"));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -106,17 +106,24 @@ describe("Build Packet preparation", () => {
   it("fails closed for packet evidence unrelated to validated Investigation sources", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-unrelated-evidence-"));
     try {
-      await mkdir(join(cwd, "generated"), { recursive: true });
-      await writeFile(join(cwd, "generated/runner.mjs"), "export const generated = true;\n");
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      await mkdir(join(cwd, "other"), { recursive: true });
+      await writeFile(join(cwd, "scripts/runner.mjs"), "export const generated = true;\n");
+      await writeFile(join(cwd, "other/unrelated.mjs"), "export const unrelated = true;\n");
+      await symlink(join(cwd, "other/unrelated.mjs"), join(cwd, "scripts/link.mjs"));
       const evidenceInvestigation: InvestigationPayload = {
         ...investigation,
         affectedSurfaces: [],
-        evidence: [{ claim: "Generated runner", source: "generated/runner.mjs:9-21", detail: "Generated source" }],
+        evidence: [{ claim: "Generated runner", source: "No concrete repository location", detail: "Generated source" }],
       };
       const evidencePacket: BuildPacketPayload = {
         ...packet,
         expectedPaths: ["src/fix.ts"],
-        evidencePaths: [{ path: "generated/unrelated.mjs", criterionIds: ["criterion-1"], role: "generated" }],
+        evidencePaths: [
+          { path: "other/unrelated.mjs", criterionIds: ["criterion-1"], role: "generated" },
+          { path: "scripts/link.mjs", criterionIds: ["criterion-1"], role: "generated" },
+          { path: "scripts/missing.mjs", criterionIds: ["criterion-1"], role: "generated" },
+        ],
       };
       const runtime = new FakeAgentRuntime([evidenceInvestigation, evidencePacket, evidencePacket]);
       const artifacts = new InMemoryArtifactRepository();
