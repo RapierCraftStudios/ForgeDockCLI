@@ -554,7 +554,7 @@ function runOne(
         if (ownership) {
           ownership.deferred = true;
           ownership.childPid = child.pid;
-          ownership.childPgid = process.platform === "win32" ? undefined : child.pid;
+          if (process.platform !== "win32") ownership.childPgid = child.pid;
         }
         child.once("error", () => { /* close settles the rejected marker publication */ });
         child.once("close", () => {
