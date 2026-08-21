@@ -7,7 +7,7 @@ import { createArtifact, type BuildPacketPayload, type InvestigationPayload } fr
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { investigateWorkItem } from "./investigate.js";
-import { prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
+import { prepareBuildPacket, selectPacketVerificationCommands, canonicalizePacketVerification } from "./prepare.js";
 import { deriveEvidenceContract } from "./evidence-contract.js";
 
 const investigation: InvestigationPayload = {
@@ -365,7 +365,7 @@ describe("Build Packet preparation", () => {
     assert.deepEqual(prepared.packet.payload.verificationCommandTargets, [{ id: "targeted", targets: ["dist/a.test.js"] }]);
   });
 
-  it("blocks generic-only catalogs and exhausted author corrections without packets", async () => {
+  it("blocks generic-only catalogs on the controller pass and does not create packets", async () => {
     const genericCatalog = { commands: [{ id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" }], controllerGates: [] };
     const generic = { ...packet, verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "generic", criterionIds: ["criterion-1"], rationale: "Check" }] };
     const runtime = new FakeAgentRuntime([investigation, generic]);
@@ -376,14 +376,6 @@ describe("Build Packet preparation", () => {
     await assert.rejects(() => prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: genericCatalog, scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] } }, { runtime, artifacts, runs }), /generic-only-command/);
     assert.equal(runtime.tasks.length, 2);
     assert.equal((await artifacts.list(intent.subject, "BuildPacket")).length, 0);
-
-    const repairRuntime = new FakeAgentRuntime([investigation, generic, generic]);
-    const repairArtifacts = new InMemoryArtifactRepository();
-    const repairRuns = new InMemoryRunRepository();
-    const repairIntent = createArtifact({ kind: "Intent", runId: "run_generic_exhaust", subject: { repo: "a/b", issue: 143 }, producer: { role: "controller" }, payload: { title: "Exhaust", problem: "No semantic selection", constraints: [], acceptanceHints: [], dependencies: [] } });
-    const repairInvestigated = await investigateWorkItem({ intent: repairIntent, cwd: process.cwd() }, { runtime: repairRuntime, artifacts: repairArtifacts, runs: repairRuns });
-    await assert.rejects(() => prepareBuildPacket({ run: repairInvestigated.run, intent: repairIntent, investigation: repairInvestigated.investigation, cwd: process.cwd(), verificationCatalog: { commands: [{ id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" }, { id: "semantic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "regression" as const, policyVersion: "forgedock.verification/v2" }], controllerGates: [] } }, { runtime: repairRuntime, artifacts: repairArtifacts, runs: repairRuns }), /exhausted after two sessions/);
-    assert.equal((await repairArtifacts.list(repairIntent.subject, "BuildPacket")).length, 0);
   });
 
   it("accepts gate-only criteria", async () => {
@@ -395,6 +387,18 @@ describe("Build Packet preparation", () => {
     const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd: process.cwd(), verificationCatalog: { commands: [], controllerGates: [{ id: "staging-review", description: "Validate" }] }, scopeHints: { writePaths: ["src/a.ts", "test/a.test.ts"] } }, { runtime, artifacts, runs });
     assert.equal(prepared.run.state, "building");
     assert.equal(prepared.packet.payload.evidenceContract, undefined);
+  });
+  it("augments a generic criterion from a frozen read-only investigation test target", () => {
+    const output = { ...packet, expectedPaths: ["vendor/pi-runtime/dist/core/tools/ls.js"], verificationPlan: ["npm test"], verificationRequirements: [{ kind: "command" as const, id: "generic", criterionIds: ["criterion-1"], rationale: "Generic baseline" }] };
+    const catalog = {
+      commands: [
+        { id: "generic", command: "npm", args: ["test"], required: true, selection: "packet" as const, evidenceCapability: "generic" as const, policyVersion: "forgedock.verification/v2" },
+        { id: "targeted", command: "node", args: ["--test"], required: true, selection: "packet" as const, targeting: "expected-test-paths" as const, evidenceCapability: "targeted-test" as const, policyVersion: "forgedock.verification/v2", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } },
+      ], controllerGates: [],
+    };
+    const canonical = canonicalizePacketVerification(output, catalog, output.expectedPaths, [], ["src/pi-runtime-tool-renderers.test.ts"]);
+    assert.deepEqual(canonical.expectedPaths, ["vendor/pi-runtime/dist/core/tools/ls.js"]);
+    assert.deepEqual(canonical.verificationRequirements?.map(({ id }) => id), ["generic", "targeted"]);
   });
   it("revalidates exact-base evidence contracts and binds capability identity into the plan", () => {
     const catalog = [{
