@@ -2153,7 +2153,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
         repo,
         number: issue,
         title: `Child ${issue}`,
-        body: "",
+        body: issue === 100 ? "## Prerequisites\n- Requires #7." : "",
         url: `https://github.test/${repo}/issues/${issue}`,
         state: "OPEN" as const,
         labels: [],
@@ -2180,7 +2180,28 @@ test("visible decomposition keeps non-root repository identity on initial and re
     artifacts,
     repository: "owner/control",
     effective: { fastLaneTarget: "work-main" } as any,
-    orchestration: { nodes: [] } as any,
+    orchestration: {
+      nodes: [
+        {
+          id: "valid-prerequisite",
+          issue: 7,
+          repository: "  Owner/WORK  ",
+          priority: 1,
+          dependencies: [],
+          claims: [],
+          memberIssues: [7],
+        },
+        {
+          id: "foreign-prerequisite",
+          issue: 7,
+          repository: "owner/other",
+          priority: 1,
+          dependencies: [],
+          claims: [],
+          memberIssues: [7],
+        },
+      ],
+    } as any,
     node: { id: "parent", issue: 42, repository: "owner/work" } as any,
     item: {
       id: "parent",
@@ -2204,6 +2225,7 @@ test("visible decomposition keeps non-root repository identity on initial and re
   assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
   assert.equal(initial?.items[0]?.repository, "owner/work");
   assert.equal(initial?.items[0]?.targetBranch, "work-main");
+  assert.deepEqual(initial?.items[0]?.dependencies, ["valid-prerequisite"]);
 
   repositoryReads.length = 0;
   artifactReads.length = 0;
@@ -2216,6 +2238,71 @@ test("visible decomposition keeps non-root repository identity on initial and re
   assert.deepEqual(branchReads, [{ repo: "owner/work", branch: "work-main" }]);
   assert.equal(resumed?.items[0]?.repository, "owner/work");
   assert.equal(resumed?.items[0]?.targetBranch, "work-main");
+  assert.deepEqual(resumed?.items[0]?.dependencies, ["valid-prerequisite"]);
+});
+
+test("visible decomposition fails closed when a concurrent child read rejects", async () => {
+  const issueReads: number[] = [];
+  const github = {
+    async getRepository(repo: string) {
+      return { repo, defaultBranch: "work-main" };
+    },
+    async getIssue(issue: number) {
+      issueReads.push(issue);
+      if (issue === 101) throw new Error("child read failed");
+      return {
+        repo: "owner/work",
+        number: issue,
+        title: `Child ${issue}`,
+        body: "",
+        url: `https://github.test/owner/work/issues/${issue}`,
+        state: "OPEN" as const,
+        labels: [],
+        comments: [],
+      };
+    },
+  } as any;
+  const input = {
+    github,
+    artifacts: { async list() { return []; } },
+    repository: "owner/control",
+    effective: { fastLaneTarget: "work-main" } as any,
+    orchestration: {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "orch-visible-fail-closed",
+      repository: "owner/control",
+      issueNumbers: [42],
+      maxParallel: 2,
+      autoMerge: false,
+      status: "running",
+      createdAt: "now",
+      updatedAt: "now",
+      nodes: [],
+    },
+    node: { id: "parent", issue: 42, repository: "owner/work" },
+    item: {
+      id: "parent",
+      issue: 42,
+      repository: "owner/work",
+      priority: 1,
+      dependencies: [],
+      claims: [],
+      labels: [],
+      affectedFiles: [],
+      memberIssues: [42],
+      title: "Parent",
+      summary: "Parent",
+    },
+    childIssues: [100, 101],
+  } as any;
+  const durableBefore = structuredClone(input.orchestration);
+
+  await assert.rejects(
+    () => materializeVisibleDecomposition(input),
+    /child read failed/,
+  );
+  assert.deepEqual(issueReads.sort((left, right) => left - right), [100, 101]);
+  assert.deepEqual(input.orchestration, durableBefore);
 });
 
 test("visible DAG refuses to retry terminally decomposed work", async () => {
