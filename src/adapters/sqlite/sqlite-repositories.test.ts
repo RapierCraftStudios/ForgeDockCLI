@@ -9,7 +9,7 @@ import { ConcurrentPromotionUpdateError, type PromotionRecord } from "../../core
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
-import { InMemoryLeaseWitness } from "../../core/ports/lease.js";
+import { InMemoryLeaseRepository, InMemoryLeaseWitness, type LeaseInspection, type LeaseRepository } from "../../core/ports/lease.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
@@ -56,6 +56,41 @@ function resolveChildOutput(state: ChildOutputState): void {
   const { resolve } = state.waiter;
   state.waiter = undefined;
   resolve(output);
+}
+
+interface LeaseBindingTestRepository extends Pick<LeaseRepository, "acquire" | "continuity"> {
+  inspect(itemId: string, now?: number): LeaseInspection | undefined;
+}
+
+function assertBindingValidationOrdering(repository: LeaseBindingTestRepository): void {
+  const overlongBinding = "x".repeat(513);
+  assert.throws(() => repository.acquire("fresh-binding", "worker", 100, 1_000, { binding: "   " }), /Lease binding must not be empty/);
+  assert.throws(() => repository.acquire("fresh-binding", "worker", 100, 1_000, { binding: overlongBinding }), /Lease binding is too long/);
+  assert.equal(repository.continuity().state, "verified");
+  assert.equal(repository.continuity().epoch, 0);
+
+  const fresh = repository.acquire("fresh-binding", "worker", 100, 1_000, { binding: "  fresh-binding  " });
+  assert.ok(fresh);
+  assert.equal(fresh.binding, "fresh-binding");
+  assert.equal(fresh.epoch, 1);
+  assert.equal(repository.inspect("fresh-binding")?.binding, "fresh-binding");
+
+  const expired = repository.acquire("expired-binding", "old-worker", 100, 1_000, { binding: "old-binding" });
+  assert.ok(expired);
+  assert.equal(expired.epoch, 2);
+  const beforeInvalid = repository.inspect("expired-binding");
+  assert.ok(beforeInvalid);
+  assert.throws(() => repository.acquire("expired-binding", "new-worker", 100, 1_100, { binding: "   " }), /Lease binding must not be empty/);
+  assert.throws(() => repository.acquire("expired-binding", "new-worker", 100, 1_100, { binding: overlongBinding }), /Lease binding is too long/);
+  assert.deepEqual(repository.inspect("expired-binding"), beforeInvalid);
+  assert.equal(repository.continuity().state, "verified");
+  assert.equal(repository.continuity().epoch, 2);
+
+  const replacement = repository.acquire("expired-binding", "new-worker", 100, 1_100, { binding: "  replacement-binding  " });
+  assert.ok(replacement);
+  assert.equal(replacement.binding, "replacement-binding");
+  assert.equal(replacement.epoch, 3);
+  assert.equal(repository.inspect("expired-binding")?.binding, "replacement-binding");
 }
 
 async function assertConcurrentConstructors(moduleUrl: string, className: string, databasePath: string, root: string): Promise<void> {
@@ -469,6 +504,17 @@ describe("SQLite operational repositories", () => {
       assert.equal((await store.history(queued.runId)).at(-1)?.event, "RESUME_BUILD");
     } finally {
       store.close();
+    }
+  });
+
+  it("rejects invalid fresh and expired bindings without consuming fencing epochs", () => {
+    const sqlite = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
+    const memory = new InMemoryLeaseRepository(new InMemoryLeaseWitness());
+    try {
+      assertBindingValidationOrdering(sqlite);
+      assertBindingValidationOrdering(memory);
+    } finally {
+      sqlite.close();
     }
   });
 

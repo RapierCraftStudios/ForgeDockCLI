@@ -144,13 +144,13 @@ export class InMemoryLeaseRepository implements LeaseRepository {
   constructor(witness: LeaseWitness = new InMemoryLeaseWitness()) { this.#witness = witness; }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now(), options?: LeaseAcquisitionOptions): Lease | undefined {
+    const binding = normalizedBinding(options?.binding);
     this.#assertContinuity();
     const current = this.#leases.get(itemId);
     const recoveredRow = current && this.#recoveryEpoch !== undefined && current.epoch < this.#recoveryEpoch;
     if (current && current.expiresAt > now && !recoveredRow) return undefined;
     const advanced = this.#witness.compareAndAdvance(this.#localMaximum);
     this.#acceptWitness(advanced);
-    const binding = normalizedBinding(options?.binding);
     const lease: Lease = { itemId, owner, token: crypto.randomUUID(), ...(binding !== undefined ? { binding } : {}), epoch: advanced.epoch, acquiredAt: now, heartbeatAt: now, expiresAt: now + ttlMs, continuity: "verified" };
     this.#leases.set(itemId, lease);
     this.#recoveryEpoch = undefined;
