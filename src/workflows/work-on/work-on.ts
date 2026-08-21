@@ -193,6 +193,9 @@ export async function resumeTargetAdvanceWorkOn(
     throw new Error(`Target recovery requires target_recovery or retry_wait state, found ${input.run.state}`);
   }
   const checkpoint = input.checkpoint.payload;
+  if (checkpoint.phase === "reviewed") {
+    throw new Error("Target recovery checkpoint is already reviewed and cannot be republished");
+  }
   const pullRequest = input.pullRequest;
   assertTargetRecoveryIdentity(input);
   await assertTargetReceiptChain(input, dependencies.artifacts);

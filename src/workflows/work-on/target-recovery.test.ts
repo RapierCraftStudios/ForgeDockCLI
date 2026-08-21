@@ -6,6 +6,7 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { VerificationRunner } from "../../core/ports/verification.js";
 import { attachArtifact, createRun, transition, type RunState } from "../../core/state/machine.js";
 import { reconcileLatestRunArtifacts } from "../../core/state/reconcile.js";
+import { decideSubjectAdmission } from "../../core/state/admission.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 import { resumeTargetAdvanceWorkOn } from "./work-on.js";
@@ -93,6 +94,44 @@ describe("direct target recovery integration", () => {
     assert.equal((await fixture.artifacts.list(subject, "BuildResult")).length, 2);
     assert.equal((await fixture.artifacts.list({ ...subject, pr: 7 }, "ReviewVerdict")).length, 1);
   });
+  it("resolves reviewed checkpoints by matching fresh verdict disposition", async () => {
+    const reviewed = async (runId: string, disposition: "approve" | "request_changes") => {
+      const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId); const fixture = await targetRun(runId, i, inv, p, b);
+      const fresh = build(runId, targetBase, recoveredHead);
+      const verdict = createArtifact({ kind: "ReviewVerdict", runId, subject, producer: { role: "reviewer" }, payload: { disposition, headSha: recoveredHead, baseBranch: "main", reviewerRoles: ["reviewer"], findings: [], checks: [] } });
+      await fixture.artifacts.append(fresh);
+      await fixture.artifacts.append(verdict);
+      await persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: fresh, sourceBuildResult: b, workspace, targetBranch: "main", observedTargetSha: targetBase, phase: "reviewed", verdict, artifacts: fixture.artifacts });
+      return await fixture.artifacts.list(subject);
+    };
+    const admissionState = (artifacts: readonly DurableArtifact[]) => {
+      const decision = decideSubjectAdmission(artifacts);
+      if (!("state" in decision)) throw new Error(`unexpected admission action ${decision.action}`);
+      return decision.state;
+    };
+    const approved = await reviewed("target-reviewed-approve", "approve");
+    const approvedReconciled = reconcileLatestRunArtifacts(approved);
+    assert.equal(approvedReconciled.state, "merging");
+    assert.equal(admissionState(approved), "merging");
+    const changes = await reviewed("target-reviewed-changes", "request_changes");
+    const changesReconciled = reconcileLatestRunArtifacts(changes);
+    assert.equal(changesReconciled.state, "remediating");
+    assert.equal(admissionState(changes), "remediating");
+    const missingVerdict = approved.filter((artifact) => artifact.kind !== "ReviewVerdict");
+    const mismatchedVerdict = approved.map((artifact) => artifact.kind === "ReviewVerdict"
+      ? { ...artifact, payload: { ...artifact.payload, headSha: "e".repeat(40) } }
+      : artifact);
+    assert.notEqual(reconcileLatestRunArtifacts(mismatchedVerdict).state, "merging");
+    assert.notEqual(admissionState(mismatchedVerdict), "merging");
+  });
+
+  it("rejects direct resume of an already reviewed checkpoint", async () => {
+    const runId = "target-reviewed-guard"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const reviewedCheckpoint = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, phase: "reviewed" as const } } as typeof fixture.checkpoint;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: reviewedCheckpoint, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /already reviewed/);
+  });
+
   it("rejects checkpoint identity drift before target mutation", async () => {
     const runId = "target-identity"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
     const fixture = await targetRun(runId, i, inv, p, b); const { git, dependencies } = deps(fixture);
