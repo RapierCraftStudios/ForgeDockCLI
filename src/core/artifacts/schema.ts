@@ -660,6 +660,15 @@ export const OutcomePayloadSchema = Type.Object({
   /** Batch members intentionally left open because closure-protected labels were present. */
   preservedChildIssues: Type.Optional(Type.Array(Type.String())),
   batchParent: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** Terminal target-recovery failures supersede the resumable checkpoint. */
+  targetRecovery: Type.Optional(Type.Object({
+    checkpointId: NonEmptyString,
+    phase: NonEmptyString,
+    cause: Type.String({ minLength: 1, maxLength: 4096 }),
+    attempt: Type.Object({ number: Type.Integer({ minimum: 1 }), max: Type.Integer({ minimum: 1 }) }),
+  })),
+  /** Terminal artifact lineage; prevents a stale checkpoint from masking failure. */
+  supersedes: Type.Optional(NonEmptyString),
   failureEvidence: Type.Optional(Type.Object({
     branch: NonEmptyString,
     workspacePath: NonEmptyString,

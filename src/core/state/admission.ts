@@ -193,6 +193,8 @@ export function decideSubjectAdmission(
   const build = latestArtifactOfKind(latest.artifacts, "BuildResult");
   const verdict = latestArtifactOfKind(latest.artifacts, "ReviewVerdict");
   const outcome = latestArtifactOfKind(latest.artifacts, "Outcome");
+  const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
+    && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
   const remediationCheckpoint = latestArtifactOfKind(latest.artifacts, "RemediationBlocked");
   const deliveryContext = hasIntent && hasInvestigation && hasPacket;
   const latestBuildIndex = lastArtifactIndex(latest.artifacts, "BuildResult");
@@ -205,6 +207,12 @@ export function decideSubjectAdmission(
     : lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
   const latestRetry = latestArtifactOfKind(latest.artifacts, "RetryCheckpoint");
   const latestRetryIndex = lastArtifactIndex(latest.artifacts, "RetryCheckpoint");
+  if (terminalTargetRecoveryOutcome) {
+    return {
+      action: "block", runId: latest.runId, state: outcome!.payload.status === "blocked" ? "blocked" : "failed",
+      reason: `Target recovery checkpoint ${outcome!.payload.targetRecovery!.checkpointId} is superseded by terminal ${outcome!.payload.status} Outcome: ${outcome!.payload.reason}`,
+    };
+  }
   if (latestRetry?.payload.status === "exhausted") {
     return {
       action: "block", runId: latest.runId, state: "blocked",

@@ -10,7 +10,7 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type PullRequestRepairWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
-import type { LeaseGuard } from "../../core/ports/lease.js";
+import { LeaseContinuityError, type LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import type { TelemetryRepository } from "../../core/ports/telemetry.js";
 import {
@@ -188,7 +188,7 @@ type VerificationCatalogResolver = (
  * target-sensitive operation is fenced by the caller's lease and route claim;
  * this function never reuses the old approval as a verdict for the new head.
  */
-export async function resumeTargetAdvanceWorkOn(
+async function resumeTargetAdvanceWorkOnInternal(
   input: TargetAdvanceResumeInput,
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult & { buildResult: DurableArtifact<"BuildResult"> }> {
@@ -255,6 +255,13 @@ export async function resumeTargetAdvanceWorkOn(
           reason: `Target advancement recovery exhausted after ${checkpoint.attempt.max} attempts: ${reason}`,
           ...(run.targetBranch ? { targetBranch: run.targetBranch } : {}),
           childIssues: [],
+          targetRecovery: {
+            checkpointId: checkpointArtifact?.id ?? input.checkpoint.id,
+            phase,
+            cause: reason,
+            attempt: { number: attempt, max: checkpoint.attempt.max },
+          },
+          supersedes: checkpointArtifact?.id ?? input.checkpoint.id,
         },
       }, { id: `target_exhausted_${createHash("sha256").update(`${run.runId}:${checkpoint.routeClaimKey}:${checkpoint.attempt.max}`).digest("hex").slice(0, 32)}` });
       await dependencies.artifacts.append(exhaustedOutcome);
@@ -535,6 +542,102 @@ export async function resumeTargetAdvanceWorkOn(
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
   return { run: reviewed.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
 }
+
+/**
+ * Convert a permanent failure observed after target integration into a durable
+ * terminal projection. Reconciliation must never let the older checkpoint win
+ * merely because the exception interrupted the resume call.
+ */
+export async function resumeTargetAdvanceWorkOn(
+  input: TargetAdvanceResumeInput,
+  dependencies: WorkOnDependencies,
+): Promise<WorkOnResult & { buildResult: DurableArtifact<"BuildResult"> }> {
+  try {
+    return await resumeTargetAdvanceWorkOnInternal(input, dependencies);
+  } catch (error) {
+    // Retryable movement/network failures and ownership ambiguity retain their
+    // checkpoint. Only a permanent controller error terminalizes the run.
+    if ((error instanceof WorkflowExecutionError && error.recoverable)
+      || error instanceof LeaseContinuityError
+      || error instanceof ClaimPromotionConflictError
+      || error instanceof ClaimPromotionRecoveryError
+      || input.signal?.aborted === true) {
+      throw error;
+    }
+    const guarded = guardMutationBoundaries(dependencies);
+    const artifacts = await guarded.artifacts.list(input.run.subject);
+    const terminalCheckpoint = artifacts
+      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> =>
+        artifact.kind === "TargetAdvanceCheckpoint" && artifact.runId === input.run.runId)
+      .sort((left, right) => left.payload.updatedAt.localeCompare(right.payload.updatedAt) || left.id.localeCompare(right.id))
+      .at(-1) ?? input.checkpoint;
+    const terminalCheckpointId = terminalCheckpoint.id;
+    const existing = artifacts.find((artifact): artifact is DurableArtifact<"Outcome"> =>
+      artifact.kind === "Outcome"
+      && artifact.runId === input.run.runId
+      && (artifact.payload.targetRecovery?.checkpointId === terminalCheckpointId
+        || artifact.payload.targetRecovery?.checkpointId === input.checkpoint.id)
+      && (artifact.payload.status === "failed" || artifact.payload.status === "blocked"));
+    const current = await guarded.runs.load(input.run.runId) ?? input.run;
+    if (existing) {
+      // A restart may re-enter the same checkpoint after the terminal append;
+      // preserve exactly one Outcome and return the original cause/lineage.
+      throw new WorkflowExecutionError(existing.payload.reason, current, {
+        cause: error,
+        recoverable: false,
+        retryDisposition: {
+          disposition: "permanent", retryable: false, domain: "workflow", code: "target-recovery-terminal",
+          cause: error instanceof Error ? error : new Error(String(error)),
+        },
+        targetAdvanceCheckpointId: terminalCheckpointId,
+      });
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    // Build the transition receipt before the append, but do not commit it
+    // until the terminal artifact is durable. This ordering closes the crash
+    // window where a failed run could coexist with a resumable checkpoint.
+    const terminalTransition = current.state === "failed" || current.state === "blocked"
+      ? undefined
+      : transition(current, "FAIL", { reason });
+    const terminalRun = terminalTransition?.state ?? current;
+    const terminal = createArtifact({
+      kind: "Outcome",
+      runId: input.run.runId,
+      subject: input.run.subject,
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: {
+        status: "failed",
+        reason,
+        ...(terminalRun.targetBranch ? { targetBranch: terminalRun.targetBranch } : {}),
+        ...(terminalRun.promotionTarget ? { promotionTarget: terminalRun.promotionTarget } : {}),
+        ...(terminalRun.productionTarget ? { productionTarget: terminalRun.productionTarget } : {}),
+        childIssues: [],
+        targetRecovery: {
+          checkpointId: terminalCheckpointId,
+          phase: terminalCheckpoint.payload.phase,
+          cause: reason,
+          attempt: terminalCheckpoint.payload.attempt,
+        },
+        supersedes: terminalCheckpointId,
+      },
+    }, { id: `target_terminal_${createHash("sha256").update(`${input.run.runId}:${terminalCheckpointId}`).digest("hex").slice(0, 40)}` });
+    await guarded.artifacts.append(terminal);
+    const committedRun = attachArtifact(terminalRun, "Outcome", terminal.id);
+    if (terminalTransition) {
+      await guarded.runs.commit(current.version, committedRun, terminalTransition.record);
+    }
+    throw new WorkflowExecutionError(reason, committedRun, {
+      cause: error,
+      recoverable: false,
+      retryDisposition: {
+        disposition: "permanent", retryable: false, domain: "workflow", code: "target-recovery-terminal",
+        cause: error instanceof Error ? error : new Error(reason),
+      },
+      targetAdvanceCheckpointId: terminalCheckpointId,
+    });
+  }
+}
+
 function freshTargetRecoveryEvidence(
   packet: DurableArtifact<"BuildPacket">,
   sourceBuild: DurableArtifact<"BuildResult">,

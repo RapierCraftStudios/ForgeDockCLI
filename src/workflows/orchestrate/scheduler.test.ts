@@ -880,8 +880,42 @@ it("completes a 1,000-node mixed-route fleet with bounded recovery concurrency",
   assert.equal(attempts.size, 1_000);
 });
 
-it("uses durable target recovery attempt metadata across restart", async () => {
+it("caps repeated authoritative attempt-one target recovery outcomes monotonically", async () => {
   let calls = 0;
+  const events: string[] = [];
+  const result = await runSchedule([
+    { id: "loop-shape", issue: 1, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls += 1;
+    return { status: "target_recovery", attempt: 1, maxAttempts: 3 };
+  }, { onEvent: (event) => { if (event.itemId) events.push(`${event.type}:${event.itemId}`); } });
+  assert.equal(calls, 3);
+  assert.equal(result.status.get("loop-shape"), "failed");
+  assert.equal(events.filter((event) => event === "failed:loop-shape").length, 1);
+  assert.equal(events.filter((event) => event === "resumed:loop-shape").length, 2);
+});
+
+it("caps repeated retry-wait target movement attempt-one outcomes", async () => {
+  let calls = 0;
+  const result = await runSchedule([
+    { id: "retry-loop-shape", issue: 2, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls += 1;
+    return {
+      status: "retry_wait",
+      attempt: 1,
+      maxAttempts: 3,
+      retryCode: "target-advanced",
+      retryable: true,
+      nextAttemptAt: new Date().toISOString(),
+    };
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.status.get("retry-loop-shape"), "failed");
+});
+
+  it("uses durable target recovery attempt metadata across restart", async () => {
+    let calls = 0;
   const result = await runSchedule([
     { id: "resumed", issue: 1, priority: 1, dependencies: [], claims: [] },
   ], 1, async () => {

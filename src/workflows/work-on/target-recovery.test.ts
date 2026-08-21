@@ -196,6 +196,74 @@ describe("direct target recovery integration", () => {
     await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: fixture.checkpoint, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, depsWithLease), /lease lost/);
     assert.equal(promotions, 0); assert.equal(git.commits, 0); assert.equal(git.pushes, 0);
   });
+  it("terminalizes a permanent anchor failure after integrated checkpoint without redispatch", async () => {
+    const runId = "target-permanent-anchor";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const git = new GitFake();
+    git.revisionChangedPaths = async () => [];
+    const dependencies = deps(fixture, git).dependencies;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({
+      run: fixture.run, checkpoint: fixture.checkpoint, intent: i,
+      investigation: inv, packet: p, buildResult: b,
+      workspace, verification: [command],
+    }, dependencies), (error: unknown) => {
+      assert.ok(error instanceof WorkflowExecutionError);
+      assert.equal(error.recoverable, false);
+      assert.match(error.targetAdvanceCheckpointId ?? "", /^target_/);
+      assert.match(error.message, /stale or out-of-scope path anchors/);
+      return true;
+    });
+    const artifacts = await fixture.artifacts.list(subject);
+    const outcomes = artifacts.filter((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome");
+    const latestCheckpoint = artifacts.filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint").at(-1);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0]?.payload.targetRecovery?.checkpointId, latestCheckpoint?.id);
+    assert.equal(reconcileLatestRunArtifacts(artifacts).state, "failed");
+    const terminal = terminalOrchestrationResult(subject.issue, artifacts, reconcileLatestRunArtifacts(artifacts));
+    assert.equal(terminal?.status, "failed");
+
+    // A restart/reconciliation replay observes the same terminal lineage and
+    // must not append a second Outcome or redispatch target movement.
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({
+      run: fixture.run, checkpoint: fixture.checkpoint, intent: i,
+      investigation: inv, packet: p, buildResult: b,
+      workspace, verification: [command],
+    }, dependencies), /stale or out-of-scope path anchors/);
+    assert.equal((await fixture.artifacts.list(subject, "Outcome")).length, 1);
+  });
+
+  it("keeps terminal artifact authority when the run commit fails", async () => {
+    const runId = "target-terminal-commit-crash";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const git = new GitFake(); git.revisionChangedPaths = async () => [];
+    const originalCommit = fixture.runs.commit.bind(fixture.runs);
+    (fixture.runs as any).commit = async (expectedVersion: number, state: RunState, record: any) => {
+      if (state.state === "failed") throw new Error("simulated commit crash");
+      return originalCommit(expectedVersion, state, record);
+    };
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: fixture.checkpoint, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture, git).dependencies));
+    assert.equal((await fixture.artifacts.list(subject, "Outcome")).length, 1);
+    assert.equal((await fixture.runs.load(runId))?.state, "target_recovery");
+    assert.equal(reconcileLatestRunArtifacts(await fixture.artifacts.list(subject)).state, "failed");
+  });
+
+  it("does not commit failed state when terminal artifact append fails", async () => {
+    const runId = "target-terminal-append-crash";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const git = new GitFake(); git.revisionChangedPaths = async () => [];
+    const originalAppend = fixture.artifacts.append.bind(fixture.artifacts);
+    (fixture.artifacts as any).append = async (artifact: DurableArtifact) => {
+      if (artifact.kind === "Outcome") throw new Error("simulated append crash");
+      return originalAppend(artifact);
+    };
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: fixture.checkpoint, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture, git).dependencies));
+    assert.equal((await fixture.artifacts.list(subject, "Outcome")).length, 0);
+    assert.equal((await fixture.runs.load(runId))?.state, "target_recovery");
+  });
+
   it("turns the max-attempt boundary into one exhausted retry and blocked outcome", async () => {
     const runId = "target-exhaustion"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId); const fixture = await targetRun(runId, i, inv, p, b);
     const checkpoint = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, attempt: { number: 1, max: 2 } } } as typeof fixture.checkpoint;

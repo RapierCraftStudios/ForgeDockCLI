@@ -122,6 +122,8 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
     : undefined;
   const outcome = recoverableTerminalOutcome ?? latestOutcome;
   const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
+  const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
+    && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
   const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
   const targetAdvanceCheckpointIndex = targetAdvanceCheckpoint?.payload.phase === "reviewed"
@@ -134,11 +136,11 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   if (targetAdvanceCheckpoint?.payload.phase === "reviewed" && !reviewedTargetValidation.valid) {
     warnings.push(reviewedTargetValidation.reason!);
   }
-  const checkpointIsLatest = (remediationCheckpoint !== undefined
+  const checkpointIsLatest = !terminalTargetRecoveryOutcome && ((remediationCheckpoint !== undefined
     && remediationCheckpointIndex >= Math.max(outcomeIndex, buildIndex))
     || (nonterminalCheckpoint !== undefined
-      && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex));
-  if (nonterminalCheckpoint && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex)) {
+      && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex)));
+  if (!terminalTargetRecoveryOutcome && nonterminalCheckpoint && nonterminalCheckpointIndex > Math.max(outcomeIndex, buildIndex)) {
     state = nonterminalCheckpoint.kind === "RetryCheckpoint"
       ? (nonterminalCheckpoint.payload.status === "exhausted" ? "blocked" : "retry_wait")
       : "target_recovery";

@@ -365,6 +365,16 @@ export async function runSchedule(
   let targetRecoveryAbortHandler: (() => void) | undefined;
   const targetRecoveryAttempts = new Map<string, number>();
   const targetRecoveryMaxAttempts = new Map<string, number>();
+  // Durable node evidence survives a scheduler restart; never reset the
+  // in-memory target budget when a worker reports the same attempt again.
+  for (const item of items) {
+    if (item.retryAttempt !== undefined && Number.isSafeInteger(item.retryAttempt) && item.retryAttempt > 0) {
+      targetRecoveryAttempts.set(item.id, item.retryAttempt);
+    }
+    if (item.retryMaxAttempts !== undefined && Number.isSafeInteger(item.retryMaxAttempts) && item.retryMaxAttempts > 0) {
+      targetRecoveryMaxAttempts.set(item.id, Math.min(3, item.retryMaxAttempts));
+    }
+  }
   let occupiedIssueSlots = 0;
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const queuedWaitReasonChanges = new Set<string>();
@@ -596,12 +606,17 @@ export async function runSchedule(
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
           if (outcome.status === "target_recovery") {
-            const legacyAttempt = (targetRecoveryAttempts.get(item.id) ?? 0) + 1;
-            const attempt = outcome.attempt ?? legacyAttempt;
+            const previousAttempt = targetRecoveryAttempts.get(item.id) ?? 0;
+            const authoritativeAttempt = outcome.attempt;
+            const attempt = Math.max(previousAttempt + 1, authoritativeAttempt ?? 1);
             targetRecoveryAttempts.set(item.id, attempt);
-            const maxAttempts = outcome.maxAttempts
-              ?? targetRecoveryMaxAttempts.get(item.id)
-              ?? 3;
+            const previousMax = targetRecoveryMaxAttempts.get(item.id);
+            const reportedMax = outcome.maxAttempts;
+            // Establish the bound once, then only tighten it. A repeated or
+            // stale result cannot replenish budget, including after restart.
+            const maxAttempts = Math.max(1, Math.min(3,
+              previousMax ?? reportedMax ?? 3,
+              reportedMax ?? previousMax ?? 3));
             targetRecoveryMaxAttempts.set(item.id, maxAttempts);
             status.set(item.id, "target_recovery");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
@@ -618,6 +633,8 @@ export async function runSchedule(
             emit("target_recovery", item.id);
             if (attempt >= maxAttempts) {
               status.set(item.id, "failed");
+              updateQueuedWaitReason(item.id, undefined, false);
+              targetRecoveryWakeups.delete(item.id);
               emit("failed", item.id);
             } else {
               // The worker has finished and released its lease/capacity. Yield
@@ -637,8 +654,20 @@ export async function runSchedule(
           } else if (outcome.status === "retry_wait") {
             const nextAttemptAt = outcome.nextAttemptAt
               ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString();
-            const attempt = outcome.attempt ?? 1;
-            const maxAttempts = outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER;
+            const targetMovement = outcome.retryCode === "target-advanced"
+              || outcome.targetAdvanceCheckpointId !== undefined;
+            const attempt = targetMovement
+              ? Math.max((targetRecoveryAttempts.get(item.id) ?? 0) + 1, outcome.attempt ?? 1)
+              : (outcome.attempt ?? 1);
+            const maxAttempts = targetMovement
+              ? Math.max(1, Math.min(3,
+                targetRecoveryMaxAttempts.get(item.id) ?? outcome.maxAttempts ?? 3,
+                outcome.maxAttempts ?? targetRecoveryMaxAttempts.get(item.id) ?? 3))
+              : (outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER);
+            if (targetMovement) {
+              targetRecoveryAttempts.set(item.id, attempt);
+              targetRecoveryMaxAttempts.set(item.id, maxAttempts);
+            }
             status.set(item.id, "retry_wait");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
             waitReasons.set(item.id, {
@@ -651,6 +680,7 @@ export async function runSchedule(
             });
             if (attempt >= maxAttempts) {
               status.set(item.id, "failed");
+              if (targetMovement) updateQueuedWaitReason(item.id, undefined, false);
               emit("failed", item.id);
             } else {
               // Retry waits do not occupy worker capacity or a node lease. Keep

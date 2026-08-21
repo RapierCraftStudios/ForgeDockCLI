@@ -2473,10 +2473,16 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
             return { status: "suspended", error };
           }
+          if (error instanceof WorkflowExecutionError && !error.recoverable && error.targetAdvanceCheckpointId) {
+            return { status: "failed", error: error.message, targetAdvanceCheckpointId: error.targetAdvanceCheckpointId, retryable: false };
+          }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
             const targetRecovery = error.run.state === "target_recovery" || error.run.state === "retry_wait"
               || error.retryDisposition.code === "target-advanced";
             if (targetRecovery) {
+              const durableArtifacts = await artifacts.list(subject);
+              const durableRetry = latestArtifactOfKind(durableArtifacts, "RetryCheckpoint");
+              const durableTarget = latestArtifactOfKind(durableArtifacts, "TargetAdvanceCheckpoint");
               process.stdout.write(`${statusGlyph("active", mode)} ${item.id} target movement deferred · durable retry will re-admit the frozen route\n`);
               return {
                 status: "retry_wait",
@@ -2485,11 +2491,11 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
                 ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
                 ...(error.retryCheckpointId ? { retryCheckpointId: error.retryCheckpointId } : {}),
                 retryAfterMs: error.retryDisposition.retryAfterMs ?? 500,
-                attempt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.number
-                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.number ?? error.run.attempt,
-                maxAttempts: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.max
-                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.max ?? 3,
-                nextAttemptAt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.nextAt
+                attempt: durableRetry?.payload.attempt.number
+                  ?? durableTarget?.payload.attempt.number ?? error.run.attempt,
+                maxAttempts: durableRetry?.payload.attempt.max
+                  ?? durableTarget?.payload.attempt.max ?? 3,
+                nextAttemptAt: durableRetry?.payload.attempt.nextAt
                   ?? new Date(Date.now() + (error.retryDisposition.retryAfterMs ?? 500)).toISOString(),
                 retryDomain: error.retryDisposition.domain,
                 retryCode: error.retryDisposition.code,
@@ -2945,7 +2951,8 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           });
         } catch (error) {
           if (error instanceof TargetBranchAdvancedError && current.action === "resume" && current.checkpoint === "target-advance") {
-            const checkpoint = latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint");
+            const durableArtifacts = await artifacts.list(subject);
+            const checkpoint = latestArtifactOfKind(durableArtifacts, "TargetAdvanceCheckpoint");
             const attempt = (checkpoint?.payload.attempt.number ?? 1) + 1;
             const maxAttempts = checkpoint?.payload.attempt.max ?? 3;
             if (attempt > maxAttempts) return { status: "failed", error: `Target branch moved ${maxAttempts} times; target recovery exhausted`, attempt, maxAttempts, retryDomain: "workflow", retryCode: "target-advance-exhausted" };
@@ -2958,10 +2965,16 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
             return { status: "suspended", error };
           }
+          if (error instanceof WorkflowExecutionError && !error.recoverable && error.targetAdvanceCheckpointId) {
+            return { status: "failed", error: error.message, targetAdvanceCheckpointId: error.targetAdvanceCheckpointId, retryable: false };
+          }
           if (error instanceof WorkflowExecutionError && error.recoverable) {
             const targetRecovery = error.run.state === "target_recovery" || error.run.state === "retry_wait"
               || error.retryDisposition.code === "target-advanced";
             if (targetRecovery) {
+              const durableArtifacts = await artifacts.list(subject);
+              const durableRetry = latestArtifactOfKind(durableArtifacts, "RetryCheckpoint");
+              const durableTarget = latestArtifactOfKind(durableArtifacts, "TargetAdvanceCheckpoint");
               process.stdout.write(`${statusGlyph("active", mode)} ${item.id} target movement deferred · durable retry will re-admit the frozen route\n`);
               return {
                 status: "retry_wait",
@@ -2970,11 +2983,11 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
                 ...(error.targetAdvanceCheckpointId ? { targetAdvanceCheckpointId: error.targetAdvanceCheckpointId } : {}),
                 ...(error.retryCheckpointId ? { retryCheckpointId: error.retryCheckpointId } : {}),
                 retryAfterMs: error.retryDisposition.retryAfterMs ?? 500,
-                attempt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.number
-                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.number ?? error.run.attempt,
-                maxAttempts: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.max
-                  ?? latestArtifactOfKind(issueArtifacts, "TargetAdvanceCheckpoint")?.payload.attempt.max ?? 3,
-                nextAttemptAt: latestArtifactOfKind(issueArtifacts, "RetryCheckpoint")?.payload.attempt.nextAt
+                attempt: durableRetry?.payload.attempt.number
+                  ?? durableTarget?.payload.attempt.number ?? error.run.attempt,
+                maxAttempts: durableRetry?.payload.attempt.max
+                  ?? durableTarget?.payload.attempt.max ?? 3,
+                nextAttemptAt: durableRetry?.payload.attempt.nextAt
                   ?? new Date(Date.now() + (error.retryDisposition.retryAfterMs ?? 500)).toISOString(),
                 retryDomain: error.retryDisposition.domain,
                 retryCode: error.retryDisposition.code,

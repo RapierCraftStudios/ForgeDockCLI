@@ -15,6 +15,21 @@ export function terminalOrchestrationResult(
   artifacts: readonly DurableArtifact[],
   reconciled: ReconciledSubjectState,
 ): Exclude<ScheduleWorkerResult, void> | undefined {
+  const terminalTargetOutcome = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"Outcome"> =>
+    artifact.kind === "Outcome"
+    && artifact.runId === reconciled.runId
+    && artifact.payload.targetRecovery?.checkpointId !== undefined
+    && (artifact.payload.status === "failed" || artifact.payload.status === "blocked"));
+  if (terminalTargetOutcome) {
+    return {
+      status: terminalTargetOutcome.payload.status === "blocked" ? "blocked" : "failed",
+      error: `#${issue} reached ${terminalTargetOutcome.payload.status}: ${terminalTargetOutcome.payload.reason}`,
+      targetAdvanceCheckpointId: terminalTargetOutcome.payload.targetRecovery!.checkpointId,
+      attempt: terminalTargetOutcome.payload.targetRecovery!.attempt.number,
+      maxAttempts: terminalTargetOutcome.payload.targetRecovery!.attempt.max,
+      retryable: false,
+    };
+  }
   if (reconciled.state === "target_recovery") {
     const checkpoint = reconciled.targetAdvanceCheckpoint;
     return {
