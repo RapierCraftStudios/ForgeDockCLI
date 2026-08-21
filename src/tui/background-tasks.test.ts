@@ -98,6 +98,65 @@ test("waitForTerminal resets semantic idle only for correlated semantic observat
   observer.close();
 });
 
+test("waitForTerminal replays semantic activity before correlated initial-window process noise", async () => {
+  const { cwd, messages, tasks, ctx } = fixture();
+  const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 32 });
+  const producer = createObservationProducer("background-initial-window-test");
+  let releaseFirstQuery!: () => void;
+  let firstQueryStarted!: () => void;
+  const firstQueryGate = new Promise<void>((resolve) => { releaseFirstQuery = resolve; });
+  const firstQueryStartedSignal = new Promise<void>((resolve) => { firstQueryStarted = resolve; });
+  let isFirstQuery = true;
+  tasks.setObservationSink({
+    emit: (draft) => observer.emit(draft),
+    query: async (query) => {
+      if (isFirstQuery) {
+        isFirstQuery = false;
+        firstQueryStarted();
+        await firstQueryGate;
+      }
+      return observer.query(query);
+    },
+  });
+  const triggerPath = join(cwd, "emit-correlated-noise");
+  const record = tasks.start({
+    command: process.execPath,
+    args: ["-e", "const fs=require('node:fs'); const trigger=process.argv[1]; const timer=setInterval(()=>{if(fs.existsSync(trigger)){clearInterval(timer); process.stdout.write('correlated process noise'); setTimeout(()=>process.exit(0),25)}},1)", triggerPath],
+    cwd,
+    ctx,
+  });
+  const waiting = tasks.waitForTerminal(record.id, { warnAfterMs: 100 });
+  try {
+    await firstQueryStartedSignal;
+    await observer.emit({ producer, identity: { controllerTaskId: record.id }, source: "workflow", channel: "activity", kind: "workflow.progress", payload: { phase: "initial-window" } });
+    const noiseSeen = new Promise<void>((resolve) => {
+      const observedKinds = new Set<string>();
+      let unsubscribe: () => void = () => undefined;
+      const subscription = observer.subscribe((event) => {
+        if (event.identity.controllerTaskId !== record.id) return;
+        if (event.kind !== "output.stdout" && event.kind !== "process.exited") return;
+        observedKinds.add(event.kind);
+        if (observedKinds.size === 2) {
+          unsubscribe();
+          resolve();
+        }
+      });
+      unsubscribe = subscription.unsubscribe;
+    });
+    writeFileSync(triggerPath, "go");
+    await noiseSeen;
+    releaseFirstQuery();
+    assert.equal((await waiting).status, "completed");
+    assert.equal(messages.some((message) => message.includes("no semantic activity")), false);
+  } finally {
+    releaseFirstQuery();
+    await waiting.catch(() => undefined);
+    if (tasks.isOperationallyActive(record.id)) tasks.cancel(record.id);
+    await tasks.shutdown();
+    observer.close();
+  }
+});
+
 test("waitForTerminal warns for a long noisy process with no semantic activity", async () => {
   const { cwd, messages, tasks, ctx } = fixture();
   const observer = new ForgeDockObserver({ store: new SqliteObservationStore(":memory:"), maxQueueDepth: 32 });
