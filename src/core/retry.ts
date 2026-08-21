@@ -39,16 +39,23 @@ const NETWORK_WORDS = /dns|tls|certificate|socket|network|timeout|temporarily un
 export function classifyRetryableError(error: unknown, options: RetryClassifierOptions = {}): RetryClassification {
   const cause = asError(error);
   const candidate = error as Record<string, unknown> | null;
-  const status = numeric(candidate?.status) ?? numeric(candidate?.statusCode) ?? parseStatus(cause.message);
-  const retryAfterMs = parseRetryAfter(candidate, cause.message);
+  const externalClassification = candidate?.classification;
+  const externalKind = externalClassification && typeof externalClassification === "object"
+    ? stringValue((externalClassification as Record<string, unknown>).kind)
+    : undefined;
+  const externalRetryable = externalKind !== undefined && typeof candidate?.attempts === "number";
+  const status = numeric(candidate?.status) ?? numeric(candidate?.statusCode) ?? numeric((externalClassification as Record<string, unknown> | undefined)?.status) ?? parseStatus(cause.message);
+  const retryAfterMs = parseRetryAfter(candidate, cause.message)
+    ?? numeric((externalClassification as Record<string, unknown> | undefined)?.retryAfterMs);
   const sessionRef = options.sessionRef ?? stringValue(candidate?.sessionRef) ?? stringValue(candidate?.sessionId);
   const resumableSession = options.resumableSession === true
     || candidate?.resumable === true
     || (sessionRef !== undefined && candidate?.resumable !== false);
-  const domain = options.domain ?? inferDomain(cause.message, candidate);
-  const code = stringValue(candidate?.code)?.toLowerCase() ?? codeFor(status, cause.message, resumableSession);
+  const domain = options.domain ?? (externalRetryable ? "transport" : inferDomain(cause.message, candidate));
+  const code = stringValue(candidate?.code)?.toLowerCase() ?? (externalRetryable ? `${externalKind}-exhausted` : codeFor(status, cause.message, resumableSession));
 
   let retryable = false;
+  if (externalRetryable) retryable = true;
   if (status !== undefined && (RETRYABLE_STATUS.has(status) || status >= 500)) retryable = true;
   if (status === 401 && options.authenticationRefreshAvailable) retryable = true;
   if (RETRYABLE_CODES.has(String(candidate?.code ?? "").toUpperCase()) || NETWORK_WORDS.test(cause.message)) retryable = true;

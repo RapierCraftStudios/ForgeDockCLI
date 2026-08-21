@@ -28,6 +28,7 @@ import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
 import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
+import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
 
 export const repositoryFromRemote = parseRepositoryFromRemote;
 
@@ -1987,26 +1988,21 @@ export class GitHubClient implements ForgeHost {
 
   private async gh(args: string[], input?: string): Promise<string> {
     const readOnly = isReadOnlyGhInvocation(args);
-    let attempts = 0;
-    while (attempts < MAX_READ_ATTEMPTS) {
-      attempts += 1;
-      try {
-        return await this.runGh(args, input);
-      } catch (error) {
-        if (readOnly && !this.authRefreshAttempted && isGitHubAuthenticationFailure(error)) {
-          this.authRefreshAttempted = true;
-          const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))();
-          if (!refreshed) throw error;
-          continue;
-        }
-        if (!readOnly || !isTransientGitHubReadFailure(error) || attempts >= MAX_READ_ATTEMPTS) throw error;
-        await waitForReadRetry(attempts, error);
-      }
+    const run = () => readOnly
+      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), { hostKey: "github.com" })
+      : this.runGh(args, input);
+    try {
+      return await run();
+    } catch (error) {
+      if (!readOnly || this.authRefreshAttempted || !isGitHubAuthenticationFailure(error)) throw error;
+      this.authRefreshAttempted = true;
+      const refreshed = await (this.refreshAuth ?? (() => refreshConfiguredGitHubApp(this.commandCwd)))();
+      if (!refreshed) throw error;
+      return run();
     }
-    throw new Error("GitHub read attempts exhausted");
   }
 
-  private runGh(args: string[], input?: string): Promise<string> {
+  private runGh(args: string[], input?: string, signal?: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn("gh", args, {
         cwd: this.commandCwd,
@@ -2014,6 +2010,7 @@ export class GitHubClient implements ForgeHost {
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
         windowsHide: true,
+        ...(signal !== undefined ? { signal } : {}),
       });
       let stdout = "";
       let stderr = "";

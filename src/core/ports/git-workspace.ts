@@ -29,7 +29,7 @@ export class AdvertisedRemoteHeadMismatchError extends Error {
 }
 
 export interface GitWorkspaceManager {
-  create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace>;
+  create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace>;
   /**
    * Move an untouched delivery workspace to an exact, host-advertised target
    * revision. Implementations must fetch the branch directly, reject dirty or
@@ -64,7 +64,7 @@ export interface GitWorkspaceManager {
   /** Prove one fetched commit is contained in a descendant revision. */
   isAncestor(workspace: GitWorkspace, ancestorSha: string, descendantSha: string): Promise<boolean>;
   /** Install lockfile dependencies without executing repository lifecycle scripts. */
-  prepareWorkspaceDependencies(workspace: GitWorkspace): Promise<void>;
+  prepareWorkspaceDependencies(workspace: GitWorkspace, signal?: AbortSignal): Promise<void>;
   /** Compare committed regular-file blobs with the exact content verified in the worktree; Git mode 120000 entries must fail the proof. */
   committedContentMatches(
     workspace: GitWorkspace,

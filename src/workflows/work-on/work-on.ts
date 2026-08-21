@@ -654,7 +654,7 @@ async function prepareCleanPreBuilderExecution(
     : input.verification;
   const verification = selectPacketVerificationCommands(input.packet.payload, catalog, refreshed.baseSha);
   const commands = verification.map((command) => ({ ...command, cwd: refreshed.path }));
-  await dependencies.git.prepareWorkspaceDependencies(refreshed);
+  await dependencies.git.prepareWorkspaceDependencies(refreshed, input.signal);
   await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after dependency preparation");
   // Baseline evidence is reusable only when every durable check carries the
   // exact identity of the freshly frozen command plan.  planId includes the
@@ -843,6 +843,7 @@ export async function workOn(
       runId: input.intent.runId,
       issue,
       baseRef: `origin/${deliveryBranch}`,
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
     const laneTarget = input.parentRemediation
       ? { ...runTargetForLane(input.lane, input.productionTarget), targetBranch: input.parentRemediation.parentBranch }

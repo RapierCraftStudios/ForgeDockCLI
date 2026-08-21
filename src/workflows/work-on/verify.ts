@@ -272,7 +272,7 @@ export async function verifyAndCommit(
         throw error;
       }
     }
-    if (!preflightFailure) await dependencies.git.prepareWorkspaceDependencies(input.workspace);
+    if (!preflightFailure) await dependencies.git.prepareWorkspaceDependencies(input.workspace, input.signal);
     const observedChecks = preflightFailure ? [] : await dependencies.verifier.run(
       input.commands,
       input.signal,

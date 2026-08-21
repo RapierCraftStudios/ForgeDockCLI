@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
+import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
 
 const execFileAsync = promisify(execFile);
 const dependencyInstallLocks = new Map<string, Promise<void>>();
@@ -40,7 +41,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     this.#root = resolve(root);
   }
 
-  async create(input: { runId: string; issue: number; baseRef: string }): Promise<GitWorkspace> {
+  async create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace> {
     const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
     const fetchedBase = input.baseRef.startsWith("origin/")
@@ -73,7 +74,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         added = true;
         await this.git(["config", `branch.${branch}.forgedockBaseSha`, baseSha], this.#repo);
       });
-      await this.installDependencies(path);
+      await this.installDependencies(path, input.signal);
       return { path, branch, baseRef: input.baseRef, baseSha };
     } catch (error) {
       if (!added) throw error;
@@ -479,8 +480,8 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     return true;
   }
 
-  async prepareWorkspaceDependencies(workspace: GitWorkspace): Promise<void> {
-    await this.installDependencies(workspace.path);
+  async prepareWorkspaceDependencies(workspace: GitWorkspace, signal?: AbortSignal): Promise<void> {
+    await this.installDependencies(workspace.path, signal);
   }
 
   async commit(workspace: GitWorkspace, message: string): Promise<string> {
@@ -873,7 +874,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
-  private async installDependencies(worktreePath: string): Promise<void> {
+  private async installDependencies(worktreePath: string, signal?: AbortSignal): Promise<void> {
     if (!existsSync(join(worktreePath, "package-lock.json"))) return;
     const path = resolve(worktreePath);
     this.assertDependencyInstallTarget(path);
@@ -881,7 +882,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     const previous = dependencyInstallLocks.get(key) ?? Promise.resolve();
     const current = previous
       .catch(() => undefined)
-      .then(() => this.withDependencyInstallLock(path, () => this.installDependenciesExclusive(path)));
+      .then(() => this.withDependencyInstallLock(path, () => this.installDependenciesExclusive(path, signal)));
     dependencyInstallLocks.set(key, current);
     try {
       await current;
@@ -900,7 +901,7 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
-  private async installDependenciesExclusive(worktreePath: string): Promise<void> {
+  private async installDependenciesExclusive(worktreePath: string, signal?: AbortSignal): Promise<void> {
     const stampPath = join(worktreePath, ".forgedock", "dependency-install.json");
     const fingerprint = await this.dependencyFingerprint(worktreePath);
     if (await this.dependenciesReady(stampPath, fingerprint, worktreePath)) {
@@ -924,18 +925,27 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
         .find((candidate): candidate is string => Boolean(candidate && existsSync(candidate)))
       : undefined;
     if (process.platform === "win32" && !npmCli) throw new Error("Unable to locate npm-cli.js while preparing isolated worktree dependencies");
-    const args = [...(npmCli ? [npmCli] : []), "ci", "--ignore-scripts", "--no-audit", "--no-fund"];
+    const args = [...(npmCli ? [npmCli] : []), "ci", "--prefer-offline", "--ignore-scripts", "--no-audit", "--no-fund"];
     try {
-      await execFileAsync(command, args, {
-        cwd: worktreePath,
-        env: verificationEnvironment(process.env),
-        encoding: "utf8",
-        windowsHide: true,
-        maxBuffer: 10 * 1024 * 1024,
-      });
+      await withExternalOperationRetry(async (operationSignal) => {
+        await rm(stampPath, { force: true });
+        try {
+          await execFileAsync(command, args, {
+            cwd: worktreePath,
+            env: verificationEnvironment(process.env),
+            encoding: "utf8",
+            windowsHide: true,
+            maxBuffer: 10 * 1024 * 1024,
+            ...(operationSignal !== undefined ? { signal: operationSignal } : {}),
+          });
+        } catch (error) {
+          const detail = error as Error & { stderr?: string };
+          throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+        }
+      }, signal !== undefined ? { signal } : {});
     } catch (error) {
-      const detail = error as Error & { stderr?: string };
-      throw new Error(`npm ci failed while preparing ${basename(worktreePath)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+      await rm(stampPath, { force: true });
+      throw error;
     }
 
     // npm links package executables by chmod'ing their source files. A file
