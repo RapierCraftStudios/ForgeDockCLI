@@ -1578,4 +1578,23 @@ describe("OrchestrationController", () => {
     );
     assert.equal(observerErrors.length, durableAtDelivery.length);
   });
+
+  it("auto-redispatches target recovery with fresh attempts in one controller lifecycle", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let calls = 0;
+    const service = controller(repository, async () => {
+      calls += 1;
+      return calls === 1
+        ? { status: "target_recovery", error: "target moved", attempt: 1, maxAttempts: 3 }
+        : { status: "completed" };
+    });
+    const result = await service.createAndRun({ repository: "owner/repo", items: [item("recover", 26)], maxParallel: 1 });
+    assert.equal(calls, 2);
+    assert.deepEqual(result.schedule.startOrder, ["recover", "recover"]);
+    assert.equal(result.record.status, "completed");
+    const node = result.record.nodes[0]!;
+    assert.equal(node.status, "completed");
+    assert.equal(node.attempts?.length, 2);
+    assert.notEqual(node.attempts?.[0]?.attemptId, node.attempts?.[1]?.attemptId);
+  });
 });

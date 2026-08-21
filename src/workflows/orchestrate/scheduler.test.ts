@@ -848,6 +848,38 @@ describe("lean orchestration scheduler", () => {
   });
 });
 
+it("completes a 1,000-node mixed-route fleet with bounded recovery concurrency", async () => {
+  const items = Array.from({ length: 1_000 }, (_, index) => ({
+    id: `node-${index}`,
+    issue: index + 1,
+    priority: index % 7,
+    dependencies: [] as string[],
+    claims: [`scope/${index % 11}`],
+    repository: "owner/repo",
+    targetBranch: index % 2 === 0 ? "staging" : `release/${index % 5}`,
+  }));
+  const graph = materializeClaimDependencies(items);
+  const attempts = new Map<string, number>();
+  let active = 0;
+  let maximumActive = 0;
+  const result = await runSchedule(graph.items, 8, async (scheduled) => {
+    const attempt = (attempts.get(scheduled.id) ?? 0) + 1;
+    attempts.set(scheduled.id, attempt);
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    active -= 1;
+    return attempt === 1 && scheduled.issue % 10 === 0
+      ? { status: "target_recovery", attempt: 1, maxAttempts: 2 }
+      : { status: "completed" };
+  }, { serializationEdges: graph.edges });
+  assert.equal(result.status.size, 1_000);
+  assert.equal([...result.status.values()].every((status) => status === "completed"), true);
+  assert.ok(maximumActive <= 8);
+  assert.equal(Math.max(...attempts.values()), 2);
+  assert.equal(attempts.size, 1_000);
+});
+
 describe("worker leases", () => {
   it("prevents duplicate ownership and permits stale lease recovery", () => {
     const leases = new InMemoryLeaseRepository();

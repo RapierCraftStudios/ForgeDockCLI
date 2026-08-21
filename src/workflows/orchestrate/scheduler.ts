@@ -359,6 +359,8 @@ export async function runSchedule(
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
   const retryWakeups = new Map<string, Promise<void>>();
+  const targetRecoveryWakeups = new Map<string, Promise<void>>();
+  const targetRecoveryAttempts = new Map<string, number>();
   let occupiedIssueSlots = 0;
   const currentClaims = new Map(items.map((item) => [item.id, [...item.claims]]));
   const queuedWaitReasonChanges = new Set<string>();
@@ -392,7 +394,7 @@ export async function runSchedule(
     emit("resumed", itemId);
   }
 
-  while (running.size || queuedCount > 0 || retryWakeups.size > 0) {
+  while (running.size || queuedCount > 0 || retryWakeups.size > 0 || targetRecoveryWakeups.size > 0) {
     if (options.signal?.aborted && running.size) {
       // Cancellation stops new launches immediately, but the controller must
       // retain its execution claim until every admitted worker has settled.
@@ -550,9 +552,41 @@ export async function runSchedule(
         .then((result) => {
           const outcome = result ?? { status: "completed" as const };
           if (outcome.status === "target_recovery") {
+            const attempt = (targetRecoveryAttempts.get(item.id) ?? 0) + 1;
+            targetRecoveryAttempts.set(item.id, attempt);
+            const maxAttempts = outcome.maxAttempts ?? 3;
             status.set(item.id, "target_recovery");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            const nextAttemptAt = outcome.nextAttemptAt
+              ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString();
+            updateQueuedWaitReason(item.id, {
+              kind: "retry",
+              domain: outcome.retryDomain ?? "workflow",
+              code: outcome.retryCode ?? "target-advanced",
+              nextAttemptAt,
+              attempt,
+              maxAttempts,
+            }, false);
             emit("target_recovery", item.id);
+            if (attempt >= maxAttempts) {
+              status.set(item.id, "failed");
+              emit("failed", item.id);
+            } else {
+              // The worker has finished and released its lease/capacity. Yield
+              // through a timer before re-admitting the same node so repeated
+              // target movement cannot spin a hot synchronous loop.
+              queuedCount++;
+              const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
+              const wake = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+                targetRecoveryWakeups.delete(item.id);
+                if (status.get(item.id) !== "target_recovery") return;
+                status.set(item.id, "queued");
+                errors.delete(item.id);
+                waitReasons.delete(item.id);
+                emit("resumed", item.id);
+              });
+              targetRecoveryWakeups.set(item.id, wake);
+            }
           } else if (outcome.status === "retry_wait") {
             const nextAttemptAt = outcome.nextAttemptAt
               ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString();
@@ -689,8 +723,8 @@ export async function runSchedule(
       await waitForCapacity();
       continue;
     }
-    if (retryWakeups.size) {
-      await Promise.race(retryWakeups.values());
+    if (retryWakeups.size || targetRecoveryWakeups.size) {
+      await Promise.race([...retryWakeups.values(), ...targetRecoveryWakeups.values()]);
       continue;
     }
     // A suspended prerequisite intentionally leaves its dependents queued so a

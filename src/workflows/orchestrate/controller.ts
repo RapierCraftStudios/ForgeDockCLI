@@ -1473,9 +1473,14 @@ export class OrchestrationController {
           && scheduledStatus === "queued"
           && node.status === "suspended"
           && event.waitReasons?.get(node.id)?.kind === "active-claim-conflict";
+        const retryingTargetRecovery = event.type === "resumed"
+          && event.itemId === node.id
+          && scheduledStatus === "queued"
+          && node.status === "target_recovery";
         if ((scheduledStatus === "queued" || scheduledStatus === "running")
           && isDurablyTerminalNode(node)
-          && !retryingPromotedClaimConflict) return node;
+          && !retryingPromotedClaimConflict
+          && !retryingTargetRecovery) return node;
         const error = event.errors.get(node.id);
         const waitReason = event.waitReasons?.get(node.id);
         const { error: _error, waitReason: _waitReason, ...rest } = node;
