@@ -566,11 +566,21 @@ export async function resumeTargetAdvanceWorkOn(
     }
     const guarded = guardMutationBoundaries(dependencies);
     const artifacts = await guarded.artifacts.list(input.run.subject);
-    const terminalCheckpoint = artifacts
-      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> =>
-        artifact.kind === "TargetAdvanceCheckpoint" && artifact.runId === input.run.runId)
-      .sort((left, right) => left.payload.updatedAt.localeCompare(right.payload.updatedAt) || left.id.localeCompare(right.id))
-      .at(-1) ?? input.checkpoint;
+    const preferredCheckpointId = error instanceof WorkflowExecutionError
+      ? error.targetAdvanceCheckpointId
+      : undefined;
+    const terminalCheckpoint = (preferredCheckpointId
+      ? artifacts.find((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> =>
+        artifact.kind === "TargetAdvanceCheckpoint"
+        && artifact.runId === input.run.runId
+        && artifact.id === preferredCheckpointId)
+      : undefined)
+      ?? artifacts
+        .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> =>
+          artifact.kind === "TargetAdvanceCheckpoint" && artifact.runId === input.run.runId)
+        .sort((left, right) => left.payload.updatedAt.localeCompare(right.payload.updatedAt) || left.id.localeCompare(right.id))
+        .at(-1)
+      ?? input.checkpoint;
     const terminalCheckpointId = terminalCheckpoint.id;
     const existing = artifacts.find((artifact): artifact is DurableArtifact<"Outcome"> =>
       artifact.kind === "Outcome"
