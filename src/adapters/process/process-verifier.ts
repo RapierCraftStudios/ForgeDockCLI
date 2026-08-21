@@ -335,7 +335,11 @@ function isLiveProcessGroup(pgid: number): boolean {
   }
 }
 
-async function waitForProcessTreeQuiescence(pid: number | undefined, pgid: number | undefined, timeoutMs = 2_500): Promise<boolean> {
+export async function waitForProcessTreeQuiescence(
+  pid: number | undefined,
+  pgid: number | undefined,
+  timeoutMs = 2_500,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     const livePid = pid !== undefined && isLivePid(pid);
@@ -343,7 +347,13 @@ async function waitForProcessTreeQuiescence(pid: number | undefined, pgid: numbe
     if (!livePid && !liveGroup) return true;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return (pid !== undefined && isLivePid(pid)) || (pgid !== undefined && isLiveProcessGroup(pgid));
+  return !(
+    (pid !== undefined && isLivePid(pid)) ||
+    (pgid !== undefined && isLiveProcessGroup(pgid))
+  );
+}
+function cleanupDiagnostic(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 function updateOperationalMarker(root: string, markerName: string, identity: string, token: string, childPid?: number): void {
   const markerPath = join(root, markerName);
@@ -566,12 +576,16 @@ function runOne(
         catch (markerError) { markerCleanupError = markerError; }
       }
       if (cancelled) {
+        if (markerCleanupError !== undefined) attachCleanupDiagnostic(abortReason, markerCleanupError);
         reject(abortReason);
         return;
       }
       const durationMs = Math.max(0, Math.round(performance.now() - started));
       const errorCode = error.code ?? error.name ?? "spawn-error";
-      const summary = `Failed to start verification command (${errorCode})`;
+      const baseSummary = `Failed to start verification command (${errorCode})`;
+      const summary = markerCleanupError === undefined
+        ? baseSummary
+        : `${baseSummary}; verification cleanup: ${cleanupDiagnostic(markerCleanupError)}`;
       resolve({
         ...verificationResultMetadata(spec),
         status: "failed",
@@ -594,19 +608,28 @@ function runOne(
         catch (markerError) { markerCleanupError = markerError; }
       }
       if (cancelled) {
+        if (markerCleanupError !== undefined) attachCleanupDiagnostic(abortReason, markerCleanupError);
         reject(abortReason);
         return;
       }
       const renderedOutput = output.finish();
       const durationMs = Math.max(0, Math.round(performance.now() - started));
-      const status = code === 0 && !timedOut ? "passed" as const : "failed" as const;
-      const summary = summarize(renderedOutput.text, timedOut, status);
-      const failureSignatures = status === "failed" ? extractFailureSignatures(renderedOutput.text, timedOut) : [];
+      const commandStatus = code === 0 && !timedOut ? "passed" as const : "failed" as const;
+      const status = markerCleanupError === undefined ? commandStatus : "failed" as const;
+      const summaryBase = summarize(renderedOutput.text, timedOut, commandStatus);
+      const summary = markerCleanupError === undefined
+        ? summaryBase
+        : `${summaryBase ? `${summaryBase}; ` : ""}verification cleanup: ${cleanupDiagnostic(markerCleanupError)}`;
+      const failureSignatures = status === "failed"
+        ? [...(commandStatus === "failed" ? extractFailureSignatures(renderedOutput.text, timedOut) : []), ...(markerCleanupError === undefined ? [] : [cleanupDiagnostic(markerCleanupError)])]
+        : [];
       resolve({
         ...verificationResultMetadata(spec),
         status,
         ...(status === "failed" ? {
-          failureClass: timedOut ? ("timeout" as const) : ("command" as const),
+          failureClass: markerCleanupError !== undefined
+            ? ("infrastructure" as const)
+            : (timedOut ? ("timeout" as const) : ("command" as const)),
         } : {}),
         ...(typeof code === "number" ? { exitCode: code } : {}),
         durationMs,

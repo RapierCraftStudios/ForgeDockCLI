@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
-import { ProcessVerificationRunner, windowsTaskkillSucceeded } from "./process-verifier.js";
+import { ProcessVerificationRunner, waitForProcessTreeQuiescence, windowsTaskkillSucceeded } from "./process-verifier.js";
 
 function stagingLayout(cwd: string, identity = "test-staging-identity") {
   const source = JSON.stringify({ compilerOptions: { rootDir: "src", outDir: "dist" }, include: ["src/**/*.ts"] });
@@ -46,6 +46,17 @@ describe("deterministic process verification", () => {
     assert.equal(windowsTaskkillSucceeded({ status: 1 }), false);
     assert.equal(windowsTaskkillSucceeded({ status: null }), false);
     assert.equal(windowsTaskkillSucceeded({ status: 0, error: new Error("spawn failed") }), false);
+  });
+
+  it("distinguishes live process trees from quiescent trees", async () => {
+    assert.equal(await waitForProcessTreeQuiescence(undefined, undefined, 10), true);
+    assert.equal(await waitForProcessTreeQuiescence(process.pid, undefined, 20), false);
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", () => resolve());
+    });
+    assert.equal(await waitForProcessTreeQuiescence(child.pid, undefined, 100), true);
   });
 
   it("records executable evidence without invoking a shell", async () => {
@@ -164,7 +175,9 @@ describe("deterministic process verification", () => {
       const first = new ProcessVerificationRunner({ lockPath }).run([{ ...stagedCommand(
         directory, "cleanup-failure", ["-e", "require('node:fs').unlinkSync(process.argv[1])", marker], cleanupLayout,
       ), lockScope: "machine-global" }]);
-      await assert.rejects(first, /marker changed unexpectedly/);
+      const [cleanupResult] = await first;
+      assert.equal(cleanupResult?.status, "failed");
+      assert.match(cleanupResult?.summary ?? "", /verification cleanup: Verification staging marker changed unexpectedly/);
       const second = await new ProcessVerificationRunner({ lockPath }).run([{
         id: "after-cleanup-failure", command: process.execPath, args: ["-e", ""], cwd: directory,
         timeoutMs: 5_000, required: true,
