@@ -237,7 +237,7 @@ export function transition(
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
-if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RESUME_TARGET_ADVANCE" || event === "TARGET_RECOVERY_RESUMED" || event === "RESUME_RETRY_WAIT" || event === "RETRY_DUE" || event === "RETRY_WAIT_EXPIRED" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
+if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RESUME_TARGET_ADVANCE" || event === "TARGET_RECOVERY_RESUMED" || event === "RETRY_DUE" || event === "RETRY_WAIT_EXPIRED" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;
   }

@@ -82,7 +82,9 @@ export function reconcileArtifacts(artifacts: readonly DurableArtifact[]): Recon
   const outcomeIndex = recoverableTerminalOutcome ? terminalInvestigationOutcomeIndex : latestOutcomeIndex;
   const buildIndex = lastArtifactIndex(ordered, "BuildResult");
   const remediationCheckpointIndex = lastArtifactIndex(ordered, "RemediationBlocked");
-  const targetAdvanceCheckpointIndex = latestArtifactIndex(ordered, "TargetAdvanceCheckpoint");
+  const targetAdvanceCheckpointIndex = targetAdvanceCheckpoint?.payload.phase === "reviewed"
+    ? -1
+    : latestArtifactIndex(ordered, "TargetAdvanceCheckpoint");
   const retryCheckpointIndex = latestArtifactIndex(ordered, "RetryCheckpoint");
   const nonterminalCheckpoint = retryCheckpointIndex > targetAdvanceCheckpointIndex ? retryCheckpoint : targetAdvanceCheckpoint;
   const nonterminalCheckpointIndex = Math.max(retryCheckpointIndex, targetAdvanceCheckpointIndex);

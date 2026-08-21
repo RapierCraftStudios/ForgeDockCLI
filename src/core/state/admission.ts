@@ -188,7 +188,9 @@ export function decideSubjectAdmission(
   const latestOutcomeIndex = lastArtifactIndex(latest.artifacts, "Outcome");
   const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
   const latestTargetAdvance = latestArtifactOfKind(latest.artifacts, "TargetAdvanceCheckpoint");
-  const latestTargetAdvanceIndex = lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
+  const latestTargetAdvanceIndex = latestTargetAdvance?.payload.phase === "reviewed"
+    ? -1
+    : lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
   const latestRetry = latestArtifactOfKind(latest.artifacts, "RetryCheckpoint");
   const latestRetryIndex = lastArtifactIndex(latest.artifacts, "RetryCheckpoint");
   if (latestRetry?.payload.status === "exhausted") {

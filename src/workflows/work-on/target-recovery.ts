@@ -6,7 +6,9 @@ import type { GitWorkspace } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
 import type { RunState } from "../../core/state/machine.js";
 
-/** Stable serialization resource for all target-sensitive delivery work. */
+/** Controller policy cap for target-advance recovery attempts. */
+export const TARGET_RECOVERY_MAX_ATTEMPTS = 3;
+
 export function normalizedTargetRouteClaim(repository: string, targetBranch: string): string {
   const repo = repository.trim().toLowerCase().replaceAll("\\", "/").replace(/^https?:\/\//, "").replace(/\/+$/, "");
   const target = targetBranch.trim().replaceAll("\\", "/").replace(/^refs\/heads\//, "");
@@ -52,10 +54,13 @@ export async function persistTargetAdvanceCheckpoint(input: {
     ?? createHash("sha256").update(JSON.stringify({ head: sourceBuildResult.payload.headSha, paths: sourceBuildResult.payload.changedPaths })).digest("hex");
   const phase = input.phase ?? "target-read";
   const attemptNumber = input.attempt ?? 1;
-  const maxAttempts = input.maxAttempts ?? 3;
-  if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1 || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
-    throw new Error("Target recovery checkpoint attempt must be a positive bounded integer");
+  const maxAttempts = input.maxAttempts ?? TARGET_RECOVERY_MAX_ATTEMPTS;
+  if (!Number.isSafeInteger(attemptNumber) || attemptNumber < 1
+    || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1
+    || attemptNumber > maxAttempts || maxAttempts > TARGET_RECOVERY_MAX_ATTEMPTS) {
+    throw new Error(`Target recovery checkpoint attempt must satisfy 1 <= number <= max <= ${TARGET_RECOVERY_MAX_ATTEMPTS}`);
   }
+  const sourceBaseSha = sourceBuildResult.payload.baseSha ?? input.workspace.baseSha ?? sourceBuildResult.payload.headSha;
   const sourceVerdictId = input.verdict?.id
     ?? prior?.payload.sourceVerdictId;
   const verificationPlanId = createHash("sha256").update(JSON.stringify(input.packet.payload.verificationPlan)).digest("hex");
@@ -74,7 +79,7 @@ export async function persistTargetAdvanceCheckpoint(input: {
     ...(sourceVerdictId ? { sourceVerdictId } : {}),
     packetArtifactId: input.packet.id,
     sourceBuildResultId: sourceBuildResult.id,
-    sourceBaseSha: sourceBuildResult.payload.baseSha ?? input.workspace.baseSha ?? sourceBuildResult.payload.headSha,
+    sourceBaseSha,
     sourceHeadSha: sourceBuildResult.payload.headSha,
     observedTargetSha: input.observedTargetSha,
     phase,

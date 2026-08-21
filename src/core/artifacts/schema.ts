@@ -837,7 +837,7 @@ export const TargetAdvanceCheckpointPayloadSchema = Type.Object({
   expectedPaths: Type.Array(BoundedString, { maxItems: 4096 }),
   verifiedContentDigest: Digest,
   verificationPlanId: BoundedString,
-  attempt: Type.Object({ number: Type.Integer({ minimum: 1 }), max: Type.Integer({ minimum: 1 }) }),
+  attempt: Type.Object({ number: Type.Integer({ minimum: 1, maximum: 3 }), max: Type.Integer({ minimum: 1, maximum: 3 }) }),
   workspace: Type.Object({ path: BoundedString, branch: BoundedString, baseRef: BoundedString }),
   integrationHeadSha: Type.Optional(Sha), mergeHeadSha: Type.Optional(Sha),
   freshVerificationCheckpointId: Type.Optional(BoundedString), freshBuildResultId: Type.Optional(BoundedString),

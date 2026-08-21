@@ -360,8 +360,9 @@ export async function runSchedule(
   const running = new Map<string, Promise<void>>();
   const retryWakeups = new Map<string, Promise<void>>();
   const targetRecoveryWakeups = new Map<string, Promise<void>>();
-  const targetRecoveryWakeQueue: Array<{ itemId: string; at: number; resolve: () => void }> = [];
+  const targetRecoveryWakeQueue: Array<{ itemId: string; at: number; resolve: () => void; reject: (error: unknown) => void }> = [];
   let targetRecoveryWakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let targetRecoveryAbortHandler: (() => void) | undefined;
   const targetRecoveryAttempts = new Map<string, number>();
   const targetRecoveryMaxAttempts = new Map<string, number>();
   let occupiedIssueSlots = 0;
@@ -382,6 +383,10 @@ export async function runSchedule(
     const first = targetRecoveryWakeQueue[0];
     if (!first) {
       targetRecoveryWakeTimer = undefined;
+      if (targetRecoveryAbortHandler && options.signal) {
+        options.signal.removeEventListener("abort", targetRecoveryAbortHandler);
+        targetRecoveryAbortHandler = undefined;
+      }
       return;
     }
     targetRecoveryWakeTimer = setTimeout(() => {
@@ -391,8 +396,25 @@ export async function runSchedule(
       armTargetRecoveryWakeTimer();
     }, Math.max(0, first.at - Date.now()));
   };
-  const scheduleTargetRecoveryWake = (itemId: string, at: number): Promise<void> => new Promise<void>((resolve) => {
-    targetRecoveryWakeQueue.push({ itemId, at, resolve });
+  const scheduleTargetRecoveryWake = (itemId: string, at: number): Promise<void> => new Promise<void>((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(options.signal.reason ?? new Error("Orchestration scheduling was cancelled"));
+      return;
+    }
+    targetRecoveryWakeQueue.push({ itemId, at, resolve, reject });
+    if (targetRecoveryAbortHandler === undefined && options.signal) {
+      targetRecoveryAbortHandler = () => {
+        const reason = options.signal?.reason ?? new Error("Orchestration scheduling was cancelled");
+        if (targetRecoveryWakeTimer !== undefined) clearTimeout(targetRecoveryWakeTimer);
+        targetRecoveryWakeTimer = undefined;
+        const pending = targetRecoveryWakeQueue.splice(0);
+        const handler = targetRecoveryAbortHandler;
+        targetRecoveryAbortHandler = undefined;
+        if (handler) options.signal?.removeEventListener("abort", handler);
+        for (const wake of pending) wake.reject(reason);
+      };
+      options.signal.addEventListener("abort", targetRecoveryAbortHandler, { once: true });
+    }
     targetRecoveryWakeQueue.sort((left, right) => left.at - right.at);
     armTargetRecoveryWakeTimer();
   });

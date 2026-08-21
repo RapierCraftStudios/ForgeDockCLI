@@ -1579,6 +1579,39 @@ describe("OrchestrationController", () => {
     assert.equal(observerErrors.length, durableAtDelivery.length);
   });
 
+  it("restores a durable retry budget instead of defaulting to three attempts", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const gate = deferred<void>();
+    const service = controller(repository, async () => {
+      await gate.promise;
+      return { status: "completed" };
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("retry-budget", 27)], maxParallel: 1 });
+    const original = created.nodes[0]!;
+    const retryAttempt = {
+      attemptId: "attempt-retry-budget",
+      attempt: 3,
+      recovery: "resume" as const,
+      status: "retry_wait" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:01:00.000Z",
+      completedAt: "2026-01-01T00:01:00.000Z",
+      retryAttempt: 3,
+      retryMaxAttempts: 6,
+      retryNextAt: "2025-01-01T00:00:00.000Z",
+    };
+    await repository.saveOrchestration({
+      ...created,
+      status: "running",
+      nodes: [{ ...original, status: "running", activeAttemptId: retryAttempt.attemptId, attempts: [retryAttempt] }],
+    });
+    const resumed = service.resume(created.orchestrationId);
+    await waitUntil(() => repository.saves.some((record) => record.nodes[0]?.waitReason?.kind === "retry" && record.nodes[0]?.waitReason?.maxAttempts === 6), "durable retry budget was not restored");
+    gate.resolve();
+    const result = await resumed;
+    assert.equal(result.record.nodes[0]?.status, "completed");
+  });
+
   it("auto-redispatches target recovery with fresh attempts in one controller lifecycle", async () => {
     const repository = new RecordingOrchestrationRepository();
     let calls = 0;

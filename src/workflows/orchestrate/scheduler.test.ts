@@ -894,6 +894,32 @@ it("uses durable target recovery attempt metadata across restart", async () => {
   assert.equal(result.status.get("resumed"), "failed");
 });
 
+it("aborts a long retry wait without dispatching", async () => {
+  const signal = new AbortController();
+  let calls = 0;
+  const execution = runSchedule([
+    { id: "retry", issue: 1, priority: 1, dependencies: [], claims: [], retryNextAt: new Date(Date.now() + 60_000).toISOString(), retryAttempt: 1, retryMaxAttempts: 3 },
+  ], 1, async () => { calls++; return { status: "completed" }; }, { signal: signal.signal });
+  setTimeout(() => signal.abort(new Error("cancel retry wait")), 10);
+  await assert.rejects(execution, /cancel retry wait/);
+  assert.equal(calls, 0);
+});
+
+it("aborts a long target recovery wait without redispatching", async () => {
+  const signal = new AbortController();
+  let calls = 0;
+  const execution = runSchedule([
+    { id: "target", issue: 1, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls++;
+    return { status: "target_recovery", nextAttemptAt: new Date(Date.now() + 60_000).toISOString(), attempt: 1, maxAttempts: 3 };
+  }, { signal: signal.signal });
+  await waitFor(() => calls === 1);
+  signal.abort(new Error("cancel target wait"));
+  await assert.rejects(execution, /cancel target wait/);
+  assert.equal(calls, 1);
+});
+
 describe("worker leases", () => {
   it("prevents duplicate ownership and permits stale lease recovery", () => {
     const leases = new InMemoryLeaseRepository();

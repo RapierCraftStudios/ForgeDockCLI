@@ -76,6 +76,8 @@ export interface OrchestrationWorkerAttemptRecord {
   retryable?: boolean;
   retryAfterMs?: number;
   retryNextAt?: string;
+  retryAttempt?: number;
+  retryMaxAttempts?: number;
   retryDomain?: "github" | "provider" | "workflow" | "lease" | "transport";
   retryCode?: string;
   operationKey?: string;

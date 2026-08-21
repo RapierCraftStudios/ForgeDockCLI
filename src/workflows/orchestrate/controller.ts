@@ -1222,6 +1222,8 @@ export class OrchestrationController {
         ...(normalized.targetAdvanceCheckpointId !== undefined ? { targetAdvanceCheckpointId: normalized.targetAdvanceCheckpointId } : {}),
         ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
         ...(normalized.retryAfterMs !== undefined ? { retryAfterMs: normalized.retryAfterMs } : {}),
+        ...(normalized.attempt !== undefined ? { retryAttempt: normalized.attempt } : {}),
+        ...(normalized.maxAttempts !== undefined ? { retryMaxAttempts: normalized.maxAttempts } : {}),
         ...(normalized.nextAttemptAt !== undefined ? { retryNextAt: normalized.nextAttemptAt } : {}),
         ...(normalized.retryDomain !== undefined ? { retryDomain: normalized.retryDomain as Exclude<OrchestrationWorkerAttemptRecord["retryDomain"], undefined> } : {}),
         ...(normalized.retryCode !== undefined ? { retryCode: normalized.retryCode } : {}),
@@ -1963,8 +1965,8 @@ function scheduleResultFromAttempt(
         ...(attempt.retryable !== undefined ? { retryable: attempt.retryable } : {}),
         ...(attempt.retryDomain !== undefined ? { retryDomain: attempt.retryDomain } : {}),
         ...(attempt.retryCode !== undefined ? { retryCode: attempt.retryCode } : {}),
-        attempt: attempt.attempt,
-        maxAttempts: 3,
+        attempt: attempt.retryAttempt ?? attempt.attempt,
+        maxAttempts: attempt.retryMaxAttempts ?? 3,
       };
     case "interrupted":
       return { status: "failed", error: error ?? "worker attempt was interrupted" };

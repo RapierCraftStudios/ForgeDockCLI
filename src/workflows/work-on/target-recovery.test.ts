@@ -155,6 +155,18 @@ describe("direct target recovery integration", () => {
     assert.equal((await fixture.artifacts.list(subject, "RetryCheckpoint")).length, 1);
     assert.equal((await fixture.artifacts.list(subject, "Outcome")).length, 1);
   });
+  it("rejects forged source base and checkpoint attempt bounds before Git mutation", async () => {
+    const runId = "target-authority";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const forgedBase = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, sourceBaseSha: "d".repeat(40) } } as typeof fixture.checkpoint;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedBase, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /source base/);
+    const forgedMax = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, attempt: { number: 1, max: 1_000_000_000 } } } as typeof fixture.checkpoint;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedMax, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /attempt/);
+    const forgedOrder = { ...fixture.checkpoint, payload: { ...fixture.checkpoint.payload, attempt: { number: 3, max: 2 } } } as typeof fixture.checkpoint;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: forgedOrder, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /attempt/);
+    await assert.rejects(() => persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: b, workspace, targetBranch: "main", observedTargetSha: targetBase, maxAttempts: 1_000_000_000, artifacts: fixture.artifacts }), /attempt/);
+  });
   it("normalizes route claims and keeps unrelated retry keys independent", async () => {
     assert.equal(normalizedTargetRouteClaim("HTTPS://ACME/Repo/", "refs/heads/main"), "target-route:acme/repo:main");
     const runId = "retry-scope"; const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId); const fixture = await targetRun(runId, i, inv, p, b);

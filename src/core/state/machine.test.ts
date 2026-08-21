@@ -99,6 +99,18 @@ describe("workflow state machine", () => {
     assert.match(run.blockedReason ?? "", /exhausted after 2/);
   });
 
+  it("does not consume semantic attempts while rehydrating a retry wait", () => {
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 12 }, target: { lane: "fast", targetBranch: "main" } });
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED", "TARGET_RECOVERY_REQUESTED"] as const) {
+      run = transition(run, event).state;
+    }
+    run = transition(run, "RETRY_WAIT_SCHEDULED").state;
+    const attempt = run.attempt;
+    run = transition(run, "RESUME_RETRY_WAIT").state;
+    run = transition(run, "RESUME_RETRY_WAIT").state;
+    assert.equal(run.attempt, attempt);
+  });
+
   it("resumes a retained verification workspace without replaying investigation or build", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 8 } });
     for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_FAILED"] as const) {

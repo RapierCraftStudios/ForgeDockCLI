@@ -42,7 +42,7 @@ import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, runTargetForLane, type IssueLane, type ParentRemediationTarget } from "./lane.js";
-import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
+import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint, TARGET_RECOVERY_MAX_ATTEMPTS } from "./target-recovery.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
 
@@ -84,6 +84,17 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
     || checkpoint.payload.sourceHeadSha.toLowerCase() !== buildResult.payload.headSha.toLowerCase()
     || buildResult.runId !== run.runId || intent.runId !== run.runId) {
     throw new Error("Target recovery packet/build/intent identity does not match the admitted run");
+  }
+  const checkpointBaseSha = checkpoint.payload.sourceBaseSha.toLowerCase();
+  const expectedBaseSha = (buildResult.payload.baseSha ?? checkpoint.payload.sourceBaseSha).toLowerCase();
+  const { number: recoveryAttempt, max: recoveryMax } = checkpoint.payload.attempt;
+  if (checkpointBaseSha !== expectedBaseSha) {
+    throw new Error("Target recovery checkpoint source base does not match the retained build/fallback base");
+  }
+  if (!Number.isSafeInteger(recoveryAttempt) || recoveryAttempt < 1
+    || !Number.isSafeInteger(recoveryMax) || recoveryMax < 1
+    || recoveryAttempt > recoveryMax || recoveryMax > TARGET_RECOVERY_MAX_ATTEMPTS) {
+    throw new Error(`Target recovery checkpoint attempt must satisfy 1 <= number <= max <= ${TARGET_RECOVERY_MAX_ATTEMPTS}`);
   }
   const retainedHead = checkpoint.payload.freshBuildResultId && checkpoint.payload.phase !== "target-read"
     ? (checkpoint.payload.integrationHeadSha ?? checkpoint.payload.mergeHeadSha ?? checkpoint.payload.sourceHeadSha)
