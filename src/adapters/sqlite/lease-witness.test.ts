@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -16,6 +17,63 @@ import {
   leaseWitnessRequirementMessage,
   RetainedCheckpointWitness,
 } from "./lease-witness.js";
+
+interface ConcurrentChildResult {
+  ok: boolean;
+  state?: string;
+  reference?: Record<string, unknown>;
+  error?: string;
+}
+
+function runConcurrentFirstUseChild(input: {
+  checkout: string;
+  localDataRoot: string;
+  barrier: string;
+  ready: string;
+}): Promise<{ code: number | null; output: ConcurrentChildResult }> {
+  const moduleUrl = new URL("./lease-witness.js", import.meta.url).href;
+  const source = `
+    import { existsSync, readFileSync, writeFileSync } from "node:fs";
+    import { createOrBootstrapLocalLeaseWitness } from ${JSON.stringify(moduleUrl)};
+    const input = ${JSON.stringify(input)};
+    const waiter = new Int32Array(new SharedArrayBuffer(4));
+    writeFileSync(input.ready, "ready");
+    while (!existsSync(input.barrier)) Atomics.wait(waiter, 0, 0, 2);
+    try {
+      const witness = createOrBootstrapLocalLeaseWitness(input.checkout, { localDataRoot: input.localDataRoot, environment: {} });
+      const reference = JSON.parse(readFileSync(input.checkout + "/.forgedock/lease-witness.json", "utf8"));
+      process.stdout.write(JSON.stringify({ ok: true, state: witness.verify().state, reference }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+      process.exitCode = 1;
+    }
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      try {
+        const output = JSON.parse(stdout) as ConcurrentChildResult;
+        if (!output.ok && stderr) output.error = `${output.error ?? "child failed"}: ${stderr.trim()}`;
+        resolve({ code, output });
+      } catch (error) {
+        reject(new Error(`concurrent witness child emitted invalid output: ${stdout}\n${stderr}`, { cause: error }));
+      }
+    });
+  });
+}
+
+async function waitForFiles(paths: string[]): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!paths.every(existsSync) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(paths.every(existsSync), true, "concurrent witness children did not become ready");
+}
 
 describe("retained lease checkpoint witness", () => {
   it("authenticates compare-and-advance and rejects invalid signatures", () => {
@@ -89,6 +147,34 @@ describe("retained lease checkpoint witness", () => {
         assert.equal(lease?.epoch, 1);
         assert.equal(store.continuity().state, "verified");
       } finally { store.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("admits coordinated concurrent first use through one verified witness", async () => {
+    const root = mkdtempSync(join(tmpdir(), "forgedock-witness-concurrent-"));
+    const checkout = join(root, "checkout");
+    const localDataRoot = join(root, "local-data");
+    const barrier = join(root, "start");
+    const ready = [join(root, "ready-1"), join(root, "ready-2")];
+    mkdirSync(checkout);
+    try {
+      const children = ready.map((readyPath) => runConcurrentFirstUseChild({ checkout, localDataRoot, barrier, ready: readyPath }));
+      await waitForFiles(ready);
+      writeFileSync(barrier, "start");
+      const results = await Promise.all(children);
+      for (const result of results) {
+        assert.equal(result.code, 0, result.output.error);
+        assert.equal(result.output.ok, true, result.output.error);
+        assert.equal(result.output.state, "verified");
+        assert.doesNotMatch(result.output.error ?? "", /EEXIST/);
+        assert.ok(result.output.reference);
+      }
+      const references = results.map((result) => result.output.reference);
+      assert.equal(references[0]?.checkoutDigest, references[1]?.checkoutDigest);
+      assert.equal(references[0]?.checkpointPath, references[1]?.checkpointPath);
+      assert.equal(references[0]?.publicKeyPath, references[1]?.publicKeyPath);
+      assert.equal(references[0]?.privateKeyPath, references[1]?.privateKeyPath);
+      assert.equal(createConfiguredLeaseWitness(checkout, { localDataRoot, environment: {} })?.verify().state, "verified");
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
