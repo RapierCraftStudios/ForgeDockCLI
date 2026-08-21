@@ -15,6 +15,16 @@ export const MAX_CAPTURE_CHUNKS = 1_024;
 export const MAX_REDACTION_CARRY_CHARS = 4_096;
 export const OUTPUT_TRUNCATION_MARKER = "[verification output truncated]";
 
+type PreparedOutputOwnership = {
+  token: string;
+  markerName: string;
+  identity: string;
+  root: string;
+  deferred?: boolean;
+  childPid?: number;
+  childPgid?: number;
+};
+
 export class ProcessVerificationRunner implements VerificationRunner {
   readonly #lockPath: string;
   readonly #environment: NodeJS.ProcessEnv;
@@ -25,7 +35,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
   }
 
   async prepareOperationalOutput(commands: readonly VerificationCommand[]): Promise<void> {
-    const prepared = new Map<string, { token: string; markerName: string; identity: string; root: string }>();
+    const prepared = new Map<string, PreparedOutputOwnership>();
     let primaryError: unknown;
     let cleanupError: unknown;
     try {
@@ -38,7 +48,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
       throw error;
     } finally {
       for (const [root, ownership] of prepared) {
-        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
+        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName, ownership); }
         catch (error) {
           if (error instanceof DeferredCleanupError && primaryError !== undefined) {
             attachCleanupDiagnostic(primaryError, error);
@@ -133,7 +143,7 @@ export class ProcessVerificationRunner implements VerificationRunner {
     } finally {
       let cleanupError: unknown;
       for (const [root, ownership] of preparedOutputs) {
-        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName); }
+        try { cleanupOperationalOutput(root, ownership.token, ownership.markerName, ownership); }
         catch (error) {
           if (error instanceof DeferredCleanupError && primaryError !== undefined) {
             attachCleanupDiagnostic(primaryError, error);
@@ -379,7 +389,15 @@ function clearOperationalMarker(root: string, markerName: string, identity: stri
   updateOperationalMarker(root, markerName, identity, token);
 }
 
-function cleanupOperationalOutput(root: string, token: string, markerName: string): void {
+function cleanupOperationalOutput(root: string, token: string, markerName: string, ownership?: PreparedOutputOwnership): void {
+  if (ownership?.deferred) {
+    const livePid = ownership.childPid !== undefined && isLivePid(ownership.childPid);
+    const liveGroup = ownership.childPgid !== undefined && isLiveProcessGroup(ownership.childPgid);
+    if (livePid || liveGroup) {
+      throw new DeferredCleanupError(`Verification staging child ownership is unresolved: ${root}`);
+    }
+    ownership.deferred = false;
+  }
   const stat = lstatSync(root);
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`Verification staging root changed unexpectedly: ${root}`);
   const markerPath = join(root, markerName);
@@ -500,7 +518,7 @@ function runOne(
   spec: VerificationCommand,
   environment: NodeJS.ProcessEnv,
   signal?: AbortSignal,
-  ownership?: { token: string; markerName: string; identity: string; root: string },
+  ownership?: PreparedOutputOwnership,
 ): Promise<CheckResult> {
   return new Promise((resolve, reject) => {
     const started = performance.now();
@@ -533,10 +551,29 @@ function runOne(
     if (ownership && child.pid) {
       try { updateOperationalMarker(ownership.root, ownership.markerName, ownership.identity, ownership.token, child.pid); }
       catch (error) {
+        if (ownership) {
+          ownership.deferred = true;
+          ownership.childPid = child.pid;
+          ownership.childPgid = process.platform === "win32" ? undefined : child.pid;
+        }
         child.once("error", () => { /* close settles the rejected marker publication */ });
-        child.once("close", () => reject(error));
+        child.once("close", () => {
+          void (async () => {
+            if (ownership) {
+              try {
+                const quiescent = await waitForProcessTreeQuiescence(
+                  ownership.childPid,
+                  ownership.childPgid,
+                );
+                ownership.deferred = !quiescent;
+              } catch {
+                ownership.deferred = true;
+              }
+            }
+            reject(error);
+          })();
+        });
         terminateProcessTree(child);
-        if (child.exitCode !== null) reject(error);
         return;
       }
     }
