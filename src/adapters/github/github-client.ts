@@ -1402,7 +1402,14 @@ export class GitHubClient implements ForgeHost {
     // PR creation is non-atomic with the response. Reconcile the exact branch
     // route before replaying, including after a lost response.
     const reconcile = async (): Promise<PullRequestSnapshot | undefined> => {
-      const candidate = await this.findOpenPromotionPullRequest(input.repo, input.headBranch, input.baseBranch, operationMarker);
+      const candidate = await this.findOpenPromotionPullRequest(
+        input.repo,
+        input.headBranch,
+        input.baseBranch,
+        operationMarker,
+        input.title,
+        input.body,
+      );
       if (!candidate) return undefined;
       if (candidate.headBranch !== input.headBranch || candidate.baseBranch !== input.baseBranch) {
         throw new Error(`Existing pull request route does not match ${input.headBranch} -> ${input.baseBranch}`);
@@ -1711,7 +1718,14 @@ export class GitHubClient implements ForgeHost {
     }
   }
 
-  async findOpenPromotionPullRequest(repo: string, headBranch: string, baseBranch: string, operationMarker?: string): Promise<PullRequestSnapshot | undefined> {
+  async findOpenPromotionPullRequest(
+    repo: string,
+    headBranch: string,
+    baseBranch: string,
+    operationMarker?: string,
+    expectedTitle?: string,
+    expectedBody?: string,
+  ): Promise<PullRequestSnapshot | undefined> {
     const result = await this.gh([
       "pr", "list", "--repo", repo, "--state", "open", "--head", headBranch, "--base", baseBranch,
       "--json", "number", "--limit", "10",
@@ -1720,8 +1734,19 @@ export class GitHubClient implements ForgeHost {
     for (const value of values) {
       if (value.number && Number.isSafeInteger(value.number)) {
         const pullRequest = await this.getPullRequest(repo, value.number);
-        if (pullRequest.state === "OPEN" && pullRequest.headBranch === headBranch && pullRequest.baseBranch === baseBranch
-          && (operationMarker === undefined || pullRequest.body.includes(operationMarker))) return pullRequest;
+        if (pullRequest.state !== "OPEN" || pullRequest.headBranch !== headBranch || pullRequest.baseBranch !== baseBranch) continue;
+        if (operationMarker !== undefined && pullRequest.body.includes(operationMarker)) return pullRequest;
+        // Adopt a legacy PR only when its complete identity matches. A PR on
+        // the same route with different content is ambiguous and must not be
+        // silently reused or duplicated.
+        const legacyBodyMatches = expectedBody !== undefined
+          && pullRequest.body === expectedBody;
+        const legacyTitleMatches = expectedTitle !== undefined
+          && pullRequest.title === expectedTitle;
+        if (legacyBodyMatches && legacyTitleMatches) return pullRequest;
+        if (operationMarker !== undefined) {
+          throw new Error(`Open pull request #${pullRequest.number} on ${headBranch} -> ${baseBranch} has a non-matching operation identity`);
+        }
       }
     }
     return undefined;

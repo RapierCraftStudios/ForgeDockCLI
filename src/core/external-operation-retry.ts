@@ -220,10 +220,16 @@ export async function withExternalOperationRetry<T>(
       const boundedRetryAfter = retryAfter === undefined
         ? undefined
         : Math.min(retryAfterCeiling, Math.max(0, retryAfter));
-      const bounded = boundedRetryAfter === undefined ? exponential : Math.max(exponential, boundedRetryAfter);
-      if (options.hostKey !== undefined) setAdmission(options, boundedRetryAfter ?? bounded);
-      const jitter = bounded * jitterRatio * ((random() * 2) - 1);
-      await sleep(Math.max(0, boundedRetryAfter ?? 0, bounded + jitter), options.signal);
+      // Jitter only local exponential spacing. An authoritative server cooldown
+      // is a floor, not a value to jitter upward: the security ceiling must
+      // bound the actual wait as well as the admission gate.
+      const localJitter = exponential * jitterRatio * ((random() * 2) - 1);
+      const localDelay = Math.max(0, exponential + localJitter);
+      const delay = boundedRetryAfter === undefined
+        ? Math.min(maxDelayMs, localDelay)
+        : Math.max(boundedRetryAfter, Math.min(maxDelayMs, localDelay));
+      if (options.hostKey !== undefined) setAdmission(options, boundedRetryAfter ?? delay);
+      await sleep(delay, options.signal);
     }
   }
   throw new Error("External operation retry loop terminated unexpectedly");

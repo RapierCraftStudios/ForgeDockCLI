@@ -132,6 +132,21 @@ describe("external-operation retry", () => {
     assert.equal(delays[0], 120_000);
   });
 
+  it("keeps authoritative cooldowns within their security ceiling despite jitter", async () => {
+    const delays: number[] = [];
+    await assert.rejects(withExternalOperationRetry(async () => {
+      throw externalHttpError({ status: 503, headers: new Headers({ "retry-after": "900" }) });
+    }, {
+      maxAttempts: 2,
+      maxDelayMs: 5_000,
+      maxRetryAfterMs: 900_000,
+      jitterRatio: 1,
+      random: () => 1,
+      sleep: async (delay) => { delays.push(delay); },
+    }));
+    assert.deepEqual(delays, [900_000]);
+  });
+
   it("keeps a typed wrapper's root cause", () => {
     const original = new Error("socket");
     const error = new ExternalOperationError("socket failed", { kind: "network" }, { cause: original });

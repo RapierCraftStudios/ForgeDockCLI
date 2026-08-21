@@ -41,6 +41,29 @@ describe("GitHub read retry boundary", () => {
     assert.equal(attempts, 2);
   });
 
+
+  it("adopts an exact legacy promotion PR without an operation marker", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "runGh", { value: async (args: readonly string[]) => {
+      if (args[0] === "pr" && args[1] === "list") return JSON.stringify([{ number: 17 }]);
+      return JSON.stringify({
+        number: 17,
+        title: "Promote release",
+        body: "Legacy promotion body",
+        url: "https://github.com/a/b/pull/17",
+        state: "OPEN",
+        headRefOid: "0123456789abcdef0123456789abcdef01234567",
+        headRefName: "release/candidate",
+        baseRefName: "main",
+      });
+    } });
+    const result = await client.findOpenPromotionPullRequest(
+      "a/b", "release/candidate", "main", "<!-- FORGEDOCK:PR-CREATE operation=new -->",
+      "Promote release", "Legacy promotion body",
+    );
+    assert.equal(result?.number, 17);
+  });
+
   it("retries gh CLI connection guidance as a transient read failure", async () => {
     let attempts = 0;
     const client = new GitHubClient();
