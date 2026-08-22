@@ -2422,6 +2422,51 @@ test("visible decomposition keeps non-root repository identity on initial and re
   assert.deepEqual(resumed?.items[0]?.dependencies, ["valid-prerequisite"]);
 });
 
+test("visible decomposition qualifies a child when a foreign root occupies its bare ID", async () => {
+  const github = {
+    async getRepository(repo: string) {
+      return { repo, defaultBranch: "parent-main" };
+    },
+    async getIssue(issue: number, repo: string) {
+      return {
+        repo,
+        number: issue,
+        title: `Child ${issue}`,
+        body: "",
+        url: `https://github.test/${repo}/issues/${issue}`,
+        state: "OPEN" as const,
+        labels: [],
+        comments: [],
+      };
+    },
+    async listBranches() { return []; },
+    async getBranchHead() { return "head"; },
+  } as any;
+  const result = await materializeVisibleDecomposition({
+    github,
+    artifacts: { async list() { return []; } },
+    repository: "owner/root",
+    effective: { fastLaneTarget: "staging" } as any,
+    orchestration: {
+      nodes: [
+        { id: "issue-7", issue: 7, repository: "owner/root", priority: 1, dependencies: [], claims: [], memberIssues: [7] },
+        { id: "parent", issue: 42, repository: "owner/parent", priority: 1, dependencies: [], claims: [], memberIssues: [42] },
+      ],
+    } as any,
+    node: { id: "parent", issue: 42, repository: "owner/parent" } as any,
+    item: {
+      id: "parent", issue: 42, repository: "owner/parent", priority: 1, dependencies: [], claims: [],
+      labels: [], affectedFiles: [], memberIssues: [42], title: "Parent", summary: "Parent",
+    },
+    childIssues: [7],
+  });
+
+  assert.ok(result);
+  assert.equal(result.items[0]?.id, "issue-r006f0077006e00650072002f0070006100720065006e0074-7");
+  assert.notEqual(result.items[0]?.id, "issue-7");
+  assert.deepEqual(result.items[0]?.dependencies, []);
+});
+
 test("visible decomposition fails closed when a concurrent child read rejects", async () => {
   const childIssues = Array.from({ length: DEFAULT_REMOTE_READ_CONCURRENCY + 2 }, (_, index) => index + 100);
   const failingIssue = 101;

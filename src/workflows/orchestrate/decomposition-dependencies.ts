@@ -1,9 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { normalizeOrchestrationRepository, orchestrationIssueIdentityKey } from "../../core/ports/orchestration.js";
+
 export interface DecompositionDependencyNodeIdentity {
   id: string;
   issue: number;
+  repository: string;
   memberIssues?: readonly number[];
+}
+
+/**
+ * Encode the effective repository without treating punctuation as a separator.
+ *
+ * Node IDs are persisted and later used as graph/lease keys, so the encoding
+ * must be injective for every normalized repository identity. Encoding UTF-16
+ * code units as fixed-width hexadecimal keeps that property without relying on
+ * URL parsing or lossy slug replacement (and is deterministic in every
+ * adapter).
+ */
+function encodeRepositoryForNodeId(repository: string): string {
+  const normalized = normalizeOrchestrationRepository(repository);
+  return Array.from({ length: normalized.length }, (_, index) =>
+    normalized.charCodeAt(index).toString(16).padStart(4, "0"),
+  ).join("");
+}
+
+/** Build a reversible repository-qualified fallback ID without collisions. */
+export function decompositionQualifiedNodeId(repository: string, issue: number): string {
+  return `issue-r${encodeRepositoryForNodeId(repository)}-${issue}`;
 }
 
 export function dependencyIssueNumbersFromBody(body: string): number[] {
@@ -18,29 +42,35 @@ export function mapDecompositionDependencies(
   childIssue: number,
   body: string,
   nodes: readonly DecompositionDependencyNodeIdentity[],
+  childRepository: string,
 ): string[] {
-  const issueToNode = new Map<number, string>();
+  const effectiveChildRepository = normalizeOrchestrationRepository(childRepository);
+  const issueToNode = new Map<string, string>();
+  const identityKey = (repository: string, issue: number) =>
+    orchestrationIssueIdentityKey({ repository, issue });
   for (const node of nodes) {
+    const effectiveRepository = normalizeOrchestrationRepository(node.repository);
     for (const issue of new Set([node.issue, ...(node.memberIssues ?? [])])) {
-      const existing = issueToNode.get(issue);
+      const key = identityKey(effectiveRepository, issue);
+      const existing = issueToNode.get(key);
       if (existing !== undefined && existing !== node.id) {
-        throw new Error(`Cannot map decomposition prerequisite #${issue}: it is represented by both ${existing} and ${node.id}`);
+        throw new Error(`Cannot map decomposition prerequisite #${issue} in ${effectiveRepository}: it is represented by both ${existing} and ${node.id}`);
       }
-      issueToNode.set(issue, node.id);
+      issueToNode.set(key, node.id);
     }
   }
 
   const dependencies = dependencyIssueNumbersFromBody(body);
-  const missing = dependencies.filter((issue) => !issueToNode.has(issue));
+  const missing = dependencies.filter((issue) => !issueToNode.has(identityKey(effectiveChildRepository, issue)));
   if (missing.length) {
     throw new Error(
-      `Decomposition child #${childIssue} has prerequisites outside the frozen orchestration DAG: ${missing.map((issue) => `#${issue}`).join(", ")}`,
+      `Decomposition child #${childIssue} in ${effectiveChildRepository} has prerequisites outside the frozen orchestration DAG: ${missing.map((issue) => `#${issue}`).join(", ")}`,
     );
   }
-  const childNode = issueToNode.get(childIssue);
-  const mapped = [...new Set(dependencies.map((issue) => issueToNode.get(issue)!))];
+  const childNode = issueToNode.get(identityKey(effectiveChildRepository, childIssue));
+  const mapped = [...new Set(dependencies.map((issue) => issueToNode.get(identityKey(effectiveChildRepository, issue))!))];
   if (childNode !== undefined && mapped.includes(childNode)) {
-    throw new Error(`Decomposition child #${childIssue} cannot depend on itself`);
+    throw new Error(`Decomposition child #${childIssue} in ${effectiveChildRepository} cannot depend on itself`);
   }
   return mapped;
 }
