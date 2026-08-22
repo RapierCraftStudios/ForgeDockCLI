@@ -34,6 +34,67 @@ export type OrchestrationPlanMetadata = Record<string, OrchestrationMetadataValu
 
 export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "reattach";
 
+/** Terminal semantic result of one controller-owned investigation admission. */
+export type InvestigationSettlementState =
+  | "confirmed"
+  | "invalid"
+  | "decomposed"
+  | "failed"
+  | "retrying"
+  | "cancelled";
+
+export type InvestigationWaveState = "pending" | "running" | "confirmed" | "settled" | "failed" | "cancelled";
+
+/** Exact repository-qualified identity frozen before an investigation worker runs. */
+export interface OrchestrationInvestigationSettlement {
+  repository: string;
+  issue: number;
+  waveId: string;
+  targetBranch: string;
+  baseSha: string;
+  state: InvestigationSettlementState;
+  attempt: number;
+  maxAttempts: number;
+  investigationArtifactId?: string;
+  outcomeArtifactId?: string;
+  decompositionChildren?: OrchestrationIssueIdentity[];
+  error?: string;
+  updatedAt: string;
+}
+
+/** Frozen route/base evidence retained even while a wave is pending or cancelled. */
+export interface OrchestrationInvestigationFrozenBase extends OrchestrationIssueIdentity {
+  targetBranch: string;
+  baseSha: string;
+}
+
+/** Durable wave checkpoint. The selected set is never inferred from scheduler capacity. */
+export interface OrchestrationInvestigationWave {
+  schema: "forgedock.investigation-wave/v1";
+  waveId: string;
+  parentWaveId?: string;
+  repository: string;
+  targetBranch: string;
+  selected: OrchestrationIssueIdentity[];
+  frozenBases: OrchestrationInvestigationFrozenBase[];
+  settlements: OrchestrationInvestigationSettlement[];
+  state: InvestigationWaveState;
+  executionAttempt: number;
+  executionClaimId?: string;
+  maxAttempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Proof handed from admission to materialization and delivery. */
+export interface OrchestrationAdmissionProof {
+  waveId: string;
+  repository: string;
+  targetBranch: string;
+  selected: OrchestrationInvestigationSettlement[];
+  settledAt: string;
+}
+
 export type OrchestrationWorkerAttemptStatus =
   | "launching"
   | "running"
@@ -211,6 +272,10 @@ export interface OrchestrationRecord {
   nodes: OrchestrationNodeRecord[];
   /** Optional for backward compatibility with pre-serialization-edge records. */
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
+  /** Controller-owned investigation barrier checkpoint. */
+  investigationWave?: OrchestrationInvestigationWave;
+  /** Durable proof consumed by materialization and resumed delivery. */
+  admissionProof?: OrchestrationAdmissionProof;
 }
 
 /** Canonical repository-qualified identity for issue ownership. */

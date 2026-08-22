@@ -11,7 +11,10 @@ import {
   type MaterializedBatchIssue,
 } from "./batching.js";
 import { contractBatchGroups } from "./batching.js";
-import { orchestrationIssueIdentityKey } from "../../core/ports/orchestration.js";
+import {
+  orchestrationIssueIdentityKey,
+  type OrchestrationAdmissionProof,
+} from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 export interface BatchMaterializationHost {
@@ -37,6 +40,8 @@ export interface MaterializeBatchGroupsInput {
   items?: readonly BatchableWorkItem[];
   /** Optional authoritative lane snapshot keyed by normalized repository plus issue. */
   expectedRoutes?: ExpectedRoutes;
+  /** Controller-issued proof. When supplied, every proposed member is checked before the first host write. */
+  admissionProof?: OrchestrationAdmissionProof;
 }
 
 export interface MaterializeBatchGroupsResult {
@@ -56,6 +61,7 @@ export async function materializeBatchGroups(
   const groups: IssueBatchGroup[] = [];
   const materialized: MaterializedBatchIssue[] = [];
   const createdIssues: Array<{ repo: string; issue: number }> = [];
+  assertAdmissionProof(input);
   try {
     for (const proposed of input.groups) {
       const validated = await revalidateBatchGroup(proposed, input.repo, input.host, input.expectedRoutes);
@@ -162,6 +168,31 @@ export async function revalidateBatchGroup(
   }
   if (members.length < 2) throw new Error(`Batch group ${proposed.id} must contain at least two members`);
   return { members, ...(milestone ? { milestone } : {}) };
+}
+
+function assertAdmissionProof(input: MaterializeBatchGroupsInput): void {
+  if (!input.admissionProof) return;
+  if (!input.admissionProof.waveId.trim() || input.admissionProof.selected.length === 0) {
+    throw new Error("Batch materialization requires a non-empty confirmed admission proof");
+  }
+  const admitted = new Map(input.admissionProof.selected.map((settlement) => [
+    orchestrationIssueIdentityKey(settlement), settlement,
+  ]));
+  for (const group of input.groups) {
+    for (const member of group.members) {
+      const repository = member.repository ?? input.repo;
+      const settlement = admitted.get(orchestrationIssueIdentityKey({ repository, issue: member.issue }));
+      if (!settlement || settlement.state !== "confirmed") {
+        throw new Error(`Cannot materialize #${member.issue}: durable investigation admission is missing or unsettled`);
+      }
+      if (settlement.targetBranch !== member.targetBranch) {
+        throw new Error(`Cannot materialize #${member.issue}: admitted target branch changed`);
+      }
+      if (!/^[0-9a-f]{7,64}$/i.test(settlement.baseSha)) {
+        throw new Error(`Cannot materialize #${member.issue}: admitted base SHA is missing or stale`);
+      }
+    }
+  }
 }
 
 function expectedRouteFor(

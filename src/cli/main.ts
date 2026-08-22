@@ -7,6 +7,7 @@ import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core
 import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
+import type { InvestigationAdmissionSelection } from "../workflows/orchestrate/investigation-admission.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
@@ -2245,12 +2246,78 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
       discoverVerificationCommands(checkoutRoot, `origin/${targetBranch}`);
     }
+
+    // The admission DAG is deliberately created and settled before the first
+    // batch host write. Its record is a durable checkpoint, not scheduler
+    // capacity: every original member must carry one exact base SHA receipt.
+    const admissionOrchestrationId = `dag_admission_${crypto.randomUUID()}`;
+    const selectedAdmissions = new Map<string, { item: typeof items[number]; repository: string; issue: number }>();
+    for (const item of items) {
+      const itemRepository = repositoryForScheduledItem(item, repository.repo);
+      for (const issue of [item.issue, ...(item.memberIssues ?? [])]) {
+        selectedAdmissions.set(orchestrationRouteCacheKey(itemRepository, issue), { item, repository: itemRepository, issue });
+      }
+    }
+    const admissionSelections: InvestigationAdmissionSelection[] = [];
+    for (const selected of selectedAdmissions.values()) {
+      const route = requiredOrchestrationRoute(routedIssues, { repository: selected.repository, issue: selected.issue });
+      const baseSha = await git.resolveBaseSha(`origin/${route.lane.targetBranch}`);
+      admissionSelections.push({ repository: selected.repository, issue: selected.issue, targetBranch: route.lane.targetBranch, baseSha });
+    }
+    const admissionController = new OrchestrationController({
+      repository: store,
+      executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      transportCapacity: effective.maxParallel,
+      worker: async () => undefined,
+      investigationWorker: async ({ waveId, selection, signal }) => {
+        const source = selectedAdmissions.get(orchestrationRouteCacheKey(selection.repository, selection.issue));
+        if (!source) throw new Error(`Admission selection disappeared for ${selection.repository}#${selection.issue}`);
+        const issue = await github.getIssue(selection.issue, selection.repository);
+        const route = requiredOrchestrationRoute(routedIssues, { repository: selection.repository, issue: selection.issue });
+        const runId = `run_admission_${waveId}_${selection.repository.replace(/[^a-zA-Z0-9_-]/g, "-")}_${selection.issue}`;
+        const intent = createArtifact({
+          kind: "Intent", runId, subject: { repo: selection.repository, issue: selection.issue }, producer: { role: "controller", runtime: "forgedock" },
+          payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [], sourceUrl: issue.url },
+        }, { id: `art_admission_intent_${waveId}_${selection.repository.replace(/[^a-zA-Z0-9_-]/g, "-")}_${selection.issue}` });
+        const workspace = await git.create({ runId, issue: selection.issue, baseRef: `origin/${selection.targetBranch}`, baseSha: selection.baseSha, signal });
+        try {
+          const investigated = await investigateWorkItem({
+            intent, cwd: workspace.path, target: runTargetForLane(route.lane, effective.productionTarget), admissionOnly: true, admissionWaveId: waveId, signal,
+            scopeHints: { affectedFiles: source.item.affectedFiles ?? [], claims: source.item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+            ...(resolvedProvider !== undefined ? { provider: resolvedProvider } : {}),
+            ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+            ...(resolvedThinking !== undefined ? { thinking: resolvedThinking } : {}),
+            ...resolvedPlanning,
+          }, { runtime, artifacts, runs: store });
+          return {
+            state: investigated.investigation.payload.outcome === "confirmed" ? "confirmed" as const : investigated.investigation.payload.outcome === "invalid" ? "invalid" as const : "decomposed" as const,
+            investigationArtifactId: investigated.investigation.id,
+            ...(investigated.outcome ? { outcomeArtifactId: investigated.outcome.id } : {}),
+          };
+        } finally {
+          await git.remove(workspace);
+        }
+      },
+    });
+    const admissionRecord = await admissionController.create({
+      orchestrationId: admissionOrchestrationId, repository: repository.repo, requestedIssueNumbers: admissionSelections.map(({ issue }) => issue),
+      items: proposed.items, maxParallel: effective.maxParallel, autoMerge: false,
+    });
+    const admissionProof = await admissionController.admitInvestigationWave(admissionRecord.orchestrationId, {
+      waveId: `wave_${admissionOrchestrationId}`, repository: repository.repo, targetBranch: admissionSelections[0]?.targetBranch ?? repository.defaultBranch,
+      selected: admissionSelections, ...(signal !== undefined ? { signal } : {}), maxAttempts: 3,
+    });
+    const settledAdmission = await store.loadOrchestration(admissionOrchestrationId);
+    if (!settledAdmission?.investigationWave) throw new Error("Durable investigation wave disappeared before materialization");
+    await store.saveOrchestration({ ...settledAdmission, status: "completed", admissionProof, updatedAt: new Date().toISOString() });
+
     const materializedResult = assembly.groups.length
       ? await materializeBatchGroups({
         repo: repository.repo,
         groups: assembly.groups,
         items,
         host: github,
+        admissionProof,
         expectedRoutes: new Map(items.map((item) => {
           const itemRepository = repositoryForScheduledItem(item, repository.repo);
           const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
@@ -2608,6 +2675,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       maxParallel: effective.maxParallel,
       autoMerge,
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+      investigationWave: settledAdmission.investigationWave,
       plan: {
         adapter: "cli",
         batchingPolicy: effective.batchingPolicy,

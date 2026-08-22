@@ -13,6 +13,7 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import { LeaseContinuityError, type LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import type { TelemetryRepository } from "../../core/ports/telemetry.js";
+import type { OrchestrationAdmissionProof } from "../../core/ports/orchestration.js";
 import {
   isRepairableVerificationFailure,
   MAX_VERIFICATION_REPAIR_ATTEMPTS,
@@ -27,6 +28,7 @@ import { completeInvalidWorkItem, completeWorkItem } from "./complete.js";
 import {
   deterministicOutcomeId,
   investigateWorkItem,
+  consumeAdmittedInvestigation,
   resumeInvestigationWorkItem,
   WorkflowExecutionError,
 } from "./investigate.js";
@@ -1013,6 +1015,10 @@ export async function workOn(
     /** Promote frozen Build Packet paths into the owning scheduler before edits begin. */
     onClaimsPromoted?: (paths: readonly string[]) => void | Promise<void>;
     signal?: AbortSignal;
+    /** Durable controller proof required for exact-base delivery when supplied. */
+    admissionProof?: OrchestrationAdmissionProof;
+    /** Investigation artifact named by the admission proof; avoids provider replay. */
+    admittedInvestigation?: DurableArtifact<"Investigation">;
   },
   dependencies: WorkOnDependencies,
 ): Promise<WorkOnResult> {
@@ -1075,13 +1081,33 @@ export async function workOn(
       }
     }
     const deliveryBranch = input.parentRemediation?.parentBranch ?? input.lane.targetBranch;
+    let admittedInvestigation = input.admittedInvestigation;
+    let admittedBaseSha: string | undefined;
+    if (input.admissionProof) {
+      const settlement = input.admissionProof.selected.find((candidate) =>
+        candidate.repository.toLowerCase() === input.intent.subject.repo.toLowerCase() && candidate.issue === issue);
+      if (!settlement || settlement.state !== "confirmed") throw new Error(`No confirmed investigation admission for ${input.intent.subject.repo}#${issue}`);
+      if (settlement.targetBranch !== deliveryBranch || !/^[0-9a-f]{7,64}$/i.test(settlement.baseSha)) {
+        throw new Error(`Investigation admission for ${input.intent.subject.repo}#${issue} has stale route or base SHA evidence`);
+      }
+      admittedBaseSha = settlement.baseSha;
+      if (!admittedInvestigation && settlement.investigationArtifactId) {
+        const durable = await dependencies.artifacts.list(input.intent.subject, "Investigation");
+        admittedInvestigation = durable.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.id === settlement.investigationArtifactId);
+      }
+      if (!admittedInvestigation) throw new Error(`Investigation admission for ${input.intent.subject.repo}#${issue} has no durable Investigation artifact`);
+    }
     assertLease(dependencies);
     workspace = await dependencies.git.create({
       runId: input.intent.runId,
       issue,
       baseRef: `origin/${deliveryBranch}`,
+      ...(admittedBaseSha !== undefined ? { baseSha: admittedBaseSha } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
+    if (admittedBaseSha !== undefined && workspace.baseSha?.toLowerCase() !== admittedBaseSha.toLowerCase()) {
+      throw new Error(`Git workspace base SHA ${workspace.baseSha ?? "missing"} does not match admitted ${admittedBaseSha}`);
+    }
     if (input.resolveVerificationCatalog) {
       if (!workspace.baseSha) throw new Error("Workspace creation did not return an exact base SHA for verification catalog resolution");
       verification = await input.resolveVerificationCatalog(workspace.baseSha);
@@ -1092,6 +1118,7 @@ export async function workOn(
       : runTargetForLane(input.lane, input.productionTarget);
     const investigated = await investigateWorkItem({
       intent: input.intent,
+      ...(admittedInvestigation !== undefined ? { admittedInvestigation } : {}),
       ...(input.priorArtifacts !== undefined ? { priorArtifacts: input.priorArtifacts } : {}),
       cwd: workspace.path,
       target: laneTarget,

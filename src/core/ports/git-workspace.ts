@@ -29,7 +29,9 @@ export class AdvertisedRemoteHeadMismatchError extends Error {
 }
 
 export interface GitWorkspaceManager {
-  create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace>;
+  create(input: { runId: string; issue: number; baseRef: string; baseSha?: string; signal?: AbortSignal }): Promise<GitWorkspace>;
+  /** Resolve the exact advertised commit used to freeze an investigation wave. */
+  resolveBaseSha?(baseRef: string): Promise<string>;
   /**
    * Move an untouched delivery workspace to an exact, host-advertised target
    * revision. Implementations must fetch the branch directly, reject dirty or

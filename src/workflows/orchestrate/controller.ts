@@ -45,9 +45,16 @@ import {
   normalizedDeliveryRouteClaim,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
+import {
+  runInvestigationAdmission,
+  type InvestigationAdmissionInput,
+  type InvestigationAdmissionWorker,
+} from "./investigation-admission.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
+  /** Optional pre-frozen controller-owned investigation wave. */
+  investigationWave?: OrchestrationRecord["investigationWave"];
   repository: string;
   requestedIssueNumbers?: readonly number[];
   items: readonly ScheduledWorkItem[];
@@ -178,6 +185,8 @@ export interface OrchestrationControllerDependencies {
   transportCapacity: number | (() => number | Promise<number>);
   /** Optional cancellation for a run waiting on external transport capacity. */
   signal?: AbortSignal;
+  /** Read-only investigator used by an explicitly admitted investigation wave. */
+  investigationWorker?: InvestigationAdmissionWorker;
   onEvent?: OrchestrationEventSink;
   /** Observer failures are diagnostic only and never change workflow state. */
   onEventError?: (error: unknown, event: OrchestrationEvent) => void;
@@ -277,6 +286,7 @@ export class OrchestrationController {
       autoMerge: input.autoMerge ?? true,
       ...(input.plan !== undefined ? { plan: structuredClone(input.plan) } : {}),
       ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
+      ...(input.investigationWave !== undefined ? { investigationWave: structuredClone(input.investigationWave) } : {}),
       executionAttempt: 0,
       status: "running",
       createdAt: now,
@@ -305,6 +315,49 @@ export class OrchestrationController {
   async createAndRun(input: CreateOrchestrationInput): Promise<OrchestrationControllerResult> {
     const record = await this.create(input);
     return this.run(record.orchestrationId);
+  }
+
+  /**
+   * Admit the frozen selected set before scheduler delivery. The execution
+   * claim is acquired even when this is called before `run`, so a second
+   * controller cannot settle the same wave concurrently.
+   */
+  async admitInvestigationWave(
+    orchestrationId: string,
+    input: Omit<InvestigationAdmissionInput, "executionAttempt" | "executionClaimId">,
+  ): Promise<import("../../core/ports/orchestration.js").OrchestrationAdmissionProof> {
+    const claim = await this.dependencies.executionAdmission.acquire(orchestrationId);
+    if (!claim) throw new Error(`Investigation wave ${input.waveId} is already being admitted`);
+    try {
+      claim.assertValid();
+      const loaded = await this.dependencies.repository.loadOrchestration(orchestrationId);
+      if (!loaded) throw new Error(`Unknown orchestration: ${orchestrationId}`);
+      if (loaded.status === "cancelled") throw new Error(`Orchestration ${orchestrationId} is cancelled`);
+      const executionAttempt = (loaded.executionAttempt ?? 0) + 1;
+      const executionInput = {
+        ...input,
+        executionAttempt,
+        executionClaimId: claim.claimId,
+      } satisfies InvestigationAdmissionInput;
+      const proof = await runInvestigationAdmission(executionInput, {
+        repository: this.dependencies.repository,
+        claim,
+        worker: this.dependencies.investigationWorker ?? (() => Promise.reject(new Error("No read-only investigation worker is configured"))),
+        load: async () => {
+          const current = await this.dependencies.repository.loadOrchestration(orchestrationId);
+          if (!current) throw new Error(`Unknown orchestration: ${orchestrationId}`);
+          return current;
+        },
+        save: async (record) => {
+          claim.assertValid();
+          await persistOrchestrationWithClaim(claim, this.dependencies.repository, record);
+          this.emitSnapshot(record);
+        },
+      });
+      return proof;
+    } finally {
+      await claim.release();
+    }
   }
 
   async run(orchestrationId: string): Promise<OrchestrationControllerResult> {
@@ -452,6 +505,9 @@ export class OrchestrationController {
       });
       await this.flush(state);
 
+      if (state.record.investigationWave && state.record.investigationWave.state !== "confirmed") {
+        throw new Error(`Orchestration ${orchestrationId} lacks a confirmed investigation admission wave`);
+      }
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);

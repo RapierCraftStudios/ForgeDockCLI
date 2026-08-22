@@ -44,6 +44,12 @@ export interface InvestigateInput {
   target?: RunTarget;
   scopeHints?: ScopeHints;
   signal?: AbortSignal;
+  /** Controller admission mode: persist read-only evidence without projecting outcomes or children. */
+  admissionOnly?: boolean;
+  /** Durable controller artifact to consume without running the provider. */
+  admittedInvestigation?: DurableArtifact<"Investigation">;
+  /** Stable semantic identity used when a controller retries an admission attempt. */
+  admissionWaveId?: string;
 }
 
 export interface ResumeInvestigateInput extends InvestigateInput {
@@ -81,6 +87,11 @@ export interface InvestigateResult {
  * write succeeds but the caller loses the response. The semantic checkpoint
  * deliberately excludes clocks and attempt numbers.
  */
+export function deterministicInvestigationId(runId: string, subject: Subject, waveId: string): string {
+  const identity = ["forgedock.investigation/v1", runId, subject.repo.toLowerCase(), subject.issue?.toString() ?? "", waveId].join("\0");
+  return `art_investigation_${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
+}
+
 export function deterministicOutcomeId(
   runId: string,
   subject: Subject,
@@ -97,10 +108,36 @@ export function deterministicOutcomeId(
   return `art_outcome_${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
 }
 
+/** Consume a controller-issued Investigation without invoking the provider again. */
+export async function consumeAdmittedInvestigation(
+  input: InvestigateInput & { investigation: DurableArtifact<"Investigation"> },
+  dependencies: InvestigateDependencies,
+): Promise<InvestigateResult> {
+  if (!sameSubject(input.intent.subject, input.investigation.subject)) {
+    throw new Error("Admitted Investigation subject does not match Intent");
+  }
+  enforceInvestigationSemantics(input.investigation.payload);
+  let run = createRun({
+    workflow: "work-on",
+    subject: input.intent.subject,
+    runId: input.intent.runId,
+    ...(input.target ? { target: input.target } : {}),
+    scopeManifest: investigationScopeManifest(input.scopeHints),
+  });
+  run = attachArtifact(run, "Intent", input.intent.id);
+  run = attachArtifact(run, "Investigation", input.investigation.id);
+  await dependencies.artifacts.append(input.intent);
+  await dependencies.artifacts.append(input.investigation);
+  await dependencies.runs.create(run);
+  run = await applyTransition(dependencies.runs, run, "START_INVESTIGATION");
+  return finishInvestigation(dependencies, run, input.investigation, `durable:${input.investigation.id}`, input.signal, input.admissionOnly === true);
+}
+
 export async function investigateWorkItem(
   input: InvestigateInput,
   dependencies: InvestigateDependencies,
 ): Promise<InvestigateResult> {
+  if (input.admittedInvestigation) return consumeAdmittedInvestigation({ ...input, investigation: input.admittedInvestigation }, dependencies);
   const scopeManifest = investigationScopeManifest(input.scopeHints);
   let run = createRun({
     workflow: "work-on",
@@ -220,7 +257,9 @@ async function continueInvestigation(
           model: agentResult.model,
         },
         payload: agentResult.output,
-      });
+      }, input.admissionOnly && input.admissionWaveId
+        ? { id: deterministicInvestigationId(run.runId, run.subject, input.admissionWaveId) }
+        : {});
       await dependencies.artifacts.append(investigation);
       sessionRef = agentResult.sessionRef;
     }
@@ -231,6 +270,7 @@ async function continueInvestigation(
       investigation,
       sessionRef ?? `durable:${investigation.id}`,
       input.signal,
+      input.admissionOnly === true,
     );
   } catch (error) {
     if (error instanceof WorkflowExecutionError && error.run.state === "cancelled") throw error;
@@ -253,6 +293,7 @@ async function finishInvestigation(
   investigation: DurableArtifact<"Investigation">,
   sessionRef: string,
   signal?: AbortSignal,
+  admissionOnly = false,
 ): Promise<InvestigateResult> {
   // Keep this guard next to the semantic/artifact/decomposition boundary as a
   // second defense if cancellation is raised between the caller's post-await
@@ -262,7 +303,7 @@ async function finishInvestigation(
   }
   let run = attachArtifact(initialRun, "Investigation", investigation.id);
   let outcome: DurableArtifact<"Outcome"> | undefined;
-  if (investigation.payload.outcome !== "confirmed") {
+  if (investigation.payload.outcome !== "confirmed" && !admissionOnly) {
     if (investigation.payload.outcome === "decompose" && !dependencies.decomposer) {
       throw new Error("Decomposition requires a controller issue materializer");
     }

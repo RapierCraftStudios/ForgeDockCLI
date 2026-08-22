@@ -41,13 +41,31 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     this.#root = resolve(root);
   }
 
-  async create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace> {
+  async resolveBaseSha(baseRef: string): Promise<string> {
+    const fetchedBase = baseRef.startsWith("origin/") ? await this.fetchOriginBase(baseRef) : baseRef;
+    const sha = (await this.git(["rev-parse", `${fetchedBase}^{commit}`], this.#repo)).trim();
+    if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new Error(`Unable to resolve exact base SHA for ${baseRef}`);
+    return sha;
+  }
+
+  async create(input: { runId: string; issue: number; baseRef: string; baseSha?: string; signal?: AbortSignal }): Promise<GitWorkspace> {
     const { branch, path } = this.workspaceIdentity(input);
     await mkdir(dirname(path), { recursive: true });
     const fetchedBase = input.baseRef.startsWith("origin/")
       ? await this.fetchOriginBase(input.baseRef)
       : input.baseRef;
-    const baseSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
+    const advertisedSha = (await this.git(["rev-parse", fetchedBase], this.#repo)).trim();
+    const baseSha = input.baseSha ?? advertisedSha;
+    if (!/^[0-9a-f]{7,64}$/i.test(baseSha)) throw new Error("Workspace creation requires an exact base SHA");
+    if (input.baseSha !== undefined && input.baseSha.toLowerCase() !== advertisedSha.toLowerCase()) {
+      throw new Error(`Admitted base ${input.baseSha} is stale; target ${input.baseRef} now advertises ${advertisedSha}`);
+    }
+    await this.git(["rev-parse", "--verify", `${baseSha}^{commit}`], this.#repo);
+    try {
+      await this.git(["merge-base", "--is-ancestor", baseSha, advertisedSha], this.#repo);
+    } catch (error) {
+      throw new Error(`Admitted base ${baseSha} is not contained by target ${input.baseRef} at ${advertisedSha}`, { cause: error });
+    }
     const hooksPath = await this.controllerEmptyHooksPath();
     let added = false;
     try {
