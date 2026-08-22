@@ -2486,6 +2486,251 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
   assert.deepEqual(input.orchestration, durableBefore);
 });
 
+test("visible TUI decomposition preserves non-root identity through start and fresh persisted resume", async () => {
+  const childIssues = [100, 101] as const;
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "visible-tui-decomposition",
+    subject: { repo: "owner/work", issue: 42 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split work", childIssues: ["#100 First", "#101 Second"] },
+  });
+  const makeFixture = (state: FakePiState, repository: InMemoryOrchestrationRepository, failExpansion = false) => {
+    const repositoryReads: string[] = [];
+    const artifactReads: Array<{ repo: string; issue: number }> = [];
+    const issueReads: Array<{ repo: string; issue: number }> = [];
+    const branchReads: Array<{ repo: string; branch: string }> = [];
+    const resolveCalls: Array<{ repository: string; childIssues?: readonly number[] }> = [];
+    const github = {
+      async getRepository(repo: string) {
+        repositoryReads.push(repo);
+        return { repo, defaultBranch: repo === "owner/work" ? "work-main" : "control-main" };
+      },
+      async getIssue(issue: number, repo: string) {
+        issueReads.push({ repo, issue });
+        return {
+          repo,
+          number: issue,
+          title: `Issue ${issue}`,
+          body: "",
+          url: `https://github.test/${repo}/issues/${issue}`,
+          state: "OPEN" as const,
+          labels: [],
+          comments: [],
+        };
+      },
+      async listBranches(repo: string) {
+        branchReads.push({ repo, branch: "milestone/" });
+        return [];
+      },
+      async getBranchHead(repo: string, branch: string) {
+        branchReads.push({ repo, branch });
+        return "head";
+      },
+    } as any;
+    const artifacts = {
+      async list(subject: { repo: string; issue: number }) {
+        artifactReads.push(subject);
+        return [outcome];
+      },
+    };
+    const resolveDecomposition = async ({ orchestration, node, item, childIssues: supplied }: any) => {
+      resolveCalls.push({ repository: item.repository ?? node.repository ?? orchestration.repository, ...(supplied !== undefined ? { childIssues: supplied } : {}) });
+      if (failExpansion) throw new Error("first supervisor stopped before child expansion");
+      const discovered = await artifacts.list({ repo: item.repository ?? node.repository ?? orchestration.repository, issue: item.issue });
+      assert.deepEqual(discovered[0]?.payload.childIssues, ["#100 First", "#101 Second"]);
+      return materializeVisibleDecomposition({
+        github,
+        artifacts,
+        repository: "owner/control",
+        effective: { fastLaneTarget: "work-main" } as any,
+        orchestration,
+        node,
+        item,
+        ...(supplied !== undefined ? { childIssues: supplied } : {}),
+      });
+    };
+    const input = (items: readonly any[], assertCompleted: (item: any) => Promise<any>) => ({
+      repository: "owner/control",
+      requestedIssueNumbers: [42],
+      items,
+      maxParallel: 2,
+      maxDecompositionChildren: 4,
+      maxDecompositionDepth: 2,
+      revalidateRoute: async (item: any) => {
+        const authoritative = await github.getRepository(item.repository ?? "owner/control");
+        const issue = await github.getIssue(item.issue, item.repository ?? "owner/control");
+        return { repository: item.repository ?? "owner/control", targetBranch: authoritative.defaultBranch === "work-main" ? "work-main" : "control-main", lane: "fast" as const, ...(issue ? {} : {}) };
+      },
+      resolveDecomposition,
+      taskFor: (item: any) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+      assertCompleted,
+      onComplete: () => undefined,
+    });
+    return { input, repositoryReads, artifactReads, issueReads, branchReads, resolveCalls };
+  };
+  const installSpawnWitness = (state: FakePiState, prefix: string) => {
+    const launches: Array<{ issue: number; runId: string }> = [];
+    const emit = state.pi.events.emit.bind(state.pi.events);
+    state.pi.events.emit = ((name: string, data: any) => {
+      emit(name, data);
+      if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+        const issue = Number(/issue #(\d+)/.exec(data.params.task)?.[1]);
+        const runId = `${prefix}-${launches.length + 1}`;
+        launches.push({ issue, runId });
+        queueMicrotask(() => {
+          emit(`subagents:rpc:v1:reply:${data.requestId}`, {
+            version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: runId } },
+          });
+          setTimeout(() => emit("subagent:async-complete", { runId }), 0);
+        });
+      }
+    }) as typeof state.pi.events.emit;
+    return { emit, launches };
+  };
+  // Initial route: the real delegator/controller expands and completes both children.
+  const initialRepository = new InMemoryOrchestrationRepository();
+  const initialState = fakePi();
+  const initialWitness = installSpawnWitness(initialState, "visible-start");
+  const initialFixture = makeFixture(initialState, initialRepository);
+  const initialDelegator = witnessedDagDelegator(initialState.pi, initialRepository);
+  const initial = await initialDelegator.start(initialFixture.input(
+    [{ id: "parent", issue: 42, repository: "owner/work", targetBranch: "work-main", lane: "fast", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [42], title: "Parent", summary: "Parent" }],
+    async (item) => item.issue === 42 ? { status: "skipped", error: "authoritative child scope required", childIssues } : { status: "completed" },
+  ));
+  assert.deepEqual(initialWitness.launches.map((launch) => launch.issue), [42]);
+  await initial.completion;
+  const initialRecord = await initialRepository.loadOrchestration(initial.id);
+  assert.deepEqual(initialFixture.resolveCalls, [{ repository: "owner/work", childIssues }]);
+  assert.ok(initialFixture.repositoryReads.every((repo) => repo === "owner/work"));
+  assert.deepEqual(initialFixture.artifactReads, [{ repo: "owner/work", issue: 42 }]);
+  assert.ok(initialFixture.issueReads.some((read) => read.repo === "owner/work" && read.issue === 100));
+  assert.ok(initialFixture.issueReads.some((read) => read.repo === "owner/work" && read.issue === 101));
+  assert.ok(initialFixture.branchReads.some((read) => read.repo === "owner/work" && read.branch === "work-main"));
+  assert.deepEqual(initialRecord?.nodes.find((node) => node.id === "parent")?.decompositionChildren, [...childIssues]);
+  assert.deepEqual(initialRecord?.nodes.filter((node) => node.issue !== 42).map((node) => node.repository), ["owner/work", "owner/work"]);
+  assert.deepEqual(initialRecord?.nodes.filter((node) => node.issue !== 42).map((node) => node.status), ["completed", "completed"]);
+  await initialDelegator.shutdown();
+
+  // Persist a failed checkpoint after the parent worker reports its authoritative children.
+  const persistedRepository = new InMemoryOrchestrationRepository();
+  const firstState = fakePi();
+  const firstWitness = installSpawnWitness(firstState, "visible-checkpoint");
+  const firstFixture = makeFixture(firstState, persistedRepository, true);
+  const firstDelegator = witnessedDagDelegator(firstState.pi, persistedRepository);
+  const first = await firstDelegator.start(firstFixture.input(
+    [{ id: "parent", issue: 42, repository: "owner/work", targetBranch: "work-main", lane: "fast", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [42], title: "Parent", summary: "Parent" }],
+    async (item) => item.issue === 42 ? { status: "skipped", error: "authoritative child scope required", childIssues } : { status: "completed" },
+  ));
+  await assert.rejects(first.completion, /first supervisor stopped/);
+  const checkpoint = await persistedRepository.loadOrchestration(first.id);
+  assert.equal(checkpoint?.status, "failed");
+  assert.equal(checkpoint?.nodes.find((node) => node.id === "parent")?.decompositionChildren, undefined);
+  assert.deepEqual(checkpoint?.nodes.find((node) => node.id === "parent")?.attempts?.at(-1)?.decompositionChildren, [...childIssues]);
+  assert.equal(checkpoint?.nodes.filter((node) => node.issue !== 42).length, 0);
+  await firstDelegator.shutdown();
+
+  // A fresh supervisor must load the record and rebuild the non-root node before resuming.
+  const secondState = fakePi();
+  const secondWitness = installSpawnWitness(secondState, "visible-resume");
+  const secondFixture = makeFixture(secondState, persistedRepository);
+  const second = witnessedDagDelegator(secondState.pi, persistedRepository, async (record) => secondFixture.input(
+    record.nodes.map((node) => ({ ...node, labels: [], affectedFiles: node.affectedFiles ?? [], memberIssues: node.memberIssues ?? [node.issue], title: node.title ?? `Issue ${node.issue}`, summary: node.summary ?? "Resumed" })),
+    async (item) => item.issue === 42 ? { status: "skipped", childIssues } : { status: "completed" },
+  ));
+  const resumed = await second.resume(first.id);
+  await resumed.completion;
+  assert.deepEqual(secondWitness.launches.map((launch) => launch.issue), [100, 101]);
+  const resumedRecord = await persistedRepository.loadOrchestration(first.id);
+  assert.deepEqual(secondFixture.resolveCalls, [{ repository: "owner/work", childIssues }]);
+  assert.ok(secondFixture.repositoryReads.every((repo) => repo === "owner/work"));
+  assert.ok(secondFixture.issueReads.every((read) => read.repo === "owner/work"));
+  assert.ok(secondFixture.branchReads.some((read) => read.repo === "owner/work" && read.branch === "work-main"));
+  assert.deepEqual(resumedRecord?.nodes.find((node) => node.id === "parent")?.decompositionChildren, [...childIssues]);
+  assert.deepEqual(resumedRecord?.nodes.filter((node) => node.issue !== 42).map((node) => node.repository), ["owner/work", "owner/work"]);
+  assert.deepEqual(resumedRecord?.nodes.filter((node) => node.issue !== 42).map((node) => node.status), ["completed", "completed"]);
+  await second.shutdown();
+});
+
+test("visible TUI decomposition fails closed at the controller boundary", async () => {
+  const childIssues = [100, 101] as const;
+  const runCase = async (rejectIssue?: number) => {
+    const state = fakePi();
+    const repository = new InMemoryOrchestrationRepository();
+    const launches: Array<{ issue: number; runId: string }> = [];
+    const issueReads: Array<{ repo: string; issue: number }> = [];
+    const originalEmit = state.pi.events.emit.bind(state.pi.events);
+    state.pi.events.emit = ((name: string, data: any) => {
+      originalEmit(name, data);
+      if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+        const issue = Number(/issue #(\d+)/.exec(data.params.task)?.[1]);
+        const runId = `${rejectIssue === undefined ? "visible-success" : "visible-reject"}-${launches.length + 1}`;
+        launches.push({ issue, runId });
+        queueMicrotask(() => {
+          originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+            version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: runId } },
+          });
+          setTimeout(() => originalEmit("subagent:async-complete", { runId }), 0);
+        });
+      }
+    }) as typeof state.pi.events.emit;
+    const github = {
+      async getRepository(repo: string) { return { repo, defaultBranch: "work-main" }; },
+      async getIssue(issue: number, repo: string) {
+        issueReads.push({ repo, issue });
+        if (issue === rejectIssue) throw new Error("concurrent child read failed");
+        return { repo, number: issue, title: `Child ${issue}`, body: "", url: `https://github.test/${repo}/issues/${issue}`, state: "OPEN" as const, labels: [], comments: [] };
+      },
+      async listBranches() { return []; },
+      async getBranchHead() { return "head"; },
+    } as any;
+    const delegator = witnessedDagDelegator(state.pi, repository);
+    const run = await delegator.start({
+      repository: "owner/control",
+      items: [{ id: "parent", issue: 42, repository: "owner/work", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [42], title: "Parent", summary: "Parent" }],
+      maxParallel: 2,
+      maxDecompositionChildren: 4,
+      maxDecompositionDepth: 2,
+      resolveDecomposition: async ({ orchestration, node, item, childIssues: supplied }) => materializeVisibleDecomposition({
+        github,
+        artifacts: { async list() { return []; } },
+        repository: "owner/control",
+        effective: { fastLaneTarget: "work-main" } as any,
+        orchestration,
+        node,
+        item,
+        ...(supplied !== undefined ? { childIssues: supplied } : {}),
+      }),
+      taskFor: (item) => ({ agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() }),
+      assertCompleted: async (item) => item.issue === 42 ? { status: "skipped", error: "authoritative child scope required", childIssues } : { status: "completed" },
+      onComplete: () => undefined,
+    });
+    assert.deepEqual(launches.map((launch) => launch.issue), [42]);
+    if (rejectIssue === undefined) {
+      await run.completion;
+      assert.deepEqual(launches.map((launch) => launch.issue), [42, 100, 101]);
+    } else {
+      await assert.rejects(run.completion, /concurrent child read failed/);
+    }
+    const durable = await repository.loadOrchestration(run.id);
+    await delegator.shutdown();
+    return { durable, issueReads, launches };
+  };
+
+  const rejected = await runCase(101);
+  assert.deepEqual(rejected.issueReads.map((read) => read.issue).sort((left, right) => left - right), [100, 101]);
+  assert.deepEqual(rejected.launches.map((launch) => launch.issue), [42]);
+  assert.equal(rejected.durable?.nodes.filter((node) => node.issue !== 42).length, 0);
+  assert.equal(rejected.durable?.nodes.find((node) => node.id === "parent")?.decompositionChildren, undefined);
+  assert.deepEqual(rejected.durable?.nodes.find((node) => node.id === "parent")?.attempts?.at(-1)?.decompositionChildren, [...childIssues]);
+  assert.equal(rejected.durable?.status, "failed");
+
+  const successful = await runCase();
+  assert.deepEqual(successful.launches.map((launch) => launch.issue), [42, 100, 101]);
+  assert.deepEqual(successful.durable?.nodes.filter((node) => node.issue !== 42).map((node) => node.status), ["completed", "completed"]);
+  assert.deepEqual(successful.durable?.nodes.filter((node) => node.issue !== 42).map((node) => node.repository), ["owner/work", "owner/work"]);
+});
+
 test("visible DAG refuses to retry terminally decomposed work", async () => {
   const state = fakePi();
   const originalEmit = state.pi.events.emit.bind(state.pi.events);
