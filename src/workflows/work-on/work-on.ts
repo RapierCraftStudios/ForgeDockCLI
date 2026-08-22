@@ -743,12 +743,12 @@ async function freshTargetRecoveryEvidence(
       }
       }
     }
-    if (strictSemantic && (anchors.symbols.length === 0 || anchors.testIds.length === 0)) {
-      throw new Error(`Target recovery criterion ${criterionId} lacks proven symbols or test IDs`);
+    if (strictSemantic && anchors.symbols.length === 0) {
+      throw new Error(`Target recovery criterion ${criterionId} lacks proven symbol or invariant evidence`);
     }
     const requiredIds = contract?.requiredCommandIds ?? [];
     const semanticIds = contract?.semanticCommandIds ?? [];
-    const anchoredIds = new Set(anchors.verificationCommandIds);
+    const anchoredIds = new Set(anchors.verificationCommandIds ?? []);
     const missingRequired = [...new Set([...requiredIds, ...semanticIds])].filter((id) => !anchoredIds.has(id) || !passedCommands.has(id));
     if (missingRequired.length) throw new Error(`Target recovery criterion ${criterionId} has unproven required semantic commands: ${missingRequired.join(", ")}`);
     if (strictSemantic && requiredIds.length > 0 && semanticIds.length === 0) {
@@ -766,10 +766,11 @@ async function freshTargetRecoveryEvidence(
     const matrixIds = (packet.payload.invariantMatrices ?? [])
       .filter((row) => row.criterionId === criterionId)
       .flatMap((row) => [row.testId, ...expandInvariantMatrix(row).map((item) => item.id)]);
-    if (matrixIds.some((id) => !anchors.testIds.includes(id))) {
+    if (matrixIds.some((id) => !(anchors.testIds ?? []).includes(id))) {
       throw new Error(`Target recovery criterion ${criterionId} has incomplete invariant matrix evidence`);
     }
-    if (anchors.verificationCommandIds.some((id) => !passedCommands.has(id))) {
+    const verificationCommandIds = anchors.verificationCommandIds ?? [];
+    if (verificationCommandIds.some((id) => !passedCommands.has(id))) {
       throw new Error(`Target recovery criterion ${criterionId} has stale verification command anchors`);
     }
     return {

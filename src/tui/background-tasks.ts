@@ -337,6 +337,7 @@ export class ForgeDockBackgroundTasks {
     let lastProgressAt = Date.now();
     let emptyObservationPolls = 0;
     let warned = false;
+    let replacementNoticeKey: string | undefined;
     while (true) {
       const record = this.recordsFromDisk().get(id);
       if (!record) throw new Error(`Unknown ForgeDock background task: ${id}`);
@@ -381,9 +382,21 @@ export class ForgeDockBackgroundTasks {
         MAX_OBSERVATION_POLL_MS,
         MIN_OBSERVATION_POLL_MS * 2 ** Math.floor(emptyObservationPolls / 4),
       );
-      if (!warned && Date.now() - lastProgressAt >= warnAfterMs) {
+      const replacement = findLiveReplacementTask(record, this.#records.values());
+      if (replacement) {
+        lastProgressAt = Date.now();
+        warned = false;
+        if (replacementNoticeKey !== replacement.id) {
+          replacementNoticeKey = replacement.id;
+          const message = `ForgeDock controller task ${id} is superseded by live replacement ${replacement.id}; recovery is queued automatically and the replacement owns the current phase.`;
+          const notify = this.#ctx?.ui.notify;
+          if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "info");
+          try { this.#pi.sendMessage({ customType: "forgedock-progress-recovery", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
+        }
+      }
+      if (!warned && !replacement && Date.now() - lastProgressAt >= warnAfterMs) {
         warned = true;
-        const message = `ForgeDock controller task ${id} has no semantic activity for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and recovery is still explicit.`;
+        const message = `ForgeDock controller task ${id} has no semantic activity for ${Math.round(warnAfterMs / 1_000)}s; durable state remains authoritative and controller recovery is queued automatically when supported.`;
         const notify = this.#ctx?.ui.notify;
       if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
         try { this.#pi.sendMessage({ customType: "forgedock-progress-warning", content: message, display: true }, { deliverAs: "nextTurn" }); } catch { /* session teardown */ }
@@ -748,6 +761,28 @@ function readLogDelta(path: string | undefined, offset: number): { text: string;
   } finally {
     closeSync(fd);
   }
+}
+
+function findLiveReplacementTask(
+  predecessor: BackgroundTaskRecord,
+  candidates: Iterable<BackgroundTaskRecord>,
+): BackgroundTaskRecord | undefined {
+  if (!predecessor.launchKey) return undefined;
+  const identity = predecessor.launchKey.split("/").map((part) => {
+    try { return decodeURIComponent(part); } catch { return part; }
+  });
+  if (identity.length < 3 || !identity[0] || !identity[1]) return undefined;
+  return [...candidates]
+    .filter((candidate) => candidate.id !== predecessor.id && candidate.launchKey)
+    .filter((candidate) => {
+      const parts = candidate.launchKey!.split("/").map((part) => {
+        try { return decodeURIComponent(part); } catch { return part; }
+      });
+      return parts[0] === identity[0] && parts[1] === identity[1] && parts[2] !== identity[2]
+        && (candidate.status === "running" || candidate.status === "detached")
+        && isProcessAlive(candidate.pid);
+    })
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
 }
 
 export function isRestartBlockedTask(record: BackgroundTaskRecord): boolean {

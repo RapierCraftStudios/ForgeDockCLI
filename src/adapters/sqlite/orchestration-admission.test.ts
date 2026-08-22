@@ -168,6 +168,99 @@ describe("lease-backed orchestration execution admission", () => {
     }
   });
 
+  it("fences cross-process semantic stop and preserves queued successors", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-orchestration-stop-"));
+    const path = join(directory, "state.db");
+    const witness = new InMemoryLeaseWitness();
+    const firstStore = new SqliteRepositories(path, { witness });
+    const secondStore = new SqliteRepositories(path, { witness });
+    try {
+      const firstAdmission = new LeaseBackedOrchestrationExecutionAdmission(firstStore, { owner: "first-controller" });
+      const secondAdmission = new LeaseBackedOrchestrationExecutionAdmission(secondStore, { owner: "stop-controller" });
+      const firstController = new OrchestrationController({
+        repository: firstStore,
+        executionAdmission: firstAdmission,
+        transportCapacity: 1,
+        worker: async () => undefined,
+      });
+      await firstController.create({
+        orchestrationId: "dag-cross-process-stop",
+        repository: "owner/repo",
+        maxParallel: 1,
+        items: [
+          { id: "root", issue: 1, priority: 1, dependencies: [], claims: [] },
+          { id: "successor", issue: 2, priority: 2, dependencies: ["root"], claims: [] },
+        ],
+      });
+      const liveClaim = await firstAdmission.acquire("dag-cross-process-stop");
+      assert.ok(liveClaim);
+      const stopController = new OrchestrationController({
+        repository: secondStore,
+        executionAdmission: secondAdmission,
+        transportCapacity: 1,
+        worker: async () => undefined,
+      });
+      await assert.rejects(
+        stopController.stop("dag-cross-process-stop", true),
+        /active orchestration execution|Stop the owning controller/i,
+      );
+      assert.equal((await secondStore.loadOrchestration("dag-cross-process-stop"))?.status, "running");
+      await liveClaim.release();
+      const stopped = await stopController.stop("dag-cross-process-stop", true);
+      assert.equal(stopped.status, "cancelled");
+      assert.deepEqual(stopped.nodes.map((node) => node.status), ["queued", "queued"]);
+      assert.equal(stopped.nodes[1]?.attempts?.length ?? 0, 0, "semantic successor must never launch");
+      assert.ok(liveClaim.persist);
+      await assert.rejects(
+        liveClaim.persist(firstStore, { ...stopped, status: "failed", updatedAt: "2030-01-01T00:00:02.000Z" }),
+        /released|stale|continuity/i,
+      );
+    } finally {
+      firstStore.close();
+      secondStore.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  it("does not let a local-stop fallback overwrite a newer controller claim", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-orchestration-stop-race-"));
+    const path = join(directory, "state.db");
+    const witness = new InMemoryLeaseWitness();
+    const firstStore = new SqliteRepositories(path, { witness });
+    const secondStore = new SqliteRepositories(path, { witness });
+    try {
+      const firstAdmission = new LeaseBackedOrchestrationExecutionAdmission(firstStore, { owner: "first-controller" });
+      const secondAdmission = new LeaseBackedOrchestrationExecutionAdmission(secondStore, { owner: "second-controller" });
+      const creator = new OrchestrationController({ repository: firstStore, executionAdmission: firstAdmission, transportCapacity: 1, worker: async () => undefined });
+      await creator.create({
+        orchestrationId: "dag-local-stop-race",
+        repository: "owner/repo",
+        maxParallel: 1,
+        items: [{ id: "root", issue: 1, priority: 1, dependencies: [], claims: [] }],
+      });
+      const firstClaim = await firstAdmission.acquire("dag-local-stop-race");
+      assert.ok(firstClaim);
+      const stopper = new OrchestrationController({ repository: secondStore, executionAdmission: secondAdmission, transportCapacity: 1, worker: async () => undefined });
+      const controls = (stopper as any).executions as Map<string, { abort: AbortController; stopRequested: boolean }>;
+      controls.set("dag-local-stop-race", { abort: new AbortController(), stopRequested: false });
+      const stopping = stopper.stop("dag-local-stop-race", true);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await firstClaim.release();
+      const replacement = await secondAdmission.acquire("dag-local-stop-race");
+      assert.ok(replacement);
+      replacement.assertValid();
+      const current = await secondStore.loadOrchestration("dag-local-stop-race");
+      assert.ok(current);
+      await replacement.persist?.(secondStore, { ...current, executionClaimId: replacement.claimId, updatedAt: "2030-01-01T00:00:02.000Z" });
+      controls.delete("dag-local-stop-race");
+      await assert.rejects(stopping, /already active in another controller|owning controller/i);
+      assert.equal((await secondStore.loadOrchestration("dag-local-stop-race"))?.status, "running");
+      await replacement.release();
+    } finally {
+      firstStore.close();
+      secondStore.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
   it("fails closed when a claim expires before its next heartbeat", async () => {
     const store = new SqliteRepositories(":memory:", { witness: new InMemoryLeaseWitness() });
     let now = 1_000;

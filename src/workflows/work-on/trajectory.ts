@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
-import type { ControllerTimingSummary, TelemetrySummary } from "../../core/ports/telemetry.js";
+import type { ControllerTimingSummary, QualitySummary, TelemetrySummary } from "../../core/ports/telemetry.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 
 export const TRAJECTORY_OPEN = "<!-- FORGE:TRAJECTORY -->";
@@ -36,6 +36,8 @@ export interface TrajectoryReceipt {
   childIssues: number[];
   childOutcomeIds: string[];
   telemetry?: TelemetrySummary;
+  /** Optional additive quality projection; omitted by legacy callers/receipts. */
+  qualitySummary?: QualitySummary;
   controllerTiming?: ControllerTimingSummary;
   completedAt: string;
   controllerRunId: string;
@@ -107,6 +109,13 @@ export function validateReceipt(value: unknown): asserts value is TrajectoryRece
       throw new Error("Trajectory telemetry summary is invalid");
     }
   }
+  if (receipt.qualitySummary !== undefined) {
+    const quality = receipt.qualitySummary;
+    if (!quality || quality.schema !== "forgedock.quality/v1" || !quality.wallClock || !quality.agent
+      || !quality.firstPass || !quality.remediation || !quality.verification || !Array.isArray(quality.attributions)
+      || quality.attributions.length > 32 || quality.verification.observations.length > 500
+      || quality.verification.repeated.length > 500) throw new Error("Trajectory quality summary is invalid");
+  }
   if (receipt.controllerTiming !== undefined) {
     const timing = receipt.controllerTiming;
     if (!timing || typeof timing !== "object" || !Number.isSafeInteger(timing.activeMs) || timing.activeMs < 0
@@ -133,6 +142,8 @@ export function trajectoryReceiptFromArtifacts(input: {
   childIssues?: readonly number[];
   childOutcomeIds?: readonly string[];
   telemetry?: TelemetrySummary;
+  /** Optional additive quality projection; omitted by legacy callers/receipts. */
+  qualitySummary?: QualitySummary;
   controllerTiming?: ControllerTimingSummary;
   completedAt?: string;
 }): TrajectoryReceipt {
@@ -175,6 +186,7 @@ export function trajectoryReceiptFromArtifacts(input: {
     childIssues: [...new Set(input.childIssues ?? [])].filter((issue) => Number.isSafeInteger(issue) && issue > 0),
     childOutcomeIds: [...new Set(input.childOutcomeIds ?? [])],
     ...(input.telemetry !== undefined ? { telemetry: input.telemetry } : {}),
+    ...(input.qualitySummary !== undefined ? { qualitySummary: input.qualitySummary } : {}),
     ...(input.controllerTiming !== undefined ? { controllerTiming: input.controllerTiming } : {}),
     completedAt: input.completedAt ?? new Date().toISOString(),
     controllerRunId: input.artifacts[0]?.runId ?? "unknown-run",

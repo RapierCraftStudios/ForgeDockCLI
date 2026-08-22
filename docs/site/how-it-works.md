@@ -67,7 +67,7 @@ When you run `/work-on 42`, ForgeDock runs a sequential pipeline where each stag
 │  PRs:     FORGE:REVIEWER (9 domain agents)                          │
 │                                                                     │
 │  Labels:  workflow:investigating → workflow:building →              │
-│           workflow:in-review → workflow:merged                      │
+│           workflow:waiting (queued/recovering) → in-review → merged │
 │                                                                     │
 │  Every agent reads this. Every agent writes to it.                  │
 │  Nothing is lost between conversations.                             │
@@ -98,6 +98,11 @@ The context agent surfaces **institutional memory** — past review findings on 
 
 The builder reads the architecture plan and implements in the specified order. It works in an isolated git worktree (not the main repo checkout) to avoid interfering with other in-flight work.
 
+### Controller-frozen Build Packet context and evidence
+
+The active typed pipeline may add a compact `contextPackage` to a Build Packet. It is derived deterministically from Investigation read-only evidence at the exact base SHA, includes content digests, criterion links, safe locators, test entrypoints, and bounded redacted excerpts, and is advisory only: it never expands the builder's write scope. New packet admission resolves every executable/evidence command ID against the frozen verification catalog and binds the resulting plan identity before builder dispatch. At submission, each criterion must have concrete path/symbol coverage and applicable focused test, invariant, or frozen-command anchors; generic prose is rejected once with actionable correction diagnostics. A typed complexity signal is retained for future decomposition policy but is not a gate.
+
+
 ### Stage 5: Quality Gate
 
 Before committing, the quality gate runs 14+ checks covering: security, SQL safety, auth model, env var completeness, frontend proxy wiring, deployment config, and more. The builder iterates until the gate passes (max 3 iterations).
@@ -127,7 +132,7 @@ A new agent session running `/work-on 42` should always know what to do next by 
 
 ## Labels as State Machine
 
-GitHub labels track the workflow state of every issue. The pipeline reads these labels to determine what to do next. A human can also manually set a label to nudge the pipeline or override its routing.
+GitHub labels track the workflow state of every issue. During orchestration, `workflow:waiting` is a controller-owned neutral activity state for queued claim conflicts, retries, and automatic recovery; it is not a request for human validation. A live worker restores the durable run-phase label, and terminal projections take precedence over stale attempts. A human can also manually set a label to nudge the pipeline or override its routing.
 
 > **Label reference**: [`docs/spec/label-state-machine.md`](https://github.com/RapierCraftStudios/ForgeDock/blob/main/docs/spec/label-state-machine.md) — full state table, transition rules, and terminal labels.
 

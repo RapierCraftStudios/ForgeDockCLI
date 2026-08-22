@@ -964,8 +964,9 @@ function collectContractStructuralDiagnostics(input: {
       if (!allowedPaths.has(path)) diagnostics.push({ code: "out-of-contract-path", criterionId: expected.criterionId, message: `${expected.criterionId} cites path outside its frozen evidence contract: ${path}`, details: { path } });
     }
     const required = new Set(expected.requiredCommandIds);
-    const cited = new Set(anchors.verificationCommandIds);
-    for (const id of anchors.verificationCommandIds) {
+    const citedCommandIds = anchors.verificationCommandIds ?? [];
+    const cited = new Set(citedCommandIds);
+    for (const id of citedCommandIds) {
       if (!commandById.has(id)) diagnostics.push({ code: "unknown-command", criterionId: expected.criterionId, message: `${expected.criterionId} cites unknown command ID ${id}`, details: { commandId: id } });
       else if (!required.has(id)) diagnostics.push({ code: "out-of-contract-command", criterionId: expected.criterionId, message: `${expected.criterionId} cites command ID ${id}, which is not required for that criterion`, details: { commandId: id } });
     }
@@ -979,7 +980,7 @@ function collectContractStructuralDiagnostics(input: {
       diagnostics.push({ code: "generic-only-command", criterionId: expected.criterionId, message: `${expected.criterionId} is backed only by generic commands` });
     }
     for (const testId of expected.invariantTestIds) {
-      if (!anchors.testIds.includes(testId)) diagnostics.push({ code: "missing-invariant-test-id", criterionId: expected.criterionId, message: `${expected.criterionId} omits invariant root test ID ${testId}`, details: { testId } });
+      if (!anchors.testIds?.includes(testId)) diagnostics.push({ code: "missing-invariant-test-id", criterionId: expected.criterionId, message: `${expected.criterionId} omits invariant root test ID ${testId}`, details: { testId } });
     }
   }
   return diagnostics;
@@ -996,10 +997,10 @@ function normalizeAcceptanceAnchors(
     paths: [...new Set(anchors.paths)],
     symbols: [...new Set(anchors.symbols)],
     testIds: [...new Set([
-      ...anchors.testIds,
+      ...(anchors.testIds ?? []),
       ...contractCriterion.invariantCaseIds,
     ])],
-    verificationCommandIds: [...new Set(anchors.verificationCommandIds)],
+    ...(anchors.verificationCommandIds ? { verificationCommandIds: [...new Set(anchors.verificationCommandIds)] } : {}),
   };
 }
 function usesStrictSemanticEvidence(packet: DurableArtifact<"BuildPacket">): boolean {
@@ -1031,7 +1032,8 @@ function criterionAnchorPreflightFailure(input: {
     if (anchoredPaths.some((path) => !allowedPaths.has(path))) {
       return `Criterion ${id} anchors evidence outside the frozen Build Packet: ${anchoredPaths.filter((path) => !allowedPaths.has(path)).join(", ")}`;
     }
-    const unknownCommands = anchors.verificationCommandIds.filter((commandId) => !commandIds.has(commandId));
+    const citedCommandIds = anchors.verificationCommandIds ?? [];
+    const unknownCommands = citedCommandIds.filter((commandId) => !commandIds.has(commandId));
     if (unknownCommands.length) return `Criterion ${id} cites unknown frozen verification command IDs: ${unknownCommands.join(", ")}`;
     const requiredIds = input.packet.payload.verificationRequirements
       ?.filter((requirement) => requirement.kind === "command" && requirement.criterionIds.includes(id))
@@ -1039,17 +1041,17 @@ function criterionAnchorPreflightFailure(input: {
     const matrixTestIds = input.packet.payload.invariantMatrices
       ?.filter((row) => row.criterionId === id)
       .flatMap((row) => [row.testId, ...expandInvariantMatrix(row).map(({ id: caseId }) => caseId)]) ?? [];
-    const missingMatrixTests = matrixTestIds.filter((testId) => !anchors.testIds.includes(testId));
+    const missingMatrixTests = matrixTestIds.filter((testId) => !(anchors.testIds ?? []).includes(testId));
     if (missingMatrixTests.length) {
       return `Criterion ${id} omits controller-derived invariant matrix test IDs: ${missingMatrixTests.join(", ")}`;
     }
     if (!requiredIds.length) {
       return `Criterion ${id} has no controller-frozen command requirement`;
     }
-    if (requiredIds.some((commandId) => !anchors.verificationCommandIds.includes(commandId))) {
-      return `Criterion ${id} omits controller-required verification anchors: ${requiredIds.filter((commandId) => !anchors.verificationCommandIds.includes(commandId)).join(", ")}`;
+    if (requiredIds.some((commandId) => !citedCommandIds.includes(commandId))) {
+      return `Criterion ${id} omits controller-required verification anchors: ${requiredIds.filter((commandId) => !citedCommandIds.includes(commandId)).join(", ")}`;
     }
-    const hasSemanticCommand = anchors.verificationCommandIds.some((commandId) => {
+    const hasSemanticCommand = citedCommandIds.some((commandId) => {
       if (!requiredIds.includes(commandId)) return false;
       const command = input.commands.find(({ id: candidate }) => candidate === commandId);
       return command !== undefined && (
@@ -1073,7 +1075,7 @@ async function criterionSemanticEvidenceFailure(
   for (const item of coverage) {
     const id = item.criterionId!;
     const anchors = item.anchors!;
-    const failedIds = anchors.verificationCommandIds.filter((commandId) => commandStatus(commandId, commands, checks) !== "passed");
+    const failedIds = (anchors.verificationCommandIds ?? []).filter((commandId) => commandStatus(commandId, commands, checks) !== "passed");
     if (failedIds.length) failures.push(`${id}: ${failedIds.join(", ")}`);
   }
   return failures.length ? `Criteria cannot pass because anchored controller checks did not pass: ${failures.join("; ")}` : undefined;

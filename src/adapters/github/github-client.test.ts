@@ -525,6 +525,32 @@ describe("GitHub workflow label projection", () => {
     assert.equal(workflowLabelForState("failed"), "workflow:engine-error");
     assert.equal(workflowLabelForState("cancelled"), undefined);
   });
+
+  it("projects waiting orchestration nodes and rejects stale attempt projections", async () => {
+    let labels = ["workflow:building"];
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({ labels: labels.map((name) => ({ name })) });
+      if (args[0] === "issue" && args[1] === "edit") {
+        const add = args.includes("--add-label") ? args[args.indexOf("--add-label") + 1]?.split(",") ?? [] : [];
+        const remove = args.includes("--remove-label") ? args[args.indexOf("--remove-label") + 1]?.split(",") ?? [] : [];
+        labels = [...new Set([...labels.filter((label) => !remove.includes(label)), ...add])];
+        return "";
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const node = { id: "issue-21", issue: 21, priority: 1, memberIssues: [], status: "queued" as const, dependencies: [], claims: [], childRunIds: [] };
+    const base = { orchestrationId: "dag-new", repository: "a/b", node };
+    await client.projectOrchestrationNodeState({ ...base, phase: "waiting", attempt: { attemptId: "attempt-1", attempt: 1, recovery: "initial", status: "retry_wait", startedAt: "now", updatedAt: "now" } });
+    assert.deepEqual(labels, ["workflow:waiting"]);
+    await client.projectOrchestrationNodeState({ ...base, phase: "active", node: { ...node, status: "running" }, attempt: { attemptId: "attempt-1", attempt: 1, recovery: "resume", status: "running", startedAt: "now", updatedAt: "now" } });
+    assert.deepEqual(labels, []);
+    await client.projectOrchestrationNodeState({ ...base, phase: "terminal", node: { ...node, status: "completed" }, attempt: { attemptId: "attempt-1", attempt: 1, recovery: "resume", status: "completed", startedAt: "now", updatedAt: "now" } });
+    assert.deepEqual(labels, ["workflow:merged"]);
+    await client.projectOrchestrationNodeState({ ...base, phase: "waiting", attempt: { attemptId: "old", attempt: 1, recovery: "initial", status: "retry_wait", startedAt: "now", updatedAt: "now" } });
+    assert.deepEqual(labels, ["workflow:merged"]);
+  });
 });
 
 describe("GitHub canonical marker admission", () => {

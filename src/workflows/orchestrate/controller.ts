@@ -146,9 +146,20 @@ export type OrchestrationDecompositionResolver = (input: {
   childIssues?: readonly number[];
 }) => Promise<OrchestrationDecompositionExpansion | undefined>;
 
+export interface OrchestrationNodeProjectionInput {
+  orchestrationId: string;
+  repository: string;
+  node: Readonly<OrchestrationNodeRecord>;
+  attempt?: Readonly<OrchestrationWorkerAttemptRecord>;
+  /** Controller-derived activity truth; never inferred from worker prose. */
+  phase: "waiting" | "active" | "terminal";
+}
+
 export interface OrchestrationControllerDependencies {
   repository: OrchestrationRepository;
   worker: OrchestrationWorkOnWorker;
+  /** Optional rebuildable projection of typed DAG activity into a forge host. */
+  projectNodeState?: (input: OrchestrationNodeProjectionInput) => Promise<void>;
   /** Durable, cross-process fencing for one active execution of a DAG. */
   executionAdmission: OrchestrationExecutionAdmission;
   /** Required to safely resume a record containing running/suspended nodes. */
@@ -334,10 +345,39 @@ export class OrchestrationController {
     if (!control && loaded.status !== "running") {
       return structuredClone(loaded);
     }
-    const cancelled = { ...loaded, status: "cancelled" as const, updatedAt: this.now() };
-    await this.dependencies.repository.saveOrchestration(cancelled);
-    this.emitSnapshot(cancelled);
-    return structuredClone(cancelled);
+    return this.persistCancelledWithAdmission(orchestrationId);
+  }
+
+  private async persistCancelledWithAdmission(orchestrationId: string): Promise<OrchestrationRecord> {
+    // A controller in another process (or a local cancellation whose durable
+    // checkpoint failed) may still own the execution claim. Never overwrite a
+    // newer record with an unfenced cancellation: acquire the exact admission,
+    // reload authoritative state, and persist through its fence.
+    const claim = await this.dependencies.executionAdmission.acquire(orchestrationId);
+    if (!claim) {
+      let leaseStatus;
+      try {
+        leaseStatus = await this.dependencies.executionAdmission.describe?.(orchestrationId);
+      } catch {
+        leaseStatus = undefined;
+      }
+      throw new Error(`${activeOrchestrationExecutionMessage(orchestrationId, leaseStatus)} Stop the owning controller's admitted tasks first, then retry the semantic stop.`);
+    }
+    try {
+      claim.assertValid();
+      const authoritative = await this.dependencies.repository.loadOrchestration(orchestrationId);
+      if (!authoritative) throw new Error(`Unknown orchestration: ${orchestrationId}`);
+      if (authoritative.status === "cancelled" || authoritative.status !== "running") return structuredClone(authoritative);
+      const cancelled = { ...authoritative, status: "cancelled" as const, executionClaimId: claim.claimId, updatedAt: this.now() };
+      if (!claim.persist) {
+        throw new Error(`Orchestration ${orchestrationId} stop requires an atomic fenced repository; durable cancellation refused`);
+      }
+      await claim.persist(this.dependencies.repository, cancelled);
+      this.emitSnapshot(cancelled);
+      return structuredClone(cancelled);
+    } finally {
+      await claim.release();
+    }
   }
 
   private async execute(orchestrationId: string, resume: boolean): Promise<OrchestrationControllerResult> {
@@ -1800,6 +1840,7 @@ export class OrchestrationController {
       result: scheduleResultFromRecord(record, []),
       updatedAt: record.updatedAt,
     });
+    this.projectNodeStates(record);
     const event: OrchestrationEvent = {
       name: "snapshot",
       orchestrationId: record.orchestrationId,
@@ -1811,6 +1852,22 @@ export class OrchestrationController {
       return;
     }
     this.emitEventSafely(event);
+  }
+
+  private projectNodeStates(record: OrchestrationRecord): void {
+    const project = this.dependencies.projectNodeState;
+    if (!project) return;
+    for (const node of record.nodes) {
+      const attempt = activeAttempt(node);
+      const phase = orchestrationNodeProjectionPhase(node);
+      void project({
+        orchestrationId: record.orchestrationId,
+        repository: orchestrationNodeRepository(record, node),
+        node: structuredClone(node),
+        ...(attempt !== undefined ? { attempt: structuredClone(attempt) } : {}),
+        phase,
+      }).catch(() => undefined);
+    }
   }
 
   private queueEvent(state: PersistenceState, event: OrchestrationEvent): void {
@@ -1837,6 +1894,12 @@ export class OrchestrationController {
       // Event observers are diagnostics, never orchestration authority.
     }
   }
+}
+
+function orchestrationNodeProjectionPhase(node: OrchestrationNodeRecord): "waiting" | "active" | "terminal" {
+  if (node.status === "running") return "active";
+  if (node.status === "queued" || node.status === "retry_wait" || node.status === "target_recovery" || node.status === "suspended") return "waiting";
+  return "terminal";
 }
 
 function nodeRecordFromItem(item: ScheduledWorkItem): OrchestrationNodeRecord {

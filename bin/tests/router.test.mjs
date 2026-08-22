@@ -1479,6 +1479,7 @@ describe("doctor --fix (forge#1944)", () => {
       "workflow:ready-to-build",
       "workflow:building",
       "workflow:in-review",
+      "workflow:waiting",
       "workflow:awaiting-merge",
       "workflow:merged",
       "workflow:decomposed",

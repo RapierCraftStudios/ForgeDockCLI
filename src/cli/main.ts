@@ -2289,6 +2289,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      projectNodeState: (input) => github.projectOrchestrationNodeState(input),
       ...(signal !== undefined ? { signal } : {}),
       transportCapacity: effective.maxParallel,
       maxDecompositionChildren: effective.maxRemediationChildren,
@@ -2834,6 +2835,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      projectNodeState: (input) => github.projectOrchestrationNodeState(input),
       ...(signal !== undefined ? { signal } : {}),
       transportCapacity: record.maxParallel,
       maxDecompositionChildren: maxRemediationChildren,

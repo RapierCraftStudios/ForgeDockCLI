@@ -63,7 +63,80 @@ export function criterionCoverageInstructions(
   ].join(" ");
 }
 
-/** Controller-only gate for the bounded builder; never inferred from model prose. */
+export function validateFrozenBuilderCommands(
+  packet: DurableArtifact<"BuildPacket">,
+  commands: readonly VerificationCommand[],
+): void {
+  const byId = new Map<string, VerificationCommand>();
+  const modernPacket = Boolean(packet.payload.verificationPolicyVersion || packet.payload.evidenceContract || packet.payload.verificationRequirements);
+  for (const command of commands) {
+    if (byId.has(command.id)) throw new Error(`[packet-command-identity] Duplicate frozen verification command ID '${command.id}'`);
+    if (modernPacket && !command.planId) throw new Error(`[packet-command-identity] Frozen verification command '${command.id}' has no planId; re-admit the packet against the exact catalog before builder dispatch`);
+    byId.set(command.id, command);
+  }
+  const referenced = new Set([
+    ...(packet.payload.verificationRequirements ?? []).filter(({ kind }) => kind === "command").map(({ id }) => id),
+    ...(packet.payload.evidenceContract?.criteria ?? []).flatMap(({ requiredCommandIds, semanticCommandIds }) => [...requiredCommandIds, ...semanticCommandIds]),
+  ]);
+  for (const id of referenced) {
+    if (!byId.has(id)) throw new Error(`[packet-command-identity] Packet evidence command '${id}' is not present in the frozen verification catalog/plan; correct packet admission before builder dispatch`);
+  }
+  for (const identity of packet.payload.verificationCommandIdentities ?? []) {
+    if (!byId.has(identity.id)) throw new Error(`[packet-command-identity] Packet command identity '${identity.id}' is not present in the frozen verification catalog/plan`);
+  }
+}
+export function auditBuilderCriterionCoverage(
+  packet: DurableArtifact<"BuildPacket">,
+  commands: readonly VerificationCommand[],
+  submission: unknown,
+): { code: string; criterionId?: string; message: string }[] {
+  if (!packet.payload.evidenceContract && !packet.payload.verificationRequirements) return [];
+  if (!submission || typeof submission !== "object") return [{ code: "invalid-submission", message: "Submit a schema-valid builder result before criterion self-audit." }];
+  const candidate = submission as Partial<BuilderSubmission>;
+  const coverage = Array.isArray(candidate.criterionCoverage) ? candidate.criterionCoverage : [];
+  const criteria = packet.payload.acceptanceCriteria;
+  const diagnostics: { code: string; criterionId?: string; message: string }[] = [];
+  const commandIds = new Set(commands.map(({ id }) => id));
+  const requiredByCriterion = new Map<string, Set<string>>();
+  for (const criterion of packet.payload.evidenceContract?.criteria ?? []) {
+    requiredByCriterion.set(criterion.criterionId, new Set([...criterion.requiredCommandIds, ...criterion.semanticCommandIds]));
+  }
+  for (let index = 0; index < criteria.length; index += 1) {
+    const criterionId = `criterion-${index + 1}`;
+    const rows = coverage.filter((entry) => entry && typeof entry === "object" && (entry as { criterionId?: unknown }).criterionId === criterionId);
+    const item = rows[0] as BuilderSubmission["criterionCoverage"][number] | undefined;
+    if (rows.length !== 1 || !item) {
+      diagnostics.push({ code: rows.length ? "duplicate-criterion-coverage" : "missing-criterion-coverage", criterionId, message: `${criterionId} must have exactly one concrete coverage entry with its frozen criterion identity.` });
+      continue;
+    }
+    if (item.criterion !== criteria[index]) diagnostics.push({ code: "criterion-text-mismatch", criterionId, message: `${criterionId} must copy the controller-frozen acceptance criterion verbatim.` });
+    const anchors = item.anchors;
+    if (!anchors) {
+      diagnostics.push({ code: "missing-coverage-anchors", criterionId, message: `${criterionId} needs concrete path and symbol anchors plus a focused test/invariant or applicable frozen command anchor; prose alone is not coverage.` });
+      continue;
+    }
+    const allowedPaths = new Set([
+      ...packet.payload.expectedPaths,
+      ...(packet.payload.evidencePaths ?? []).filter(({ criterionIds }) => criterionIds.includes(criterionId)).map(({ path }) => path),
+    ]);
+    if (!anchors.paths.some((path) => allowedPaths.has(path))) diagnostics.push({ code: "coverage-path-outside-scope", criterionId, message: `${criterionId} must anchor at least one frozen expected or criterion-scoped evidence path.` });
+    if (!anchors.symbols.length) diagnostics.push({ code: "missing-symbol-anchor", criterionId, message: `${criterionId} must name a concrete implementation symbol, contract, or invariant.` });
+    const relevantCommands = requiredByCriterion.get(criterionId)
+      ?? new Set(packet.payload.verificationRequirements
+        ?.filter((requirement) => requirement.kind === "command" && requirement.criterionIds.includes(criterionId))
+        .map(({ id }) => id)
+        ?? commands.filter(({ required }) => required).map(({ id }) => id));
+    const anchoredCommands = anchors.verificationCommandIds ?? [];
+    const unknownCommands = anchoredCommands.filter((id) => !commandIds.has(id));
+    if (unknownCommands.length) diagnostics.push({ code: "unknown-coverage-command", criterionId, message: `${criterionId} references command IDs not present in the frozen verification catalog: ${unknownCommands.join(", ")}.` });
+    if (relevantCommands.size && !anchoredCommands.some((id) => relevantCommands.has(id))) diagnostics.push({ code: "missing-command-anchor", criterionId, message: `${criterionId} must anchor one applicable frozen required/semantic command with a fresh receipt (${[...relevantCommands].join(", ")}).` });
+    const hasFocusedEvidence = Boolean(anchors.testIds?.length) || anchors.symbols.length > 0;
+    if (!hasFocusedEvidence) diagnostics.push({ code: "missing-focused-evidence", criterionId, message: `${criterionId} needs a focused test/invariant ID or semantically sufficient symbol evidence.` });
+  }
+  return diagnostics;
+}
+
+
 export function deriveBuilderVerificationGate(
   packet: DurableArtifact<"BuildPacket">,
   commands: readonly VerificationCommand[],
@@ -143,6 +216,7 @@ export async function buildWorkItem(
 ): Promise<{ run: RunState; submission: BuilderSubmission; sessionRef: string }> {
   if (input.run.state !== "building") throw new Error(`Build requires building state, found ${input.run.state}`);
   const frozenCommands = input.verification ?? [];
+  validateFrozenBuilderCommands(input.packet, frozenCommands);
   const verificationGate = frozenCommands.length && (input.verificationRunner ?? dependencies.verifier)
     ? deriveBuilderVerificationGate(input.packet, frozenCommands, input.priorVerificationFailure)
     : undefined;
@@ -182,6 +256,7 @@ export async function buildWorkItem(
             `Minimal fix guidance: ${input.verificationDiagnosis.minimalFixGuidance}`,
           ] : []),
         ] : []),
+        "The packet may include a controller-produced contextPackage. Treat it as compact, immutable, exact-base-bound advisory evidence only; it never expands write scope or limits inspection of any otherwise allowed path, and excerpts may be redacted.",
         "Do not expand scope or perform unrelated cleanup. If the packet omits a required integration path, report the packet gap instead of silently widening the change.",
         "Prefer the smallest complete integration change: preserve existing public shapes, serialization, error/cancellation, concurrency, and repository conventions unless the frozen criteria explicitly require changing them.",
         ...(input.verification?.length ? [
@@ -191,7 +266,8 @@ export async function buildWorkItem(
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
         criterionCoverageInstructions(input.packet),
-        "Every criterionCoverage entry must include typed anchors: concrete repository paths, stable implementation symbols, stable test/invariant-matrix IDs, and the relevant frozen verification command IDs. Prose implementation notes remain readable but cannot authorize a pass. Use only command IDs actually relevant to that criterion; generic green checks cannot substitute for missing symbol/test evidence.",
+        "Every criterionCoverage entry must include typed anchors: concrete repository paths, stable implementation symbols, stable test/invariant-matrix IDs when applicable, and the relevant frozen verification command IDs. Prose implementation notes remain readable but cannot authorize a pass. Use only command IDs actually relevant to that criterion; generic green checks cannot substitute for missing symbol/test evidence.",
+        "Before submit_artifact, perform a first-pass self-audit for every frozen criterion: cite changed path and symbol, then a focused test/invariant or applicable required/semantic command. A path/symbol invariant is sufficient when no focused test is applicable; do not omit an anchor or invent a generic assertion. Correct one rejected submission using the controller diagnostic.",
         ...(input.packet.payload.evidenceContract?.version === "forgedock.evidence/v1" ? [
           `Evidence contract v1 (controller-frozen, compact): ${input.packet.payload.evidenceContract.criteria.map((criterion) => `${criterion.criterionId}{writePaths=${criterion.allowedWritePaths.join(",") || "none"}; evidenceOnlyPaths=${criterion.allowedEvidencePaths.join(",") || "none"}; commands=${criterion.requiredCommandIds.join(",") || "none"}; semantic=${criterion.semanticCommandIds.join(",") || "none"}; gates=${criterion.controllerGateIds.join(",") || "none"}; invariantRows=${criterion.invariantRowIds.join(",") || "none"}; invariantTests=${criterion.invariantTestIds.join(",") || "none"}}`).join(" | ")}`,
           "Evidence-only paths are read-only: inspect them for evidence, but never modify them and never report them as changed paths unless they are also frozen expected write paths.",
@@ -230,6 +306,7 @@ export async function buildWorkItem(
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
       ...(verificationGate !== undefined ? { verificationGate } : {}),
+      submissionAudit: (submission: unknown) => auditBuilderCriterionCoverage(input.packet, frozenCommands, submission),
       outputSchema: BuilderSubmissionSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),

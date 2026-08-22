@@ -25,6 +25,7 @@ import type {
 import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository } from "../../core/ports/repositories.js";
 import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
+import type { OrchestrationNodeProjectionInput } from "../../workflows/orchestrate/controller.js";
 import { classifyRetryableError, deterministicOperationKey, retryBackoffMs } from "../../core/retry.js";
 import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
@@ -36,6 +37,7 @@ const WORKFLOW_LABELS = [
   { name: "workflow:investigating", color: "1D76DB", description: "ForgeDock investigation is active" },
   { name: "workflow:ready-to-build", color: "0E8A16", description: "ForgeDock investigation is complete and build is ready" },
   { name: "workflow:building", color: "FBCA04", description: "ForgeDock build or verification is active" },
+  { name: "workflow:waiting", color: "C5DEF5", description: "ForgeDock orchestration is queued or recovering automatically" },
   { name: "workflow:in-review", color: "5319E7", description: "ForgeDock pull-request review is active" },
   { name: "workflow:awaiting-merge", color: "D4C5F9", description: "ForgeDock review passed and awaits a human merge" },
   { name: "workflow:merged", color: "0E8A16", description: "ForgeDock delivery completed and merged" },
@@ -117,6 +119,35 @@ const REVIEW_FINDING_LABELS = [
   { name: "priority:P2", color: "FBCA04", description: "Medium priority" },
   { name: "priority:P3", color: "0E8A16", description: "Low priority" },
 ] as const;
+
+function orchestrationLabelForProjection(input: OrchestrationNodeProjectionInput): string | undefined {
+  if (input.phase === "waiting") return "workflow:waiting";
+  if (input.phase === "active") return undefined;
+  if (input.node.status === "completed" || input.node.status === "skipped") return "workflow:merged";
+  if (input.node.status === "invalid") return "workflow:invalid";
+  if (input.node.status === "blocked") return "workflow:engine-error";
+  if (input.node.status === "failed") return "workflow:engine-error";
+  return undefined;
+}
+
+function acceptOrchestrationProjection(
+  current: { orchestrationId: string; nodeId: string; attempt: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] },
+  input: OrchestrationNodeProjectionInput,
+  attempt: number,
+): boolean {
+  if (current.orchestrationId !== input.orchestrationId || current.nodeId !== input.node.id) {
+    // A new DAG may replace a terminal projection, but an older DAG can never
+    // reclaim an issue while a newer DAG still owns an active/waiting attempt.
+    return current.phase === "terminal";
+  }
+  if (attempt !== current.attempt) return attempt > current.attempt;
+  if (current.phase === "terminal") return false;
+  if (current.phase === "active" && input.phase === "waiting") {
+    return input.attempt?.status !== "running" && input.attempt?.status !== "launching";
+  }
+  if (current.phase === "waiting" && input.phase === "waiting") return true;
+  return input.phase !== "waiting";
+}
 
 export function workflowLabelForState(state: RunStateName): string | undefined {
   if (state === "investigating") return "workflow:investigating";
@@ -447,6 +478,9 @@ export function renderPaginatedPullRequestDiff(raw: string): string {
 
 export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
+  /** Per-issue serialization prevents stale DAG attempts racing newer projections. */
+  private readonly orchestrationProjectionQueues = new Map<string, Promise<void>>();
+  private readonly orchestrationProjectionFences = new Map<string, { orchestrationId: string; nodeId: string; attempt: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] }>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
   /** Immutable SHA comparisons are shared only within this client/request lifetime. */
   private readonly comparisonReads = new Map<string, Promise<GitHubComparisonProjection>>();
@@ -991,7 +1025,58 @@ export class GitHubClient implements ForgeHost {
     await initialization;
   }
 
+  /**
+   * Project controller-owned DAG activity. This is deliberately separate from
+   * RunState projection: a queued worker must not look active merely because
+   * its durable work-on run remains in a build phase.
+   */
+  async projectOrchestrationNodeState(input: OrchestrationNodeProjectionInput): Promise<void> {
+    const key = `${input.repository.toLowerCase()}#${input.node.issue}`;
+    const previous = this.orchestrationProjectionQueues.get(key) ?? Promise.resolve();
+    const operation = previous.then(async () => {
+      const attempt = input.attempt?.attempt ?? 0;
+      const current = this.orchestrationProjectionFences.get(key);
+      if (current && !acceptOrchestrationProjection(current, input, attempt)) return;
+      await this.ensureWorkflowLabels(input.repository);
+      const target = orchestrationLabelForProjection(input);
+      const labelResult = await this.gh(["issue", "view", String(input.node.issue), "--repo", input.repository, "--json", "labels"]);
+      const labels = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
+      const remove = labels.filter((label) => (target ? WORKFLOW_LABEL_NAMES : ["workflow:waiting"]).includes(label) && label !== target);
+      const args = ["issue", "edit", String(input.node.issue), "--repo", input.repository];
+      if (target && !labels.includes(target)) args.push("--add-label", target);
+      if (remove.length) args.push("--remove-label", remove.join(","));
+      if ((target && !labels.includes(target)) || remove.length) await this.gh(args);
+      this.orchestrationProjectionFences.set(key, {
+        orchestrationId: input.orchestrationId,
+        nodeId: input.node.id,
+        attempt,
+        phase: input.phase,
+        status: input.node.status,
+      });
+    });
+    this.orchestrationProjectionQueues.set(key, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.orchestrationProjectionQueues.get(key) === operation) this.orchestrationProjectionQueues.delete(key);
+    }
+  }
+
   async projectRunState(state: RunState): Promise<void> {
+    const issue = state.subject.issue;
+    if (!issue) return;
+    const key = `${state.subject.repo.toLowerCase()}#${issue}`;
+    const previous = this.orchestrationProjectionQueues.get(key) ?? Promise.resolve();
+    const operation = previous.then(() => this.projectRunStateUnqueued(state));
+    this.orchestrationProjectionQueues.set(key, operation);
+    try {
+      await operation;
+    } finally {
+      if (this.orchestrationProjectionQueues.get(key) === operation) this.orchestrationProjectionQueues.delete(key);
+    }
+  }
+
+  private async projectRunStateUnqueued(state: RunState): Promise<void> {
     const issue = state.subject.issue;
     if (!issue) return;
     await this.ensureWorkflowLabels(state.subject.repo);

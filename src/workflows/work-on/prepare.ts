@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type ControllerVerificationGate, type DurableArtifact, type VerificationRequirement, type InvestigationScopeReceipt } from "../../core/artifacts/schema.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type BuildContextPackage, type BuildComplexitySignal, type ControllerVerificationGate, type DurableArtifact, type VerificationRequirement, type InvestigationScopeReceipt } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand } from "../../core/ports/verification.js";
 import {
@@ -38,6 +40,114 @@ import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
   & Partial<Omit<VerificationCommand, "cwd" | "id" | "command" | "args">>;
+
+const execFileAsync = promisify(execFile);
+const CONTEXT_PACKAGE_LIMITS = {
+  maxEntries: 32,
+  maxBytes: 200_000,
+  maxExcerptBytes: 1_200,
+} as const;
+
+/** Deterministic, controller-only advisory context from exact-base evidence. */
+export async function deriveBuildContextPackage(input: {
+  investigation: DurableArtifact<"Investigation">;
+  acceptanceCriteria: readonly string[];
+  evidencePaths: readonly EvidencePathDeclaration[];
+  readRoots: readonly string[];
+  cwd: string;
+  baseSha: string;
+}): Promise<BuildContextPackage | undefined> {
+  if (!/^[0-9a-f]{7,64}$/i.test(input.baseSha)) return undefined;
+  const investigationDigest = createHash("sha256").update(JSON.stringify(input.investigation.payload)).digest("hex");
+  const sources = input.investigation.payload.evidence;
+  const declarations = new Map(input.evidencePaths.map((declaration) => [declaration.path, declaration]));
+  const candidatePaths = [...new Set([
+    ...input.evidencePaths.map(({ path }) => path),
+    ...sources.map(({ source }) => source).flatMap((source) => {
+      const match = /(?:^|[\s`(])((?:src|test|tests|packages|bin|lib|docs)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)(?::\d+(?::\d+)?)?(?:\b|$)/.exec(source);
+      return match?.[1] ? [match[1]] : [];
+    }),
+  ])].sort();
+  const entries: BuildContextPackage["entries"] = [];
+  let totalBytes = 0;
+  for (const path of candidatePaths) {
+    if (entries.length >= CONTEXT_PACKAGE_LIMITS.maxEntries || totalBytes >= CONTEXT_PACKAGE_LIMITS.maxBytes) break;
+    const size = await validateFrozenReadOnlyFile(path, input.cwd, input.readRoots.length ? input.readRoots : ["."]);
+    if (size === undefined) continue;
+    let content: Buffer;
+    try {
+      const result = await execFileAsync("git", ["show", `${input.baseSha}:${path}`], {
+        cwd: input.cwd,
+        maxBuffer: Math.min(96 * 1024, CONTEXT_PACKAGE_LIMITS.maxBytes),
+        encoding: "buffer",
+      });
+      content = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(String(result.stdout));
+    } catch {
+      // A missing path at the exact base is not useful context and must not
+      // fall back to mutable worktree content.
+      continue;
+    }
+    if (!content.length || content.length > 96 * 1024 || totalBytes + content.length > CONTEXT_PACKAGE_LIMITS.maxBytes) continue;
+    totalBytes += content.length;
+    const related = sources.filter(({ source }) => source.includes(path));
+    const markerText = related.map(({ claim, detail, source }) => `${claim} ${detail} ${source}`).join(" ");
+    const explicitCriteria = [...markerText.matchAll(/criterion-[1-9][0-9]*/g)].map((match) => match[0]);
+    const criterionIds = [...new Set(explicitCriteria.filter((id) => input.acceptanceCriteria[Number(id.slice("criterion-".length)) - 1] !== undefined))];
+    const linked = criterionIds.length ? criterionIds : input.acceptanceCriteria.map((_, index) => `criterion-${index + 1}`);
+    const locators = [...new Set([
+      ...(declarations.get(path)?.role ? [`evidence-role:${declarations.get(path)!.role}`] : []),
+      ...related.flatMap(({ source, detail }) => [source, ...locatorCandidates(detail)]),
+    ])].filter(Boolean).slice(0, 8);
+    const testEntrypoints = [...new Set([
+      ...(isTestPath(path) ? [path] : []),
+      ...related.flatMap(({ detail }) => pathCandidates(detail).filter(isTestPath)),
+    ])].slice(0, 8);
+    entries.push({
+      path,
+      contentDigest: createHash("sha256").update(content).digest("hex"),
+      bytes: content.length,
+      criterionIds: linked,
+      locators,
+      testEntrypoints,
+      excerpt: redactContextExcerpt(content.toString("utf8")),
+    });
+  }
+  if (!entries.length) return undefined;
+  const packageDigest = createHash("sha256").update(JSON.stringify({ version: "forgedock.context-package/v1", baseSha: input.baseSha.toLowerCase(), investigationDigest, entries })).digest("hex");
+  return { version: "forgedock.context-package/v1", baseSha: input.baseSha.toLowerCase(), investigationDigest, packageDigest, entries };
+}
+
+function pathCandidates(text: string): string[] {
+  return [...text.matchAll(/(?:^|[\s`(])((?:src|test|tests|packages|bin|lib|docs)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)(?::\d+(?::\d+)?)?(?:\b|$)/g)].map((match) => match[1]!).filter(Boolean);
+}
+function locatorCandidates(text: string): string[] {
+  return [...text.matchAll(/(?:[A-Za-z_$][\w$]*\.)?[A-Za-z_$][\w$]*(?:#[A-Za-z_$][\w$]*)?/g)].map((match) => match[0]!).filter((value) => value.length > 2).slice(0, 8);
+}
+function isTestPath(path: string): boolean { return /(?:^|\/)\S+\.test\.[cm]?[jt]sx?$/i.test(path); }
+function redactContextExcerpt(content: string): string {
+  const redacted = content.split(/\r?\n/).map((line) => /(?:password|secret|token|api[_-]?key|private[_-]?key)\s*[:=]/i.test(line) || /(?:gh[pousr]_|sk-[A-Za-z0-9])/.test(line) ? "[REDACTED]" : line).join("\n");
+  return redacted.slice(0, CONTEXT_PACKAGE_LIMITS.maxExcerptBytes);
+}
+
+export function deriveBuildComplexitySignal(input: {
+  acceptanceCriteria: readonly string[];
+  expectedPaths: readonly string[];
+  relationCount: number;
+  risks: readonly { risk: string; mitigation: string }[];
+}): BuildComplexitySignal {
+  const criterionCount = input.acceptanceCriteria.length;
+  const pathCount = input.expectedPaths.length;
+  const riskCount = input.risks.length;
+  const score = criterionCount * 2 + pathCount + Math.min(input.relationCount, 16) + riskCount * 2;
+  const level = score >= 18 ? "high" : score >= 8 ? "medium" : "low";
+  const dimensions = [
+    criterionCount > 3 ? "multiple-criteria" : "single-criterion",
+    pathCount > 6 ? "wide-path-surface" : "focused-path-surface",
+    input.relationCount > 0 ? "related-contracts" : "no-relation-closure",
+    riskCount > 0 ? "explicit-risks" : "no-explicit-risks",
+  ];
+  return { version: "forgedock.complexity-signal/v1", level, score, criterionCount, pathCount, relationCount: input.relationCount, riskCount, dimensions };
+}
 
 export interface VerificationCatalog {
   commands: readonly VerificationCatalogEntry[];
@@ -204,7 +314,7 @@ export async function prepareBuildPacket(
         }
       }
     }
-    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths, relationGraph, relationGraphCheckpoint, investigationScopeReceipt } = materialized!;
+    const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths, relationGraph, relationGraphCheckpoint, investigationScopeReceipt, contextPackage, complexitySignal } = materialized!;
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
@@ -219,6 +329,8 @@ export async function prepareBuildPacket(
         ...(evidenceContract ? { evidenceContract } : {}),
         ...(relationGraph ? { relationGraph } : {}),
         ...(investigationScopeReceipt ? { investigationScopeReceipt } : {}),
+        ...(contextPackage ? { contextPackage } : {}),
+        ...(complexitySignal ? { complexitySignal } : {}),
       },
     });
     await dependencies.artifacts.append(packet);
@@ -362,12 +474,14 @@ async function materializePacketOutput(
   expectedPaths: string[];
   evidencePaths: EvidencePathDeclaration[];
   evidenceContract?: import("../../core/artifacts/schema.js").VerificationEvidenceContract;
-  controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "invariantMatrices" | "evidenceContract" | "evidencePaths">;
+  controllerVerifiedOutput: Omit<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "invariantMatrices" | "evidenceContract" | "evidencePaths" | "contextPackage" | "complexitySignal">;
   policyMetadata: Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities"> | Record<string, never>;
   invariantMatrices: ReturnType<typeof deriveSecurityInvariantMatrices>;
   relationGraph?: BuildPacketPayload["relationGraph"];
   relationGraphCheckpoint?: RelationGraphCheckpointPayload;
   investigationScopeReceipt?: InvestigationScopeReceipt;
+  contextPackage?: BuildContextPackage;
+  complexitySignal?: BuildComplexitySignal;
 }> {
   if (!output.expectedPaths.length) throw new PacketAuthorCorrectableError(["[write-scope] Build Packet must declare at least one concrete expected path"]);
   const criterionDuplicates = [...new Set(output.acceptanceCriteria.filter((criterion, index, criteria) => criteria.indexOf(criterion) !== index))];
@@ -466,15 +580,29 @@ async function materializePacketOutput(
     evidencePaths: _modelEvidencePaths,
     relationGraph: _untrustedRelationGraph,
     investigationScopeReceipt: _untrustedInvestigationScopeReceipt,
+    contextPackage: _modelContextPackage,
+    complexitySignal: _modelComplexitySignal,
     ...controllerVerifiedOutput
   } = verifiedOutput;
   const policyMetadata = catalog
     ? await packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands, evidence.declarations.map(({ path }) => path), cwd, investigationSurfaces)
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
+  const contextPackage = investigation
+    ? await deriveBuildContextPackage({
+      investigation,
+      acceptanceCriteria: controllerVerifiedOutput.acceptanceCriteria,
+      evidencePaths: evidence.declarations,
+      readRoots: packetAuthorReadRoots,
+      cwd,
+      baseSha,
+    })
+    : undefined;
   if (!catalog) {
     const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
-    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
+    const relationCount = graphAuthority.metadata ? graphAuthority.metadata.invariantIds.length + graphAuthority.metadata.commandIds.length : 0;
+    const complexitySignal = deriveBuildComplexitySignal({ acceptanceCriteria: controllerVerifiedOutput.acceptanceCriteria, expectedPaths, relationCount, risks: controllerVerifiedOutput.risks });
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(contextPackage ? { contextPackage } : {}), complexitySignal, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
   // capability metadata on any command that will execute is a catalog defect,
@@ -521,6 +649,12 @@ async function materializePacketOutput(
     throw new PacketAuthorCorrectableError(derivationDiagnostics, semanticNeeded && !semanticAvailable);
   }
   const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
+  const complexitySignal = deriveBuildComplexitySignal({
+    acceptanceCriteria: controllerVerifiedOutput.acceptanceCriteria,
+    expectedPaths,
+    relationCount: graphAuthority.metadata ? graphAuthority.metadata.invariantIds.length + graphAuthority.metadata.commandIds.length : 0,
+    risks: controllerVerifiedOutput.risks,
+  });
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -528,6 +662,8 @@ async function materializePacketOutput(
     controllerVerifiedOutput,
     policyMetadata,
     invariantMatrices,
+    ...(contextPackage ? { contextPackage } : {}),
+    complexitySignal,
     ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}),
     ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}),
   };

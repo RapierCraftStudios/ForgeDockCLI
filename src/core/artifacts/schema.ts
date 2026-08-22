@@ -192,6 +192,37 @@ export const InvestigationScopeReceiptSchema = Type.Object({
 });
 export type InvestigationScopeReceipt = Static<typeof InvestigationScopeReceiptSchema>;
 
+export const BuildContextPackageSchema = Type.Object({
+  /** Controller-produced, advisory context; absent on retained legacy packets. */
+  version: Type.Literal("forgedock.context-package/v1"),
+  baseSha: Sha,
+  investigationDigest: PacketDigest,
+  packageDigest: PacketDigest,
+  entries: Type.Array(Type.Object({
+    path: NonEmptyString,
+    contentDigest: PacketDigest,
+    bytes: Type.Integer({ minimum: 0 }),
+    criterionIds: Type.Array(CriterionIdSchema, { minItems: 1 }),
+    locators: Type.Array(NonEmptyString, { maxItems: 8 }),
+    testEntrypoints: Type.Array(NonEmptyString, { maxItems: 8 }),
+    excerpt: Type.String({ maxLength: 1_200 }),
+  }), { minItems: 1, maxItems: 32 }),
+});
+export type BuildContextPackage = Static<typeof BuildContextPackageSchema>;
+
+export const BuildComplexitySignalSchema = Type.Object({
+  /** Advisory signal only; it never blocks a packet or chooses decomposition. */
+  version: Type.Literal("forgedock.complexity-signal/v1"),
+  level: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
+  score: Type.Integer({ minimum: 0 }),
+  criterionCount: Type.Integer({ minimum: 0 }),
+  pathCount: Type.Integer({ minimum: 0 }),
+  relationCount: Type.Integer({ minimum: 0 }),
+  riskCount: Type.Integer({ minimum: 0 }),
+  dimensions: Type.Array(NonEmptyString, { maxItems: 8 }),
+});
+export type BuildComplexitySignal = Static<typeof BuildComplexitySignalSchema>;
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -199,6 +230,10 @@ export const BuildPacketPayloadSchema = Type.Object({
     source: NonEmptyString,
     relevance: NonEmptyString,
   })),
+  /** Additive controller-produced read-only context, bound to the frozen base. */
+  contextPackage: Type.Optional(BuildContextPackageSchema),
+  /** Additive advisory complexity/risk signal; not a decomposition gate. */
+  complexitySignal: Type.Optional(BuildComplexitySignalSchema),
   implementationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
   expectedPaths: Type.Array(NonEmptyString),
   verificationPlan: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -287,9 +322,9 @@ export const CriterionEvidenceAnchorsSchema = Type.Object({
   /** Stable exported/local symbol names at those paths. */
   symbols: Type.Array(NonEmptyString, { minItems: 1 }),
   /** Stable test names, case IDs, or typed invariant-matrix row IDs. */
-  testIds: Type.Array(NonEmptyString, { minItems: 1 }),
-  /** Frozen command IDs that the controller must observe passing. */
-  verificationCommandIds: Type.Array(NonEmptyString, { minItems: 1 }),
+  testIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+  /** Frozen command IDs when executable evidence is applicable. */
+  verificationCommandIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
 });
 export type CriterionEvidenceAnchors = Static<typeof CriterionEvidenceAnchorsSchema>;
 

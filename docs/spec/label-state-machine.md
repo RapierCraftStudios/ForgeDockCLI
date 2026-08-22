@@ -13,6 +13,7 @@ See also: [FORGE Annotation Protocol §6](forge-protocol-v1.md#6-label-state-mac
 | `workflow:investigating` | Investigation phase active | Investigator agent |
 | `workflow:ready-to-build` | Investigation complete, build not started | Investigator agent |
 | `workflow:building` | Build phase active | Builder agent |
+| `workflow:waiting` | Orchestration queued, claim-conflicted, retrying, or recovering automatically; no worker is currently active | Typed orchestration controller |
 | `workflow:in-review` | PR created, review active | Orchestrator agent |
 | `workflow:awaiting-merge` | Remediated + re-reviewed, awaiting a human merge decision | Review-pr Phase 8 (auto-merge guard) |
 | `workflow:merged` | PR merged, issue closed | Close phase agent |
@@ -32,6 +33,7 @@ See also: [FORGE Annotation Protocol §6](forge-protocol-v1.md#6-label-state-mac
   → workflow:investigating      [Phase 1: Investigate]
   → workflow:ready-to-build     [Phase 2: Investigation complete]
   → workflow:building           [Phase 3: Build started]
+  → workflow:waiting            [Orchestration: queued/claim conflict/retry/recovery; automatic, not human validation]
   → workflow:in-review          [Phase 4: PR created]
   → workflow:awaiting-merge [TERMINAL] [Phase 5/review-pr: re-reviewed after needs-human, awaiting human merge]
   → workflow:merged  [TERMINAL] [Phase 5: PR merged]
@@ -63,7 +65,7 @@ At most one `workflow:*` label should be active on an issue at any time. When tr
 ```bash
 gh issue edit {NUMBER} -R {REPO} \
   --add-label "workflow:building" \
-  --remove-label "workflow:investigating,workflow:ready-to-build,workflow:in-review,workflow:awaiting-merge,workflow:merged,workflow:invalid,workflow:decomposed"
+  --remove-label "workflow:investigating,workflow:ready-to-build,workflow:building,workflow:waiting,workflow:in-review,workflow:awaiting-merge,workflow:merged,workflow:invalid,workflow:decomposed"
 ```
 
 This is enforced by `scripts/transition-label.sh` — use `resolve_script 'transition-label'` rather than calling `gh issue edit` directly when possible.

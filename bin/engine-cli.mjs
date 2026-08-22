@@ -25,6 +25,7 @@ export const ACTIVE_WORKFLOW_LABELS = [
   "workflow:investigating",
   "workflow:ready-to-build",
   "workflow:building",
+  "workflow:waiting",
   "workflow:in-review",
 ];
 

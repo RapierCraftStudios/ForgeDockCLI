@@ -2,7 +2,7 @@
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
-import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository } from "../../core/ports/telemetry.js";
+import { summarizeControllerTiming, summarizeQuality, summarizeTelemetry, type TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import {
   abortablePollDelay,
@@ -441,12 +441,22 @@ export async function completeWorkItem(
     const contracts = new Map((input.memberContracts ?? []).map((contract) => [contract.issue, contract]));
     const trajectoryArtifacts = [...parentArtifacts, outcome, input.verdict];
     const telemetry = dependencies.telemetry ? summarizeTelemetry(dependencies.telemetry.listTelemetry(run.runId)) : undefined;
+    const history = await dependencies.runs.history(run.runId);
+    const progress = await dependencies.runs.listProgress(run.runId);
     const controllerTiming = summarizeControllerTiming(
       run.createdAt,
-      await dependencies.runs.history(run.runId),
+      history,
       Date.parse(run.updatedAt),
-      await dependencies.runs.listProgress(run.runId),
+      progress,
     );
+    const qualitySummary = summarizeQuality({
+      run,
+      transitions: history,
+      progress,
+      artifacts: trajectoryArtifacts,
+      ...(dependencies.telemetry ? { agentReceipts: dependencies.telemetry.listTelemetry(run.runId) } : {}),
+      now: Date.parse(run.updatedAt),
+    });
     for (const child of childOutcomes) {
       const contract = contracts.get(child.issue);
       const receipt = trajectoryReceiptFromArtifacts({
@@ -458,6 +468,7 @@ export async function completeWorkItem(
         childIssues: [],
         childOutcomeIds: [child.artifact.id],
         ...(telemetry !== undefined ? { telemetry } : {}),
+        qualitySummary,
         controllerTiming,
       });
       await publishTrajectory(dependencies.host, {
@@ -475,6 +486,7 @@ export async function completeWorkItem(
       childIssues: completedChildIssues,
       childOutcomeIds: childOutcomes.map(({ artifact }) => artifact.id),
       ...(telemetry !== undefined ? { telemetry } : {}),
+      qualitySummary,
       controllerTiming,
     });
     await publishTrajectory(dependencies.host, {

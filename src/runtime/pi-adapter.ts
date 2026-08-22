@@ -110,6 +110,11 @@ export interface SubmissionVerificationDiagnostic {
   }[];
   nextAction: string;
   verificationRevision: number;
+  submissionDiagnostics?: readonly {
+    code: string;
+    criterionId?: string;
+    message: string;
+  }[];
 }
 
 /** Terminal typed failure after the model repeats an unchanged rejected submission. */
@@ -539,6 +544,22 @@ export class PiAgentRuntime implements AgentRuntime {
           }
           lastRejectedSubmissionKey = key;
           throw new ArtifactSubmissionRejectedError(diagnostic);
+        }
+        const submissionDiagnostics = task.submissionAudit?.(params) ?? [];
+        if (submissionDiagnostics.length) {
+          const auditedDiagnostic: SubmissionVerificationDiagnostic = {
+            ...diagnostic,
+            submissionDiagnostics: [...submissionDiagnostics],
+            nextAction: `Correct each criterion coverage diagnostic (${submissionDiagnostics.map(({ criterionId, code }) => `${criterionId ?? "packet"}:${code}`).join(", ")}), then retry submit_artifact once without changing the frozen packet or scope.`,
+          };
+          const key = canonicalSubmissionKey(verificationState, auditedDiagnostic);
+          if (key === lastRejectedSubmissionKey) {
+            throw new ArtifactSubmissionGateError(auditedDiagnostic, submissionAttempts, {
+              ...(activeSessionRef !== undefined ? { sessionRef: activeSessionRef } : {}),
+            });
+          }
+          lastRejectedSubmissionKey = key;
+          throw new ArtifactSubmissionRejectedError(auditedDiagnostic);
         }
         lastRejectedSubmissionKey = undefined;
         submitted = params as T;

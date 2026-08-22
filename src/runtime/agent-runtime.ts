@@ -312,6 +312,12 @@ export interface AgentTask<_T> {
   verificationGate?: {
     requiredCommandIds: readonly string[];
   };
+  /** Optional controller-owned first-pass artifact audit at submit_artifact. */
+  submissionAudit?: (submission: unknown) => readonly {
+    code: string;
+    criterionId?: string;
+    message: string;
+  }[];
   outputSchema: TSchema;
   modelPolicy: ModelPolicy;
 }

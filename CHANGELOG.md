@@ -8,6 +8,7 @@
 ### Added
 
 - Native `/orchestrate stop <dag-id>` provides an explicit, exact-DAG semantic stop with a launch barrier, worker drain, durable `cancelled` status, and distinct cancelled board/task guidance.
+- Controller-derived trajectory quality summaries record first-pass verification/review outcomes, phase wall time, agent activity, remediation, repeated verification, model/provider usage, and evidence-backed causal attribution with explicit unknowns.
 - `npm run certify:orchestration` builds and runs an exact-file, single-concurrency local certification set with GitHub credentials removed; `npm run certify:orchestration:dry-run` prints the audited plan without execution.
 
 ### Changed
@@ -18,8 +19,11 @@
 - Natural-language scope selection is projected into typed discovery evidence before controller validation. Fleet and orchestration views report selected/runnable issue demand, requested/transport/effective caps, node status, and typed waits without presenting queued demand as active.
 - `forgedock.verification/v2` now builds a bounded catalog from the refreshed exact base and runs only packet-selected `diff-check`, one safe direct TypeScript integrity command, and targeted direct Node tests. Required hosted CI remains separate live authority and must expose a nonempty passing GitHub-required set with authoritative provenance at the exact reviewed SHA.
 - Builder criterion coverage now uses typed path, symbol, test/invariant, and command anchors backed by passing controller-observed checks. Verification repair gets at most two fresh bounded sessions, retains the prior submission/session reference within the live process, and cannot widen frozen packet scope; after restart only the durable failure Outcome is reconstructed.
+- Build Packets now carry deterministic exact-base context packages, frozen verification identities, advisory complexity signals, and criterion-linked pre-submit self-audits so unknown commands and explicit acceptance omissions are corrected before independent review.
 - Review continuity now uses a durable `FindingRootLedger` and schema-v4 exact-SHA initial/closure plans. Omission does not close an open root. Controller-owned `mustFix` is distinct from final `blocking`: qualifying medium roots can remain nonblocking while still forcing `request_changes`, bounded remediation, re-verification, and closure review.
 - Dogfood readiness is now tracked as phased certification waves. Implementation and local regression evidence do not constitute a readiness claim; certification remains open.
+- Orchestration now projects queued claim conflicts, retries, and automatic recovery as `workflow:waiting`; exact DAG/node/attempt fencing prevents stale projections from reclaiming newer active or terminal labels, and resuming workers restores active run labels.
+- TUI task warnings now correlate orchestration launch identities so a live replacement suppresses predecessor no-activity warnings while genuinely stranded tasks remain visible.
 
 ### Fixed
 
