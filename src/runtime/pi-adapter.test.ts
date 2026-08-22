@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { Type } from "typebox";
-import { assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationRuntimeState, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, verificationHeartbeatIntervalMs, verificationInvocationTimeoutMs } from "./pi-adapter.js";
+import { ArtifactSubmissionGateError, assertPiRuntimeTargetsReady, boundedToolErrorSummary, createVerificationRuntimeState, createVerificationTool, DEFAULT_VERIFY_TOOL_HEARTBEAT_MS, MAX_NESTED_AGENT_RESPONSE_BYTES, NestedReviewerTransportError, PiAgentRuntime, postNestedAgentRequest, reserveToolCallBudget, resolvePiModelPolicy, submissionDiagnosticFor, submissionRejectionKeyFor, terminalErrorSummary, verificationHeartbeatIntervalMs, verificationInvocationTimeoutMs } from "./pi-adapter.js";
 import { createScopeManifestReceipt, scopeManifestFor, scopeManifestForReviewer, type AgentEvent } from "./agent-runtime.js";
 
 const REVIEWER_SCOPE = createScopeManifestReceipt(scopeManifestForReviewer());
@@ -248,6 +248,7 @@ test("verification receipts require exact frozen metadata and latest mutation ge
   } as any;
   const tool = createVerificationTool(task, () => undefined, 20, randomUUID(), state)!;
   await tool.execute("verify-1", { commandId: "test" }, undefined, undefined, {} as never);
+  assert.equal(state.verificationRevision, 1);
   assert.deepEqual(state.receipts.get("test"), { commandId: "test", generation: 0 });
   state.mutationGeneration += 1;
   assert.deepEqual(state.receipts.get("test"), { commandId: "test", generation: 0 });
@@ -260,6 +261,61 @@ test("verification receipts require exact frozen metadata and latest mutation ge
   await tool.execute("verify-4", { commandId: "test" }, undefined, undefined, {} as never);
   assert.equal(state.receipts.size, 0);
 });
+
+test("submission diagnostics enumerate failed, missing, passing, and stale frozen checks", () => {
+  const state = createVerificationRuntimeState();
+  state.statuses.set("failed", { status: "failed", generation: 1 });
+  state.statuses.set("passing", { status: "passed", generation: 0 });
+  state.receipts.set("passing", { commandId: "passing", generation: 0 });
+  state.statuses.set("stale", { status: "passed", generation: 0 });
+  state.receipts.set("stale", { commandId: "stale", generation: 0 });
+  state.mutationGeneration = 1;
+  const diagnostic = submissionDiagnosticFor({ verificationGate: { requiredCommandIds: ["failed", "missing", "passing", "stale"] } } as any, state);
+  assert.deepEqual(diagnostic.statuses.map((item) => [item.commandId, item.status]), [
+    ["failed", "failed"], ["missing", "missing"], ["passing", "stale"], ["stale", "stale"],
+  ]);
+  assert.match(diagnostic.nextAction, /failed, missing, passing, stale/);
+  assert.equal(diagnostic.statuses.find((item) => item.commandId === "stale")?.receiptGeneration, 0);
+});
+
+test("a current passing receipt is the only submission-gate success", () => {
+  const state = createVerificationRuntimeState();
+  state.statuses.set("check", { status: "passed", generation: 2 });
+  state.receipts.set("check", { commandId: "check", generation: 2 });
+  state.mutationGeneration = 2;
+  const diagnostic = submissionDiagnosticFor({ verificationGate: { requiredCommandIds: ["check"] } } as any, state);
+  assert.deepEqual(diagnostic.statuses[0], { commandId: "check", status: "passing", mutationGeneration: 2, receiptGeneration: 2 });
+});
+
+
+test("submission terminal wording records attempted rejection and typed repeated-gate reason", () => {
+  const diagnostic = { requiredCommandIds: ["check"], statuses: [{ commandId: "check", status: "missing" as const, mutationGeneration: 0 }], nextAction: "Run check", verificationRevision: 0 };
+  const error = new ArtifactSubmissionGateError(diagnostic, 2);
+  assert.equal(error.name, "ArtifactSubmissionGateError");
+  assert.match(error.message, /same artifact and verification state twice/);
+  assert.doesNotMatch(terminalErrorSummary(new Error("Agent execution maxTurns budget exhausted"), false, 1), /before artifact submission/);
+  assert.match(terminalErrorSummary(new Error("Agent execution maxTurns budget exhausted"), false, 0), /without attempting artifact submission/);
+});
+
+
+test("submission corrective window ignores payload churn but resets after fresh verification", () => {
+  const state = createVerificationRuntimeState();
+  const diagnostic = submissionDiagnosticFor({ verificationGate: { requiredCommandIds: ["check"] } } as any, state);
+  const firstKey = submissionRejectionKeyFor(state, diagnostic);
+  const changedPayloadKey = submissionRejectionKeyFor(state, { ...diagnostic });
+  assert.equal(changedPayloadKey, firstKey, "artifact payload is deliberately absent from the rejection key");
+  const reject = (payload: unknown) => {
+    const key = submissionRejectionKeyFor(state, diagnostic);
+    if (key === firstKey && payload !== undefined && attempts++ > 0) throw new ArtifactSubmissionGateError(diagnostic, attempts);
+    return key;
+  };
+  let attempts = 0;
+  assert.equal(reject({ summary: "first" }), firstKey);
+  assert.throws(() => reject({ summary: "corrected" }), ArtifactSubmissionGateError);
+  assert.throws(() => reject({ summary: "third" }), ArtifactSubmissionGateError);
+  assert.notEqual(submissionRejectionKeyFor({ ...state, verificationRevision: state.verificationRevision + 1 }, diagnostic), firstKey);
+});
+
 
 test("verification replays frozen prerequisites in one staging invocation", async () => {
   const commands = [

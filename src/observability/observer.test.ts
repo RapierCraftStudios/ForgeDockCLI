@@ -302,12 +302,15 @@ test("agent adapter preserves user-visible events but discards private thinking 
   sink({ type: "thinking.delta", logicalStreamId: "stream-agent-1", taskId: "agent-1", text: "private chain of thought" });
   sink({ type: "text.delta", logicalStreamId: "stream-agent-1", taskId: "agent-1", text: "visible progress" });
   sink({ type: "tool.started", logicalStreamId: "stream-agent-1", taskId: "agent-1", toolCallId: "call-1", tool: "read", args: { path: "src/a.ts", secret: "hide" } });
+  sink({ type: "tool.completed", logicalStreamId: "stream-agent-1", taskId: "agent-1", toolCallId: "call-submit", tool: "submit_artifact", isError: true, errorSummary: "Artifact submission rejected; inspect the verification diagnostic", details: { requiredCommandIds: ["check"], statuses: [{ commandId: "check", status: "stale", mutationGeneration: 2, receiptGeneration: 1 }], nextAction: "Run check after the latest edit" } });
   await observer.flush();
   const events = await observer.query({ forgeRunId: "run-agent" });
   assert.equal(events.some((event) => JSON.stringify(event.payload).includes("private chain")), false);
   assert.equal(events.some((event) => JSON.stringify(event.payload).includes("visible progress")), true);
   const tool = events.find((event) => event.kind === "tool.started");
   assert.deepEqual((tool?.payload as { args?: Record<string, unknown> }).args, { path: "src/a.ts" });
+  const rejection = events.find((event) => event.kind === "tool.completed");
+  assert.deepEqual((rejection?.payload as { details?: unknown }).details, { requiredCommandIds: ["check"], statuses: [{ commandId: "check", status: "stale", mutationGeneration: 2, receiptGeneration: 1 }], nextAction: "Run check after the latest edit" });
   observer.close();
 });
 

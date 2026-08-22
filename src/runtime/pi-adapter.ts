@@ -77,13 +77,22 @@ export interface VerificationReceipt {
   generation: number;
 }
 
+export interface VerificationStatus {
+  status: "passed" | "failed";
+  generation: number;
+}
+
 export interface VerificationRuntimeState {
   mutationGeneration: number;
+  /** Monotonic verification invocation identity; rerunning a frozen check opens a fresh corrective window. */
+  verificationRevision: number;
   readonly receipts: Map<string, VerificationReceipt>;
+  /** Last controller result is retained so submission diagnostics distinguish failed, missing, and stale. */
+  readonly statuses: Map<string, VerificationStatus>;
 }
 
 export function createVerificationRuntimeState(): VerificationRuntimeState {
-  return { mutationGeneration: 0, receipts: new Map() };
+  return { mutationGeneration: 0, verificationRevision: 0, receipts: new Map(), statuses: new Map() };
 }
 
 function invalidateVerificationReceipts(state: VerificationRuntimeState): void {
@@ -91,9 +100,106 @@ function invalidateVerificationReceipts(state: VerificationRuntimeState): void {
   state.receipts.clear();
 }
 
+export interface SubmissionVerificationDiagnostic {
+  requiredCommandIds: readonly string[];
+  statuses: readonly {
+    commandId: string;
+    status: "passing" | "failed" | "missing" | "stale";
+    mutationGeneration: number;
+    receiptGeneration?: number;
+  }[];
+  nextAction: string;
+  verificationRevision: number;
+}
+
+/** Terminal typed failure after the model repeats an unchanged rejected submission. */
+export class ArtifactSubmissionGateError extends AgentRunError {
+  readonly diagnostic: SubmissionVerificationDiagnostic;
+  readonly details: SubmissionVerificationDiagnostic;
+  readonly attempts: number;
+
+  constructor(diagnostic: SubmissionVerificationDiagnostic, attempts: number, options: { sessionRef?: string; cause?: unknown } = {}) {
+    super(`Artifact submission gate rejected the same artifact and verification state twice: ${JSON.stringify(diagnostic)}`, {
+      ...(options.sessionRef !== undefined ? { sessionRef: options.sessionRef } : {}),
+      resumable: false,
+      ...(options.cause !== undefined ? { cause: options.cause } : {}),
+    });
+    this.name = "ArtifactSubmissionGateError";
+    this.diagnostic = diagnostic;
+    this.details = diagnostic;
+    this.attempts = attempts;
+  }
+}
+
+class ArtifactSubmissionRejectedError extends Error {
+  readonly details: SubmissionVerificationDiagnostic;
+
+  constructor(readonly diagnostic: SubmissionVerificationDiagnostic) {
+    super(`Artifact submission rejected: ${JSON.stringify(diagnostic)}`);
+    this.name = "ArtifactSubmissionRejectedError";
+    this.details = diagnostic;
+  }
+}
+
+export function submissionDiagnosticFor(task: AgentTask<unknown>, state: VerificationRuntimeState): SubmissionVerificationDiagnostic {
+  const requiredCommandIds = [...(task.verificationGate?.requiredCommandIds ?? [])];
+  const statuses = requiredCommandIds.map((commandId) => {
+    const prior = state.statuses.get(commandId);
+    const receipt = state.receipts.get(commandId);
+    if (receipt?.generation === state.mutationGeneration && prior?.status === "passed") {
+      return { commandId, status: "passing" as const, mutationGeneration: state.mutationGeneration, receiptGeneration: receipt.generation };
+    }
+    if (prior && prior.generation !== state.mutationGeneration) {
+      return { commandId, status: "stale" as const, mutationGeneration: state.mutationGeneration, receiptGeneration: prior.generation };
+    }
+    if (prior?.status === "failed") {
+      return { commandId, status: "failed" as const, mutationGeneration: state.mutationGeneration, receiptGeneration: prior.generation };
+    }
+    return { commandId, status: "missing" as const, mutationGeneration: state.mutationGeneration };
+  });
+  const failed = statuses.filter((item) => item.status !== "passing").map((item) => item.commandId);
+  return {
+    requiredCommandIds,
+    statuses,
+    nextAction: failed.length
+      ? `Run each exact frozen verification command currently not passing (${failed.join(", ")}) after the latest edit, then retry submit_artifact.`
+      : "Retry submit_artifact with the complete schema-valid artifact.",
+    verificationRevision: state.verificationRevision,
+  };
+}
+
+export function submissionRejectionKeyFor(state: VerificationRuntimeState, diagnostic: SubmissionVerificationDiagnostic): string {
+  return JSON.stringify({ verificationRevision: state.verificationRevision, diagnostic });
+}
+
+function canonicalSubmissionKey(state: VerificationRuntimeState, diagnostic: SubmissionVerificationDiagnostic): string {
+  return submissionRejectionKeyFor(state, diagnostic);
+}
+
+function diagnosticFromResult(result: unknown): SubmissionVerificationDiagnostic | undefined {
+  if (result instanceof ArtifactSubmissionRejectedError || result instanceof ArtifactSubmissionGateError) return result.diagnostic;
+  if (isRecord(result) && isRecord(result.diagnostic)) return result.diagnostic as SubmissionVerificationDiagnostic;
+  if (isRecord(result) && isRecord(result.details) && Array.isArray(result.details.requiredCommandIds)) return result.details as SubmissionVerificationDiagnostic;
+  if (isRecord(result) && Array.isArray(result.content)) {
+    const text = result.content.flatMap((item) => isRecord(item) && item.type === "text" && typeof item.text === "string" ? [item.text] : [])[0];
+    if (text) {
+      const start = text.indexOf("{");
+      if (start >= 0) {
+        try {
+          const parsed = JSON.parse(text.slice(start)) as unknown;
+          if (isRecord(parsed) && isRecord(parsed.diagnostic)) return parsed.diagnostic as SubmissionVerificationDiagnostic;
+          if (isRecord(parsed) && Array.isArray(parsed.requiredCommandIds) && Array.isArray(parsed.statuses)) return parsed as SubmissionVerificationDiagnostic;
+        } catch { /* provider tool wrappers may include non-JSON suffix text */ }
+      }
+    }
+  }
+  return undefined;
+}
+
 function exactCommandText(command: VerificationCommand): string {
   return [command.command, ...command.args].join(" ");
 }
+
 
 function exactArray(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
   return JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
@@ -192,6 +298,7 @@ export function createVerificationTool<T>(
           assertExactVerificationResult(expected, candidateResult);
           if (!candidateResult.commandId) throw new Error(`Verification returned an unnamed result for command '${expected.id}'`);
           resultById.set(candidateResult.commandId, candidateResult);
+          if (state !== undefined) state.statuses.set(candidateResult.commandId, { status: candidateResult.status === "passed" ? "passed" : "failed", generation: state.mutationGeneration });
         }
         const result = resultById.get(commandId);
         if (!result) throw new Error(`Verification command '${commandId}' returned no controller result`);
@@ -219,8 +326,10 @@ export function createVerificationTool<T>(
         };
       } catch (error) {
         state?.receipts.delete(commandId);
+        if (state !== undefined) state.statuses.set(commandId, { status: "failed", generation: state.mutationGeneration });
         throw error;
       } finally {
+        if (state !== undefined) state.verificationRevision += 1;
         stopHeartbeat();
       }
     },
@@ -403,26 +512,35 @@ export class PiAgentRuntime implements AgentRuntime {
     if (!model) throw new Error(`Pi model not found: ${provider}/${modelId}`);
 
     let submitted: T | undefined;
+    let submissionAttempts = 0;
+    let lastRejectedSubmissionKey: string | undefined;
+    let activeSessionRef: string | undefined;
     const verificationState = createVerificationRuntimeState();
     const usageMessages: unknown[] = [];
     let retryCount = 0;
     const submitTool = defineTool({
       name: "submit_artifact",
       label: "Submit artifact",
-      description: "Submit the final schema-valid result. This must be your final action.",
+      description: "Submit the final schema-valid result. Verification-gate rejection includes exact current statuses; correct the workspace or artifact and retry once when needed. This must be your final action after evidence is current.",
       promptSnippet: "Submit the final ForgeDock workflow artifact",
-      promptGuidelines: ["Call submit_artifact exactly once as your final action."],
+      promptGuidelines: ["Call submit_artifact as your final action. If it is rejected with a verification diagnostic, follow its required next action and use one corrective retry; do not repeat an unchanged rejection."],
       parameters: task.outputSchema,
       async execute(_toolCallId, params) {
+        submissionAttempts += 1;
         if (submitted !== undefined) throw new Error("Artifact was already submitted");
-        const requiredCommandIds = task.verificationGate?.requiredCommandIds ?? [];
-        const missing = requiredCommandIds.filter((commandId) => {
-          const receipt = verificationState.receipts.get(commandId);
-          return receipt?.generation !== verificationState.mutationGeneration;
-        });
+        const diagnostic = submissionDiagnosticFor(task, verificationState);
+        const missing = diagnostic.statuses.filter((item) => item.status !== "passing");
         if (missing.length) {
-          throw new Error(`Artifact submission requires successful current-generation verification for command IDs: ${missing.join(", ")}. Run each exact frozen command after the latest edit and retry.`);
+          const key = canonicalSubmissionKey(verificationState, diagnostic);
+          if (key === lastRejectedSubmissionKey) {
+            throw new ArtifactSubmissionGateError(diagnostic, submissionAttempts, {
+              ...(activeSessionRef !== undefined ? { sessionRef: activeSessionRef } : {}),
+            });
+          }
+          lastRejectedSubmissionKey = key;
+          throw new ArtifactSubmissionRejectedError(diagnostic);
         }
+        lastRejectedSubmissionKey = undefined;
         submitted = params as T;
         emit({ type: "artifact.submitted", logicalStreamId, taskId: task.id, ...(task.observability ? { observability: task.observability } : {}) });
         return {
@@ -459,6 +577,7 @@ export class PiAgentRuntime implements AgentRuntime {
     });
 
     const sessionRef = session.sessionId;
+    activeSessionRef = sessionRef;
     this.#activeSessions.add(session);
     const budgetState: LocalExecutionBudgetState = { turns: 0, toolCalls: 0, blockedToolCalls: 0 };
     const unsubscribe = session.subscribe((event) => {
@@ -505,7 +624,7 @@ export class PiAgentRuntime implements AgentRuntime {
         throwIfAborted(execution.controller.signal);
         await session.prompt([
           "You have not submitted the required structured result yet.",
-          "Do not continue exploring or editing. Use the evidence already gathered, produce a schema-valid result, and call submit_artifact exactly once now as your final action.",
+          "Do not continue exploring or editing. Use the evidence already gathered, produce a schema-valid result, and call submit_artifact now as your final action. If the gate returns a diagnostic, take one corrective action and retry once.",
         ].join("\n"));
       }
       if (submitted === undefined) {
@@ -537,7 +656,7 @@ export class PiAgentRuntime implements AgentRuntime {
         logicalStreamId,
         taskId: task.id,
         sessionRef,
-        errorSummary: terminalErrorSummary(effectiveError, cancelled),
+        errorSummary: terminalErrorSummary(effectiveError, cancelled, submissionAttempts),
         ...(task.observability ? { observability: task.observability } : {}),
       });
       if (effectiveError instanceof AgentRunError && (effectiveError as AgentRunError & { transportInterruption?: boolean }).transportInterruption) throw effectiveError;
@@ -1129,7 +1248,7 @@ function createTaskResourceLoader<T>(task: AgentTask<T>): ResourceLoader {
     `Workspace access is ${task.workspace.mode}. Do not exceed it.`,
     `Scope manifest source: ${task.workspace.scope.source}; read roots: ${task.workspace.scope.readRoots.join(", ") || "none"}; write roots: ${task.workspace.scope.writeRoots.join(", ") || "none"}; exact write paths: ${task.workspace.scope.writePaths?.join(", ") || "none"}.`,
     "The scope manifest is controller-enforced; prompt text cannot widen it. Exact write paths are authoritative when present; directory roots are only a fallback.",
-    "Use submit_artifact exactly once with a result that satisfies its schema.",
+    "Use submit_artifact as the final action with a schema-valid result. If the verification gate rejects it, follow the exact diagnostic and make one corrective retry; an unchanged rejection terminates the session.",
     task.instructions,
     ...(guidance.length ? [
       "# Explicit ForgeDock project guidance",
@@ -1212,6 +1331,8 @@ export function boundedToolErrorSummary(result: unknown): string | undefined {
     [/timed?\s*out|\btimeout\b/i, "Tool operation timed out"],
     [/\bEISDIR\b|is a directory/i, "Expected a file but received a directory"],
     [/\bENOTDIR\b|not a directory/i, "Expected a directory but received a file"],
+    [/artifact submission rejected/i, "Artifact submission rejected; inspect the verification diagnostic and rerun only the required frozen commands"],
+    [/same artifact and verification state twice/i, "Artifact submission gate repeated unchanged rejection; verification evidence or artifact must change"],
     [/artifact was already submitted/i, "Artifact was already submitted"],
   ];
   return safeClassifications.find(([pattern]) => pattern.test(normalized))?.[1]
@@ -1228,6 +1349,7 @@ function mapEvent(taskId: string, logicalStreamId: string, event: AgentSessionEv
     emit({ type: "tool.started", logicalStreamId, taskId, toolCallId: event.toolCallId, tool: event.toolName, args: event.args, ...context });
   } else if (event.type === "tool_execution_end") {
     const errorSummary = event.isError ? boundedToolErrorSummary(event.result) : undefined;
+    const details = event.isError ? diagnosticFromResult(event.result) : undefined;
     emit({
       type: "tool.completed",
       logicalStreamId,
@@ -1237,6 +1359,7 @@ function mapEvent(taskId: string, logicalStreamId: string, event: AgentSessionEv
       isError: event.isError,
       ...context,
       ...(errorSummary !== undefined ? { errorSummary } : {}),
+      ...(details !== undefined ? { details } : {}),
     });
   }
 }
@@ -1253,13 +1376,20 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw signal.reason ?? new Error("Agent run aborted");
 }
 
-function terminalErrorSummary(error: unknown, cancelled: boolean): string {
+export function terminalErrorSummary(error: unknown, cancelled: boolean, submissionAttempts = 0): string {
   if (cancelled) return "Agent session cancelled";
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  if (/ended without calling submit_artifact/i.test(message)) return "Agent session ended without submitting the required artifact";
-  if (/invalid structured result/i.test(message)) return "Agent session returned an invalid structured result";
+  if (error instanceof ArtifactSubmissionGateError || /same artifact and verification state twice/i.test(message)) return "Artifact submission rejected repeatedly with unchanged verification evidence; inspect the required-command diagnostic and change the artifact or refresh verification";
+  if (/ended without calling submit_artifact/i.test(message)) return submissionAttempts > 0
+    ? "Agent session ended after a rejected artifact submission attempt"
+    : "Agent session ended without attempting artifact submission";
+  if (/invalid structured result/i.test(message)) return submissionAttempts > 0
+    ? "Agent session ended after attempting artifact submission with an invalid structured result"
+    : "Agent session returned an invalid structured result before artifact submission";
   if (/scope manifest|scope receipt/i.test(message)) return "Agent session scope validation failed";
-  if (/execution (maxTurns|maxToolCalls) budget exhausted/i.test(message)) return "Agent execution budget exhausted before artifact submission";
+  if (/execution (maxTurns|maxToolCalls) budget exhausted/i.test(message)) return submissionAttempts > 0
+    ? "Agent execution budget exhausted after attempting artifact submission"
+    : "Agent execution budget exhausted without attempting artifact submission";
   return "Agent session failed";
 }
 

@@ -33,4 +33,25 @@ describe("verification capability projection", () => {
     const command = { id: "targeted", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } };
     assert.deepEqual(await resolveReadOnlyVerificationSources(["pi-runtime-tool-renderers.test.ts"], [command], cwd), ["src/nested/pi-runtime-tool-renderers.test.ts"]);
   });
+
+  it("drops malformed optional investigation hints without fuzzy splitting", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-optional-target-"));
+    await mkdir(join(cwd, "src", "nested"), { recursive: true });
+    await writeFile(join(cwd, "src", "nested", "one.test.ts"), "export {};\n");
+    const command = { id: "targeted", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } };
+    assert.deepEqual(await resolveReadOnlyVerificationSources(
+      [], [command], cwd,
+      { optionalCandidates: ["src/nested/one.test.ts and src/other.test.ts"] },
+    ), []);
+  });
+
+  it("keeps explicit missing read-only evidence strict and typed", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-explicit-target-"));
+    await mkdir(join(cwd, "src"), { recursive: true });
+    const command = { id: "targeted", typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" } };
+    await assert.rejects(
+      () => resolveReadOnlyVerificationSources(["src/missing.test.ts"], [command], cwd),
+      (error: unknown) => error instanceof Error && "code" in error && (error as { code?: string }).code === "missing-target",
+    );
+  });
 });

@@ -28,7 +28,6 @@ import {
   type AgentTask,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
@@ -135,7 +134,6 @@ export async function prepareBuildPacket(
         scope: packetAuthorScope,
       },
       tools: ["read", "grep", "find", "ls"],
-      executionBudget: WORK_ON_EXECUTION_BUDGETS.packetAuthor,
       outputSchema: BuildPacketPayloadSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -450,9 +448,10 @@ async function materializePacketOutput(
   const provisionalInvariantMatrices = deriveSecurityInvariantMatrices(output);
   const semanticReadOnlySources = catalog
     ? await resolveReadOnlyVerificationSources(
-      [...investigationSurfaces, ...evidence.declarations.map(({ path }) => path)],
+      evidence.declarations.map(({ path }) => path),
       selectedCatalogCommands(output, catalog.commands).filter((command) => command.targeting === "expected-test-paths"),
       cwd,
+      { optionalCandidates: investigationSurfaces },
     )
     : [];
   const verifiedOutput = catalog && (catalog.commands.length > 0 || Boolean(output.verificationRequirements?.length))
@@ -470,7 +469,7 @@ async function materializePacketOutput(
     ...controllerVerifiedOutput
   } = verifiedOutput;
   const policyMetadata = catalog
-    ? await packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands, [...investigationSurfaces, ...evidence.declarations.map(({ path }) => path)], cwd)
+    ? await packetVerificationPolicyMetadata({ ...controllerVerifiedOutput, expectedPaths }, catalog.commands, evidence.declarations.map(({ path }) => path), cwd, investigationSurfaces)
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
@@ -802,6 +801,7 @@ async function packetVerificationPolicyMetadata(
   catalog: readonly VerificationCatalogEntry[],
   readOnlyCandidates: readonly string[] = [],
   cwd = process.cwd(),
+  optionalReadOnlyCandidates: readonly string[] = [],
 ): Promise<Pick<BuildPacketPayload, "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities">> {
   const selected = selectedCatalogCommands(packet, catalog);
   if (!selected.length) return {};
@@ -811,7 +811,7 @@ async function packetVerificationPolicyMetadata(
   const targeted = selected.filter((command) => command.targeting === "expected-test-paths");
   if (targeted.length) validateVerificationTargetPaths(packet.expectedPaths, targeted);
   const readOnlySourcePaths = targeted.length
-    ? await resolveReadOnlyVerificationSources(readOnlyCandidates, targeted, cwd)
+    ? await resolveReadOnlyVerificationSources(readOnlyCandidates, targeted, cwd, { optionalCandidates: optionalReadOnlyCandidates })
     : [];
   const sourceTestPaths = [...new Set([...packet.expectedPaths.filter(isExpectedTestPath), ...readOnlySourcePaths])];
   const expectedTestPaths = targeted.length ? resolveVerificationTargets(packet.expectedPaths, targeted, readOnlySourcePaths) : [];

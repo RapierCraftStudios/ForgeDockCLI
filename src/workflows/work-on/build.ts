@@ -7,7 +7,6 @@ import type { VerificationCommand, VerificationRunner } from "../../core/ports/v
 import { transition, type RunState } from "../../core/state/machine.js";
 import { isRecoverableAgentExecutionError, scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "./investigate.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export const BuilderSubmissionSchema = Type.Object({
   summary: Type.String({ minLength: 1 }),
@@ -232,7 +231,6 @@ export async function buildWorkItem(
       } : {}),
       ...(verificationGate !== undefined ? { verificationGate } : {}),
       outputSchema: BuilderSubmissionSchema,
-      executionBudget: WORK_ON_EXECUTION_BUDGETS.builder,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),

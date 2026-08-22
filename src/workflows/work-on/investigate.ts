@@ -22,7 +22,6 @@ import {
   type AgentRuntime,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export interface InvestigateDependencies {
   runtime: AgentRuntime;
@@ -193,7 +192,6 @@ async function continueInvestigation(
           scope: scopeManifest,
         },
         tools: ["read", "grep", "find", "ls"],
-        executionBudget: WORK_ON_EXECUTION_BUDGETS.investigator,
         outputSchema: InvestigationPayloadSchema,
         modelPolicy,
       }, {

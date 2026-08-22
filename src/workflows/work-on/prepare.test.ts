@@ -30,6 +30,47 @@ const packet: BuildPacketPayload = {
 };
 
 describe("Build Packet preparation", () => {
+  it("materializes when malformed investigation test hints are optional", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-malformed-hint-"));
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(join(cwd, "src/fix.ts"), "export const fixed = true;\n");
+      const malformedInvestigation: InvestigationPayload = {
+        ...investigation,
+        affectedSurfaces: ["src/tui/forgedock-extension.test.ts and src/workflows/orchestrate/controller.test.ts"],
+      };
+      const gatedPacket: BuildPacketPayload = {
+        ...packet,
+        expectedPaths: ["src/fix.ts"],
+        verificationPlan: ["controller-gate:staging-review"],
+        verificationRequirements: [{ kind: "controller-gate", id: "staging-review", criterionIds: ["criterion-1"], rationale: "Controller-owned completion." }],
+      };
+      const runtime = new FakeAgentRuntime([malformedInvestigation, gatedPacket]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_malformed_hint", subject: { repo: "a/b", issue: 421 }, producer: { role: "controller" },
+        payload: { title: "Optional hint", problem: "Ignore malformed read-only hint", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      const prepared = await prepareBuildPacket({
+        run: investigated.run, intent, investigation: investigated.investigation, cwd,
+        verificationCatalog: {
+          commands: [{
+            id: "targeted", command: "node", args: ["--test"], required: true, selection: "always",
+            targeting: "expected-test-paths", evidenceCapability: "targeted-test", policyVersion: "forgedock.verification/v2",
+            typescriptLayout: { sourceRoot: "src", outputRoot: "dist", project: "tsconfig.json", configDigest: "digest" },
+          }],
+          controllerGates: [{ id: "staging-review", description: "Validate staging" }],
+        },
+      }, { runtime, artifacts, runs });
+      assert.equal(prepared.run.state, "building");
+      assert.deepEqual(prepared.packet.payload.expectedPaths, ["src/fix.ts"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("combines intent, investigation, context and plan into one durable barrier", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet]);
     const artifacts = new InMemoryArtifactRepository();

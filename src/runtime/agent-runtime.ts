@@ -334,7 +334,7 @@ export type AgentEvent =
   | { readonly type: "tool.started"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly args?: unknown; readonly observability?: AgentObservability }
   /** A bounded tool is still running; this is liveness evidence, not a new tool call. */
   | { readonly type: "tool.progress"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly elapsedMs: number; readonly timeoutMs: number; readonly observability?: AgentObservability }
-  | { readonly type: "tool.completed"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly isError: boolean; readonly errorSummary?: string; readonly observability?: AgentObservability }
+  | { readonly type: "tool.completed"; readonly logicalStreamId: string; readonly taskId: string; readonly toolCallId: string; readonly tool: string; readonly isError: boolean; readonly errorSummary?: string; readonly details?: unknown; readonly observability?: AgentObservability }
   | { readonly type: "artifact.submitted"; readonly logicalStreamId: string; readonly taskId: string; readonly observability?: AgentObservability }
   | { readonly type: "session.completed"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly observability?: AgentObservability }
   | { readonly type: "session.failed"; readonly logicalStreamId: string; readonly taskId: string; readonly sessionRef: string; readonly errorSummary: string; readonly observability?: AgentObservability }

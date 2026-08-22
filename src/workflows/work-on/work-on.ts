@@ -49,7 +49,6 @@ import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, ru
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint, TARGET_RECOVERY_MAX_ATTEMPTS } from "./target-recovery.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 
 export { repositoryPathFromLocation } from "../review-pr/scope.js";
 
@@ -1607,7 +1606,6 @@ async function diagnoseVerificationTransition(
     tools: ["read", "grep", "find", "ls", "verify"],
     verification: { commands: input.commands, runner: dependencies.verifier },
     outputSchema: VerificationDiagnosisSchema,
-    executionBudget: WORK_ON_EXECUTION_BUDGETS.investigator,
     modelPolicy: {
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),

@@ -128,10 +128,16 @@ export function validateVerificationTargetPaths(
   }
 }
 
+export interface ReadOnlyVerificationSourceOptions {
+  /** Investigation surfaces are advisory read-only hints, unlike packet evidence. */
+  readonly optionalCandidates?: readonly string[];
+}
+
 export async function resolveReadOnlyVerificationSources(
   candidates: readonly string[],
   targetedCommands: readonly Pick<VerificationCommand, "id" | "typescriptLayout">[],
   cwd: string,
+  options: ReadOnlyVerificationSourceOptions = {},
 ): Promise<string[]> {
   if (!targetedCommands.length) return [];
   const layouts = targetedCommands.map((command) => command.typescriptLayout).filter((layout): layout is NonNullable<typeof layout> => Boolean(layout));
@@ -143,18 +149,27 @@ export async function resolveReadOnlyVerificationSources(
   const files = await boundedTestFiles(join(cwd, sourceRoot), MAX_VERIFICATION_TARGETS * 8);
   const normalizedFiles = files.map((file) => `${sourceRoot}/${file}`.replace(/^\.\//, ""));
   const selected = new Set<string>();
-  for (const raw of candidates) {
+  const allCandidates = [
+    ...candidates.map((raw) => [raw, false] as const),
+    ...(options.optionalCandidates ?? []).map((raw) => [raw, true] as const),
+  ];
+  for (const [raw, optional] of allCandidates) {
     const candidate = raw.replaceAll("\\", "/").replace(/^\.\//, "");
     if (!isExpectedTestPath(candidate)) continue;
-    if (!candidate.includes("/")) {
-      const matches = normalizedFiles.filter((file) => file.split("/").at(-1) === candidate);
-      if (matches.length !== 1) {
-        if (matches.length > 1) throw new Error(`Ambiguous read-only verification target '${raw}'`);
-        if (matches.length === 0) throw new Error(`Missing read-only verification target '${raw}'`);
-      }
-      selected.add(matches[0]!);
-    } else if (normalizedFiles.includes(candidate)) selected.add(candidate);
-    else throw new Error(`Missing read-only verification target '${raw}'`);
+    try {
+      if (!candidate.includes("/")) {
+        const matches = normalizedFiles.filter((file) => file.split("/").at(-1) === candidate);
+        if (matches.length !== 1) {
+          if (matches.length > 1) throw new VerificationCapabilityMismatchError("missing-target", `Ambiguous read-only verification target '${raw}'`, raw);
+          if (matches.length === 0) throw new VerificationCapabilityMismatchError("missing-target", `Missing read-only verification target '${raw}'`, raw);
+        }
+        selected.add(matches[0]!);
+      } else if (normalizedFiles.includes(candidate)) selected.add(candidate);
+      else throw new VerificationCapabilityMismatchError("missing-target", `Missing read-only verification target '${raw}'`, raw);
+    } catch (error) {
+      if (optional && isVerificationCapabilityMismatchError(error) && error.code === "missing-target") continue;
+      throw error;
+    }
   }
   const sourcePaths = [...selected];
   validateVerificationTargetPaths(sourcePaths, targetedCommands);

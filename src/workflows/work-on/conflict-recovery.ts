@@ -11,7 +11,6 @@ import { BuilderSubmissionSchema, type BuilderSubmission } from "./build.js";
 import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
 import { publishRemediationRevision } from "./publish-revision.js";
 import { uncoveredVerificationCommands } from "./verify.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { persistTargetAdvanceCheckpoint as persistTargetAdvanceCheckpointShared } from "./target-recovery.js";
 
 /** The old approval is evidence for admission only; it is never reused for the new SHA. */
@@ -451,7 +450,6 @@ async function runPacketConflictResolver(
     },
     tools: ["read", "grep", "find", "ls", "edit", "write"],
     outputSchema: BuilderSubmissionSchema,
-    executionBudget: WORK_ON_EXECUTION_BUDGETS.ciRepair,
     modelPolicy: {
       ...(recovery.provider !== undefined ? { provider: recovery.provider } : {}),
       ...(recovery.model !== undefined ? { model: recovery.model } : {}),

@@ -90,7 +90,7 @@ export function createAgentEventObservationSink(observer: ObservationSink, conte
       return;
     }
     if (event.type === "tool.completed") {
-      void observer.emit({ ...base, channel: "tool", kind: "tool.completed", severity: event.isError ? "error" : "info", payload: { tool: event.tool, toolCallId: event.toolCallId, isError: event.isError, ...(event.errorSummary ? { summary: event.errorSummary } : {}), ...observabilityPayload(event) } });
+      void observer.emit({ ...base, channel: "tool", kind: "tool.completed", severity: event.isError ? "error" : "info", payload: { tool: event.tool, toolCallId: event.toolCallId, isError: event.isError, ...(event.errorSummary ? { summary: event.errorSummary } : {}), ...(event.details !== undefined ? { details: event.details } : {}), ...observabilityPayload(event) } });
       return;
     }
     if (event.type === "artifact.submitted") {

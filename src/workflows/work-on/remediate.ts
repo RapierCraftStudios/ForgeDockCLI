@@ -12,7 +12,6 @@ import {
   type AgentEventSink,
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
-import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
 import { BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
@@ -95,7 +94,6 @@ export async function remediateReview(
       } : {}),
       ...(verificationGate !== undefined ? { verificationGate } : {}),
       outputSchema: BuilderSubmissionSchema,
-      executionBudget: WORK_ON_EXECUTION_BUDGETS.remediator,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
