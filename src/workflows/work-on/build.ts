@@ -24,6 +24,46 @@ export const BuilderSubmissionSchema = Type.Object({
 });
 export type BuilderSubmission = Static<typeof BuilderSubmissionSchema>;
 
+/**
+ * Normalize only the prose projection of a complete, controller-recognized
+ * criterion report.  Stable IDs are the authority: if the report is missing,
+ * duplicates, or invents an ID, leave it untouched so verification can reject
+ * it rather than silently repairing malformed evidence.
+ */
+export function normalizeBuilderSubmission(
+  packet: DurableArtifact<"BuildPacket">,
+  submission: BuilderSubmission,
+): BuilderSubmission {
+  const criteria = packet.payload.acceptanceCriteria;
+  const expectedIds = criteria.map((_, index) => `criterion-${index + 1}`);
+  const ids = submission.criterionCoverage.map(({ criterionId }) => criterionId);
+  const complete = ids.length === expectedIds.length
+    && ids.every((id): id is string => id !== undefined && /^criterion-[1-9][0-9]*$/.test(id))
+    && new Set(ids).size === expectedIds.length
+    && expectedIds.every((id) => ids.includes(id));
+  if (!complete) return submission;
+  return {
+    ...submission,
+    criterionCoverage: submission.criterionCoverage.map((coverage) => ({
+      ...coverage,
+      criterion: criteria[Number(coverage.criterionId!.slice("criterion-".length)) - 1]!,
+    })),
+  };
+}
+
+/** Exact criterion identity/prose table shared by builder and remediator. */
+export function criterionCoverageInstructions(
+  packet: DurableArtifact<"BuildPacket">,
+): string {
+  const table = packet.payload.acceptanceCriteria
+    .map((criterion, index) => `criterion-${index + 1} => ${JSON.stringify(criterion)}`)
+    .join("; ");
+  return [
+    `For criterionCoverage, use exactly this controller-frozen table (stable ID => verbatim criterion): ${table}.`,
+    "Include exactly one coverage entry for every table row. Stable IDs must be unique, complete, and in the exact frozen order; copy the criterion text verbatim, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria.",
+  ].join(" ");
+}
+
 /** Controller-only gate for the bounded builder; never inferred from model prose. */
 export function deriveBuilderVerificationGate(
   packet: DurableArtifact<"BuildPacket">,
@@ -151,7 +191,7 @@ export async function buildWorkItem(
         "Use the pure compute tool when a criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, alter workflow state, commit, push, merge, or close issues.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns git publication; your check result is feedback, not controller evidence.",
-        "For criterionCoverage, assign stable IDs criterion-1, criterion-2, and so on in the exact order of the Build Packet acceptanceCriteria; copy every criterion verbatim into the criterion field, preserving punctuation and wording exactly; do not paraphrase, rename, split, or merge criteria. Include exactly one coverage entry for each criterion.",
+        criterionCoverageInstructions(input.packet),
         "Every criterionCoverage entry must include typed anchors: concrete repository paths, stable implementation symbols, stable test/invariant-matrix IDs, and the relevant frozen verification command IDs. Prose implementation notes remain readable but cannot authorize a pass. Use only command IDs actually relevant to that criterion; generic green checks cannot substitute for missing symbol/test evidence.",
         ...(input.packet.payload.evidenceContract?.version === "forgedock.evidence/v1" ? [
           `Evidence contract v1 (controller-frozen, compact): ${input.packet.payload.evidenceContract.criteria.map((criterion) => `${criterion.criterionId}{writePaths=${criterion.allowedWritePaths.join(",") || "none"}; evidenceOnlyPaths=${criterion.allowedEvidencePaths.join(",") || "none"}; commands=${criterion.requiredCommandIds.join(",") || "none"}; semantic=${criterion.semanticCommandIds.join(",") || "none"}; gates=${criterion.controllerGateIds.join(",") || "none"}; invariantRows=${criterion.invariantRowIds.join(",") || "none"}; invariantTests=${criterion.invariantTestIds.join(",") || "none"}}`).join(" | ")}`,
@@ -203,7 +243,7 @@ export async function buildWorkItem(
     });
     const advanced = transition(run, "BUILD_COMPLETED");
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
-    return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
+    return { run: advanced.state, submission: normalizeBuilderSubmission(input.packet, result.output), sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (isRecoverableAgentExecutionError(error)) {

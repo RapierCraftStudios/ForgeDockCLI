@@ -9,7 +9,7 @@ import { clusterMustFixFindings, remediateReview } from "./remediate.js";
 
 const submission = {
   summary: "Fixed medium root", changedPaths: ["src/a.ts"],
-  criterionCoverage: [{ criterionId: "criterion-1", criterion: "Guard remains correct", implementation: "guard fixed", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["test"] } }],
+  criterionCoverage: [{ criterionId: "criterion-1", criterion: "Paraphrased remediation prose", implementation: "guard fixed", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["test"] } }],
   decisions: [], residualRisks: [],
 };
 
@@ -53,6 +53,8 @@ describe("mustFix remediation", () => {
     assert.match(runtime.tasks[0]?.objective ?? "", /medium-root|root-medium/);
     assert.ok(runtime.tasks[0]?.tools.includes("verify"));
     assert.deepEqual(runtime.tasks[0]?.verificationGate, { requiredCommandIds: ["lint", "test"] });
+    assert.match(runtime.tasks[0]?.instructions ?? "", /criterion-1.*Guard remains correct/);
+    assert.equal(result.submission.criterionCoverage[0]?.criterion, "Guard remains correct");
   });
 
   it("bounds clusters without silently dropping roots", () => {

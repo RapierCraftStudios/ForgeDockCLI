@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { buildWorkItem, deriveBuilderVerificationGate, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
+import { buildWorkItem, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
 import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 
@@ -50,6 +50,35 @@ const reportOnlyFailure = createArtifact({
       changedPaths: ["src/a.ts"], diagnostics: [{ code: "evidence-gap", message: "Missing anchor" }], checks: [],
     },
   },
+});
+
+
+describe("criterion report normalization", () => {
+  const packetArtifact = createArtifact({ kind: "BuildPacket", runId: "run_build", subject: { repo: "a/b", issue: 1 }, producer: { role: "packet-author" }, payload: packet });
+  it("normalizes prose only for a complete unique stable-ID table", () => {
+    const normalized = normalizeBuilderSubmission(packetArtifact, {
+      ...submission,
+      criterionCoverage: [{ ...submission.criterionCoverage[0]!, criterionId: "criterion-1", criterion: "paraphrased" }],
+    });
+    assert.equal(normalized.criterionCoverage[0]?.criterion, "State is preserved");
+    assert.match(criterionCoverageInstructions(packetArtifact), /criterion-1.*State is preserved/);
+  });
+
+  it("leaves missing or duplicate IDs untouched for strict verification", () => {
+    const malformed = normalizeBuilderSubmission(packetArtifact, submission);
+    assert.equal(malformed.criterionCoverage[0]?.criterion, "State is preserved");
+    const duplicate = normalizeBuilderSubmission(createArtifact({
+      ...packetArtifact,
+      payload: { ...packet, acceptanceCriteria: ["First", "Second"] },
+    }), {
+      ...submission,
+      criterionCoverage: [
+        { ...submission.criterionCoverage[0]!, criterionId: "criterion-1", criterion: "wrong" },
+        { ...submission.criterionCoverage[0]!, criterionId: "criterion-1", criterion: "wrong" },
+      ],
+    });
+    assert.equal(duplicate.criterionCoverage[0]?.criterion, "wrong");
+  });
 });
 
 

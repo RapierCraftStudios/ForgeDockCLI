@@ -76,12 +76,39 @@ describe("review finding scope policy", () => {
     });
     const locationlessIntroduced = finding({ id: "false-introduced", introducedByRemediation: true });
     delete locationlessIntroduced.location;
-    assert.throws(() => applyFindingScopePolicy([locationlessIntroduced], packet, prior, {
+    const [locationlessDowngraded, validSibling] = applyFindingScopePolicy([locationlessIntroduced, finding({ id: "valid-sibling", matchedPriorFindingIds: ["review-prior"] })], packet, prior, {
       remediationDeltaPaths: ["src/unrelated.ts"],
-    }), /without exact current-head hunk authority/);
-    assert.throws(() => applyFindingScopePolicy([
-      finding({ id: "cumulative", introducedByRemediation: true, location: "src/a.ts:25" }),
-    ], packet, prior, { remediationDeltaPaths: ["src/a.ts"] }), /without exact current-head hunk authority/);
+    });
+    assert.equal(locationlessDowngraded?.scopeDisposition, "follow_up");
+    assert.equal(locationlessDowngraded?.introductionDisposition, "newly-discovered-preexisting");
+    assert.equal(locationlessDowngraded?.blocking, false);
+    assert.equal(locationlessDowngraded?.mustFix, false);
+    assert.equal(locationlessDowngraded?.introducedByRemediation, false);
+    assert.match(locationlessDowngraded?.scopeRationale ?? "", /exact current-head hunk or changed delivery-authority/);
+    assert.equal(validSibling?.blocking, true);
+    assert.equal(validSibling?.scopeDisposition, "in_scope");
+    const unsupportedEvidence = {
+      priorReproducer: "before",
+      currentReproducer: "after",
+      causalSymbols: ["guard"],
+      hunkReferences: ["src/a.ts:L25-L25:guard"],
+    };
+    const [cumulativeDowngraded] = applyFindingScopePolicy([
+      finding({ id: "cumulative", introducedByRemediation: true, location: "src/a.ts:25", introductionEvidence: unsupportedEvidence }),
+    ], packet, prior, { remediationDeltaPaths: ["src/a.ts"] });
+    assert.equal(cumulativeDowngraded?.scopeDisposition, "follow_up");
+    assert.equal(cumulativeDowngraded?.introductionDisposition, "newly-discovered-preexisting");
+    assert.equal(cumulativeDowngraded?.blocking, false);
+    assert.equal(cumulativeDowngraded?.mustFix, false);
+    assert.equal(cumulativeDowngraded?.introducedByRemediation, false);
+    assert.deepEqual(cumulativeDowngraded?.introductionEvidence, unsupportedEvidence);
+
+    const [continuedBadIntroduction] = applyFindingScopePolicy([
+      finding({ id: "continued-bad-intro", matchedPriorFindingIds: ["review-prior"], introducedByRemediation: true }),
+    ], packet, prior, { remediationDeltaPaths: ["src/unrelated.ts"] });
+    assert.equal(continuedBadIntroduction?.scopeDisposition, "in_scope");
+    assert.equal(continuedBadIntroduction?.introductionDisposition, "continuation");
+    assert.equal(continuedBadIntroduction?.introducedByRemediation, false);
 
     const [newConcern, continued] = applyFindingScopePolicy([
       finding({ id: "new", matchedPriorFindingIds: [] }),

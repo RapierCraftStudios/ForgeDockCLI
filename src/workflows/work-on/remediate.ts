@@ -13,7 +13,7 @@ import {
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
 import { WORK_ON_EXECUTION_BUDGETS } from "./execution-budgets.js";
-import { BuilderSubmissionSchema, deriveBuilderVerificationGate, type BuilderSubmission } from "./build.js";
+import { BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError } from "./investigate.js";
 
 export async function remediateReview(
@@ -69,6 +69,7 @@ export async function remediateReview(
         "Use the pure compute tool when an accepted criterion requires hashes, canonical JSON, base64url, or an Ed25519 test vector; never invent cryptographic fixture values.",
         "Do not invoke GitHub, commit, push, merge, or alter workflow state.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns publication; your check result is feedback, not controller evidence.",
+        criterionCoverageInstructions(input.packet),
         "Report the complete current delivery revision: carry forward prior Build Result paths and criterion evidence, then add or revise the paths and criteria changed by this remediation. The controller normalizes omitted in-scope paths to its scoped Git observation, but rejects fabricated reported paths.",
         "The controller re-runs every required verification command and starts a fresh review at the new SHA.",
       ].join("\n"),
@@ -105,7 +106,7 @@ export async function remediateReview(
     });
     const advanced = transition(run, "REMEDIATION_COMPLETED");
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
-    return { run: advanced.state, submission: result.output, sessionRef: result.sessionRef };
+    return { run: advanced.state, submission: normalizeBuilderSubmission(input.packet, result.output), sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (isRecoverableAgentExecutionError(error)) {
