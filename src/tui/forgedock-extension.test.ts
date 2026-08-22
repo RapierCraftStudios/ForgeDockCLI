@@ -2462,7 +2462,7 @@ test("visible decomposition qualifies a child when a foreign root occupies its b
   });
 
   assert.ok(result);
-  assert.equal(result.items[0]?.id, "issue-owner%2Fparent-7");
+  assert.equal(result.items[0]?.id, "issue-r006f0077006e00650072002f0070006100720065006e0074-7");
   assert.notEqual(result.items[0]?.id, "issue-7");
   assert.deepEqual(result.items[0]?.dependencies, []);
 });

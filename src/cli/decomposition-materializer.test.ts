@@ -95,7 +95,7 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(issueReads, [{ repo: "owner/parent", issue: 7 }]);
     assert.deepEqual(repositoryReads, ["owner/parent"]);
     assert.deepEqual(artifactReads, [{ repo: "owner/parent", issue: 42 }]);
-    assert.equal(fresh.items[0]?.id, "issue-owner%2Fparent-7");
+    assert.equal(fresh.items[0]?.id, "issue-r006f0077006e00650072002f0070006100720065006e0074-7");
     assert.equal(fresh.items[0]?.repository, "owner/parent");
     assert.equal(fresh.items[0]?.targetBranch, "parent-main");
     assert.equal(fresh.items[0]?.lane, "fast");
@@ -111,7 +111,7 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(issueReads, [{ repo: "owner/parent", issue: 7 }]);
     assert.deepEqual(repositoryReads, ["owner/parent"]);
     assert.deepEqual(artifactReads, []);
-    assert.equal(resumed.items[0]?.id, "issue-owner%2Fparent-7");
+    assert.equal(resumed.items[0]?.id, "issue-r006f0077006e00650072002f0070006100720065006e0074-7");
     assert.deepEqual(resumed.items[0]?.dependencies, ["parent"]);
   });
 
@@ -156,6 +156,7 @@ describe("CLI decomposition materializer", () => {
     });
     assert.ok(first);
     const firstId = first.items[0]?.id;
+    assert.equal(firstId, "issue-r006f0077006e00650072002f0061002d0062-7");
     assert.notEqual(firstId, "issue-7");
 
     orchestration.nodes = [...orchestration.nodes, {
@@ -169,6 +170,7 @@ describe("CLI decomposition materializer", () => {
     });
     assert.ok(second);
     const secondId = second.items[0]?.id;
+    assert.equal(secondId, "issue-r006f0077006e00650072002f0061005f0062-7");
     assert.notEqual(secondId, "issue-7");
     assert.notEqual(firstId, secondId);
     assert.equal(first.items.filter((item) => item.id === secondId).length, 0);

@@ -60,7 +60,7 @@ describe("decomposition prerequisites", () => {
     const hyphen = decompositionQualifiedNodeId("owner/a-b", 7);
     const underscore = decompositionQualifiedNodeId("owner/a_b", 7);
     assert.notEqual(hyphen, underscore);
-    assert.equal(hyphen, "issue-owner%2Fa-b-7");
-    assert.equal(underscore, "issue-owner%2Fa_b-7");
+    assert.equal(hyphen, "issue-r006f0077006e00650072002f0061002d0062-7");
+    assert.equal(underscore, "issue-r006f0077006e00650072002f0061005f0062-7");
   });
 });

@@ -9,9 +9,25 @@ export interface DecompositionDependencyNodeIdentity {
   memberIssues?: readonly number[];
 }
 
-/** Build a reversible repository-qualified fallback ID without lossy slug collisions. */
+/**
+ * Encode the effective repository without treating punctuation as a separator.
+ *
+ * Node IDs are persisted and later used as graph/lease keys, so the encoding
+ * must be injective for every normalized repository identity. Encoding UTF-16
+ * code units as fixed-width hexadecimal keeps that property without relying on
+ * URL parsing or lossy slug replacement (and is deterministic in every
+ * adapter).
+ */
+function encodeRepositoryForNodeId(repository: string): string {
+  const normalized = normalizeOrchestrationRepository(repository);
+  return Array.from({ length: normalized.length }, (_, index) =>
+    normalized.charCodeAt(index).toString(16).padStart(4, "0"),
+  ).join("");
+}
+
+/** Build a reversible repository-qualified fallback ID without collisions. */
 export function decompositionQualifiedNodeId(repository: string, issue: number): string {
-  return `issue-${encodeURIComponent(normalizeOrchestrationRepository(repository))}-${issue}`;
+  return `issue-r${encodeRepositoryForNodeId(repository)}-${issue}`;
 }
 
 export function dependencyIssueNumbersFromBody(body: string): number[] {
