@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
-import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
+import type { InvestigationReleaseReceipt, OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import {
@@ -44,7 +44,7 @@ import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
-import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
+import { investigateWorkItem, resumeInvestigationWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
 import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
@@ -56,6 +56,7 @@ import { promoteBranch, PromotionExecutionError } from "../workflows/promotion/p
 import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, parseBatchContract, parseBatchMemberIssues, type BatchableWorkItem } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
+import { InvestigationAdmissionService, type InvestigationAdmissionIssue } from "../workflows/orchestrate/investigation-admission.js";
 import { buildSchedulePreview, ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
 import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
@@ -2244,6 +2245,56 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
       discoverVerificationCommands(checkoutRoot, `origin/${targetBranch}`);
     }
+    const admissionIssues: InvestigationAdmissionIssue[] = [];
+    const admissionKeys = new Set<string>();
+    for (const selected of items) {
+      const itemRepository = repositoryForScheduledItem(selected, repository.repo);
+      const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: selected.issue });
+      const key = `${itemRepository.trim().toLowerCase()}#${selected.issue}`;
+      if (admissionKeys.has(key)) continue;
+      admissionKeys.add(key);
+      admissionIssues.push({ repository: itemRepository, issue: selected.issue, targetBranch: route.lane.targetBranch });
+    }
+    const admission = new InvestigationAdmissionService({
+      repository: store,
+      host: github,
+      ...(signal !== undefined ? { signal } : {}),
+      investigate: async ({ issue, repository: issueRepository, targetBranch, baseSha, attempt, signal: admissionSignal }) => {
+        const subject = { repo: issueRepository, issue: issue.number };
+        const durable = await artifacts.list(subject);
+        const existingInvestigation = [...durable].reverse().find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation");
+        if (existingInvestigation) {
+          return {
+            outcome: existingInvestigation.payload.outcome,
+            artifactIds: [existingInvestigation.id],
+            ...(existingInvestigation.payload.decomposition ? { decomposition: existingInvestigation.payload.decomposition } : {}),
+          };
+        }
+        const runId = `run_investigation_${createHash("sha256").update(`${issueRepository.toLowerCase()}#${issue.number}`).digest("hex").slice(0, 24)}`;
+        const intent = createArtifact({
+          kind: "Intent",
+          runId, subject, producer: { role: "controller", runtime: "forgedock" },
+          payload: {
+            title: issue.title,
+            problem: issue.body || issue.title,
+            constraints: [], acceptanceHints: [], dependencies: [], sourceUrl: issue.url,
+          },
+        }, { id: `art_intent_${createHash("sha256").update(runId).digest("hex").slice(0, 32)}` });
+        const existingRun = await baseRuns.load(runId);
+        const investigated = existingRun?.state === "investigating"
+          ? await resumeInvestigationWorkItem({ intent, run: existingRun, ...(admissionSignal ? { signal: admissionSignal } : {}), cwd: checkoutRoot, target: runTargetForLane(requiredOrchestrationRoute(routedIssues, { repository: issueRepository, issue: issue.number }).lane, effective.productionTarget), scopeHints: { affectedFiles: affectedFilesFromIssueBody(issue.body) } }, { runtime, artifacts, runs: baseRuns })
+          : await investigateWorkItem({ intent, cwd: checkoutRoot, ...(admissionSignal ? { signal: admissionSignal } : {}), target: runTargetForLane(requiredOrchestrationRoute(routedIssues, { repository: issueRepository, issue: issue.number }).lane, effective.productionTarget), scopeHints: { affectedFiles: affectedFilesFromIssueBody(issue.body) }, ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}) }, { runtime, artifacts, runs: baseRuns });
+        return {
+          outcome: investigated.investigation.payload.outcome,
+          artifactIds: [investigated.investigation.id, ...(investigated.outcome ? [investigated.outcome.id] : [])],
+          ...(investigated.investigation.payload.decomposition ? { decomposition: investigated.investigation.payload.decomposition } : {}),
+          ...(attempt > 1 ? { error: `recovered investigation attempt ${attempt}` } : {}),
+        };
+      },
+    });
+    const admissionResult = await admission.admit({ repository: repository.repo, issues: admissionIssues });
+    const investigationRelease = admissionResult.releaseReceipt;
+    if (!investigationRelease) throw new Error(`Investigation admission did not release the selected wave (${admissionResult.wave.status})`);
     const materializedResult = assembly.groups.length
       ? await materializeBatchGroups({
         repo: repository.repo,
@@ -2259,7 +2310,15 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
             ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
           }] as const;
-        })),      })
+        })),
+        investigationRelease,
+        revalidateInvestigationRelease: async (receipt) => {
+          for (const base of receipt.bases) {
+            const current = await github.getBranchHead(base.repository, base.targetBranch);
+            if (current.toLowerCase() !== base.baseSha.toLowerCase()) throw new Error(`Investigation base SHA drifted for ${base.repository}#${base.issue}; refusing materialization`);
+          }
+        },
+      })
       : { groups: [], materialized: [], validatedItems: items };
     const contracted = materializedResult.validatedItems;
     for (const materialized of materializedResult.materialized) {
@@ -2288,6 +2347,12 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
+      revalidateInvestigationRelease: async (receipt) => {
+        for (const base of receipt.bases) {
+          const current = await github.getBranchHead(base.repository, base.targetBranch);
+          if (current.toLowerCase() !== base.baseSha.toLowerCase()) throw new Error(`Investigation base SHA drifted for ${base.repository}#${base.issue}; refusing dispatch`);
+        }
+      },
       ...(signal !== undefined ? { signal } : {}),
       transportCapacity: effective.maxParallel,
       maxDecompositionChildren: effective.maxRemediationChildren,
@@ -2605,6 +2670,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       serializationEdges: scheduleItems.edges,
       maxParallel: effective.maxParallel,
       autoMerge,
+      investigationRelease,
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       plan: {
         adapter: "cli",

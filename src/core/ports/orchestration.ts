@@ -1,5 +1,58 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+export type InvestigationSettlementStatus =
+  | "pending"
+  | "running"
+  | "confirmed"
+  | "invalid"
+  | "decomposed"
+  | "failed"
+  | "retrying"
+  | "cancelled";
+
+export type InvestigationWaveStatus = "pending" | "running" | "settled" | "blocked" | "cancelled";
+
+/** Durable controller-owned admission evidence for one selected issue. */
+export interface InvestigationSettlementRecord {
+  repository: string;
+  issue: number;
+  targetBranch: string;
+  baseSha: string;
+  status: InvestigationSettlementStatus;
+  attempt: number;
+  maxAttempts: number;
+  updatedAt: string;
+  artifactIds: string[];
+  replacementIssueNumbers: number[];
+  lineage?: { parentIssue: number; depth: number };
+  error?: string;
+  retryCheckpoint?: { id: string; nextAttemptAt: string; domain: string; code: string };
+}
+
+/** JSON-safe durable barrier state. Version is the CAS/fencing revision. */
+export interface InvestigationWaveRecord {
+  schema: "forgedock.investigation-wave/v1";
+  waveId: string;
+  repository: string;
+  selectedIssueNumbers: number[];
+  issues: InvestigationSettlementRecord[];
+  status: InvestigationWaveStatus;
+  owner: string;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  releaseReceipt?: InvestigationReleaseReceipt;
+}
+
+/** Release evidence is intentionally serializable; no callback is durable authority. */
+export interface InvestigationReleaseReceipt {
+  waveId: string;
+  repository: string;
+  issueNumbers: number[];
+  bases: Array<{ repository: string; issue: number; targetBranch: string; baseSha: string }>;
+  settledAt: string;
+}
+
 export type DurableOrchestrationNodeStatus =
   | "queued"
   | "running"
@@ -211,6 +264,10 @@ export interface OrchestrationRecord {
   nodes: OrchestrationNodeRecord[];
   /** Optional for backward compatibility with pre-serialization-edge records. */
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
+  /** Controller-owned admission barrier persisted with the DAG. */
+  investigationWave?: InvestigationWaveRecord;
+  /** Release receipt is retained on the DAG so recovery cannot bypass admission. */
+  investigationRelease?: InvestigationReleaseReceipt;
 }
 
 /** Canonical repository-qualified identity for issue ownership. */
@@ -361,7 +418,27 @@ export interface OrchestrationRepository {
   listRunningOrchestrations(limit?: number, before?: OrchestrationListCursor): Promise<OrchestrationRecord[]>;
 }
 
+/** Durable wave storage is separate so legacy orchestration adapters remain valid. */
+export interface InvestigationWaveRepository {
+  createInvestigationWave(record: InvestigationWaveRecord): Promise<void>;
+  loadInvestigationWave(waveId: string): Promise<InvestigationWaveRecord | undefined>;
+  saveInvestigationWave(expectedVersion: number, record: InvestigationWaveRecord): Promise<void>;
+  /** Optional dead-owner recovery; must CAS both version and prior owner. */
+  adoptInvestigationWave?(expectedVersion: number, previousOwner: string, record: InvestigationWaveRecord): Promise<void>;
+}
+
 export const MAX_ORCHESTRATION_PAGE_SIZE = 100;
+
+export function investigationReleaseIsSettled(receipt: InvestigationReleaseReceipt, issueNumbers: readonly number[]): void {
+  const expected = [...new Set(issueNumbers)].sort((a, b) => a - b);
+  const actual = [...new Set(receipt.issueNumbers)].sort((a, b) => a - b);
+  if (expected.length !== actual.length || expected.some((issue, index) => issue !== actual[index])) {
+    throw new Error("Investigation release does not cover the exact selected issue set");
+  }
+  if (!receipt.bases.length || receipt.bases.some((base) => !base.targetBranch || !/^[0-9a-f]{40}$/i.test(base.baseSha))) {
+    throw new Error("Investigation release is missing exact base evidence");
+  }
+}
 
 /**
  * Read all bounded running-DAG pages before admitting a fresh scope. Durable

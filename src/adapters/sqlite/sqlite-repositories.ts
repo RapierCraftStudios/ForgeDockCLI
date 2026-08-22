@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { assertArtifact, type ArtifactKind, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseInspection, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
-import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type InvestigationWaveRecord, type InvestigationWaveRepository, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
@@ -37,7 +37,7 @@ export interface SqliteRepositoryPurgeResult {
   leases: number;
 }
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, InvestigationWaveRepository, PromotionRepository {
   readonly #database: DatabaseSync;
   readonly #path: string;
   readonly #witness: LeaseWitness | undefined;
@@ -128,6 +128,13 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       );
       CREATE INDEX IF NOT EXISTS orchestrations_updated ON orchestrations(updated_at);
       CREATE INDEX IF NOT EXISTS orchestrations_running_updated ON orchestrations(status, updated_at, orchestration_id);
+      CREATE TABLE IF NOT EXISTS investigation_waves (
+        wave_id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        owner TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS promotion_records (
         promotion_id TEXT PRIMARY KEY,
         repository TEXT NOT NULL,
@@ -281,6 +288,35 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   async saveOrchestration(record: OrchestrationRecord): Promise<void> {
     await withSqliteBusyRetry(() => this.inTransaction(() => {
       this.saveOrchestrationInTransaction(record);
+    }));
+  }
+
+  async createInvestigationWave(record: InvestigationWaveRecord): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      this.#database.prepare(`INSERT INTO investigation_waves (wave_id, version, owner, updated_at, record_json) VALUES (?, ?, ?, ?, ?)`)
+        .run(record.waveId, record.version, record.owner, record.updatedAt, JSON.stringify(record));
+    }));
+  }
+
+  async loadInvestigationWave(waveId: string): Promise<InvestigationWaveRecord | undefined> {
+    const row = this.#database.prepare("SELECT record_json FROM investigation_waves WHERE wave_id = ?")
+      .get(waveId) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as InvestigationWaveRecord : undefined;
+  }
+
+  async saveInvestigationWave(expectedVersion: number, record: InvestigationWaveRecord): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      const result = this.#database.prepare(`UPDATE investigation_waves SET version = ?, owner = ?, updated_at = ?, record_json = ? WHERE wave_id = ? AND version = ? AND owner = ?`)
+        .run(record.version, record.owner, record.updatedAt, JSON.stringify(record), record.waveId, expectedVersion, record.owner);
+      if (result.changes !== 1) throw new Error(`Stale or fenced investigation wave update: ${record.waveId}`);
+    }));
+  }
+
+  async adoptInvestigationWave(expectedVersion: number, previousOwner: string, record: InvestigationWaveRecord): Promise<void> {
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      const result = this.#database.prepare(`UPDATE investigation_waves SET version = ?, owner = ?, updated_at = ?, record_json = ? WHERE wave_id = ? AND version = ? AND owner = ?`)
+        .run(record.version, record.owner, record.updatedAt, JSON.stringify(record), record.waveId, expectedVersion, previousOwner);
+      if (result.changes !== 1) throw new Error(`Stale investigation wave owner fence: ${record.waveId}`);
     }));
   }
 

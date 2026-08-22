@@ -6,6 +6,7 @@ import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
 import {
   findDurableOrchestrationIssueConflicts,
+  investigationReleaseIsSettled,
   normalizeOrchestrationRepository,
   OrchestrationIssueOwnershipConflictError,
   orchestrationIssueIdentityKey,
@@ -24,6 +25,7 @@ import type {
   OrchestrationRepository,
   OrchestrationWorkerAttemptRecord,
   OrchestrationWorkerAttemptStatus,
+  InvestigationReleaseReceipt,
 } from "../../core/ports/orchestration.js";
 import {
   orchestrationEventFromSchedule,
@@ -58,6 +60,8 @@ export interface CreateOrchestrationInput {
   productionTarget?: string;
   /** Opaque, JSON-safe authorisation/evidence supplied by the planning layer. */
   plan?: OrchestrationPlanMetadata;
+  /** Durable controller-owned investigation barrier receipt. */
+  investigationRelease?: InvestigationReleaseReceipt;
 }
 
 export interface OrchestrationTaskIdentity {
@@ -161,6 +165,8 @@ export interface OrchestrationControllerDependencies {
   maxDecompositionChildren?: number;
   /** Maximum replacement lineage depth (root nodes are depth zero). */
   maxDecompositionDepth?: number;
+  /** Re-read exact branch heads immediately before dispatch/recovery. */
+  revalidateInvestigationRelease?: (receipt: Readonly<InvestigationReleaseReceipt>) => Promise<void>;
   /** Available worker slots in the caller's process/RPC/subagent transport. */
   /** Optional authoritative artifact store for generic retry checkpoints. */
   retryArtifacts?: ArtifactRepository;
@@ -258,6 +264,7 @@ export class OrchestrationController {
       autoMerge: input.autoMerge ?? true,
       ...(input.plan !== undefined ? { plan: structuredClone(input.plan) } : {}),
       ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
+      ...(input.investigationRelease !== undefined ? { investigationRelease: structuredClone(input.investigationRelease) } : {}),
       executionAttempt: 0,
       status: "running",
       createdAt: now,
@@ -367,6 +374,7 @@ export class OrchestrationController {
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);
+      await this.assertInvestigationRelease(state.record);
       await this.flush(state);
 
       if (!prepared.items.length) {
@@ -386,6 +394,7 @@ export class OrchestrationController {
       let schedule: ScheduleResult = scheduleResultFromRecord(state.record, []);
       let pass = prepared;
       while (pass.items.length) {
+        await this.assertInvestigationRelease(state.record);
         const observeTransportCapacity = (capacity: number): void => {
           // This is intentionally an in-memory observation. The next
           // controller checkpoint (attempt, heartbeat, worker transition, or
@@ -460,6 +469,7 @@ export class OrchestrationController {
 
   private async prepareInitial(state: PersistenceState): Promise<PreparedExecution> {
     const items = state.record.nodes.map(itemFromNodeRecord);
+    if (state.record.investigationRelease) investigationReleaseIsSettled(state.record.investigationRelease, state.record.requestedIssueNumbers ?? state.record.issueNumbers);
     const serializationEdges = (state.record.serializationEdges ?? []).map(cloneSerializationEdge);
     validateGraph(items, serializationEdges);
     for (const node of state.record.nodes) await this.assertInitialNodeRoute(state, node);
@@ -472,6 +482,7 @@ export class OrchestrationController {
   }
 
   private async prepareResume(state: PersistenceState): Promise<PreparedExecution> {
+    if (state.record.investigationRelease) investigationReleaseIsSettled(state.record.investigationRelease, state.record.requestedIssueNumbers ?? state.record.issueNumbers);
     const actions = new Map<string, PreparedAction>();
     const completed = new Set(state.record.nodes.filter((node) => node.status === "completed").map((node) => node.id));
 
@@ -1690,6 +1701,13 @@ export class OrchestrationController {
   private async flush(state: PersistenceState): Promise<void> {
     await state.pending;
     if (state.error !== undefined) throw state.error;
+  }
+
+  private async assertInvestigationRelease(record: OrchestrationRecord): Promise<void> {
+    const receipt = record.investigationRelease;
+    if (!receipt) return;
+    investigationReleaseIsSettled(receipt, record.requestedIssueNumbers ?? record.issueNumbers);
+    await this.dependencies.revalidateInvestigationRelease?.(structuredClone(receipt));
   }
 
   private async resolveTransportCapacity(allowZero = false): Promise<number> {

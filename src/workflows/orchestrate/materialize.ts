@@ -11,7 +11,7 @@ import {
   type MaterializedBatchIssue,
 } from "./batching.js";
 import { contractBatchGroups } from "./batching.js";
-import { orchestrationIssueIdentityKey } from "../../core/ports/orchestration.js";
+import { investigationReleaseIsSettled, orchestrationIssueIdentityKey, type InvestigationReleaseReceipt } from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 export interface BatchMaterializationHost {
@@ -37,6 +37,10 @@ export interface MaterializeBatchGroupsInput {
   items?: readonly BatchableWorkItem[];
   /** Optional authoritative lane snapshot keyed by normalized repository plus issue. */
   expectedRoutes?: ExpectedRoutes;
+  /** Controller admission is a required precondition for mutating hosts. */
+  investigationRelease?: InvestigationReleaseReceipt;
+  /** Revalidate captured refs immediately before the first external write. */
+  revalidateInvestigationRelease?: (receipt: Readonly<InvestigationReleaseReceipt>) => Promise<void>;
 }
 
 export interface MaterializeBatchGroupsResult {
@@ -53,6 +57,12 @@ export interface MaterializeBatchGroupsResult {
 export async function materializeBatchGroups(
   input: MaterializeBatchGroupsInput,
 ): Promise<MaterializeBatchGroupsResult> {
+  if (input.investigationRelease) {
+    investigationReleaseIsSettled(input.investigationRelease, input.items
+      ? input.items.flatMap((item) => [item.issue, ...(item.memberIssues ?? [])])
+      : input.groups.flatMap((group) => group.members.map((member) => member.issue)));
+    await input.revalidateInvestigationRelease?.(structuredClone(input.investigationRelease));
+  }
   const groups: IssueBatchGroup[] = [];
   const materialized: MaterializedBatchIssue[] = [];
   const createdIssues: Array<{ repo: string; issue: number }> = [];

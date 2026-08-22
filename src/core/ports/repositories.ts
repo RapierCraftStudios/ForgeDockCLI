@@ -3,7 +3,7 @@
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
 import type { RunState, TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "./forge-host.js";
-import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
+import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type InvestigationWaveRecord, type InvestigationWaveRepository, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
 export interface RemediationAdmissionKey {
   repo: string;
@@ -168,8 +168,36 @@ export class InMemoryArtifactRepository implements ArtifactRepository {
   }
 }
 
-export class InMemoryOrchestrationRepository implements OrchestrationRepository {
+export class InMemoryOrchestrationRepository implements OrchestrationRepository, InvestigationWaveRepository {
   readonly records = new Map<string, OrchestrationRecord>();
+  readonly investigationWaves = new Map<string, InvestigationWaveRecord>();
+
+  async createInvestigationWave(record: InvestigationWaveRecord): Promise<void> {
+    if (this.investigationWaves.has(record.waveId)) throw new Error(`Investigation wave already exists: ${record.waveId}`);
+    this.investigationWaves.set(record.waveId, structuredClone(record));
+  }
+
+  async loadInvestigationWave(waveId: string): Promise<InvestigationWaveRecord | undefined> {
+    const record = this.investigationWaves.get(waveId);
+    return record ? structuredClone(record) : undefined;
+  }
+
+  async saveInvestigationWave(expectedVersion: number, record: InvestigationWaveRecord): Promise<void> {
+    const current = this.investigationWaves.get(record.waveId);
+    if (!current) throw new Error(`Unknown investigation wave: ${record.waveId}`);
+    if (current.version !== expectedVersion) throw new Error(`Stale investigation wave update for ${record.waveId}: expected v${expectedVersion}, found v${current.version}`);
+    if (record.version !== expectedVersion + 1) throw new Error("Investigation wave save must advance exactly one version");
+    if (current.owner !== record.owner) throw new Error(`Investigation wave ${record.waveId} is owned by another controller`);
+    this.investigationWaves.set(record.waveId, structuredClone(record));
+  }
+
+  async adoptInvestigationWave(expectedVersion: number, previousOwner: string, record: InvestigationWaveRecord): Promise<void> {
+    const current = this.investigationWaves.get(record.waveId);
+    if (!current || current.version !== expectedVersion || current.owner !== previousOwner || record.version !== expectedVersion + 1) {
+      throw new Error(`Stale investigation wave owner fence: ${record.waveId}`);
+    }
+    this.investigationWaves.set(record.waveId, structuredClone(record));
+  }
 
   async createOrchestration(record: OrchestrationRecord): Promise<void> {
     if (this.records.has(record.orchestrationId)) throw new Error(`Orchestration already exists: ${record.orchestrationId}`);

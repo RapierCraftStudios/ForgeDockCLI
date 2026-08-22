@@ -9,6 +9,7 @@ import { InMemoryLeaseRepository, InMemoryLeaseWitness } from "../../core/ports/
 import type { OrchestrationRecord, OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
 import { OrchestrationController } from "../../workflows/orchestrate/controller.js";
+import { InvestigationAdmissionService } from "../../workflows/orchestrate/investigation-admission.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
 
@@ -184,6 +185,35 @@ describe("lease-backed orchestration execution admission", () => {
       await claim.release();
     } finally {
       store.close();
+    }
+  });
+
+  it("persists investigation waves with a CAS fence across SQLite instances", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "forgedock-investigation-wave-"));
+    const path = join(directory, "state.db");
+    const first = new SqliteRepositories(path);
+    const second = new SqliteRepositories(path);
+    const baseSha = "b".repeat(40);
+    try {
+      const service = new InvestigationAdmissionService({
+        repository: first,
+        owner: "sqlite-controller",
+        host: {
+          getIssue: async (number) => ({ repo: "owner/repo", number, title: `Issue ${number}`, body: "Fix", url: "https://example.test", state: "OPEN" as const }),
+          getBranchHead: async () => baseSha,
+          materializeDecomposition: async () => [],
+        },
+        investigate: async () => ({ outcome: "confirmed", artifactIds: ["art_investigation"] }),
+      });
+      const result = await service.admit({ repository: "owner/repo", issues: [{ repository: "owner/repo", issue: 9, targetBranch: "main" }] });
+      assert.equal(result.wave.status, "settled");
+      const loaded = await second.loadInvestigationWave(result.wave.waveId);
+      assert.equal(loaded?.issues[0]?.baseSha, baseSha);
+      assert.equal(loaded?.releaseReceipt?.waveId, result.wave.waveId);
+    } finally {
+      first.close();
+      second.close();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
