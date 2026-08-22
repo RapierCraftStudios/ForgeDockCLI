@@ -1615,20 +1615,21 @@ test("preview confirmation rejects changed execution plans", async () => {
   }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /executionPlan changed after confirmation/);
 });
 
-test("preview continuation rejects a wrong token and issue substitution", async () => {
+test("preview continuation rejects model-supplied checkpoint capabilities and issue substitution", async () => {
   const state = fakePi();
   const tool = state.tools.get("forgedock_orchestrate") as any;
   assert.ok(tool);
+  assert.equal(tool.parameters.properties.previewToken, undefined);
   bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
   await tool.execute("preview-replay-guards", {
     issueNumbers: [7],
     executionPlan: [{ issue: 7, title: "Seven", summary: "Original", dependsOn: [], claims: ["src/a"], labels: [] }],
   }, undefined, undefined, { ...commandContext(), hasUI: false } as any);
-  await assert.rejects(() => tool.execute("wrong-token", {
+  await assert.rejects(() => tool.execute("supplied-token", {
     issueNumbers: [7],
     confirmed: true,
     previewToken: "not-the-live-token",
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /missing, expired, or belongs to another preview/);
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /opaque preview checkpoint capability/);
   await assert.rejects(() => tool.execute("wrong-scope", {
     issueNumbers: [8],
     confirmed: true,
@@ -3298,7 +3299,6 @@ test("preview confirmation recognizes a minor proceed typo without recognizing r
 
   const guidance = buildOrchestrationPreviewConfirmationGuidance({
     issueNumbers: [346, 345],
-    previewToken: "preview-token-for-test",
   });
   assert.match(guidance, /call forgedock_orchestrate exactly once/i);
   assert.match(guidance, /"issueNumbers":\[346,345\]/);
@@ -3310,7 +3310,6 @@ test("preview confirmation recognizes a minor proceed typo without recognizing r
 
   const checkpointGuidance = buildOrchestrationPreviewCheckpointGuidance({
     issueNumbers: [346, 345],
-    previewToken: "preview-token-for-test",
   });
   assert.match(checkpointGuidance, /live orchestration preview/);
   assert.match(checkpointGuidance, /forgedock-background-task/);
