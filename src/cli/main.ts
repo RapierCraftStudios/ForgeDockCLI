@@ -61,6 +61,7 @@ import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-r
 import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController } from "../workflows/orchestrate/controller.js";
+import { retryWorkOnAgentBudget } from "../workflows/orchestrate/agent-budget-retry.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { acquireNodeLease, inspectNodeLease, orchestrationNodeLeaseBinding, waitForNodeLease } from "../workflows/orchestrate/node-lease.js";
 import { reconcileAuthoritativeWorkerArtifacts } from "../workflows/orchestrate/reconcile-worker.js";
@@ -2469,6 +2470,17 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
           }
+          const budgetRetry = await retryWorkOnAgentBudget(error, {
+            artifacts,
+            subject,
+            nodeId: item.id,
+            attemptId: controllerContext.attemptId,
+            signal: workerSignal,
+          });
+          if (budgetRetry) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} ${budgetRetry.status === "retry_wait" ? "retry_wait" : "failed"} · native work-on execution budget ${budgetRetry.status === "retry_wait" ? "released for retry" : "exhausted"}\n`);
+            return budgetRetry;
+          }
           if (error instanceof ClaimPromotionRecoveryError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
             return { status: "suspended", error };
@@ -2950,6 +2962,17 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             signal: workerSignal,
           });
         } catch (error) {
+          const budgetRetry = await retryWorkOnAgentBudget(error, {
+            artifacts,
+            subject,
+            nodeId: item.id,
+            attemptId: context.attemptId,
+            signal: workerSignal,
+          });
+          if (budgetRetry) {
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} ${budgetRetry.status === "retry_wait" ? "retry_wait" : "failed"} · native work-on execution budget ${budgetRetry.status === "retry_wait" ? "released for retry" : "exhausted"}\n`);
+            return budgetRetry;
+          }
           if (error instanceof TargetBranchAdvancedError && current.action === "resume" && current.checkpoint === "target-advance") {
             const durableArtifacts = await artifacts.list(subject);
             const checkpoint = latestArtifactOfKind(durableArtifacts, "TargetAdvanceCheckpoint");

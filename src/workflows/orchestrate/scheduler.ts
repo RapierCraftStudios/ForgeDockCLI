@@ -680,7 +680,7 @@ export async function runSchedule(
             });
             if (attempt >= maxAttempts) {
               status.set(item.id, "failed");
-              if (targetMovement) updateQueuedWaitReason(item.id, undefined, false);
+              updateQueuedWaitReason(item.id, undefined, false);
               emit("failed", item.id);
             } else {
               // Retry waits do not occupy worker capacity or a node lease. Keep
@@ -708,6 +708,7 @@ export async function runSchedule(
             emit("suspended", item.id);
           } else if (outcome.status === "failed") {
             status.set(item.id, "failed");
+            if (outcome.retryCode?.endsWith("-exhausted") || outcome.retryCheckpointId !== undefined) waitReasons.delete(item.id);
             errors.set(item.id, asError(outcome.error ?? "scheduled worker failed"));
             emit("failed", item.id);
           } else if (outcome.status === "skipped") {

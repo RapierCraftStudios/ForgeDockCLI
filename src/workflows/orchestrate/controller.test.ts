@@ -1641,6 +1641,37 @@ describe("OrchestrationController", () => {
     assert.equal(result.record.nodes[0]?.status, "completed");
   });
 
+  it("clears stale retry waitReason when bounded retry exhausts", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let calls = 0;
+    const service = controller(repository, async () => {
+      calls += 1;
+      return calls === 1
+        ? { status: "retry_wait", error: "budget", attempt: 1, maxAttempts: 2, retryAfterMs: 1, retryDomain: "workflow" as const, retryCode: "agent-execution-budget" }
+        : { status: "failed", error: "budget exhausted", retryable: false, retryCode: "agent-execution-budget-exhausted", retryCheckpointId: "retry-exhausted" };
+    });
+    const result = await service.createAndRun({ repository: "owner/repo", maxParallel: 1, items: [item("budget-exhaust", 443)] });
+    assert.equal(calls, 2);
+    assert.equal(result.record.nodes[0]?.status, "failed");
+    assert.equal(result.record.nodes[0]?.waitReason, undefined);
+  });
+
+  it("auto-redispatches retry_wait after capacity release in one live schedule", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let calls = 0;
+    const service = controller(repository, async () => {
+      calls += 1;
+      return calls === 1
+        ? { status: "retry_wait", error: "native work-on budget", attempt: 1, maxAttempts: 3, retryAfterMs: 1, retryDomain: "workflow" as const, retryCode: "agent-execution-budget" }
+        : { status: "completed" };
+    });
+    const result = await service.createAndRun({ repository: "owner/repo", maxParallel: 1, items: [item("budget-retry", 443)] });
+    assert.equal(calls, 2);
+    assert.deepEqual(result.schedule.startOrder, ["budget-retry", "budget-retry"]);
+    assert.equal(result.record.nodes[0]?.status, "completed");
+    assert.equal(result.record.nodes[0]?.waitReason, undefined);
+  });
+
   it("auto-redispatches target recovery with fresh attempts in one controller lifecycle", async () => {
     const repository = new RecordingOrchestrationRepository();
     let calls = 0;
