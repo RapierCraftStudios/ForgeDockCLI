@@ -27,6 +27,25 @@ class CommentClient {
 }
 function key(subject: Subject) { return `${subject.repo}#${subject.pr ? `pr${subject.pr}` : `i${subject.issue}`}`; }
 
+const DEFAULT_PULL_REQUEST_HEAD_SHA = "c".repeat(40);
+function pullRequestProjection(
+  number: number,
+  state: "OPEN" | "CLOSED" | "MERGED" = "OPEN",
+  headSha = DEFAULT_PULL_REQUEST_HEAD_SHA,
+  headBranch = "forgedock/issue-186",
+) {
+  return {
+    number,
+    title: "Delivery",
+    body: "",
+    url: `https://github.test/a/b/pull/${number}`,
+    state,
+    headRefOid: headSha,
+    headRefName: headBranch,
+    baseRefName: "staging",
+  };
+}
+
 describe("GitHub read retry boundary", () => {
   it("retries a transient read failure and returns the eventual result", async () => {
     let attempts = 0;
@@ -403,17 +422,7 @@ describe("GitHub pull request diff retrieval", () => {
 });
 
 describe("GitHub pull request admission", () => {
-  const headSha = "c".repeat(40);
-  const pullRequestProjection = (number: number, state: "OPEN" | "CLOSED" | "MERGED" = "OPEN") => ({
-    number,
-    title: "Delivery",
-    body: "",
-    url: `https://github.test/a/b/pull/${number}`,
-    state,
-    headRefOid: headSha,
-    headRefName: "forgedock/issue-186",
-    baseRefName: "staging",
-  });
+  const headSha = DEFAULT_PULL_REQUEST_HEAD_SHA;
 
   it("rejects a GitHub projection whose PR identity differs from the requested number", async () => {
     const client = new GitHubClient();
@@ -1674,6 +1683,128 @@ describe("GitHub remediation admission", () => {
     await assert.rejects(fixture.make().materializeRemediationChildren(input), /post-create read interrupted/);
     await assert.rejects(fixture.make().materializeRemediationChildren(input), /remains unresolved/);
     assert.equal(fixture.creates(), 1);
+  });
+});
+
+describe("GitHub reset safety", () => {
+  const sha = "a".repeat(40);
+
+  it("deletes an exact managed comment only after rereading body and marker identity", async () => {
+    const calls: string[][] = [];
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "api" && args[1]?.includes("/comments?")) {
+        return JSON.stringify([[{ id: 41, body: "managed\n<!-- FORGEDOCK:RESET -->" }]]);
+      }
+      return "";
+    } });
+    await client.deleteIssueComment("a/b", { id: 41, issue: 7, marker: "<!-- FORGEDOCK:RESET -->", bodySha256: createHash("sha256").update("managed\n<!-- FORGEDOCK:RESET -->").digest("hex") });
+    assert.deepEqual(calls.at(-1), ["api", "repos/a/b/issues/comments/41", "--method", "DELETE"]);
+
+    const drifted = new GitHubClient();
+    const changedBody = "different\n<!-- FORGEDOCK:OTHER -->";
+    Object.defineProperty(drifted, "gh", { value: async (args: string[]) => args[1]?.includes("/comments?")
+      ? JSON.stringify([[{ id: 41, body: changedBody }]]) : "" });
+    await assert.rejects(drifted.deleteIssueComment("a/b", { id: 41, issue: 7, marker: "<!-- FORGEDOCK:RESET -->", bodySha256: createHash("sha256").update(changedBody).digest("hex") }), /changed before deletion/);
+
+    const artifact = createArtifact({
+      kind: "Intent", runId: "reset-run", subject: { repo: "a/b", issue: 7 }, producer: { role: "test" },
+      payload: { title: "Reset artifact", problem: "Exact deletion", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const artifactBody = renderArtifactComment(artifact);
+    const artifactClient = new GitHubClient();
+    let artifactDeleted = false;
+    Object.defineProperty(artifactClient, "gh", { value: async (args: string[]) => {
+      if (args[1]?.includes("/comments?")) return JSON.stringify([[{ id: 42, body: artifactBody }]]);
+      if (args.includes("DELETE")) { artifactDeleted = true; return ""; }
+      return "";
+    } });
+    await artifactClient.deleteIssueComment("a/b", { id: 42, issue: 7, marker: `artifact:${artifact.id}`, bodySha256: createHash("sha256").update(artifactBody).digest("hex") });
+    assert.equal(artifactDeleted, true);
+  });
+
+  it("authorizes managed PRs and refs by exact numbers and branches", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "list") return JSON.stringify([{ number: 8 }, { number: 9 }]);
+      if (args[0] === "api" && args[1]?.includes("matching-refs")) return JSON.stringify([[{
+        ref: "refs/heads/forgedock/issue-7-run", object: { sha },
+      }, { ref: "refs/heads/forgedock/issue-99-other", object: { sha } }]]);
+      if (args[0] === "pr" && args[1] === "view") {
+        const number = Number(args[2]);
+        return JSON.stringify(pullRequestProjection(number, "OPEN", sha, number === 8 ? "forgedock/issue-7-run" : "forgedock/issue-99-other"));
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const selection = { repo: "a/b", issueNumbers: [7], dagIds: [] };
+    const authorization = { pullRequestNumbers: [8], headBranches: ["forgedock/issue-7-run"] };
+    assert.deepEqual(await client.listManagedRefs(selection, authorization), [{ name: "forgedock/issue-7-run", kind: "remote", sha, exactRef: "refs/heads/forgedock/issue-7-run", managed: true }]);
+    assert.deepEqual((await client.listPullRequests(selection, authorization)).map(({ number }) => number), [8]);
+  });
+
+  it("closes only the exact open PR and refuses merged or drifted identity", async () => {
+    let state: "OPEN" | "CLOSED" | "MERGED" = "OPEN";
+    const comments: Array<{ body: string }> = [];
+    const calls: string[][] = [];
+    let mutationCalls = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[], input?: string) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify(pullRequestProjection(7, state, sha, "forgedock/issue-7-run"));
+      if (args[0] === "api" && args[1]?.includes("/comments") && args.includes("POST")) {
+        mutationCalls += 1;
+        comments.push({ body: JSON.parse(input ?? "{}").body as string });
+        return "";
+      }
+      if (args[0] === "api" && args[1]?.includes("/comments")) return JSON.stringify([comments]);
+      if (args[0] === "pr" && args[1] === "close") { mutationCalls += 1; state = "CLOSED"; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.closePullRequest("a/b", 7, "Reset");
+    assert.equal(state, "CLOSED");
+    assert.ok(calls.every((args) => args.join(" ").includes("a/b") && args.join(" ").includes("7")), "every close mutation/read must retain exact repo and PR identity");
+
+    state = "MERGED";
+    const mutationsBeforeMerged = mutationCalls;
+    await assert.rejects(client.closePullRequest("a/b", 7, "Reset"), /already MERGED/);
+    assert.equal(mutationCalls, mutationsBeforeMerged, "merged PR must not receive a close/comment mutation");
+  });
+
+  it("compares the exact remote ref SHA before deleting it", async () => {
+    let deleted = false;
+    let deleteCalls = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "api" && args[1]?.includes("git/ref/heads/")) return JSON.stringify({ object: { sha } });
+      if (args.includes("DELETE")) { deleteCalls += 1; deleted = true; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.deleteExactRemoteRef("a/b", "refs/heads/forgedock/issue-7-run", sha.toUpperCase());
+    assert.equal(deleted, true);
+    await assert.rejects(client.deleteExactRemoteRef("a/b", "refs/heads/forgedock/issue-7-run", "b".repeat(40)), /changed before deletion/);
+    assert.equal(deleteCalls, 1);
+    await assert.rejects(client.deleteExactRemoteRef("a/b", "refs/heads/../unsafe", sha), /Unsafe remote ref/);
+    const missing = new GitHubClient();
+    Object.defineProperty(missing, "gh", { value: async () => { throw new Error("HTTP 404: Reference does not exist"); } });
+    await missing.deleteExactRemoteRef("a/b", "refs/heads/forgedock/missing", sha);
+  });
+
+  it("revalidates workflow labels before restoring the pre-reset set", async () => {
+    let labels = ["workflow:building", "customer"];
+    let edits = 0;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "issue" && args[1] === "view") return JSON.stringify({ number: 7, title: "Issue", body: "", url: "https://github.test/a/b/issues/7", state: "OPEN", labels: labels.map((name) => ({ name })), milestone: null });
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "edit") { edits += 1; labels = ["customer"]; return ""; }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    await client.restoreWorkflowLabels("a/b", 7, ["workflow:building"], { current: ["workflow:building"], restored: ["workflow:building"] });
+    const editsBeforeDrift = edits;
+    labels = ["workflow:reviewing"];
+    await assert.rejects(client.restoreWorkflowLabels("a/b", 7, ["workflow:building"], { current: ["workflow:building"], restored: ["workflow:building"] }), /labels changed before reset/);
+    assert.equal(edits, editsBeforeDrift, "label drift must prevent the underlying edit mutation");
   });
 });
 

@@ -1218,3 +1218,152 @@ describe("isolated Git worktrees", () => {
     }
   });
 });
+
+function resetWorktreeFixture(prefix: string, worktreeDirectory = "worktrees") {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const repo = join(root, "repo");
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  git(repo, "config", "user.name", "ForgeDock Test");
+  git(repo, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(repo, "README.md"), "base\n");
+  git(repo, "add", "README.md");
+  git(repo, "commit", "-m", "base");
+  return { root, repo, manager: new GitWorktreeManager(repo, join(root, worktreeDirectory)) };
+}
+
+describe("reset-managed Git worktrees", () => {
+  it("discovers only selected managed worktrees and filters operational dirt", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-discovery-", "managed worktrees");
+    try {
+      const issue = await fixture.manager.create({ runId: "run_reset", issue: 42, baseRef: "HEAD" });
+      writeFileSync(join(issue.path, "changed.txt"), "dirty\n");
+      mkdirSync(join(issue.path, ".forgedock"), { recursive: true });
+      writeFileSync(join(issue.path, ".forgedock", "state.db"), "operational\n");
+      const ignored = join(fixture.root, "ignored");
+      git(fixture.repo, "worktree", "add", "--detach", ignored, "HEAD");
+
+      const found = await fixture.manager.listManagedResetWorktrees({ issueNumbers: [42], dagIds: [] });
+      assert.deepEqual(found, [{ path: resolve(issue.path), branch: issue.branch, headSha: await fixture.manager.head(issue), dirty: ["changed.txt"], managed: true }]);
+      assert.equal((await fixture.manager.listManagedResetWorktrees({ issueNumbers: [], dagIds: [] })).length, 0);
+      await fixture.manager.remove(issue);
+      git(fixture.repo, "worktree", "remove", "--force", ignored);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes an exact managed worktree and its forgedock branch", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-remove-");
+    try {
+      const workspace = await fixture.manager.create({ runId: "run_exact", issue: 43, baseRef: "HEAD" });
+      const headSha = await fixture.manager.head(workspace);
+      await fixture.manager.removeExactManaged({ path: workspace.path, branch: workspace.branch, headSha });
+      await fixture.manager.assertAbsent({ path: workspace.path, branch: workspace.branch, headSha });
+      assert.throws(() => git(fixture.repo, "show-ref", "--verify", `refs/heads/${workspace.branch}`));
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes an exact orphan forgedock branch after its worktree is already absent", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-orphan-");
+    try {
+      const orphan = await fixture.manager.create({ runId: "run_orphan", issue: 46, baseRef: "HEAD" });
+      const headSha = await fixture.manager.head(orphan);
+      git(fixture.repo, "worktree", "remove", "--force", orphan.path);
+      assert.ok(git(fixture.repo, "show-ref", "--verify", `refs/heads/${orphan.branch}`));
+
+      await fixture.manager.removeExactManaged({ path: orphan.path, branch: orphan.branch, headSha });
+      await fixture.manager.assertAbsent({ path: orphan.path, branch: orphan.branch, headSha });
+      assert.throws(() => git(fixture.repo, "show-ref", "--verify", `refs/heads/${orphan.branch}`));
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects orphan branch identity drift without deleting the branch", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-orphan-drift-");
+    try {
+      const orphan = await fixture.manager.create({ runId: "run_orphan_drift", issue: 47, baseRef: "HEAD" });
+      const expectedHead = await fixture.manager.head(orphan);
+      git(fixture.repo, "worktree", "remove", "--force", orphan.path);
+      writeFileSync(join(fixture.repo, "drift.txt"), "drift\n");
+      git(fixture.repo, "add", "drift.txt");
+      git(fixture.repo, "commit", "-m", "drift branch target");
+      git(fixture.repo, "branch", "-f", orphan.branch, git(fixture.repo, "rev-parse", "HEAD"));
+
+      await assert.rejects(
+        fixture.manager.removeExactManaged({ path: orphan.path, branch: orphan.branch, headSha: expectedHead }),
+        /branch identity drift/,
+      );
+      await assert.rejects(
+        fixture.manager.assertAbsent({ path: orphan.path, branch: orphan.branch, headSha: expectedHead }),
+        /branch remains/,
+      );
+      assert.ok(git(fixture.repo, "show-ref", "--verify", `refs/heads/${orphan.branch}`));
+      git(fixture.repo, "branch", "-D", orphan.branch);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects reset removal outside the managed root", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-outside-");
+    try {
+      await assert.rejects(
+        fixture.manager.removeExactManaged({ path: join(fixture.root, "outside"), branch: "forgedock/issue-48-run_outside", headSha: git(fixture.repo, "rev-parse", "HEAD") }),
+        /outside managed root/i,
+      );
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("revalidates worktree identity under the metadata lock before force removal", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-toctou-");
+    let restoreAcquire: (() => void) | undefined;
+    try {
+      const workspace = await fixture.manager.create({ runId: "run_toctou", issue: 45, baseRef: "HEAD" });
+      const headSha = await fixture.manager.head(workspace);
+      const internals = fixture.manager as unknown as { acquireRepositoryMetadataLock: () => Promise<unknown> };
+      const originalAcquire = internals.acquireRepositoryMetadataLock.bind(fixture.manager);
+      restoreAcquire = () => { internals.acquireRepositoryMetadataLock = originalAcquire; };
+      let injected = false;
+      internals.acquireRepositoryMetadataLock = async () => {
+        if (!injected) {
+          injected = true;
+          git(workspace.path, "checkout", "--detach", headSha);
+        }
+        return originalAcquire();
+      };
+      await assert.rejects(
+        fixture.manager.removeExactManaged({ path: workspace.path, branch: workspace.branch, headSha }),
+        /identity drift/,
+      );
+      assert.equal(existsSync(workspace.path), true, "identity drift must prevent force removal");
+      restoreAcquire?.();
+      await fixture.manager.remove(workspace);
+    } finally {
+      restoreAcquire?.();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains review branches while removing the exact selected worktree", async () => {
+    const fixture = resetWorktreeFixture("forgedock-reset-review-");
+    try {
+      const path = join(fixture.root, "worktrees", "review-dag-reset");
+      git(fixture.repo, "worktree", "add", "-b", "review/dag-reset", path, "HEAD");
+      const headSha = git(path, "rev-parse", "HEAD");
+      const found = await fixture.manager.listManagedResetWorktrees({ issueNumbers: [], dagIds: ["dag-reset"] });
+      assert.equal(found[0]?.branch, "review/dag-reset");
+      await fixture.manager.removeExactManaged({ path, branch: "review/dag-reset", headSha });
+      assert.equal(existsSync(path), false);
+      await fixture.manager.assertAbsent({ path, branch: "review/dag-reset", headSha });
+      assert.ok(git(fixture.repo, "show-ref", "--verify", "refs/heads/review/dag-reset"));
+      git(fixture.repo, "branch", "-D", "review/dag-reset");
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+});

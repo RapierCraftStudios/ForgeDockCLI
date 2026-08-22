@@ -75,6 +75,36 @@ describe("typed pristine repository reset", () => {
     assert.deepEqual(manifest.labels["1"]?.restored, ["customer"]);
   });
 
+  it("fails closed when workflow labels drift before restoration", async () => {
+    const deps = fakeDeps();
+    deps.host.readLabels = async () => ({
+      current: ["workflow:building", "customer"],
+      events: [
+        { name: "customer", action: "labeled", occurredAt: "2026-01-01T00:00:00Z", eventId: 1 },
+        { name: "workflow:building", action: "labeled", occurredAt: "2026-01-02T00:00:00Z", eventId: 2 },
+      ], restored: [],
+    });
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    deps.host.readLabels = async () => ({
+      current: ["workflow:reviewing", "customer"],
+      events: [], restored: [],
+    });
+    await assert.rejects(() => applyPristineReset(manifest, manifest.digest, deps), /label beforecondition drift/i);
+    assert.deepEqual(deps.mutations, []);
+  });
+
+  it("discovers and preserves merged pull request identity without destructive actions", async () => {
+    const deps = fakeDeps();
+    deps.host.readPullRequest = async (_repo, number) => ({ number, state: "MERGED", headSha: sha, headBranch: "forgedock/issue-1-run", baseBranch: "main" });
+    deps.host.listPullRequests = async () => [{ number: 7, state: "MERGED", headSha: sha, headBranch: "forgedock/issue-1-run", baseBranch: "main" }];
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    assert.deepEqual(manifest.pullRequests, [{ number: 7, state: "MERGED", headSha: sha, headBranch: "forgedock/issue-1-run", baseBranch: "main" }]);
+    const closeAction = manifest.actions.find((action) => action.type === "close-pull-requests");
+    assert.deepEqual(closeAction, { type: "close-pull-requests", numbers: [] });
+    await applyPristineReset(manifest, manifest.digest, deps);
+    assert.equal(deps.mutations.some((mutation) => mutation.startsWith("close:")), false);
+  });
+
   it("rejects a tampered digest before fencing or cleanup", async () => {
     const deps = fakeDeps();
     const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);

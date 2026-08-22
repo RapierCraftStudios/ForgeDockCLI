@@ -605,30 +605,61 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
   }
 
   async assertAbsent(input: { path: string; branch: string; headSha: string }): Promise<void> {
-    if (existsSync(resolve(input.path))) throw new Error(`Reset worktree postcondition failed; path remains: ${input.path}`);
+    assertInside(this.#root, resolve(input.path));
+    assertSha(input.headSha, "managed worktree HEAD");
+    const path = resolve(input.path);
+    await this.withRepositoryMetadataLock(async () => {
+      if (existsSync(path)) throw new Error(`Reset worktree postcondition failed; path remains: ${input.path}`);
+      if (!isManagedResetBranch(input.branch)) return;
+      const current = await this.readLocalBranchHead(input.branch);
+      if (current !== undefined) throw new Error(`Reset worktree postcondition failed; branch remains: ${input.branch}`);
+    });
   }
 
   async removeExactManaged(input: { path: string; branch: string; headSha: string }): Promise<void> {
     assertInside(this.#root, resolve(input.path));
     assertSha(input.headSha, "managed worktree HEAD");
     const path = resolve(input.path);
-    if (!existsSync(path)) return;
-    const observedRoot = resolve((await this.git(["rev-parse", "--show-toplevel"], path)).trim());
-    const observedBranch = (await this.git(["branch", "--show-current"], path)).trim();
-    const observedHead = (await this.git(["rev-parse", "HEAD"], path)).trim();
-    if (!sameFilesystemPath(observedRoot, path) || observedBranch !== input.branch || observedHead.toLowerCase() !== input.headSha.toLowerCase()) {
-      throw new Error(`Managed worktree identity drift at ${path}`);
-    }
-    await this.remove({ path, branch: input.branch, baseRef: input.headSha, baseSha: input.headSha });
+    await this.withRepositoryMetadataLock(async () => {
+      if (existsSync(path)) {
+        await this.assertManagedWorktreeIdentity({ path, branch: input.branch, headSha: input.headSha });
+        await this.removeLocked({ path, branch: input.branch }, input.headSha);
+      } else {
+        await this.removeExactBranch(input.branch, input.headSha);
+      }
+    });
   }
   async remove(workspace: GitWorkspace): Promise<void> {
     assertInside(this.#root, workspace.path);
-    await this.withRepositoryMetadataLock(async () => {
-      await this.git(["worktree", "remove", "--force", workspace.path], this.#repo);
-      if (workspace.branch.startsWith("forgedock/")) {
-        try { await this.git(["branch", "-D", workspace.branch], this.#repo); } catch { /* branch may already be absent */ }
-      }
-    });
+    await this.withRepositoryMetadataLock(() => this.removeLocked(workspace));
+  }
+  private async assertManagedWorktreeIdentity(input: { path: string; branch: string; headSha: string }): Promise<void> {
+    const observedRoot = resolve((await this.git(["rev-parse", "--show-toplevel"], input.path)).trim());
+    const observedBranch = (await this.git(["branch", "--show-current"], input.path)).trim();
+    const observedHead = (await this.git(["rev-parse", "HEAD"], input.path)).trim();
+    if (!sameFilesystemPath(observedRoot, input.path) || observedBranch !== input.branch || observedHead.toLowerCase() !== input.headSha.toLowerCase()) {
+      throw new Error(`Managed worktree identity drift at ${input.path}`);
+    }
+  }
+  private async removeLocked(workspace: Pick<GitWorkspace, "path" | "branch">, expectedHeadSha?: string): Promise<void> {
+    await this.git(["worktree", "remove", "--force", workspace.path], this.#repo);
+    if (!isManagedResetBranch(workspace.branch)) return;
+    if (expectedHeadSha) {
+      await this.removeExactBranch(workspace.branch, expectedHeadSha);
+      return;
+    }
+    try { await this.git(["branch", "-D", workspace.branch], this.#repo); } catch { /* branch may already be absent */ }
+  }
+  private async removeExactBranch(branch: string, expectedHeadSha: string): Promise<void> {
+    const current = await this.readLocalBranchHead(branch);
+    if (current === undefined) return;
+    if (current.toLowerCase() !== expectedHeadSha.toLowerCase()) throw new Error(`Managed worktree branch identity drift at ${branch}`);
+    await this.git(["branch", "-D", branch], this.#repo);
+  }
+  private async readLocalBranchHead(branch: string): Promise<string | undefined> {
+    if (!isManagedResetBranch(branch)) return undefined;
+    const output = (await this.git(["for-each-ref", "--format=%(objectname)", `refs/heads/${branch}`], this.#repo)).trim();
+    return output || undefined;
   }
 
 
@@ -1259,7 +1290,9 @@ function isOperationalPath(path: string): boolean {
     || normalized === "node_modules"
     || normalized.startsWith("node_modules/");
 }
-function isSafeRepairBranch(value: string): boolean { return Boolean(value) && value.length <= 240 && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") && !/[\s~^:?*\[\\]/.test(value) && value.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== ".."); }
+function isSafeBranchName(value: string): boolean { return Boolean(value) && value.length <= 240 && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") && !/[\s~^:?*\[\\]/.test(value) && value.split("/").every((segment) => Boolean(segment) && segment !== "." && segment !== ".."); }
+function isSafeRepairBranch(value: string): boolean { return isSafeBranchName(value); }
+function isManagedResetBranch(value: string): boolean { return value.startsWith("forgedock/") && isSafeBranchName(value); }
 
 function isSha(value: string): boolean { return /^[0-9a-f]{40,64}$/i.test(value); }
 
