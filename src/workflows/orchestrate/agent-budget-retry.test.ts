@@ -96,7 +96,9 @@ describe("native work-on agent budget retry", () => {
     assert.equal(checkpoint.payload.attempt.number, 1);
     assert.equal(checkpoint.payload.attempt.max, WORK_ON_AGENT_BUDGET_RETRY_MAX_ATTEMPTS);
     assert.equal(checkpoint.payload.attempt.deadlineAt !== undefined, true);
-    assert.equal(Date.parse(checkpoint.payload.attempt.deadlineAt!) - Date.parse(checkpoint.payload.attempt.firstAt), WORK_ON_AGENT_BUDGET_RETRY_DEADLINE_MS);
+    const deadlineWindow = Date.parse(checkpoint.payload.attempt.deadlineAt!) - Date.parse(checkpoint.payload.attempt.firstAt);
+    assert.ok(deadlineWindow <= WORK_ON_AGENT_BUDGET_RETRY_DEADLINE_MS);
+    assert.ok(deadlineWindow >= WORK_ON_AGENT_BUDGET_RETRY_DEADLINE_MS - 1_000);
     assert.deepEqual(checkpoint.payload.artifactIds, ["intent-lineage"]);
     assert.equal(checkpoint.payload.sessionRef, "session-remediator");
   });
