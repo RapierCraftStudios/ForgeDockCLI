@@ -77,7 +77,7 @@ export function scopeManifestFor(source: ScopeManifestSource, hints: ScopeHints 
   const metadataRoots = [...(hints.metadataRoots ?? [])]
     .map(normalizeScopePath)
     .filter((value): value is string => Boolean(value) && isSafeRelativeScopePath(value));
-  const writePaths = canonicalizeConcreteScopePaths(
+  const writePaths = canonicalizeBuilderWritePaths(
     [...(hints.writePaths ?? [])].map(stripLocation),
   );
   const readRoots = [...new Set([...paths, ...metadataRoots])];
@@ -95,7 +95,7 @@ export function scopeManifestForBuildPacket(
   expectedPaths: readonly string[],
   evidencePaths: readonly string[] = [],
 ): ScopeManifest {
-  const writePaths = canonicalizeConcreteScopePaths(expectedPaths);
+  const writePaths = canonicalizeBuilderWritePaths(expectedPaths);
   const readOnlyPaths = canonicalizeConcreteScopePaths(evidencePaths);
   return scopeManifestFor("build-packet", {
     affectedFiles: writePaths,
@@ -153,7 +153,7 @@ function canonicalizeScopeManifest(value: unknown): ScopeManifest {
   if (!readRoots.length) throw new Error("Scope manifest must contain at least one read root");
   const writePaths = scope.writePaths === undefined
     ? []
-    : canonicalizeConcreteScopePaths(assertStringArray(scope.writePaths, "writePaths"));
+    : canonicalizeBuilderWritePaths(assertStringArray(scope.writePaths, "writePaths"));
   return {
     readRoots,
     writeRoots,
@@ -200,6 +200,40 @@ export function canonicalizeConcreteScopePaths(paths: readonly string[]): string
   assertConcreteScopePaths(normalized);
   return [...new Set(normalized)];
 }
+
+const PROTECTED_BUILDER_WRITE_ROOTS = new Set([
+  ".git",
+  ".forgedock",
+  ".pi-subagents",
+  "node_modules",
+]);
+
+/** Validate concrete builder/remediator writes against controller-owned paths. */
+export function assertBuilderWritePaths(paths: readonly string[]): void {
+  assertConcreteScopePaths(paths);
+  const protectedPaths = paths.filter(isProtectedBuilderWritePath);
+  if (protectedPaths.length) {
+    throw new Error(`Protected builder write paths are not allowed: ${protectedPaths.join(", ")}`);
+  }
+}
+
+/** Canonical exact builder writes, excluding operational state and dependencies. */
+export function canonicalizeBuilderWritePaths(paths: readonly string[]): string[] {
+  const normalized = paths.map(normalizeScopePath).filter(Boolean);
+  assertBuilderWritePaths(normalized);
+  return [...new Set(normalized)];
+}
+
+/** Return whether a path enters a controller-owned directory family. */
+export function isProtectedBuilderWritePath(path: string): boolean {
+  const normalized = normalizeScopePath(path);
+  return normalized
+    .split("/")
+    .some((segment) => PROTECTED_BUILDER_WRITE_ROOTS.has(segment.toLowerCase()));
+}
+
+/** Alias used by generic scope-policy callers. */
+export const isProtectedScopePath = isProtectedBuilderWritePath;
 
 /** Top-level, non-root read boundaries used to discover cross-directory consumers. */
 export function scopeDiscoveryRoots(paths: readonly string[]): string[] {

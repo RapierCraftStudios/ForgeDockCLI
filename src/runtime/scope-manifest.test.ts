@@ -61,6 +61,28 @@ describe("scope manifests", () => {
     ]);
   });
 
+  it("rejects protected operational directories and descendants from packet writes", () => {
+    assert.throws(
+      () => scopeManifestForBuildPacket(["src/ok.ts", "NODE_MODULES\\cache\\state.json"]),
+      /Protected builder write paths are not allowed.*NODE_MODULES\/cache\/state\.json/,
+    );
+    assert.throws(
+      () => scopeManifestForBuildPacket([".FoRgEdOcK/state.json"]),
+      /Protected builder write paths are not allowed/,
+    );
+  });
+
+  it("rejects protected paths for generic and remediation manifests", () => {
+    assert.throws(
+      () => scopeManifestFor("issue-hints", { metadataRoots: ["."], writePaths: [".git/hooks/pre-commit"] }),
+      /Protected builder write paths are not allowed/,
+    );
+    assert.throws(
+      () => scopeManifestFor("remediation", { metadataRoots: ["."], writePaths: ["node_modules/cache.json"] }),
+      /Protected builder write paths are not allowed/,
+    );
+  });
+
   it("does not turn semantic claims into nonexistent filesystem roots", () => {
     const manifest = scopeManifestFor("issue-hints", { claims: ["main", "component:api", "src/core"], metadataRoots: ["package.json"] });
     assert.ok(manifest.readRoots.includes("src/core"));

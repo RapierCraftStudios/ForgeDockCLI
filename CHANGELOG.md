@@ -25,6 +25,7 @@
 - Standalone review now distinguishes an empty GitHub required-check projection from a failed check query: `/review-pr` dispatches exact-SHA reviewers with a visible durable warning, while direct, work-on, and promotion merge admission still require a nonempty passing required-check set.
 - Corrected the read-only reviewer contract: new plans omit per-shard tool-call quotas, reviewers continue targeted path-scoped exploration without a fixed tool-call cutoff, and unexpected runtime budget exhaustion fails closed rather than counting as completion or producing a `ReviewVerdict`.
 - Reset cleanup now revalidates managed worktree identity under the metadata lock, removes only exact-SHA orphaned `forgedock/*` branches, and fails closed on path, branch, or head drift, with focused adapter coverage.
+- Build Packet preparation now accepts validated concrete packet paths as exact isolated-worktree write grants without requiring issue or investigation path hints, while protected operational paths remain denied across build, remediation, and scope-receipt manifests.
 
 ## 1.8.1 - 2026-08-17
 

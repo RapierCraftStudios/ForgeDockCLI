@@ -35,7 +35,6 @@ import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract
 import { closeExpectedWriteScope, INVESTIGATION_EVIDENCE_LIMITS, resolveInvestigationEvidenceSources, validateFrozenReadOnlyFile } from "./scope-closure.js";
 import type { EvidencePathDeclaration, InvariantMatrixRow, VerificationEvidenceDiagnostic, RelationGraphCheckpointPayload } from "../../core/artifacts/schema.js";
 import { buildRelationGraph, closeRelationGraph, digestRelation, graphCommandPlanDigest, graphConfigDigest, graphEvidenceContractDigest, relationGraphCheckpointPayload, relationGraphCheckpointId, type RelationGraph } from "../../core/packet/relation-graph.js";
-import { deriveInvestigationScopeDecision, createInvestigationScopeReceipt, INVESTIGATION_SCOPE_LIMITS } from "../../core/packet/investigation-scope.js";
 import { detectRepositoryLanguages, repositoryAdaptersFor } from "../../adapters/repository/index.js";
 
 type VerificationCatalogEntry = Pick<VerificationCommand, "id" | "command" | "args">
@@ -383,32 +382,10 @@ async function materializePacketOutput(
   const investigatedPaths = canonicalizeConcreteScopePaths(investigationSurfaces.filter(isConcreteScopePath));
   const investigationEvidencePaths = await resolveInvestigationEvidenceSources(investigationEvidenceSources, cwd);
   const controllerPaths = canonicalizeConcreteScopePaths(controllerWriteHints.filter(isConcreteScopePath));
-  const noConcreteHints = declaredPaths.length === 0 && controllerPaths.length === 0;
-  const scopeLaneEligible = noConcreteHints
-    && intent !== undefined
-    && investigation !== undefined
-    && subject !== undefined
-    && /^[0-9a-f]{40}$/i.test(baseSha)
-    && investigation.payload.outcome === "confirmed"
-    && investigation.payload.confidence === "high"
-    && investigationEvidencePaths.length > 0;
-  let investigationScopeDecision: Awaited<ReturnType<typeof deriveInvestigationScopeDecision>> | undefined;
-  if (scopeLaneEligible) {
-    investigationScopeDecision = await deriveInvestigationScopeDecision({
-      runId,
-      subject,
-      intent,
-      investigation,
-      baseSha,
-      proposedPaths: output.expectedPaths,
-      cwd,
-      evidencePaths: investigationEvidencePaths,
-      limits: INVESTIGATION_SCOPE_LIMITS,
-    });
-  }
-  const effectiveControllerPaths = investigationScopeDecision?.approvedPaths ?? controllerPaths;
-  // The controller's proven scope closure remains delivery authority. A
-  // high-confidence no-hints lane may add only the exact receipt decision.
+  const effectiveControllerPaths = controllerPaths;
+  // Concrete packet paths are the exact builder grant after canonical path
+  // validation. Investigation/controller hints remain provenance and read-scope
+  // inputs; they do not gate a cross-cutting packet's proposed write set.
   const closure = await closeExpectedWriteScope(output.expectedPaths, {
     issueWriteHints: declaredPaths,
     controllerWriteHints: effectiveControllerPaths,
@@ -497,14 +474,8 @@ async function materializePacketOutput(
     : {};
   const invariantMatrices = deriveSecurityInvariantMatrices(controllerVerifiedOutput);
   if (!catalog) {
-    const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path), scopeLaneEligible);
-    const receipt = investigationScopeDecision && intent && investigation
-      ? graphAuthority.checkpoint && graphAuthority.metadata
-        ? createInvestigationScopeReceipt({ runId, subject: subject!, intent, investigation, baseSha, decision: investigationScopeDecision, relationCheckpointId: graphAuthority.checkpoint.checkpointId!, relationCheckpointDigest: graphAuthority.checkpoint.checkpointDigest!, limits: INVESTIGATION_SCOPE_LIMITS })
-        : undefined
-      : undefined;
-    if (investigationScopeDecision && !receipt) throw new PacketAuthorCorrectableError(["[investigation-scope] Safe architecture scope requires a durable relation checkpoint"]);
-    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}), ...(receipt ? { investigationScopeReceipt: receipt } : {}) };
+    const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}), ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}) };
   }
   // A policy-v2 packet is newly materialized controller authority. Missing
   // capability metadata on any command that will execute is a catalog defect,
@@ -525,11 +496,7 @@ async function materializePacketOutput(
   const selectedCommands = selectedCatalogCommands(controllerVerifiedOutput, catalog.commands);
   const hasExplicitEvidenceCapabilities = selectedCommands.every((command) => command.evidenceCapability !== undefined);
   if (policyMetadata.verificationPolicyVersion !== "forgedock.verification/v2" || !hasExplicitEvidenceCapabilities) {
-    if (!investigationScopeDecision) return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
-    const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, undefined, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path), scopeLaneEligible);
-    if (!graphAuthority.checkpoint || !graphAuthority.metadata) throw new PacketAuthorCorrectableError(["[investigation-scope] Safe architecture scope requires a durable relation checkpoint"]);
-    const receipt = createInvestigationScopeReceipt({ runId, subject: subject!, intent: intent!, investigation: investigation!, baseSha, decision: investigationScopeDecision, relationCheckpointId: graphAuthority.checkpoint.checkpointId!, relationCheckpointDigest: graphAuthority.checkpoint.checkpointDigest!, limits: INVESTIGATION_SCOPE_LIMITS });
-    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices, relationGraph: graphAuthority.metadata, relationGraphCheckpoint: graphAuthority.checkpoint, investigationScopeReceipt: receipt };
+    return { expectedPaths, evidencePaths: evidence.declarations, controllerVerifiedOutput, policyMetadata, invariantMatrices };
   }
   const targetById = new Map((policyMetadata.verificationCommandTargets ?? []).map(({ id, targets }) => [id, targets]));
   const projectedCommands = projectVerificationCapabilities(catalog.commands).map((capability) => ({
@@ -554,11 +521,7 @@ async function materializePacketOutput(
     const semanticNeeded = derivation.diagnostics.some(({ code }) => code === "generic-only-command" || code === "invariant-command-missing" || code === "unusable-semantic-command");
     throw new PacketAuthorCorrectableError(derivationDiagnostics, semanticNeeded && !semanticAvailable);
   }
-  const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path), scopeLaneEligible);
-  if (investigationScopeDecision && (!graphAuthority.checkpoint || !graphAuthority.metadata)) throw new PacketAuthorCorrectableError(["[investigation-scope] Safe architecture scope requires a durable relation checkpoint"]);
-  const receipt = investigationScopeDecision && graphAuthority.checkpoint && graphAuthority.metadata
-    ? createInvestigationScopeReceipt({ runId, subject: subject!, intent: intent!, investigation: investigation!, baseSha, decision: investigationScopeDecision, relationCheckpointId: graphAuthority.checkpoint.checkpointId!, relationCheckpointDigest: graphAuthority.checkpoint.checkpointDigest!, limits: INVESTIGATION_SCOPE_LIMITS })
-    : undefined;
+  const graphAuthority = await deriveRelationGraphMetadataShadow(expectedPaths, declaredPaths, effectiveControllerPaths, cwd, policyMetadata, derivation.contract, baseSha, expectedPaths, evidence.declarations.map(({ path }) => path));
   return {
     expectedPaths,
     evidencePaths: evidence.declarations,
@@ -568,7 +531,6 @@ async function materializePacketOutput(
     invariantMatrices,
     ...(graphAuthority.metadata ? { relationGraph: graphAuthority.metadata } : {}),
     ...(graphAuthority.checkpoint ? { relationGraphCheckpoint: graphAuthority.checkpoint } : {}),
-    ...(receipt ? { investigationScopeReceipt: receipt } : {}),
   };
 }
 
@@ -582,10 +544,9 @@ async function deriveRelationGraphMetadataShadow(
   baseSha: string,
   finalExpectedPaths?: readonly string[],
   finalEvidencePaths: readonly string[] = [],
-  allowPlannedPaths = false,
 ): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
   try {
-    return await deriveRelationGraphMetadata(expectedPaths, issuePaths, controllerPaths, cwd, policyMetadata, evidenceContract, baseSha, finalExpectedPaths, finalEvidencePaths, allowPlannedPaths);
+    return await deriveRelationGraphMetadata(expectedPaths, issuePaths, controllerPaths, cwd, policyMetadata, evidenceContract, baseSha, finalExpectedPaths, finalEvidencePaths);
   } catch (error) {
     if (process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT === "1") throw error;
     return {};
@@ -602,7 +563,6 @@ async function deriveRelationGraphMetadata(
   baseSha: string,
   finalExpectedPaths?: readonly string[],
   finalEvidencePaths: readonly string[] = [],
-  allowPlannedPaths = false,
 ): Promise<{ metadata?: BuildPacketPayload["relationGraph"]; checkpoint?: RelationGraphCheckpointPayload }> {
   const seeds = [...new Set([...issuePaths, ...controllerPaths])].map((path) => ({
     path,
@@ -616,16 +576,13 @@ async function deriveRelationGraphMetadata(
   const availableFiles = new Set(facts.flatMap((fact) => fact.nodes
     .filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test" || node.kind === "config")
     .map((node) => node.identity)));
-  if (!allowPlannedPaths && seeds.some(({ path }) => !availableFiles.has(path))) return {};
-  // Missing paths are allowed only for the controller-approved architecture
-  // lane. Their deterministic placeholder digest records planned authority;
-  // no filesystem claim is made for a path that does not yet exist.
+  if (seeds.some(({ path }) => !availableFiles.has(path))) return {};
   const nodeDigestByPath = new Map(facts.flatMap((fact) => fact.nodes
     .filter((node) => node.kind === "file" || node.kind === "generated" || node.kind === "test" || node.kind === "config")
     .map((node) => [node.identity, node.digest] as const)));
   const authoritativeSeeds = seeds.map((seed) => ({
     ...seed,
-    contentDigest: nodeDigestByPath.get(seed.path) ?? digestRelation({ plannedPath: seed.path, baseSha }),
+    contentDigest: nodeDigestByPath.get(seed.path)!,
   }));
   const configSeeds = facts.flatMap((fact) => fact.nodes
     .filter((node): node is typeof node & { digest: string } => node.kind === "config" && node.identity.includes("/") && Boolean(node.digest))

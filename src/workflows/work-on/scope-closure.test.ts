@@ -10,15 +10,33 @@ import { closeExpectedWriteScope, resolveInvestigationEvidenceSources } from "./
 const configLiteral = "docs/CONFIG.md";
 
 describe("scope closure", () => {
-  it("admits deterministic source/test companions but not arbitrary root siblings", async () => {
-    const result = await closeExpectedWriteScope(["src/widget.ts", "test/widget.test.ts", "src/unrelated.test.ts"], {
-      issueWriteHints: ["src/widget.ts"],
-    });
-    assert.deepEqual(result.expectedPaths, ["src/widget.ts", "test/widget.test.ts"]);
-    assert.deepEqual(result.rejectedPaths, ["src/unrelated.test.ts"]);
-    assert.match(result.diagnostics[0] ?? "", /bounded companion/);
+  it("accepts concrete cross-cutting claims without issue hints", async () => {
+    const result = await closeExpectedWriteScope(["src/widget.ts", "test/widget.test.ts", "src/unrelated.test.ts"]);
+    assert.deepEqual(result.expectedPaths, ["src/unrelated.test.ts", "src/widget.ts", "test/widget.test.ts"]);
+    assert.deepEqual(result.rejectedPaths, []);
+    assert.deepEqual(result.diagnostics, []);
   });
 
+  it("refuses protected operational directories and descendants", async () => {
+    const result = await closeExpectedWriteScope([
+      "src/ok.ts",
+      ".GIT\\hooks\\pre-commit",
+      "node_modules/cache.json",
+      ".pi-subagents/state.json",
+    ]);
+    assert.deepEqual(result.expectedPaths, ["src/ok.ts"]);
+    assert.deepEqual(result.rejectedPaths, []);
+    assert.ok(result.diagnostics.length >= 1);
+    assert.match(result.diagnostics[0] ?? "", /Protected builder write paths/);
+  });
+
+  it("keeps unsafe and non-concrete proposals denied", async () => {
+    const result = await closeExpectedWriteScope(["../escape.ts", "/absolute.ts", "src/*.ts", "src/safe.ts"]);
+    assert.deepEqual(result.expectedPaths, ["src/safe.ts"]);
+    assert.deepEqual(result.rejectedPaths, []);
+    assert.equal(result.diagnostics.length, 1);
+    assert.match(result.diagnostics[0] ?? "", /invalid-write-path/);
+  });
   it("keeps investigation surfaces read-only and accepts controller write hints", async () => {
     const result = await closeExpectedWriteScope(["src/consumer.ts", "src/contract.ts"], {
       issueWriteHints: ["src/consumer.ts"],
@@ -28,7 +46,7 @@ describe("scope closure", () => {
     assert.deepEqual(result.collateralPaths, []);
   });
 
-  it("admits a collateral test only when its frozen content references the hinted config", async () => {
+  it("accepts concrete packet paths alongside issue hints", async () => {
     assert.equal(configLiteral, "docs/CONFIG.md");
     const result = await closeExpectedWriteScope(["src/workflows/work-on/scope-closure.test.ts"], {
       issueWriteHints: ["docs/CONFIG.md"],
@@ -38,7 +56,7 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
-  it("admits a prefixed regression test for a short documentation contract stem", async () => {
+  it("accepts concrete regression paths with short contract hints", async () => {
     const result = await closeExpectedWriteScope(["src/core/config/forgedock-config.test.ts"], {
       issueWriteHints: ["docs/CONFIG.md"],
     });
@@ -46,7 +64,7 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
-  it("recognizes multi-extension declaration companions", async () => {
+  it("accepts declaration paths with implementation hints", async () => {
     const result = await closeExpectedWriteScope(["vendor/pi-runtime/dist/core/tools/ls.d.ts"], {
       issueWriteHints: ["vendor/pi-runtime/dist/core/tools/ls.js"],
     });
@@ -71,7 +89,7 @@ describe("scope closure", () => {
     assert.deepEqual(result.rejectedPaths, []);
   });
 
-  it("admits a bounded transitive controller dependency set regardless of proposal order", async () => {
+  it("accepts all concrete paths regardless of proposal order", async () => {
     const proposed = [
       "src/workflows/work-on/complete.test.ts",
       "src/workflows/review-pr/ci-policy.test.ts",
@@ -89,19 +107,21 @@ describe("scope closure", () => {
     assert.equal(proposed.every((path) => result.expectedPaths.includes(path)), true);
   });
 
-  it("rejects investigation-only exact and basename-related writes", async () => {
-    const exact = await closeExpectedWriteScope(["docs/CONFIG.md"], {
-    });
-    assert.deepEqual(exact.expectedPaths, []);
-    assert.deepEqual(exact.rejectedPaths, ["docs/CONFIG.md"]);
-
-    const companion = await closeExpectedWriteScope(["tests/forgedock-config.test.ts"], {
-    });
-    assert.deepEqual(companion.expectedPaths, []);
-    assert.deepEqual(companion.rejectedPaths, ["tests/forgedock-config.test.ts"]);
+  it("accepts investigation surfaces as claims without write hints", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-evidence-claims-"));
+    try {
+      await mkdir(join(cwd, "scripts"), { recursive: true });
+      await writeFile(join(cwd, "scripts/stage-generated.mjs"), "export default true;\n");
+      const paths = await resolveInvestigationEvidenceSources(["scripts/stage-generated.mjs:9-21"], cwd);
+      const closure = await closeExpectedWriteScope(paths, {});
+      assert.deepEqual(closure.expectedPaths, paths);
+      assert.deepEqual(closure.rejectedPaths, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
-  it("admits an investigation path only when explicitly repeated by controller write hints", async () => {
+  it("retains controller hints as provenance without gating claims", async () => {
     const result = await closeExpectedWriteScope(["docs/CONFIG.md"], {
       controllerWriteHints: ["docs/CONFIG.md"],
     });
@@ -122,8 +142,8 @@ describe("scope closure", () => {
       ], cwd);
       assert.deepEqual(paths, ["config/runtime.json", "scripts/stage-generated.mjs"]);
       const closure = await closeExpectedWriteScope(paths, {});
-      assert.deepEqual(closure.expectedPaths, []);
-      assert.deepEqual(closure.rejectedPaths, paths);
+      assert.deepEqual(closure.expectedPaths, paths);
+      assert.deepEqual(closure.rejectedPaths, []);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -172,11 +192,12 @@ describe("scope closure", () => {
     }
   });
 
-  it("bounds collateral admission", async () => {
+  it("does not truncate concrete claims to a companion bound", async () => {
     const result = await closeExpectedWriteScope([
       "src/a.ts", "test/a.test.ts", "tests/a.spec.ts", "fixtures/a.fixture.ts",
     ], { issueWriteHints: ["src/a.ts"], maxCollateralPaths: 1 });
-    assert.equal(result.collateralPaths.length, 1);
-    assert.ok(result.diagnostics.some((diagnostic) => diagnostic.includes("write-scope-limit")));
+    assert.deepEqual(result.expectedPaths, ["fixtures/a.fixture.ts", "src/a.ts", "test/a.test.ts", "tests/a.spec.ts"]);
+    assert.deepEqual(result.rejectedPaths, []);
+    assert.deepEqual(result.diagnostics, []);
   });
 });

@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { resolve, relative, isAbsolute, posix, join } from "node:path";
+import { resolve, relative, isAbsolute, join } from "node:path";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
-import { canonicalizeConcreteScopePaths, isConcreteScopePath } from "../../runtime/agent-runtime.js";
+import { canonicalizeBuilderWritePaths, canonicalizeConcreteScopePaths, isConcreteScopePath } from "../../runtime/agent-runtime.js";
 
-const COLLATERAL_LIMIT = 16;
-const MAX_RELATION_READS = 32;
-const MAX_RELATION_BYTES = 128 * 1024;
-const TEST_SUFFIX = /(?:\.test|\.spec|\.fixture)$/i;
 
 /**
  * Resolve only controller-observed Investigation evidence locations into
@@ -118,11 +114,10 @@ function safeEvidenceLocation(source: string, path: string): boolean {
 }
 
 export interface ScopeClosureInput {
-  /** Concrete paths declared by the issue/controller and therefore direct authority. */
+  /** Optional issue/controller claims retained as provenance metadata. */
   issueWriteHints?: readonly string[];
-  /** Concrete paths supplied by the controller outside the model output. */
   controllerWriteHints?: readonly string[];
-  /** Frozen checkout used to prove literal/import relations for collateral files. */
+  /** Deprecated compatibility fields; path claims are no longer relation-closed. */
   cwd?: string;
   maxCollateralPaths?: number;
 }
@@ -135,74 +130,35 @@ export interface ScopeClosureResult {
 }
 
 /**
- * Close a proposed packet write scope without turning a read/discovery root into
- * write authority. Direct hints are retained; a model-proposed collateral path
- * is admitted only when it is a bounded companion (same logical basename, with
- * test/spec/fixture suffixes ignored) of a concrete hint. This deliberately
- * admits source/test pairs such as src/foo.ts + test/foo.test.ts while rejecting
- * arbitrary siblings in src or an unbounded directory proposal.
+ * Canonicalize a proposed packet scope. A packet-author proposal is accepted
+ * as the exact builder grant after concrete-path validation; managed-worktree
+ * containment, observed diff, verification, and review remain the authority
+ * boundaries for what may actually be changed and delivered.
  */
 export async function closeExpectedWriteScope(
   proposed: readonly string[],
   input: ScopeClosureInput = {},
 ): Promise<ScopeClosureResult> {
   const diagnostics: string[] = [];
-  const rejectedPaths: string[] = [];
-  const maxCollateralPaths = Math.max(0, Math.min(COLLATERAL_LIMIT, input.maxCollateralPaths ?? COLLATERAL_LIMIT));
   const issueHints = canonicalConcrete(input.issueWriteHints ?? [], diagnostics);
   const directHints = canonicalConcrete([
     ...issueHints,
     ...(input.controllerWriteHints ?? []),
   ], diagnostics);
-  const relationHints = [...directHints];
-  const directSet = new Set(directHints);
-  const collateral: string[] = [];
-  const accepted = new Set(issueHints);
-  const contents = new Map<string, string | undefined>();
-  let relationReads = 0;
   const proposedPaths = canonicalConcrete(proposed, diagnostics);
-  const pending = [...new Set(proposedPaths.filter((path) => !directSet.has(path)))];
-  for (const path of proposedPaths) if (directSet.has(path)) accepted.add(path);
+  const directSet = new Set(directHints);
 
-  // Resolve a bounded fixed point over real source/import relationships. This
-  // lets a controller-authorized interface admit its direct implementation and
-  // tests regardless of model output ordering, without trusting investigation
-  // prose or unrelated same-root files as write authority.
-  let advanced = true;
-  while (advanced && pending.length && collateral.length < maxCollateralPaths) {
-    advanced = false;
-    for (let index = 0; index < pending.length && collateral.length < maxCollateralPaths;) {
-      const path = pending[index]!;
-      const basenameRelation = isBasenameCompanion(path, relationHints);
-      const contentRelation = !basenameRelation && input.cwd !== undefined
-        ? await hasFrozenContentRelation(path, relationHints, input.cwd, contents, () => {
-          relationReads += 1;
-          return relationReads <= MAX_RELATION_READS;
-        })
-        : false;
-      if (!basenameRelation && !contentRelation) {
-        index += 1;
-        continue;
-      }
-      pending.splice(index, 1);
-      collateral.push(path);
-      accepted.add(path);
-      relationHints.push(path);
-      advanced = true;
-    }
-  }
-  rejectedPaths.push(...pending);
-
-  if (rejectedPaths.length) {
-    diagnostics.push(`[write-scope] Expected paths are not directly hinted or a bounded companion of a write hint: ${[...new Set(rejectedPaths)].sort().join(", ")}`);
-  }
-  if (proposedPaths.length > maxCollateralPaths + directHints.length) {
-    diagnostics.push(`[write-scope-limit] At most ${maxCollateralPaths} collateral expected paths may be admitted before freeze`);
-  }
+  // A packet author runs read-only in a managed worktree. Its concrete path
+  // list is therefore the exact builder grant after canonical validation; the
+  // builder can still change only inside that grant. Observed diff, verification,
+  // and review gates remain authoritative for what is actually delivered. Do
+  // not require issue/controller hints to bless a claim: issues with
+  // investigation-discovered cross-cutting scope have no reliable direct hint
+  // to seed a basename/companion closure.
   return {
-    expectedPaths: [...accepted].sort(),
-    collateralPaths: [...new Set(collateral)].sort(),
-    rejectedPaths: [...new Set(rejectedPaths)].sort(),
+    expectedPaths: [...new Set([...directHints, ...proposedPaths])].sort(),
+    collateralPaths: proposedPaths.filter((path) => !directSet.has(path)).sort(),
+    rejectedPaths: [],
     diagnostics,
   };
 }
@@ -213,118 +169,13 @@ function canonicalConcrete(paths: readonly string[], diagnostics: string[]): str
     const invalid = paths.filter((path) => !isConcreteScopePath(path));
     diagnostics.push(`[invalid-write-path] Write hints/proposals must be concrete repository-relative files: ${invalid.join(", ")}`);
   }
-  try {
-    return canonicalizeConcreteScopePaths(concrete);
-  } catch (error) {
-    diagnostics.push(`[invalid-write-path] ${error instanceof Error ? error.message : String(error)}`);
-    return [];
-  }
-}
-
-function isBasenameCompanion(candidate: string, hints: readonly string[]): boolean {
-  const candidateKey = logicalBasename(candidate);
-  if (!candidateKey) return false;
-  return hints.some((hint) => {
-    const hintKey = logicalBasename(hint);
-    if (hintKey === candidateKey) return true;
-    // Documentation contracts commonly use a short product-neutral stem
-    // (`CONFIG.md`) while their existing regression test carries a bounded
-    // product prefix (`forgedock-config.test.ts`). Permit that suffix relation
-    // only for test/spec/fixture candidates, never for production sources.
-    return isTestLike(candidate) && ["-", "_", "."].some((separator) =>
-      candidateKey.endsWith(`${separator}${hintKey}`) || hintKey.endsWith(`${separator}${candidateKey}`));
-  });
-}
-
-function isTestLike(path: string): boolean {
-  const basename = path.split("/").at(-1) ?? "";
-  const withoutExtension = basename.replace(/\.d\.[^.]+$/i, "").replace(/\.[^.]+$/, "");
-  return TEST_SUFFIX.test(withoutExtension);
-}
-
-async function hasFrozenContentRelation(
-  candidate: string,
-  hints: readonly string[],
-  cwd: string,
-  contents: Map<string, string | undefined>,
-  canRead: () => boolean,
-): Promise<boolean> {
-  const paths = [...new Set([candidate, ...hints])];
-  for (const path of paths) {
-    const content = await readBoundedRepositoryFile(path, cwd, contents, canRead);
-    if (content === undefined) continue;
-    if (path === candidate) {
-      for (const hint of hints) {
-        if (containsLiteralPathReference(content, path, hint)) return true;
-      }
-    } else if (containsLiteralPathReference(content, path, candidate)) {
-      return true;
+  const allowed: string[] = [];
+  for (const path of concrete) {
+    try {
+      allowed.push(...canonicalizeBuilderWritePaths([path]));
+    } catch (error) {
+      diagnostics.push(`[invalid-write-path] ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  return false;
-}
-
-async function readBoundedRepositoryFile(
-  path: string,
-  cwd: string,
-  contents: Map<string, string | undefined>,
-  canRead: () => boolean,
-): Promise<string | undefined> {
-  if (contents.has(path)) return contents.get(path);
-  if (!canRead()) return undefined;
-  const root = resolve(cwd);
-  const absolute = resolve(root, path);
-  const relativePath = relative(root, absolute).replaceAll("\\", "/");
-  if (!relativePath || relativePath.startsWith("../") || isAbsolute(relativePath)) {
-    contents.set(path, undefined);
-    return undefined;
-  }
-  try {
-    const realRoot = await realpath(root);
-    const realFile = await realpath(absolute);
-    const realRelative = relative(realRoot, realFile).replaceAll("\\", "/");
-    if (!realRelative || realRelative.startsWith("../") || isAbsolute(realRelative)) {
-      contents.set(path, undefined);
-      return undefined;
-    }
-    const value = await readFile(realFile, { encoding: "utf8" });
-    const bounded = value.slice(0, MAX_RELATION_BYTES);
-    contents.set(path, bounded);
-    return bounded;
-  } catch {
-    contents.set(path, undefined);
-    return undefined;
-  }
-}
-
-function containsLiteralPathReference(content: string, sourcePath: string, referencedPath: string): boolean {
-  const forms = new Set([referencedPath, `./${referencedPath}`, `/${referencedPath}`]);
-  const referencedModule = stripModuleExtension(referencedPath);
-  for (const quote of ["\"", "'", "`"] as const) {
-    let cursor = 0;
-    while (cursor < content.length) {
-      const start = content.indexOf(quote, cursor);
-      if (start < 0) break;
-      const end = content.indexOf(quote, start + 1);
-      if (end < 0) break;
-      const literal = content.slice(start + 1, end).replaceAll("\\", "/");
-      if (forms.has(literal) || literal.endsWith(`/${referencedPath}`)) return true;
-      if (literal.startsWith(".")) {
-        const resolvedImport = posix.normalize(posix.join(posix.dirname(sourcePath), literal));
-        if (!resolvedImport.startsWith("../") && stripModuleExtension(resolvedImport) === referencedModule) return true;
-      }
-      cursor = end + 1;
-    }
-  }
-  return false;
-}
-
-function stripModuleExtension(path: string): string {
-  return path.replace(/\.(?:[cm]?[jt]sx?)$/i, "");
-}
-
-function logicalBasename(path: string): string {
-  const basename = path.split("/").at(-1) ?? "";
-  const withoutExtension = basename.replace(/\.d\.[^.]+$/i, "").replace(/\.[^.]+$/, "");
-  return withoutExtension.replace(TEST_SUFFIX, "").toLowerCase();
+  return [...new Set(allowed)];
 }

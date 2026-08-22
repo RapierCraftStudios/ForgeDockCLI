@@ -84,6 +84,15 @@ test("reviewer scope receipts are whole-checkout read-only and tamper evident", 
   assert.throws(() => validateScopeManifestReceipt({ ...receipt, scopeDigest: "0".repeat(64) }), /does not match/);
 });
 
+test("scope receipts reject protected write paths", () => {
+  assert.throws(() => createScopeManifestReceipt({
+    readRoots: ["."],
+    writeRoots: [],
+    writePaths: [".PI-SUBAGENTS/state.json"],
+    source: "remediation",
+  }), /Protected builder write paths are not allowed/);
+});
+
 test("runtime budgets are opt-in and parse only explicit positive limits", () => {
   assert.deepEqual(configuredRuntimeBudgetLimits({}), {});
   assert.deepEqual(configuredRuntimeBudgetLimits({
