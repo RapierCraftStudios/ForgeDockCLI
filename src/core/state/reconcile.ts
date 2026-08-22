@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DurableArtifact } from "../artifacts/schema.js";
-import type { RunStateName } from "./machine.js";
+import type { ArtifactRepository, RunRepository } from "../ports/repositories.js";
+import type { RunStateName, RunState } from "./machine.js";
 
 export interface ReconciledSemanticState {
   state: RunStateName;
@@ -14,6 +15,46 @@ export interface ReconciledSemanticState {
 
 export interface ReconciledSubjectState extends ReconciledSemanticState {
   runId?: string;
+}
+
+export interface FreshFailureRunResolution {
+  run: RunState;
+  /** The local caller is stale and must not publish a synthetic failure. */
+  preserve: boolean;
+}
+
+const recoverableFailureStates = new Set<RunStateName>([
+  "investigating", "preparing", "building", "publishing", "target_recovery",
+  "retry_wait", "remediating", "merging", "reviewing", "blocked",
+]);
+
+/**
+ * Reload controller state before an outer delegated catch publishes FAIL.
+ * Downstream phases may have durably advanced the run while the caller still
+ * holds an older snapshot.  In that case the durable artifact projection is
+ * the recovery authority; never overwrite it with a stale failure transition.
+ */
+export async function resolveFreshFailureRun(input: {
+  run: RunState;
+  artifacts: ArtifactRepository;
+  runs: RunRepository;
+}): Promise<FreshFailureRunResolution> {
+  const authoritative = await input.runs.load(input.run.runId);
+  if (!authoritative) return { run: input.run, preserve: false };
+  if (authoritative.version <= input.run.version) return { run: authoritative, preserve: false };
+  const artifacts = await input.artifacts.list(input.run.subject);
+  const reconciled = reconcileLatestRunArtifacts(artifacts);
+  const durableSemanticEvidence = artifacts.some((artifact) =>
+    artifact.kind === "BuildResult"
+    || artifact.kind === "VerificationCheckpoint"
+    || artifact.kind === "ReviewVerdict"
+    || artifact.kind === "Outcome"
+    || artifact.kind === "RemediationBlocked"
+    || artifact.kind === "TargetAdvanceCheckpoint");
+  const preserve = reconciled.runId === input.run.runId
+    && recoverableFailureStates.has(authoritative.state)
+    && durableSemanticEvidence;
+  return { run: authoritative, preserve };
 }
 
 export interface ReviewedTargetCheckpointValidation {

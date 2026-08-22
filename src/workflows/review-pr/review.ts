@@ -6,6 +6,7 @@ import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
+import { resolveFreshFailureRun } from "../../core/state/reconcile.js";
 import { AgentExecutionInterruptedError, AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEvent, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { SemanticIdleWatchdog } from "../../runtime/semantic-idle.js";
@@ -1012,6 +1013,11 @@ export async function reviewPullRequest(
     const rawReason = error instanceof Error ? error.message : String(error);
     const reason = projectionCheckpointStarted ? `review-finding publication failed: ${rawReason}` : rawReason;
     const interrupted = error instanceof AgentExecutionInterruptedError;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     const event = error instanceof ReviewWaveIncompleteError || interrupted ? "REVIEW_BLOCKED" as const : "FAIL" as const;
     const failed = transition(run, event, { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);

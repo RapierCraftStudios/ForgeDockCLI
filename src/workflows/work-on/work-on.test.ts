@@ -789,6 +789,53 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["packet-author"]);
   });
 
+  it("preserves a newer remediating run when build resume catches a stale downstream failure", async () => {
+    const fixture = await createBuildCheckpointFixture("run_stale_outer_catch");
+    const { artifacts, runs, intent, investigationArtifact, packetArtifact } = fixture;
+    const freshBuild = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Fresh build",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [],
+      },
+    });
+    const freshVerdict = createArtifact({
+      kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: 11 }, producer: { role: "controller" },
+      payload: { headSha: sha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    const callbackError = new Error("stale downstream callback");
+    let injected = false;
+    const onClaimsPromoted = async () => {
+      if (injected) return;
+      injected = true;
+      await artifacts.append(freshBuild);
+      await artifacts.append(freshVerdict);
+      let current = await runs.load(intent.runId);
+      if (!current) throw new Error("Missing run during stale catch injection");
+      for (const event of ["BUILD_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED"] as const) {
+        const advanced = transition(current, event, { headSha: sha });
+        await runs.commit(current.version, advanced.state, advanced.record);
+        current = advanced.state;
+      }
+      throw callbackError;
+    };
+    await assert.rejects(resumeBuildWorkOn({
+      run: fixture.run, intent, investigation: investigationArtifact, packet: packetArtifact,
+      workspace, baseBranch: "main", verification: [targetedTestVerification], onClaimsPromoted,
+    }, {
+      runtime: new FakeAgentRuntime([]), artifacts, runs, git: fixture.git,
+      verifier: new EndToEndVerifier(), host: fixture.host,
+    }), (error: unknown) => {
+      assert.equal(error instanceof Error ? error.name : undefined, "WorkflowExecutionError");
+      assert.notEqual(error instanceof Error ? error.name : undefined, "ConcurrentRunUpdateError");
+      return true;
+    });
+    const persisted = await runs.load(intent.runId);
+    assert.equal(persisted?.state, "remediating");
+    assert.equal(persisted?.version, 8);
+    assert.equal((await runs.history(intent.runId)).some((record) => record.event === "FAIL"), false);
+  });
   it("dispatches the builder only after successful claim promotion from the preparation checkpoint", async () => {
     const fixture = await createPreparationCheckpointFixture("run_preparation_claim_success");
     const runtime = new FakeAgentRuntime([packet, submission, { summary: "Approved", findings: [] }]);

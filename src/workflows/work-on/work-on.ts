@@ -18,6 +18,7 @@ import {
   MAX_VERIFICATION_REPAIR_ATTEMPTS,
 } from "../../core/state/admission.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
+import { resolveFreshFailureRun } from "../../core/state/reconcile.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
 import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestForBuildPacket, STANDARD_SCOPE_METADATA_ROOTS, isRecoverableAgentExecutionError } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
@@ -540,6 +541,21 @@ async function resumeTargetAdvanceWorkOnInternal(
     workspace: workspace.path, findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
   }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+  // Review is the final semantic phase of ordinary target recovery. Persist it
+  // against the fresh receipts so a crash after review resumes remediation (or
+  // merge) rather than replaying target movement from the stale source head.
+  await persistTargetAdvanceCheckpoint({
+    run: reviewed.run, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult,
+    workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "reviewed",
+    attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    freshVerificationCheckpointId: verificationCheckpoint.id,
+    freshBuildResultId: freshBuildResult.id,
+    integrationHeadSha: newHead,
+    mergeHeadSha: newHead,
+    pullRequest: published.pullRequest.number,
+    pushedHeadSha: published.pullRequest.headSha,
+    artifacts: dependencies.artifacts,
+  });
   return { run: reviewed.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
 }
 
@@ -1175,8 +1191,16 @@ export async function workOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
-    if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
+    if (run) {
+      const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      run = fresh.run;
+      if (fresh.preserve) {
+        retainWorkspaceForRecovery = true;
+        throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+      }
+    }
+    if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
@@ -1384,8 +1408,16 @@ export async function resumeEarlyWorkOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
-    if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
+    if (run) {
+      const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+      run = fresh.run;
+      if (fresh.preserve) {
+        retainWorkspaceForRecovery = true;
+        throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+      }
+    }
+    if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked" && run.state !== "invalid") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);
@@ -1786,6 +1818,12 @@ export async function resumeBuildWorkOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      retainWorkspaceForRecovery = true;
+      throw new WorkflowExecutionError(error instanceof Error ? error.message : String(error), run, { cause: error, recoverable: true });
+    }
     if (recoverable) retainWorkspaceForRecovery = true;
     const reason = error instanceof Error ? error.message : String(error);
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
@@ -2424,6 +2462,12 @@ export async function resumeWorkOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      retainWorkspaceForRecovery = true;
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
@@ -2667,6 +2711,12 @@ export async function resumeReviewWorkOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      retainWorkspaceForRecovery = true;
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
@@ -2969,6 +3019,12 @@ export async function resumePublicationWorkOn(
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      retainWorkspaceForRecovery = true;
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     if (recoverable) retainWorkspaceForRecovery = true;
     if (!recoverable && run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
@@ -3253,6 +3309,12 @@ export async function resumeConflictRecoveryWorkOn(
     }
     const reason = error instanceof Error ? error.message : String(error);
     if (error instanceof WorkflowExecutionError) run = error.run;
+    const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
+    run = fresh.run;
+    if (fresh.preserve) {
+      retainWorkspaceForRecovery = true;
+      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    }
     if (run.state !== "failed" && run.state !== "blocked") {
       const failed = transition(run, "FAIL", { reason });
       await dependencies.runs.commit(run.version, failed.state, failed.record);

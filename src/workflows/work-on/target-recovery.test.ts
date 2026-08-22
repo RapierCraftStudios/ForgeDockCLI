@@ -92,7 +92,15 @@ describe("direct target recovery integration", { concurrency: false }, () => {
     assert.equal(result.pullRequest?.baseBranch, "main");
     assert.equal(git.commits, 1); assert.equal(git.pushes, 1);
     assert.equal((await fixture.artifacts.list(subject, "VerificationCheckpoint")).length, 1);
-    assert.equal((await fixture.artifacts.list(subject, "BuildResult")).length, 2);
+    const builds = (await fixture.artifacts.list(subject, "BuildResult"))
+      .filter((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult");
+    assert.equal(builds.length, 2);
+    const checkpoints = (await fixture.artifacts.list(subject, "TargetAdvanceCheckpoint"))
+      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint");
+    const finalCheckpoint = checkpoints.at(-1);
+    assert.equal(finalCheckpoint?.payload.phase, "reviewed");
+    assert.equal(finalCheckpoint?.payload.freshBuildResultId, builds.at(-1)?.id);
+    assert.equal(finalCheckpoint?.payload.integrationHeadSha, builds.at(-1)?.payload.headSha);
     assert.equal((await fixture.artifacts.list({ ...subject, pr: 7 }, "ReviewVerdict")).length, 1);
   });
   it("accepts unchanged contract evidence boundaries without expanding the recovered write revision", async () => {

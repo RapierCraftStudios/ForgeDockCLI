@@ -882,8 +882,9 @@ async function workOn(
           throw new Error(`Run ${resumeRunId} lacks the packet, investigation, BuildResult, and target checkpoint required for target recovery`);
         }
         const targetPr = await github.findOpenPullRequest?.(subject.repo, targetBuild.payload.branch);
-        if (targetPr && targetPr.headSha.toLowerCase() !== targetCheckpoint.payload.sourceHeadSha.toLowerCase()) {
-          throw new Error(`Run ${resumeRunId} has an open PR whose head does not match the target checkpoint`);
+        const expectedTargetPrHead = targetFreshBuild?.payload.headSha ?? targetCheckpoint.payload.sourceHeadSha;
+        if (targetPr && targetPr.headSha.toLowerCase() !== expectedTargetPrHead.toLowerCase()) {
+          throw new Error(`Run ${resumeRunId} has an open PR whose head does not match the target checkpoint${targetFreshBuild ? " fresh BuildResult" : ""}`);
         }
         const targetRun = await store.load(resumeRunId);
         if (!targetRun || (targetRun.state !== "target_recovery" && targetRun.state !== "retry_wait")) throw new Error(`Run ${resumeRunId} is not durably admitted for target recovery`);

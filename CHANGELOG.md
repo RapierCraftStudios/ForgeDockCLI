@@ -22,6 +22,10 @@
 
 ### Fixed
 
+- Outer delegated workflow catches now reload authoritative run state before publishing failure, preserving a newer recoverable remediation/review trajectory instead of masking it with a stale `FAIL` transition.
+
+- Target recovery now durably records the reviewed fresh Build Result before remediation admission, and resume validates an open PR against that fresh head instead of the stale pre-recovery source.
+
 - Standalone review now distinguishes an empty GitHub required-check projection from a failed check query: `/review-pr` dispatches exact-SHA reviewers with a visible durable warning, while direct, work-on, and promotion merge admission still require a nonempty passing required-check set.
 - Corrected the read-only reviewer contract: new plans omit per-shard tool-call quotas, reviewers continue targeted path-scoped exploration without a fixed tool-call cutoff, and unexpected runtime budget exhaustion fails closed rather than counting as completion or producing a `ReviewVerdict`.
 - Reset cleanup now revalidates managed worktree identity under the metadata lock, removes only exact-SHA orphaned `forgedock/*` branches, and fails closed on path, branch, or head drift, with focused adapter coverage.
