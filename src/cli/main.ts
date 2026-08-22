@@ -78,6 +78,7 @@ import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/d
 import { mapWithConcurrency } from "../core/concurrency.js";
 import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
+import { getOrchestrationRoute, orchestrationRouteCacheKey, requiredOrchestrationRoute, setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
 
 const args = process.argv.slice(2);
 const gracefulSignals = ["work-on", "orchestrate", "review-pr", "promote"].includes(args[0] ?? "")
@@ -159,7 +160,7 @@ async function materializeCliDecomposition(input: {
   node: Readonly<OrchestrationNodeRecord>;
   item: ScheduledWorkItem;
   childIssues?: readonly number[];
-  routedIssues?: Map<number, { issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
+  routedIssues?: OrchestrationRouteCache<{ issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
 }): Promise<{
   childIssues: readonly number[];
   items: readonly ScheduledWorkItem[];
@@ -167,33 +168,42 @@ async function materializeCliDecomposition(input: {
 } | undefined> {
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
-    const artifacts = await input.artifacts.list({ repo: input.repository, issue: input.item.issue });
+    const scheduledRepository = input.item.repository ?? input.repository;
+    const artifacts = await input.artifacts.list({ repo: scheduledRepository, issue: input.item.issue });
     const reconciled = reconcileLatestRunArtifacts(artifacts);
     if (reconciled.state !== "decomposed") return undefined;
     children = decompositionChildIssuesFromArtifacts(input.item.issue, artifacts, reconciled.runId);
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
+  const scheduledRepository = input.item.repository ?? input.repository;
+  const existingNodeIds = new Set(input.orchestration.nodes.map((candidate) => candidate.id));
+  const childNodeIds = new Map(children.map((issue) => [issue, existingNodeIds.has(`issue-${issue}`)
+    ? decompositionChildNodeId(scheduledRepository, issue)
+    : `issue-${issue}`] as const));
   const dependencyNodes = [
     ...input.orchestration.nodes.map((candidate) => ({
       id: candidate.id,
       issue: candidate.issue,
       ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
     })),
-    ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
+    ...children.map((issue) => ({ id: childNodeIds.get(issue)!, issue, memberIssues: [issue] })),
   ];
-  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, input.repository));
+  const scheduledRepositoryInfo = scheduledRepository === input.repository
+    ? { defaultBranch: input.defaultBranch }
+    : await input.github.getRepository(scheduledRepository);
+  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, scheduledRepository));
   const childItems: ScheduledWorkItem[] = [];
   for (const issue of snapshots) {
     if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
     const lane = await resolveIssueLane(
       issue,
-      input.defaultBranch,
+      scheduledRepositoryInfo.defaultBranch,
       input.github,
       input.effective.fastLaneTarget,
       input.effective.featurePromotionTarget,
       input.effective.productionTarget,
     );
-    input.routedIssues?.set(issue.number, { issue, lane });
+    if (input.routedIssues) setOrchestrationRoute(input.routedIssues, { repository: scheduledRepository, issue: issue.number }, { issue, lane });
     const affectedFiles = affectedFilesFromIssueBody(issue.body);
     const labels = issue.labels ?? [];
     const priority = labels.some((label) => /(?:^|:)P0$/i.test(label)) ? 0
@@ -203,12 +213,12 @@ async function materializeCliDecomposition(input: {
     const sourcePullRequest = /^\*\*Source:\*\*\s*PR\s+#(\d+)\b/im.exec(issue.body)?.[1];
     const defectClass = /<!--\s*FORGE:CLASS:\s*([A-Za-z0-9_-]+)\s*-->/i.exec(issue.body)?.[1];
     childItems.push({
-      id: `issue-${issue.number}`,
+      id: childNodeIds.get(issue.number) ?? decompositionChildNodeId(scheduledRepository, issue.number),
       issue: issue.number,
       priority,
       dependencies: mapDecompositionDependencies(issue.number, issue.body, dependencyNodes),
-      claims: affectedFiles.length ? [...affectedFiles] : [`component:${input.repository}`],
-      repository: input.repository,
+      claims: affectedFiles.length ? [...affectedFiles] : [`component:${scheduledRepository}`],
+      repository: scheduledRepository,
       targetBranch: lane.targetBranch,
       lane: lane.kind,
       ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2105,36 +2115,53 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
   }
   const baseItems = loadOrchestrationItems(issueNumbers, repository.repo);
   const readAuthoritativeItems = async (allowMissingMilestoneBranch = !dispatchAuthorized) => {
-    const issueSnapshots = await mapWithConcurrency(baseItems, (item) => github.getIssue(item.issue, repository.repo));
-    let milestoneBranches = issueSnapshots.some((issue) => issue.milestone)
-      ? await github.listBranches(repository.repo, "milestone/")
-      : [];
-    if (!allowMissingMilestoneBranch && issueSnapshots.some((issue) => issue.milestone)) {
-      await provisionMissingMilestoneBranches(issueSnapshots, repository.defaultBranch, github);
-      milestoneBranches = await github.listBranches(repository.repo, "milestone/");
-    }
-    const routedIssues = new Map<number, { issue: (typeof issueSnapshots)[number]; lane: IssueLane }>();
-    for (const issue of issueSnapshots) {
-      routedIssues.set(issue.number, {
+    // Resolve every scheduled repository independently. A numeric issue is not
+    // an identity until its scheduled repository has been attached to it.
+    const repositoryContexts = new Map<string, Awaited<ReturnType<GitHubClient["getRepository"]>>>();
+    await mapWithConcurrency([...new Set(baseItems.map((item) => repositoryForScheduledItem(item, repository.repo)))], async (repo) => {
+      repositoryContexts.set(repo.trim().toLowerCase(), repo === repository.repo ? repository : await github.getRepository(repo));
+    });
+    const issueSnapshots = await mapWithConcurrency(baseItems, (item) => {
+      const repo = repositoryForScheduledItem(item, repository.repo);
+      return github.getIssue(item.issue, repo);
+    });
+    const milestoneBranches = new Map<string, Awaited<ReturnType<GitHubClient["listBranches"]>>>();
+    await mapWithConcurrency([...repositoryContexts.entries()], async ([key, context]) => {
+      const repoIssues = issueSnapshots.filter((issue, index) => repositoryForScheduledItem(baseItems[index]!, repository.repo).trim().toLowerCase() === key);
+      let branches = repoIssues.some((issue) => issue.milestone) ? await github.listBranches(context.repo, "milestone/") : [];
+      if (!allowMissingMilestoneBranch && repoIssues.some((issue) => issue.milestone)) {
+        await provisionMissingMilestoneBranches(repoIssues, context.defaultBranch, github);
+        branches = await github.listBranches(context.repo, "milestone/");
+      }
+      milestoneBranches.set(key, branches);
+    });
+    const routedIssues: OrchestrationRouteCache<{ issue: (typeof issueSnapshots)[number]; lane: IssueLane }> = new Map();
+    for (const [index, issue] of issueSnapshots.entries()) {
+      const scheduledRepository = repositoryForScheduledItem(baseItems[index]!, repository.repo);
+      const context = repositoryContexts.get(scheduledRepository.trim().toLowerCase()) ?? repository;
+      setOrchestrationRoute(routedIssues, { repository: scheduledRepository, issue: issue.number }, {
         issue,
-        lane: classifyIssueLane(issue, repository.defaultBranch, milestoneBranches, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget, {
+        lane: classifyIssueLane(issue, context.defaultBranch, milestoneBranches.get(scheduledRepository.trim().toLowerCase()) ?? [], effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget, {
           ...(allowMissingMilestoneBranch ? { allowMissingMilestoneBranch: true } : {}),
         }),
       });
     }
     await mapWithConcurrency([...new Set([...routedIssues.values()]
-      .map(({ lane }) => lane)
-      .filter((lane) => lane.resolution !== "planned-canonical")
-      .map((lane) => lane.targetBranch))], (branch) => github.getBranchHead(repository.repo, branch));
+      .filter(({ lane }) => lane.resolution !== "planned-canonical")
+      .map(({ issue, lane }) => `${issue.repo}\u0000${lane.targetBranch}`))], (route) => {
+      const [repo, branch] = route.split("\u0000");
+      return github.getBranchHead(repo!, branch!);
+    });
     const items: BatchableWorkItem[] = baseItems.map((item) => {
-      const observed = requiredIssueRoute(routedIssues, item.issue).issue;
-      const lane = requiredIssueRoute(routedIssues, item.issue).lane;
+      const scheduledRepository = repositoryForScheduledItem(item, repository.repo);
+      const observed = requiredOrchestrationRoute(routedIssues, { repository: scheduledRepository, issue: item.issue }).issue;
+      const lane = requiredOrchestrationRoute(routedIssues, { repository: scheduledRepository, issue: item.issue }).lane;
       const priority = observed.labels.find((label) => /^(?:priority:)?P[0-3]$/i.test(label))?.slice(-2).toUpperCase();
       const affectedFiles = affectedFilesFromIssueBody(observed.body);
       const claims = [...new Set([...item.claims, ...affectedFiles])];
       return {
         ...item,
-        repository: repository.repo,
+        repository: scheduledRepository,
         targetBranch: lane.targetBranch,
         lane: lane.kind,
         ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
@@ -2144,7 +2171,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         title: observed.title,
         summary: observed.body.slice(0, 4_000),
         affectedFiles,
-        claims: claims.length ? claims : [`component:${repository.repo}`],
+        claims: claims.length ? claims : [`component:${scheduledRepository}`],
         riskClass: inferBatchRiskClass(observed.title, observed.body, observed.labels),
         ...(priority ? { urgencyTier: ["P0", "P1"].includes(priority) ? "urgent" as const : "normal" as const } : {}),
       };
@@ -2169,7 +2196,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
   if (argv.includes("--dry-run") || dispatchMode === "preview") {
     process.stdout.write(`ForgeDock orchestration preview · dispatch_mode=${effective.dispatchMode}\n`);
     for (const item of proposed.items) {
-      const route = routedIssues.get(item.issue);
+      const route = getOrchestrationRoute(routedIssues, { repository: repositoryForScheduledItem(item, repository.repo), issue: item.issue });
       const lane = route?.lane;
       const target = item.targetBranch ?? lane?.targetBranch ?? "unknown-target";
       process.stdout.write(`${item.id} · ${item.lane ?? lane?.kind ?? "unknown-lane"} → ${target} · depends [${item.dependencies.join(", ") || "none"}] · claims [${item.claims.join(", ")}]\n`);
@@ -2223,21 +2250,26 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         groups: assembly.groups,
         items,
         host: github,
-        expectedRoutes: new Map([...routedIssues.entries()].map(([number, value]) => [number, {
-          targetBranch: value.lane.targetBranch,
-          lane: value.lane.kind,
-          ...(value.lane.kind === "feature" && value.lane.promotionTarget !== undefined ? { promotionTarget: value.lane.promotionTarget } : {}),
-          ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-        }])),      })
+        expectedRoutes: new Map(items.map((item) => {
+          const itemRepository = repositoryForScheduledItem(item, repository.repo);
+          const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
+          return [orchestrationRouteCacheKey(itemRepository, item.issue), {
+            targetBranch: route.lane.targetBranch,
+            lane: route.lane.kind,
+            ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
+            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+          }] as const;
+        })),      })
       : { groups: [], materialized: [], validatedItems: items };
     const contracted = materializedResult.validatedItems;
     for (const materialized of materializedResult.materialized) {
       const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
       const member = group?.members[0];
       if (group && member) {
-        const lane = requiredIssueRoute(routedIssues, member.issue).lane;
-        const batchIssue = await github.getIssue(materialized.issue, repository.repo);
-        routedIssues.set(materialized.issue, { issue: batchIssue, lane });
+        const memberRepository = repositoryForScheduledItem(member, repository.repo);
+        const lane = requiredOrchestrationRoute(routedIssues, { repository: memberRepository, issue: member.issue }).lane;
+        const batchIssue = await github.getIssue(materialized.issue, memberRepository);
+        setOrchestrationRoute(routedIssues, { repository: memberRepository, issue: materialized.issue }, { issue: batchIssue, lane });
       }
     }
     const scheduleItems = materializeClaimDependencies(contracted);
@@ -2299,9 +2331,10 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         });
       }, 20_000);
       try {
-        const subject = { repo: repository.repo, issue: item.issue };
+        const itemRepository = repositoryForScheduledItem(item, repository.repo);
+        const subject = { repo: itemRepository, issue: item.issue };
         const issueArtifacts = await artifacts.list(subject);
-        const admission = decideSubjectAdmission(issueArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: requiredIssueRoute(routedIssues, item.issue).lane.targetBranch });
+        const admission = decideSubjectAdmission(issueArtifacts, { rerun: argv.includes("--rerun"), currentTargetBranch: requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue }).lane.targetBranch });
         if (admission.action === "skip") {
           skipped.set(item.id, admission.state);
           outcomes.set(item.id, admission.state);
@@ -2326,7 +2359,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           });
           clearInterval(heartbeat);
           store.release(item.id, lease.token);
-          const resumeArgs = [String(item.issue), "--repo", repository.repo, "--resume"];
+          const resumeArgs = [String(item.issue), "--repo", itemRepository, "--resume"];
           const dependencies = item.dependencies.map(issueNumberFromScheduledId);
           if (dependencies.length) resumeArgs.push("--depends-on", dependencies.join(","));
           resumeArgs.push(autoMerge ? "--auto-merge" : "--no-auto-merge");
@@ -2366,12 +2399,12 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
         }
-        const { issue, lane } = requiredIssueRoute(routedIssues, item.issue);
+        const { issue, lane } = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
         const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
         const batchMembers = item.memberIssues ? [...item.memberIssues] : [];
         const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
         const intent = createArtifact({
-          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
+          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: itemRepository, issue: item.issue },
           producer: { role: "controller", runtime: "forgedock" },
           payload: {
             title: issue.title,
@@ -2525,7 +2558,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       }
       },
       reconcileWorker: async ({ item }) => {
-        const subject = { repo: repository.repo, issue: item.issue };
+        const subject = { repo: repositoryForScheduledItem(item, repository.repo), issue: item.issue };
         const issueArtifacts = await artifacts.list(subject);
         const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
         if (reconciled.state === "completed") {
@@ -2766,7 +2799,8 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
     });
 
     const reconcileWorker = async (item: ScheduledWorkItem) => {
-      const subject = { repo: record.repository, issue: item.issue };
+      const itemRepository = repositoryForScheduledItem(item, record.repository);
+      const subject = { repo: itemRepository, issue: item.issue };
       let issueArtifacts = await artifacts.list(subject);
       let reconciled = reconcileLatestRunArtifacts(issueArtifacts);
       const initialClassification = reconcileAuthoritativeWorkerArtifacts({
@@ -2819,10 +2853,12 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
         ...(childIssues !== undefined ? { childIssues } : {}),
       }),
       revalidateRoute: async ({ item }) => {
-        const issue = await github.getIssue(item.issue, record.repository);
+        const itemRepository = repositoryForScheduledItem(item, record.repository);
+        const itemRepositoryInfo = itemRepository === record.repository ? checkedCheckout : await github.getRepository(itemRepository);
+        const issue = await github.getIssue(item.issue, itemRepository);
         const lane = await resolveIssueLane(
           issue,
-          checkedCheckout.defaultBranch,
+          itemRepositoryInfo.defaultBranch,
           github,
           configuredOrchestration.fastLaneTarget,
           configuredOrchestration.featurePromotionTarget,
@@ -2838,7 +2874,8 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
       },
       reconcileWorker: ({ item }) => reconcileWorker(item),
       worker: async (item, context) => {
-        const subject = { repo: record.repository, issue: item.issue };
+        const itemRepository = repositoryForScheduledItem(item, record.repository);
+        const subject = { repo: itemRepository, issue: item.issue };
         const issueArtifacts = await artifacts.list(subject);
         const current = decideSubjectAdmission(issueArtifacts, {
           ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}),
@@ -2862,7 +2899,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           throw new Error(`#${item.issue} has terminal state ${current.state} without a supported orchestration result`);
         }
         if (current.action === "block") throw new Error(current.reason);
-        const workerArgs = [String(item.issue), "--repo", record.repository];
+        const workerArgs = [String(item.issue), "--repo", itemRepository];
         const dependencies = item.dependencies.map(issueNumberFromScheduledId);
         if (dependencies.length) workerArgs.push("--depends-on", dependencies.join(","));
         workerArgs.push(record.autoMerge ? "--auto-merge" : "--no-auto-merge");
@@ -3075,10 +3112,12 @@ function projectRunsToGitHub(runs: RunRepository, github: GitHubClient): RunRepo
   );
 }
 
-function requiredIssueRoute<T>(routes: ReadonlyMap<number, T>, issue: number): T {
-  const route = routes.get(issue);
-  if (!route) throw new Error(`Issue #${issue} has no authoritative lane classification`);
-  return route;
+function repositoryForScheduledItem(item: Pick<ScheduledWorkItem, "repository">, fallback: string): string {
+  return item.repository?.trim() || fallback;
+}
+
+function decompositionChildNodeId(repository: string, issue: number): string {
+  return `issue-${repository.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${issue}`;
 }
 
 function loadOrchestrationItems(issueNumbers: number[], repo: string): ScheduledWorkItem[] {
@@ -3359,7 +3398,7 @@ function option(argv: string[], name: string): string | undefined {
 }
 
 function issueNumberFromScheduledId(id: string): number {
-  const match = /^issue-(\d+)$/.exec(id);
+  const match = /^issue-(?:.+-)?(\d+)$/.exec(id);
   if (!match) throw new Error(`Invalid scheduled issue dependency: ${id}`);
   return Number(match[1]);
 }
