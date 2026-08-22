@@ -9,6 +9,7 @@
 
 - Pristine reset applies archived, identity-fenced external cleanup with bounded resource-serialized concurrency (default four), aggregates failures before any database purge, and reports stage counts and durations in the CLI.
 - Fresh native orchestrations now support an investigation-first phase: exact issue/route/base evidence is persisted, read-only investigations run concurrently without claim serialization, a durable barrier precedes execution-DAG materialization, and observer snapshots distinguish the investigating set from the executing DAG. Legacy durable execution DAGs remain resumable.
+- TUI orchestration now shares the CLI's typed investigation/materialization workers, so fresh native launches cannot dispatch legacy full `work-on` workers before the investigation barrier; durable phase and wave identity is rebuilt on restart.
 
 ### Added
 

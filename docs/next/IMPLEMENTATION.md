@@ -126,6 +126,12 @@ implementation boundary, not live dogfood readiness; the certification ledger is
   keep genuinely active work from being cancelled as idle.
 - [x] Durable parent DAG/node records, live-owner reconciliation, completed-node
   preservation, retained-worktree recovery, and explicit failed/blocked-node resume.
+- [x] Fresh native CLI and TUI DAGs use a shared investigation-first controller
+  phase: independent read-only investigations run under the issue-slot and sampled
+  transport caps, persist exact-base evidence, settle invalid/decomposed work at a
+  durable wave barrier, then materialize the exact phase-2 execution DAG. Legacy
+  records retain their prior execution semantics; restart rebuilds the phase
+  materializer from durable identity.
 
 ## Configuration and UI
 

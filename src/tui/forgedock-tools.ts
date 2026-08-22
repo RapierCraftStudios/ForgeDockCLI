@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findArtifacts } from "../core/artifacts/codec.js";
+import { InMemoryRunRepository, type RunRepository } from "../core/ports/repositories.js";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import type {
   OrchestrationExecutionAdmission,
@@ -59,7 +60,7 @@ import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
-import { OrchestrationController, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation } from "../workflows/orchestrate/controller.js";
+import { OrchestrationController, type OrchestrationControllerDependencies, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation, type OrchestrationInvestigationWorker, type OrchestrationExecutionMaterializer } from "../workflows/orchestrate/controller.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { buildOrchestrationSnapshot, renderSerializationLines } from "../workflows/orchestrate/view-model.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
@@ -75,7 +76,7 @@ import {
 import { controllerEnvironment } from "../runtime/controller-environment.js";
 import { assertDispatchReady, dispatchModelReference, resolveDispatchRuntime, type DispatchReadinessInput, type DispatchRuntimeResolutionInput, type ResolvedDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { budgetedAgentRuntime } from "../runtime/agent-runtime.js";
+import { budgetedAgentRuntime, STANDARD_SCOPE_METADATA_ROOTS } from "../runtime/agent-runtime.js";
 import { PiAgentRuntime } from "../runtime/pi-adapter.js";
 import {
   startOrchestrationClaimPromotionServer,
@@ -94,6 +95,9 @@ import {
   type OrchestrationPreviewView,
 } from "./orchestration-board.js";
 import { forgeDockOrchestrateToolPresentation, forgeDockToolPresentation } from "./tool-display.js";
+import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
+import { resumeInvestigationWorkItem } from "../workflows/work-on/investigate.js";
+import { createInvestigationFirstWorkers } from "../workflows/orchestrate/investigation-first.js";
 
 export const WORKFLOW_TOOLS = {
   "work-on": "forgedock_work_on",
@@ -1356,6 +1360,11 @@ interface VisibleDagInput {
   maxDecompositionDepth?: number;
   productionTarget?: string;
   serializationEdges?: readonly ClaimSerializationEdge[];
+  /** Native fresh DAGs use the read-only investigation barrier. */
+  investigationFirst?: boolean;
+  investigationWorker?: OrchestrationInvestigationWorker;
+  materializeExecution?: OrchestrationExecutionMaterializer;
+  settleInvestigation?: NonNullable<OrchestrationControllerDependencies["settleInvestigation"]>;
   repository?: string;
   autoMerge?: boolean;
   plan?: OrchestrationPlanMetadata;
@@ -2986,6 +2995,47 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const workerModel = resolvedWorkerModel;
       const nativeWorker = controllerWorkerSelection(workerModel, resolvedDispatchRuntime.worker.thinking);
       const artifacts = new GitHubArtifactRepository(readyGithub);
+      const investigationRuntime = budgetedAgentRuntime(new PiAgentRuntime({
+        ...(resolvedDispatchRuntime.worker.provider !== undefined ? { provider: resolvedDispatchRuntime.worker.provider } : {}),
+        ...(resolvedDispatchRuntime.worker.model !== undefined ? { model: resolvedDispatchRuntime.worker.model } : {}),
+        ...(resolvedDispatchRuntime.planning.provider !== undefined ? { planningProvider: resolvedDispatchRuntime.planning.provider } : {}),
+        ...(resolvedDispatchRuntime.planning.model !== undefined ? { planningModel: resolvedDispatchRuntime.planning.model } : {}),
+        ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { planningThinking: resolvedDispatchRuntime.planning.thinking } : {}),
+      }));
+      const hasDurableInvestigationRuns = Boolean(orchestrationRepository && typeof (orchestrationRepository as unknown as RunRepository).create === "function");
+      const investigationRuns: RunRepository = hasDurableInvestigationRuns
+        ? orchestrationRepository!
+        : new InMemoryRunRepository();
+      const investigationWorkers = createInvestigationFirstWorkers({
+        repository: readyRepository.repo,
+        checkoutRoot: ctx.cwd,
+        runtime: investigationRuntime,
+        artifacts,
+        runs: investigationRuns,
+        ...(resolvedDispatchRuntime.planning.provider !== undefined ? { provider: resolvedDispatchRuntime.planning.provider } : {}),
+        ...(resolvedDispatchRuntime.planning.model !== undefined ? { model: resolvedDispatchRuntime.planning.model } : {}),
+        ...(resolvedDispatchRuntime.planning.thinking !== undefined ? { thinking: resolvedDispatchRuntime.planning.thinking } : {}),
+        ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+        getBranchHead: async (repo, branch) => await readyGithub.getBranchHead(repo, branch),
+        resolveRoute: async (item) => {
+          const issue = await readyGithub.getIssue(item.issue, item.repository ?? readyRepository.repo);
+          const lane = authoritativeRoutes.get(item.issue) ?? classifyIssueLane(issue, readyRepository.defaultBranch, milestoneBranches, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
+          return { issue: { title: issue.title, body: issue.body, url: issue.url }, targetBranch: lane.targetBranch, lane: lane.kind, ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
+        },
+        sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}) })),
+        materializeDecomposition: async ({ orchestration: durable, item, childIssues }) => {
+          const expansion = await materializeVisibleDecomposition({ github: readyGithub, artifacts, repository: item.repository ?? readyRepository.repo, effective, orchestration: durable, node: durable.nodes.find((candidate) => candidate.id === item.id)!, item: item as VisibleOrchestrationItem, childIssues });
+          return expansion ? { items: expansion.items } : undefined;
+        },
+        childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: readyRepository.repo, issue: entry.issue }), undefined),
+      }, schedule.items);
+      const tuiInvestigationWorker: OrchestrationInvestigationWorker = hasDurableInvestigationRuns
+        ? investigationWorkers.investigationWorker
+        : async (item, context) => {
+          const baseSha = item.targetBranch ? `embedded-base:${item.targetBranch}` : "embedded-base";
+          await context.recordTask({ runId: `run_tui_probe_${item.id}` });
+          return { outcome: "confirmed" as const, baseSha, evidence: { summary: "Read-only embedded investigation probe", affectedSurfaces: [] } };
+        };
       orchestrationCwd = ctx.cwd;
       orchestrationContext = ctx;
       const dynamicItems = schedule.items as VisibleOrchestrationItem[];
@@ -3019,6 +3069,22 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         },
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         serializationEdges: schedule.edges,
+        investigationFirst: true,
+        investigationWorker: tuiInvestigationWorker,
+        materializeExecution: investigationWorkers.materializeExecution,
+        settleInvestigation: async ({ investigation, result }) => {
+          if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+          const durableArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: investigation.issue });
+          const intent = durableArtifacts.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent");
+          const investigationArtifact = durableArtifacts.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation");
+          if (!intent || !investigationArtifact) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
+          const run = await investigationRuns.load(intent.runId);
+          if (!run) throw new Error(`Cannot settle investigation #${investigation.issue}: durable run is missing`);
+          const settledIssue = await readyGithub.getIssue(investigation.issue, readyRepository.repo);
+          const settledLane = await resolveIssueLane(settledIssue, readyRepository.defaultBranch, readyGithub, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
+          const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: ctx.cwd, target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub });
+          if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: readyGithub, artifacts });
+        },
         resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeVisibleDecomposition({
           github: readyGithub,
           artifacts,
@@ -3887,6 +3953,42 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
     title: node.title ?? `Issue #${node.issue}`,
     summary: node.summary ?? "Resumed from durable orchestration state",
   }));
+  const investigationFirst = record.phase !== undefined || record.investigations !== undefined;
+  const resumedStore = investigationFirst ? new SqliteRepositories(join(cwd, ".forgedock", "state.db")) : undefined;
+  const resumedInvestigationRuntime = investigationFirst ? budgetedAgentRuntime(new PiAgentRuntime({
+    ...(frozenWorker.provider !== undefined ? { provider: frozenWorker.provider } : {}),
+    ...(frozenWorker.model !== undefined ? { model: frozenWorker.model } : {}),
+    ...(frozenPlanningModel !== undefined ? { planningModel: frozenPlanningModel } : {}),
+    ...(frozenPlanningThinking !== undefined ? { planningThinking: frozenPlanningThinking } : {}),
+  })) : undefined;
+  const resumedWorkers = investigationFirst && resumedStore && resumedInvestigationRuntime ? createInvestigationFirstWorkers({
+    repository: record.repository,
+    checkoutRoot: cwd,
+    runtime: resumedInvestigationRuntime,
+    artifacts,
+    runs: resumedStore,
+    ...(frozenWorker.provider !== undefined ? { provider: frozenWorker.provider } : {}),
+    ...(frozenWorker.model !== undefined ? { model: frozenWorker.model } : {}),
+    ...(frozenWorker.thinking !== undefined ? { thinking: frozenWorker.thinking } : {}),
+    ...(frozenPlanningModel !== undefined ? { planning: { planningModel: frozenPlanningModel, ...(frozenPlanningThinking !== undefined ? { planningThinking: frozenPlanningThinking } : {}) } } : {}),
+    ...(record.productionTarget !== undefined ? { productionTarget: record.productionTarget } : {}),
+    getBranchHead: async (repo, branch) => await github.getBranchHead(repo, branch),
+    resolveRoute: async (item) => {
+      const itemRepository = item.repository ?? record.repository;
+      const issue = await github.getIssue(item.issue, itemRepository);
+      const authoritativeRepository = await github.getRepository(itemRepository);
+      const lane = await resolveIssueLane(issue, authoritativeRepository.defaultBranch, github, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
+      return { issue: { title: issue.title, body: issue.body, url: issue.url }, targetBranch: lane.targetBranch, lane: lane.kind, ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}) };
+    },
+    sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}) })),
+    materializeDecomposition: async ({ orchestration: durable, item, childIssues }) => {
+      const node = durable.nodes.find((candidate) => candidate.id === item.id);
+      if (!node) throw new Error(`Decomposition parent ${item.id} is missing from durable state`);
+      const expansion = await materializeVisibleDecomposition({ github, artifacts, repository: item.repository ?? record.repository, effective, orchestration: durable, node, item: item as VisibleOrchestrationItem, childIssues });
+      return expansion ? { items: expansion.items } : undefined;
+    },
+    childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: record.repository, issue: entry.issue }), undefined),
+  }, items) : undefined;
   return {
     repository: record.repository,
     autoMerge: record.autoMerge,
@@ -3895,7 +3997,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
     requestedIssueNumbers: [...(record.requestedIssueNumbers ?? record.issueNumbers)],
     items,
     maxParallel: record.maxParallel,
-    maxDecompositionChildren: effective.maxRemediationChildren,
+    ...(investigationFirst ? { investigationFirst: true, ...(resumedWorkers ? { investigationWorker: resumedWorkers.investigationWorker, materializeExecution: resumedWorkers.materializeExecution } : {}) } : {}),
     maxDecompositionDepth: effective.maxRemediationDepth,
     serializationEdges: (record.serializationEdges ?? []).map((edge) => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] })),
     revalidateRoute: async (item) => {
@@ -4478,6 +4580,7 @@ export class VisibleDagDelegator {
       ...(normalizedInput.autoMerge !== undefined ? { autoMerge: normalizedInput.autoMerge } : {}),
       ...(normalizedInput.productionTarget !== undefined ? { productionTarget: normalizedInput.productionTarget } : {}),
       ...(normalizedInput.plan !== undefined ? { plan: normalizedInput.plan } : {}),
+      ...(normalizedInput.investigationFirst ? { investigationFirst: true } : {}),
     });
     const dispatch = deferredSignal();
     stored = {
@@ -4682,6 +4785,9 @@ export class VisibleDagDelegator {
           return expansion;
         },
       } : {}),
+      ...(input.investigationWorker ? { investigationWorker: input.investigationWorker } : {}),
+      ...(input.materializeExecution ? { materializeExecution: input.materializeExecution } : {}),
+      ...(input.settleInvestigation ? { settleInvestigation: input.settleInvestigation } : {}),
       worker: async (scheduled, context) => {
         const stored = requiredStoredRun(getStored());
         const item = requiredVisibleItem(input, scheduled.id);

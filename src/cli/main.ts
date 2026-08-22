@@ -80,6 +80,7 @@ import { mapWithConcurrency } from "../core/concurrency.js";
 import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
 import { getOrchestrationRoute, orchestrationRouteCacheKey, requiredOrchestrationRoute, setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
+import { createInvestigationFirstWorkers } from "../workflows/orchestrate/investigation-first.js";
 
 const args = process.argv.slice(2);
 const gracefulSignals = ["work-on", "orchestrate", "review-pr", "promote"].includes(args[0] ?? "")
@@ -2167,6 +2168,31 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
+    const sharedInvestigationWorkers = createInvestigationFirstWorkers({
+      repository: repository.repo,
+      checkoutRoot,
+      runtime,
+      artifacts,
+      runs,
+      ...(provider !== undefined ? { provider } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(thinking !== undefined ? { thinking } : {}),
+      planning,
+      ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+      getBranchHead: async (repo, branch) => await github.getBranchHead(repo, branch),
+      resolveRoute: async (item) => {
+        const routed = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
+        return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
+      },
+      sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}) })),
+      materializeDecomposition: async ({ orchestration: durable, item, childIssues }) => {
+        const parent = durable.nodes.find((node) => node.id === item.id);
+        if (!parent) throw new Error(`Decomposition parent ${item.id} is missing from the durable investigation set`);
+        const expansion = await materializeCliDecomposition({ github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective, orchestration: durable, node: parent, item, childIssues, routedIssues });
+        return expansion ? { items: expansion.items } : undefined;
+      },
+      childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: repository.repo, issue: entry.issue }), undefined),
+    }, scheduleItems.items);
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
@@ -2188,69 +2214,8 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         ...(childIssues !== undefined ? { childIssues } : {}),
       }),
       isCancelled: async () => false,
-      investigationWorker: async (item, context) => {
-        const { issue, lane } = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
-        const intent = createArtifact({
-          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
-          producer: { role: "controller", runtime: "forgedock" },
-          payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
-        });
-        await context.recordTask({ runId: intent.runId });
-        const baseSha = await github.getBranchHead(repository.repo, lane.targetBranch);
-        const investigated = await investigateWorkItem({
-          intent, cwd: checkoutRoot, target: runTargetForLane(lane, effective.productionTarget),
-          deferInterpretation: true,
-          scopeHints: { affectedFiles: item.affectedFiles ?? [], claims: item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
-          ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}), ...planning,
-        }, { runtime, artifacts, runs });
-        const payload = investigated.investigation.payload;
-        return {
-          outcome: payload.outcome,
-          baseSha,
-          evidence: {
-            investigationId: investigated.investigation.id,
-            rootCause: payload.rootCause ?? null,
-            summary: payload.summary,
-            affectedSurfaces: payload.affectedSurfaces,
-          },
-          ...(payload.decomposition !== undefined ? { childIssues: [] } : {}),
-        };
-      },
-      materializeExecution: async ({ orchestration, investigations }) => {
-        const confirmed = new Set(investigations.filter((entry) => entry.outcome === "confirmed").map((entry) => entry.nodeId));
-        const sourceItems: ScheduledWorkItem[] = orchestration.investigationWave === 1
-          ? [...scheduleItems.items]
-          : orchestration.nodes.map((node) => ({
-            id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims],
-            ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}),
-            ...(node.lane !== undefined ? { lane: node.lane } : {}),
-            ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}),
-            ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}),
-            ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}),
-            ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}),
-            ...(node.title !== undefined ? { title: node.title } : {}),
-            ...(node.summary !== undefined ? { summary: node.summary } : {}),
-          }));
-        const items = sourceItems.filter((item) => confirmed.has(item.id));
-        const edges = (orchestration.investigationWave === 1 ? scheduleItems.edges : (orchestration.serializationEdges ?? [])).filter((edge) => confirmed.has(edge.predecessor) && confirmed.has(edge.successor));
-        const nextInvestigationItems: ScheduledWorkItem[] = [];
-        for (const entry of investigations.filter((candidate) => candidate.outcome === "decompose")) {
-          const issueArtifacts = await artifacts.list({ repo: repository.repo, issue: entry.issue });
-          const childIssues = decompositionChildIssuesFromArtifacts(entry.issue, issueArtifacts, undefined);
-          const parent = orchestration.nodes.find((node) => node.id === entry.nodeId);
-          if (!parent) throw new Error(`Decomposition parent ${entry.nodeId} is missing from the durable investigation set`);
-          const expansion = await materializeCliDecomposition({
-            github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective,
-            orchestration, node: parent, item: {
-              id: parent.id, issue: parent.issue, priority: parent.priority, dependencies: [], claims: [],
-              ...(parent.targetBranch !== undefined ? { targetBranch: parent.targetBranch } : {}),
-              ...(parent.lane !== undefined ? { lane: parent.lane } : {}),
-            }, childIssues, routedIssues,
-          });
-          if (expansion) nextInvestigationItems.push(...expansion.items);
-        }
-        return { items, serializationEdges: edges, ...(nextInvestigationItems.length ? { nextInvestigationItems } : {}) };
-      },
+      investigationWorker: sharedInvestigationWorkers.investigationWorker,
+      materializeExecution: sharedInvestigationWorkers.materializeExecution,
       settleInvestigation: async ({ investigation, result }) => {
         if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
         const subject = { repo: repository.repo, issue: investigation.issue };
