@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, realpath, readFile } from "node:fs/promises";
 import { relative, resolve, sep, isAbsolute } from "node:path";
 import { Check } from "typebox/value";
 import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
@@ -12,6 +12,7 @@ import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspace
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { LeaseContinuityError, type LeaseGuard } from "../../core/ports/lease.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
+import { verificationCommandCacheIdentity, digestJson, type VerificationReceiptCache } from "../../core/ports/verification-receipt-cache.js";
 import type { TelemetryRepository } from "../../core/ports/telemetry.js";
 import {
   isRepairableVerificationFailure,
@@ -20,6 +21,7 @@ import {
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import { resolveFreshFailureRun } from "../../core/state/reconcile.js";
 import type { AgentEventSink, AgentRuntime, ScopeHints } from "../../runtime/agent-runtime.js";
+import { verificationEnvironmentFingerprint } from "../../runtime/controller-environment.js";
 import { canonicalizeConcreteScopePaths, isConcreteScopePath, scopeManifestForBuildPacket, STANDARD_SCOPE_METADATA_ROOTS, isRecoverableAgentExecutionError } from "../../runtime/agent-runtime.js";
 import { ClaimPromotionRecoveryError } from "../../runtime/orchestration-claim-transport.js";
 import { buildWorkItem, type BuilderSubmission, VerificationDiagnosisSchema, type VerificationDiagnosis } from "./build.js";
@@ -61,6 +63,9 @@ export interface WorkOnDependencies {
   verifier: VerificationRunner;
   host: ForgeHost;
   telemetry?: TelemetryRepository;
+  verificationReceiptCache?: VerificationReceiptCache;
+  /** Sealed controller identity; callers may inject it for deterministic tests. */
+  verificationEnvironmentFingerprint?: string;
   /** Controller-owned fencing guard checked before every dependent mutation. */
   /** Route claim must be held before any target-sensitive recovery mutation. */
   promoteTargetRouteClaim?: () => Promise<void>;
@@ -456,7 +461,12 @@ async function resumeTargetAdvanceWorkOnInternal(
   const commands = frozenVerification.map((command) => ({ ...command, cwd: workspace.path }));
   let checks: CheckResult[];
   try {
-    checks = await dependencies.verifier.run(commands, input.signal);
+    checks = [...await reuseVerificationReceipts({
+      run, packet: input.packet, workspace, baseBranch: checkpoint.targetBranch,
+      verification: frozenVerification, revisionSha: newHead,
+      contentDigest: await deliveryContentDigest(workspace.path, changedPaths),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    }, dependencies)];
   } catch (error) {
     const observed = await getBranchHead(targetRepository, checkpoint.targetBranch).catch(() => targetSha);
     const classification = classifyRetryableError(error, { domain: "workflow" });
@@ -865,31 +875,17 @@ async function prepareCleanPreBuilderExecution(
     ? await input.resolveVerificationCatalog(refreshed.baseSha)
     : input.verification;
   const verification = selectPacketVerificationCommands(input.packet.payload, catalog, refreshed.baseSha);
-  const commands = verification.map((command) => ({ ...command, cwd: refreshed.path }));
   await dependencies.git.prepareWorkspaceDependencies(refreshed, input.signal);
   await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after dependency preparation");
-  // Baseline evidence is reusable only when every durable check carries the
-  // exact identity of the freshly frozen command plan.  planId includes the
-  // refreshed base SHA; policy and target checks prevent same-ID catalog drift.
-  const baselineMatchesFrozenPlan = input.baselineChecks !== undefined
-    && input.baselineChecks.length === commands.length
-    && commands.every((command, index) => {
-      const check = input.baselineChecks?.find((candidate) =>
-        candidate.commandId === command.id) ?? input.baselineChecks?.[index];
-      if (!check) return false;
-      return check.commandId === command.id
-        && check.planId === command.planId
-        && check.policyVersion === command.policyVersion
-        && JSON.stringify(check.commandTargets ?? []) === JSON.stringify(command.targets ?? [])
-        && check.command === [command.command, ...command.args].join(" ");
-    });
-  const baselineChecks = baselineMatchesFrozenPlan
-    ? [...input.baselineChecks!]
-    : await dependencies.verifier.run(
-      commands,
-      input.signal,
-      verificationProgressRecorder(input.run.runId, "baseline", dependencies.runs),
-    );
+  const baselineChecks = await reuseVerificationReceipts({
+    run: input.run,
+    packet: input.packet,
+    workspace: refreshed,
+    baseBranch: input.baseBranch,
+    verification,
+    ...(input.baselineChecks !== undefined ? { supplied: input.baselineChecks } : {}),
+    ...(input.signal !== undefined ? { signal: input.signal } : {}),
+  }, dependencies);
   await assertPristineWorkspace(refreshed, refreshed.baseSha, dependencies, "after baseline verification");
   await dependencies.runs.recordProgress({
     runId: input.run.runId,
@@ -898,6 +894,115 @@ async function prepareCleanPreBuilderExecution(
     occurredAt: new Date().toISOString(),
   });
   return { workspace: refreshed, verification, baselineChecks };
+}
+
+async function reuseVerificationReceipts(
+  input: {
+    run: RunState;
+    packet: DurableArtifact<"BuildPacket">;
+    workspace: GitWorkspace;
+    baseBranch: string;
+    verification: readonly Omit<VerificationCommand, "cwd">[];
+    supplied?: readonly CheckResult[];
+    revisionSha?: string;
+    contentDigest?: string;
+    signal?: AbortSignal;
+  },
+  dependencies: WorkOnDependencies,
+): Promise<readonly CheckResult[]> {
+  const commands = input.verification.map((command) => ({ ...command, cwd: input.workspace.path }));
+  const cache = dependencies.verificationReceiptCache;
+  const environmentFingerprint = dependencies.verificationEnvironmentFingerprint ?? verificationEnvironmentFingerprint();
+  const lockfileFingerprint = await lockfilesFingerprint(input.workspace.path);
+  const toolchainFingerprint = digestJson({
+    node: process.version, platform: process.platform, arch: process.arch,
+    path: process.env.PATH ?? "",
+    commands: commands.map(({ command, args, timeoutMs }) => ({ command, args, timeoutMs })),
+  });
+  const contentDigest = input.contentDigest ?? digestJson({
+    baseSha: input.workspace.baseSha,
+    expectedPaths: input.packet.payload.expectedPaths,
+    packetId: input.packet.id,
+  });
+  const byIndex: Array<CheckResult | undefined> = new Array(commands.length);
+  const misses: VerificationCommand[] = [];
+  const keys = new Map<string, ReturnType<typeof verificationCommandCacheIdentity>>();
+  let hits = 0;
+  for (const [index, command] of commands.entries()) {
+    const key = verificationCommandCacheIdentity(command, {
+      repository: input.run.subject.repo,
+      baseSha: input.workspace.baseSha!, revisionSha: input.revisionSha ?? input.workspace.baseSha!,
+      targetRoute: input.baseBranch, contentDigest, environmentFingerprint,
+      toolchainFingerprint, lockfileFingerprint,
+    });
+    if (!key) {
+      misses.push(command);
+      await recordVerificationCacheProgress(dependencies, input.run.runId, "reject", command.id);
+      continue;
+    }
+    keys.set(command.id, key);
+    const cached = cache ? await cache.get(key) : undefined;
+    if (cached?.check.status === "passed") {
+      byIndex[index] = cached.check;
+      hits += 1;
+      await recordVerificationCacheProgress(dependencies, input.run.runId, "hit", command.id, cached.savedDurationMs);
+      continue;
+    }
+    // A supplied baseline is accepted only when its complete identity matches;
+    // it is immediately promoted into the operational cache when available.
+    const supplied = input.supplied?.find((candidate) => candidate.commandId === command.id);
+    if (supplied?.status === "passed" && supplied.command === [command.command, ...command.args].join(" ")
+      && supplied.planId === command.planId && supplied.policyVersion === command.policyVersion
+      && JSON.stringify(supplied.commandTargets ?? []) === JSON.stringify(command.targets ?? [])) {
+      byIndex[index] = supplied;
+      if (cache) await cache.put(key, supplied);
+      await recordVerificationCacheProgress(dependencies, input.run.runId, "store", command.id, supplied.durationMs);
+      continue;
+    }
+    misses.push(command);
+    await recordVerificationCacheProgress(dependencies, input.run.runId, "miss", command.id);
+  }
+  if (misses.length) {
+    const observed = await dependencies.verifier.run(
+      misses, input.signal, verificationProgressRecorder(input.run.runId, "baseline", dependencies.runs),
+    );
+    for (const [missIndex, command] of misses.entries()) {
+      const originalIndex = commands.findIndex((candidate) => candidate.id === command.id);
+      const check = observed[missIndex];
+      if (check) byIndex[originalIndex] = check;
+      const key = keys.get(command.id);
+      if (key && check?.status === "passed" && cache) {
+        if (await cache.put(key, check)) await recordVerificationCacheProgress(dependencies, input.run.runId, "store", command.id, check.durationMs);
+      }
+    }
+  }
+  if (hits === commands.length) {
+    await recordVerificationCacheProgress(dependencies, input.run.runId, "all-hit", undefined);
+  }
+  return byIndex.filter((check): check is CheckResult => check !== undefined);
+}
+
+async function recordVerificationCacheProgress(
+  dependencies: WorkOnDependencies,
+  runId: string,
+  event: "hit" | "miss" | "reject" | "store" | "all-hit",
+  commandId?: string,
+  durationMs?: number,
+): Promise<void> {
+  await dependencies.runs.recordProgress({
+    runId, phase: `verification.receipt-cache.${event}`,
+    message: `${commandId ?? "verification plan"}${durationMs !== undefined ? ` saved ${durationMs}ms` : ""}`,
+    occurredAt: new Date().toISOString(),
+  });
+}
+
+async function lockfilesFingerprint(root: string): Promise<string> {
+  const files = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock"];
+  const values: Array<[string, string]> = [];
+  for (const file of files) {
+    try { values.push([file, (await readFile(`${root}/${file}`)).toString("base64")]); } catch { /* absent lockfile */ }
+  }
+  return digestJson(values);
 }
 
 async function assertPristineWorkspace(

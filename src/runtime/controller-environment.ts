@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -97,6 +98,19 @@ export function sealVerificationEnvironment(environment: NodeJS.ProcessEnv = pro
   const path = environmentValue(sealed, "PATH");
   if (path) sealed[FORGEDOCK_VERIFICATION_PATH] = path;
   return sealed;
+}
+
+/**
+ * Stable controller-environment identity for operational verification caches.
+ * Random isolated homes, transport variables, secrets, and machine-local paths
+ * are deliberately excluded; PATH/tool versions are represented separately.
+ */
+export function verificationEnvironmentFingerprint(environment: NodeJS.ProcessEnv = process.env): string {
+  const excluded = /(?:HOME|USERPROFILE|CONFIG|CACHE|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|KEY|CREDENTIAL|COOKIE|JWT|PATH$|TMP|TEMP|RUNTIME|SESSION|RUN_ID)/i;
+  const entries = Object.entries(withoutAgentTransportEnvironment(environment))
+    .filter(([name, value]) => value !== undefined && !excluded.test(name))
+    .sort(([left], [right]) => left.localeCompare(right));
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
 function discoverGitForWindowsRoot(environment: NodeJS.ProcessEnv): string | undefined {

@@ -766,7 +766,7 @@ async function workOn(
           buildResult: targetBuild, ...(targetFreshBuild !== undefined ? { freshBuildResult: targetFreshBuild } : {}), ...(targetPr !== undefined ? { pullRequest: targetPr } : {}), workspace: targetWorkspace,
           resolveVerificationCatalog: (baseSha: string) => discoverVerificationCommands(process.cwd(), baseSha),
           verification: targetVerification, signal: leaseController.signal,
-        }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, leaseGuard, ...(orchestration?.promoteTargetRouteClaim ? { promoteTargetRouteClaim: orchestration.promoteTargetRouteClaim } : {}), onAgentEvent });
+        }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, verificationReceiptCache: store, leaseGuard, ...(orchestration?.promoteTargetRouteClaim ? { promoteTargetRouteClaim: orchestration.promoteTargetRouteClaim } : {}), onAgentEvent });
         process.stdout.write(`${statusGlyph("active", mode)} Recovered target movement for ${resumeRunId} at ${recovered.buildResult.payload.headSha}; fresh review admission is required
 `);
         return;
@@ -1082,7 +1082,7 @@ async function workOn(
         },
         signal: leaseController.signal,
       };
-      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, ciPolicy: reviewCi, ciRepairWorkspaces: git, leaseGuard, onAgentEvent };
+      const dependencies = { runtime, artifacts, runs, git, verifier, host: github, telemetry: store, verificationReceiptCache: store, ciPolicy: reviewCi, ciRepairWorkspaces: git, leaseGuard, onAgentEvent };
       const result = admission.checkpoint === "conflict-recovery"
         ? await resumeConflictRecoveryWorkOn({
           run,

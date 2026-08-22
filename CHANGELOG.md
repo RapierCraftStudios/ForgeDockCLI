@@ -7,6 +7,8 @@
 
 ### Added
 
+- Controller verification now supports fail-closed reuse of exact, passed command receipts through the rebuildable SQLite operational cache. Receipt identity binds command arguments, packet targets, exact base/revision, policy/catalog, lockfiles, toolchain, and sealed environment; cache hits and saved duration are recorded as controller progress and never replace semantic or GitHub evidence.
+
 - Native `/orchestrate stop <dag-id>` provides an explicit, exact-DAG semantic stop with a launch barrier, worker drain, durable `cancelled` status, and distinct cancelled board/task guidance.
 - Controller-derived trajectory quality summaries record first-pass verification/review outcomes, phase wall time, agent activity, remediation, repeated verification, model/provider usage, and evidence-backed causal attribution with explicit unknowns.
 - `npm run certify:orchestration` builds and runs an exact-file, single-concurrency local certification set with GitHub credentials removed; `npm run certify:orchestration:dry-run` prints the audited plan without execution.

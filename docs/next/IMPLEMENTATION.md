@@ -61,8 +61,7 @@ implementation boundary, not live dogfood readiness; the certification ledger is
   generate repository tests or prove named symbols/test IDs exist.
 - [x] Exact-SHA publication, review, merge, closure, and recovery freshness checks,
   including authoritative issue re-read before a merged Outcome is final.
-- [x] Durable checkpoint resume for investigation, build, verification, publication,
-  review/remediation, and completion without replaying completed semantic work.
+- [x] Durable verification receipt reuse is limited to passed, fully bound controller commands. SQLite stores the rebuildable cache; exact command/args, packet targets, policy/catalog, base/revision, lockfiles, toolchain, environment, and content identities are required, with hit/miss/reject/store progress and post-hit pristine checks.
 
 ### `review-pr`
 

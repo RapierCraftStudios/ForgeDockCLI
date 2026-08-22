@@ -11,6 +11,8 @@ import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, Or
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
+import { isCacheableVerificationResult, verificationReceiptCacheKey, type VerificationReceiptCache, type VerificationReceiptCacheEntry, type VerificationReceiptCacheKey } from "../../core/ports/verification-receipt-cache.js";
+import type { CheckResult } from "../../core/ports/verification.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
 import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
 
@@ -37,7 +39,7 @@ export interface SqliteRepositoryPurgeResult {
   leases: number;
 }
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository, VerificationReceiptCache {
   readonly #database: DatabaseSync;
   readonly #path: string;
   readonly #witness: LeaseWitness | undefined;
@@ -102,6 +104,19 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         receipt_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS run_telemetry_run ON run_telemetry(run_id, created_at);
+      CREATE TABLE IF NOT EXISTS verification_receipt_cache (
+        cache_key TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        revision_sha TEXT NOT NULL,
+        target_route TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        stored_at TEXT NOT NULL,
+        key_json TEXT NOT NULL,
+        check_json TEXT NOT NULL,
+        saved_duration_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS verification_receipt_cache_route ON verification_receipt_cache(repository, target_route, base_sha, revision_sha);
       CREATE TABLE IF NOT EXISTS remediation_admissions (
         admission_key TEXT PRIMARY KEY,
         repository TEXT NOT NULL,
@@ -503,6 +518,48 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       FROM run_progress WHERE run_id = ? ORDER BY progress_id
     `).all(runId) as Array<{ run_id: string; phase: string; message: string; occurred_at: string }>;
     return rows.map((row) => ({ runId: row.run_id, phase: row.phase, message: row.message, occurredAt: row.occurred_at }));
+  }
+
+  async get(key: VerificationReceiptCacheKey): Promise<VerificationReceiptCacheEntry | undefined> {
+    const cacheKey = verificationReceiptCacheKey(key);
+    const row = this.#database.prepare(`
+      SELECT key_json, check_json, saved_duration_ms, stored_at
+      FROM verification_receipt_cache WHERE cache_key = ?
+    `).get(cacheKey) as { key_json: string; check_json: string; saved_duration_ms: number; stored_at: string } | undefined;
+    if (!row) return undefined;
+    try {
+      const keyValue = JSON.parse(row.key_json) as VerificationReceiptCacheKey;
+      const check = JSON.parse(row.check_json) as CheckResult;
+      if (!isCacheableVerificationResult(key, check) || verificationReceiptCacheKey(keyValue) !== cacheKey) return undefined;
+      return {
+        key: keyValue,
+        check,
+        savedDurationMs: row.saved_duration_ms,
+        storedAt: row.stored_at,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async put(key: VerificationReceiptCacheKey, check: CheckResult): Promise<boolean> {
+    if (!isCacheableVerificationResult(key, check)) return false;
+    const storedAt = new Date().toISOString();
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      this.#database.prepare(`
+        INSERT INTO verification_receipt_cache
+          (cache_key, repository, base_sha, revision_sha, target_route, command_id, stored_at, key_json, check_json, saved_duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key) DO UPDATE SET
+          stored_at = excluded.stored_at, key_json = excluded.key_json,
+          check_json = excluded.check_json, saved_duration_ms = excluded.saved_duration_ms
+      `).run(
+        verificationReceiptCacheKey(key), key.repository.toLowerCase(), key.baseSha.toLowerCase(),
+        key.revisionSha.toLowerCase(), key.targetRoute, key.commandId, storedAt,
+        JSON.stringify(key), JSON.stringify(check), check.durationMs,
+      );
+    }));
+    return true;
   }
 
   acquire(itemId: string, owner: string, ttlMs: number, now = Date.now(), options?: LeaseAcquisitionOptions): Lease | undefined {
