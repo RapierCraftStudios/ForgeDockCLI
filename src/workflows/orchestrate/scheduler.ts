@@ -38,6 +38,11 @@ export interface ScheduledWorkItem {
 }
 
 export type ScheduledStatus = "queued" | "running" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "invalid";
+export type GithubRateLimitDisposition = {
+  kind: "github-primary-rate-limit" | "github-secondary-rate-limit";
+  reason: "primary" | "secondary";
+  operationKey: string;
+};
 export type ScheduleWorkerResult = void | {
   status: "completed" | "skipped" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "failed" | "invalid";
   error?: Error | string;
@@ -51,7 +56,7 @@ export type ScheduleWorkerResult = void | {
   retryDomain?: string;
   retryCode?: string;
   operationKey?: string;
-  /** Typed durable workflow checkpoint disposition; scheduler treats it as a bounded relaunch, not suspension. */
+  rateLimit?: GithubRateLimitDisposition & { retryAfterMs?: number; resetAt?: number; blockedUntil?: number };  /** Typed durable workflow checkpoint disposition; scheduler treats it as a bounded relaunch, not suspension. */
   recoverableCheckpoint?: {
     kind: "remediation";
     checkpointKey: string;
@@ -705,11 +710,13 @@ export async function runSchedule(
               kind: "retry",
               domain: outcome.retryDomain ?? "workflow",
               code: outcome.retryCode ?? "retryable",
+              ...(outcome.rateLimit !== undefined ? { rateLimitReason: outcome.rateLimit.reason } : {}),
               nextAttemptAt,
               attempt,
               maxAttempts,
             });
-            const exhausted = recoverable ? attempt > maxAttempts : attempt >= maxAttempts;
+            const exhausted = (recoverable ? attempt > maxAttempts : attempt >= maxAttempts)
+              && outcome.rateLimit === undefined;
             if (exhausted) {
               status.set(item.id, "failed");
               updateQueuedWaitReason(item.id, undefined, false);

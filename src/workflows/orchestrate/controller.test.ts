@@ -1697,6 +1697,46 @@ describe("OrchestrationController", () => {
     assert.equal(result.record.nodes[0]?.status, "completed");
   });
 
+  it("restores typed GitHub rate-limit retry evidence across controller restart", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const gate = deferred<void>();
+    let calls = 0;
+    const service = controller(repository, async () => {
+      calls += 1;
+      await gate.promise;
+      return { status: "completed" };
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("rate-restart", 28)], maxParallel: 1 });
+    const original = created.nodes[0]!;
+    const retryAttempt = {
+      attemptId: "attempt-rate-restart",
+      attempt: 1,
+      recovery: "resume" as const,
+      status: "retry_wait" as const,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:01:00.000Z",
+      completedAt: "2026-01-01T00:01:00.000Z",
+      retryAttempt: 1,
+      retryMaxAttempts: 3,
+      retryNextAt: "2025-01-01T00:00:00.000Z",
+      retryDomain: "github" as const,
+      retryCode: "github-primary-rate-limit",
+      operationKey: "github.com:owner/repo:issue",
+      rateLimit: { kind: "github-primary-rate-limit" as const, reason: "primary" as const, operationKey: "github.com:owner/repo:issue", retryAfterMs: 1_000, blockedUntil: 1_000 },
+    };
+    await repository.saveOrchestration({
+      ...created,
+      status: "running",
+      nodes: [{ ...original, status: "running", activeAttemptId: retryAttempt.attemptId, attempts: [retryAttempt] }],
+    });
+    const resumed = service.resume(created.orchestrationId);
+    await waitUntil(() => repository.saves.some((record) => record.nodes[0]?.attempts?.some((attempt) => attempt.rateLimit?.kind === "github-primary-rate-limit")), "typed rate-limit evidence was not retained");
+    gate.resolve();
+    const result = await resumed;
+    assert.equal(calls, 1);
+    assert.equal(result.record.nodes[0]?.status, "completed");
+  });
+
   it("clears stale retry waitReason when bounded retry exhausts", async () => {
     const repository = new RecordingOrchestrationRepository();
     let calls = 0;

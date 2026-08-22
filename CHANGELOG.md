@@ -7,6 +7,8 @@
 
 ### Added
 
+- GitHub primary and secondary REST/GraphQL rate limits are classified as shared, redacted infrastructure backpressure. Native workers persist the bounded cooldown in SQLite, surface `retry_wait` with a stable GitHub operation key, and resume automatically without creating a failed node or semantic Outcome; projection warnings remain nonfatal.
+
 - Controller verification now supports fail-closed reuse of exact, passed command receipts through the rebuildable SQLite operational cache. Receipt identity binds command arguments, packet targets, exact base/revision, policy/catalog, lockfiles, toolchain, and sealed environment; cache hits and saved duration are recorded as controller progress and never replace semantic or GitHub evidence.
 
 - Native `/orchestrate stop <dag-id>` provides an explicit, exact-DAG semantic stop with a launch barrier, worker drain, durable `cancelled` status, and distinct cancelled board/task guidance.

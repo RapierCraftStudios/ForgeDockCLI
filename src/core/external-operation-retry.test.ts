@@ -71,17 +71,18 @@ describe("external-operation retry", () => {
 
   it("classifies retryable HTTP statuses and Retry-After", () => {
     const response = new Response("busy", { status: 429, headers: { "retry-after": "2" } });
-    const error = externalHttpError(response);
-    assert.deepEqual(classifyExternalFault(error), { kind: "http", status: 429, retryAfterMs: 2_000 });
+    const error = externalHttpError({ status: response.status, headers: response.headers, body: "API rate limit exceeded", source: "github" });
+    assert.deepEqual(classifyExternalFault(error), { kind: "github-primary-rate-limit", status: 429, retryAfterMs: 2_000, reason: "primary" });
     assert.equal(classifyExternalFault(new Error("HTTP 404 response")), undefined);
     assert.deepEqual(classifyExternalFault(Object.assign(new Error("TLS failure"), { code: "ERR_TLS_CERT_ALTNAME_INVALID" })), { kind: "tls", code: "ERR_TLS_CERT_ALTNAME_INVALID" });
   });
 
   it("retries quota 403 but leaves permission 403 permanent", () => {
-    const quota = externalHttpError({ status: 403, body: "secondary rate limit", headers: new Headers({ "retry-after": "1" }) });
-    assert.deepEqual(classifyExternalFault(quota), { kind: "http", status: 403, retryAfterMs: 1_000 });
-    const permission = externalHttpError({ status: 403, body: "Resource not accessible by integration", headers: new Headers() });
-    assert.equal(classifyExternalFault(permission), undefined);
+    const quota = externalHttpError({ status: 403, body: "secondary rate limit", headers: new Headers({ "retry-after": "1" }), source: "github" });
+    assert.deepEqual(classifyExternalFault(quota), { kind: "github-secondary-rate-limit", status: 403, retryAfterMs: 1_000, reason: "secondary" });
+    const permissionWithRetry = externalHttpError({ status: 403, body: "Resource not accessible by integration", headers: new Headers({ "retry-after": "1" }), source: "github" });
+    assert.equal(classifyExternalFault(permissionWithRetry), undefined);
+
   });
 
   it("shares host admission backoff across concurrent callers", async () => {
@@ -92,13 +93,43 @@ describe("external-operation retry", () => {
     const sleep = async (delay: number) => { sleeps++; now += delay; };
     const operation = async () => {
       calls++;
-      if (calls <= 2) throw externalHttpError({ status: 429, headers: new Headers({ "retry-after": "2" }) });
+      if (calls <= 2) throw externalHttpError({ status: 429, headers: new Headers({ "retry-after": "2" }), source: "github" });
       return "ok";
     };
     const options = { hostKey: "test-host", now: () => now, sleep, jitterRatio: 0, maxAttempts: 2 };
     assert.deepEqual(await Promise.all([withExternalOperationRetry(operation, options), withExternalOperationRetry(operation, options)]), ["ok", "ok"]);
     assert.ok(sleeps >= 2);
     clearExternalOperationAdmission("test-host");
+  });
+
+  it("shares durable-style rate-limit admission and resumes after reset", async () => {
+    let blockedUntil = 0;
+    const coordinator = {
+      readAdmission: (key: string, now = 0) => blockedUntil > now ? { blockedUntil, reason: "primary", updatedAt: now } : undefined,
+      writeAdmission: (_key: string, state: { blockedUntil: number }) => { blockedUntil = state.blockedUntil; },
+    };
+    let now = 0;
+    let calls = 0;
+    const sleeps: number[] = [];
+    const sleep = async (delay: number) => { sleeps.push(delay); now += delay; };
+    await assert.rejects(withExternalOperationRetry(async () => {
+      calls++;
+      throw externalHttpError({ status: 429, headers: new Headers({ "retry-after": "2" }), source: "github" });
+    }, { hostKey: "repo:a/b", coordinator, now: () => now, sleep, maxAttempts: 1 }));
+    assert.equal(calls, 1);
+    await withExternalOperationRetry(async () => { calls++; return "ok"; }, { hostKey: "repo:a/b", coordinator, now: () => now, sleep, maxAttempts: 1 });
+    assert.equal(calls, 2);
+    assert.ok(sleeps.some((delay) => delay >= 2_000));
+  });
+
+  it("classifies GraphQL CLI rate-limit text and redacts credentials", async () => {
+    const error = new Error("gh api GraphQL: API rate limit exceeded for user ID 123 (token=ghp_secret-value) user@example.com");
+    assert.equal(classifyExternalFault(error)?.kind, "github-primary-rate-limit");
+    await assert.rejects(withExternalOperationRetry(async () => { throw error; }, { maxAttempts: 1 }), (caught: unknown) => {
+      assert.ok(caught instanceof ExternalOperationRetryError);
+      assert.doesNotMatch(caught.message, /ghp_secret|user@example\.com|user ID 123/);
+      return true;
+    });
   });
 
   it("classifies GitHub's exact connectivity guidance as transient network", () => {

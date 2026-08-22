@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import { OrchestrationIssueOwnershipConflictError, type OrchestrationRecord } from "../../core/ports/orchestration.js";
@@ -123,6 +124,39 @@ async function assertConcurrentConstructors(moduleUrl: string, className: string
 }
 
 describe("SQLite operational repositories", () => {
+  it("treats admission as optional for current and legacy read-only stores", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-readonly-"));
+    const currentPath = join(root, "current.db");
+    const writable = new SqliteRepositories(currentPath);
+    writable.writeAdmission("github.com:a/b", { blockedUntil: Date.now() + 60_000, reason: "primary", updatedAt: Date.now() });
+    writable.close();
+    const current = new SqliteRepositories(currentPath, { readOnly: true });
+    assert.equal(current.readAdmission("github.com:a/b")?.reason, "primary");
+    current.close();
+
+    const legacyPath = join(root, "legacy.db");
+    const legacy = new DatabaseSync(legacyPath);
+    legacy.exec("CREATE TABLE runs (run_id TEXT PRIMARY KEY, version INTEGER NOT NULL, state_json TEXT NOT NULL)");
+    legacy.close();
+    const legacyReader = new SqliteRepositories(legacyPath, { readOnly: true });
+    assert.equal(legacyReader.readAdmission("github.com:a/b"), undefined);
+    legacyReader.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("prunes expired admission rows only through writable instances", () => {
+    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-prune-"));
+    const path = join(root, "state.db");
+    const store = new SqliteRepositories(path);
+    const now = Date.now();
+    store.writeAdmission("github.com:expired", { blockedUntil: now - 1, reason: "primary", updatedAt: now - 10 });
+    store.writeAdmission("github.com:live", { blockedUntil: now + 60_000, reason: "secondary", updatedAt: now });
+    assert.equal(store.readAdmission("github.com:expired"), undefined);
+    assert.equal(store.readAdmission("github.com:live")?.reason, "secondary");
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   it("waits for simultaneous repository and observation-store constructors", async () => {
     const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-constructor-race-"));
     try {

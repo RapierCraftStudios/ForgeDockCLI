@@ -222,6 +222,8 @@ paths:
 
 ForgeDock Next uses the managed [`next.orchestration`](#forgedock-next-managed-block) route fields. `dispatch_mode` defaults to mutation-free preview. A confirmed orchestration may provision a missing canonical `milestone/{slug}` branch from the repository default before dispatch; preview only reports the planned lane and performs no branch mutation. The controller never silently falls back to `staging` for a milestone issue.
 
+GitHub REST and GraphQL primary/secondary rate limits are treated as infrastructure backpressure. Native workers persist a redacted repository-scoped cooldown in the checkout's rebuildable SQLite state, expose `retry_wait` and a stable GitHub operation key in progress/TUI views, and resume after `Retry-After` or reset. Ordinary 4xx responses remain fail-closed; asynchronous label/status projection warnings never authorize or block workflow correctness.
+
 Promotion is a separate controller, never an implicit issue-delivery merge: `forgedock-next promote --from milestone/<slug> --to staging --confirm` creates and verifies a feature-lane promotion PR; `forgedock-next promote --production --confirm` proposes staging → the configured `production_target`. Merge authorization is separate (`--authorize-merge`, or `--resume <promotion-id> --authorize-merge`) and production promotion fails closed unless the target's branch protection is proven.
 
 ---

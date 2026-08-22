@@ -18,7 +18,7 @@ export type OrchestrationWaitReason =
   | { kind: "active-claim-conflict"; node: string; claims: string[] }
   | { kind: "capacity"; maxParallel: number }
   | { kind: "suspended-predecessor"; predecessor: string; checkpoint: string }
-  | { kind: "retry"; domain: string; code: string; nextAttemptAt: string; attempt: number; maxAttempts: number }
+  | { kind: "retry"; domain: string; code: string; nextAttemptAt: string; attempt: number; maxAttempts: number; rateLimitReason?: "primary" | "secondary" }
   | { kind: "decomposition-replan"; children: number[] };
 
 /** JSON-safe, caller-defined evidence frozen with an orchestration plan. */
@@ -81,6 +81,14 @@ export interface OrchestrationWorkerAttemptRecord {
   retryDomain?: "github" | "provider" | "workflow" | "lease" | "transport";
   retryCode?: string;
   operationKey?: string;
+  rateLimit?: {
+    kind: "github-primary-rate-limit" | "github-secondary-rate-limit";
+    reason: "primary" | "secondary";
+    operationKey: string;
+    retryAfterMs?: number;
+    resetAt?: number;
+    blockedUntil?: number;
+  };
 }
 
 export interface OrchestrationRecoveryRecord {

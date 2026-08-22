@@ -1326,6 +1326,7 @@ export class OrchestrationController {
         ...(normalized.retryDomain !== undefined ? { retryDomain: normalized.retryDomain as Exclude<OrchestrationWorkerAttemptRecord["retryDomain"], undefined> } : {}),
         ...(normalized.retryCode !== undefined ? { retryCode: normalized.retryCode } : {}),
         ...(normalized.operationKey !== undefined ? { operationKey: normalized.operationKey } : {}),
+        ...(normalized.rateLimit !== undefined ? { rateLimit: normalized.rateLimit } : {}),
       }),
     );
     if (normalized.retryCheckpointId !== undefined || normalized.targetAdvanceCheckpointId !== undefined) {
@@ -2136,6 +2137,8 @@ function scheduleResultFromAttempt(
         ...(attempt.retryable !== undefined ? { retryable: attempt.retryable } : {}),
         ...(attempt.retryDomain !== undefined ? { retryDomain: attempt.retryDomain } : {}),
         ...(attempt.retryCode !== undefined ? { retryCode: attempt.retryCode } : {}),
+        ...(attempt.operationKey !== undefined ? { operationKey: attempt.operationKey } : {}),
+        ...(attempt.rateLimit !== undefined ? { rateLimit: attempt.rateLimit } : {}),
         attempt: attempt.retryAttempt ?? attempt.attempt,
         maxAttempts: attempt.retryMaxAttempts ?? 3,
       };
@@ -2236,7 +2239,13 @@ function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleW
     ? { operationKey: `${classification.domain}:${classification.code}` }
     : { retryAfterMs: classification.retryAfterMs, operationKey: `${classification.domain}:${classification.code}` };
   const delay = retryBackoffMs(attempt, backoffOptions);
-  const exhausted = attempt >= maxAttempts;
+  const rateLimitKind = classification.code === "github-primary-rate-limit" || classification.code === "github-secondary-rate-limit"
+    ? classification.code
+    : undefined;
+  const rateLimited = rateLimitKind !== undefined;
+  const operationKey = `${classification.domain}:${classification.code}`;
+  const reason = rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary";
+  const exhausted = attempt >= maxAttempts && !rateLimited;
   return {
     status: exhausted ? "failed" : "retry_wait",
     error: error instanceof Error ? error : String(error),
@@ -2247,7 +2256,8 @@ function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleW
     maxAttempts,
     retryDomain: classification.domain,
     retryCode: exhausted ? `${classification.code}-exhausted` : classification.code,
-    operationKey: `${classification.domain}:${classification.code}`,
+    operationKey,
+    ...(rateLimitKind !== undefined ? { rateLimit: { kind: rateLimitKind, reason, operationKey, ...(classification.retryAfterMs !== undefined ? { retryAfterMs: classification.retryAfterMs } : {}), ...(classification.resetAt !== undefined ? { resetAt: classification.resetAt } : {}), blockedUntil: Date.now() + delay } } : {}),
   };
 }
 

@@ -8,13 +8,25 @@ export type ExternalFaultKind =
   | "connection-refused"
   | "tls"
   | "network"
-  | "http";
+  | "http"
+  | "github-primary-rate-limit"
+  | "github-secondary-rate-limit";
 
 export interface ExternalFaultClassification {
   kind: ExternalFaultKind;
   code?: string;
   status?: number;
   retryAfterMs?: number;
+  /** Epoch milliseconds, when GitHub supplied an absolute reset time. */
+  resetAt?: number;
+  reason?: "primary" | "secondary";
+  source?: "github";
+}
+
+/** Rebuildable, process-shared admission state for one remote repository. */
+export interface ExternalOperationCoordinator {
+  readAdmission(key: string, now?: number): { blockedUntil: number; reason: string; updatedAt: number } | undefined;
+  writeAdmission(key: string, state: { blockedUntil: number; reason: string; updatedAt: number }): void;
 }
 
 export class ExternalOperationError extends Error {
@@ -154,7 +166,8 @@ export function operationalFailureFrom(
 
 function boundedCause(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message.length > 2_000 ? `${message.slice(0, 1_997)}...` : message;
+  const redacted = redactExternalText(message);
+  return redacted.length > 2_000 ? `${redacted.slice(0, 1_997)}...` : redacted;
 }
 
 export interface ExternalOperationRetryOptions {
@@ -170,6 +183,8 @@ export interface ExternalOperationRetryOptions {
   random?: () => number;
   /** Shared remote host admission key; callers using the same key honor one backoff. */
   hostKey?: string;
+  /** Durable coordinator shared by native worker processes. */
+  coordinator?: ExternalOperationCoordinator;
   /** Clock used by the shared admission gate. */
   now?: () => number;
   /** Maximum shared gate delay, independent of per-call retry bounds. */
@@ -208,6 +223,15 @@ export async function withExternalOperationRetry<T>(
       const classification = classifyExternalFault(error);
       if (!classification) throw error;
       failures.push(error);
+      if (options.coordinator !== undefined && options.hostKey !== undefined && isGitHubRateLimit(classification)) {
+        const now = (options.now ?? Date.now)();
+        const serverDelay = classification.retryAfterMs ?? (classification.resetAt !== undefined ? Math.max(0, classification.resetAt - now) : undefined);
+        options.coordinator.writeAdmission(options.hostKey, {
+          blockedUntil: now + Math.min(options.maxGateDelayMs ?? 15 * 60_000, Math.max(1_000, serverDelay ?? 1_000)),
+          reason: classification.reason ?? "primary",
+          updatedAt: now,
+        });
+      }
       if (attempt >= maxAttempts) {
         throw new ExternalOperationRetryError(
           `External operation failed after ${attempt} attempt${attempt === 1 ? "" : "s"} (${classification.kind}): ${boundedErrorMessage(error)}`,
@@ -228,7 +252,9 @@ export async function withExternalOperationRetry<T>(
       const delay = boundedRetryAfter === undefined
         ? Math.min(maxDelayMs, localDelay)
         : Math.max(boundedRetryAfter, Math.min(maxDelayMs, localDelay));
-      if (options.hostKey !== undefined) setAdmission(options, boundedRetryAfter ?? delay);
+      if (options.hostKey !== undefined) {
+        setAdmission(options, boundedRetryAfter ?? delay);
+      }
       await sleep(delay, options.signal);
     }
   }
@@ -239,8 +265,12 @@ async function waitForAdmission(options: ExternalOperationRetryOptions): Promise
   const key = options.hostKey;
   if (key === undefined) return;
   const now = options.now ?? Date.now;
-  const until = externalAdmissionUntil.get(key) ?? 0;
-  const delay = until - now();
+  const localUntil = externalAdmissionUntil.get(key) ?? 0;
+  const nowValue = now();
+  if (localUntil <= nowValue) externalAdmissionUntil.delete(key);
+  const durable = options.coordinator?.readAdmission(key, nowValue);
+  const until = Math.max(externalAdmissionUntil.get(key) ?? 0, durable?.blockedUntil ?? 0);
+  const delay = until - nowValue;
   if (delay > 0) await (options.sleep ?? defaultSleep)(delay, options.signal);
 }
 
@@ -278,18 +308,23 @@ export function externalHttpError(response: {
   statusText?: string;
   headers?: Headers;
   body?: unknown;
+  source?: "github";
 }): Error {
   const body = typeof response.body === "string" ? response.body : "";
   const retryAfterMs = parseRetryAfter(response.headers?.get("retry-after"));
-  const resetMs = parseRateLimitReset(response.headers?.get("x-ratelimit-reset"));
-  const quota = response.status === 403 && isQuotaLimited(body, response.headers);
+  const resetAt = parseRateLimitResetAt(response.headers?.get("x-ratelimit-reset"));
+  const resetMs = resetAt === undefined ? undefined : Math.max(0, resetAt - Date.now());
+  const quota = response.source === "github" && (response.status === 429 || (response.status === 403 && isQuotaLimited(body, response.headers)));
+  const rateKind = quota ? rateLimitKind(body, response.headers) : undefined;
   const retryable = isRetryableHttpStatus(response.status) || quota;
   if (!retryable) return new Error(`External HTTP operation failed (${response.status}${response.statusText ? ` ${response.statusText}` : ""})`);
   const authoritativeRetry = retryAfterMs ?? resetMs;
   const classification: ExternalFaultClassification = {
-    kind: "http",
+    kind: rateKind ?? "http",
     status: response.status,
     ...(authoritativeRetry !== undefined ? { retryAfterMs: authoritativeRetry } : {}),
+    ...(resetAt !== undefined ? { resetAt } : {}),
+    ...(rateKind !== undefined ? { reason: rateKind === "github-secondary-rate-limit" ? "secondary" as const : "primary" as const } : {}),
   };
   return new ExternalOperationError(
     `External HTTP operation failed (${response.status}${response.statusText ? ` ${response.statusText}` : ""})`,
@@ -303,11 +338,15 @@ function classifyOne(error: unknown): ExternalFaultClassification | undefined {
   if (isClassification(known)) return known;
 
   const status = numericProperty(error, "status") ?? numericProperty(error, "statusCode");
-  if (status === 403 && isQuotaLimited(stringProperty(error, "body") ?? stringProperty(error, "message") ?? "", headersProperty(error))) {
+  const body = stringProperty(error, "body") ?? stringProperty(error, "message") ?? "";
+  if (isGitHubSource(error, body) && ((status === 403 && isQuotaLimited(body, headersProperty(error))) || status === 429)) {
+    const rateKind = rateLimitKind(body, headersProperty(error));
+    const resetAt = parseRateLimitResetAt(headersProperty(error)?.get("x-ratelimit-reset"));
     const retryAfterMs = numericProperty(error, "retryAfterMs")
       ?? parseRetryAfter(headersProperty(error)?.get("retry-after"))
-      ?? parseRateLimitReset(headersProperty(error)?.get("x-ratelimit-reset"));
-    return { kind: "http", status, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+      ?? parseRetryAfterFromMessage(body)
+      ?? (resetAt === undefined ? undefined : Math.max(0, resetAt - Date.now()));
+    return { kind: rateKind, source: "github", status, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}), ...(resetAt !== undefined ? { resetAt } : {}), reason: rateKind === "github-secondary-rate-limit" ? "secondary" : "primary" };
   }
   if (status !== undefined && isRetryableHttpStatus(status)) {
     const retryAfterMs = numericProperty(error, "retryAfterMs")
@@ -325,17 +364,23 @@ function classifyOne(error: unknown): ExternalFaultClassification | undefined {
   if (code === "ENETUNREACH" || code === "EHOSTUNREACH" || code === "ECONNABORTED" || code === "EPIPE" || code?.startsWith("UND_ERR_")) return { kind: "network", ...(code ? { code } : {}) };
 
   const message = typeof error.message === "string" ? error.message : "";
-  if (/\b403\b/.test(message) && isQuotaLimited(message, headersProperty(error))) {
-    const retryAfterMs = parseRetryAfter(headersProperty(error)?.get("retry-after"))
-      ?? parseRetryAfterFromMessage(message)
-      ?? parseRateLimitReset(headersProperty(error)?.get("x-ratelimit-reset"));
-    return { kind: "http", status: 403, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+  if (isGitHubSource(error, message) && isQuotaLimited(message, headersProperty(error)) && /rate limit|abuse detection|temporarily blocked|too many requests/i.test(message)) {
+    const rateKind = rateLimitKind(message, headersProperty(error));
+    const resetAt = parseRateLimitResetAt(headersProperty(error)?.get("x-ratelimit-reset"));
+    const retryAfterMs = numericProperty(error, "retryAfterMs") ?? parseRetryAfter(headersProperty(error)?.get("retry-after")) ?? parseRetryAfterFromMessage(message) ?? (resetAt === undefined ? undefined : Math.max(0, resetAt - Date.now()));
+    return { kind: rateKind, source: "github", ...(status !== undefined ? { status } : {}), ...(retryAfterMs !== undefined ? { retryAfterMs } : {}), ...(resetAt !== undefined ? { resetAt } : {}), reason: rateKind === "github-secondary-rate-limit" ? "secondary" : "primary" };
   }
-  if (/\b(408|425|429|5\d\d)\b/.test(message) && /\b(?:HTTP|status|response|request|server|npm)\b/i.test(message)) {
+  if (isGitHubSource(error, message) && status === undefined && /\b(?:403|429)\b/.test(message) && isQuotaLimited(message, headersProperty(error))) {
+    const rateKind = rateLimitKind(message, headersProperty(error));
+    const resetAt = parseRateLimitResetAt(headersProperty(error)?.get("x-ratelimit-reset"));
+    const retryAfterMs = parseRetryAfter(headersProperty(error)?.get("retry-after")) ?? parseRetryAfterFromMessage(message) ?? (resetAt === undefined ? undefined : Math.max(0, resetAt - Date.now()));
+    return { kind: rateKind, source: "github", status: /\b429\b/.test(message) ? 429 : 403, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}), ...(resetAt !== undefined ? { resetAt } : {}), reason: rateKind === "github-secondary-rate-limit" ? "secondary" : "primary" };
+  }
+  if ((status !== undefined && isRetryableHttpStatus(status)) || (/\b(408|425|429|5\d\d)\b/.test(message) && /\b(?:HTTP|status|response|request|server|npm)\b/i.test(message))) {
     const matched = /\b(408|425|429|5\d\d)\b/.exec(message);
-    const httpStatus = matched?.[1] ? Number(matched[1]) : undefined;
+    const httpStatus = status ?? (matched?.[1] ? Number(matched[1]) : undefined);
     if (httpStatus !== undefined) {
-      const retryAfterMs = parseRetryAfterFromMessage(message);
+      const retryAfterMs = numericProperty(error, "retryAfterMs") ?? parseRetryAfterFromMessage(message);
       return { kind: "http", status: httpStatus, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
     }
   }
@@ -350,8 +395,15 @@ function classifyOne(error: unknown): ExternalFaultClassification | undefined {
 }
 
 function boundedErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.length > 2_000 ? `${message.slice(0, 1_997)}...` : message;
+  return boundedCause(error);
+}
+
+function redactExternalText(value: string): string {
+  return value
+    .replace(/(gh[pousr]_|github_pat_|token=|access_token=|authorization:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/\b(?:token|secret|password)\s*[:=]\s*[^\s,;]+/gi, "$&".replace(/[^:=]+$/, "[REDACTED]"))
+    .replace(/\buser(?:\s+id)?\s*[:=]?\s*\d+\b/gi, "user ID [REDACTED]")
+    .replace(/\b[A-Za-z0-9_./-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED-USER]");
 }
 
 function isRetryableHttpStatus(status: number): boolean {
@@ -360,18 +412,29 @@ function isRetryableHttpStatus(status: number): boolean {
 
 function isQuotaLimited(body: string, headers?: Headers): boolean {
   const remaining = headers?.get("x-ratelimit-remaining");
-  const headerSignal = headers !== undefined && (
-    remaining === "0" || headers.get("x-ratelimit-reset") !== null || headers.get("retry-after") !== null
-  );
+  const headerSignal = headers !== undefined && remaining === "0";
   return headerSignal || /secondary rate limit|rate limit exceeded|api rate limit|abuse detection|too many requests|temporarily blocked/i.test(body);
 }
 
-function parseRateLimitReset(value: string | null | undefined): number | undefined {
+function rateLimitKind(body: string, headers?: Headers): "github-primary-rate-limit" | "github-secondary-rate-limit" {
+  return /secondary rate limit|abuse detection|temporarily blocked|secondary/i.test(body)
+    ? "github-secondary-rate-limit"
+    : "github-primary-rate-limit";
+}
+
+function isGitHubSource(error: ObjectLike, text: string): boolean {
+  return error.source === "github" || /(?:^|\b)(?:gh|github|api\.github\.com)\b/i.test(text);
+}
+function isGitHubRateLimit(classification: ExternalFaultClassification): boolean {
+  return classification.kind === "github-primary-rate-limit" || classification.kind === "github-secondary-rate-limit";
+}
+
+function parseRateLimitResetAt(value: string | null | undefined): number | undefined {
   if (!value) return undefined;
   const epoch = Number(value.trim());
-  if (!Number.isFinite(epoch)) return undefined;
-  return Math.max(0, epoch * 1_000 - Date.now());
+  return Number.isFinite(epoch) && epoch > 0 ? epoch * 1_000 : undefined;
 }
+
 function parseRetryAfterFromMessage(message: string): number | undefined {
   const match = /retry[- ]after[=: ]+(\d+)/i.exec(message);
   return match?.[1] === undefined ? undefined : Number(match[1]) * 1_000;
@@ -418,7 +481,7 @@ async function defaultSleep(delayMs: number, signal?: AbortSignal): Promise<void
   });
 }
 
-type ObjectLike = Record<string, unknown> & { cause?: unknown; classification?: unknown; code?: unknown; kind?: unknown; message?: unknown; status?: unknown; statusCode?: unknown; retryAfterMs?: unknown; body?: unknown; headers?: unknown };
+type ObjectLike = Record<string, unknown> & { cause?: unknown; classification?: unknown; code?: unknown; kind?: unknown; message?: unknown; status?: unknown; statusCode?: unknown; retryAfterMs?: unknown; body?: unknown; headers?: unknown; source?: unknown };
 function isObject(value: unknown): value is ObjectLike { return typeof value === "object" && value !== null; }
 function stringProperty(value: ObjectLike, key: "body" | "message"): string | undefined {
   const candidate = value[key];
@@ -433,5 +496,5 @@ function numericProperty(value: ObjectLike, key: "status" | "statusCode" | "retr
 }
 function isClassification(value: unknown): value is ExternalFaultClassification {
   if (!isObject(value) || typeof value.kind !== "string") return false;
-  return ["timeout", "dns", "connection-reset", "connection-refused", "tls", "network", "http"].includes(value.kind);
+  return ["timeout", "dns", "connection-reset", "connection-refused", "tls", "network", "http", "github-primary-rate-limit", "github-secondary-rate-limit"].includes(value.kind);
 }

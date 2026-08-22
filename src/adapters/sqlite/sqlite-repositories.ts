@@ -14,7 +14,8 @@ import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/tele
 import { isCacheableVerificationResult, verificationReceiptCacheKey, type VerificationReceiptCache, type VerificationReceiptCacheEntry, type VerificationReceiptCacheKey } from "../../core/ports/verification-receipt-cache.js";
 import type { CheckResult } from "../../core/ports/verification.js";
 import type { RunState, TransitionRecord } from "../../core/state/machine.js";
-import { initializeSqliteDatabase, withSqliteBusyRetry } from "../../core/sqlite-retry.js";
+import { initializeSqliteDatabase, withSqliteBusyRetry, withSqliteBusyRetrySync } from "../../core/sqlite-retry.js";
+import type { ExternalOperationCoordinator } from "../../core/external-operation-retry.js";
 
 /** Exact persisted identities accepted by the internal cleanup boundary. */
 export interface SqliteRepositoryPurgeManifest {
@@ -39,15 +40,16 @@ export interface SqliteRepositoryPurgeResult {
   leases: number;
 }
 
-export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository, VerificationReceiptCache {
+export class SqliteRepositories implements ArtifactRepository, RunRepository, LeaseRepository, TelemetryRepository, RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository, OrchestrationRepository, PromotionRepository, VerificationReceiptCache, ExternalOperationCoordinator {
   readonly #database: DatabaseSync;
   readonly #path: string;
   readonly #witness: LeaseWitness | undefined;
+  readonly #readOnly: boolean;
   #recoveryEpoch: number | undefined;
   #leaseFailure: string | undefined;
-
   constructor(path: string, options: { witness?: LeaseWitness; readOnly?: boolean } = {}) {
     this.#path = path;
+    this.#readOnly = options.readOnly === true;
     this.#witness = options.witness;
     if (path !== ":memory:" && !options.readOnly) mkdirSync(dirname(path), { recursive: true });
     this.#database = new DatabaseSync(path, options.readOnly ? { readOnly: true } : {});
@@ -152,6 +154,12 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         record_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS promotions_updated ON promotion_records(updated_at);
+      CREATE TABLE IF NOT EXISTS external_operation_admission (
+        admission_key TEXT PRIMARY KEY,
+        blocked_until INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
     if (options.readOnly) return;
     // Existing operational stores predate fencing. They are retained for
@@ -159,6 +167,35 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN binding TEXT"); } catch { /* already migrated */ }
   }
+
+  readAdmission(key: string, now = Date.now()): { blockedUntil: number; reason: string; updatedAt: number } | undefined {
+    try {
+      const row = this.#database.prepare("SELECT blocked_until, reason, updated_at FROM external_operation_admission WHERE admission_key = ?").get(key) as { blocked_until: number; reason: string; updated_at: number } | undefined;
+      if (!row || row.blocked_until <= now) return undefined;
+      return { blockedUntil: row.blocked_until, reason: row.reason, updatedAt: row.updated_at };
+    } catch {
+      // Legacy read-only stores may predate this operational table. Admission
+      // is advisory; a missing table must never make GitHub operations fail.
+      return undefined;
+    }
+  }
+
+  writeAdmission(key: string, state: { blockedUntil: number; reason: string; updatedAt: number }): void {
+    if (this.#readOnly) return;
+    if (!Number.isSafeInteger(state.blockedUntil) || !Number.isSafeInteger(state.updatedAt) || state.blockedUntil < state.updatedAt) return;
+    withSqliteBusyRetrySync(() => {
+      this.#database.prepare("DELETE FROM external_operation_admission WHERE blocked_until <= ?").run(state.updatedAt);
+      this.#database.prepare(`
+      INSERT INTO external_operation_admission (admission_key, blocked_until, reason, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(admission_key) DO UPDATE SET
+        blocked_until = CASE WHEN excluded.blocked_until > external_operation_admission.blocked_until THEN excluded.blocked_until ELSE external_operation_admission.blocked_until END,
+        reason = CASE WHEN excluded.blocked_until >= external_operation_admission.blocked_until THEN excluded.reason ELSE external_operation_admission.reason END,
+        updated_at = CASE WHEN excluded.blocked_until >= external_operation_admission.blocked_until THEN excluded.updated_at ELSE external_operation_admission.updated_at END
+    `).run(key, state.blockedUntil, state.reason.slice(0, 80), state.updatedAt);
+    });
+  }
+
 
   async append(artifact: DurableArtifact): Promise<void> {
     assertArtifact(artifact);

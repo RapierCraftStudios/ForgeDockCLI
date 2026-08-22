@@ -161,7 +161,12 @@ export function renderWaitReason(reason: WaitReason | { kind?: unknown; [key: st
       const typed = reason as WaitReason & { kind: "suspended-predecessor" };
       return `suspended predecessor ${typed.predecessor} at ${typed.checkpoint}`;
     }
-    case "retry": return `retry:${reason.code}@${reason.nextAttemptAt}`;
+    case "retry": {
+      const typed = reason as WaitReason & { kind: "retry" };
+      return typed.rateLimitReason
+        ? `github ${typed.rateLimitReason} rate limit; retry@${typed.nextAttemptAt}`
+        : `retry:${typed.code}@${typed.nextAttemptAt}`;
+    }
     case "decomposition-replan": return `decomposition replan ${(reason as WaitReason & { kind: "decomposition-replan" }).children.map((issue) => `#${issue}`).join(",")}`;
     default: return `unknown wait reason ${safeInline(String(reason.kind ?? "unknown"))}`;
   }

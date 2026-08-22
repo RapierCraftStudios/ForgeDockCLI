@@ -12,6 +12,8 @@ export interface RetryClassification {
   code: string;
   status?: number;
   retryAfterMs?: number;
+  resetAt?: number;
+  rateLimitReason?: "primary" | "secondary";
   /** A resumable provider session must be continued, never started again. */
   sessionRef?: string;
   resumableSession?: boolean;
@@ -44,6 +46,7 @@ export function classifyRetryableError(error: unknown, options: RetryClassifierO
     ? stringValue((externalClassification as Record<string, unknown>).kind)
     : undefined;
   const externalRetryable = externalKind !== undefined && typeof candidate?.attempts === "number";
+  const isGitHubRateLimit = externalKind === "github-primary-rate-limit" || externalKind === "github-secondary-rate-limit";
   const status = numeric(candidate?.status) ?? numeric(candidate?.statusCode) ?? numeric((externalClassification as Record<string, unknown> | undefined)?.status) ?? parseStatus(cause.message);
   const retryAfterMs = parseRetryAfter(candidate, cause.message)
     ?? numeric((externalClassification as Record<string, unknown> | undefined)?.retryAfterMs);
@@ -51,8 +54,8 @@ export function classifyRetryableError(error: unknown, options: RetryClassifierO
   const resumableSession = options.resumableSession === true
     || candidate?.resumable === true
     || (sessionRef !== undefined && candidate?.resumable !== false);
-  const domain = options.domain ?? (externalRetryable ? "transport" : inferDomain(cause.message, candidate));
-  const code = stringValue(candidate?.code)?.toLowerCase() ?? (externalRetryable ? `${externalKind}-exhausted` : codeFor(status, cause.message, resumableSession));
+  const domain = options.domain ?? (isGitHubRateLimit ? "github" : externalRetryable ? "transport" : inferDomain(cause.message, candidate));
+  const code = stringValue(candidate?.code)?.toLowerCase() ?? (isGitHubRateLimit ? externalKind : externalRetryable ? `${externalKind}-exhausted` : codeFor(status, cause.message, resumableSession));
 
   let retryable = false;
   if (externalRetryable) retryable = true;
@@ -74,6 +77,8 @@ export function classifyRetryableError(error: unknown, options: RetryClassifierO
     code,
     ...(status !== undefined ? { status } : {}),
     ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    ...((typeof (externalClassification as Record<string, unknown> | undefined)?.resetAt === "number") ? { resetAt: (externalClassification as Record<string, unknown>).resetAt as number } : {}),
+    ...((externalClassification as Record<string, unknown> | undefined)?.reason !== undefined ? { rateLimitReason: stringValue((externalClassification as Record<string, unknown>).reason) as "primary" | "secondary" } : {}),
     ...(sessionRef !== undefined ? { sessionRef } : {}),
     ...(resumableSession ? { resumableSession: true } : {}),
     cause,

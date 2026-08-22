@@ -29,7 +29,7 @@ import type { OrchestrationNodeProjectionInput } from "../../workflows/orchestra
 import { classifyRetryableError, deterministicOperationKey, retryBackoffMs } from "../../core/retry.js";
 import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
-import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
+import { withExternalOperationRetry, type ExternalOperationCoordinator } from "../../core/external-operation-retry.js";
 
 export const repositoryFromRemote = parseRepositoryFromRemote;
 
@@ -88,7 +88,7 @@ function isReadOnlyGhInvocation(args: readonly string[]): boolean {
   if (command === "repo") return subcommand === "view";
   if (command === "issue") return subcommand === "list" || subcommand === "view";
   if (command === "pr") return subcommand === "list" || subcommand === "view" || subcommand === "checks" || subcommand === "diff";
-  if (command === "label") return subcommand === "list";
+  if (command === "run") return subcommand === "view";  if (command === "label") return subcommand === "list";
   return false;
 }
 
@@ -487,14 +487,21 @@ export class GitHubClient implements ForgeHost {
   private authRefreshAttempted = false;
   private commandCwd: string;
   private checkoutContext: CheckoutContext | undefined;
+  private readonly externalOperationCoordinator: ExternalOperationCoordinator | undefined;
 
   constructor(
     readonly cwd = process.cwd(),
     readonly remediationAdmissions: RemediationAdmissionRepository & Partial<ReviewFindingPublicationFenceRepository> = new InMemoryRemediationAdmissionRepository(),
     readonly refreshAuth?: (signal?: AbortSignal) => Promise<boolean>,
     readonly signal?: AbortSignal,
+    coordinator?: ExternalOperationCoordinator,
   ) {
     this.commandCwd = cwd;
+    this.externalOperationCoordinator = coordinator
+      ?? (typeof (remediationAdmissions as unknown as { readAdmission?: unknown }).readAdmission === "function"
+        && typeof (remediationAdmissions as unknown as { writeAdmission?: unknown }).writeAdmission === "function"
+        ? remediationAdmissions as unknown as ExternalOperationCoordinator
+        : undefined);
   }
 
   /**
@@ -2105,15 +2112,24 @@ export class GitHubClient implements ForgeHost {
     });
   }
 
+  private externalOperationKey(args: readonly string[]): string {
+    const repoIndex = args.findIndex((arg) => arg === "--repo");
+    const explicitRepo = repoIndex >= 0 ? args[repoIndex + 1] : undefined;
+    const endpointRepo = args.find((arg) => /^repos\/[^/]+\/[^/]+/.test(arg))?.match(/^repos\/([^/]+\/[^/?]+)/)?.[1];
+    const positionalRepo = args.find((arg) => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(arg));
+    const repository = (explicitRepo ?? endpointRepo ?? positionalRepo ?? this.checkoutContext?.repository);
+    if (!repository) return "github.com";
+    return `github.com:${repository.toLowerCase()}`;
+  }
+
   private async gh(args: string[], input?: string): Promise<string> {
     const readOnly = isReadOnlyGhInvocation(args);
-    const run = () => readOnly
-      ? withExternalOperationRetry((signal) => this.runGh(args, input, signal), {
-          hostKey: "github.com",
-          maxAttempts: MAX_READ_ATTEMPTS,
-          ...(this.signal !== undefined ? { signal: this.signal } : {}),
-        })
-      : this.runGh(args, input, this.signal);
+    const run = () => withExternalOperationRetry((signal) => this.runGh(args, input, signal), {
+      hostKey: this.externalOperationKey(args),
+      ...(this.externalOperationCoordinator !== undefined ? { coordinator: this.externalOperationCoordinator } : {}),
+      maxAttempts: readOnly ? MAX_READ_ATTEMPTS : 1,
+      ...(this.signal !== undefined ? { signal: this.signal } : {}),
+    });
     try {
       return await run();
     } catch (error) {
@@ -2156,7 +2172,7 @@ export class GitHubClient implements ForgeHost {
           resolve(stdout);
           return;
         }
-        reject(new Error(`gh ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`));
+        reject(Object.assign(new Error(`gh ${args[0] ?? ""} failed (${code ?? "unknown"}): ${stderr.trim()}`), { source: "github" as const }));
       });
       if (input !== undefined) child.stdin.end(input);
       else child.stdin.end();
