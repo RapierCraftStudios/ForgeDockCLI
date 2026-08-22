@@ -95,7 +95,7 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(issueReads, [{ repo: "owner/parent", issue: 7 }]);
     assert.deepEqual(repositoryReads, ["owner/parent"]);
     assert.deepEqual(artifactReads, [{ repo: "owner/parent", issue: 42 }]);
-    assert.equal(fresh.items[0]?.id, "issue-owner-parent-7");
+    assert.equal(fresh.items[0]?.id, "issue-owner%2Fparent-7");
     assert.equal(fresh.items[0]?.repository, "owner/parent");
     assert.equal(fresh.items[0]?.targetBranch, "parent-main");
     assert.equal(fresh.items[0]?.lane, "fast");
@@ -111,7 +111,66 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(issueReads, [{ repo: "owner/parent", issue: 7 }]);
     assert.deepEqual(repositoryReads, ["owner/parent"]);
     assert.deepEqual(artifactReads, []);
-    assert.equal(resumed.items[0]?.id, "issue-owner-parent-7");
+    assert.equal(resumed.items[0]?.id, "issue-owner%2Fparent-7");
     assert.deepEqual(resumed.items[0]?.dependencies, ["parent"]);
+  });
+
+  it("keeps punctuation-distinct repositories on distinct qualified child IDs", async () => {
+    const github = {
+      async getRepository(repository: string) {
+        return { repo: repository, defaultBranch: `${repository}-main` };
+      },
+      async getIssue(issueNumber: number, repository: string) {
+        return issue(repository, issueNumber);
+      },
+      async listBranches() { return []; },
+      async getBranchHead() { return "head"; },
+    } as any;
+    const makeNode = (id: string, repository: string, issueNumber: number) => ({
+      ...node(id, repository, issueNumber),
+      dependencies: [] as string[],
+    });
+    const orchestration = {
+      repository: "owner/root",
+      nodes: [
+        makeNode("issue-7", "owner/root", 7),
+        makeNode("parent-hyphen", "owner/a-b", 42),
+        makeNode("parent-underscore", "owner/a_b", 43),
+      ],
+    } as any;
+    const base = {
+      github,
+      artifacts: { async list() { return []; } },
+      repository: "owner/root",
+      defaultBranch: "root-main",
+      effective: { fastLaneTarget: "staging" } as any,
+      orchestration,
+      routedIssues: new Map<string, any>(),
+    } as any;
+
+    const first = await materializeCliDecomposition({
+      ...base,
+      node: makeNode("parent-hyphen", "owner/a-b", 42),
+      item: makeNode("parent-hyphen", "owner/a-b", 42),
+      childIssues: [7],
+    });
+    assert.ok(first);
+    const firstId = first.items[0]?.id;
+    assert.notEqual(firstId, "issue-7");
+
+    orchestration.nodes = [...orchestration.nodes, {
+      ...makeNode(firstId!, "owner/a-b", 7),
+    }];
+    const second = await materializeCliDecomposition({
+      ...base,
+      node: makeNode("parent-underscore", "owner/a_b", 43),
+      item: makeNode("parent-underscore", "owner/a_b", 43),
+      childIssues: [7],
+    });
+    assert.ok(second);
+    const secondId = second.items[0]?.id;
+    assert.notEqual(secondId, "issue-7");
+    assert.notEqual(firstId, secondId);
+    assert.equal(first.items.filter((item) => item.id === secondId).length, 0);
   });
 });

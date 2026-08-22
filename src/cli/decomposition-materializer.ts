@@ -10,7 +10,7 @@ import { affectedFilesFromIssueBody } from "../workflows/orchestrate/batching.js
 import { resolveIssueLane, type IssueLane } from "../workflows/work-on/lane.js";
 import { materializeClaimDependencies, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
+import { decompositionQualifiedNodeId, mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
 import type { EffectiveOrchestrationConfig } from "../core/config/forgedock-config.js";
 import { setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
 
@@ -43,10 +43,6 @@ export function decompositionChildIssuesFromArtifacts(
   });
 }
 
-function decompositionChildNodeId(repository: string, issue: number): string {
-  return `issue-${repository.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${issue}`;
-}
-
 export async function materializeCliDecomposition(input: {
   github: GitHubClient;
   artifacts: Pick<ArtifactRepository, "list">;
@@ -75,7 +71,7 @@ export async function materializeCliDecomposition(input: {
   const scheduledRepository = input.item.repository ?? input.repository;
   const existingNodeIds = new Set(input.orchestration.nodes.map((candidate) => candidate.id));
   const childNodeIds = new Map(children.map((issue) => [issue, existingNodeIds.has(`issue-${issue}`)
-    ? decompositionChildNodeId(scheduledRepository, issue)
+    ? decompositionQualifiedNodeId(scheduledRepository, issue)
     : `issue-${issue}`] as const));
   const dependencyNodes = [
     ...input.orchestration.nodes.map((candidate) => ({
@@ -111,7 +107,7 @@ export async function materializeCliDecomposition(input: {
     const sourcePullRequest = /^\*\*Source:\*\*\s*PR\s+#(\d+)\b/im.exec(issue.body)?.[1];
     const defectClass = /<!--\s*FORGE:CLASS:\s*([A-Za-z0-9_-]+)\s*-->/i.exec(issue.body)?.[1];
     childItems.push({
-      id: childNodeIds.get(issue.number) ?? decompositionChildNodeId(scheduledRepository, issue.number),
+      id: childNodeIds.get(issue.number) ?? decompositionQualifiedNodeId(scheduledRepository, issue.number),
       issue: issue.number,
       priority,
       dependencies: mapDecompositionDependencies(issue.number, issue.body, dependencyNodes, scheduledRepository),

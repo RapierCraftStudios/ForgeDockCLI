@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mapDecompositionDependencies } from "./decomposition-dependencies.js";
+import { decompositionQualifiedNodeId, mapDecompositionDependencies } from "./decomposition-dependencies.js";
 
 const nodes = [
   { id: "batch-100", repository: "owner/repo", issue: 100, memberIssues: [1, 2] },
@@ -54,5 +54,13 @@ describe("decomposition prerequisites", () => {
       ],
       " owner/parent ",
     ), ["child-7"]);
+  });
+
+  it("uses collision-free repository-qualified node IDs", () => {
+    const hyphen = decompositionQualifiedNodeId("owner/a-b", 7);
+    const underscore = decompositionQualifiedNodeId("owner/a_b", 7);
+    assert.notEqual(hyphen, underscore);
+    assert.equal(hyphen, "issue-owner%2Fa-b-7");
+    assert.equal(underscore, "issue-owner%2Fa_b-7");
   });
 });

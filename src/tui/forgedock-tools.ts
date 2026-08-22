@@ -54,7 +54,7 @@ import {
 } from "../workflows/orchestrate/batching.js";
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
-import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
+import { decompositionQualifiedNodeId, mapDecompositionDependencies } from "../workflows/orchestrate/decomposition-dependencies.js";
 import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
@@ -1185,6 +1185,10 @@ export async function materializeVisibleDecomposition(input: {
   }
   if (!children.length) throw new Error(`Issue #${input.item.issue} decomposition has no replacement children`);
   const effectiveParentRepositoryKey = normalizeOrchestrationRepository(effectiveParentRepository);
+  const existingNodeIds = new Set(input.orchestration.nodes.map((candidate) => candidate.id));
+  const childNodeIds = new Map(children.map((issue) => [issue, existingNodeIds.has(`issue-${issue}`)
+    ? decompositionQualifiedNodeId(effectiveParentRepository, issue)
+    : `issue-${issue}`] as const));
   const dependencyNodes = [
     ...input.orchestration.nodes
       .filter((candidate) => orchestrationNodeRepository(input.orchestration, candidate) === effectiveParentRepositoryKey)
@@ -1194,7 +1198,12 @@ export async function materializeVisibleDecomposition(input: {
         repository: orchestrationNodeRepository(input.orchestration, candidate),
         ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
       })),
-    ...children.map((issue) => ({ id: `issue-${issue}`, issue, repository: effectiveParentRepository, memberIssues: [issue] })),
+    ...children.map((issue) => ({
+      id: childNodeIds.get(issue)!,
+      issue,
+      repository: effectiveParentRepository,
+      memberIssues: [issue],
+    })),
   ];
   const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
   const childItems: VisibleOrchestrationItem[] = [];
@@ -1213,7 +1222,7 @@ export async function materializeVisibleDecomposition(input: {
     const sourcePullRequest = sourcePullRequestFromIssueBody(issue.body);
     const defectClass = defectClassFromIssueBody(issue.body);
     childItems.push({
-      id: `issue-${issue.number}`,
+      id: childNodeIds.get(issue.number) ?? decompositionQualifiedNodeId(effectiveParentRepository, issue.number),
       issue: issue.number,
       priority: priorityFromIssueLabels(issue.labels ?? []),
       dependencies,

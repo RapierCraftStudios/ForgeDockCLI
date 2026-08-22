@@ -9,6 +9,11 @@ export interface DecompositionDependencyNodeIdentity {
   memberIssues?: readonly number[];
 }
 
+/** Build a reversible repository-qualified fallback ID without lossy slug collisions. */
+export function decompositionQualifiedNodeId(repository: string, issue: number): string {
+  return `issue-${encodeURIComponent(normalizeOrchestrationRepository(repository))}-${issue}`;
+}
+
 export function dependencyIssueNumbersFromBody(body: string): number[] {
   const section = /(?:^|\n)#{2,6}\s+(?:dependencies|prerequisites|blocked by)\s*\n([\s\S]*?)(?=\n#{2,6}\s|$)/i.exec(body)?.[1];
   if (!section) return [];
