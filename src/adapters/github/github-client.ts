@@ -121,6 +121,7 @@ const REVIEW_FINDING_LABELS = [
 ] as const;
 
 function orchestrationLabelForProjection(input: OrchestrationNodeProjectionInput): string | undefined {
+  if (input.workflowLabel !== undefined) return input.workflowLabel;
   if (input.phase === "waiting") return "workflow:waiting";
   if (input.phase === "active") return undefined;
   if (input.node.status === "completed" || input.node.status === "skipped") return "workflow:merged";

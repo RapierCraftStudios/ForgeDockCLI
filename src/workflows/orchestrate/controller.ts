@@ -205,6 +205,8 @@ export interface OrchestrationNodeProjectionInput {
   attempt?: Readonly<OrchestrationWorkerAttemptRecord>;
   /** Controller-derived activity truth; never inferred from worker prose. */
   phase: "waiting" | "active" | "terminal";
+  /** Optional investigation-first workflow label projection. */
+  workflowLabel?: "workflow:investigating" | "workflow:waiting" | "workflow:invalid" | "workflow:decomposed";
 }
 
 export interface OrchestrationControllerDependencies {
@@ -662,6 +664,19 @@ export class OrchestrationController {
     const durable = [...(record.investigations ?? [])].filter((entry) => entry.wave === wave);
     if (!durable.length) throw new Error(`Investigation wave ${wave} has no durable members`);
     const byNode = new Map(durable.map((entry) => [entry.nodeId, entry]));
+    const initialCompleted = durable.filter((entry) => entry.status === "completed").length;
+    if ((state.record.investigationBarrier?.completed ?? 0) !== initialCompleted) {
+      this.replaceRecord(state, {
+        ...state.record,
+        investigationBarrier: {
+          ...(state.record.investigationBarrier ?? { expected: durable.length, startedAt: this.now() }),
+          expected: durable.length,
+          completed: initialCompleted,
+        },
+        updatedAt: this.now(),
+      });
+      await this.flush(state);
+    }
     const items = record.nodes
       .filter((node) => {
         const investigation = byNode.get(node.id);
@@ -729,6 +744,7 @@ export class OrchestrationController {
           ...(result.evidence !== undefined ? { evidence: structuredClone(result.evidence) } : {}),
           completedAt: this.now(),
         }));
+        this.updateInvestigationBarrier(state, wave);
         await this.flush(state);
         activeInvestigations -= 1;
         return { status: result.outcome === "confirmed" ? "completed" : result.outcome === "invalid" ? "invalid" : "skipped", ...(result.childIssues ? { childIssues: result.childIssues } : {}) };
@@ -743,8 +759,7 @@ export class OrchestrationController {
       investigationWaveConcurrency: [...waveMetrics.investigationWaveConcurrency, peakInvestigations],
       runnableFrontier: [...waveMetrics.runnableFrontier, items.length],
     }, updatedAt: this.now() });
-    if (latest.some((entry) => entry.status !== "completed"
-      || ((entry.outcome === "invalid" || entry.outcome === "decompose") && entry.settledAt === undefined))) {
+    if (latest.some((entry) => entry.status !== "completed")) {
       state.record.metrics = {
         ...(state.record.metrics ?? { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 }),
         barrierWaits: (state.record.metrics?.barrierWaits ?? 0) + 1,
@@ -845,7 +860,28 @@ export class OrchestrationController {
     await this.flush(state);
   }
 
-  private updateInvestigation(state: PersistenceState, nodeId: string, update: (entry: OrchestrationInvestigationRecord) => OrchestrationInvestigationRecord): void {
+  private updateInvestigationBarrier(state: PersistenceState, wave: number): void {
+    const entries = (state.record.investigations ?? []).filter((entry) => entry.wave === wave);
+    const expected = state.record.investigationBarrier?.expected ?? entries.length;
+    const completed = Math.min(expected, entries.filter((entry) => entry.status === "completed").length);
+    const current = state.record.investigationBarrier;
+    if (current?.expected === expected && current.completed === completed) return;
+    this.replaceRecord(state, {
+      ...state.record,
+      investigationBarrier: {
+        ...(current ?? { expected, startedAt: this.now() }),
+        expected,
+        completed,
+      },
+      updatedAt: this.now(),
+    });
+  }
+
+  private updateInvestigation(
+    state: PersistenceState,
+    nodeId: string,
+    update: (entry: OrchestrationInvestigationRecord) => OrchestrationInvestigationRecord,
+  ): void {
     const investigations = (state.record.investigations ?? []).map((entry) => entry.nodeId === nodeId ? update(entry) : entry);
     this.replaceRecord(state, { ...state.record, investigations, updatedAt: this.now() });
   }
@@ -2193,6 +2229,7 @@ export class OrchestrationController {
         node: structuredClone(node),
         ...(attempt !== undefined ? { attempt: structuredClone(attempt) } : {}),
         phase,
+        ...(record.phase === "investigating" ? { workflowLabel: investigationWorkflowLabel(record, node) } : {}),
       }).catch(() => undefined);
     }
   }
@@ -2221,6 +2258,14 @@ export class OrchestrationController {
       // Event observers are diagnostics, never orchestration authority.
     }
   }
+}
+
+function investigationWorkflowLabel(record: OrchestrationRecord, node: OrchestrationNodeRecord): "workflow:investigating" | "workflow:waiting" | "workflow:invalid" | "workflow:decomposed" {
+  const investigation = (record.investigations ?? []).find((entry) => entry.nodeId === node.id);
+  if (investigation?.outcome === "invalid" && investigation.settledAt !== undefined) return "workflow:invalid";
+  if (investigation?.outcome === "decompose" && investigation.settledAt !== undefined) return "workflow:decomposed";
+  if (investigation?.status === "running") return "workflow:investigating";
+  return "workflow:waiting";
 }
 
 function orchestrationNodeProjectionPhase(node: OrchestrationNodeRecord): "waiting" | "active" | "terminal" {

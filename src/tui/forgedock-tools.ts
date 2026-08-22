@@ -1402,6 +1402,7 @@ interface VisibleDagInput {
   findControllerTask?: (identity: OrchestrationTransportIdentity) => Promise<string | undefined> | string | undefined;
   assertCompleted: (item: VisibleOrchestrationItem) => Promise<ScheduleWorkerResult | void>;
   onComplete: (result: ScheduleResult, orchestrationId: string) => void;
+  onFailure?: (error: unknown, orchestrationId: string) => void;
   onEvent?: (event: OrchestrationEvent) => void;
 }
 
@@ -3251,6 +3252,14 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           ctx.ui.setStatus("forgedock", failures || invalid
             ? `■ Orchestration ${orchestrationId} · ${failures} need attention${invalid ? ` · ${invalid} invalid` : ""}`
             : `✓ Orchestration ${orchestrationId} complete`);
+        },
+        onFailure: (error, orchestrationId) => {
+          const reason = error instanceof Error ? error.message : String(error);
+          ctx.ui.setStatus("forgedock", `■ Orchestration ${orchestrationId} failed · ${reason}`);
+          onUpdate?.({
+            content: [{ type: "text", text: `Orchestration ${orchestrationId} failed: ${reason}` }],
+            details: { command: "orchestrate", args: issues.map(String), state: "failed" } satisfies OrchestrationToolDetails,
+          });
         },
         onEvent: (event) => {
           orchestrationBoard.updateEvent(event, invocationLabel, repository?.repo);
@@ -5164,6 +5173,7 @@ export class VisibleDagDelegator {
       stored.running = false;
       const latest = await this.repository().loadOrchestration(stored.id).catch(() => undefined);
       if (latest) stored.durableRecord = latest;
+      stored.input.onFailure?.(error, stored.id);
       throw error;
     });
     completion.catch(() => undefined);
