@@ -1421,24 +1421,69 @@ function createResetCliDependencies(
     },
     state: {
       capture: async (target) => {
-        if (!store) return { runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [] };
+        if (!store) return {
+          runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [],
+          selectedIssueNumbers: target.issueNumbers,
+          workspaceAuthorization: { issueNumbers: target.issueNumbers, runIds: [], branches: [] },
+        };
         const allRuns = store.listRuns(10_000);
         const allDagRecords = await store.listOrchestrations(10_000);
-        const selectedDagRecords = allDagRecords.filter((dag) => target.dagIds.includes(dag.orchestrationId)
-          || (dag.repository.toLowerCase() === target.repo.toLowerCase() && dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))));
+        const selectedDagIds = new Set(target.dagIds);
+        const explicitlySelectedDagRecords = allDagRecords.filter((dag) => selectedDagIds.has(dag.orchestrationId));
+        const selectedDagIssueIdentities = new Set(explicitlySelectedDagRecords.flatMap((dag) => [
+          ...dag.issueNumbers,
+          ...dag.nodes.flatMap((node) => [node.issue, ...(node.memberIssues ?? [])]),
+        ]));
+        const discoveredDagRecords = allDagRecords.filter((dag) => selectedDagIds.has(dag.orchestrationId)
+          || (dag.repository.toLowerCase() === target.repo.toLowerCase()
+            && (dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))
+              || (selectedDagIds.size > 0 && dag.issueNumbers.some((issue) => selectedDagIssueIdentities.has(issue))))));
+        const selectedDagRecords = discoveredDagRecords.filter((dag) => selectedDagIds.size === 0 || selectedDagIds.has(dag.orchestrationId));
         const dags = selectedDagRecords.map((dag) => ({ orchestrationId: dag.orchestrationId, repository: dag.repository, status: dag.status, updatedAt: dag.updatedAt, recordSha256: sha256Reset(JSON.stringify(dag)) }));
         const dagIds = new Set(dags.map((dag) => dag.orchestrationId));
-        const nodeSelection = selectResetDagNodes(selectedDagRecords, target);
-        const dagRunIds = new Set(nodeSelection.selected.flatMap(({ node }) => resetNodeRunIds(node)));
+        const nodeSelection = selectResetDagNodes(discoveredDagRecords, target);
+        const invalidIssueStates = new Map(await Promise.all(nodeSelection.selectedInvalid.map(async ({ node }) => {
+          const issue = await github.getIssue(node.issue, target.repo);
+          return [node.issue, issue.state] as const;
+        })));
+        const mutableInvalid = nodeSelection.selectedInvalid.filter(({ node }) => invalidIssueStates.get(node.issue) === "OPEN");
+        const mutableInvalidKeys = new Set(mutableInvalid.map(({ dag, node }) => `${dag.orchestrationId}|${node.id}`));
+        const mutableInvalidIssues = new Set(mutableInvalid.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]));
+        const preservedNodeRunIds = new Set(nodeSelection.preserved
+          .filter(({ dag, node }) => !mutableInvalidKeys.has(`${dag.orchestrationId}|${node.id}`))
+          .flatMap(({ dag, node }) => {
+            const directRunIds = resetNodeRunIds(node);
+            if (directRunIds.length) return directRunIds;
+            const issues = new Set([node.issue, ...(node.memberIssues ?? [])]);
+            if ([...issues].some((issue) => mutableInvalidIssues.has(issue))) {
+              throw new Error(`Reset selection is ambiguous; invalid issue identity is shared with preserved node ${node.id}`);
+            }
+            return allRuns
+              .filter((run) => run.subject.repo.toLowerCase() === dag.repository.toLowerCase() && issues.has(run.subject.issue ?? -1))
+              .map((run) => run.runId);
+          }));
+        const inferredMutableInvalidRunIds = new Set(allRuns
+          .filter((run) => !preservedNodeRunIds.has(run.runId)
+            && run.subject.repo.toLowerCase() === target.repo.toLowerCase() && mutableInvalidIssues.has(run.subject.issue ?? -1))
+          .map((run) => run.runId));
+        const selectedPurgeNodes = [...nodeSelection.selected, ...mutableInvalid];
+        const dagRunIds = new Set([
+          ...nodeSelection.selected.flatMap(({ node }) => resetNodeRunIds(node)),
+          ...mutableInvalid.flatMap(({ node }) => resetNodeRunIds(node)),
+          ...inferredMutableInvalidRunIds,
+        ]);
         const preservedNodes = nodeSelection.preserved.map(({ dag, node, reason }) => {
           const memberIssues = [...new Set([node.issue, ...(node.memberIssues ?? [])])].sort((a, b) => a - b);
           const inferredRunIds = allRuns
             .filter((run) => run.subject.repo.toLowerCase() === dag.repository.toLowerCase() && memberIssues.includes(run.subject.issue ?? -1))
             .map((run) => run.runId);
+          const proofRunIds = mutableInvalidKeys.has(`${dag.orchestrationId}|${node.id}`)
+            ? []
+            : inferredRunIds;
           return {
             orchestrationId: dag.orchestrationId, nodeId: node.id, issue: node.issue,
             memberIssues, status: node.status,
-            runIds: [...new Set([...resetNodeRunIds(node), ...inferredRunIds])].sort(), reason,
+            runIds: [...new Set([...resetNodeRunIds(node), ...proofRunIds])].filter((runId) => !dagRunIds.has(runId)).sort(), reason,
           };
         });
         const preservedRunIds = [...new Set(preservedNodes.flatMap((node) => node.runIds))].sort();
@@ -1449,7 +1494,7 @@ function createResetCliDependencies(
         const missingPreservedRuns = preservedRunIds.filter((runId) => !allRuns.some((run) => run.runId === runId));
         if (missingPreservedRuns.length) throw new Error(`Reset preservation evidence is incomplete; run rows were not found: ${missingPreservedRuns.join(", ")}`);
         const preservedArtifactIds = [...new Set(store.listArtifactsForRuns(preservedRunIds).map((artifact) => artifact.artifactId))].sort();
-        const selectedIssuesFromNodes = new Set(nodeSelection.selected.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]));
+        const selectedIssuesFromNodes = new Set(selectedPurgeNodes.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]));
         const preservedRunSet = new Set(preservedRunIds);
         const runs = allRuns.filter((run) => !preservedRunSet.has(run.runId) && (dagRunIds.has(run.runId)
           || (run.subject.repo.toLowerCase() === target.repo.toLowerCase() && selectedIssuesFromNodes.has(run.subject.issue ?? -1))))
@@ -1463,20 +1508,20 @@ function createResetCliDependencies(
         };
         const activeIssueNumbers = target.issueNumbers.length
           ? (selectedDagRecords.length
-            ? target.issueNumbers.filter((issue) => nodeSelection.selected.some(({ node }) => node.issue === issue || (node.memberIssues ?? []).includes(issue)))
+            ? target.issueNumbers.filter((issue) => selectedPurgeNodes.some(({ node }) => node.issue === issue || (node.memberIssues ?? []).includes(issue)))
             : [...target.issueNumbers])
-          : nodeSelection.selected.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]);
+          : selectedPurgeNodes.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]);
         const promotions = (await store.listPromotions(10_000)).filter((promotion) => promotion.repository.toLowerCase() === target.repo.toLowerCase()
           && activeIssueNumbers.some((issue) => promotion.sourceBranch.includes(`issue-${issue}`)))
           .map((promotion) => ({ promotionId: promotion.promotionId, repository: promotion.repository, version: promotion.version, phase: promotion.phase, snapshotSha256: sha256Reset(JSON.stringify(promotion)) }));
         const leaseIds = [...runIds, ...dags.map((dag) => `orchestration-execution:${dag.orchestrationId}`), ...target.dagIds.map((dag) => `orchestration-execution:${dag}`), ...([...new Set(activeIssueNumbers)].map((issue) => `issue-${issue}`))];
-        const selectedNodeIds = new Set(nodeSelection.selected.map(({ node }) => node.id));
+        const selectedNodeIds = new Set(selectedPurgeNodes.map(({ node }) => node.id));
         const selectedNodeLeases = (itemId: string): boolean => selectedDagRecords.some((dag) => itemId.startsWith(`orchestration:${dag.orchestrationId}:`))
           && [...selectedNodeIds].some((nodeId) => itemId.includes(`:node:${nodeId}:`));
         const leaseSnapshots = store.listAllLeaseSnapshots().filter((lease) => leaseIds.includes(lease.itemId)
           || selectedNodeLeases(lease.itemId)
           || runIds.some((runId) => lease.itemId.includes(runId)));
-        const taskIdentities = readResetTaskRecords(target, runIds, nodeSelection.selected.map(({ node }) => node.id)).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
+        const taskIdentities = readResetTaskRecords(target, runIds, selectedPurgeNodes.map(({ node }) => node.id)).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
         return {
           runs, artifacts: store.listArtifactsForRuns(runIds),
           tasks: taskIdentities,
@@ -1486,6 +1531,14 @@ function createResetCliDependencies(
           promotions, dags, leases: leaseSnapshots, authorization,
           preservedNodes, preservedRunIds, preservedArtifactIds, archive: [],
           selectedIssueNumbers: [...new Set(activeIssueNumbers)].sort((a, b) => a - b),
+          workspaceAuthorization: {
+            issueNumbers: [...new Set(activeIssueNumbers)].sort((a, b) => a - b),
+            runIds,
+            branches: [...new Set([
+              ...selectedRunRecords.flatMap((run) => run.subject.issue === undefined ? [] : [resetManagedWorktreeBranch(run.subject.issue, run.runId)]),
+              ...selectedLocalArtifacts.flatMap((artifact) => artifact.kind === "BuildResult" ? [artifact.payload.branch] : []),
+            ])].sort(),
+          },
           observationEvents: observations ? observations.listResetEventsForRuns(runIds) : [],
         };
       },
@@ -1555,7 +1608,13 @@ function createResetCliDependencies(
     },
     ...(onProgress ? { onProgress } : {}),
     workspaces: {
-      capture: async (target) => (await worktreeManager.listManagedResetWorktrees(target)).map((worktree) => ({ ...worktree })),
+      capture: async (target, authorization) => {
+        if (!authorization) return (await worktreeManager.listManagedResetWorktrees(target)).map((worktree) => ({ ...worktree }));
+        if (!authorization.issueNumbers.length || !authorization.branches.length) return [];
+        const scoped = await worktreeManager.listManagedResetWorktrees({ ...target, issueNumbers: authorization.issueNumbers, dagIds: [] });
+        const branches = new Set(authorization.branches);
+        return scoped.filter((worktree) => branches.has(worktree.branch)).map((worktree) => ({ ...worktree }));
+      },
       archiveDirty: async (worktree) => worktreeManager.archiveDirtyManaged(worktree),
       removeExact: async (worktree) => worktreeManager.removeExactManaged(worktree),
       assertAbsent: async (worktree) => worktreeManager.assertAbsent(worktree),
@@ -1619,6 +1678,11 @@ function archiveResetTaskEvidence(manifest: PristineResetManifest): ResetArchive
     }
   }
   return writeResetArchive(`reset-${manifest.digest}.tasks.json`, { schema: "forgedock.pristine-reset/tasks/v1", files: taskFiles }, "tasks");
+}
+
+function resetManagedWorktreeBranch(issue: number, runId: string): string {
+  const suffix = runId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(-24);
+  return `forgedock/issue-${issue}-${suffix}`;
 }
 
 function resetNodeRunIds(node: OrchestrationNodeRecord): string[] {
@@ -2169,10 +2233,12 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
       },
       sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}) })),
-      materializeDecomposition: async ({ orchestration: durable, item, childIssues }) => {
+      materializeDecomposition: async ({ orchestration: durable, item, childIssues, signal: materializeSignal, assertActive }) => {
+        assertActive?.();
+        if (materializeSignal?.aborted) throw materializeSignal.reason ?? new Error("Decomposition materialization cancelled");
         const parent = durable.nodes.find((node) => node.id === item.id);
         if (!parent) throw new Error(`Decomposition parent ${item.id} is missing from the durable investigation set`);
-        const expansion = await materializeCliDecomposition({ github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective, orchestration: durable, node: parent, item, childIssues, routedIssues });
+        const expansion = await materializeCliDecomposition({ github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective, orchestration: durable, node: parent, item, childIssues, routedIssues, ...(materializeSignal !== undefined ? { signal: materializeSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
         return expansion ? { items: expansion.items } : undefined;
       },
       childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: repository.repo, issue: entry.issue }), undefined),

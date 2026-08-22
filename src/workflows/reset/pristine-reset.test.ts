@@ -36,7 +36,7 @@ function fakeDeps(overrides: Partial<ResetPlanDependencies> = {}): ResetPlanDepe
 }
 
 describe("typed pristine repository reset", () => {
-  const orchestration = (id: string, issue: number, status: "queued" | "completed" = "queued", route = "staging"): OrchestrationRecord => ({
+  const orchestration = (id: string, issue: number, status: "queued" | "completed" | "invalid" = "queued", route = "staging"): OrchestrationRecord => ({
     schema: "forgedock.orchestration/v1", orchestrationId: id, repository: "o/r", issueNumbers: [issue],
     maxParallel: 1, autoMerge: false, status: "running", createdAt: "2026-01-01", updatedAt: "2026-01-01",
     nodes: [{ id: `${id}-node`, issue, priority: 1, dependencies: [], claims: [], targetBranch: route, targetRouteClaim: `o/r:${route}`, status, childRunIds: [`run-${id}`], memberIssues: [issue] }],
@@ -63,6 +63,39 @@ describe("typed pristine repository reset", () => {
     assert.throws(() => selectResetDagNodes(dags, { repo: "o/r", issueNumbers: [458], dagIds: ["dag-a", "dag-b"] }), /ambiguous for issue #458/);
   });
 
+  it("retains selected invalid-node identity while exposing it for open-issue cleanup", () => {
+    const invalid = orchestration("dag-invalid", 478, "invalid");
+    const completed = orchestration("dag-completed", 479, "completed");
+    const unselected = orchestration("dag-unselected", 480, "invalid");
+    const result = selectResetDagNodes([invalid, completed, unselected], { repo: "o/r", issueNumbers: [478], dagIds: [] });
+    assert.deepEqual(result.selectedInvalid.map(({ dag, node }) => `${dag.orchestrationId}/${node.id}`), ["dag-invalid/dag-invalid-node"]);
+    assert.equal(result.preserved.some(({ dag, node, reason }) => reason === "invalid" && dag.orchestrationId === "dag-invalid" && node.issue === 478), true);
+    assert.equal(result.preserved.some(({ dag }) => dag.orchestrationId === "dag-completed"), true);
+    assert.equal(result.preserved.some(({ dag }) => dag.orchestrationId === "dag-unselected"), true);
+  });
+
+  it("uses state-admitted DAG issue and worktree identities before host reads", async () => {
+    const deps = fakeDeps();
+    const readIssues: number[] = [];
+    let workspaceSelection: readonly number[] = [];
+    let workspaceBranches: readonly string[] = [];
+    deps.host.readIssue = async (_repo, issue) => { readIssues.push(issue); return { number: issue, state: "OPEN", labels: ["workflow:building"], body: "original body" }; };
+    deps.state.capture = async () => ({
+      runs: [{ runId: "run-1", version: 1, state: "cancelled" }], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], leases: [], archive: [],
+      dags: [{ orchestrationId: "dag-478", repository: "o/r", status: "invalid", updatedAt: "2026-01-01", recordSha256: sha256("dag") }],
+      selectedIssueNumbers: [1], workspaceAuthorization: { issueNumbers: [1], runIds: ["run-1"], branches: ["forgedock/issue-1-run-1"] },
+    });
+    deps.workspaces.capture = async (selection, authorization) => {
+      workspaceSelection = selection.issueNumbers;
+      workspaceBranches = authorization?.branches ?? [];
+      return [];
+    };
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [], dagIds: ["dag-478"] }, deps);
+    assert.deepEqual(readIssues, [1]);
+    assert.deepEqual(workspaceSelection, [1]);
+    assert.deepEqual(workspaceBranches, ["forgedock/issue-1-run-1"]);
+    assert.deepEqual(manifest.actions.filter((action) => action.type === "restore-labels"), [{ type: "restore-labels", issue: 1, labels: [] }]);
+  });
   it("dry-run is read-only and replays labels deterministically", async () => {
     assert.deepEqual(replayLabels([
       { name: "workflow:building", action: "labeled", occurredAt: "2026-01-02", eventId: 2 },

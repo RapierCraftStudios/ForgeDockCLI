@@ -173,6 +173,13 @@ export interface ResetHost {
   deleteExactRef(repo: string, exactRef: string, expectedSha: string): Promise<void>;
 }
 
+export interface ResetWorkspaceAuthorization {
+  /** Exact issue identities and run-derived branch identities admitted for capture. */
+  issueNumbers: readonly number[];
+  runIds: readonly string[];
+  branches: readonly string[];
+}
+
 export interface ResetStateStore {
   capture(selection: ResetSelection): Promise<{
     runs: readonly ResetRunIdentity[];
@@ -187,6 +194,7 @@ export interface ResetStateStore {
     preservedRunIds?: readonly string[];
     preservedArtifactIds?: readonly string[];
     selectedIssueNumbers?: readonly number[];
+    workspaceAuthorization?: ResetWorkspaceAuthorization;
     leases: PristineResetManifest["leases"];
     archive: readonly ResetArchiveIdentity[];
     authorization?: ResetExternalAuthorization;
@@ -202,7 +210,7 @@ export interface ResetStateStore {
 }
 
 export interface ResetWorkspaceStore {
-  capture(selection: ResetSelection): Promise<readonly ResetWorktreeIdentity[]>;
+  capture(selection: ResetSelection, authorization?: ResetWorkspaceAuthorization): Promise<readonly ResetWorktreeIdentity[]>;
   archiveDirty(worktree: ResetWorktreeIdentity): Promise<ResetArchiveIdentity | undefined>;
   removeExact(worktree: ResetWorktreeIdentity): Promise<void>;
   assertAbsent?(worktree: ResetWorktreeIdentity): Promise<void>;
@@ -248,19 +256,28 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const dagIds = uniqueStrings(selection.dagIds);
   if (!selection.repo.trim()) throw new Error("Reset repository must not be blank");
   if (!issueNumbers.length && !dagIds.length) throw new Error("Reset requires at least one issue or DAG identity");
-  const [issues, comments, labels, worktrees, captured] = await Promise.all([
-    Promise.all(issueNumbers.map((number) => deps.host.readIssue(selection.repo, number))),
-    Promise.all(issueNumbers.map((number) => deps.host.listComments(selection.repo, number))).then((x) => x.flat()),
-    Promise.all(issueNumbers.map(async (number) => [number, await deps.host.readLabels(selection.repo, number)] as const)),
-    deps.workspaces.capture({ ...selection, issueNumbers, dagIds }),
-    deps.state.capture({ ...selection, issueNumbers, dagIds }),
+  const captured = await deps.state.capture({ ...selection, issueNumbers, dagIds });
+  // State discovery is authoritative for DAG-only selections: it admits only
+  // selected, still-open invalid issues before any host issue/comment/label read.
+  const mutableIssueNumbers = uniqueNumbers(captured.selectedIssueNumbers ?? issueNumbers);
+  const captureSelection = { ...selection, issueNumbers: mutableIssueNumbers, dagIds };
+  const workspaceAuthorization = captured.workspaceAuthorization ?? {
+    issueNumbers: mutableIssueNumbers,
+    runIds: captured.runs.map((run) => run.runId),
+    branches: [],
+  };
+  const [issues, comments, labels, worktrees] = await Promise.all([
+    Promise.all(mutableIssueNumbers.map((number) => deps.host.readIssue(selection.repo, number))),
+    Promise.all(mutableIssueNumbers.map((number) => deps.host.listComments(selection.repo, number))).then((x) => x.flat()),
+    Promise.all(mutableIssueNumbers.map(async (number) => [number, await deps.host.readLabels(selection.repo, number)] as const)),
+    deps.workspaces.capture(captureSelection, workspaceAuthorization),
   ]);
   const authorized = captured.authorization;
   const pullRequests = deps.host.listPullRequests
-    ? await deps.host.listPullRequests({ ...selection, issueNumbers, dagIds }, authorized)
+    ? await deps.host.listPullRequests(captureSelection, authorized)
     : [];
   const refs = deps.host.listManagedRefs
-    ? await deps.host.listManagedRefs({ ...selection, issueNumbers, dagIds }, authorized)
+    ? await deps.host.listManagedRefs(captureSelection, authorized)
     : [];
   const selectedRunIds = new Set(captured.runs.map((run) => run.runId));
   const selectedArtifactIds = new Set(captured.artifacts.map((artifact) => artifact.artifactId));
@@ -268,12 +285,12 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const missingDags = dagIds.filter((dagId) => !selectedDagIds.has(dagId));
   if (missingDags.length) throw new Error(`Reset discovery is incomplete; selected DAGs were not found: ${missingDags.join(", ")}`);
   const issueState = new Map(issues.map((issue) => [issue.number, issue.state]));
-  const mutableIssueNumbers = new Set(captured.selectedIssueNumbers ?? issueNumbers);
+  const mutableIssues = new Set(mutableIssueNumbers);
   const openPullRequests = new Set(pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => pr.number));
   const pullComments = deps.host.listPullRequestComments
     ? (await Promise.all(pullRequests.filter((pr) => openPullRequests.has(pr.number)).map((pr) => deps.host.listPullRequestComments!(selection.repo, pr.number)))).flat()
     : [];
-  const allComments = [...comments.filter((comment) => mutableIssueNumbers.has(comment.issue) && issueState.get(comment.issue) === "OPEN"), ...pullComments];
+  const allComments = [...comments.filter((comment) => mutableIssues.has(comment.issue) && issueState.get(comment.issue) === "OPEN"), ...pullComments];
   const managedComments = allComments.filter((comment) => comment.managed === true
     && isSelectedResetComment(comment, selectedRunIds, selectedArtifactIds, selectedDagIds));
   const artifactCommentIds = new Map<string, number>();
@@ -289,7 +306,7 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
     }
     artifactCommentIds.set(publicationKey, comment.id);
   }
-  const labelMap = Object.fromEntries(labels.filter(([number]) => mutableIssueNumbers.has(number) && issueState.get(number) === "OPEN").map(([number, value]) => {
+  const labelMap = Object.fromEntries(labels.filter(([number]) => mutableIssues.has(number) && issueState.get(number) === "OPEN").map(([number, value]) => {
     const issueComments = managedComments.filter((comment) => comment.issue === number && comment.pr === undefined);
     const cutoffAt = firstWorkflowOwnershipCutoff([value], issueComments);
     return [String(number), {
@@ -586,7 +603,12 @@ function sha256Bytes(value: Uint8Array): string { return createHash("sha256").up
 export function selectResetDagNodes(
   dags: readonly OrchestrationRecord[],
   target: ResetSelection,
-): { selected: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>; preserved: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord; reason: "completed" | "invalid" | "unselected" }> } {
+): {
+  selected: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>;
+  /** Terminal invalid nodes retain identity proof but may be mutable when explicitly selected and still open. */
+  selectedInvalid: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>;
+  preserved: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord; reason: "completed" | "invalid" | "unselected" }>;
+} {
   const terminal = new Set(["completed", "invalid", "skipped"]);
   const candidates = dags.flatMap((dag) => dag.nodes.map((node) => ({ dag, node })));
   const selectedDagIds = new Set(target.dagIds);
@@ -619,14 +641,19 @@ export function selectResetDagNodes(
       }
       for (const match of matches) selected.add(`${match.dag.orchestrationId}|${match.node.id}`);
     }
+  } else if (selectedDagIds.size) {
+    for (const { dag, node } of candidates) {
+      if (selectedDagIds.has(dag.orchestrationId)) selected.add(`${dag.orchestrationId}|${node.id}`);
+    }
   } else {
     for (const { dag, node } of candidates) selected.add(`${dag.orchestrationId}|${node.id}`);
   }
   const selectedNodes = candidates.filter(({ dag, node }) => selected.has(`${dag.orchestrationId}|${node.id}`) && !terminal.has(node.status));
+  const selectedInvalid = candidates.filter(({ dag, node }) => selected.has(`${dag.orchestrationId}|${node.id}`) && node.status === "invalid");
   const preserved = candidates.filter(({ dag, node }) => !selected.has(`${dag.orchestrationId}|${node.id}`) || terminal.has(node.status)).map(({ dag, node }) => ({
     dag, node, reason: terminal.has(node.status) ? (node.status === "invalid" ? "invalid" : "completed") : "unselected",
   } as const));
-  return { selected: selectedNodes, preserved };
+  return { selected: selectedNodes, selectedInvalid, preserved };
 }
 
 export function replayLabels(events: readonly ResetLabelEvent[], before?: string): string[] {
