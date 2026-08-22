@@ -45,7 +45,7 @@ import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
-import { investigateWorkItem, retryableExternalWorkflowError, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
+import { investigateWorkItem, resumeInvestigationWorkItem, retryableExternalWorkflowError, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
 import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
@@ -2187,6 +2187,88 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         routedIssues,
         ...(childIssues !== undefined ? { childIssues } : {}),
       }),
+      isCancelled: async () => false,
+      investigationWorker: async (item, context) => {
+        const { issue, lane } = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
+        const intent = createArtifact({
+          kind: "Intent", runId: `run_${crypto.randomUUID()}`, subject: { repo: repository.repo, issue: item.issue },
+          producer: { role: "controller", runtime: "forgedock" },
+          payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
+        });
+        await context.recordTask({ runId: intent.runId });
+        const baseSha = await github.getBranchHead(repository.repo, lane.targetBranch);
+        const investigated = await investigateWorkItem({
+          intent, cwd: checkoutRoot, target: runTargetForLane(lane, effective.productionTarget),
+          deferInterpretation: true,
+          scopeHints: { affectedFiles: item.affectedFiles ?? [], claims: item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+          ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}), ...planning,
+        }, { runtime, artifacts, runs });
+        const payload = investigated.investigation.payload;
+        return {
+          outcome: payload.outcome,
+          baseSha,
+          evidence: {
+            investigationId: investigated.investigation.id,
+            rootCause: payload.rootCause ?? null,
+            summary: payload.summary,
+            affectedSurfaces: payload.affectedSurfaces,
+          },
+          ...(payload.decomposition !== undefined ? { childIssues: [] } : {}),
+        };
+      },
+      materializeExecution: async ({ orchestration, investigations }) => {
+        const confirmed = new Set(investigations.filter((entry) => entry.outcome === "confirmed").map((entry) => entry.nodeId));
+        const sourceItems: ScheduledWorkItem[] = orchestration.investigationWave === 1
+          ? [...scheduleItems.items]
+          : orchestration.nodes.map((node) => ({
+            id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims],
+            ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}),
+            ...(node.lane !== undefined ? { lane: node.lane } : {}),
+            ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}),
+            ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}),
+            ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}),
+            ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}),
+            ...(node.title !== undefined ? { title: node.title } : {}),
+            ...(node.summary !== undefined ? { summary: node.summary } : {}),
+          }));
+        const items = sourceItems.filter((item) => confirmed.has(item.id));
+        const edges = (orchestration.investigationWave === 1 ? scheduleItems.edges : (orchestration.serializationEdges ?? [])).filter((edge) => confirmed.has(edge.predecessor) && confirmed.has(edge.successor));
+        const nextInvestigationItems: ScheduledWorkItem[] = [];
+        for (const entry of investigations.filter((candidate) => candidate.outcome === "decompose")) {
+          const issueArtifacts = await artifacts.list({ repo: repository.repo, issue: entry.issue });
+          const childIssues = decompositionChildIssuesFromArtifacts(entry.issue, issueArtifacts, undefined);
+          const parent = orchestration.nodes.find((node) => node.id === entry.nodeId);
+          if (!parent) throw new Error(`Decomposition parent ${entry.nodeId} is missing from the durable investigation set`);
+          const expansion = await materializeCliDecomposition({
+            github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective,
+            orchestration, node: parent, item: {
+              id: parent.id, issue: parent.issue, priority: parent.priority, dependencies: [], claims: [],
+              ...(parent.targetBranch !== undefined ? { targetBranch: parent.targetBranch } : {}),
+              ...(parent.lane !== undefined ? { lane: parent.lane } : {}),
+            }, childIssues, routedIssues,
+          });
+          if (expansion) nextInvestigationItems.push(...expansion.items);
+        }
+        return { items, serializationEdges: edges, ...(nextInvestigationItems.length ? { nextInvestigationItems } : {}) };
+      },
+      settleInvestigation: async ({ investigation, result }) => {
+        if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+        const subject = { repo: repository.repo, issue: investigation.issue };
+        const durable = await artifacts.list(subject);
+        const intent = durable.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent");
+        const investigationArtifact = durable.find((artifact) => artifact.kind === "Investigation");
+        if (!intent || investigationArtifact?.kind !== "Investigation") throw new Error(`Cannot settle invalid #${investigation.issue}: durable investigation identity is missing`);
+        const run = await runs.load(intent.runId);
+        if (!run) throw new Error(`Cannot settle invalid #${investigation.issue}: durable run is missing`);
+        const lane = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: investigation.issue }).lane;
+        const settled = await resumeInvestigationWorkItem({
+          run, intent, investigation: investigationArtifact, cwd: checkoutRoot,
+          target: runTargetForLane(lane, effective.productionTarget),
+          scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+          ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}), ...planning,
+        }, { runtime, artifacts, runs, decomposer: github });
+        if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: github, artifacts });
+      },
       worker: async (item, controllerContext) => {
       const workerAbort = new AbortController();
       const workerSignal = signal ? AbortSignal.any([workerAbort.signal, signal]) : workerAbort.signal;
@@ -2512,9 +2594,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           source: "workflow",
           channel: "lifecycle",
           kind: "orchestration.state.changed",
-          payload: { name: event.name, itemId: event.itemId, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes, waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })) },
+          payload: { name: event.name, itemId: event.itemId, phase: snapshot.phase, investigationBarrier: snapshot.investigationBarrier, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes, waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })) },
         });
-        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
+        process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""}${snapshot.phase === "investigating" ? ` · investigating set ${snapshot.investigationBarrier?.completed ?? 0}/${snapshot.investigationBarrier?.expected ?? 0}` : snapshot.phase === "executing" ? " · executing DAG" : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
     });
     const controllerResult = await controller.createAndRun({
@@ -2524,6 +2606,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       items: scheduleItems.items,
       serializationEdges: scheduleItems.edges,
       maxParallel: effective.maxParallel,
+      investigationFirst: true,
       autoMerge,
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       plan: {

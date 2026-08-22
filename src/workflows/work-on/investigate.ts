@@ -44,6 +44,8 @@ export interface InvestigateInput {
   target?: RunTarget;
   scopeHints?: ScopeHints;
   signal?: AbortSignal;
+  /** Controller-only checkpoint: append Investigation but defer interpretation until a barrier. */
+  deferInterpretation?: boolean;
 }
 
 export interface ResumeInvestigateInput extends InvestigateInput {
@@ -225,6 +227,14 @@ async function continueInvestigation(
       sessionRef = agentResult.sessionRef;
     }
 
+    if (input.deferInterpretation) {
+      const checkpoint = attachArtifact(run, "Investigation", investigation.id);
+      return {
+        run: checkpoint,
+        investigation,
+        sessionRef: sessionRef ?? `durable:${investigation.id}`,
+      };
+    }
     return await finishInvestigation(
       dependencies,
       run,

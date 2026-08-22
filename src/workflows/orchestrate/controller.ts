@@ -24,6 +24,9 @@ import type {
   OrchestrationRepository,
   OrchestrationWorkerAttemptRecord,
   OrchestrationWorkerAttemptStatus,
+  OrchestrationInvestigationOutcome,
+  OrchestrationInvestigationRecord,
+  OrchestrationShadowContractionProposal,
 } from "../../core/ports/orchestration.js";
 import {
   orchestrationEventFromSchedule,
@@ -60,7 +63,48 @@ export interface CreateOrchestrationInput {
   productionTarget?: string;
   /** Opaque, JSON-safe authorisation/evidence supplied by the planning layer. */
   plan?: OrchestrationPlanMetadata;
+  /** Opt into the native investigation-first path for fresh records. */
+  investigationFirst?: boolean;
 }
+
+export interface OrchestrationInvestigationResult {
+  outcome: OrchestrationInvestigationOutcome;
+  /** Machine-checkable evidence used by the phase-2 materializer. */
+  evidence?: OrchestrationPlanMetadata;
+  /** Exact base observed by the read-only worker. */
+  baseSha?: string;
+  /** Decomposition is interpreted only after the complete wave barrier. */
+  childIssues?: readonly number[];
+}
+
+export interface OrchestrationInvestigationWorkerContext extends OrchestrationWorkerContext {
+  phase: "investigation";
+  wave: number;
+}
+
+export type OrchestrationInvestigationWorker = (
+  item: ScheduledWorkItem,
+  context: OrchestrationInvestigationWorkerContext,
+) => Promise<OrchestrationInvestigationResult>;
+
+export interface OrchestrationExecutionMaterializationInput {
+  orchestration: Readonly<OrchestrationRecord>;
+  wave: number;
+  investigations: readonly OrchestrationInvestigationRecord[];
+}
+
+export interface OrchestrationExecutionMaterialization {
+  items: readonly ScheduledWorkItem[];
+  serializationEdges?: readonly ClaimSerializationEdge[];
+  /** Shadow-only proposals are persisted but can never alter the returned DAG. */
+  shadowContractionProposals?: readonly OrchestrationShadowContractionProposal[];
+  /** Replacement children become the bounded next investigation wave. */
+  nextInvestigationItems?: readonly ScheduledWorkItem[];
+}
+
+export type OrchestrationExecutionMaterializer = (
+  input: OrchestrationExecutionMaterializationInput,
+) => Promise<OrchestrationExecutionMaterialization>;
 
 export interface OrchestrationTaskIdentity {
   taskId?: string;
@@ -183,6 +227,20 @@ export interface OrchestrationControllerDependencies {
   onEvent?: OrchestrationEventSink;
   /** Observer failures are diagnostic only and never change workflow state. */
   onEventError?: (error: unknown, event: OrchestrationEvent) => void;
+  /** Read-only phase-1 worker. Required for fresh investigation-first records. */
+  investigationWorker?: OrchestrationInvestigationWorker;
+  /** Controller-owned phase-2 DAG materializer, invoked only after the barrier. */
+  materializeExecution?: OrchestrationExecutionMaterializer;
+  /** Maximum attempts for one read-only investigation before barrier failure. */
+  investigationMaxAttempts?: number;
+  /** Settle invalid/decomposition semantics after the complete wave barrier. */
+  settleInvestigation?: (input: {
+    orchestration: Readonly<OrchestrationRecord>;
+    investigation: Readonly<OrchestrationInvestigationRecord>;
+    result: OrchestrationInvestigationResult;
+  }) => Promise<void>;
+  /** Optional cancellation fence checked after every investigation settles. */
+  isCancelled?: (orchestrationId: string) => boolean | Promise<boolean>;
   now?: () => string;
   createOrchestrationId?: () => string;
   createAttemptId?: () => string;
@@ -259,6 +317,21 @@ export class OrchestrationController {
     validateGraph(graph.items, graph.edges);
     for (const item of graph.items) assertProtectedProductionRoute(item, input.productionTarget);
 
+    if (input.investigationFirst && (!this.dependencies.investigationWorker || !this.dependencies.materializeExecution)) {
+      throw new Error("investigation-first orchestration requires an investigation worker and execution materializer");
+    }
+    const investigationWave = input.investigationFirst ? 1 : undefined;
+    const investigations = input.investigationFirst
+      ? graph.items.map((item): OrchestrationInvestigationRecord => ({
+          issue: item.issue,
+          nodeId: item.id,
+          wave: 1,
+          ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
+          ...(item.lane !== undefined ? { lane: item.lane } : {}),
+          status: "queued",
+          attemptCount: 0,
+        }))
+      : undefined;
     const rootRepository = normalizeOrchestrationRepository(input.repository);
     const requestedIssueNumbers = uniqueIssueNumbers(
       input.requestedIssueNumbers
@@ -283,12 +356,21 @@ export class OrchestrationController {
       status: "running",
       createdAt: now,
       updatedAt: now,
-      serializationEdges: graph.edges.map((edge) => ({
+      serializationEdges: (input.investigationFirst ? [] : graph.edges).map((edge) => ({
         predecessor: edge.predecessor,
         successor: edge.successor,
         overlappingClaims: [...edge.overlappingClaims],
       })),
-      nodes: graph.items.map((item) => nodeRecordFromItem(item)),
+      nodes: graph.items.map((item) => nodeRecordFromItem(input.investigationFirst
+        ? { ...item, dependencies: [], claims: [] }
+        : item)),
+      ...(investigationWave !== undefined ? {
+        phase: "investigating" as const,
+        investigationWave,
+        investigations: investigations!,
+        investigationBarrier: { expected: investigations!.length, completed: 0, startedAt: now },
+        metrics: { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 },
+      } : {}),
     };
     // Repository implementations also enforce this at their insert
     // linearization point. The read here gives custom adapters the same
@@ -456,6 +538,10 @@ export class OrchestrationController {
       });
       await this.flush(state);
 
+      if (state.record.phase === "investigating") {
+        await this.runInvestigationPhase(state);
+      }
+
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);
@@ -553,6 +639,166 @@ export class OrchestrationController {
         this.executions.delete(orchestrationId);
       }
     }
+  }
+
+  private async runInvestigationPhase(state: PersistenceState): Promise<void> {
+    const worker = this.dependencies.investigationWorker;
+    const materialize = this.dependencies.materializeExecution;
+    if (!worker || !materialize) throw new Error("Investigation-first execution is missing its phase dependencies");
+    const maxAttempts = this.dependencies.investigationMaxAttempts ?? 2;
+    assertPositiveInteger(maxAttempts, "investigationMaxAttempts");
+    const record = state.record;
+    const wave = record.investigationWave ?? 1;
+    const durable = [...(record.investigations ?? [])].filter((entry) => entry.wave === wave);
+    if (!durable.length) throw new Error(`Investigation wave ${wave} has no durable members`);
+    const byNode = new Map(durable.map((entry) => [entry.nodeId, entry]));
+    const items = record.nodes
+      .filter((node) => byNode.has(node.id) && byNode.get(node.id)!.status !== "completed")
+      // Investigation workers are deliberately independent: future implementation
+      // paths and claims must never serialize read-only discovery.
+      .map((node) => ({ ...itemFromNodeRecord(node), dependencies: [], claims: [] }));
+    const outcomes = new Map<string, OrchestrationInvestigationResult>();
+    let activeInvestigations = 0;
+    let peakInvestigations = 0;
+    const startedAt = Date.now();
+    const current = await runSchedule(
+      items,
+      state.record.effectiveMaxParallel ?? state.record.maxParallel,
+      async (item, schedulerContext) => {
+        let attempt = await this.beginAttempt(state, item.id, "initial");
+        activeInvestigations += 1;
+        peakInvestigations = Math.max(peakInvestigations, activeInvestigations);
+        const maxAttempts = this.dependencies.investigationMaxAttempts ?? 2;
+        let result: OrchestrationInvestigationResult;
+        for (;;) {
+          this.updateInvestigation(state, item.id, (entry) => ({
+            ...entry, status: "running", attemptCount: entry.attemptCount + 1,
+            startedAt: entry.startedAt ?? this.now(),
+          }));
+          await this.flush(state);
+          const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationInvestigationWorkerContext;
+          context.phase = "investigation";
+          context.wave = wave;
+          try {
+            result = await worker(item, context);
+            state.claim.assertValid();
+            break;
+          } catch (error) {
+            await this.failAttempt(state, item.id, attempt.attemptId, error);
+            const entry = byNode.get(item.id)!;
+            const attempts = state.record.investigations?.find((candidate) => candidate.nodeId === item.id)?.attemptCount ?? entry.attemptCount;
+            if (attempts >= maxAttempts) {
+              this.updateInvestigation(state, item.id, (current) => ({ ...current, status: "failed", error: error instanceof Error ? error.message : String(error) }));
+              await this.flush(state);
+              activeInvestigations -= 1;
+              throw error;
+            }
+            attempt = await this.beginAttempt(state, item.id, "relaunch", attempt.attemptId);
+          }
+        }
+        outcomes.set(item.id, result!);
+        await this.finishAttempt(state, item.id, attempt.attemptId, {
+          status: result!.outcome === "confirmed" ? "completed" : result!.outcome === "invalid" ? "invalid" : "skipped",
+          ...(result!.childIssues ? { childIssues: result!.childIssues } : {}),
+        });
+        this.updateInvestigation(state, item.id, (entry) => ({
+          ...entry, status: "completed", outcome: result!.outcome,
+          ...(result!.baseSha !== undefined ? { baseSha: result!.baseSha } : {}),
+          ...(result!.evidence !== undefined ? { evidence: structuredClone(result!.evidence) } : {}),
+          completedAt: this.now(),
+        }));
+        await this.flush(state);
+        activeInvestigations -= 1;
+        return { status: result!.outcome === "confirmed" ? "completed" : result!.outcome === "invalid" ? "invalid" : "skipped", ...(result!.childIssues ? { childIssues: result!.childIssues } : {}) };
+      },
+      { serializationEdges: [] },
+    );
+    this.applyScheduleResult(state, current);
+    const latest = [...(state.record.investigations ?? [])].filter((entry) => entry.wave === wave);
+    const waveMetrics = state.record.metrics ?? { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 };
+    this.replaceRecord(state, { ...state.record, metrics: {
+      ...waveMetrics,
+      investigationWaveConcurrency: [...waveMetrics.investigationWaveConcurrency, peakInvestigations],
+      runnableFrontier: [...waveMetrics.runnableFrontier, items.length],
+    }, updatedAt: this.now() });
+    if (latest.some((entry) => entry.status !== "completed")) {
+      state.record.metrics = {
+        ...(state.record.metrics ?? { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 }),
+        barrierWaits: (state.record.metrics?.barrierWaits ?? 0) + 1,
+        barrierDurationMs: [...(state.record.metrics?.barrierDurationMs ?? []), Date.now() - startedAt],
+      };
+      this.replaceRecord(state, { ...state.record, updatedAt: this.now() });
+      await this.flush(state);
+      throw new Error(`Investigation barrier failed for wave ${wave}`);
+    }
+    if (await this.dependencies.isCancelled?.(record.orchestrationId)) {
+      this.replaceRecord(state, { ...state.record, status: "cancelled", updatedAt: this.now() });
+      await this.flush(state);
+      throw new Error(`Orchestration ${record.orchestrationId} was cancelled at the investigation barrier`);
+    }
+    const settle = this.dependencies.settleInvestigation;
+    if (settle) {
+      for (const entry of latest) {
+        if (entry.outcome !== "invalid" && entry.outcome !== "decompose") continue;
+        const result = outcomes.get(entry.nodeId) ?? { outcome: entry.outcome, ...(entry.evidence !== undefined ? { evidence: entry.evidence } : {}), ...(entry.baseSha !== undefined ? { baseSha: entry.baseSha } : {}) };
+        await settle({ orchestration: structuredClone(state.record), investigation: structuredClone(entry), result });
+        state.claim.assertValid();
+      }
+    }
+    const materialized = await materialize({ orchestration: structuredClone(state.record), wave, investigations: latest.map((entry) => structuredClone(entry)) });
+    state.claim.assertValid();
+    const nextItems = materialized.items.map(cloneScheduledItem);
+    const nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
+    validateGraph(nextItems, nextEdges);
+    for (const item of nextItems) assertProtectedProductionRoute(item, state.record.productionTarget);
+    const shadow = materialized.shadowContractionProposals ?? [];
+    const priorMetrics = state.record.metrics ?? { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 };
+    if (materialized.nextInvestigationItems?.length) {
+      const children = materialized.nextInvestigationItems.map(cloneScheduledItem);
+      const existingIds = new Set(state.record.nodes.map((node) => node.id));
+      if (children.some((child) => existingIds.has(child.id))) throw new Error("Next investigation wave reused an existing node id");
+      const nextWave = wave + 1;
+      const childNodes = children.map(nodeRecordFromItem);
+      const childInvestigations = children.map((child): OrchestrationInvestigationRecord => ({
+        issue: child.issue, nodeId: child.id, wave: nextWave,
+        ...(child.targetBranch !== undefined ? { targetBranch: child.targetBranch } : {}),
+        ...(child.lane !== undefined ? { lane: child.lane } : {}), status: "queued", attemptCount: 0,
+      }));
+      this.replaceRecord(state, {
+        ...state.record,
+        phase: "investigating",
+        investigationWave: nextWave,
+        nodes: [...state.record.nodes, ...childNodes],
+        issueNumbers: uniqueIssueNumbers([...state.record.issueNumbers, ...children.flatMap((child) => [child.issue, ...(child.memberIssues ?? [])])]),
+        investigations: [...(state.record.investigations ?? []), ...childInvestigations],
+        investigationBarrier: { expected: childInvestigations.length, completed: 0, startedAt: this.now() },
+        metrics: { ...priorMetrics, barrierWaits: priorMetrics.barrierWaits + 1, barrierDurationMs: [...priorMetrics.barrierDurationMs, Date.now() - startedAt], shadowContractionProposals: priorMetrics.shadowContractionProposals + shadow.length },
+        shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
+        updatedAt: this.now(),
+      });
+      this.emitSnapshot(state.record, state);
+      await this.flush(state);
+      await this.runInvestigationPhase(state);
+      return;
+    }
+    this.replaceRecord(state, {
+      ...state.record,
+      phase: "executing",
+      nodes: nextItems.map((item) => nodeRecordFromItem(item)),
+      serializationEdges: nextEdges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
+      executionMaterializedAt: this.now(),
+      shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
+      metrics: { ...priorMetrics, barrierWaits: priorMetrics.barrierWaits + 1, barrierDurationMs: [...priorMetrics.barrierDurationMs, Date.now() - startedAt], shadowContractionProposals: priorMetrics.shadowContractionProposals + shadow.length },
+      investigationBarrier: { ...(state.record.investigationBarrier ?? { expected: latest.length, completed: latest.length, startedAt: this.now() }), completed: latest.length, completedAt: this.now() },
+      updatedAt: this.now(),
+    });
+    this.emitSnapshot(state.record, state);
+    await this.flush(state);
+  }
+
+  private updateInvestigation(state: PersistenceState, nodeId: string, update: (entry: OrchestrationInvestigationRecord) => OrchestrationInvestigationRecord): void {
+    const investigations = (state.record.investigations ?? []).map((entry) => entry.nodeId === nodeId ? update(entry) : entry);
+    this.replaceRecord(state, { ...state.record, investigations, updatedAt: this.now() });
   }
 
   private async prepareInitial(state: PersistenceState): Promise<PreparedExecution> {
@@ -1860,6 +2106,11 @@ export class OrchestrationController {
       ...(record.transportCapacity !== undefined ? { transportCapacity: record.transportCapacity } : {}),
       ...(record.effectiveMaxParallel !== undefined ? { effectiveMaxParallel: record.effectiveMaxParallel } : {}),
       result: scheduleResultFromRecord(record, []),
+      phase: record.phase,
+      ...(record.investigationBarrier !== undefined ? { investigationBarrier: {
+        expected: record.investigationBarrier.expected,
+        completed: record.investigationBarrier.completed,
+      } } : {}),
       updatedAt: record.updatedAt,
     });
     this.projectNodeStates(record);

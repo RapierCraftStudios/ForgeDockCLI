@@ -59,6 +59,9 @@ export interface OrchestrationSnapshot {
   orchestrationId: string;
   /** Durable DAG lifecycle status, used to distinguish operator stop from failure. */
   orchestrationStatus?: "running" | "completed" | "failed" | "cancelled";
+  /** `investigating set` is distinct from the phase-2 executing DAG. */
+  phase?: "investigating" | "executing";
+  investigationBarrier?: { expected: number; completed: number };
   nodes: OrchestrationNode[];
   readyNodes: string[];
   blockedNodes: string[];

@@ -8,6 +8,7 @@
 ### Changed
 
 - Pristine reset applies archived, identity-fenced external cleanup with bounded resource-serialized concurrency (default four), aggregates failures before any database purge, and reports stage counts and durations in the CLI.
+- Fresh native orchestrations now support an investigation-first phase: exact issue/route/base evidence is persisted, read-only investigations run concurrently without claim serialization, a durable barrier precedes execution-DAG materialization, and observer snapshots distinguish the investigating set from the executing DAG. Legacy durable execution DAGs remain resumable.
 
 ### Added
 
@@ -46,6 +47,7 @@
 - Build Packet preparation now treats concrete packet paths as exact isolated-worktree write grants without requiring issue or investigation hints; investigation affected-surface hints remain optional read-only verification hints, so malformed or missing targets are dropped without fuzzy expansion while protected paths remain denied.
 - Explicit `/orchestrate stop <dag-id>` now activates `forgedock_orchestrate`, the tool that owns semantic stop, and passes the exact DAG stop authorization instead of routing through ordinary resume.
 - Ordinary `/orchestrate resume <dag-id>` remains isolated to the durable resume tool.
+
 ## 1.8.1 - 2026-08-17
 
 ### Fixed

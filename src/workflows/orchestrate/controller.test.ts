@@ -1786,4 +1786,44 @@ describe("OrchestrationController", () => {
     assert.equal(node.attempts?.length, 2);
     assert.notEqual(node.attempts?.[0]?.attemptId, node.attempts?.[1]?.attemptId);
   });
+
+  it("runs an investigation set concurrently and materializes execution only after its barrier", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const started: string[] = [];
+    const release = deferred<void>();
+    let materialized = false;
+    const executed: string[] = [];
+    const service = controller(repository, async (scheduled) => {
+      assert.equal(materialized, true);
+      executed.push(scheduled.id);
+    }, {
+      investigationWorker: async (scheduled, context) => {
+        assert.equal(context.phase, "investigation");
+        started.push(scheduled.id);
+        await release.promise;
+        return { outcome: "confirmed", evidence: { source: "test" }, baseSha: "a".repeat(40) };
+      },
+      materializeExecution: async ({ investigations }) => {
+        assert.equal(investigations.length, 2);
+        assert.ok(investigations.every((entry) => entry.status === "completed"));
+        materialized = true;
+        return { items: [item("issue-1", 1), item("issue-2", 2)], serializationEdges: [] };
+      },
+    });
+    const execution = service.createAndRun({
+      repository: "owner/repo", maxParallel: 2, investigationFirst: true,
+      items: [
+        { ...item("issue-1", 1), claims: ["src/shared.ts"] },
+        { ...item("issue-2", 2, ["issue-1"]), claims: ["src/shared.ts"] },
+      ],
+    });
+    await waitUntil(() => started.length === 2, "investigation workers did not launch concurrently");
+    assert.equal(materialized, false);
+    release.resolve();
+    const result = await execution;
+    assert.equal(result.record.phase, "executing");
+    assert.equal(materialized, true);
+    assert.deepEqual(executed, ["issue-1", "issue-2"]);
+    assert.deepEqual(result.record.investigations?.map((entry) => entry.baseSha), ["a".repeat(40), "a".repeat(40)]);
+  });
 });

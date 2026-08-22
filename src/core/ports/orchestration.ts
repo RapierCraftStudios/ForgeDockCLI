@@ -34,6 +34,47 @@ export type OrchestrationPlanMetadata = Record<string, OrchestrationMetadataValu
 
 export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "reattach";
 
+/** Durable phases for the investigation-first native orchestrator. */
+export type OrchestrationPhase = "investigating" | "executing";
+
+export type OrchestrationInvestigationOutcome = "confirmed" | "invalid" | "decompose";
+
+export interface OrchestrationInvestigationRecord {
+  issue: number;
+  nodeId: string;
+  wave: number;
+  baseSha?: string;
+  targetBranch?: string;
+  lane?: "fast" | "feature";
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  outcome?: OrchestrationInvestigationOutcome;
+  evidence?: OrchestrationPlanMetadata;
+  attemptCount: number;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+}
+
+export interface OrchestrationShadowContractionProposal {
+  proposalId: string;
+  wave: number;
+  memberNodeIds: string[];
+  findingRoot: string;
+  criteria: string;
+  route: string;
+  claims: string[];
+  accepted: false;
+  reason: string;
+}
+
+export interface OrchestrationMetrics {
+  investigationWaveConcurrency: number[];
+  barrierWaits: number;
+  barrierDurationMs: number[];
+  runnableFrontier: number[];
+  shadowContractionProposals: number;
+}
+
 export type OrchestrationWorkerAttemptStatus =
   | "launching"
   | "running"
@@ -220,6 +261,14 @@ export interface OrchestrationRecord {
   nodes: OrchestrationNodeRecord[];
   /** Optional for backward compatibility with pre-serialization-edge records. */
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
+  /** Additive fields used only by fresh investigation-first records. */
+  phase?: OrchestrationPhase;
+  investigationWave?: number;
+  investigations?: OrchestrationInvestigationRecord[];
+  investigationBarrier?: { expected: number; completed: number; startedAt: string; completedAt?: string };
+  executionMaterializedAt?: string;
+  metrics?: OrchestrationMetrics;
+  shadowContractionProposals?: OrchestrationShadowContractionProposal[];
 }
 
 /** Canonical repository-qualified identity for issue ownership. */

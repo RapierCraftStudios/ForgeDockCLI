@@ -55,6 +55,10 @@ project_board:
       label: "Platform"
 ```
 
+## Native orchestration phases
+
+Fresh native orchestrations may use the investigation-first path. The controller freezes the selected issue, route, and base evidence, dispatches one read-only investigation per issue concurrently, and persists an exact wave barrier. Invalid issues are settled individually and confirmed issues are materialized into the execution DAG only after every wave member settles. Observer snapshots report `investigating set · barrier completed/expected` before switching to `executing DAG`. Existing durable execution DAG records continue to resume through the scheduler unchanged.
+
 ---
 
 ## Finding Your IDs

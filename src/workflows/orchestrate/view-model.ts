@@ -20,6 +20,8 @@ export function buildOrchestrationSnapshot(input: {
   transportCapacity?: number;
   effectiveMaxParallel?: number;
   updatedAt?: string;
+  phase?: OrchestrationSnapshot["phase"];
+  investigationBarrier?: OrchestrationSnapshot["investigationBarrier"];
 }): OrchestrationSnapshot {
   const status = input.result?.status ?? new Map(input.items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = input.result?.errors ?? new Map<string, Error>();
@@ -79,6 +81,8 @@ export function buildOrchestrationSnapshot(input: {
   return {
     orchestrationId: input.orchestrationId,
     ...(input.orchestrationStatus !== undefined ? { orchestrationStatus: input.orchestrationStatus } : {}),
+    ...(input.phase !== undefined ? { phase: input.phase } : {}),
+    ...(input.investigationBarrier !== undefined ? { investigationBarrier: input.investigationBarrier } : {}),
     nodes,
     readyNodes,
     blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed" || node.status === "skipped").map((node) => node.id),
@@ -106,7 +110,9 @@ export function buildOrchestrationSnapshot(input: {
 }
 
 export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): string {
-  const lines = [`Orchestration ${snapshot.orchestrationId}${snapshot.orchestrationStatus ? ` · ${snapshot.orchestrationStatus}` : ""}`, `Updated ${snapshot.updatedAt}`, ""];
+  const lines = [`Orchestration ${snapshot.orchestrationId}${snapshot.orchestrationStatus ? ` · ${snapshot.orchestrationStatus}` : ""}`, `Updated ${snapshot.updatedAt}`, ...(snapshot.phase === "investigating"
+    ? [`investigating set · barrier ${snapshot.investigationBarrier?.completed ?? 0}/${snapshot.investigationBarrier?.expected ?? 0}`]
+    : snapshot.phase === "executing" ? ["executing DAG"] : []), ""];
   const selected = snapshot.issueSlots?.selected ?? selectedIssueCount(snapshot);
   const runnable = snapshot.issueSlots?.runnableNow ?? runnableIssueSlots(snapshot);
   const requested = snapshot.issueSlots?.requestedCap;
