@@ -57,6 +57,8 @@ export interface OrchestrationIssueSlots {
 
 export interface OrchestrationSnapshot {
   orchestrationId: string;
+  /** Durable DAG lifecycle status, used to distinguish operator stop from failure. */
+  orchestrationStatus?: "running" | "completed" | "failed" | "cancelled";
   nodes: OrchestrationNode[];
   readyNodes: string[];
   blockedNodes: string[];

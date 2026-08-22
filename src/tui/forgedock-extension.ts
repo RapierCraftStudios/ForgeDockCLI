@@ -28,6 +28,7 @@ import {
   controlSubagentRun,
   deactivateWorkflowTools,
   explicitOrchestrationResumeId,
+  explicitOrchestrationStopId,
   buildOrchestrationPreviewCheckpointGuidance,
   buildOrchestrationPreviewConfirmationGuidance,
   getOrchestrationPreviewContinuation,
@@ -453,9 +454,11 @@ function registerWorkflow(
       // Orchestration confirms the resolved DAG and proposed work-unit batches inside
       // its native tool; a pre-resolution confirmation would be both vague and duplicate.
       if (workflow !== "orchestrate" && workflow !== "deep-plan" && !await confirmWorkflow(workflow, normalized, ctx)) return;
+      if (workflow === "orchestrate" && explicitOrchestrationStopId(normalized) && ctx.hasUI
+        && !await ctx.ui.confirm("Stop ForgeDock orchestration?", `Exact DAG: ${explicitOrchestrationStopId(normalized)}\n\nThis cancels the DAG semantically, drains its admitted workers, and preserves queued nodes unattempted.`)) return;
       if (workflow === "deep-plan") requestDeepPlanMode();
       activateWorkflow();
-      if (workflow === "orchestrate" && !explicitOrchestrationResumeId(normalized)) {
+      if (workflow === "orchestrate" && !explicitOrchestrationResumeId(normalized) && !explicitOrchestrationStopId(normalized)) {
         bindOrchestrationInvocation(pi, { rawArgs: normalized });
       }
       try {
@@ -476,8 +479,9 @@ async function queueNativeWorkflow(
 ): Promise<void> {
   const tool = WORKFLOW_TOOLS[command];
   const resumeOrchestrationId = command === "orchestrate" ? explicitOrchestrationResumeId(rawArgs) : undefined;
+  const stopOrchestrationId = command === "orchestrate" ? explicitOrchestrationStopId(rawArgs) : undefined;
   activateOnly(pi, command === "orchestrate"
-    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [ORCHESTRATION_DISCOVERY_TOOL, tool, HUMAN_DECISION_TOOL]
+    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : stopOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [ORCHESTRATION_DISCOVERY_TOOL, tool, HUMAN_DECISION_TOOL]
     : [tool],
   command === "orchestrate" && !resumeOrchestrationId ? ["bash"] : []);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);

@@ -7,6 +7,7 @@ import type { OrchestrationNode, OrchestrationRoute, OrchestrationSerializationC
 
 export function buildOrchestrationSnapshot(input: {
   orchestrationId: string;
+  orchestrationStatus?: OrchestrationSnapshot["orchestrationStatus"];
   items: readonly ScheduledWorkItem[];
   result?: Pick<ScheduleResult, "status" | "errors" | "waitReasons">;
   activeLeases?: readonly Lease[];
@@ -77,6 +78,7 @@ export function buildOrchestrationSnapshot(input: {
   const projectedEdges = projectSerializationEdges(input.items, input.serializationEdges ?? [], input.repository);
   return {
     orchestrationId: input.orchestrationId,
+    ...(input.orchestrationStatus !== undefined ? { orchestrationStatus: input.orchestrationStatus } : {}),
     nodes,
     readyNodes,
     blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed" || node.status === "skipped").map((node) => node.id),
@@ -104,7 +106,7 @@ export function buildOrchestrationSnapshot(input: {
 }
 
 export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): string {
-  const lines = [`Orchestration ${snapshot.orchestrationId}`, `Updated ${snapshot.updatedAt}`, ""];
+  const lines = [`Orchestration ${snapshot.orchestrationId}${snapshot.orchestrationStatus ? ` · ${snapshot.orchestrationStatus}` : ""}`, `Updated ${snapshot.updatedAt}`, ""];
   const selected = snapshot.issueSlots?.selected ?? selectedIssueCount(snapshot);
   const runnable = snapshot.issueSlots?.runnableNow ?? runnableIssueSlots(snapshot);
   const requested = snapshot.issueSlots?.requestedCap;

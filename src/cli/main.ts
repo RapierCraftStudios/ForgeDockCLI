@@ -2384,7 +2384,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             });
           } catch (error) {
             const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
-            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; resume after the active node completes\n`);
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; automatically requeued after the active node completes\n`);
             return suspension.result;
           } finally {
             setAgentEventObservationIdentity({
@@ -2513,7 +2513,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             return { status: "suspended", error: error.message };
           }
           if (error instanceof ClaimPromotionConflictError) {
-            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; resume after the active node completes\n`);
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${error.conflicts.join(", ")}; automatically requeued after the active node completes\n`);
             // Preserve the scheduler error object through the typed suspended
             // result; the controller still serializes its message durably.
             return { status: "suspended", error };
@@ -3020,7 +3020,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             return { status: "suspended", error: error.message };
           }
           const suspension = resolveClaimPromotionConflictAtBoundary(error, "orchestration-parent");
-          process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; resume after the active node completes\n`);
+          process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · Build Packet claims conflict with ${suspension.conflict.conflicts.join(", ")}; automatically requeued after the active node completes\n`);
           return suspension.result;
         } finally {
           clearInterval(heartbeat);

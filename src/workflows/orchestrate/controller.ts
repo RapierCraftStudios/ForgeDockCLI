@@ -182,6 +182,13 @@ export interface OrchestrationControllerResult {
   record: OrchestrationRecord;
 }
 
+interface ExecutionControl {
+  abort: AbortController;
+  stopRequested: boolean;
+  state?: PersistenceState;
+  done?: Promise<unknown>;
+}
+
 interface PersistenceState {
   record: OrchestrationRecord;
   claim: OrchestrationExecutionClaim;
@@ -213,6 +220,7 @@ export class OrchestrationController {
   private readonly now: () => string;
   private readonly createOrchestrationId: () => string;
   private readonly createAttemptId: () => string;
+  private readonly executions = new Map<string, ExecutionControl>();
 
   constructor(private readonly dependencies: OrchestrationControllerDependencies) {
     this.now = dependencies.now ?? (() => new Date().toISOString());
@@ -296,11 +304,50 @@ export class OrchestrationController {
     return this.execute(orchestrationId, true);
   }
 
+  requestStop(orchestrationId: string, confirmed = false): void {
+    if (!confirmed) throw new Error(`Stopping orchestration ${orchestrationId} requires explicit confirmation`);
+    const control = this.executions.get(orchestrationId);
+    if (!control) return;
+    control.stopRequested = true;
+    control.abort.abort(new Error(`Orchestration ${orchestrationId} stopped by operator`));
+  }
+
+  /**
+   * The barrier is raised synchronously before aborting the scheduler so no
+   * successor can be admitted after the request.
+   */
+  async stop(orchestrationId: string, confirmed = false): Promise<OrchestrationRecord> {
+    if (!confirmed) throw new Error(`Stopping orchestration ${orchestrationId} requires explicit confirmation`);
+    const control = this.executions.get(orchestrationId);
+    if (control) {
+      control.stopRequested = true;
+      control.abort.abort(new Error(`Orchestration ${orchestrationId} stopped by operator`));
+      while (this.executions.has(orchestrationId)) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      const completed = control.state?.record;
+      if (completed?.status === "cancelled") return structuredClone(completed);
+    }
+    const loaded = await this.dependencies.repository.loadOrchestration(orchestrationId);
+    if (!loaded) throw new Error(`Unknown orchestration: ${orchestrationId}`);
+    if (loaded.status === "cancelled") return structuredClone(loaded);
+    if (!control && loaded.status !== "running") {
+      return structuredClone(loaded);
+    }
+    const cancelled = { ...loaded, status: "cancelled" as const, updatedAt: this.now() };
+    await this.dependencies.repository.saveOrchestration(cancelled);
+    this.emitSnapshot(cancelled);
+    return structuredClone(cancelled);
+  }
+
   private async execute(orchestrationId: string, resume: boolean): Promise<OrchestrationControllerResult> {
     if (this.active.has(orchestrationId)) throw new Error(`Orchestration ${orchestrationId} is already active in this controller`);
     // Claim process-local admission before the first await so two callers on
     // this controller cannot both pass the preflight check.
     this.active.add(orchestrationId);
+    const control: ExecutionControl = { abort: new AbortController(), stopRequested: false };
+    this.executions.set(orchestrationId, control);
+    const signal = combineAbortSignals(this.dependencies.signal, control.abort.signal);
     let claim: OrchestrationExecutionClaim | undefined;
     let state: PersistenceState | undefined;
     try {
@@ -347,6 +394,7 @@ export class OrchestrationController {
         pending: Promise.resolve(),
         deferredStartedEvents: [],
       };
+      control.state = state;
       const dynamicTransportCapacity = typeof this.dependencies.transportCapacity === "function";
       // A live transport can be temporarily out of slots. Keep the durable
       // run admitted with an effective cap of zero and let the scheduler
@@ -405,7 +453,7 @@ export class OrchestrationController {
                 }
               : transportCapacity,
             onCapacityObserved: observeTransportCapacity,
-            ...(this.dependencies.signal !== undefined ? { signal: this.dependencies.signal } : {}),
+            ...(signal !== undefined ? { signal } : {}),
             serializationEdges: pass.serializationEdges,
             resumedItemIds: pass.resumedItemIds,
             onClaimsPromoted: async (itemId, claims) => {
@@ -437,7 +485,11 @@ export class OrchestrationController {
         record: structuredClone(state.record),
       };
     } catch (error) {
-      if (state && state.error === undefined) {
+      if (state && isExpectedCancellation(error, signal, control)) {
+        this.cancelState(state, "operator stop");
+        this.emitSnapshot(state.record, state);
+        try { await this.flush(state); } catch { /* retain original cancellation */ }
+      } else if (state && state.error === undefined) {
         this.replaceRecord(state, { ...state.record, status: "failed", updatedAt: this.now() });
         this.emitSnapshot(state.record, state);
         try {
@@ -454,6 +506,7 @@ export class OrchestrationController {
         if (claim) await claim.release();
       } finally {
         this.active.delete(orchestrationId);
+        this.executions.delete(orchestrationId);
       }
     }
   }
@@ -1037,6 +1090,7 @@ export class OrchestrationController {
       try {
         result = await action.reconciliation.wait(context);
       } catch (error) {
+        if (this.isStopping(state)) throw error;
         const retry = retryResultForError(error, attempt.attempt);
         if (retry) {
           try {
@@ -1073,6 +1127,7 @@ export class OrchestrationController {
     try {
       result = await this.dependencies.worker(item, context);
     } catch (error) {
+      if (this.isStopping(state)) throw error;
       const retry = retryResultForError(error, attempt.attempt);
       if (retry) {
         const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
@@ -1101,6 +1156,7 @@ export class OrchestrationController {
     recovery: OrchestrationRecoveryMode,
   ): OrchestrationWorkerContext {
     return {
+      ...(schedulerContext.signal !== undefined ? { signal: schedulerContext.signal } : {}),
       orchestrationId: state.record.orchestrationId,
       executionAttempt: state.record.executionAttempt ?? 0,
       attemptId,
@@ -1548,6 +1604,28 @@ export class OrchestrationController {
     this.emitSnapshot(state.record, state);
   }
 
+  private isStopping(state: PersistenceState): boolean {
+    return this.executions.get(state.record.orchestrationId)?.stopRequested === true;
+  }
+
+  private cancelState(state: PersistenceState, reason: string): void {
+    const now = this.now();
+    this.replaceRecord(state, {
+      ...state.record,
+      status: "cancelled",
+      updatedAt: now,
+      nodes: state.record.nodes.map((node) => {
+        const active = activeAttempt(node);
+        if (!active) return node;
+        const attempts = (node.attempts ?? []).map((attempt) => attempt.attemptId === active.attemptId
+          ? { ...attempt, status: "interrupted" as const, completedAt: now, updatedAt: now, error: reason }
+          : attempt);
+        const { activeAttemptId: _activeAttemptId, error: _error, waitReason: _waitReason, ...rest } = node;
+        return { ...rest, status: "queued" as const, attempts, lastRecovery: { mode: "relaunch" as const, reconciledAt: now, attemptId: active.attemptId, reason } };
+      }),
+    });
+  }
+
   private updateNode(
     state: PersistenceState,
     nodeId: string,
@@ -1670,6 +1748,7 @@ export class OrchestrationController {
     }, state.record);
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: state.record.orchestrationId,
+      orchestrationStatus: state.record.status,
       repository: state.record.repository,
       items: state.record.nodes.map(itemFromNodeRecord),
       serializationEdges: (state.record.serializationEdges ?? []).map(cloneSerializationEdge),
@@ -1710,6 +1789,7 @@ export class OrchestrationController {
   private emitSnapshot(record: OrchestrationRecord, state?: PersistenceState): void {
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: record.orchestrationId,
+      orchestrationStatus: record.status,
       repository: record.repository,
       items: record.nodes.map(itemFromNodeRecord),
       serializationEdges: (record.serializationEdges ?? []).map(cloneSerializationEdge),
@@ -2173,6 +2253,21 @@ function activeOrchestrationExecutionMessage(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function combineAbortSignals(left: AbortSignal | undefined, right: AbortSignal): AbortSignal {
+  if (!left) return right;
+  const combined = new AbortController();
+  const abort = (signal: AbortSignal) => combined.abort(signal.reason);
+  if (left.aborted) abort(left);
+  else left.addEventListener("abort", () => abort(left), { once: true });
+  if (right.aborted) abort(right);
+  else right.addEventListener("abort", () => abort(right), { once: true });
+  return combined.signal;
+}
+
+function isExpectedCancellation(_error: unknown, _signal: AbortSignal, control: ExecutionControl): boolean {
+  return control.stopRequested;
 }
 
 /** Orchestration records are JSON-safe; preserve key order from the record. */

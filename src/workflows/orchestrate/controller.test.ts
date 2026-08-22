@@ -182,6 +182,31 @@ describe("OrchestrationController", () => {
     assert.equal(admission.hasClaim("dag-test"), false);
   });
 
+  it("operator stop raises a barrier, preserves queued provenance, and is idempotent", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const started: string[] = [];
+    const service = controller(repository, async (scheduled, context) => {
+      started.push(scheduled.id);
+      await new Promise<void>((resolve) => {
+        context.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { status: "completed" };
+    });
+    const running = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 2,
+      items: [item("one", 1), item("two", 2), item("successor", 3, ["one"])],
+    });
+    const runningFailure = assert.rejects(running, /stopped by operator/);
+    await waitUntil(() => started.length === 2, "expected two admitted workers");
+    const stopped = await service.stop("dag-test", true);
+    assert.equal(stopped.status, "cancelled");
+    await runningFailure;
+    assert.deepEqual(started.sort(), ["one", "two"]);
+    assert.equal(stopped.nodes.find((node) => node.id === "successor")?.status, "queued");
+    assert.equal((await service.stop("dag-test", true)).status, "cancelled");
+  });
+
   it("preflights every initial frozen route before dispatch and preserves distinct routes", async () => {
     const frozenItems: ScheduledWorkItem[] = [
       {

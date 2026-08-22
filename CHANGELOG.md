@@ -7,6 +7,7 @@
 
 ### Added
 
+- Native `/orchestrate stop <dag-id>` provides an explicit, exact-DAG semantic stop with a launch barrier, worker drain, durable `cancelled` status, and distinct cancelled board/task guidance.
 - `npm run certify:orchestration` builds and runs an exact-file, single-concurrency local certification set with GitHub credentials removed; `npm run certify:orchestration:dry-run` prints the audited plan without execution.
 
 ### Changed

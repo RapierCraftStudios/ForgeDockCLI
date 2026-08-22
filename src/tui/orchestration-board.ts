@@ -16,6 +16,7 @@ export type OrchestrationUiPhase =
   | "delegated"
   | "active"
   | "completed"
+  | "cancelled"
   | "failed"
   | "blocked"
   | "suspended"
@@ -86,6 +87,7 @@ export function formatOrchestrationInvocationLabel(command: string, rawArgs: str
 }
 
 export function orchestrationTerminalPhase(snapshot: OrchestrationSnapshot): OrchestrationBoardPhase {
+  if (snapshot.orchestrationStatus === "cancelled") return "cancelled";
   const statuses = snapshot.nodes.map((node) => node.status);
   if (statuses.includes("failed")) return "failed";
   if (statuses.includes("blocked")) return "blocked";
@@ -136,7 +138,7 @@ export class OrchestrationBoardController {
     if (previous && event.at < previous.updatedAt) return;
     const record: BoardRecord = {
       orchestrationId: event.orchestrationId,
-      phase: "active",
+      phase: event.snapshot.orchestrationStatus === "cancelled" ? "cancelled" : "active",
       invocationLabel: previous?.invocationLabel ?? invocationLabel,
       snapshot: event.snapshot,
       ...(previous?.repository !== undefined ? { repository: previous.repository } : repository !== undefined ? { repository } : {}),
@@ -243,7 +245,7 @@ export class OrchestrationBoardController {
       const terminal = record.snapshot.nodes.filter((node) => ["completed", "skipped", "failed", "blocked", "invalid"].includes(node.status)).length;
       const active = record.snapshot.nodes.filter((node) => node.status === "running").length;
       const total = record.snapshot.nodes.length;
-      const progress = record.phase === "completed" ? `${completed}/${total} complete` : `${terminal}/${total} terminal`;
+      const progress = record.phase === "completed" ? `${completed}/${total} complete` : record.phase === "cancelled" ? `${completed}/${total} complete · stopped` : `${terminal}/${total} terminal`;
       lines.push(truncateToWidth(`${phaseGlyph(record.phase, theme)} ${record.orchestrationId} · ${record.phase} · ${progress}${active ? ` · ${active} active` : ""}`, width));
       lines.push(truncateToWidth(`  ${formatOrchestrationIssueSlots(record.snapshot.issueSlots, selectedIssueCount(record.snapshot), undefined)}`, width));
       for (const node of record.snapshot.nodes) lines.push(truncateToWidth(`  ${renderNodeRow(node, theme)}`, width));
@@ -364,6 +366,7 @@ function selectedIssueCount(snapshot: OrchestrationSnapshot): number {
 
 function phaseGlyph(phase: OrchestrationBoardPhase, theme: Theme): string {
   if (phase === "completed") return theme.fg("success", "✓");
+  if (phase === "cancelled") return theme.fg("dim", "■");
   if (phase === "failed" || phase === "invalid") return theme.fg("error", "✕");
   if (phase === "blocked") return theme.fg("error", "■");
   if (phase === "detached") return theme.fg("dim", "◇");

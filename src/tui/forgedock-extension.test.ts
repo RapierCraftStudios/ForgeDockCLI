@@ -2945,6 +2945,65 @@ test("explicit orchestration resume routes directly to the durable resume tool",
   assert.doesNotThrow(() => bindOrchestrationInvocation(state.pi, { rawArgs: "another fresh request" }));
 });
 
+test("explicit orchestration stop routes to the semantic stop action", async () => {
+  const orchestrationId = "dag_cd83f20b-7670-4be3-984c-63f20a77a72f";
+  const prompt = buildNativeCommandPrompt("orchestrate", `stop ${orchestrationId}`);
+  assert.match(prompt, new RegExp(`Call forgedock_resume_orchestration exactly once with orchestrationId="${orchestrationId}"`));
+  assert.match(prompt, /stop=true/);
+  assert.match(prompt, /confirmed=true/);
+  assert.match(prompt, /Do not call forgedock_tasks cancel/);
+  assert.doesNotMatch(prompt, /forgedock_orchestrate/);
+
+  const state = fakePi();
+  forgedockExtension(state.pi);
+  await state.commands.get("orchestrate")?.(`stop ${orchestrationId}`, commandContext());
+  assert.deepEqual(state.active, ["read", "forgedock_resume_orchestration"]);
+  assert.match(state.sent.at(-1)?.content ?? "", /semantic stop|stop/i);
+});
+
+test("fresh TUI stop initializes durable context and reports terminal status truthfully", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const record = (orchestrationId: string, status: OrchestrationRecord["status"]): OrchestrationRecord => ({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId,
+    repository: "owner/repo",
+    issueNumbers: [1],
+    requestedIssueNumbers: [1],
+    maxParallel: 1,
+    autoMerge: true,
+    status,
+    createdAt: "2030-01-01T00:00:00.000Z",
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    nodes: [{ id: "issue-1", issue: 1, priority: 1, dependencies: [], claims: [], status: "queued", childRunIds: [] }],
+  });
+  await repository.createOrchestration(record("dag_fresh_stop", "running"));
+  await repository.createOrchestration(record("dag_completed_stop", "completed"));
+  await repository.createOrchestration(record("dag_failed_stop", "failed"));
+  await repository.createOrchestration(record("dag_cancelled_stop", "cancelled"));
+  const state = fakePi(
+    ["read"],
+    { orchestrationRepository: repository, orchestrationExecutionAdmission: admission, dispatchReadinessCheck: async () => undefined, controllerEntryPath: null },
+  );
+  const tool = state.tools.get("forgedock_orchestrate");
+  assert.ok(tool);
+  const execute = (orchestrationId: string) => tool.execute(
+    `stop-${orchestrationId}`,
+    { stop: true, orchestrationId, confirmed: true },
+    undefined,
+    undefined,
+    commandContext() as any,
+  );
+  const stopped = await execute("dag_fresh_stop");
+  assert.match((stopped.content?.[0] as any)?.text ?? "", /dag_fresh_stop cancelled/);
+  const completed = await execute("dag_completed_stop");
+  assert.match((completed.content?.[0] as any)?.text ?? "", /already completed/);
+  const failed = await execute("dag_failed_stop");
+  assert.match((failed.content?.[0] as any)?.text ?? "", /already failed/);
+  const cancelled = await execute("dag_cancelled_stop");
+  assert.match((cancelled.content?.[0] as any)?.text ?? "", /dag_cancelled_stop cancelled/);
+});
+
 test("typed orchestration derives bounded authoritative plan metadata", () => {
   const body = [
     "**Source:** PR #186 — staging review",

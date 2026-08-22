@@ -275,6 +275,28 @@ describe("lean orchestration scheduler", () => {
     assert.equal(result.status.get("second"), "completed");
   });
 
+  it("reaches a fixed point across semantic failure, claim release, and mixed downstream chains", async () => {
+    const started: string[] = [];
+    const result = await runSchedule([
+      { id: "root", issue: 1, priority: 1, dependencies: [], claims: ["src/shared"] },
+      { id: "semantic-child", issue: 2, priority: 1, dependencies: ["root"], claims: ["docs"] },
+      { id: "claim-only", issue: 3, priority: 1, dependencies: [], claims: ["src/shared"] },
+      { id: "mixed-child", issue: 4, priority: 1, dependencies: ["claim-only", "semantic-child"], claims: ["api"] },
+    ], 1, async (item) => {
+      started.push(item.id);
+      if (item.id === "root") throw new Error("root failed");
+    }, {
+      serializationEdges: [{ predecessor: "root", successor: "claim-only", overlappingClaims: ["src/shared"] }],
+    });
+    assert.deepEqual(started, ["root", "claim-only"]);
+    assert.equal(result.status.get("root"), "failed");
+    assert.equal(result.status.get("claim-only"), "completed");
+    assert.equal(result.status.get("semantic-child"), "blocked");
+    assert.equal(result.status.get("mixed-child"), "blocked");
+    assert.match(result.errors.get("semantic-child")?.message ?? "", /Blocked by dependency root/);
+    assert.match(result.errors.get("mixed-child")?.message ?? "", /Blocked by dependency semantic-child/);
+  });
+
   it("emits typed wait reasons for claim serialization and clears them on dispatch", async () => {
     let release!: () => void;
     const waits: Array<[string, import("./scheduler.js").WaitReason | undefined]> = [];

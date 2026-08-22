@@ -80,7 +80,8 @@ export type ScheduleClaimsSink = (itemId: string, claims: readonly string[]) => 
  */
 export type ScheduleCapacity = number | (() => number | Promise<number>);
 export interface ScheduleWorkerContext {
-  /** Add concrete Build Packet paths before the worker mutates its checkout. */
+  /** Abort raised by an operator stop; workers should stop their exact transport task. */
+  signal?: AbortSignal;
   promoteClaims(claims: readonly string[]): Promise<void>;
   /** Promote the normalized repository/target route immediately before mutation. */
   promoteTargetRouteClaim(): Promise<void>;
@@ -558,6 +559,7 @@ export async function runSchedule(
       startOrder.push(item.id);
       emit("started", item.id);
       const context: ScheduleWorkerContext = {
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
         promoteClaims: async (claims) => {
           const merged = [...new Set([...(currentClaims.get(item.id) ?? []), ...claims.map((claim) => claim.trim()).filter(Boolean)])];
           // Re-read the live set here. A worker can discover Build Packet
@@ -759,7 +761,14 @@ export async function runSchedule(
           }
         })
         .catch((error: unknown) => {
-          if (isLeaseContinuityFailure(error)) {
+          if (options.signal?.aborted) {
+            // The controller owns semantic cancellation and will persist the
+            // DAG as cancelled after all admitted workers drain. Do not turn
+            // an interrupted worker into a failed successor here.
+            status.set(item.id, "queued");
+            errors.delete(item.id);
+            emit("queued", item.id);
+          } else if (isLeaseContinuityFailure(error)) {
             // A thrown continuity error has the same durable meaning as an
             // explicit suspended result returned by a controller worker.
             status.set(item.id, "suspended");

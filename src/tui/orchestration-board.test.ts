@@ -87,6 +87,17 @@ test("board registry renders concurrent DAGs without overwriting either snapshot
   assert.equal(widgets.has(FORGEDOCK_ORCHESTRATION_WIDGET_KEY), false);
 });
 
+test("board renders cancelled DAGs as stopped without active attention", () => {
+  const widgets = new Map<string, unknown>();
+  const board = new OrchestrationBoardController();
+  board.attach({ hasUI: true, ui: { setWidget: (key: string, value: unknown) => value === undefined ? widgets.delete(key) : widgets.set(key, value) } } as any);
+  board.updateEvent({ name: "snapshot", orchestrationId: "dag_cancel", at: "2030-01-01T00:00:00.000Z", snapshot: { ...snapshot("dag_cancel", 70, "queued", "2030-01-01T00:00:00.000Z"), orchestrationStatus: "cancelled" } }, "/orchestrate stop dag_cancel", "owner/repo");
+  const factory = widgets.get(FORGEDOCK_ORCHESTRATION_WIDGET_KEY) as (tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[] };
+  const rendered = factory({ requestRender: () => undefined }, theme).render(160).join("\n");
+  assert.match(rendered, /dag_cancel · cancelled · .*stopped/);
+  board.dispose();
+});
+
 test("preview confirmation window includes elapsed state, fresh-preview guidance, and absolute deadline", () => {
   assert.equal(formatOrchestrationInvocationLabel("orchestrate", "#68\nsecret"), "/orchestrate #68 secret");
   assert.equal(
