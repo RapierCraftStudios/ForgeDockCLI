@@ -207,6 +207,37 @@ describe("OrchestrationController", () => {
     assert.equal((await service.stop("dag-test", true)).status, "cancelled");
   });
 
+  it("preserves a queued successor when an admitted worker resolves after cancellation", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const admission = new TestExecutionAdmission();
+    const started = deferred<void>();
+    const service = controller(repository, async (_scheduled, context) => {
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        context.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { status: "suspended", error: "investigator resolution cancelled" };
+    }, {
+      executionAdmission: admission,
+    });
+
+    const running = service.createAndRun({
+      repository: "owner/repo",
+      maxParallel: 1,
+      items: [item("investigator", 1), item("successor", 2, ["investigator"])],
+    });
+    const runningFailure = assert.rejects(running, /stopped by operator/);
+    await started.promise;
+    await service.stop("dag-test", true);
+    await runningFailure;
+
+    const persisted = await repository.loadOrchestration("dag-test");
+    assert.equal(persisted?.status, "cancelled");
+    assert.equal(persisted?.nodes.find((node) => node.id === "investigator")?.status, "queued");
+    assert.equal(persisted?.nodes.find((node) => node.id === "successor")?.status, "queued");
+    assert.equal(admission.hasClaim("dag-test"), false);
+  });
+
   it("preflights every initial frozen route before dispatch and preserves distinct routes", async () => {
     const frozenItems: ScheduledWorkItem[] = [
       {

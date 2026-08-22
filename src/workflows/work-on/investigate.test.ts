@@ -115,6 +115,58 @@ describe("work-on investigation", () => {
     ]);
   });
 
+  it("cancels an in-flight successful resolution before semantic admission for every outcome", async () => {
+    const cancellation = new Error("operator cancellation won the race");
+    const payloads: InvestigationPayload[] = [
+      confirmed(),
+      {
+        outcome: "invalid",
+        confidence: "high",
+        summary: "The report is already covered.",
+        evidence: confirmed().evidence,
+        affectedSurfaces: ["src/widget.ts"],
+        risks: [],
+        recommendation: "No delivery is required.",
+      },
+      {
+        outcome: "decompose",
+        confidence: "high",
+        summary: "The report needs separate deliverables.",
+        evidence: confirmed().evidence,
+        affectedSurfaces: ["src/widget.ts"],
+        risks: [],
+        recommendation: "Deliver both child outcomes.",
+        decomposition: [
+          { title: "First child", outcome: "Deliver the first part", dependsOn: [] },
+          { title: "Second child", outcome: "Deliver the second part", dependsOn: [] },
+        ],
+      },
+    ];
+
+    for (const payload of payloads) {
+      const outcome = payload.outcome;
+      const abort = new AbortController();
+      const runtime = new FakeAgentRuntime([() => {
+        abort.abort(cancellation);
+        return payload;
+      }]);
+      const deps = dependencies(runtime);
+      await assert.rejects(
+        investigateWorkItem({ intent: intent(`run_cancel_${outcome}`), cwd: process.cwd(), signal: abort.signal }, deps),
+        (error: unknown) => error instanceof WorkflowExecutionError
+          && error.run.state === "cancelled"
+          && error.message === cancellation.message,
+      );
+      const runId = `run_cancel_${outcome}`;
+      assert.deepEqual((await deps.runs.history(runId)).map((record) => record.event), [
+        "START_INVESTIGATION", "CANCEL",
+      ]);
+      assert.equal((await deps.runs.load(runId))?.state, "cancelled");
+      assert.deepEqual(deps.artifacts.artifacts.map((artifact) => artifact.kind), ["Intent"]);
+      assert.equal(deps.materialized.length, 0, `${outcome} cancellation must not materialize children`);
+    }
+  });
+
   it("records invalid evidence with a provisional closure checkpoint", async () => {
     const runtime = new FakeAgentRuntime([{
       ...confirmed(),

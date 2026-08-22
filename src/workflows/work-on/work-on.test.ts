@@ -452,6 +452,41 @@ describe("complete work-on trajectory", () => {
     assert.equal(outcomes.at(-1)?.payload.issueClosure?.status, "completed");
   });
 
+  it("retains a cancelled investigation checkpoint without admitting delivery work", async () => {
+    const abort = new AbortController();
+    const cancellation = new Error("investigator resolution cancelled");
+    const runtime = new FakeAgentRuntime([() => {
+      abort.abort(cancellation);
+      return investigation;
+    }]);
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createWorkOnIntent("run_cancel_work_on");
+    let promoted = false;
+
+    await assert.rejects(
+      workOn({
+        intent,
+        repoPath: process.cwd(),
+        lane: fastLane,
+        verification: [targetedTestVerification],
+        signal: abort.signal,
+        onClaimsPromoted: () => { promoted = true; },
+      }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host }),
+      (error: unknown) => error instanceof WorkflowExecutionError
+        && error.run.state === "cancelled"
+        && error.message === cancellation.message,
+    );
+
+    assert.equal((await runs.load(intent.runId))?.state, "cancelled");
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["investigator"]);
+    assert.equal(artifacts.artifacts.some((artifact) => artifact.kind === "BuildPacket"), false);
+    assert.equal(promoted, false);
+    assert.equal(git.removed, false, "a cancelled run retains its recovery workspace");
+  });
+
   it("retains the frozen building checkpoint when parent claim arbitration suspends the worker", async () => {
     const runtime = new FakeAgentRuntime([investigation, packet]);
     const artifacts = new InMemoryArtifactRepository();
