@@ -5,6 +5,7 @@ import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository } from "../../core/ports/repositories.js";
 import type { RunState } from "../../core/state/machine.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
+import { runSchedule, type ScheduledWorkItem } from "./scheduler.js";
 import {
   retryWorkOnAgentBudget,
   WORK_ON_AGENT_BUDGET_RETRY_BACKOFF_MS,
@@ -101,6 +102,36 @@ describe("native work-on agent budget retry", () => {
     assert.ok(deadlineWindow >= WORK_ON_AGENT_BUDGET_RETRY_DEADLINE_MS - 1_000);
     assert.deepEqual(checkpoint.payload.artifactIds, ["intent-lineage"]);
     assert.equal(checkpoint.payload.sessionRef, "session-remediator");
+  });
+
+  it("redrives the retained work-on run inside one live schedule", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const item: ScheduledWorkItem = {
+      id: "issue-443",
+      issue: 443,
+      priority: 1,
+      dependencies: [],
+      claims: ["src/tui/forgedock-extension.test.ts"],
+    };
+    let calls = 0;
+    const result = await runSchedule([item], 1, async () => {
+      calls += 1;
+      if (calls > 1) return { status: "completed" };
+      return await retryWorkOnAgentBudget(wrappedBudget(), {
+        artifacts,
+        subject,
+        nodeId: item.id,
+        attemptId: "attempt-live",
+      });
+    });
+    assert.equal(calls, 2);
+    assert.deepEqual(result.startOrder, ["issue-443", "issue-443"]);
+    assert.equal(result.status.get("issue-443"), "completed");
+    assert.equal(result.waitReasons?.has("issue-443") ?? false, false);
+    const checkpoint = (await artifacts.list(subject, "RetryCheckpoint"))
+      .find((artifact): artifact is DurableArtifact<"RetryCheckpoint"> => artifact.kind === "RetryCheckpoint");
+    assert.equal(checkpoint?.payload.status, "waiting");
+    assert.equal(checkpoint?.payload.attempt.number, 1);
   });
 
   it("increments only the checkpoint attempt and terminalizes max/deadline exhaustion", async () => {
