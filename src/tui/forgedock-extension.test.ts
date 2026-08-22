@@ -2534,11 +2534,19 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   const artifactReads: Array<{ repo: string; issue: number }> = [];
   const issueReads: Array<{ repo: string; issue: number }> = [];
   const rebuildIdentities: Array<{ nodeRepository: string | undefined; itemRepository: string | undefined }> = [];
+  const taskPreparations: number[] = [];
   const workerDispatches: number[] = [];
+  const launchSnapshots: Array<{ issue: number; record: OrchestrationRecord | undefined }> = [];
+  const pendingLaunchSnapshots: Promise<void>[] = [];
   const observations: Array<
     | { kind: "save"; record: OrchestrationRecord }
     | { kind: "dispatch"; issue: number }
   > = [];
+  let expansionSaveGateArmed = false;
+  let expansionSaveStarted!: () => void;
+  const expansionSaveReady = new Promise<void>((resolve) => { expansionSaveStarted = resolve; });
+  let releaseExpansionSave!: () => void;
+  const expansionSaveRelease = new Promise<void>((resolve) => { releaseExpansionSave = resolve; });
   let failureMode = true;
   const branchReads: Array<{ repo: string; branch: string }> = [];
   let startedReads = 0;
@@ -2555,12 +2563,35 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
 
   class RecordingOrchestrationRepository extends InMemoryOrchestrationRepository {
     override async saveOrchestration(record: OrchestrationRecord): Promise<void> {
-      observations.push({ kind: "save", record: structuredClone(record) });
       await super.saveOrchestration(record);
+      const parent = record.nodes.find((node) => node.id === "parent");
+      const hasReplacementChildren = record.nodes.length > 1
+        && parent?.decompositionChildren?.length === childIssues.length
+        && childIssues.every((issue) => record.nodes.some((node) => node.issue === issue));
+      if (hasReplacementChildren && !expansionSaveGateArmed) {
+        expansionSaveGateArmed = true;
+        expansionSaveStarted();
+        await expansionSaveRelease;
+      }
+      observations.push({ kind: "save", record: structuredClone(record) });
     }
   }
 
   const repository = new RecordingOrchestrationRepository();
+  let orchestrationId: string | undefined;
+  const observeSpawn = (data: any) => {
+    const issueMatch = /issue #(\d+)/.exec(String(data.params?.task ?? ""));
+    assert.ok(issueMatch, "every worker spawn must carry its issue in the task");
+    const issue = Number(issueMatch[1]);
+    workerDispatches.push(issue);
+    observations.push({ kind: "dispatch", issue });
+    if (issue !== 42) {
+      assert.ok(orchestrationId, "child launches must belong to the persisted orchestration");
+      pendingLaunchSnapshots.push(repository.loadOrchestration(orchestrationId).then((record) => {
+        launchSnapshots.push({ issue, record });
+      }));
+    }
+  };
   const github = {
     async getRepository(repo: string) {
       repositoryReads.push(repo);
@@ -2654,8 +2685,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
         });
       },
       taskFor: (item: any) => {
-        workerDispatches.push(item.issue);
-        observations.push({ kind: "dispatch", issue: item.issue });
+        taskPreparations.push(item.issue);
         return { agent: "forgedock-issue-worker", task: `Deliver issue #${item.issue}`, cwd: process.cwd() };
       },
       assertCompleted: async (item: any) => item.issue === 42 && failReads
@@ -2672,6 +2702,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   firstState.pi.events.emit = ((name: string, data: any) => {
     firstOriginalEmit(name, data);
     if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      observeSpawn(data);
       queueMicrotask(() => firstOriginalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
         version: 1,
         requestId: data.requestId,
@@ -2699,6 +2730,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   const initial = await first.start(makeInput([parent], async () => {
     throw new Error("the initial run must not use the rebuild callback");
   }, true));
+  orchestrationId = initial.id;
   firstOriginalEmit("subagent:async-complete", { runId: "integration-parent" });
   const failed = assert.rejects(() => initial.completion, /child read failed/);
   await firstWaveReady;
@@ -2710,6 +2742,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   assert.equal(inFlight, 0);
   assert.equal(startedReads, childIssues.length + 1, "the parent route read and every child read must settle");
   assert.equal(completedReads, childIssues.length + 1);
+  assert.deepEqual(taskPreparations, [42], "the failed expansion only prepared the parent task");
   assert.deepEqual(workerDispatches, [42], "a resolver rejection must dispatch no replacement child worker");
   const failedRecord = await repository.loadOrchestration(initial.id);
   assert.equal(failedRecord?.status, "failed");
@@ -2736,6 +2769,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   secondState.pi.events.emit = ((name: string, data: any) => {
     secondOriginalEmit(name, data);
     if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
+      observeSpawn(data);
       const runId = `integration-child-${workerDispatches.at(-1)}`;
       queueMicrotask(() => secondOriginalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
         version: 1,
@@ -2759,8 +2793,17 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
       throw new Error("nested rebuild callback is not used");
     }, false);
   });
-  const resumed = await second.resume(initial.id);
+  const resumedPromise = second.resume(initial.id);
+  await expansionSaveReady;
+  const flushedExpansion = await repository.loadOrchestration(initial.id);
+  assert.ok(flushedExpansion);
+  assert.deepEqual(flushedExpansion.nodes.find((node) => node.id === "parent")?.decompositionChildren, childIssues);
+  assert.ok(childIssues.every((issue) => flushedExpansion.nodes.some((node) => node.issue === issue)));
+  assert.deepEqual(workerDispatches, [42], "the actual spawn boundary must remain closed until save completion");
+  releaseExpansionSave();
+  const resumed = await resumedPromise;
   await resumed.completion;
+  await Promise.all(pendingLaunchSnapshots);
   const completed = await repository.loadOrchestration(initial.id);
   assert.equal(completed?.status, "completed");
   assert.deepEqual(completed?.nodes.find((node) => node.id === "parent")?.decompositionChildren, childIssues);
@@ -2782,12 +2825,18 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   assert.equal(branchReads.some(({ repo }: { repo: string }) => repo === "owner/control"), false);
   assert.equal(issueReads.some(({ repo }: { repo: string }) => repo === "owner/control"), false);
   assert.equal(artifactReads.some(({ repo }: { repo: string }) => repo === "owner/control"), false);
+  const childLaunches = workerDispatches.filter((issue) => issue !== 42);
+  assert.deepEqual(childLaunches, childIssues);
+  assert.ok(launchSnapshots.length >= childIssues.length);
+  assert.ok(launchSnapshots.every(({ issue, record }) => record?.nodes.find((node) => node.id === "parent")?.decompositionChildren?.includes(issue)
+    && record.nodes.some((node) => node.issue === issue && node.repository === "owner/work")),
+  "each actual child spawn must observe the durable expansion");
   const firstChildDispatch = observations.findIndex((event) => event.kind === "dispatch" && event.issue !== 42);
   assert.ok(firstChildDispatch >= 0);
   assert.ok(observations.slice(0, firstChildDispatch).some((event) => event.kind === "save"
     && event.record.nodes.find((node) => node.id === "parent")?.decompositionChildren?.join(",") === childIssues.join(",")
     && childIssues.every((issue) => event.record.nodes.some((node) => node.issue === issue))),
-  "child dispatch must follow the durable expansion flush");
+  "actual child spawn must follow the completed durable expansion save");
   await first.shutdown();
   await second.shutdown();
 });
