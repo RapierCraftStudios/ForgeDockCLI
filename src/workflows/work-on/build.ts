@@ -6,7 +6,7 @@ import type { RunRepository } from "../../core/ports/repositories.js";
 import type { VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import { isRecoverableAgentExecutionError, scopeManifestForBuildPacket, type AgentEventSink, type AgentRuntime, type ScopeHints } from "../../runtime/agent-runtime.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 
 export const BuilderSubmissionSchema = Type.Object({
   summary: Type.String({ minLength: 1 }),
@@ -328,6 +328,8 @@ export async function buildWorkItem(
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, submission: normalizeBuilderSubmission(input.packet, result.output), sessionRef: result.sessionRef };
   } catch (error) {
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     const reason = error instanceof Error ? error.message : String(error);
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_BUILD", { reason });

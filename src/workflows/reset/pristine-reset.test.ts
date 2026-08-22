@@ -191,6 +191,56 @@ describe("typed pristine repository reset", () => {
     assert.equal(manifest.preservedNodes[0]?.status, "completed");
   });
 
+  it("bounds independent mutations while serializing one issue resource", async () => {
+    const deps = fakeDeps();
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    let active = 0;
+    let maximum = 0;
+    const deletedRefs = new Set<string>();
+    const refs = Array.from({ length: 6 }, (_, index) => ({ name: `ref-${index}`, kind: "remote" as const, sha, exactRef: `refs/heads/ref-${index}`, managed: true as const }));
+    deps.host.readRef = async (_repo, ref) => deletedRefs.has(ref) ? undefined : sha;
+    deps.host.deleteExactRef = async (_repo, ref) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      deletedRefs.add(ref);
+      active -= 1;
+      deps.mutations.push(`ref:${ref}`);
+    };
+    const unsigned = { ...manifest, refs, pullRequests: [], actions: manifest.actions };
+    const { digest: _digest, ...unsignedManifest } = unsigned;
+    const prepared = { ...unsigned, digest: resetManifestDigest(unsignedManifest) };
+    await applyPristineReset(prepared, prepared.digest, { ...deps, mutationConcurrency: 2 });
+    assert.ok(maximum <= 2);
+    assert.equal(deps.mutations.filter((value) => value.startsWith("ref:")).length, refs.length);
+  });
+
+  it("collects bounded mutation failures and never purges", async () => {
+    const deps = fakeDeps();
+    let purged = false;
+    deps.state.purgeExactManifest = async () => { purged = true; return { runs: 0, artifacts: 0, orchestrations: 0, promotions: 0, telemetry: 0, remediationAdmissions: 0, reviewFindingFences: 0, leases: 0 }; };
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    const refs = [
+      { name: "bad", kind: "remote" as const, sha, exactRef: "refs/heads/bad", managed: true as const },
+      { name: "also-bad", kind: "remote" as const, sha, exactRef: "refs/heads/also-bad", managed: true as const },
+    ];
+    deps.host.deleteExactRef = async () => { throw new Error("secret transport detail"); };
+    const unsigned = { ...manifest, refs, pullRequests: [], actions: manifest.actions };
+    const { digest: _digest, ...unsignedManifest } = unsigned;
+    const prepared = { ...unsigned, digest: resetManifestDigest(unsignedManifest) };
+    await assert.rejects(
+      () => applyPristineReset(prepared, prepared.digest, deps),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.equal(error.errors.length, refs.length);
+        assert.match(String(error.errors[0]), /ref refs\/heads\/bad/);
+        assert.doesNotMatch(String(error.errors[0]), /secret transport/);
+        return true;
+      },
+    );
+    assert.equal(purged, false);
+  });
+
   it("archives dirty worktrees before exact force removal", async () => {
     const deps = fakeDeps();
     const order: string[] = [];

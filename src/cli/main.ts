@@ -9,6 +9,7 @@ import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactReposito
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
+import { retryableExternalDisposition } from "../core/retry.js";
 import {
   decideSubjectAdmission,
   latestArtifactOfKind,
@@ -44,7 +45,7 @@ import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
-import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
+import { investigateWorkItem, retryableExternalWorkflowError, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
 import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
@@ -76,7 +77,7 @@ import { decompositionChildIssuesFromArtifacts, materializeCliDecomposition } fr
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetSelection } from "../workflows/reset/pristine-reset.js";
+import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
 import { getOrchestrationRoute, orchestrationRouteCacheKey, requiredOrchestrationRoute, setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
 
@@ -1322,7 +1323,11 @@ async function resetIssue(argv: string[]): Promise<void> {
   const observationModule = await import("../observability/sqlite-store.js");
   const observations = existsSync(observationPath) ? new observationModule.SqliteObservationStore(observationPath, { readOnly: applyDigest === undefined }) : undefined;
   const selection: ResetSelection = { repo: repository, issueNumbers: selectedIssues, dagIds: selectedDags };
-  const deps = createResetCliDependencies(github, store, observations);
+  const onResetProgress = applyDigest === undefined ? undefined : (event: ResetProgressEvent): void => {
+    if (event.completed !== event.total) return;
+    process.stdout.write(`[reset] ${event.stage} ${event.completed}/${event.total} in ${event.elapsedMs}ms\n`);
+  };
+  const deps = createResetCliDependencies(github, store, observations, onResetProgress);
   try {
     if (applyDigest !== undefined) {
       if (argv.includes("--dry-run")) throw new Error("Reset --apply cannot be combined with --dry-run");
@@ -1343,7 +1348,12 @@ async function resetIssue(argv: string[]): Promise<void> {
   }
 }
 
-function createResetCliDependencies(github: GitHubClient, store: InstanceType<typeof import("../adapters/sqlite/sqlite-repositories.js").SqliteRepositories> | undefined, observations?: InstanceType<typeof import("../observability/sqlite-store.js").SqliteObservationStore>): ResetPlanDependencies {
+function createResetCliDependencies(
+  github: GitHubClient,
+  store: InstanceType<typeof import("../adapters/sqlite/sqlite-repositories.js").SqliteRepositories> | undefined,
+  observations?: InstanceType<typeof import("../observability/sqlite-store.js").SqliteObservationStore>,
+  onProgress?: (event: ResetProgressEvent) => void,
+): ResetPlanDependencies {
   const worktreeManager = new GitWorktreeManager(process.cwd());
   return {
     host: {
@@ -1542,6 +1552,7 @@ function createResetCliDependencies(github: GitHubClient, store: InstanceType<ty
         }
       },
     },
+    ...(onProgress ? { onProgress } : {}),
     workspaces: {
       capture: async (target) => (await worktreeManager.listManagedResetWorktrees(target)).map((worktree) => ({ ...worktree })),
       archiveDirty: async (worktree) => worktreeManager.archiveDirtyManaged(worktree),
@@ -2337,6 +2348,43 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             workerAbort.abort(error);
             return { status: "suspended", error: `Lease continuity failed for ${item.id}; worker aborted and dependents remain queued` };
           }
+          const externalDisposition = retryableExternalDisposition(error);
+          const rateLimitKind = externalDisposition?.code === "github-primary-rate-limit" || externalDisposition?.code === "github-secondary-rate-limit"
+            ? externalDisposition.code
+            : undefined;
+          if (externalDisposition && rateLimitKind !== undefined) {
+            const operationKey = `${item.repository ?? subject.repo}`.toLowerCase().includes(":")
+              ? `${item.repository ?? subject.repo}`.toLowerCase()
+              : `github.com:${(item.repository ?? subject.repo).toLowerCase()}`;
+            const now = Date.now();
+            const delay = Math.min(15 * 60_000, Math.max(1_000,
+              externalDisposition.retryAfterMs
+                ?? (externalDisposition.resetAt !== undefined ? Math.max(0, externalDisposition.resetAt - now) : 1_000)));
+            const nextAttemptAt = new Date(now + delay).toISOString();
+            const attempt = item.retryAttempt ?? 1;
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} retry_wait · GitHub ${rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary"} rate limit; retry at ${nextAttemptAt}\n`);
+            return {
+              status: "retry_wait",
+              error: error instanceof Error ? error : String(error),
+              retryable: true,
+              retryAfterMs: delay,
+              nextAttemptAt,
+              attempt,
+              maxAttempts: item.retryMaxAttempts ?? 3,
+              retryDomain: "github",
+              retryCode: rateLimitKind,
+              operationKey,
+              rateLimit: {
+                kind: rateLimitKind,
+                reason: rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary",
+                operationKey,
+                attempt,
+                ...(externalDisposition.retryAfterMs !== undefined ? { retryAfterMs: externalDisposition.retryAfterMs } : {}),
+                ...(externalDisposition.resetAt !== undefined ? { resetAt: externalDisposition.resetAt } : {}),
+                blockedUntil: now + delay,
+              },
+            };
+          }
           const budgetRetry = await retryWorkOnAgentBudget(error, {
             artifacts,
             subject,
@@ -2834,6 +2882,43 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
             signal: workerSignal,
           });
         } catch (error) {
+          const externalDisposition = retryableExternalDisposition(error);
+          const rateLimitKind = externalDisposition?.code === "github-primary-rate-limit" || externalDisposition?.code === "github-secondary-rate-limit"
+            ? externalDisposition.code
+            : undefined;
+          if (externalDisposition && rateLimitKind !== undefined) {
+            const operationKey = `${itemRepository}`.toLowerCase().includes(":")
+              ? itemRepository.toLowerCase()
+              : `github.com:${itemRepository.toLowerCase()}`;
+            const now = Date.now();
+            const delay = Math.min(15 * 60_000, Math.max(1_000,
+              externalDisposition.retryAfterMs
+                ?? (externalDisposition.resetAt !== undefined ? Math.max(0, externalDisposition.resetAt - now) : 1_000)));
+            const nextAttemptAt = new Date(now + delay).toISOString();
+            const attempt = item.retryAttempt ?? 1;
+            process.stdout.write(`${statusGlyph("active", mode)} ${item.id} retry_wait · GitHub ${rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary"} rate limit; retry at ${nextAttemptAt}\n`);
+            return {
+              status: "retry_wait",
+              error: error instanceof Error ? error : String(error),
+              retryable: true,
+              retryAfterMs: delay,
+              nextAttemptAt,
+              attempt,
+              maxAttempts: item.retryMaxAttempts ?? 3,
+              retryDomain: "github",
+              retryCode: rateLimitKind,
+              operationKey,
+              rateLimit: {
+                kind: rateLimitKind,
+                reason: rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary",
+                operationKey,
+                attempt,
+                ...(externalDisposition.retryAfterMs !== undefined ? { retryAfterMs: externalDisposition.retryAfterMs } : {}),
+                ...(externalDisposition.resetAt !== undefined ? { resetAt: externalDisposition.resetAt } : {}),
+                blockedUntil: now + delay,
+              },
+            };
+          }
           const budgetRetry = await retryWorkOnAgentBudget(error, {
             artifacts,
             subject,

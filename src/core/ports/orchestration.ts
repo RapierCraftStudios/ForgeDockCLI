@@ -85,6 +85,7 @@ export interface OrchestrationWorkerAttemptRecord {
     kind: "github-primary-rate-limit" | "github-secondary-rate-limit";
     reason: "primary" | "secondary";
     operationKey: string;
+    attempt?: number;
     retryAfterMs?: number;
     resetAt?: number;
     blockedUntil?: number;

@@ -39,7 +39,7 @@ The default (no flags) is the annotated review screen: detection runs, AI enrich
 
 If you have both a local `claude` CLI and `ANTHROPIC_API_KEY` set and want to pin one explicitly instead of letting `init` prefer the CLI, set `FORGEDOCK_INIT_BACKEND=api` (or `=cli`, or `=none` to skip enrichment entirely). This is independent of `FORGEDOCK_BACKEND`, which controls the separate `forgedock run` engine backend.
 
-For the Next CLI, repository reset is explicitly two-phase: `forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--manifest path]` writes a canonical, digest-bound manifest; apply only with `forgedock-next reset --apply <manifest-digest> --manifest path`. Dry-run is read-only, and apply aborts on identity drift or live leases/workers.
+For the Next CLI, repository reset is explicitly two-phase: `forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--manifest path]` writes a canonical, digest-bound manifest; apply only with `forgedock-next reset --apply <manifest-digest> --manifest path`. Dry-run is read-only, and apply aborts on identity drift or live leases/workers. After private archive verification, independent external cleanup runs with resource-serialized bounded concurrency (default four); failures are aggregated and preserve the database for another explicit attempt. Apply reports archive, mutation, postcondition, and purge stage counts/durations without per-item log noise.
 
 
 | Section | Required | Purpose |

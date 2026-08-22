@@ -950,6 +950,72 @@ it("caps repeated retry-wait target movement attempt-one outcomes", async () => 
   assert.equal(result.status.get("resumed"), "failed");
 });
 
+it("bounds repeated GitHub rate-limit waits and suspends without semantic failure", async () => {
+  let calls = 0;
+  const result = await runSchedule([
+    { id: "rate-loop", issue: 3, priority: 1, dependencies: [], claims: [] },
+  ], 1, async () => {
+    calls += 1;
+    return {
+      status: "retry_wait" as const,
+      attempt: 1,
+      maxAttempts: 3,
+      retryable: true,
+      retryCode: "github-primary-rate-limit",
+      retryDomain: "github",
+      operationKey: "github.com:owner/repo",
+      nextAttemptAt: new Date().toISOString(),
+      rateLimit: {
+        kind: "github-primary-rate-limit" as const,
+        reason: "primary" as const,
+        operationKey: "github.com:owner/repo",
+        blockedUntil: Date.now() + 1,
+      },
+    };
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.status.get("rate-loop"), "suspended");
+  assert.equal(result.waitReasons?.get("rate-loop")?.kind, "retry");
+});
+
+it("preserves the typed rate window across a scheduler restart", async () => {
+  let calls = 0;
+  const result = await runSchedule([
+    {
+      id: "rate-restart",
+      issue: 4,
+      priority: 1,
+      dependencies: [],
+      claims: [],
+      retryNextAt: new Date(Date.now() - 1).toISOString(),
+      retryAttempt: 1,
+      retryMaxAttempts: 3,
+      retryCode: "github-primary-rate-limit",
+      retryOperationKey: "github.com:owner/repo",
+      retryRateLimitWindow: "github.com:owner/repo|blocked:old",
+    },
+  ], 1, async () => {
+    calls += 1;
+    return {
+      status: "retry_wait" as const,
+      retryable: true,
+      retryCode: "github-primary-rate-limit",
+      retryDomain: "github",
+      retryOperationKey: "github.com:owner/repo",
+      nextAttemptAt: new Date().toISOString(),
+      maxAttempts: 3,
+      rateLimit: {
+        kind: "github-primary-rate-limit" as const,
+        reason: "primary" as const,
+        operationKey: "github.com:owner/repo",
+        blockedUntil: Date.now() + 1,
+      },
+    };
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.status.get("rate-restart"), "suspended");
+});
+
 it("aborts a long retry wait without dispatching", async () => {
   const signal = new AbortController();
   let calls = 0;

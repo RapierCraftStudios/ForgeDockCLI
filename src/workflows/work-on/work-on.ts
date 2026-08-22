@@ -31,6 +31,7 @@ import {
   investigateWorkItem,
   resumeInvestigationWorkItem,
   WorkflowExecutionError,
+  retryableExternalWorkflowError,
 } from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
 import { certifyRelationGraphCheckpoint } from "../../core/packet/relation-checkpoint-certification.js";
@@ -1296,6 +1297,13 @@ export async function workOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
     if (run) {
@@ -1513,6 +1521,13 @@ export async function resumeEarlyWorkOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const reason = error instanceof Error ? error.message : String(error);
     if (run) {
@@ -1923,6 +1938,13 @@ export async function resumeBuildWorkOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;
@@ -2567,6 +2589,13 @@ export async function resumeWorkOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;
@@ -2816,6 +2845,13 @@ export async function resumeReviewWorkOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;
@@ -3124,6 +3160,13 @@ export async function resumePublicationWorkOn(
     const recoverable = input.signal?.aborted === true
       || error instanceof ClaimPromotionRecoveryError
       || (error instanceof WorkflowExecutionError && error.recoverable);
+    if (run) {
+      const externalRetry = retryableExternalWorkflowError(error, run);
+      if (externalRetry) {
+        retainWorkspaceForRecovery = true;
+        throw externalRetry;
+      }
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;
@@ -3192,6 +3235,11 @@ export async function resumeCompletionWorkOn(
   } catch (error) {
     if (input.signal?.aborted) throw error;
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) {
+      retainWorkspaceForRecovery = true;
+      throw externalRetry;
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     if (error instanceof WorkflowExecutionError && error.recoverable) {
       // completeWorkItem has already persisted the exact merged head as the
@@ -3414,6 +3462,11 @@ export async function resumeConflictRecoveryWorkOn(
       throw error;
     }
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) {
+      retainWorkspaceForRecovery = true;
+      throw externalRetry;
+    }
     if (error instanceof WorkflowExecutionError) run = error.run;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;

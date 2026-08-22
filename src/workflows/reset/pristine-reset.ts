@@ -8,6 +8,19 @@ import type { OrchestrationNodeRecord, OrchestrationRecord } from "../../core/po
 import type { SqliteRepositoryPurgeManifest, SqliteRepositoryPurgeResult } from "../../adapters/sqlite/sqlite-repositories.js";
 import type { SqliteObservationPurgeManifest, SqliteObservationPurgeResult } from "../../observability/sqlite-store.js";
 
+export const DEFAULT_RESET_MUTATION_CONCURRENCY = 4;
+
+export type ResetProgressStage = "archive" | "external-mutations" | "worktrees" | "postconditions" | "purge";
+
+export interface ResetProgressEvent {
+  stage: ResetProgressStage;
+  completed: number;
+  total: number;
+  elapsedMs: number;
+}
+
+export type ResetProgressCallback = (event: ResetProgressEvent) => void;
+
 /** A comment identity is an API id, not its mutable body or position. */
 export interface ResetCommentIdentity {
   id: number;
@@ -206,6 +219,9 @@ export interface ResetPlanDependencies {
   workspaces: ResetWorkspaceStore;
   cancellation: ResetCancellation;
   now?: () => number;
+  /** Maximum number of independent destructive operations in flight. */
+  mutationConcurrency?: number;
+  onProgress?: ResetProgressCallback;
 }
 
 export function canonicalResetManifest(manifest: Omit<PristineResetManifest, "digest">): string {
@@ -321,6 +337,7 @@ export async function applyPristineReset(manifest: PristineResetManifest, expect
   await rereadManifestIdentities(manifest, deps, "before");
 
   const archives: ResetArchiveIdentity[] = [...manifest.archive];
+  const archiveStarted = Date.now();
   // The signed manifest is the abandonment authority; do not append a new
   // artifact after capture because it would escape exact purge identity.
   for (const worktree of manifest.worktrees) {
@@ -332,16 +349,54 @@ export async function applyPristineReset(manifest: PristineResetManifest, expect
   if (deps.host.archiveSelectedEvidence) archives.push(...await deps.host.archiveSelectedEvidence(manifest.selection, manifest));
   if (deps.state.archiveSnapshots) archives.push(...await deps.state.archiveSnapshots(manifest.selection, manifest));
   await assertResetArchivesComplete(manifest, archives);
-  for (const comment of manifest.comments) await deps.host.deleteComment(manifest.repo, comment);
-  for (const issue of manifest.selection.issueNumbers) {
-    const expectedState = manifest.labels[String(issue)];
-    const expected = expectedState?.restored ?? [];
-    await deps.host.restoreLabels(manifest.repo, issue, expected, expectedState);
+  emitResetProgress(deps, "archive", 1, 1, archiveStarted);
+
+  const externalOperations: ResetMutationOperation[] = [];
+  for (const comment of manifest.comments) {
+    externalOperations.push({
+      resource: `issue:${comment.issue}`,
+      identity: `comment ${comment.id} on issue #${comment.issue}`,
+      run: () => deps.host.deleteComment(manifest.repo, comment),
+    });
   }
-  for (const pr of manifest.pullRequests) if (pr.state === "OPEN") await deps.host.closePullRequest(manifest.repo, pr.number, reason);
-  for (const ref of manifest.refs) await deps.host.deleteExactRef(manifest.repo, ref.exactRef, ref.sha);
-  for (const worktree of manifest.worktrees) await deps.workspaces.removeExact(worktree);
+  for (const [issueText, expectedState] of Object.entries(manifest.labels).sort(([a], [b]) => Number(a) - Number(b))) {
+    const issue = Number(issueText);
+    externalOperations.push({
+      resource: `issue:${issue}`,
+      identity: `labels on issue #${issue}`,
+      run: () => deps.host.restoreLabels(manifest.repo, issue, expectedState.restored, expectedState),
+    });
+  }
+  for (const pr of manifest.pullRequests) if (pr.state === "OPEN") {
+    externalOperations.push({
+      resource: `issue:${pr.number}`,
+      identity: `pull request #${pr.number}`,
+      run: () => deps.host.closePullRequest(manifest.repo, pr.number, reason),
+    });
+  }
+  for (const ref of manifest.refs) {
+    externalOperations.push({
+      resource: `ref:${ref.exactRef}`,
+      identity: `ref ${ref.exactRef}`,
+      run: () => deps.host.deleteExactRef(manifest.repo, ref.exactRef, ref.sha),
+    });
+  }
+  const failures = await runResetMutations(externalOperations, deps, "external-mutations");
+
+  const worktreeFailures = await runResetMutations(manifest.worktrees.map((worktree) => ({
+    resource: `worktree:${worktree.path}`,
+    identity: `worktree ${worktree.headSha}`,
+    run: () => deps.workspaces.removeExact(worktree),
+  })), deps, "worktrees");
+  failures.push(...worktreeFailures);
+  if (failures.length) {
+    throw new AggregateError(failures, `Pristine reset mutations failed (${failures.length}); database purge was not attempted`);
+  }
+
+  const postconditionStarted = Date.now();
   await rereadManifestIdentities(manifest, deps, "after");
+  emitResetProgress(deps, "postconditions", 1, 1, postconditionStarted);
+  const purgeStarted = Date.now();
   await deps.state.purgeExactManifest({
     runs: manifest.runs.map(({ runId }) => ({ runId })),
     artifacts: manifest.artifacts.map(({ artifactId, subjectKey, kind }) => ({ artifactId, subjectKey, kind })),
@@ -359,6 +414,73 @@ export async function applyPristineReset(manifest: PristineResetManifest, expect
   if (deps.state.verifyPurged) await deps.state.verifyPurged(manifest);
   if (deps.state.verifyPreserved) await deps.state.verifyPreserved(manifest);
   if (deps.state.observationVerifyPurged && manifest.observationEvents.length) await deps.state.observationVerifyPurged({ events: manifest.observationEvents });
+  emitResetProgress(deps, "purge", 1, 1, purgeStarted);
+}
+
+interface ResetMutationOperation {
+  resource: string;
+  identity: string;
+  run: () => Promise<void>;
+}
+
+async function runResetMutations(
+  operations: readonly ResetMutationOperation[],
+  deps: ResetPlanDependencies,
+  stage: "external-mutations" | "worktrees",
+): Promise<Error[]> {
+  const started = Date.now();
+  const concurrency = deps.mutationConcurrency ?? DEFAULT_RESET_MUTATION_CONCURRENCY;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("Reset mutation concurrency must be a positive integer");
+  const byResource = new Map<string, ResetMutationOperation[]>();
+  for (const operation of operations) {
+    const group = byResource.get(operation.resource) ?? [];
+    group.push(operation);
+    byResource.set(operation.resource, group);
+  }
+  let active = 0;
+  const waiters: (() => void)[] = [];
+  const acquire = async (): Promise<void> => {
+    if (active < concurrency && waiters.length === 0) { active += 1; return; }
+    await new Promise<void>((resolve) => waiters.push(resolve));
+    active += 1;
+  };
+  const release = (): void => {
+    active -= 1;
+    waiters.shift()?.();
+  };
+  const failures = new Map<number, Error>();
+  let completed = 0;
+  const report = (): void => emitResetProgress(deps, stage, completed, operations.length, started);
+  report();
+  await Promise.all([...byResource.values()].map(async (group) => {
+    for (const operation of group) {
+      const index = operations.indexOf(operation);
+      await acquire();
+      try {
+        await operation.run();
+      } catch {
+        // Keep the aggregate bounded to the signed, nonsecret resource identity.
+        failures.set(index, new Error(`Reset ${operation.identity} failed`));
+      } finally {
+        completed += 1;
+        report();
+        release();
+      }
+    }
+  }));
+  return [...failures.entries()].sort(([a], [b]) => a - b).map(([, failure]) => failure);
+}
+
+function emitResetProgress(
+  deps: ResetPlanDependencies,
+  stage: ResetProgressStage,
+  completed: number,
+  total: number,
+  started: number,
+): void {
+  try { deps.onProgress?.({ stage, completed, total, elapsedMs: Math.max(0, Date.now() - started) }); } catch {
+    // Progress presentation is observational and must never alter reset authority.
+  }
 }
 
 async function rereadManifestIdentities(manifest: PristineResetManifest, deps: ResetPlanDependencies, phase: "before" | "after"): Promise<void> {

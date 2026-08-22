@@ -6,7 +6,7 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
+import { deterministicOutcomeId, WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 
@@ -81,6 +81,8 @@ export async function publishPullRequest(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     if (error instanceof TargetBranchAdvancedError) {
       const targetBranch = error.targetBranch;
       // The checkpoint is durable before the state transition. A restart can

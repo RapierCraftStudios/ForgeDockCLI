@@ -14,7 +14,7 @@ import {
 import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFromArtifacts } from "./trajectory.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
-import { deterministicOutcomeId, WorkflowExecutionError } from "./investigate.js";
+import { deterministicOutcomeId, WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 import { resolveReviewCiConfig, type EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
 import { assertRunTargetsBranch } from "./lane.js";
 import { assessMergeAdmission, formatPullRequestCiBlock, requiredChecksMode } from "../review-pr/ci-policy.js";
@@ -153,6 +153,8 @@ export async function completeInvalidWorkItem(
     return { run: input.run, outcome: finalized };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, input.run);
+    if (externalRetry) throw externalRetry;
     throw new WorkflowExecutionError(reason, input.run, { cause: error });
   }
 }
@@ -507,6 +509,8 @@ export async function completeWorkItem(
   } catch (error) {
     if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     // MERGE_COMPLETED is already durable and the exact approved head was
     // proved authoritative. Transport exhaustion during comment/closure
     // projection must retain that closing checkpoint for resume, not strand

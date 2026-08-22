@@ -12,7 +12,7 @@ import { attachArtifact, transition, type RunState } from "../../core/state/mach
 import { isRepairableVerificationFailure } from "../../core/state/admission.js";
 import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
 import type { BuilderSubmission } from "./build.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
 import { validateEvidenceContract } from "./evidence-contract.js";
 
@@ -544,6 +544,8 @@ export async function verifyAndCommit(
   } catch (error) {
     if (error instanceof VerificationDiagnosisCallbackError) throw error;
     if (input.signal?.aborted) throw error;
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     const reason = error instanceof Error ? error.message : String(error);
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);

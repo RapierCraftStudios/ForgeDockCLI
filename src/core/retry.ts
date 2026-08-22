@@ -14,6 +14,7 @@ export interface RetryClassification {
   retryAfterMs?: number;
   resetAt?: number;
   rateLimitReason?: "primary" | "secondary";
+  operationKey?: string;
   /** A resumable provider session must be continued, never started again. */
   sessionRef?: string;
   resumableSession?: boolean;
@@ -38,6 +39,78 @@ const PERMANENT_WORDS = /validation|invalid\s+(?:argument|input|request)|permiss
 const NETWORK_WORDS = /dns|tls|certificate|socket|network|timeout|temporarily unavailable|connection reset|connection refused|no server|internet connection|eai_again|etimedout|econnreset|econnrefused/i;
 
 /** Classify errors at the controller boundary, without relying on provider classes. */
+/**
+ * Find retry authority through wrapper errors. Workflow boundaries frequently
+ * add context (and `-exhausted` codes) around the transport error; typed
+ * external classifications remain authoritative regardless of those wrappers.
+ */
+export function retryableExternalDisposition(error: unknown): RetryClassification | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 16 && current !== undefined && current !== null && !seen.has(current); depth++) {
+    seen.add(current);
+    const candidate = current as Record<string, unknown> | null;
+    const disposition = candidate?.retryDisposition;
+    if (isRetryClassification(disposition) && disposition.retryable) {
+      const normalized = normalizeExternalDisposition(disposition);
+      if (normalized.code === "github-primary-rate-limit" || normalized.code === "github-secondary-rate-limit") return normalized;
+    }
+    const classification = candidate?.classification;
+    if (isExternalRateClassification(classification)) {
+      const kind = classification.kind;
+      const cause = current instanceof Error ? current : new Error(String(current));
+      return {
+        disposition: "retryable",
+        retryable: true,
+        domain: "github",
+        code: kind,
+        ...(classification.status !== undefined ? { status: classification.status } : {}),
+        ...(classification.retryAfterMs !== undefined ? { retryAfterMs: classification.retryAfterMs } : {}),
+        ...(classification.resetAt !== undefined ? { resetAt: classification.resetAt } : {}),
+        rateLimitReason: kind === "github-secondary-rate-limit" ? "secondary" : "primary",
+        cause,
+      };
+    }
+    if (candidate?.cause !== undefined) current = candidate.cause;
+    else break;
+  }
+  return undefined;
+}
+
+function normalizeExternalDisposition(disposition: RetryClassification): RetryClassification {
+  const rateKind = disposition.code === "github-primary-rate-limit" || disposition.code === "github-secondary-rate-limit"
+    ? disposition.code
+    : undefined;
+  if (rateKind === undefined) return disposition;
+  return {
+    ...disposition,
+    domain: "github",
+    code: rateKind,
+    rateLimitReason: rateKind === "github-secondary-rate-limit" ? "secondary" : "primary",
+  };
+}
+
+function isRetryClassification(value: unknown): value is RetryClassification {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (candidate.disposition === "retryable" || candidate.disposition === "permanent")
+    && typeof candidate.retryable === "boolean"
+    && typeof candidate.domain === "string"
+    && typeof candidate.code === "string"
+    && candidate.cause instanceof Error;
+}
+
+function isExternalRateClassification(value: unknown): value is {
+  kind: "github-primary-rate-limit" | "github-secondary-rate-limit";
+  status?: number;
+  retryAfterMs?: number;
+  resetAt?: number;
+} {
+  if (!value || typeof value !== "object") return false;
+  const kind = (value as Record<string, unknown>).kind;
+  return kind === "github-primary-rate-limit" || kind === "github-secondary-rate-limit";
+}
+
 export function classifyRetryableError(error: unknown, options: RetryClassifierOptions = {}): RetryClassification {
   const cause = asError(error);
   const candidate = error as Record<string, unknown> | null;

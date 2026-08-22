@@ -10,7 +10,7 @@ import { resolveFreshFailureRun } from "../../core/state/reconcile.js";
 import { AgentExecutionInterruptedError, AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEvent, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { SemanticIdleWatchdog } from "../../runtime/semantic-idle.js";
-import { WorkflowExecutionError } from "../work-on/investigate.js";
+import { WorkflowExecutionError, retryableExternalWorkflowError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
@@ -1012,6 +1012,8 @@ export async function reviewPullRequest(
   } catch (error) {
     const rawReason = error instanceof Error ? error.message : String(error);
     const reason = projectionCheckpointStarted ? `review-finding publication failed: ${rawReason}` : rawReason;
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     const interrupted = error instanceof AgentExecutionInterruptedError;
     const fresh = await resolveFreshFailureRun({ run, artifacts: dependencies.artifacts, runs: dependencies.runs });
     run = fresh.run;

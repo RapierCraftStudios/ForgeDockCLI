@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
-import { classifyRetryableError, retryBackoffMs } from "../../core/retry.js";
+import { classifyRetryableError, retryableExternalDisposition, retryBackoffMs } from "../../core/retry.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
 import {
@@ -40,9 +40,11 @@ import {
   type ScheduleResult,
   type ScheduleWorkerContext,
   type ScheduleWorkerResult,
+  type GithubRateLimitDisposition,
   type ScheduledStatus,
   type ScheduledWorkItem,
   normalizedDeliveryRouteClaim,
+  rateLimitWindowKey,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
 
@@ -1133,7 +1135,7 @@ export class OrchestrationController {
         result = await action.reconciliation.wait(context);
       } catch (error) {
         if (this.isStopping(state)) throw error;
-        const retry = retryResultForError(error, attempt.attempt);
+        const retry = retryResultForError(error, attempt.attempt, attempt.rateLimit);
         if (retry) {
           try {
             const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
@@ -1170,7 +1172,7 @@ export class OrchestrationController {
       result = await this.dependencies.worker(item, context);
     } catch (error) {
       if (this.isStopping(state)) throw error;
-      const retry = retryResultForError(error, attempt.attempt);
+      const retry = retryResultForError(error, attempt.attempt, [...existingAttempts].reverse().find((candidate) => candidate.rateLimit !== undefined)?.rateLimit);
       if (retry) {
         const durableRetry = await this.persistGenericRetry(state, item, attempt, retry);
         await this.finishAttempt(state, item.id, attempt.attemptId, durableRetry);
@@ -1976,11 +1978,13 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
       retryMaxAttempts: retryWait.maxAttempts,
       retryCode: retryWait.code,
       ...(retryAttempt?.operationKey !== undefined ? { retryOperationKey: retryAttempt.operationKey } : {}),
+      ...(retryAttempt?.rateLimit !== undefined ? { retryRateLimitWindow: rateLimitWindowKey(retryAttempt.rateLimit) } : {}),
     } : retryAttempt?.retryCode !== undefined ? {
       retryAttempt: retryAttempt.retryAttempt ?? retryAttempt.attempt,
       retryMaxAttempts: retryAttempt.retryMaxAttempts ?? 3,
       retryCode: retryAttempt.retryCode,
       ...(retryAttempt.operationKey !== undefined ? { retryOperationKey: retryAttempt.operationKey } : {}),
+      ...(retryAttempt.rateLimit !== undefined ? { retryRateLimitWindow: rateLimitWindowKey(retryAttempt.rateLimit) } : {}),
     } : {}),
   };
 }
@@ -2231,33 +2235,56 @@ function resumedLiveAttempt(
   };
 }
 
-function retryResultForError(error: unknown, attempt: number): Exclude<ScheduleWorkerResult, void> | undefined {
-  const classification = classifyRetryableError(error);
+function retryResultForError(
+  error: unknown,
+  attempt: number,
+  priorRateLimit?: OrchestrationWorkerAttemptRecord["rateLimit"],
+): Exclude<ScheduleWorkerResult, void> | undefined {
+  const classification = retryableExternalDisposition(error) ?? classifyRetryableError(error);
   if (!classification.retryable) return undefined;
   const maxAttempts = 3;
   const backoffOptions = classification.retryAfterMs === undefined
-    ? { operationKey: `${classification.domain}:${classification.code}` }
-    : { retryAfterMs: classification.retryAfterMs, operationKey: `${classification.domain}:${classification.code}` };
+    ? { operationKey: classification.operationKey ?? `${classification.domain}:${classification.code}` }
+    : { retryAfterMs: classification.retryAfterMs, operationKey: classification.operationKey ?? `${classification.domain}:${classification.code}` };
   const delay = retryBackoffMs(attempt, backoffOptions);
+  const now = Date.now();
   const rateLimitKind = classification.code === "github-primary-rate-limit" || classification.code === "github-secondary-rate-limit"
     ? classification.code
     : undefined;
   const rateLimited = rateLimitKind !== undefined;
-  const operationKey = `${classification.domain}:${classification.code}`;
+  const operationKey = classification.operationKey ?? `${classification.domain}:${classification.code}`;
   const reason = rateLimitKind === "github-secondary-rate-limit" ? "secondary" : "primary";
-  const exhausted = attempt >= maxAttempts && !rateLimited;
+  const rateLimit: (GithubRateLimitDisposition & { attempt: number; retryAfterMs?: number; resetAt?: number; blockedUntil: number }) | undefined = rateLimitKind === undefined ? undefined : {
+    kind: rateLimitKind,
+    reason,
+    operationKey,
+    ...(classification.retryAfterMs !== undefined ? { retryAfterMs: classification.retryAfterMs } : {}),
+    ...(classification.resetAt !== undefined ? { resetAt: classification.resetAt } : {}),
+    blockedUntil: now + delay,
+    attempt: priorRateLimit !== undefined && rateLimitWindowKey(priorRateLimit) === rateLimitWindowKey({
+      kind: rateLimitKind,
+      reason,
+      operationKey,
+      ...(classification.resetAt !== undefined ? { resetAt: classification.resetAt } : {}),
+      blockedUntil: now + delay,
+    }) ? (priorRateLimit.attempt ?? 0) + 1 : 1,
+  };
+  const rateAttempt = rateLimit?.attempt;
+  const exhausted = rateLimited
+    ? rateAttempt !== undefined && rateAttempt >= maxAttempts
+    : attempt >= maxAttempts;
   return {
-    status: exhausted ? "failed" : "retry_wait",
+    status: exhausted && rateLimited ? "suspended" : exhausted ? "failed" : "retry_wait",
     error: error instanceof Error ? error : String(error),
     retryable: !exhausted,
     retryAfterMs: delay,
-    nextAttemptAt: new Date(Date.now() + delay).toISOString(),
+    nextAttemptAt: new Date(now + delay).toISOString(),
     attempt,
     maxAttempts,
     retryDomain: classification.domain,
-    retryCode: exhausted ? `${classification.code}-exhausted` : classification.code,
+    retryCode: exhausted && !rateLimited ? `${classification.code}-exhausted` : classification.code,
     operationKey,
-    ...(rateLimitKind !== undefined ? { rateLimit: { kind: rateLimitKind, reason, operationKey, ...(classification.retryAfterMs !== undefined ? { retryAfterMs: classification.retryAfterMs } : {}), ...(classification.resetAt !== undefined ? { resetAt: classification.resetAt } : {}), blockedUntil: Date.now() + delay } } : {}),
+    ...(rateLimit !== undefined ? { rateLimit } : {}),
   };
 }
 

@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyRetryableError, deterministicOperationKey, retryBackoffMs } from "./retry.js";
+import { classifyRetryableError, deterministicOperationKey, retryBackoffMs, retryableExternalDisposition } from "./retry.js";
 import { ExternalOperationRetryError } from "./external-operation-retry.js";
 import { reconcileBeforeReplay } from "./retry-operations.js";
 
@@ -31,6 +31,20 @@ test("typed transient exhaustion stays retryable despite permanent wording", () 
   });
   assert.equal(classifyRetryableError(exhausted).retryable, true);
   assert.equal(classifyRetryableError(new Error("permission denied")).retryable, false);
+});
+
+test("preserves a typed GitHub rate limit through exhausted wrappers", () => {
+  const cause = new ExternalOperationRetryError("rate limit exhausted", {
+    attempts: 1,
+    failures: [],
+    classification: { kind: "github-primary-rate-limit", source: "github", retryAfterMs: 2_000 },
+    cause: new Error("gh api rate limit"),
+  });
+  const wrapped = new Error("workflow wrapper", { cause });
+  const disposition = retryableExternalDisposition(wrapped);
+  assert.equal(disposition?.domain, "github");
+  assert.equal(disposition?.code, "github-primary-rate-limit");
+  assert.equal(disposition?.retryAfterMs, 2_000);
 });
 
 test("retains resumable provider session lineage", () => {

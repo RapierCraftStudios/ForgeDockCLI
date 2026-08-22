@@ -25,6 +25,8 @@ export interface ScheduledWorkItem {
   retryMaxAttempts?: number;
   retryCode?: string;
   retryOperationKey?: string;
+  /** Durable rate-limit window identity; changes only with reset/blocked window. */
+  retryRateLimitWindow?: string;
   lane?: "fast" | "feature";
   promotionTarget?: string;
   productionTarget?: string;
@@ -56,7 +58,7 @@ export type ScheduleWorkerResult = void | {
   retryDomain?: string;
   retryCode?: string;
   operationKey?: string;
-  rateLimit?: GithubRateLimitDisposition & { retryAfterMs?: number; resetAt?: number; blockedUntil?: number };  /** Typed durable workflow checkpoint disposition; scheduler treats it as a bounded relaunch, not suspension. */
+  rateLimit?: GithubRateLimitDisposition & { attempt?: number; retryAfterMs?: number; resetAt?: number; blockedUntil?: number };
   recoverableCheckpoint?: {
     kind: "remediation";
     checkpointKey: string;
@@ -381,6 +383,7 @@ export async function runSchedule(
   let targetRecoveryAbortHandler: (() => void) | undefined;
   const targetRecoveryAttempts = new Map<string, number>();
   const targetRecoveryMaxAttempts = new Map<string, number>();
+  const rateLimitAttempts = new Map<string, { window: string; attempt: number; maxAttempts: number }>();
   // Durable node evidence survives a scheduler restart; never reset the
   // in-memory target budget when a worker reports the same attempt again.
   for (const item of items) {
@@ -389,6 +392,13 @@ export async function runSchedule(
     }
     if (item.retryMaxAttempts !== undefined && Number.isSafeInteger(item.retryMaxAttempts) && item.retryMaxAttempts > 0) {
       targetRecoveryMaxAttempts.set(item.id, Math.min(3, item.retryMaxAttempts));
+    }
+    if (item.retryCode === "github-primary-rate-limit" || item.retryCode === "github-secondary-rate-limit") {
+      rateLimitAttempts.set(item.id, {
+        window: item.retryRateLimitWindow ?? `${item.retryOperationKey ?? "github"}:unknown`,
+        attempt: item.retryAttempt ?? 0,
+        maxAttempts: Math.max(1, Math.min(3, item.retryMaxAttempts ?? 3)),
+      });
     }
     if (item.retryCode === "remediation-checkpoint" && item.retryOperationKey !== undefined) {
       recoverableCheckpointKeys.set(item.id, item.retryOperationKey);
@@ -485,8 +495,19 @@ export async function runSchedule(
         const nextAttemptAt = item.retryNextAt;
         const attempt = item.retryAttempt ?? 1;
         const maxAttempts = item.retryMaxAttempts ?? Number.MAX_SAFE_INTEGER;
+        const rateLimitKind = item.retryCode === "github-primary-rate-limit" || item.retryCode === "github-secondary-rate-limit"
+          ? item.retryCode
+          : undefined;
         status.set(item.id, "retry_wait");
-        waitReasons.set(item.id, { kind: "retry", domain: "workflow", code: "durable-checkpoint", nextAttemptAt, attempt, maxAttempts });
+        waitReasons.set(item.id, {
+          kind: "retry",
+          domain: rateLimitKind === undefined ? "workflow" : "github",
+          code: rateLimitKind ?? "durable-checkpoint",
+          ...(rateLimitKind !== undefined ? { rateLimitReason: rateLimitKind === "github-secondary-rate-limit" ? "secondary" as const : "primary" as const } : {}),
+          nextAttemptAt,
+          attempt,
+          maxAttempts,
+        });
         const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
         const wake = waitForRetry(delay).then(() => {
           retryWakeups.delete(item.id);
@@ -680,6 +701,18 @@ export async function runSchedule(
             const recoverable = outcome.recoverableCheckpoint;
             const targetMovement = !recoverable && (outcome.retryCode === "target-advanced"
               || outcome.targetAdvanceCheckpointId !== undefined);
+            const rateLimitWindow = outcome.rateLimit === undefined ? undefined : rateLimitWindowKey(outcome.rateLimit);
+            const priorRate = rateLimitAttempts.get(item.id);
+            const isSameRateWindow = rateLimitWindow !== undefined && priorRate?.window === rateLimitWindow;
+            const rateAttempt = outcome.rateLimit === undefined
+              ? undefined
+              : isSameRateWindow ? (priorRate?.attempt ?? 0) + 1 : 1;
+            const rateMaxAttempts = outcome.rateLimit === undefined
+              ? undefined
+              : Math.max(1, Math.min(3, priorRate?.maxAttempts ?? outcome.maxAttempts ?? 3));
+            if (outcome.rateLimit !== undefined && rateLimitWindow !== undefined && rateAttempt !== undefined && rateMaxAttempts !== undefined) {
+              rateLimitAttempts.set(item.id, { window: rateLimitWindow, attempt: rateAttempt, maxAttempts: rateMaxAttempts });
+            }
             if (recoverable && recoverableCheckpointKeys.get(item.id) !== recoverable.checkpointKey) {
               recoverableCheckpointKeys.set(item.id, recoverable.checkpointKey);
               recoverableCheckpointAttempts.set(item.id, 0);
@@ -687,18 +720,22 @@ export async function runSchedule(
             // Worker reports can repeat attempt one after each target move. The
             // scheduler owns the monotonic budget and must not let stale
             // transport evidence replenish it.
-            const attempt = recoverable
-              ? (recoverableCheckpointAttempts.get(item.id) ?? 0) + 1
-              : targetMovement
-                ? Math.max((targetRecoveryAttempts.get(item.id) ?? 0) + 1, outcome.attempt ?? 1)
-                : (outcome.attempt ?? 1);
-            const maxAttempts = recoverable
-              ? Math.max(1, Math.min(outcome.maxAttempts ?? recoverable.remainingCycles, recoverable.remainingCycles))
-              : targetMovement
-                ? Math.max(1, Math.min(3,
-                  targetRecoveryMaxAttempts.get(item.id) ?? outcome.maxAttempts ?? 3,
-                  outcome.maxAttempts ?? targetRecoveryMaxAttempts.get(item.id) ?? 3))
-                : (outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER);
+            const attempt = outcome.rateLimit !== undefined
+              ? rateAttempt!
+              : recoverable
+                ? (recoverableCheckpointAttempts.get(item.id) ?? 0) + 1
+                : targetMovement
+                  ? Math.max((targetRecoveryAttempts.get(item.id) ?? 0) + 1, outcome.attempt ?? 1)
+                  : (outcome.attempt ?? 1);
+            const maxAttempts = outcome.rateLimit !== undefined
+              ? rateMaxAttempts!
+              : recoverable
+                ? Math.max(1, Math.min(outcome.maxAttempts ?? recoverable.remainingCycles, recoverable.remainingCycles))
+                : targetMovement
+                  ? Math.max(1, Math.min(3,
+                    targetRecoveryMaxAttempts.get(item.id) ?? outcome.maxAttempts ?? 3,
+                    outcome.maxAttempts ?? targetRecoveryMaxAttempts.get(item.id) ?? 3))
+                  : (outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER);
             if (recoverable) recoverableCheckpointAttempts.set(item.id, attempt);
             if (targetMovement) {
               targetRecoveryAttempts.set(item.id, attempt);
@@ -717,7 +754,11 @@ export async function runSchedule(
             });
             const exhausted = (recoverable ? attempt > maxAttempts : attempt >= maxAttempts)
               && outcome.rateLimit === undefined;
-            if (exhausted) {
+            const rateExhausted = outcome.rateLimit !== undefined && attempt >= maxAttempts;
+            if (rateExhausted) {
+              status.set(item.id, "suspended");
+              emit("suspended", item.id);
+            } else if (exhausted) {
               status.set(item.id, "failed");
               updateQueuedWaitReason(item.id, undefined, false);
               emit("failed", item.id);
@@ -769,6 +810,17 @@ export async function runSchedule(
           } else if (outcome.status === "suspended") {
             status.set(item.id, "suspended");
             if (outcome.error !== undefined) errors.set(item.id, asError(outcome.error));
+            if (outcome.rateLimit !== undefined) {
+              waitReasons.set(item.id, {
+                kind: "retry",
+                domain: "github",
+                code: outcome.retryCode ?? outcome.rateLimit.kind,
+                rateLimitReason: outcome.rateLimit.reason,
+                nextAttemptAt: outcome.nextAttemptAt ?? new Date(outcome.rateLimit.blockedUntil ?? Date.now()).toISOString(),
+                attempt: outcome.rateLimit.attempt ?? outcome.attempt ?? 1,
+                maxAttempts: outcome.maxAttempts ?? 3,
+              });
+            }
             emit("suspended", item.id);
             const claimConflict = claimPromotionConflict(outcome.error);
             if (claimConflict) {
@@ -1278,6 +1330,13 @@ function dependsTransitively(
 
 function comparePaths(left: readonly ScheduledWorkItem[], right: readonly ScheduledWorkItem[]): number {
   return left.map((item) => item.issue).join(",").localeCompare(right.map((item) => item.issue).join(","));
+}
+
+export function rateLimitWindowKey(rateLimit: NonNullable<Exclude<ScheduleWorkerResult, void>["rateLimit"]>): string {
+  const window = rateLimit.resetAt !== undefined
+    ? `reset:${rateLimit.resetAt}`
+    : `blocked:${Math.floor((rateLimit.blockedUntil ?? 0) / 60_000)}`;
+  return `${rateLimit.operationKey}|${window}`;
 }
 
 function isTerminal(status: ScheduledStatus | undefined): boolean {

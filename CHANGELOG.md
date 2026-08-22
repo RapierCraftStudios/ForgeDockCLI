@@ -5,6 +5,10 @@
 
 ## Unreleased - 2026-08-18
 
+### Changed
+
+- Pristine reset applies archived, identity-fenced external cleanup with bounded resource-serialized concurrency (default four), aggregates failures before any database purge, and reports stage counts and durations in the CLI.
+
 ### Added
 
 - GitHub primary and secondary REST/GraphQL rate limits are classified as shared, redacted infrastructure backpressure. Native workers persist the bounded cooldown in SQLite, surface `retry_wait` with a stable GitHub operation key, and resume automatically without creating a failed node or semantic Outcome; projection warnings remain nonfatal.

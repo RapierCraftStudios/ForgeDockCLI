@@ -30,7 +30,7 @@ import {
   type AgentTask,
   type ScopeHints,
 } from "../../runtime/agent-runtime.js";
-import { latestPriorLearningArtifacts, WorkflowExecutionError, deterministicOutcomeId } from "./investigate.js";
+import { latestPriorLearningArtifacts, WorkflowExecutionError, retryableExternalWorkflowError, deterministicOutcomeId } from "./investigate.js";
 import { deriveSecurityInvariantMatrices } from "./invariant-matrix.js";
 import { deriveEvidenceContract, canonicalEvidencePath, validateEvidenceContract, type EvidenceContractInput } from "./evidence-contract.js";
 import { closeExpectedWriteScope, INVESTIGATION_EVIDENCE_LIMITS, resolveInvestigationEvidenceSources, validateFrozenReadOnlyFile } from "./scope-closure.js";
@@ -361,6 +361,8 @@ export async function prepareBuildPacket(
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     if (error instanceof WorkflowExecutionError) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     if (authorCorrectableAttempted && isAuthorCorrectablePacketError(error)) {

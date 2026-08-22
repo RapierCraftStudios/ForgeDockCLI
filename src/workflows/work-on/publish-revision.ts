@@ -6,7 +6,7 @@ import type { ForgeHost, PullRequestSnapshot } from "../../core/ports/forge-host
 import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 import { assertRunTargetsBranch } from "./lane.js";
 import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
 import { persistTargetAdvanceCheckpoint } from "./target-recovery.js";
@@ -53,6 +53,8 @@ export async function publishRemediationRevision(
     return { run: advanced.state, pullRequest };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     let targetCheckpoint: DurableArtifact<"TargetAdvanceCheckpoint"> | undefined;
     if (error instanceof TargetBranchAdvancedError) {
       // Persist target drift before changing the run state. The checkpoint is

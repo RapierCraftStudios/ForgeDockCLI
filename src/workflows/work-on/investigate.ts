@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { classifyRetryableError, type RetryClassification } from "../../core/retry.js";
+import { classifyRetryableError, retryableExternalDisposition, type RetryClassification } from "../../core/retry.js";
 import {
   createArtifact,
   InvestigationPayloadSchema,
@@ -237,6 +237,8 @@ async function continueInvestigation(
     if (input.signal?.aborted) {
       await throwInvestigationCancellation(dependencies, run, input.signal);
     }
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     const reason = error instanceof Error ? error.message : String(error);
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = await applyTransition(dependencies.runs, run, "RESUME_INVESTIGATION", reason);
@@ -383,6 +385,34 @@ function enforceInvestigationSemantics(payload: InvestigationPayload): void {
   if (payload.outcome === "confirmed" && !payload.rootCause) {
     throw new Error("A confirmed investigation must state a root cause");
   }
+}
+
+/** Re-wrap typed external rate-limit authority without committing a semantic FAIL. */
+export function retryableExternalWorkflowError(error: unknown, run: RunState): WorkflowExecutionError | undefined {
+  const disposition = retryableExternalDisposition(error);
+  if (!disposition) return undefined;
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  let authoritative: WorkflowExecutionError | undefined;
+  for (let depth = 0; depth < 16 && current !== undefined && current !== null && !seen.has(current); depth++) {
+    seen.add(current);
+    if (current instanceof WorkflowExecutionError
+      && (current.retryDisposition.code === "github-primary-rate-limit" || current.retryDisposition.code === "github-secondary-rate-limit")) {
+      authoritative = current;
+      break;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  if (authoritative) return authoritative;
+  const reason = error instanceof Error ? error.message : String(error);
+  return new WorkflowExecutionError(reason, run, {
+    cause: error,
+    recoverable: true,
+    retryDisposition: {
+      ...disposition,
+      ...(disposition.domain === "github" ? { operationKey: `github.com:${run.subject.repo.toLowerCase()}` } : {}),
+    },
+  });
 }
 
 export class WorkflowExecutionError extends Error {

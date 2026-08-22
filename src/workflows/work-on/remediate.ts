@@ -13,7 +13,7 @@ import {
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
 import { BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
-import { WorkflowExecutionError } from "./investigate.js";
+import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 
 export async function remediateReview(
   input: {
@@ -107,6 +107,8 @@ export async function remediateReview(
     return { run: advanced.state, submission: normalizeBuilderSubmission(input.packet, result.output), sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    const externalRetry = retryableExternalWorkflowError(error, run);
+    if (externalRetry) throw externalRetry;
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = transition(run, "RESUME_REMEDIATION", { reason });
       await dependencies.runs.commit(run.version, checkpoint.state, checkpoint.record);
