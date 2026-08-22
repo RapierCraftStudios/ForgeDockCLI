@@ -2423,24 +2423,55 @@ test("visible decomposition keeps non-root repository identity on initial and re
 });
 
 test("visible decomposition fails closed when a concurrent child read rejects", async () => {
+  const childIssues = Array.from({ length: DEFAULT_REMOTE_READ_CONCURRENCY + 2 }, (_, index) => index + 100);
+  const failingIssue = 101;
   const issueReads: number[] = [];
+  let startedReads = 0;
+  let completedReads = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let releaseFirstWave!: () => void;
+  const firstWaveReleased = new Promise<void>((resolve) => {
+    releaseFirstWave = resolve;
+  });
+  let firstWaveEntered!: () => void;
+  const firstWaveReady = new Promise<void>((resolve) => {
+    firstWaveEntered = resolve;
+  });
+  let allReadsSettled!: () => void;
+  const readsSettled = new Promise<void>((resolve) => {
+    allReadsSettled = resolve;
+  });
   const github = {
     async getRepository(repo: string) {
       return { repo, defaultBranch: "work-main" };
     },
     async getIssue(issue: number) {
       issueReads.push(issue);
-      if (issue === 101) throw new Error("child read failed");
-      return {
-        repo: "owner/work",
-        number: issue,
-        title: `Child ${issue}`,
-        body: "",
-        url: `https://github.test/owner/work/issues/${issue}`,
-        state: "OPEN" as const,
-        labels: [],
-        comments: [],
-      };
+      startedReads += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        if (startedReads <= DEFAULT_REMOTE_READ_CONCURRENCY) {
+          if (startedReads === DEFAULT_REMOTE_READ_CONCURRENCY) firstWaveEntered();
+          await firstWaveReleased;
+        }
+        if (issue === failingIssue) throw new Error("child read failed");
+        return {
+          repo: "owner/work",
+          number: issue,
+          title: `Child ${issue}`,
+          body: "",
+          url: `https://github.test/owner/work/issues/${issue}`,
+          state: "OPEN" as const,
+          labels: [],
+          comments: [],
+        };
+      } finally {
+        inFlight -= 1;
+        completedReads += 1;
+        if (completedReads === childIssues.length) allReadsSettled();
+      }
     },
   } as any;
   const input = {
@@ -2474,15 +2505,25 @@ test("visible decomposition fails closed when a concurrent child read rejects", 
       title: "Parent",
       summary: "Parent",
     },
-    childIssues: [100, 101],
+    childIssues,
   } as any;
   const durableBefore = structuredClone(input.orchestration);
 
-  await assert.rejects(
+  const rejection = assert.rejects(
     () => materializeVisibleDecomposition(input),
     /child read failed/,
   );
-  assert.deepEqual(issueReads.sort((left, right) => left - right), [100, 101]);
+  await firstWaveReady;
+  releaseFirstWave();
+  await rejection;
+  await readsSettled;
+
+  assert.ok(maxInFlight > 1);
+  assert.equal(maxInFlight, DEFAULT_REMOTE_READ_CONCURRENCY);
+  assert.equal(inFlight, 0);
+  assert.equal(startedReads, childIssues.length);
+  assert.equal(completedReads, childIssues.length);
+  assert.deepEqual(issueReads.sort((left, right) => left - right), [...childIssues].sort((left, right) => left - right));
   assert.deepEqual(input.orchestration, durableBefore);
 });
 
