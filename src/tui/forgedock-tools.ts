@@ -3510,7 +3510,7 @@ export function buildNativeCommandPrompt(command: WorkflowCommand, rawArgs: stri
     const resumeOrchestrationId = explicitOrchestrationResumeId(rawArgs);
     const stopOrchestrationId = explicitOrchestrationStopId(rawArgs);
     if (stopOrchestrationId) {
-      return [`The user explicitly selected durable orchestration ${stopOrchestrationId} for semantic stop.`, `Call ${ORCHESTRATION_RESUME_TOOL} exactly once with orchestrationId="${stopOrchestrationId}", stop=true, and confirmed=true only because the user explicitly typed /orchestrate stop.`, "Do not call forgedock_tasks cancel; that action is operational-only. Do not discover, resume, or launch any other DAG."].join("\n");
+      return [`The user explicitly selected durable orchestration ${stopOrchestrationId} for semantic stop.`, `Call ${tool} exactly once with orchestrationId="${stopOrchestrationId}", stop=true, and confirmed=true only because the user explicitly typed /orchestrate stop.`, `Do not call ${ORCHESTRATION_RESUME_TOOL}; do not call forgedock_tasks cancel; that action is operational-only. Do not discover, resume, or launch any other DAG.`].join("\n");
     }
     if (resumeOrchestrationId) {
       return [

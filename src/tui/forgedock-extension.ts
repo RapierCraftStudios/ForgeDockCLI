@@ -481,7 +481,7 @@ async function queueNativeWorkflow(
   const resumeOrchestrationId = command === "orchestrate" ? explicitOrchestrationResumeId(rawArgs) : undefined;
   const stopOrchestrationId = command === "orchestrate" ? explicitOrchestrationStopId(rawArgs) : undefined;
   activateOnly(pi, command === "orchestrate"
-    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : stopOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : [ORCHESTRATION_DISCOVERY_TOOL, tool, HUMAN_DECISION_TOOL]
+    ? resumeOrchestrationId ? [ORCHESTRATION_RESUME_TOOL] : stopOrchestrationId ? [tool] : [ORCHESTRATION_DISCOVERY_TOOL, tool, HUMAN_DECISION_TOOL]
     : [tool],
   command === "orchestrate" && !resumeOrchestrationId ? ["bash"] : []);
   ctx.ui.setStatus("forgedock", `◇ Preparing ${workflowCommandDisplay(command)}…`);

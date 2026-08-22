@@ -32,7 +32,8 @@
 - Reset cleanup now revalidates managed worktree identity under the metadata lock, removes only exact-SHA orphaned `forgedock/*` branches, and fails closed on path, branch, or head drift, with focused adapter coverage.
 - Typed reset now permits an issue shared by multiple explicitly selected DAGs only when their repository and delivery-route identities are fully covered; unselected or conflicting identities remain fail-closed.
 - Build Packet preparation now treats concrete packet paths as exact isolated-worktree write grants without requiring issue or investigation hints; investigation affected-surface hints remain optional read-only verification hints, so malformed or missing targets are dropped without fuzzy expansion while protected paths remain denied.
-- Ordinary work-on builders and equivalent lifecycle agents no longer hit implicit turn/tool ceilings; rejected artifact submissions now retain exact verification-gate diagnostics and permit one corrective retry before failing closed.
+- Explicit `/orchestrate stop <dag-id>` now activates `forgedock_orchestrate`, the tool that owns semantic stop, and passes the exact DAG stop authorization instead of routing through ordinary resume.
+- Ordinary `/orchestrate resume <dag-id>` remains isolated to the durable resume tool.
 ## 1.8.1 - 2026-08-17
 
 ### Fixed

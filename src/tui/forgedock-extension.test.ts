@@ -2945,20 +2945,48 @@ test("explicit orchestration resume routes directly to the durable resume tool",
   assert.doesNotThrow(() => bindOrchestrationInvocation(state.pi, { rawArgs: "another fresh request" }));
 });
 
-test("explicit orchestration stop routes to the semantic stop action", async () => {
+test("explicit orchestration stop routes to forgedock_orchestrate and invokes durable stop", async () => {
   const orchestrationId = "dag_cd83f20b-7670-4be3-984c-63f20a77a72f";
-  const prompt = buildNativeCommandPrompt("orchestrate", `stop ${orchestrationId}`);
-  assert.match(prompt, new RegExp(`Call forgedock_resume_orchestration exactly once with orchestrationId="${orchestrationId}"`));
+  const repository = new InMemoryOrchestrationRepository();
+  await repository.createOrchestration({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId,
+    repository: "owner/repo",
+    issueNumbers: [1],
+    requestedIssueNumbers: [1],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "running",
+    createdAt: "2030-01-01T00:00:00.000Z",
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    nodes: [{ id: "issue-1", issue: 1, priority: 1, dependencies: [], claims: [], status: "queued", childRunIds: [] }],
+  });
+  const state = fakePi(["read"], {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: null,
+  });
+  await state.commands.get("orchestrate")?.(`stop ${orchestrationId}`, commandContext());
+  assert.deepEqual(state.active, ["read", "forgedock_orchestrate"]);
+  const prompt = state.sent.at(-1)?.content ?? "";
+  assert.match(prompt, new RegExp(`Call forgedock_orchestrate exactly once with orchestrationId="${orchestrationId}"`));
   assert.match(prompt, /stop=true/);
   assert.match(prompt, /confirmed=true/);
-  assert.match(prompt, /Do not call forgedock_tasks cancel/);
-  assert.doesNotMatch(prompt, /forgedock_orchestrate/);
+  assert.match(prompt, /Do not call forgedock_resume_orchestration/);
+  assert.doesNotMatch(prompt, /Call forgedock_resume_orchestration/);
 
-  const state = fakePi();
-  forgedockExtension(state.pi);
-  await state.commands.get("orchestrate")?.(`stop ${orchestrationId}`, commandContext());
-  assert.deepEqual(state.active, ["read", "forgedock_resume_orchestration"]);
-  assert.match(state.sent.at(-1)?.content ?? "", /semantic stop|stop/i);
+  const orchestrate = state.tools.get("forgedock_orchestrate");
+  assert.ok(orchestrate);
+  const result = await orchestrate.execute(
+    "live-stop",
+    { stop: true, orchestrationId, confirmed: true },
+    undefined,
+    undefined,
+    commandContext() as any,
+  );
+  assert.match((result.content?.[0] as any)?.text ?? "", new RegExp(`${orchestrationId} cancelled`));
+  assert.equal((await repository.loadOrchestration(orchestrationId))?.status, "cancelled");
 });
 
 test("fresh TUI stop initializes durable context and reports terminal status truthfully", async () => {
