@@ -11,6 +11,7 @@ import {
   type MaterializedBatchIssue,
 } from "./batching.js";
 import { contractBatchGroups } from "./batching.js";
+import { orchestrationIssueIdentityKey } from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ScheduledWorkItem } from "./scheduler.js";
 
 export interface BatchMaterializationHost {
@@ -25,14 +26,17 @@ export interface BatchMaterializationHost {
   closeIssue(repo: string, issue: number, reason: string): Promise<void>;
 }
 
+type ExpectedRoute = { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string };
+type ExpectedRoutes = ReadonlyMap<string, ExpectedRoute> | ReadonlyMap<number, ExpectedRoute>;
+
 export interface MaterializeBatchGroupsInput {
   repo: string;
   groups: readonly IssueBatchGroup[];
   host: BatchMaterializationHost;
   /** Full selected plan used for external dependency remapping. */
   items?: readonly BatchableWorkItem[];
-  /** Optional authoritative lane snapshot captured while resolving inputs. */
-  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string }>;
+  /** Optional authoritative lane snapshot keyed by normalized repository plus issue. */
+  expectedRoutes?: ExpectedRoutes;
 }
 
 export interface MaterializeBatchGroupsResult {
@@ -51,7 +55,7 @@ export async function materializeBatchGroups(
 ): Promise<MaterializeBatchGroupsResult> {
   const groups: IssueBatchGroup[] = [];
   const materialized: MaterializedBatchIssue[] = [];
-  const createdIssueNumbers: number[] = [];
+  const createdIssues: Array<{ repo: string; issue: number }> = [];
   try {
     for (const proposed of input.groups) {
       const validated = await revalidateBatchGroup(proposed, input.repo, input.host, input.expectedRoutes);
@@ -59,8 +63,9 @@ export async function materializeBatchGroups(
       const priority = priorityLabel(members);
       const title = `fix(batch): ${members.length} ${priority.slice(-2)} findings — ${safeTitle(proposed.key)}`.slice(0, 240);
       const summary = `Deliver ${members.map((member) => `#${member.issue}`).join(", ")} as one ${proposed.kind} work unit.`;
+      const materializationRepository = members[0]?.repository ?? input.repo;
       const issue = await input.host.materializeBatchIssue({
-        repo: input.repo,
+        repo: materializationRepository,
         title,
         body: renderBatchIssueBody({ ...proposed, members }),
         priorityLabel: priority,
@@ -68,7 +73,7 @@ export async function materializeBatchGroups(
       });
       groups.push({ ...proposed, members });
       materialized.push({ groupId: proposed.id, issue: issue.number, title: issue.title, summary });
-      createdIssueNumbers.push(issue.number);
+      createdIssues.push({ repo: materializationRepository, issue: issue.number });
     }
 
     // Validate the graph with real batch issue IDs before the caller dispatches.
@@ -78,13 +83,13 @@ export async function materializeBatchGroups(
     validateGraph(claimGraph.items);
     return { groups, materialized, validatedItems: claimGraph.items as BatchableWorkItem[] };
   } catch (error) {
-    const cleanup = await Promise.allSettled(createdIssueNumbers.map((issue) => input.host.closeIssue(
-      input.repo,
+    const cleanup = await Promise.allSettled(createdIssues.map(({ repo, issue }) => input.host.closeIssue(
+      repo,
       issue,
       "ForgeDock closed this provisional batch issue because pre-dispatch validation failed; no controller was dispatched.",
     )));
     const failures = cleanup.flatMap((result, index) => result.status === "rejected"
-      ? [{ issue: createdIssueNumbers[index]!, error: result.reason }]
+      ? [{ issue: createdIssues[index]!.issue, error: result.reason }]
       : []);
     if (failures.length) {
       const orphaned = failures.map(({ issue }) => `#${issue}`).join(", ");
@@ -108,20 +113,21 @@ export async function revalidateBatchGroup(
   proposed: IssueBatchGroup,
   repo: string,
   host: BatchMaterializationHost,
-  expectedRoutes?: ReadonlyMap<number, { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string }>,
+  expectedRoutes?: ExpectedRoutes,
 ): Promise<{ members: BatchableWorkItem[]; milestone?: string }> {
   const members: BatchableWorkItem[] = [];
   let milestone: string | undefined;
   let milestoneSeen = false;
   for (const planned of proposed.members) {
-    const expectedRoute = expectedRoutes?.get(planned.issue);
+    const plannedRepository = planned.repository ?? repo;
+    const expectedRoute = expectedRouteFor(expectedRoutes, plannedRepository, planned.issue, repo);
     if (expectedRoute && (planned.targetBranch !== expectedRoute.targetBranch
       || planned.lane !== undefined && planned.lane !== expectedRoute.lane
       || planned.promotionTarget !== expectedRoute.promotionTarget
       || planned.productionTarget !== expectedRoute.productionTarget)) {
       throw new Error(`Cannot batch #${planned.issue}: lane evidence changed since assembly`);
     }
-    const observed = await host.getIssue(planned.issue, repo);
+    const observed = await host.getIssue(planned.issue, plannedRepository);
     if (observed.state !== "OPEN") throw new Error(`Cannot batch #${planned.issue}: issue is ${observed.state.toLowerCase()}`);
     const observedMilestone = observed.milestone?.title;
     if (milestoneSeen && observedMilestone !== milestone) {
@@ -135,7 +141,7 @@ export async function revalidateBatchGroup(
     const riskClass = inferBatchRiskClass(observed.title, observed.body, observedLabels);
     const candidate: BatchableWorkItem = {
       ...planned,
-      repository: repo,
+      repository: plannedRepository,
       title: observed.title,
       summary: observed.body.slice(0, 4_000),
       labels: observedLabels,
@@ -156,6 +162,22 @@ export async function revalidateBatchGroup(
   }
   if (members.length < 2) throw new Error(`Batch group ${proposed.id} must contain at least two members`);
   return { members, ...(milestone ? { milestone } : {}) };
+}
+
+function expectedRouteFor(
+  routes: ExpectedRoutes | undefined,
+  repository: string,
+  issue: number,
+  legacyRepository: string,
+): ExpectedRoute | undefined {
+  if (!routes) return undefined;
+  const qualified = (routes as ReadonlyMap<string, ExpectedRoute>).get(orchestrationIssueIdentityKey({ repository, issue }));
+  if (qualified) return qualified;
+  // The numeric branch is retained only for the legacy TUI adapter, whose
+  // caller is root-repository-only. Never apply it to a foreign scheduled
+  // repository, where it could alias an equal issue number.
+  if (repository.trim().toLowerCase() !== legacyRepository.trim().toLowerCase()) return undefined;
+  return (routes as ReadonlyMap<number, ExpectedRoute>).get(issue);
 }
 
 function assertAuthoritativeEvidence(
