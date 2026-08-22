@@ -8,6 +8,19 @@ export interface GitWorkspace {
   baseSha?: string;
 }
 
+export interface ReadOnlyGitSnapshot {
+  path: string;
+  baseSha: string;
+  baseRef: string;
+  /** Snapshot cleanup is the only lifecycle operation exposed to callers. */
+  remove(): Promise<void>;
+}
+
+/** Separate from delivery workspaces so read-only investigators cannot acquire builder claims. */
+export interface ReadOnlyGitSnapshotManager {
+  createReadOnlySnapshot(input: { runId: string; issue: number; baseRef: string; baseSha?: string; signal?: AbortSignal }): Promise<ReadOnlyGitSnapshot>;
+}
+
 export interface ManagedWorktreeResetLifecycle {
   /** Re-read exact path/branch/HEAD identity, then force-remove only that managed worktree. */
   removeExactManaged(input: { path: string; branch: string; headSha: string }): Promise<void>;
@@ -29,6 +42,7 @@ export class AdvertisedRemoteHeadMismatchError extends Error {
 }
 
 export interface GitWorkspaceManager {
+
   create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace>;
   /**
    * Move an untouched delivery workspace to an exact, host-advertised target

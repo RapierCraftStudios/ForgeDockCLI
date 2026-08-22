@@ -44,7 +44,7 @@ import { summarizeControllerTiming, summarizeTelemetry, type TelemetryRepository
 import { colorMode, renderHeader, statusGlyph } from "../tui/brand.js";
 import { orchestrationConfigSources, readForgeDockConfig, resolveAutoMerge, splitConfiguredModel, THINKING_LEVELS, type EffectiveOrchestrationConfig, type ThinkingLevel, resolveOrchestrationConfig, resolveReviewCiConfig } from "../core/config/forgedock-config.js";
 import { completeInvalidWorkItem } from "../workflows/work-on/complete.js";
-import { investigateWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
+import { investigateWorkItem, resumeInvestigationWorkItem, WorkflowExecutionError } from "../workflows/work-on/investigate.js";
 import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
@@ -61,6 +61,7 @@ import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-r
 import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController } from "../workflows/orchestrate/controller.js";
+import { InvestigationBarrier } from "../workflows/orchestrate/investigation-barrier.js";
 import { retryWorkOnAgentBudget } from "../workflows/orchestrate/agent-budget-retry.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { acquireNodeLease, inspectNodeLease, orchestrationNodeLeaseBinding, waitForNodeLease } from "../workflows/orchestrate/node-lease.js";
@@ -2245,35 +2246,8 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
       discoverVerificationCommands(checkoutRoot, `origin/${targetBranch}`);
     }
-    const materializedResult = assembly.groups.length
-      ? await materializeBatchGroups({
-        repo: repository.repo,
-        groups: assembly.groups,
-        items,
-        host: github,
-        expectedRoutes: new Map(items.map((item) => {
-          const itemRepository = repositoryForScheduledItem(item, repository.repo);
-          const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
-          return [orchestrationRouteCacheKey(itemRepository, item.issue), {
-            targetBranch: route.lane.targetBranch,
-            lane: route.lane.kind,
-            ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
-            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-          }] as const;
-        })),      })
-      : { groups: [], materialized: [], validatedItems: items };
-    const contracted = materializedResult.validatedItems;
-    for (const materialized of materializedResult.materialized) {
-      const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
-      const member = group?.members[0];
-      if (group && member) {
-        const memberRepository = repositoryForScheduledItem(member, repository.repo);
-        const lane = requiredOrchestrationRoute(routedIssues, { repository: memberRepository, issue: member.issue }).lane;
-        const batchIssue = await github.getIssue(materialized.issue, memberRepository);
-        setOrchestrationRoute(routedIssues, { repository: memberRepository, issue: materialized.issue }, { issue: batchIssue, lane });
-      }
-    }
-    const scheduleItems = materializeClaimDependencies(contracted);
+    // Batch issue creation is deliberately deferred to the controller's
+    // post-investigation dispatch callback. Preview and assembly remain pure.
     const orchestrationId = `dag_${crypto.randomUUID()}`;
     setAgentEventObservationIdentity({
       repository: repository.repo,
@@ -2286,7 +2260,114 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
+    const readOnlySnapshots = new Map<string, Awaited<ReturnType<GitWorktreeManager["createReadOnlySnapshot"]>> >();
+    const decompositions = new Map<string, NonNullable<import("../core/artifacts/schema.js").InvestigationPayload["decomposition"]>>();
+    const investigationBarrier = new InvestigationBarrier({
+      maxAttempts: effective.maxParallel > 0 ? 3 : 1,
+      ...(signal !== undefined ? { signal } : {}),
+      repository: store,
+      admit: async ({ item, orchestration }) => {
+        const itemRepository = repositoryForScheduledItem(item, repository.repo);
+        const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
+        const snapshot = await git.createReadOnlySnapshot({
+          runId: `${orchestration.orchestrationId}-wave-${orchestration.investigationBarrier?.waves.length ?? 0}`,
+          issue: item.issue,
+          baseRef: `origin/${route.lane.targetBranch}`,
+          ...(signal !== undefined ? { signal } : {}),
+        });
+        readOnlySnapshots.set(`${itemRepository.toLowerCase()}#${item.issue}`, snapshot);
+        return { baseSha: snapshot.baseSha, targetBranch: route.lane.targetBranch, routeIdentity: `${itemRepository.toLowerCase()}:${route.lane.kind}:${route.lane.targetBranch}` };
+      },
+      investigate: async ({ item, admission, orchestration, signal: barrierSignal }) => {
+        const itemRepository = repositoryForScheduledItem(item, repository.repo);
+        const subject = { repo: itemRepository, issue: item.issue };
+        const snapshot = readOnlySnapshots.get(`${itemRepository.toLowerCase()}#${item.issue}`);
+        if (!snapshot) throw new Error(`Missing read-only investigation snapshot for ${itemRepository}#${item.issue}`);
+        const issue = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue }).issue;
+        const runId = `run_${orchestration.orchestrationId.replace(/[^a-zA-Z0-9_-]/g, "-")}_${item.issue}`;
+        const intent = createArtifact({
+          kind: "Intent", runId, subject,
+          producer: { role: "controller", runtime: "forgedock" },
+          payload: { title: issue.title, problem: issue.body || issue.title, constraints: [], acceptanceHints: [], dependencies: [...item.dependencies], sourceUrl: issue.url },
+        }, { id: `art_intent_${orchestration.orchestrationId}_${item.issue}`.replace(/[^a-zA-Z0-9_-]/g, "-") });
+        const prior = await artifacts.list(subject);
+        const durableInvestigation = [...prior].reverse().find((artifact) => artifact.kind === "Investigation" && artifact.runId === runId) as DurableArtifact<"Investigation"> | undefined;
+        const priorRun = await runs.load(runId);
+        try {
+          let result;
+          if (durableInvestigation && priorRun) {
+            result = await resumeInvestigationWorkItem({
+              intent, run: priorRun, investigation: durableInvestigation, cwd: snapshot.path, baseSha: admission.baseSha,
+              snapshot, readOnly: true,
+              ...(barrierSignal !== undefined ? { signal: barrierSignal } : {}),
+            }, { runtime, artifacts, runs });
+          } else if (durableInvestigation) {
+            result = { investigation: durableInvestigation, sessionRef: `durable:${durableInvestigation.id}` } as const;
+          } else {
+            result = await investigateWorkItem({
+              intent, cwd: snapshot.path, baseSha: admission.baseSha, snapshot, readOnly: true,
+              scopeHints: { affectedFiles: item.affectedFiles ?? [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+              investigationArtifactId: `art_investigation_${orchestration.orchestrationId}_${item.issue}`.replace(/[^a-zA-Z0-9_-]/g, "-"),
+              ...(barrierSignal !== undefined ? { signal: barrierSignal } : {}),
+            }, { runtime, artifacts, runs });
+          }
+          const payload = result.investigation.payload as import("../core/artifacts/schema.js").InvestigationPayload;
+          if (payload.outcome === "decompose" && payload.decomposition) decompositions.set(`${itemRepository.toLowerCase()}#${item.issue}`, payload.decomposition);
+          return {
+            outcome: payload.outcome === "decompose" ? "decomposed" : payload.outcome,
+            ...(payload.baseSha !== undefined ? { baseSha: payload.baseSha } : {}),
+            artifactId: result.investigation.id,
+            ...(result.outcome?.id !== undefined ? { checkpointId: result.outcome.id } : {}),
+          };
+        } finally {
+          await snapshot.remove().catch(() => undefined);
+          readOnlySnapshots.delete(`${itemRepository.toLowerCase()}#${item.issue}`);
+        }
+      },
+      expand: async ({ item, admission, orchestration, signal: barrierSignal }) => {
+        const itemRepository = repositoryForScheduledItem(item, repository.repo);
+        const definitions = decompositions.get(`${itemRepository.toLowerCase()}#${item.issue}`);
+        if (!definitions) throw new Error(`Missing durable decomposition proposal for ${itemRepository}#${item.issue}`);
+        const children = (await github.materializeDecomposition({ repo: itemRepository, parentIssue: item.issue, children: definitions })).map((child) => child.number);
+        const expansion = await materializeCliDecomposition({ github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective, orchestration, node: { ...({ id: item.id, issue: item.issue, priority: item.priority, dependencies: [...item.dependencies], claims: [...item.claims], childRunIds: [], status: "skipped" as const }) }, item, childIssues: children, routedIssues });
+        if (!expansion) throw new Error(`Unable to materialize decomposition children for ${item.id}`);
+        return { childIssues: children, items: expansion.items };
+      },
+      persist: async (record) => { await store.saveOrchestration(record); },
+    });
     const controller = new OrchestrationController({
+      investigationBarrier,
+      prepareDispatch: async ({ orchestration: durable, items: settledItems }) => {
+        const confirmed = new Set(settledItems.map((item) => `${repositoryForScheduledItem(item, repository.repo).toLowerCase()}#${item.issue}`));
+        const eligibleGroups = assembly.groups.filter((group) => group.members.every((member) => confirmed.has(`${repositoryForScheduledItem(member, repository.repo).toLowerCase()}#${member.issue}`)));
+        const materializedResult = eligibleGroups.length
+          ? await materializeBatchGroups({
+            repo: repository.repo,
+            groups: eligibleGroups,
+            items: settledItems as BatchableWorkItem[],
+            host: github,
+            expectedRoutes: new Map(settledItems.map((item) => {
+              const itemRepository = repositoryForScheduledItem(item, repository.repo);
+              const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
+              return [orchestrationRouteCacheKey(itemRepository, item.issue), {
+                targetBranch: route.lane.targetBranch, lane: route.lane.kind,
+                ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
+                ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+              }] as const;
+            })),
+          })
+          : { groups: [], materialized: [], validatedItems: [...settledItems] };
+        for (const materialized of materializedResult.materialized) {
+          const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
+          const member = group?.members[0];
+          if (!group || !member) continue;
+          const memberRepository = repositoryForScheduledItem(member, repository.repo);
+          const lane = requiredOrchestrationRoute(routedIssues, { repository: memberRepository, issue: member.issue }).lane;
+          const batchIssue = await github.getIssue(materialized.issue, memberRepository);
+          setOrchestrationRoute(routedIssues, { repository: memberRepository, issue: materialized.issue }, { issue: batchIssue, lane });
+        }
+        return materializeClaimDependencies(materializedResult.validatedItems);
+      },
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
       ...(signal !== undefined ? { signal } : {}),
@@ -2602,8 +2683,8 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       orchestrationId,
       repository: repository.repo,
       requestedIssueNumbers: issueNumbers,
-      items: scheduleItems.items,
-      serializationEdges: scheduleItems.edges,
+      items: materializeClaimDependencies(items).items,
+      serializationEdges: materializeClaimDependencies(items).edges,
       maxParallel: effective.maxParallel,
       autoMerge,
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),

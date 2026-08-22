@@ -6,6 +6,7 @@ import { Check, Errors } from "typebox/value";
 const NonEmptyString = Type.String({ minLength: 1 });
 const IsoDateTime = Type.String({ format: "date-time" });
 const Sha = Type.String({ pattern: "^[0-9a-fA-F]{7,64}$" });
+const ExactBaseSha = Type.String({ pattern: "^[0-9a-fA-F]{40}$" });
 
 export const SubjectSchema = Type.Object({
   repo: NonEmptyString,
@@ -54,6 +55,8 @@ export const IntentPayloadSchema = Type.Object({
 });
 
 export const InvestigationPayloadSchema = Type.Object({
+  /** Exact immutable snapshot used by controller-owned investigation waves. */
+  baseSha: Type.Optional(ExactBaseSha),
   outcome: Type.Union([
     Type.Literal("confirmed"),
     Type.Literal("invalid"),

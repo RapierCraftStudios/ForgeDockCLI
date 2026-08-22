@@ -10,6 +10,7 @@ import {
   type Subject,
 } from "../../core/artifacts/schema.js";
 import type { ForgeHost } from "../../core/ports/forge-host.js";
+import type { ReadOnlyGitSnapshot } from "../../core/ports/git-workspace.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
 import {
@@ -43,6 +44,13 @@ export interface InvestigateInput {
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   target?: RunTarget;
   scopeHints?: ScopeHints;
+  /** Exact controller-admitted investigation snapshot. */
+  baseSha?: string;
+  snapshot?: ReadOnlyGitSnapshot;
+  /** Prevent investigation from invoking ForgeHost decomposition mutation. */
+  readOnly?: boolean;
+  /** Stable identity supplied by a controller-owned admission wave. */
+  investigationArtifactId?: string;
   signal?: AbortSignal;
 }
 
@@ -144,6 +152,7 @@ export async function resumeInvestigationWorkItem(
   if (input.investigation) {
     assertInvestigationMatches(input.run, input.investigation);
     enforceInvestigationSemantics(input.investigation.payload);
+    validateInvestigationBaseSha(input.investigation.payload.baseSha, input.baseSha);
   }
 
   const scopeManifest = input.run.scopeManifest ?? investigationScopeManifest(input.scopeHints);
@@ -162,6 +171,7 @@ async function continueInvestigation(
   try {
     let investigation = durableInvestigation;
     let sessionRef = durableInvestigation ? `durable:${durableInvestigation.id}` : undefined;
+    if (investigation) validateInvestigationBaseSha(investigation.payload.baseSha, input.baseSha);
     if (!investigation) {
       const modelPolicy = {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -190,7 +200,7 @@ async function continueInvestigation(
         ].join("\n"),
         context: [input.intent, ...latestPriorLearningArtifacts(input.priorArtifacts ?? [])],
         workspace: {
-          cwd: input.cwd,
+          cwd: input.snapshot?.path ?? input.cwd,
           mode: "read-only",
           scope: scopeManifest,
         },
@@ -208,7 +218,13 @@ async function continueInvestigation(
       if (input.signal?.aborted) {
         await throwInvestigationCancellation(dependencies, run, input.signal);
       }
-      enforceInvestigationSemantics(agentResult.output);
+      const providerOutput = { ...agentResult.output };
+      validateInvestigationBaseSha(providerOutput.baseSha, input.baseSha);
+      const output = {
+        ...providerOutput,
+        ...(input.baseSha !== undefined && providerOutput.baseSha === undefined ? { baseSha: input.baseSha } : {}),
+      };
+      enforceInvestigationSemantics(output);
       investigation = createArtifact({
         kind: "Investigation",
         runId: run.runId,
@@ -219,8 +235,8 @@ async function continueInvestigation(
           provider: agentResult.provider,
           model: agentResult.model,
         },
-        payload: agentResult.output,
-      });
+        payload: output,
+      }, input.investigationArtifactId !== undefined ? { id: input.investigationArtifactId } : {});
       await dependencies.artifacts.append(investigation);
       sessionRef = agentResult.sessionRef;
     }
@@ -231,6 +247,7 @@ async function continueInvestigation(
       investigation,
       sessionRef ?? `durable:${investigation.id}`,
       input.signal,
+      input.readOnly === true,
     );
   } catch (error) {
     if (error instanceof WorkflowExecutionError && error.run.state === "cancelled") throw error;
@@ -253,6 +270,7 @@ async function finishInvestigation(
   investigation: DurableArtifact<"Investigation">,
   sessionRef: string,
   signal?: AbortSignal,
+  readOnly = false,
 ): Promise<InvestigateResult> {
   // Keep this guard next to the semantic/artifact/decomposition boundary as a
   // second defense if cancellation is raised between the caller's post-await
@@ -263,11 +281,11 @@ async function finishInvestigation(
   let run = attachArtifact(initialRun, "Investigation", investigation.id);
   let outcome: DurableArtifact<"Outcome"> | undefined;
   if (investigation.payload.outcome !== "confirmed") {
-    if (investigation.payload.outcome === "decompose" && !dependencies.decomposer) {
+    if (investigation.payload.outcome === "decompose" && !dependencies.decomposer && !readOnly) {
       throw new Error("Decomposition requires a controller issue materializer");
     }
-    const childIssues = investigation.payload.outcome === "decompose"
-      ? (await dependencies.decomposer!.materializeDecomposition({
+    const childIssues = investigation.payload.outcome === "decompose" && dependencies.decomposer
+      ? (await dependencies.decomposer.materializeDecomposition({
         repo: run.subject.repo,
         parentIssue: run.subject.issue ?? (() => { throw new Error("Decomposition requires an issue subject"); })(),
         children: investigation.payload.decomposition ?? [],
@@ -374,6 +392,12 @@ async function throwInvestigationCancellation(
       cause: abortReason instanceof Error ? abortReason : new Error(reason),
     },
   });
+}
+
+function validateInvestigationBaseSha(observed: string | undefined, admitted: string | undefined): void {
+  if (admitted === undefined) return;
+  if (!/^[0-9a-f]{40}$/i.test(admitted)) throw new Error(`Investigation base SHA must be exactly 40 hexadecimal characters, found ${admitted}`);
+  if (observed !== admitted) throw new Error(`Investigation result base SHA ${observed ?? "missing"} does not match admitted SHA ${admitted}`);
 }
 
 function enforceInvestigationSemantics(payload: InvestigationPayload): void {

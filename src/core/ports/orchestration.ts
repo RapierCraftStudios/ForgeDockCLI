@@ -1,5 +1,55 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+export type InvestigationSettlementStatus =
+  | "confirmed"
+  | "invalid"
+  | "decomposed"
+  | "failed"
+  | "retrying"
+  | "cancelled";
+
+export interface InvestigationAdmissionRecord {
+  repository: string;
+  issue: number;
+  baseSha: string;
+  targetBranch: string;
+  routeIdentity: string;
+  admittedAt: string;
+}
+
+export interface InvestigationSettlementRecord {
+  key: string;
+  orchestrationId: string;
+  repository: string;
+  issue: number;
+  wave: number;
+  baseSha: string;
+  status: InvestigationSettlementStatus;
+  attempt: number;
+  maxAttempts: number;
+  updatedAt: string;
+  artifactId?: string;
+  checkpointId?: string;
+  error?: string;
+  cancellationReason?: string;
+  childIssues?: number[];
+}
+
+export interface InvestigationWaveRecord {
+  wave: number;
+  parentWave?: number;
+  issueKeys: string[];
+  status: "running" | "settled" | "cancelled";
+  startedAt: string;
+  settledAt?: string;
+}
+
+export interface OrchestrationInvestigationBarrierRecord {
+  admissions: InvestigationAdmissionRecord[];
+  waves: InvestigationWaveRecord[];
+  settlements: InvestigationSettlementRecord[];
+}
+
 export type DurableOrchestrationNodeStatus =
   | "queued"
   | "running"
@@ -211,6 +261,8 @@ export interface OrchestrationRecord {
   nodes: OrchestrationNodeRecord[];
   /** Optional for backward compatibility with pre-serialization-edge records. */
   serializationEdges?: OrchestrationSerializationEdgeRecord[];
+  /** Controller-owned exact-base investigation admission and settlement ledger. */
+  investigationBarrier?: OrchestrationInvestigationBarrierRecord;
 }
 
 /** Canonical repository-qualified identity for issue ownership. */

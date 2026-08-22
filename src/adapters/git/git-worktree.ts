@@ -7,7 +7,7 @@ import { chmod, lstat, mkdir, readFile, readdir, rename, rm, stat, utimes, write
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReadOnlyGitSnapshot, type ReadOnlyGitSnapshotManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
 
@@ -32,13 +32,53 @@ type DependencyLease = {
   heartbeat: NodeJS.Timeout;
 };
 
-export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager, ManagedWorktreeResetLifecycle {
+export class GitWorktreeManager implements GitWorkspaceManager, ReadOnlyGitSnapshotManager, ReviewWorkspaceManager, PullRequestRepairWorkspaceManager, ManagedWorktreeResetLifecycle {
   readonly #repo: string;
   readonly #root: string;
 
   constructor(repo = process.cwd(), root = join(dirname(repo), ".forgedock-worktrees", basename(repo))) {
     this.#repo = resolve(repo);
     this.#root = resolve(root);
+  }
+
+  async createReadOnlySnapshot(input: { runId: string; issue: number; baseRef: string; baseSha?: string; signal?: AbortSignal }): Promise<ReadOnlyGitSnapshot> {
+    const suffix = input.runId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(-24);
+    const path = resolve(this.#root, `investigation-${input.issue}-${suffix}`);
+    assertInside(this.#root, path);
+    await mkdir(dirname(path), { recursive: true });
+    const fetchedBase = input.baseRef.startsWith("origin/") ? await this.fetchOriginBase(input.baseRef) : input.baseRef;
+    const resolvedSha = (await this.git(["rev-parse", `${fetchedBase}^{commit}`], this.#repo)).trim();
+    if (input.baseSha !== undefined) {
+      assertSha(input.baseSha, "investigation base SHA");
+      if (resolvedSha.toLowerCase() !== input.baseSha.toLowerCase()) {
+        throw new Error(`Investigation snapshot ${input.baseRef} resolved to ${resolvedSha}, expected ${input.baseSha}`);
+      }
+    }
+    const baseSha = input.baseSha ?? resolvedSha;
+    let added = false;
+    try {
+      await this.withRepositoryMetadataLock(async () => {
+        await this.git(["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, baseSha], this.#repo);
+        added = true;
+      });
+      const observed = (await this.git(["rev-parse", "HEAD"], path)).trim();
+      if (observed.toLowerCase() !== baseSha.toLowerCase()) throw new Error(`Investigation snapshot HEAD ${observed} does not match ${baseSha}`);
+      return {
+        path,
+        baseSha,
+        baseRef: input.baseRef,
+        remove: async () => {
+          await this.withRepositoryMetadataLock(async () => {
+            if (existsSync(path)) await this.git(["worktree", "remove", "--force", path], this.#repo);
+          });
+        },
+      };
+    } catch (error) {
+      if (added) {
+        try { await this.withRepositoryMetadataLock(() => this.git(["worktree", "remove", "--force", path], this.#repo)); } catch { /* preserve snapshot failure */ }
+      }
+      throw error;
+    }
   }
 
   async create(input: { runId: string; issue: number; baseRef: string; signal?: AbortSignal }): Promise<GitWorkspace> {

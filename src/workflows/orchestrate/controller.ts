@@ -45,6 +45,7 @@ import {
   normalizedDeliveryRouteClaim,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
+import { InvestigationBarrier } from "./investigation-barrier.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -146,8 +147,18 @@ export type OrchestrationDecompositionResolver = (input: {
   childIssues?: readonly number[];
 }) => Promise<OrchestrationDecompositionExpansion | undefined>;
 
+export interface OrchestrationDispatchPreparation {
+  items: readonly ScheduledWorkItem[];
+  serializationEdges?: readonly ClaimSerializationEdge[];
+}
+
 export interface OrchestrationControllerDependencies {
   repository: OrchestrationRepository;
+  /** Controller-owned selected-issue admission; it runs before scheduler readiness. */
+  investigationBarrier?: InvestigationBarrier;
+  /** Downstream assembly/materialization callback, invoked only after settlement. */
+  prepareDispatch?: (input: { orchestration: Readonly<OrchestrationRecord>; items: readonly ScheduledWorkItem[] }) => Promise<OrchestrationDispatchPreparation>;
+
   worker: OrchestrationWorkOnWorker;
   /** Durable, cross-process fencing for one active execution of a DAG. */
   executionAdmission: OrchestrationExecutionAdmission;
@@ -412,6 +423,8 @@ export class OrchestrationController {
       });
       await this.flush(state);
 
+      await this.runInvestigationBarrier(state, signal);
+      await this.flush(state);
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);
@@ -509,6 +522,72 @@ export class OrchestrationController {
         this.executions.delete(orchestrationId);
       }
     }
+  }
+
+  private async runInvestigationBarrier(state: PersistenceState, signal?: AbortSignal): Promise<void> {
+    const barrier = this.dependencies.investigationBarrier;
+    if (!barrier) {
+      const durableBarrier = state.record.investigationBarrier;
+      if (durableBarrier && (durableBarrier.waves.some((wave) => wave.status !== "settled")
+        || durableBarrier.settlements.some((settlement) => settlement.status === "retrying"))) {
+        throw new Error(`Orchestration ${state.record.orchestrationId} has an unsettled investigation wave; resume requires the barrier authority`);
+      }
+      return;
+    }
+    const sourceItems = state.record.nodes
+      .filter((node) => node.status !== "completed" && node.status !== "invalid" && !(node.status === "skipped" && node.decompositionChildren?.length))
+      .map(itemFromNodeRecord);
+    const admittedIssueNumbers = new Set(sourceItems.flatMap((item) => [item.issue, ...(item.memberIssues ?? [])]));
+    for (const issue of state.record.requestedIssueNumbers ?? state.record.issueNumbers) {
+      if (!admittedIssueNumbers.has(issue) && !state.record.nodes.some((node) => node.issue === issue || node.memberIssues?.includes(issue))) {
+        throw new Error(`Selected issue #${issue} has no repository-qualified orchestration item; refusing partial investigation admission`);
+      }
+    }
+    barrier.setPersistence(async (record) => {
+      state.claim.assertValid();
+      this.replaceRecord(state, record);
+      await this.flush(state);
+    });
+    const settled = await barrier.settle(state.record, sourceItems, signal !== undefined ? { signal } : {});
+    state.claim.assertValid();
+    this.replaceRecord(state, settled.record);
+    const existing = new Map(state.record.nodes.map((node) => [node.id, node]));
+    const readyIds = new Set(settled.items.map((item) => item.id));
+    const barrierRecord = settled.record.investigationBarrier;
+    const terminalByIdentity = new Map<string, string>();
+    for (const settlement of barrierRecord?.settlements ?? []) {
+      terminalByIdentity.set(`${settlement.repository.toLowerCase()}#${settlement.issue}`, settlement.status);
+    }
+    const dispatch = this.dependencies.prepareDispatch
+      ? await this.dependencies.prepareDispatch({ orchestration: structuredClone(settled.record), items: settled.items })
+      : { items: settled.items };
+    state.claim.assertValid();
+    const dispatchItems = dispatch.items.map(cloneScheduledItem);
+    const dispatchIds = new Set(dispatchItems.map((item) => item.id));
+    const nodes = dispatchItems.map((item) => {
+      const prior = existing.get(item.id);
+      return prior && readyIds.has(item.id) ? { ...prior, ...nodeRecordFromItem(item), status: prior.status === "completed" ? ("completed" as const) : ("queued" as const), attempts: prior.attempts ?? [] } : nodeRecordFromItem(item);
+    });
+    // Retain terminal barrier outcomes in the durable DAG, but never expose
+    // invalid/decomposed work to the scheduler or a builder.
+    for (const node of state.record.nodes) {
+      if (dispatchIds.has(node.id) || node.status === "completed") continue;
+      const key = `${orchestrationNodeRepository(state.record, node)}#${node.issue}`;
+      const settlement = terminalByIdentity.get(key);
+      if (settlement === "invalid") nodes.push({ ...node, status: "invalid", error: "Investigation classified this issue as invalid" });
+      else if (settlement === "decomposed") nodes.push({ ...node, status: "skipped", error: "Investigation decomposed this issue into a follow-up wave" });
+      else if (settlement === "failed" || settlement === "cancelled") throw new Error(`Investigation barrier settled ${key} as ${settlement}`);
+    }
+    const edges = (dispatch.serializationEdges ?? []).map(cloneSerializationEdge);
+    validateGraph(nodes.map(itemFromNodeRecord), edges);
+    this.replaceRecord(state, {
+      ...state.record,
+      nodes,
+      serializationEdges: edges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
+      issueNumbers: uniqueIssueNumbers([...state.record.issueNumbers, ...dispatchItems.flatMap((item) => [item.issue, ...(item.memberIssues ?? [])])]),
+      updatedAt: this.now(),
+    });
+    this.emitSnapshot(state.record, state);
   }
 
   private async prepareInitial(state: PersistenceState): Promise<PreparedExecution> {
