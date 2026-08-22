@@ -1203,11 +1203,18 @@ export async function materializeVisibleDecomposition(input: {
   node: Readonly<OrchestrationNodeRecord>;
   item: VisibleOrchestrationItem;
   childIssues?: readonly number[];
+  signal?: AbortSignal;
+  assertActive?: () => void;
 }): Promise<{
   childIssues: readonly number[];
   items: readonly VisibleOrchestrationItem[];
   serializationEdges?: readonly ClaimSerializationEdge[];
 } | undefined> {
+  const assertActive = (): void => {
+    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Decomposition materialization cancelled");
+    input.assertActive?.();
+  };
+  assertActive();
   const effectiveParentRepository = normalizeOrchestrationRepository(input.node.repository ?? input.item.repository ?? input.repository);
   const authoritativeRepository = await input.github.getRepository(effectiveParentRepository);
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
@@ -2934,23 +2941,17 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const readyGithub = github;
       const readyRepository = repository;
       if (!readyGithub || !readyRepository) throw new Error("ForgeDock dispatch lost its GitHub repository context before mutation");
-      const materializedResult = batchPlan.groups.length
-        ? await materializeBatchGroups({
-          repo: readyRepository.repo,
-          groups: batchPlan.groups,
-          items: batchPlan.selected,
-          host: readyGithub,
-          expectedRoutes: new Map([...authoritativeRoutes.entries()].map(([issue, lane]) => [issue, {
-            targetBranch: lane.targetBranch,
-            lane: lane.kind,
-            ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
-            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-          }])),
-        })
-        : { groups: [], materialized: [], validatedItems: discoveredItems };
-      const materialized = materializedResult.materialized;
-      const validatedGroups = materializedResult.groups;
-      const contracted = contractBatchGroups(batchPlan.selected, validatedGroups, materialized) as VisibleOrchestrationItem[];
+      // Fresh investigation-first dispatch is admitted against a shadow DAG. Do
+      // not create GitHub batch issues before the investigation barrier: the
+      // phase-2 materializer owns all issue mutation after settled evidence.
+      const virtualBase = Math.max(...issues) + 1;
+      const virtualBatches = batchPlan.groups.map((group, index) => ({
+        groupId: group.id,
+        issue: virtualBase + index,
+        title: `Proposed batch ${index + 1}`,
+        summary: `Proposed ${group.kind} batch for validation`,
+      }));
+      const contracted = contractBatchGroups(batchPlan.selected, batchPlan.groups, virtualBatches) as VisibleOrchestrationItem[];
       const schedule = materializeClaimDependencies(contracted);
       const preview = buildSchedulePreview(schedule.items, schedule.edges);
       const scheduleSnapshot = buildOrchestrationSnapshot({
@@ -3023,8 +3024,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           return { issue: { title: issue.title, body: issue.body, url: issue.url }, targetBranch: lane.targetBranch, lane: lane.kind, ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
         },
         sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}) })),
-        materializeDecomposition: async ({ orchestration: durable, item, childIssues }) => {
-          const expansion = await materializeVisibleDecomposition({ github: readyGithub, artifacts, repository: item.repository ?? readyRepository.repo, effective, orchestration: durable, node: durable.nodes.find((candidate) => candidate.id === item.id)!, item: item as VisibleOrchestrationItem, childIssues });
+        materializeDecomposition: async ({ orchestration: durable, item, childIssues, signal: materializeSignal, assertActive }) => {
+          assertActive?.();
+          if (materializeSignal?.aborted) throw materializeSignal.reason ?? new Error("Decomposition materialization cancelled");
+          const expansion = await materializeVisibleDecomposition({ github: readyGithub, artifacts, repository: item.repository ?? readyRepository.repo, effective, orchestration: durable, node: durable.nodes.find((candidate) => candidate.id === item.id)!, item: item as VisibleOrchestrationItem, childIssues, ...(materializeSignal !== undefined ? { signal: materializeSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
           return expansion ? { items: expansion.items } : undefined;
         },
         childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: readyRepository.repo, issue: entry.issue }), undefined),
@@ -3036,6 +3039,28 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           await context.recordTask({ runId: `run_tui_probe_${item.id}` });
           return { outcome: "confirmed" as const, baseSha, evidence: { summary: "Read-only embedded investigation probe", affectedSurfaces: [] } };
         };
+      let phase2BatchMaterialized = false;
+      const tuiMaterializeExecution: NonNullable<VisibleDagInput["materializeExecution"]> = async (input) => {
+        input.assertActive?.();
+        if (input.signal?.aborted) throw input.signal.reason ?? new Error("Investigation cancelled before batch materialization");
+        if (!phase2BatchMaterialized && batchPlan.groups.length) {
+          input.assertActive?.();
+          await materializeBatchGroups({
+            repo: readyRepository.repo,
+            groups: batchPlan.groups,
+            items: batchPlan.selected,
+            host: readyGithub,
+            expectedRoutes: new Map([...authoritativeRoutes.entries()].map(([issue, lane]) => [issue, {
+              targetBranch: lane.targetBranch,
+              lane: lane.kind,
+              ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
+              ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+            }])),
+          });
+          phase2BatchMaterialized = true;
+        }
+        return investigationWorkers.materializeExecution(input);
+      };
       orchestrationCwd = ctx.cwd;
       orchestrationContext = ctx;
       const dynamicItems = schedule.items as VisibleOrchestrationItem[];
@@ -3071,19 +3096,32 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         serializationEdges: schedule.edges,
         investigationFirst: true,
         investigationWorker: tuiInvestigationWorker,
-        materializeExecution: investigationWorkers.materializeExecution,
-        settleInvestigation: async ({ investigation, result }) => {
+        materializeExecution: tuiMaterializeExecution,
+        settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
           if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+          assertActive?.();
+          if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
           const durableArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: investigation.issue });
-          const intent = durableArtifacts.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent");
-          const investigationArtifact = durableArtifacts.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation");
+          const currentRunId = investigation.runId;
+          const currentInvestigationId = investigation.investigationArtifactId;
+          const scopedArtifacts = durableArtifacts.filter((artifact) => artifact.runId === currentRunId
+            && (artifact.kind !== "Investigation" || currentInvestigationId === undefined || artifact.id === currentInvestigationId));
+          if (scopedArtifacts.some((artifact) => artifact.kind === "Outcome"
+            && artifact.runId === currentRunId
+            && (artifact.payload.status === "invalid" || artifact.payload.status === "decomposed"))) return;
+          assertActive?.();
+          const intent = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent" && artifact.runId === currentRunId);
+          const investigationArtifact = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation" && artifact.id === currentInvestigationId);
           if (!intent || !investigationArtifact) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
           const run = await investigationRuns.load(intent.runId);
           if (!run) throw new Error(`Cannot settle investigation #${investigation.issue}: durable run is missing`);
+          if (run.state !== "investigating") return;
           const settledIssue = await readyGithub.getIssue(investigation.issue, readyRepository.repo);
+          assertActive?.();
           const settledLane = await resolveIssueLane(settledIssue, readyRepository.defaultBranch, readyGithub, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
-          const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: ctx.cwd, target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub });
-          if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: readyGithub, artifacts });
+          const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: ctx.cwd, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+          assertActive?.();
+          if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: readyGithub, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
         },
         resolveDecomposition: async ({ orchestration: durable, node, item, childIssues }) => materializeVisibleDecomposition({
           github: readyGithub,

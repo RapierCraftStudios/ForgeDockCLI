@@ -61,7 +61,7 @@ import { buildSchedulePreview, ClaimPromotionConflictError, materializeClaimDepe
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
 import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
-import { OrchestrationController } from "../workflows/orchestrate/controller.js";
+import { OrchestrationController, type OrchestrationControllerDependencies } from "../workflows/orchestrate/controller.js";
 import { retryWorkOnAgentBudget } from "../workflows/orchestrate/agent-budget-retry.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { acquireNodeLease, inspectNodeLease, orchestrationNodeLeaseBinding, waitForNodeLease } from "../workflows/orchestrate/node-lease.js";
@@ -2127,35 +2127,19 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     for (const targetBranch of new Set([...routedIssues.values()].map(({ lane }) => lane.targetBranch))) {
       discoverVerificationCommands(checkoutRoot, `origin/${targetBranch}`);
     }
-    const materializedResult = assembly.groups.length
-      ? await materializeBatchGroups({
-        repo: repository.repo,
-        groups: assembly.groups,
-        items,
-        host: github,
-        expectedRoutes: new Map(items.map((item) => {
-          const itemRepository = repositoryForScheduledItem(item, repository.repo);
-          const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
-          return [orchestrationRouteCacheKey(itemRepository, item.issue), {
-            targetBranch: route.lane.targetBranch,
-            lane: route.lane.kind,
-            ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
-            ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-          }] as const;
-        })),      })
-      : { groups: [], materialized: [], validatedItems: items };
-    const contracted = materializedResult.validatedItems;
-    for (const materialized of materializedResult.materialized) {
-      const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
-      const member = group?.members[0];
-      if (group && member) {
-        const memberRepository = repositoryForScheduledItem(member, repository.repo);
-        const lane = requiredOrchestrationRoute(routedIssues, { repository: memberRepository, issue: member.issue }).lane;
-        const batchIssue = await github.getIssue(materialized.issue, memberRepository);
-        setOrchestrationRoute(routedIssues, { repository: memberRepository, issue: materialized.issue }, { issue: batchIssue, lane });
-      }
-    }
-    const scheduleItems = materializeClaimDependencies(contracted);
+    // Batch issue creation is phase-2 mutation. The controller receives only a
+    // shadow contraction for phase-1 investigation.
+    const shadowContracted = contractBatchGroups(
+      assembly.selected,
+      assembly.groups,
+      assembly.groups.map((group, index) => ({
+        groupId: group.id,
+        issue: virtualBase + index,
+        title: `Proposed batch ${index + 1}`,
+        summary: "Proposed batch",
+      })),
+    );
+    const scheduleItems = materializeClaimDependencies(shadowContracted);
     const orchestrationId = `dag_${crypto.randomUUID()}`;
     setAgentEventObservationIdentity({
       repository: repository.repo,
@@ -2193,6 +2177,46 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       },
       childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: repository.repo, issue: entry.issue }), undefined),
     }, scheduleItems.items);
+    let phase2BatchMaterialized = false;
+    const phase2MaterializeExecution: NonNullable<OrchestrationControllerDependencies["materializeExecution"]> = async (input) => {
+      input.assertActive?.();
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("Investigation cancelled before batch materialization");
+      if (!phase2BatchMaterialized && assembly.groups.length) {
+        input.assertActive?.();
+        const materializedResult = await materializeBatchGroups({
+          repo: repository.repo,
+          groups: assembly.groups,
+          items,
+          host: github,
+          expectedRoutes: new Map(items.map((item) => {
+            const itemRepository = repositoryForScheduledItem(item, repository.repo);
+            const route = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
+            return [orchestrationRouteCacheKey(itemRepository, item.issue), {
+              targetBranch: route.lane.targetBranch,
+              lane: route.lane.kind,
+              ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
+              ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
+            }] as const;
+          })),
+        });
+        input.assertActive?.();
+        for (const materialized of materializedResult.materialized) {
+          input.assertActive?.();
+          const group = materializedResult.groups.find((candidate) => candidate.id === materialized.groupId);
+          const member = group?.members[0];
+          if (group && member) {
+            const memberRepository = repositoryForScheduledItem(member, repository.repo);
+            const lane = requiredOrchestrationRoute(routedIssues, { repository: memberRepository, issue: member.issue }).lane;
+            const batchIssue = await github.getIssue(materialized.issue, memberRepository);
+            input.assertActive?.();
+            setOrchestrationRoute(routedIssues, { repository: memberRepository, issue: materialized.issue }, { issue: batchIssue, lane });
+          }
+        }
+        phase2BatchMaterialized = true;
+      }
+      input.assertActive?.();
+      return sharedInvestigationWorkers.materializeExecution(input);
+    };
     const controller = new OrchestrationController({
       repository: store,
       executionAdmission: new LeaseBackedOrchestrationExecutionAdmission(store),
@@ -2215,24 +2239,40 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       }),
       isCancelled: async () => false,
       investigationWorker: sharedInvestigationWorkers.investigationWorker,
-      materializeExecution: sharedInvestigationWorkers.materializeExecution,
-      settleInvestigation: async ({ investigation, result }) => {
+      materializeExecution: phase2MaterializeExecution,
+      settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
         if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+        assertActive?.();
+        if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
         const subject = { repo: repository.repo, issue: investigation.issue };
         const durable = await artifacts.list(subject);
-        const intent = durable.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent");
-        const investigationArtifact = durable.find((artifact) => artifact.kind === "Investigation");
+        const currentRunId = investigation.runId;
+        const currentInvestigationId = investigation.investigationArtifactId;
+        const scoped = durable.filter((artifact) => artifact.runId === currentRunId
+          && (artifact.kind !== "Investigation" || currentInvestigationId === undefined || artifact.id === currentInvestigationId));
+        const existingSettlement = scoped.find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome"
+          && artifact.runId === currentRunId
+          && (artifact.payload.status === "invalid" || artifact.payload.status === "decomposed"));
+        if (existingSettlement) return;
+        assertActive?.();
+        if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
+        const intent = scoped.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent" && artifact.runId === currentRunId);
+        const investigationArtifact = scoped.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation" && artifact.id === currentInvestigationId);
         if (!intent || investigationArtifact?.kind !== "Investigation") throw new Error(`Cannot settle invalid #${investigation.issue}: durable investigation identity is missing`);
         const run = await runs.load(intent.runId);
         if (!run) throw new Error(`Cannot settle invalid #${investigation.issue}: durable run is missing`);
+        if (run.state !== "investigating") return;
         const lane = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: investigation.issue }).lane;
         const settled = await resumeInvestigationWorkItem({
           run, intent, investigation: investigationArtifact, cwd: checkoutRoot,
+          ...(settleSignal !== undefined ? { signal: settleSignal } : {}),
           target: runTargetForLane(lane, effective.productionTarget),
           scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
           ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}), ...planning,
-        }, { runtime, artifacts, runs, decomposer: github });
-        if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: github, artifacts });
+        }, { runtime, artifacts, runs, decomposer: github, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+        assertActive?.();
+        if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
+        if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: github, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
       },
       worker: async (item, controllerContext) => {
       const workerAbort = new AbortController();

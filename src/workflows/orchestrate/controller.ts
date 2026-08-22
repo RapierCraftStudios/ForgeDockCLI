@@ -80,6 +80,7 @@ export interface OrchestrationInvestigationResult {
 export interface OrchestrationInvestigationWorkerContext extends OrchestrationWorkerContext {
   phase: "investigation";
   wave: number;
+  assertActive: () => void;
 }
 
 export type OrchestrationInvestigationWorker = (
@@ -91,6 +92,9 @@ export interface OrchestrationExecutionMaterializationInput {
   orchestration: Readonly<OrchestrationRecord>;
   wave: number;
   investigations: readonly OrchestrationInvestigationRecord[];
+  /** Abort and claim fencing for every materializer side effect. */
+  signal?: AbortSignal;
+  assertActive?: () => void;
 }
 
 export interface OrchestrationExecutionMaterialization {
@@ -124,6 +128,8 @@ export interface OrchestrationWorkerContext extends ScheduleWorkerContext {
   recordTask(identity: OrchestrationTaskIdentity): Promise<void>;
   /** Persist a heartbeat correlated to this exact orchestration/node/attempt. */
   heartbeat(at?: string): Promise<void>;
+  /** Controller stop/claim fence for side-effect boundaries. */
+  assertActive?: () => void;
 }
 
 export type OrchestrationWorkOnWorker = (
@@ -238,6 +244,8 @@ export interface OrchestrationControllerDependencies {
     orchestration: Readonly<OrchestrationRecord>;
     investigation: Readonly<OrchestrationInvestigationRecord>;
     result: OrchestrationInvestigationResult;
+    signal?: AbortSignal;
+    assertActive?: () => void;
   }) => Promise<void>;
   /** Optional cancellation fence checked after every investigation settles. */
   isCancelled?: (orchestrationId: string) => boolean | Promise<boolean>;
@@ -266,6 +274,7 @@ interface PersistenceState {
   pending: Promise<void>;
   /** Synthetic scheduler starts wait for the durable launching attempt. */
   deferredStartedEvents: Array<{ itemId: string }>;
+  signal?: AbortSignal;
   error?: unknown;
 }
 
@@ -519,6 +528,7 @@ export class OrchestrationController {
         claim,
         pending: Promise.resolve(),
         deferredStartedEvents: [],
+        signal,
       };
       control.state = state;
       const dynamicTransportCapacity = typeof this.dependencies.transportCapacity === "function";
@@ -653,9 +663,13 @@ export class OrchestrationController {
     if (!durable.length) throw new Error(`Investigation wave ${wave} has no durable members`);
     const byNode = new Map(durable.map((entry) => [entry.nodeId, entry]));
     const items = record.nodes
-      .filter((node) => byNode.has(node.id) && byNode.get(node.id)!.status !== "completed")
-      // Investigation workers are deliberately independent: future implementation
-      // paths and claims must never serialize read-only discovery.
+      .filter((node) => {
+        const investigation = byNode.get(node.id);
+        if (!investigation || (investigation.status !== "queued" && investigation.status !== "running")) return false;
+        // A terminal investigation outcome is authoritative even when the
+        // corresponding node was not durably advanced before a crash.
+        return node.status !== "completed" && node.status !== "invalid" && node.status !== "skipped";
+      })
       .map((node) => ({ ...itemFromNodeRecord(node), dependencies: [], claims: [] }));
     const outcomes = new Map<string, OrchestrationInvestigationResult>();
     let activeInvestigations = 0;
@@ -665,51 +679,59 @@ export class OrchestrationController {
       items,
       state.record.effectiveMaxParallel ?? state.record.maxParallel,
       async (item, schedulerContext) => {
-        let attempt = await this.beginAttempt(state, item.id, "initial");
+        const attempt = await this.beginAttempt(state, item.id, "initial");
         activeInvestigations += 1;
         peakInvestigations = Math.max(peakInvestigations, activeInvestigations);
-        const maxAttempts = this.dependencies.investigationMaxAttempts ?? 2;
+        this.updateInvestigation(state, item.id, (entry) => ({
+          ...entry, status: "running", attemptCount: entry.attemptCount + 1,
+          startedAt: entry.startedAt ?? this.now(),
+        }));
+        await this.flush(state);
+        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationInvestigationWorkerContext;
+        context.phase = "investigation";
+        context.wave = wave;
         let result: OrchestrationInvestigationResult;
-        for (;;) {
-          this.updateInvestigation(state, item.id, (entry) => ({
-            ...entry, status: "running", attemptCount: entry.attemptCount + 1,
-            startedAt: entry.startedAt ?? this.now(),
-          }));
-          await this.flush(state);
-          const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationInvestigationWorkerContext;
-          context.phase = "investigation";
-          context.wave = wave;
-          try {
-            result = await worker(item, context);
-            state.claim.assertValid();
-            break;
-          } catch (error) {
-            await this.failAttempt(state, item.id, attempt.attemptId, error);
-            const entry = byNode.get(item.id)!;
-            const attempts = state.record.investigations?.find((candidate) => candidate.nodeId === item.id)?.attemptCount ?? entry.attemptCount;
-            if (attempts >= maxAttempts) {
-              this.updateInvestigation(state, item.id, (current) => ({ ...current, status: "failed", error: error instanceof Error ? error.message : String(error) }));
-              await this.flush(state);
-              activeInvestigations -= 1;
-              throw error;
-            }
-            attempt = await this.beginAttempt(state, item.id, "relaunch", attempt.attemptId);
+        try {
+          result = await worker(item, context);
+          state.claim.assertValid();
+        } catch (error) {
+          await this.failAttempt(state, item.id, attempt.attemptId, error);
+          const investigation = state.record.investigations?.find((candidate) => candidate.nodeId === item.id);
+          const retryAttempt = investigation?.attemptCount ?? 1;
+          const retry = retryResultForError(error, retryAttempt, investigationAttemptRateLimit(state, item.id));
+          if (retry && !context.signal?.aborted) {
+            this.updateInvestigation(state, item.id, (entry) => ({
+              ...entry,
+              status: retry.status === "retry_wait" ? "queued" : "failed",
+              error: retry.error instanceof Error ? retry.error.message : String(retry.error ?? error),
+            }));
+            await this.flush(state);
+            activeInvestigations -= 1;
+            return retry;
           }
+          this.updateInvestigation(state, item.id, (entry) => ({ ...entry, status: "failed", error: error instanceof Error ? error.message : String(error) }));
+          await this.flush(state);
+          activeInvestigations -= 1;
+          throw error;
         }
-        outcomes.set(item.id, result!);
+        state.claim.assertValid();
+        if (context.signal?.aborted) throw context.signal.reason ?? new Error("Investigation cancelled after worker completion");
+        outcomes.set(item.id, result);
         await this.finishAttempt(state, item.id, attempt.attemptId, {
-          status: result!.outcome === "confirmed" ? "completed" : result!.outcome === "invalid" ? "invalid" : "skipped",
-          ...(result!.childIssues ? { childIssues: result!.childIssues } : {}),
+          status: result.outcome === "confirmed" ? "completed" : result.outcome === "invalid" ? "invalid" : "skipped",
+          ...(result.childIssues ? { childIssues: result.childIssues } : {}),
         });
         this.updateInvestigation(state, item.id, (entry) => ({
-          ...entry, status: "completed", outcome: result!.outcome,
-          ...(result!.baseSha !== undefined ? { baseSha: result!.baseSha } : {}),
-          ...(result!.evidence !== undefined ? { evidence: structuredClone(result!.evidence) } : {}),
+          ...entry, status: "completed", outcome: result.outcome,
+          ...(result.baseSha !== undefined ? { baseSha: result.baseSha } : {}),
+          ...(result.evidence?.runId !== undefined ? { runId: String(result.evidence.runId) } : {}),
+          ...(result.evidence?.investigationId !== undefined ? { investigationArtifactId: String(result.evidence.investigationId) } : {}),
+          ...(result.evidence !== undefined ? { evidence: structuredClone(result.evidence) } : {}),
           completedAt: this.now(),
         }));
         await this.flush(state);
         activeInvestigations -= 1;
-        return { status: result!.outcome === "confirmed" ? "completed" : result!.outcome === "invalid" ? "invalid" : "skipped", ...(result!.childIssues ? { childIssues: result!.childIssues } : {}) };
+        return { status: result.outcome === "confirmed" ? "completed" : result.outcome === "invalid" ? "invalid" : "skipped", ...(result.childIssues ? { childIssues: result.childIssues } : {}) };
       },
       { serializationEdges: [] },
     );
@@ -721,7 +743,8 @@ export class OrchestrationController {
       investigationWaveConcurrency: [...waveMetrics.investigationWaveConcurrency, peakInvestigations],
       runnableFrontier: [...waveMetrics.runnableFrontier, items.length],
     }, updatedAt: this.now() });
-    if (latest.some((entry) => entry.status !== "completed")) {
+    if (latest.some((entry) => entry.status !== "completed"
+      || ((entry.outcome === "invalid" || entry.outcome === "decompose") && entry.settledAt === undefined))) {
       state.record.metrics = {
         ...(state.record.metrics ?? { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 }),
         barrierWaits: (state.record.metrics?.barrierWaits ?? 0) + 1,
@@ -737,16 +760,42 @@ export class OrchestrationController {
       throw new Error(`Orchestration ${record.orchestrationId} was cancelled at the investigation barrier`);
     }
     const settle = this.dependencies.settleInvestigation;
+    const assertInvestigationActive = (): void => {
+      if (state.signal?.aborted) throw state.signal.reason ?? new Error("Investigation cancelled before materialization");
+      state.claim.assertValid();
+    };
     if (settle) {
       for (const entry of latest) {
         if (entry.outcome !== "invalid" && entry.outcome !== "decompose") continue;
+        if (entry.settledAt !== undefined) continue;
+        assertInvestigationActive();
         const result = outcomes.get(entry.nodeId) ?? { outcome: entry.outcome, ...(entry.evidence !== undefined ? { evidence: entry.evidence } : {}), ...(entry.baseSha !== undefined ? { baseSha: entry.baseSha } : {}) };
-        await settle({ orchestration: structuredClone(state.record), investigation: structuredClone(entry), result });
-        state.claim.assertValid();
+        await settle({
+          orchestration: structuredClone(state.record),
+          investigation: structuredClone(entry),
+          result,
+          ...(state.signal !== undefined ? { signal: state.signal } : {}),
+          assertActive: assertInvestigationActive,
+        });
+        assertInvestigationActive();
+        this.updateInvestigation(state, entry.nodeId, (current) => ({
+          ...current,
+          settledAt: this.now(),
+          settlementOutcome: result.outcome,
+          ...(result.childIssues !== undefined ? { settlementChildIssues: [...result.childIssues] } : {}),
+        }));
+        await this.flush(state);
       }
     }
-    const materialized = await materialize({ orchestration: structuredClone(state.record), wave, investigations: latest.map((entry) => structuredClone(entry)) });
-    state.claim.assertValid();
+    assertInvestigationActive();
+    const materialized = await materialize({
+      orchestration: structuredClone(state.record),
+      wave,
+      investigations: latest.map((entry) => structuredClone(entry)),
+      ...(state.signal !== undefined ? { signal: state.signal } : {}),
+      assertActive: assertInvestigationActive,
+    });
+    assertInvestigationActive();
     const nextItems = materialized.items.map(cloneScheduledItem);
     const nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
     validateGraph(nextItems, nextEdges);
@@ -1447,6 +1496,11 @@ export class OrchestrationController {
   ): OrchestrationWorkerContext {
     return {
       ...(schedulerContext.signal !== undefined ? { signal: schedulerContext.signal } : {}),
+      assertActive: () => {
+        assertAttemptActive(state.record, item.id, attemptId);
+        state.claim.assertValid();
+        if (state.signal?.aborted) throw state.signal.reason ?? new Error("Orchestration stopped");
+      },
       orchestrationId: state.record.orchestrationId,
       executionAttempt: state.record.executionAttempt ?? 0,
       attemptId,
@@ -2484,6 +2538,11 @@ function resumedLiveAttempt(
     updatedAt: now,
     ...(heartbeatAt !== undefined ? { lastHeartbeatAt: heartbeatAt } : {}),
   };
+}
+
+function investigationAttemptRateLimit(state: PersistenceState, nodeId: string): OrchestrationWorkerAttemptRecord["rateLimit"] | undefined {
+  const node = state.record.nodes.find((candidate) => candidate.id === nodeId);
+  return node?.attempts?.at(-1)?.rateLimit;
 }
 
 function retryResultForError(

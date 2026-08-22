@@ -57,7 +57,7 @@ export async function completeInvalidWorkItem(
     /** Durable batch contracts are accepted as a typed fallback for member identity. */
     memberContracts?: readonly BatchMemberContract[];
   },
-  dependencies: { host: ForgeHost; artifacts: ArtifactRepository },
+  dependencies: { host: ForgeHost; artifacts: ArtifactRepository; signal?: AbortSignal; assertActive?: () => void },
 ): Promise<{ run: RunState; outcome: DurableArtifact<"Outcome"> }> {
   if (input.run.state !== "invalid") throw new Error(`Invalid closure requires invalid state, found ${input.run.state}`);
   if (input.investigation.payload.outcome !== "invalid") throw new Error("Invalid closure requires an invalid Investigation artifact");
@@ -80,6 +80,11 @@ export async function completeInvalidWorkItem(
   const childIssues = contractedChildIssues ?? reportedChildIssues;
   const isBatch = childIssues.length > 0;
   const terminalOutcomeId = deterministicOutcomeId(input.run.runId, input.run.subject, "invalid:closure-completed");
+  const assertActive = (): void => {
+    if (dependencies.signal?.aborted) throw dependencies.signal.reason ?? new Error("Invalid settlement cancelled");
+    dependencies.assertActive?.();
+  };
+  assertActive();
   try {
     const reason = `ForgeDock investigation ${input.investigation.id} proved this issue invalid: ${input.outcome.payload.reason} (evidence artifact ${input.investigation.id}).`;
     const durableFinal = (await dependencies.artifacts.list(input.run.subject, "Outcome"))
@@ -87,17 +92,20 @@ export async function completeInvalidWorkItem(
     if (durableFinal) {
       const projection = assertMatchingInvalidOutcome(durableFinal, input.run, childIssues);
       if (isBatch) {
+        assertActive();
         await assertDurableInvalidBatchProjection(
           dependencies.host,
           input.run.subject.repo,
           childIssues,
           projection.completed,
         );
-        await ensureIssueClosed(dependencies.host, input.run.subject.repo, issue, reason);
+        await ensureIssueClosed(dependencies.host, input.run.subject.repo, issue, reason, dependencies.signal, dependencies.assertActive);
       } else {
         // Keep the single-issue closure behavior: the close command remains
         // idempotent at the typed host boundary even for an already-closed issue.
+        assertActive();
         await dependencies.host.closeIssue(input.run.subject.repo, issue, reason);
+        assertActive();
         await assertClosedIssue(dependencies.host, input.run.subject.repo, issue);
       }
       return { run: input.run, outcome: durableFinal };
@@ -105,6 +113,7 @@ export async function completeInvalidWorkItem(
 
     let batchProjection: InvalidBatchProjection | undefined;
     if (isBatch) {
+      assertActive();
       batchProjection = await projectInvalidBatchMembers({
         run: input.run,
         investigation: input.investigation,
@@ -112,12 +121,16 @@ export async function completeInvalidWorkItem(
         childIssues,
         artifacts: dependencies.artifacts,
         host: dependencies.host,
+        ...(dependencies.signal !== undefined ? { signal: dependencies.signal } : {}),
+        ...(dependencies.assertActive !== undefined ? { assertActive: dependencies.assertActive } : {}),
       });
-      // A batch terminal projection is only authoritative once every eligible
-      // member and the synthetic aggregate itself are proven CLOSED by the host.
-      await ensureIssueClosed(dependencies.host, input.run.subject.repo, issue, reason);
+      // Batch members and the aggregate must be rechecked after projection.
+      assertActive();
+      await ensureIssueClosed(dependencies.host, input.run.subject.repo, issue, reason, dependencies.signal, dependencies.assertActive);
     } else {
+      assertActive();
       await dependencies.host.closeIssue(input.run.subject.repo, issue, reason);
+      assertActive();
       await assertClosedIssue(dependencies.host, input.run.subject.repo, issue);
     }
     if (closure?.status === "completed" && !isBatch) return { run: input.run, outcome: input.outcome };
@@ -149,7 +162,9 @@ export async function completeInvalidWorkItem(
     }, {
       id: terminalOutcomeId,
     });
+    assertActive();
     await dependencies.artifacts.append(finalized);
+    assertActive();
     return { run: input.run, outcome: finalized };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -865,17 +880,25 @@ async function projectInvalidBatchMembers(input: {
   childIssues: readonly number[];
   artifacts: ArtifactRepository;
   host: ForgeHost;
+  signal?: AbortSignal;
+  assertActive?: () => void;
 }): Promise<InvalidBatchProjection> {
   const parentIssue = input.run.subject.issue;
   if (!parentIssue) throw new Error("Invalid batch closure requires an aggregate issue subject");
   const completed: number[] = [];
   const preserved: Array<{ issue: number; labels: string[] }> = [];
   for (const childIssue of input.childIssues) {
+    const assertActive = (): void => {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("Invalid batch member settlement cancelled");
+      input.assertActive?.();
+    };
+    assertActive();
     const childSubject = { repo: input.run.subject.repo, issue: childIssue };
     const childReason = `ForgeDock batch issue #${parentIssue} was authoritatively classified invalid for member #${childIssue}: ${input.aggregateReason}`;
     const childOutcomeId = deterministicOutcomeId(input.run.runId, childSubject, `invalid:batch:${parentIssue}`);
     const durableChild = (await input.artifacts.list(childSubject, "Outcome"))
       .find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.id === childOutcomeId);
+    assertActive();
     const observed = await readIssue(input.host, childSubject.repo, childIssue);
     if (durableChild) {
       assertMatchingInvalidBatchMemberOutcome(durableChild, input.run, childIssue, parentIssue);
@@ -890,8 +913,13 @@ async function projectInvalidBatchMembers(input: {
       preserved.push({ issue: childIssue, labels: protectedLabels });
       continue;
     }
-    if (observed.state === "OPEN") await input.host.closeIssue?.(childSubject.repo, childIssue, childReason);
+    if (observed.state === "OPEN") {
+      assertActive();
+      await input.host.closeIssue?.(childSubject.repo, childIssue, childReason);
+      assertActive();
+    }
     await assertClosedIssue(input.host, childSubject.repo, childIssue);
+    assertActive();
     const childOutcome = createArtifact({
       kind: "Outcome",
       runId: input.run.runId,
@@ -913,7 +941,9 @@ async function projectInvalidBatchMembers(input: {
         batchParent: parentIssue,
       },
     }, { id: childOutcomeId });
+    assertActive();
     await input.artifacts.append(childOutcome);
+    assertActive();
     completed.push(childIssue);
   }
   return { completed, preserved };
@@ -958,10 +988,28 @@ function assertMatchingInvalidBatchMemberOutcome(
   }
 }
 
-async function ensureIssueClosed(host: ForgeHost, repo: string, issue: number, reason: string): Promise<void> {
+async function ensureIssueClosed(
+  host: ForgeHost,
+  repo: string,
+  issue: number,
+  reason: string,
+  signal?: AbortSignal,
+  assertActive?: () => void,
+): Promise<void> {
+  const assertClosureActive = (): void => {
+    if (signal?.aborted) throw signal.reason ?? new Error("Invalid issue closure cancelled");
+    assertActive?.();
+  };
+  assertClosureActive();
   const observed = await readIssue(host, repo, issue);
-  if (observed.state === "OPEN") await host.closeIssue?.(repo, issue, reason);
+  assertClosureActive();
+  if (observed.state === "OPEN") {
+    assertClosureActive();
+    await host.closeIssue?.(repo, issue, reason);
+    assertClosureActive();
+  }
   await assertClosedIssue(host, repo, issue);
+  assertClosureActive();
 }
 
 function assertMatchingInvalidOutcome(

@@ -54,11 +54,18 @@ export async function materializeCliDecomposition(input: {
   item: ScheduledWorkItem;
   childIssues?: readonly number[];
   routedIssues?: OrchestrationRouteCache<{ issue: Awaited<ReturnType<GitHubClient["getIssue"]>>; lane: IssueLane }>;
+  signal?: AbortSignal;
+  assertActive?: () => void;
 }): Promise<{
   childIssues: readonly number[];
   items: readonly ScheduledWorkItem[];
   serializationEdges?: readonly { predecessor: string; successor: string; overlappingClaims: readonly string[] }[];
 } | undefined> {
+  const assertActive = (): void => {
+    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Decomposition materialization cancelled");
+    input.assertActive?.();
+  };
+  assertActive();
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
     const scheduledRepository = input.item.repository ?? input.repository;

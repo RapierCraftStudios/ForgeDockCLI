@@ -42,6 +42,9 @@ export type OrchestrationInvestigationOutcome = "confirmed" | "invalid" | "decom
 export interface OrchestrationInvestigationRecord {
   issue: number;
   nodeId: string;
+  /** Exact durable run and artifact identities for settlement scoping. */
+  runId?: string;
+  investigationArtifactId?: string;
   wave: number;
   baseSha?: string;
   targetBranch?: string;
@@ -52,6 +55,10 @@ export interface OrchestrationInvestigationRecord {
   attemptCount: number;
   startedAt?: string;
   completedAt?: string;
+  /** Idempotent controller settlement receipt, written after semantic side effects succeed. */
+  settledAt?: string;
+  settlementOutcome?: OrchestrationInvestigationOutcome;
+  settlementChildIssues?: number[];
   error?: string;
 }
 

@@ -29,6 +29,8 @@ export interface InvestigateDependencies {
   runs: RunRepository;
   decomposer?: Pick<ForgeHost, "materializeDecomposition">;
   onAgentEvent?: AgentEventSink;
+  /** Controller settlement fence for external/artifact side effects. */
+  assertActive?: () => void;
 }
 
 export interface InvestigateInput {
@@ -112,8 +114,11 @@ export async function investigateWorkItem(
     scopeManifest,
   });
   run = attachArtifact(run, "Intent", input.intent.id);
+  dependencies.assertActive?.();
   await dependencies.artifacts.append(input.intent);
+  dependencies.assertActive?.();
   await dependencies.runs.create(run);
+  dependencies.assertActive?.();
   run = await applyTransition(dependencies.runs, run, "START_INVESTIGATION");
   return continueInvestigation(input, dependencies, run, scopeManifest);
 }
@@ -210,6 +215,7 @@ async function continueInvestigation(
       if (input.signal?.aborted) {
         await throwInvestigationCancellation(dependencies, run, input.signal);
       }
+      dependencies.assertActive?.();
       enforceInvestigationSemantics(agentResult.output);
       investigation = createArtifact({
         kind: "Investigation",
@@ -223,7 +229,9 @@ async function continueInvestigation(
         },
         payload: agentResult.output,
       });
+      dependencies.assertActive?.();
       await dependencies.artifacts.append(investigation);
+      dependencies.assertActive?.();
       sessionRef = agentResult.sessionRef;
     }
 
@@ -279,12 +287,13 @@ async function finishInvestigation(
       throw new Error("Decomposition requires a controller issue materializer");
     }
     const childIssues = investigation.payload.outcome === "decompose"
-      ? (await dependencies.decomposer!.materializeDecomposition({
+      ? (dependencies.assertActive?.(), (await dependencies.decomposer!.materializeDecomposition({
         repo: run.subject.repo,
         parentIssue: run.subject.issue ?? (() => { throw new Error("Decomposition requires an issue subject"); })(),
         children: investigation.payload.decomposition ?? [],
-      })).map((issue) => `#${issue.number} — ${issue.title} (${issue.url})`)
+      })).map((issue) => `#${issue.number} — ${issue.title} (${issue.url})`))
       : [];
+    dependencies.assertActive?.();
     const status = investigation.payload.outcome === "invalid" ? "invalid" : "decomposed";
     outcome = createArtifact({
       kind: "Outcome",
@@ -309,10 +318,13 @@ async function finishInvestigation(
     }, {
       id: deterministicOutcomeId(run.runId, run.subject, `${status}:investigation`),
     });
+    dependencies.assertActive?.();
     await dependencies.artifacts.append(outcome);
+    dependencies.assertActive?.();
     run = attachArtifact(run, "Outcome", outcome.id);
   }
 
+  dependencies.assertActive?.();
   const event: TransitionEvent = investigation.payload.outcome === "confirmed"
     ? "INVESTIGATION_CONFIRMED"
     : investigation.payload.outcome === "invalid"

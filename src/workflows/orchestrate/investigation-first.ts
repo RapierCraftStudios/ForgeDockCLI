@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { createArtifact } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type {
@@ -11,6 +13,8 @@ import type { ScheduledWorkItem, ClaimSerializationEdge } from "./scheduler.js";
 import { investigateWorkItem } from "../work-on/investigate.js";
 import { STANDARD_SCOPE_METADATA_ROOTS, type AgentRuntime } from "../../runtime/agent-runtime.js";
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
+
+const execFile = promisify(execFileCallback);
 
 export interface InvestigationFirstIssue {
   title: string;
@@ -48,6 +52,8 @@ export interface InvestigationFirstFactoryOptions {
     orchestration: Readonly<OrchestrationRecord>;
     item: ScheduledWorkItem;
     childIssues: readonly number[];
+    signal?: AbortSignal;
+    assertActive?: () => void;
   }): Promise<{ items: readonly ScheduledWorkItem[] } | undefined>;
   childIssuesFor?(entry: OrchestrationInvestigationRecord): Promise<readonly number[]>;
 }
@@ -85,6 +91,7 @@ export function createInvestigationFirstWorkers(
     });
     await context.recordTask({ runId: intent.runId });
     const baseSha = await contextBaseSha(options, route, item);
+    await assertExactCheckout(options.checkoutRoot, baseSha);
     const investigated = await investigateWorkItem({
       intent,
       cwd: options.checkoutRoot,
@@ -104,13 +111,24 @@ export function createInvestigationFirstWorkers(
       ...(options.model !== undefined ? { model: options.model } : {}),
       ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
       ...(options.planning ?? {}),
-    }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs });
+      ...(context.signal !== undefined ? { signal: context.signal } : {}),
+    }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs, ...(context.signal !== undefined ? { signal: context.signal } : {}), assertActive: context.assertActive });
+    if (context.signal?.aborted) throw context.signal.reason ?? new Error("Investigation cancelled before interpretation");
+    await assertExactCheckout(options.checkoutRoot, baseSha);
+    const observedBaseSha = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+    if (observedBaseSha !== baseSha) {
+      const drift = new Error(`Investigation base drifted for ${item.id}: expected ${baseSha}, observed ${observedBaseSha}`);
+      Object.assign(drift, { code: "base-drift", domain: "workflow" });
+      throw drift;
+    }
     const payload = investigated.investigation.payload;
     return {
       outcome: payload.outcome,
       baseSha,
       evidence: {
         investigationId: investigated.investigation.id,
+        runId: intent.runId,
+        baseSha,
         rootCause: payload.rootCause ?? null,
         summary: payload.summary,
         affectedSurfaces: payload.affectedSurfaces,
@@ -119,7 +137,12 @@ export function createInvestigationFirstWorkers(
     };
   };
 
-  const materializeExecution: OrchestrationExecutionMaterializer = async ({ orchestration, investigations }) => {
+  const materializeExecution: OrchestrationExecutionMaterializer = async ({ orchestration, investigations, signal, assertActive }) => {
+    const assertMaterializationActive = (): void => {
+      if (signal?.aborted) throw signal.reason ?? new Error("Investigation cancelled before materialization side effect");
+      assertActive?.();
+    };
+    assertMaterializationActive();
     const confirmed = new Set(investigations.filter((entry) => entry.outcome === "confirmed").map((entry) => entry.nodeId));
     const sourceItems = options.sourceItems(orchestration, initialItems);
     const items = sourceItems.filter((item) => confirmed.has(item.id));
@@ -131,6 +154,7 @@ export function createInvestigationFirstWorkers(
       .map((edge): ClaimSerializationEdge => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] }));
     const nextInvestigationItems: ScheduledWorkItem[] = [];
     for (const entry of investigations.filter((candidate) => candidate.outcome === "decompose")) {
+      assertMaterializationActive();
       const parent = orchestration.nodes.find((node) => node.id === entry.nodeId);
       if (!parent) throw new Error(`Decomposition parent ${entry.nodeId} is missing from the durable investigation set`);
       const expansion = await options.materializeDecomposition({
@@ -143,6 +167,8 @@ export function createInvestigationFirstWorkers(
           claims: [],
         },
         childIssues: await options.childIssuesFor?.(entry) ?? [],
+        ...(signal !== undefined ? { signal } : {}),
+        assertActive: assertMaterializationActive,
       });
       if (expansion) nextInvestigationItems.push(...expansion.items);
     }
@@ -155,6 +181,18 @@ export function createInvestigationFirstWorkers(
   return { investigationWorker, materializeExecution };
 }
 
+async function assertExactCheckout(cwd: string, expectedSha: string): Promise<void> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFile("git", ["rev-parse", "HEAD"], { cwd, maxBuffer: 128 * 1024 }));
+  } catch (error) {
+    throw new Error(`Investigation requires an exact git checkout at ${expectedSha}`, { cause: error });
+  }
+  const observed = stdout.trim();
+  if (observed.toLowerCase() !== expectedSha.toLowerCase()) {
+    throw new Error(`Investigation checkout drifted: expected local HEAD ${expectedSha}, observed ${observed}`);
+  }
+}
 async function contextBaseSha(
   options: InvestigationFirstFactoryOptions,
   route: InvestigationFirstRoute,
