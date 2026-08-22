@@ -138,6 +138,9 @@ export async function resumeInvestigationWorkItem(
   if (input.run.state !== "investigating") {
     throw new Error(`Investigation recovery requires investigating state, found ${input.run.state}`);
   }
+  if (input.signal?.aborted) {
+    await throwInvestigationCancellation(dependencies, input.run, input.signal);
+  }
   if (input.investigation) {
     assertInvestigationMatches(input.run, input.investigation);
     enforceInvestigationSemantics(input.investigation.payload);
@@ -199,6 +202,12 @@ async function continueInvestigation(
         ...(dependencies.onAgentEvent !== undefined ? { onEvent: dependencies.onAgentEvent } : {}),
       });
 
+      // The runtime may resolve after observing an abort without rejecting.
+      // This is the semantic admission barrier: cancellation must win before
+      // any interpretation, artifact creation, or downstream materialization.
+      if (input.signal?.aborted) {
+        await throwInvestigationCancellation(dependencies, run, input.signal);
+      }
       enforceInvestigationSemantics(agentResult.output);
       investigation = createArtifact({
         kind: "Investigation",
@@ -221,8 +230,13 @@ async function continueInvestigation(
       run,
       investigation,
       sessionRef ?? `durable:${investigation.id}`,
+      input.signal,
     );
   } catch (error) {
+    if (error instanceof WorkflowExecutionError && error.run.state === "cancelled") throw error;
+    if (input.signal?.aborted) {
+      await throwInvestigationCancellation(dependencies, run, input.signal);
+    }
     const reason = error instanceof Error ? error.message : String(error);
     if (isRecoverableAgentExecutionError(error)) {
       const checkpoint = await applyTransition(dependencies.runs, run, "RESUME_INVESTIGATION", reason);
@@ -238,7 +252,14 @@ async function finishInvestigation(
   initialRun: RunState,
   investigation: DurableArtifact<"Investigation">,
   sessionRef: string,
+  signal?: AbortSignal,
 ): Promise<InvestigateResult> {
+  // Keep this guard next to the semantic/artifact/decomposition boundary as a
+  // second defense if cancellation is raised between the caller's post-await
+  // check and this function.
+  if (signal?.aborted) {
+    await throwInvestigationCancellation(dependencies, initialRun, signal);
+  }
   let run = attachArtifact(initialRun, "Investigation", investigation.id);
   let outcome: DurableArtifact<"Outcome"> | undefined;
   if (investigation.payload.outcome !== "confirmed") {
@@ -330,6 +351,29 @@ async function applyTransition(
   const result = transition(current, event, reason !== undefined ? { reason } : {});
   await repository.commit(current.version, result.state, result.record);
   return result.state;
+}
+
+async function throwInvestigationCancellation(
+  dependencies: InvestigateDependencies,
+  run: RunState,
+  signal: AbortSignal,
+): Promise<never> {
+  const abortReason = signal.reason ?? new Error("Investigation cancelled");
+  const reason = abortReason instanceof Error ? abortReason.message : String(abortReason);
+  const checkpoint = run.state === "cancelled"
+    ? run
+    : await applyTransition(dependencies.runs, run, "CANCEL", reason);
+  throw new WorkflowExecutionError(reason, checkpoint, {
+    cause: abortReason,
+    recoverable: false,
+    retryDisposition: {
+      disposition: "permanent",
+      retryable: false,
+      domain: "workflow",
+      code: "cancelled",
+      cause: abortReason instanceof Error ? abortReason : new Error(reason),
+    },
+  });
 }
 
 function enforceInvestigationSemantics(payload: InvestigationPayload): void {
