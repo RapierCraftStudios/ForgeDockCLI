@@ -23,7 +23,7 @@
 - Review continuity now uses a durable `FindingRootLedger` and schema-v4 exact-SHA initial/closure plans. Omission does not close an open root. Controller-owned `mustFix` is distinct from final `blocking`: qualifying medium roots can remain nonblocking while still forcing `request_changes`, bounded remediation, re-verification, and closure review.
 - Dogfood readiness is now tracked as phased certification waves. Implementation and local regression evidence do not constitute a readiness claim; certification remains open.
 - Orchestration now projects queued claim conflicts, retries, and automatic recovery as `workflow:waiting`; exact DAG/node/attempt fencing prevents stale projections from reclaiming newer active or terminal labels, and resuming workers restores active run labels.
-- TUI task warnings now correlate orchestration launch identities so a live replacement suppresses predecessor no-activity warnings while genuinely stranded tasks remain visible.
+- TUI-launched orchestration now uses the same attempt-fenced GitHub node-state projection as CLI launches; tokenless preview confirmation preserves one frozen checkpoint across settled/background turns; remediating checkpoints relaunch with bounded scheduler metadata; semantic stop preserves concurrently completed nodes.
 
 ### Fixed
 

@@ -23,6 +23,8 @@ export interface ScheduledWorkItem {
   retryNextAt?: string;
   retryAttempt?: number;
   retryMaxAttempts?: number;
+  retryCode?: string;
+  retryOperationKey?: string;
   lane?: "fast" | "feature";
   promotionTarget?: string;
   productionTarget?: string;
@@ -49,6 +51,12 @@ export type ScheduleWorkerResult = void | {
   retryDomain?: string;
   retryCode?: string;
   operationKey?: string;
+  /** Typed durable workflow checkpoint disposition; scheduler treats it as a bounded relaunch, not suspension. */
+  recoverableCheckpoint?: {
+    kind: "remediation";
+    checkpointKey: string;
+    remainingCycles: number;
+  };
   /** Authoritative replacement issue numbers returned by a decomposition outcome. */
   childIssues?: readonly number[];
 };
@@ -360,6 +368,8 @@ export async function runSchedule(
   const startOrder: string[] = [];
   const running = new Map<string, Promise<void>>();
   const retryWakeups = new Map<string, Promise<void>>();
+  const recoverableCheckpointAttempts = new Map<string, number>();
+  const recoverableCheckpointKeys = new Map<string, string>();
   const targetRecoveryWakeups = new Map<string, Promise<void>>();
   const targetRecoveryWakeQueue: Array<{ itemId: string; at: number; resolve: () => void; reject: (error: unknown) => void }> = [];
   let targetRecoveryWakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -374,6 +384,12 @@ export async function runSchedule(
     }
     if (item.retryMaxAttempts !== undefined && Number.isSafeInteger(item.retryMaxAttempts) && item.retryMaxAttempts > 0) {
       targetRecoveryMaxAttempts.set(item.id, Math.min(3, item.retryMaxAttempts));
+    }
+    if (item.retryCode === "remediation-checkpoint" && item.retryOperationKey !== undefined) {
+      recoverableCheckpointKeys.set(item.id, item.retryOperationKey);
+      // The durable wait reason describes the next relaunch ordinal. A
+      // restart must not count that pending relaunch as already consumed.
+      recoverableCheckpointAttempts.set(item.id, Math.max(0, (item.retryAttempt ?? 1) - 1));
     }
   }
   let occupiedIssueSlots = 0;
@@ -656,16 +672,29 @@ export async function runSchedule(
           } else if (outcome.status === "retry_wait") {
             const nextAttemptAt = outcome.nextAttemptAt
               ?? new Date(Date.now() + (outcome.retryAfterMs ?? 0)).toISOString();
-            const targetMovement = outcome.retryCode === "target-advanced"
-              || outcome.targetAdvanceCheckpointId !== undefined;
-            const attempt = targetMovement
-              ? Math.max((targetRecoveryAttempts.get(item.id) ?? 0) + 1, outcome.attempt ?? 1)
-              : (outcome.attempt ?? 1);
-            const maxAttempts = targetMovement
-              ? Math.max(1, Math.min(3,
-                targetRecoveryMaxAttempts.get(item.id) ?? outcome.maxAttempts ?? 3,
-                outcome.maxAttempts ?? targetRecoveryMaxAttempts.get(item.id) ?? 3))
-              : (outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER);
+            const recoverable = outcome.recoverableCheckpoint;
+            const targetMovement = !recoverable && (outcome.retryCode === "target-advanced"
+              || outcome.targetAdvanceCheckpointId !== undefined);
+            if (recoverable && recoverableCheckpointKeys.get(item.id) !== recoverable.checkpointKey) {
+              recoverableCheckpointKeys.set(item.id, recoverable.checkpointKey);
+              recoverableCheckpointAttempts.set(item.id, 0);
+            }
+            // Worker reports can repeat attempt one after each target move. The
+            // scheduler owns the monotonic budget and must not let stale
+            // transport evidence replenish it.
+            const attempt = recoverable
+              ? (recoverableCheckpointAttempts.get(item.id) ?? 0) + 1
+              : targetMovement
+                ? Math.max((targetRecoveryAttempts.get(item.id) ?? 0) + 1, outcome.attempt ?? 1)
+                : (outcome.attempt ?? 1);
+            const maxAttempts = recoverable
+              ? Math.max(1, Math.min(outcome.maxAttempts ?? recoverable.remainingCycles, recoverable.remainingCycles))
+              : targetMovement
+                ? Math.max(1, Math.min(3,
+                  targetRecoveryMaxAttempts.get(item.id) ?? outcome.maxAttempts ?? 3,
+                  outcome.maxAttempts ?? targetRecoveryMaxAttempts.get(item.id) ?? 3))
+                : (outcome.maxAttempts ?? Number.MAX_SAFE_INTEGER);
+            if (recoverable) recoverableCheckpointAttempts.set(item.id, attempt);
             if (targetMovement) {
               targetRecoveryAttempts.set(item.id, attempt);
               targetRecoveryMaxAttempts.set(item.id, maxAttempts);
@@ -680,14 +709,16 @@ export async function runSchedule(
               attempt,
               maxAttempts,
             });
-            if (attempt >= maxAttempts) {
+            const exhausted = recoverable ? attempt > maxAttempts : attempt >= maxAttempts;
+            if (exhausted) {
               status.set(item.id, "failed");
               updateQueuedWaitReason(item.id, undefined, false);
               emit("failed", item.id);
             } else {
               // Retry waits do not occupy worker capacity or a node lease. Keep
               // the DAG running and wake exactly this item when its durable
-              // deadline arrives; dependents remain queued meanwhile.
+              // deadline arrives; recoverable checkpoints use a zero-delay,
+              // bounded relaunch rather than generic suspension.
               queuedCount++;
               const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
               const wake = waitForRetry(delay).then(() => {

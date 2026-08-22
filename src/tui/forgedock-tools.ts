@@ -59,7 +59,7 @@ import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
-import { OrchestrationController, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation } from "../workflows/orchestrate/controller.js";
+import { OrchestrationController, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation } from "../workflows/orchestrate/controller.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { buildOrchestrationSnapshot, renderSerializationLines } from "../workflows/orchestrate/view-model.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
@@ -290,8 +290,10 @@ interface OrchestrationPreviewCheckpoint {
  * identity and must never be interpreted as a DAG id.
  */
 export interface OrchestrationPreviewContinuation {
-  previewToken: string;
+  /** Only the exact frozen scope is model-facing; the checkpoint capability stays internal. */
   issueNumbers: readonly number[];
+  /** Compatibility-only test/embedder field; never rendered into guidance. */
+  previewToken?: string;
 }
 const ORCHESTRATION_PREVIEW_TTL_MS = 10 * 60 * 1_000;
 const pendingOrchestrationScopes = new WeakMap<ExtensionAPI, PendingOrchestrationInvocation>();
@@ -344,7 +346,6 @@ export function getOrchestrationPreviewContinuation(pi: ExtensionAPI): Orchestra
   const checkpoint = getOrchestrationPreview(pi);
   if (!checkpoint) return undefined;
   return {
-    previewToken: checkpoint.token,
     issueNumbers: [...checkpoint.scope.issueNumbers],
   };
 }
@@ -404,7 +405,6 @@ export function buildOrchestrationPreviewConfirmationGuidance(
   const continuation = JSON.stringify({
     issueNumbers: [...binding.issueNumbers],
     confirmed: true,
-    previewToken: binding.previewToken,
   });
   return [
     "# ForgeDock preview confirmation checkpoint",
@@ -459,6 +459,14 @@ function validatePreviewReplay(
   params: Record<string, unknown>,
   checkpoint: OrchestrationPreviewCheckpoint,
 ): void {
+  const suppliedIssues = params.issueNumbers;
+  if (suppliedIssues !== undefined) {
+    const actual = Array.isArray(suppliedIssues) ? [...suppliedIssues].sort((a, b) => Number(a) - Number(b)) : [];
+    const expected = [...checkpoint.scope.issueNumbers].sort((a, b) => a - b);
+    if (actual.length !== expected.length || actual.some((issue, index) => issue !== expected[index])) {
+      throw new Error(`The orchestration preview issue substitution rejected the changed scope; start a fresh preview`);
+    }
+  }
   const replay = checkpoint.replay;
   assertPreviewReplayValue("routing", params.routing, replay.routing);
   assertPreviewReplayValue("executionPlan", params.executionPlan, replay.executionPlan);
@@ -1124,6 +1132,36 @@ async function resolveEligibleMilestoneIssues(
   return resolved;
 }
 
+export function recoverableRemediationCheckpointResult(
+  issue: number,
+  artifacts: readonly DurableArtifact[],
+  reconciled: ReturnType<typeof reconcileLatestRunArtifacts>,
+  maxRemediationCycles: number,
+): ScheduleWorkerResult | undefined {
+  const currentRunArtifacts = reconciled.runId === undefined
+    ? []
+    : artifacts.filter((artifact) => artifact.runId === reconciled.runId);
+  if (reconciled.state !== "remediating" || currentRunArtifacts.some((artifact) => artifact.kind === "Outcome" && artifact.payload.status !== "repairing")) return undefined;
+  const verdicts = currentRunArtifacts.filter((artifact): artifact is DurableArtifact<"ReviewVerdict"> =>
+    artifact.kind === "ReviewVerdict" && artifact.payload.disposition === "request_changes",
+  );
+  const remainingCycles = Math.max(0, maxRemediationCycles - verdicts.length);
+  const checkpointKey = verdicts.at(-1)?.payload.reviewPlan?.planId ?? `request_changes:${issue}:${verdicts.length}`;
+  if (remainingCycles <= 0) return undefined;
+  return {
+    status: "retry_wait",
+    error: `#${issue} has durable request_changes checkpoint ${checkpointKey}; ${remainingCycles} remediation cycle${remainingCycles === 1 ? "" : "s"} remain`,
+    retryable: true,
+    retryAfterMs: 0,
+    attempt: verdicts.length,
+    maxAttempts: maxRemediationCycles,
+    retryDomain: "workflow",
+    retryCode: "remediation-checkpoint",
+    operationKey: checkpointKey,
+    recoverableCheckpoint: { kind: "remediation", checkpointKey, remainingCycles },
+  };
+}
+
 function latestRunOutcome(
   artifacts: readonly DurableArtifact[],
   runId: string,
@@ -1412,6 +1450,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
   let orchestrationCwd = process.cwd();
   let orchestrationContext: ExtensionContext | undefined;
   let orchestrationRepository: SqliteRepositories | undefined;
+  const orchestrationProjectors = new Map<string, GitHubClient>();
   let orchestrationWitness: LeaseWitness | undefined;
   let orchestrationLeaseError: unknown;
   const assertNativeControllerDispatchReady = async (
@@ -1515,6 +1554,15 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
     },
     () => options.orchestrationExecutionAdmission
       ?? (orchestrationRepository ? new LeaseBackedOrchestrationExecutionAdmission(orchestrationRepository) : undefined),
+    () => {
+      const projectorCwd = orchestrationCwd;
+      let projector = orchestrationProjectors.get(projectorCwd);
+      if (!projector) {
+        projector = new GitHubClient(projectorCwd, orchestrationRepository);
+        orchestrationProjectors.set(projectorCwd, projector);
+      }
+      return (projection: OrchestrationNodeProjectionInput) => projector!.projectOrchestrationNodeState(projection);
+    },
   );
   const reapStaleDurableOrchestrations = async (): Promise<void> => {
     const repository = orchestrationRepository ?? options.orchestrationRepository;
@@ -2785,7 +2833,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         clearOrchestrationInvocation(pi);
         const expiresAtIso = new Date(expiresAt).toISOString();
         const continuation = previewToken
-          ? `FORGEDOCK_PREVIEW_CONTINUATION ${JSON.stringify({ previewToken, confirmed: true, issueCount: issues.length, proposalDigest, expiresAt: expiresAtIso })}`
+          ? `FORGEDOCK_PREVIEW_CONTINUATION ${JSON.stringify({ issueNumbers: issues, confirmed: true, issueCount: issues.length, proposalDigest, expiresAt: expiresAtIso })}`
           : undefined;
         const previewView: OrchestrationPreviewView = {
           checkpoint: previewToken !== undefined,
@@ -2827,7 +2875,6 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
             state: "completed",
             ui: previewUi,
             debug: { proposalDigest },
-            ...(previewToken ? { previewToken } : {}),
           } satisfies OrchestrationToolDetails,
         };
       }
@@ -3060,23 +3107,25 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         } : {}),
         assertCompleted: async (item) => {
           const itemRepository = item.repository ?? readyRepository.repo;
-          const reconciled = reconcileLatestRunArtifacts(await artifacts.list({ repo: itemRepository, issue: item.issue }));
+          const issueArtifacts = await artifacts.list({ repo: itemRepository, issue: item.issue });
+          const reconciled = reconcileLatestRunArtifacts(issueArtifacts);
           if (reconciled.state === "completed") return;
           if (reconciled.state === "invalid") {
             return { status: "invalid", error: `#${item.issue} was classified invalid; no delivery work was performed` };
           }
           if (reconciled.state === "decomposed") {
-            const issueArtifacts = await artifacts.list({ repo: itemRepository, issue: item.issue });
             return {
               status: "skipped",
               error: `#${item.issue} decomposed into authoritative child work`,
               childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
             };
           }
+          const recoverable = recoverableRemediationCheckpointResult(item.issue, issueArtifacts, reconciled, effective.maxRemediationCycles);
+          if (recoverable) return recoverable;
           if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
             return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
           }
-          const terminal = terminalOrchestrationResult(item.issue, await artifacts.list({ repo: itemRepository, issue: item.issue }), reconciled);
+          const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has no completed terminal Outcome; reconciled state is ${reconciled.state}${reconciled.warnings.length ? ` (${reconciled.warnings.join("; ")})` : ""}`);
         },
@@ -3964,6 +4013,8 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
           childIssues: decompositionChildIssuesFromArtifacts(item.issue, issueArtifacts, reconciled.runId),
         };
       }
+      const recoverable = recoverableRemediationCheckpointResult(item.issue, issueArtifacts, reconciled, effective.maxRemediationCycles);
+      if (recoverable) return recoverable;
       if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
         return { status: "suspended", error: `#${item.issue} is suspended at recursive checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
       }
@@ -4401,6 +4452,7 @@ export class VisibleDagDelegator {
     private readonly rebuildInput?: (record: OrchestrationRecord) => Promise<VisibleDagInput>,
     private readonly directControllerTransport?: ControllerTaskTransport,
     private readonly getExecutionAdmission: () => OrchestrationExecutionAdmission | undefined = () => undefined,
+    private readonly projectNodeStateFactory?: () => (input: OrchestrationNodeProjectionInput) => Promise<void>,
   ) {
     this.unsubscribe = pi.events.on("subagent:async-complete", (event: unknown) => {
       const runId = typeof event === "object" && event !== null && "runId" in event
@@ -4612,9 +4664,11 @@ export class VisibleDagDelegator {
       resolveConflictIssueNumbers?: ReadonlySet<number>;
     } = {},
   ): OrchestrationController {
+    const projectNodeState = this.projectNodeStateFactory?.();
     return new OrchestrationController({
       repository: this.repository(),
       executionAdmission: this.admission(),
+      ...(projectNodeState ? { projectNodeState } : {}),
       transportCapacity: () => this.transportCapacity(getStored()),
       signal: combineDelegatorSignals(this.shutdownController.signal, getStored()?.stopController?.signal),
       ...(input.maxDecompositionChildren !== undefined ? { maxDecompositionChildren: input.maxDecompositionChildren } : {}),

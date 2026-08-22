@@ -96,11 +96,18 @@ export const ControllerVerificationGateSchema = Type.Object({
 
 export const CriterionIdSchema = Type.String({ pattern: "^criterion-[1-9][0-9]*$" });
 
+export const VerificationEvidenceKindSchema = Type.Union([
+  Type.Literal("structural"), Type.Literal("behavioral"), Type.Literal("temporal"),
+]);
+export type VerificationEvidenceKind = Static<typeof VerificationEvidenceKindSchema>;
+
 export const VerificationRequirementSchema = Type.Object({
   kind: Type.Union([Type.Literal("command"), Type.Literal("controller-gate")]),
   id: NonEmptyString,
   criterionIds: Type.Array(CriterionIdSchema, { minItems: 1 }),
   rationale: NonEmptyString,
+  /** Optional semantic strength; omitted legacy requirements default to structural. */
+  evidenceKind: Type.Optional(VerificationEvidenceKindSchema),
 });
 
 export const EvidencePathRoleSchema = Type.Union([
@@ -129,6 +136,8 @@ export type VerificationEvidenceDiagnostic = Static<typeof VerificationEvidenceD
 
 export const VerificationEvidenceCriterionSchema = Type.Object({
   criterionId: CriterionIdSchema,
+  /** Omitted on legacy contracts; semantically defaults to structural. */
+  evidenceKind: Type.Optional(VerificationEvidenceKindSchema),
   requiredCommandIds: Type.Array(NonEmptyString),
   semanticCommandIds: Type.Array(NonEmptyString),
   controllerGateIds: Type.Array(NonEmptyString),
@@ -296,6 +305,10 @@ export const CheckResultSchema = Type.Object({
   command: NonEmptyString,
   /** Additive stable identity; old durable check evidence remains decodable. */
   commandId: Type.Optional(NonEmptyString),
+  /** Fresh policy-v2 receipt bindings; absent on legacy checks. */
+  receiptId: Type.Optional(NonEmptyString),
+  headSha: Type.Optional(Sha),
+  contentDigest: Type.Optional(PacketDigest),
   policyVersion: Type.Optional(NonEmptyString),
   commandTargets: Type.Optional(Type.Array(NonEmptyString)),
   planId: Type.Optional(NonEmptyString),

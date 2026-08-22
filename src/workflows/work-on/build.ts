@@ -115,6 +115,14 @@ export function auditBuilderCriterionCoverage(
       diagnostics.push({ code: "missing-coverage-anchors", criterionId, message: `${criterionId} needs concrete path and symbol anchors plus a focused test/invariant or applicable frozen command anchor; prose alone is not coverage.` });
       continue;
     }
+    const contractCriterion = packet.payload.evidenceContract?.criteria.find(({ criterionId: id }) => id === criterionId);
+    const evidenceKind = contractCriterion?.evidenceKind ?? "structural";
+    if ((evidenceKind === "behavioral" || evidenceKind === "temporal") && !(anchors.testIds?.length)) {
+      diagnostics.push({ code: "missing-behavioral-test-anchor", criterionId, message: `${criterionId} requires a controller-provided targeted test, regression, or invariant ID; model symbols alone cannot prove ${evidenceKind} evidence.` });
+    }
+    if (anchors.symbols.some((symbol) => !/^[A-Za-z_$][\w$]*(?:[.#:][A-Za-z_$][\w$]*)*$/.test(symbol))) {
+      diagnostics.push({ code: "invalid-symbol-anchor", criterionId, message: `${criterionId} contains a non-deterministic or malformed symbol anchor.` });
+    }
     const allowedPaths = new Set([
       ...packet.payload.expectedPaths,
       ...(packet.payload.evidencePaths ?? []).filter(({ criterionIds }) => criterionIds.includes(criterionId)).map(({ path }) => path),

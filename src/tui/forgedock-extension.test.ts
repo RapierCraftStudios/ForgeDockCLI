@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderArtifactComment } from "../core/artifacts/codec.js";
+import type { DurableArtifact } from "../core/artifacts/schema.js";
 import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
 import { DEFAULT_REMOTE_READ_CONCURRENCY } from "../core/concurrency.js";
@@ -32,6 +33,7 @@ import {
   resolveModelReference,
   resolveOrchestrationInvocationScope,
   resolveRoutedOrchestrationScope,
+  recoverableRemediationCheckpointResult,
   sourcePullRequestFromIssueBody,
   isOrchestrationPreviewConfirmationPrompt,
   materializeVisibleDecomposition,
@@ -205,6 +207,37 @@ async function shutdownFakePi(state: FakePiState, context: ExtensionCommandConte
   for (const handler of state.handlers.get("session_shutdown") ?? []) await handler({}, context);
 }
 
+function installImmediateSubagentRpc(state: FakePiState, runId: string): {
+  spawnRequests: any[];
+  stopRequests: any[];
+} {
+  const spawnRequests: any[] = [];
+  const stopRequests: any[] = [];
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    originalEmit(name, data);
+    if (name !== "subagents:rpc:v1:request") return;
+    if (data.method === "spawn") {
+      spawnRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { details: { asyncId: runId } },
+      }));
+    } else if (data.method === "stop") {
+      stopRequests.push(data);
+      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
+        version: 1,
+        requestId: data.requestId,
+        success: true,
+        data: { stopped: true },
+      }));
+    }
+  }) as typeof state.pi.events.emit;
+  return { spawnRequests, stopRequests };
+}
+
 function jsonSessionContext(): ExtensionCommandContext {
   return {
     ...commandContext(),
@@ -317,7 +350,7 @@ test("typed no-milestone discovery applies only an authorized count and binds ex
         { issue: 9, title: "Nine", summary: "Deliver Nine", dependsOn: [], claims: ["src/nine"], labels: [] },
       ],
     }, undefined, undefined, { ...commandContext(), hasUI: false } as any) as any;
-    assert.match(preview.details.previewToken, /^[0-9a-f-]{36}$/);
+    assert.equal(preview.details.previewToken, undefined);
     searchMembers = [10, 9, 8, 7];
     await assert.rejects(
       () => orchestrate.execute("order-drift", { issueNumbers: [8, 9], confirmed: true }, undefined, undefined, { ...commandContext(), hasUI: false } as any),
@@ -884,7 +917,7 @@ test("idle TUI shows actionable workflow entrypoints without reserving a help wi
   const statuses: string[] = [];
   const ctx = {
     mode: "tui",
-    cwd: process.cwd(),
+    cwd: isolatedSessionCwd,
     hasUI: true,
     ui: {
       setTitle: () => undefined,
@@ -1347,10 +1380,10 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
   }, undefined, undefined, { ...commandContext(), cwd: fixture.root, hasUI: false } as any);
   const previewDetails = preview.details as { previewToken?: string };
-  assert.match(previewDetails.previewToken ?? "", /^[0-9a-f-]{36}$/);
+  assert.equal(previewDetails.previewToken, undefined);
   assert.match((preview.content[0] as { text: string }).text, /confirmation checkpoint/);
   assert.match((preview.content[0] as { text: string }).text, /FORGEDOCK_PREVIEW_CONTINUATION/);
-  assert.match((preview.content[0] as { text: string }).text, /previewToken/);
+  assert.doesNotMatch((preview.content[0] as { text: string }).text, /previewToken/);
 
   // A restart/recovery notice can be queued between the preview and the next
   // user turn. The live checkpoint must still bind a short affirmative typo to
@@ -1361,7 +1394,7 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
   ) as { systemPrompt: string };
   assert.match(confirmationPrompt.systemPrompt, /preview confirmation checkpoint/);
   assert.match(confirmationPrompt.systemPrompt, /call forgedock_orchestrate exactly once/i);
-  assert.match(confirmationPrompt.systemPrompt, new RegExp(`"previewToken":"${previewDetails.previewToken}"`));
+  assert.doesNotMatch(confirmationPrompt.systemPrompt, /previewToken/);
   assert.match(confirmationPrompt.systemPrompt, /"issueNumbers":\[7\]/);
   assert.match(confirmationPrompt.systemPrompt, /ignore any injected forgedock-background-task/i);
   assert.match(confirmationPrompt.systemPrompt, /do not ask for a dag_\* ID/i);
@@ -1517,17 +1550,7 @@ test("preview continuation carries the full frozen runtime contract into the chi
     planningModel: "planner/old-model", planningThinking: "low",
   });
   const state = fakePi();
-  const spawnRequests: any[] = [];
-  const originalEmit = state.pi.events.emit.bind(state.pi.events);
-  state.pi.events.emit = ((name: string, data: any) => {
-    originalEmit(name, data);
-    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
-      spawnRequests.push(data);
-      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
-        version: 1, requestId: data.requestId, success: true, data: { details: { asyncId: "frozen-runtime-run" } },
-      }));
-    }
-  }) as typeof state.pi.events.emit;
+  const { spawnRequests, stopRequests } = installImmediateSubagentRpc(state, "frozen-runtime-run");
   const tool = state.tools.get("forgedock_orchestrate") as any;
   bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], repository: "a/b", noMilestone: true });
   const ctx = { ...commandContext(), cwd, hasUI: false } as any;
@@ -1555,6 +1578,7 @@ test("preview continuation carries the full frozen runtime contract into the chi
     await shutdownFakePi(state, ctx);
     rmSync(fixture.workspace, { recursive: true, force: true });
   }
+  assert.equal(stopRequests.length, 1, "session shutdown must request a semantic stop");
 });
 
 test("bound decomposed scope rebinds a parent execution plan before DAG validation", async () => {
@@ -2130,20 +2154,7 @@ test("native DAG recovery adopts a task launched before task identity persistenc
 test("Pi fallback recovery reuses its launch receipt across the launch-to-record crash window", async () => {
   const state = fakePi();
   const repository = new LaunchIdentityFaultRepository();
-  let launches = 0;
-  const originalEmit = state.pi.events.emit.bind(state.pi.events);
-  state.pi.events.emit = ((name: string, data: any) => {
-    originalEmit(name, data);
-    if (name === "subagents:rpc:v1:request" && data.method === "spawn") {
-      launches++;
-      queueMicrotask(() => originalEmit(`subagents:rpc:v1:reply:${data.requestId}`, {
-        version: 1,
-        requestId: data.requestId,
-        success: true,
-        data: { details: { asyncId: "pi-crash-window-1" } },
-      }));
-    }
-  }) as typeof state.pi.events.emit;
+  const { spawnRequests, stopRequests } = installImmediateSubagentRpc(state, "pi-crash-window-1");
   const delegator = witnessedDagDelegator(state.pi, repository);
   const input = {
     repository: "a/b",
@@ -2160,19 +2171,20 @@ test("Pi fallback recovery reuses its launch receipt across the launch-to-record
   assert.equal(crashed.nodes[0]?.attempts?.[0]?.runId, undefined);
 
   const resumedPromise = delegator.resume(crashed.orchestrationId);
-  const completionTicker = setInterval(() => originalEmit("subagent:async-complete", { runId: "pi-crash-window-1" }), 10);
+  const completionTicker = setInterval(() => state.pi.events.emit("subagent:async-complete", { runId: "pi-crash-window-1" }), 10);
   const resumed = await Promise.race([
     resumedPromise,
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Pi recovery did not adopt the launched run")), 2_000)),
   ]);
   clearInterval(completionTicker);
   await resumed.completion;
-  assert.equal(launches, 1, "Pi recovery must wait for the existing GitHub-capable worker");
+  assert.equal(spawnRequests.length, 1, "Pi recovery must wait for the existing GitHub-capable worker");
   const recovered = await repository.loadOrchestration(crashed.orchestrationId);
   assert.equal(recovered?.status, "completed");
   assert.equal(recovered?.nodes[0]?.attempts?.length, 1);
   assert.equal(recovered?.nodes[0]?.attempts?.[0]?.runId, "pi-crash-window-1");
   await delegator.shutdown();
+  assert.equal(stopRequests.length, 1, "delegator shutdown must request a semantic stop");
 });
 
 test("fresh-rerun authorization cannot be converted back into checkpoint resume", () => {
@@ -3260,6 +3272,23 @@ test("native orchestrate prompts require typed discovery and preserve ordinary s
   assert.match(reviewPrompt, /immediately yield control to the user and do not poll forgedock_tasks unless the user explicitly asks for status/);
 });
 
+test("remediation checkpoint recovery is scoped to the reconciled run", () => {
+  const artifacts = [
+    { kind: "Outcome", runId: "old-run", payload: { status: "merged" } },
+    { kind: "ReviewVerdict", runId: "old-run", payload: { disposition: "request_changes" } },
+    { kind: "ReviewVerdict", runId: "current-run", payload: { disposition: "request_changes", reviewPlan: { planId: "current-plan" } } },
+  ] as unknown as DurableArtifact[];
+  const reconciled = { state: "remediating", runId: "current-run" } as any;
+  const recoverable = recoverableRemediationCheckpointResult(7, artifacts, reconciled, 2);
+  assert.equal(recoverable?.recoverableCheckpoint?.remainingCycles, 1);
+  assert.equal(recoverable?.recoverableCheckpoint?.checkpointKey, "current-plan");
+
+  const exhausted = recoverableRemediationCheckpointResult(7, [
+    ...artifacts,
+    { kind: "ReviewVerdict", runId: "current-run", payload: { disposition: "request_changes" } },
+  ] as unknown as DurableArtifact[], reconciled, 2);
+  assert.equal(exhausted, undefined);
+});
 test("preview confirmation recognizes a minor proceed typo without recognizing resume requests", () => {
   assert.equal(isOrchestrationPreviewConfirmationPrompt("prceed"), true);
   assert.equal(isOrchestrationPreviewConfirmationPrompt("Proceed."), true);
@@ -3274,7 +3303,7 @@ test("preview confirmation recognizes a minor proceed typo without recognizing r
   assert.match(guidance, /call forgedock_orchestrate exactly once/i);
   assert.match(guidance, /"issueNumbers":\[346,345\]/);
   assert.match(guidance, /"confirmed":true/);
-  assert.match(guidance, /"previewToken":"preview-token-for-test"/);
+  assert.doesNotMatch(guidance, /previewToken/);
   assert.match(guidance, /forgedock-background-task/);
   assert.match(guidance, /do not ask for a dag_\* ID/i);
   assert.match(guidance, /forgedock_resume_orchestration/);

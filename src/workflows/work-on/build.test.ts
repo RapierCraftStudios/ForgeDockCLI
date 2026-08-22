@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { buildWorkItem, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
+import { buildWorkItem, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, auditBuilderCriterionCoverage, type BuilderSubmission, type VerificationDiagnosis } from "./build.js";
 import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket } from "./prepare.js";
 
@@ -62,6 +62,32 @@ describe("criterion report normalization", () => {
     });
     assert.equal(normalized.criterionCoverage[0]?.criterion, "State is preserved");
     assert.match(criterionCoverageInstructions(packetArtifact), /criterion-1.*State is preserved/);
+  });
+
+  it("accepts ordinary symbol anchors and rejects unsafe symbol syntax", () => {
+    const contractedPacket = createArtifact({
+      ...packetArtifact,
+      payload: {
+        ...packet,
+        evidenceContract: {
+          version: "forgedock.evidence/v1",
+          criteria: [{ criterionId: "criterion-1", requiredCommandIds: ["semantic"], semanticCommandIds: ["semantic"], controllerGateIds: [], allowedWritePaths: ["src/a.ts"], allowedEvidencePaths: [], invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] }],
+        },
+      },
+    });
+    const commands = [{ id: "semantic", command: "node", args: ["test.js"], cwd: process.cwd(), timeoutMs: 1_000, required: true, evidenceCapability: "targeted-test" as const, targets: ["src/a.ts"] }];
+    for (const symbol of ["guard", "readToken", "foo.bar"]) {
+      const diagnostics = auditBuilderCriterionCoverage(contractedPacket, commands, {
+        ...submission,
+        criterionCoverage: [{ ...submission.criterionCoverage[0]!, criterionId: "criterion-1", criterion: "State is preserved", anchors: { paths: ["src/a.ts"], symbols: [symbol], verificationCommandIds: ["semantic"] } }],
+      });
+      assert.equal(diagnostics.some(({ code }) => code === "invalid-symbol-anchor"), false, symbol);
+    }
+    const unsafe = auditBuilderCriterionCoverage(contractedPacket, commands, {
+      ...submission,
+      criterionCoverage: [{ ...submission.criterionCoverage[0]!, criterionId: "criterion-1", criterion: "State is preserved", anchors: { paths: ["src/a.ts"], symbols: ["guard()"], verificationCommandIds: ["semantic"] } }],
+    });
+    assert.equal(unsafe.some(({ code }) => code === "invalid-symbol-anchor"), true);
   });
 
   it("leaves missing or duplicate IDs untouched for strict verification", () => {

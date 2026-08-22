@@ -336,6 +336,8 @@ export class OrchestrationController {
       while (this.executions.has(orchestrationId)) {
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
+      const latestAfterDrain = await this.dependencies.repository.loadOrchestration(orchestrationId);
+      if (latestAfterDrain && latestAfterDrain.status !== "running") return structuredClone(latestAfterDrain);
       const completed = control.state?.record;
       if (completed?.status === "cancelled") return structuredClone(completed);
     }
@@ -1543,8 +1545,13 @@ export class OrchestrationController {
       // the launching attempt identity is durable. The event is released by
       // beginAttempt after that fenced write completes.
       this.replaceNodeInMemory(state, event.itemId, (node) => {
-        const { error: _error, waitReason: _waitReason, ...rest } = node;
-        return { ...rest, status: "running" };
+        const { error: _error, waitReason, ...rest } = node;
+        const retainRecoverableCheckpoint = waitReason?.kind === "retry" && waitReason.code === "remediation-checkpoint";
+        return {
+          ...rest,
+          status: "running",
+          ...(retainRecoverableCheckpoint ? { waitReason } : {}),
+        };
       });
       state.deferredStartedEvents.push({ itemId: event.itemId });
       return;
@@ -1581,12 +1588,18 @@ export class OrchestrationController {
           && !retryingTargetRecovery) return node;
         const error = event.errors.get(node.id);
         const waitReason = event.waitReasons?.get(node.id);
+        const retainRecoverableCheckpoint = waitReason === undefined
+          && (scheduledStatus === "queued" || scheduledStatus === "running")
+          && node.waitReason?.kind === "retry"
+          && node.waitReason.code === "remediation-checkpoint";
         const { error: _error, waitReason: _waitReason, ...rest } = node;
         const candidate = {
           ...rest,
           status: durableStatus(scheduledStatus),
           ...(error !== undefined ? { error: error.message } : {}),
-          ...(waitReason !== undefined ? { waitReason: structuredClone(waitReason) } : {}),
+          ...(waitReason !== undefined
+            ? { waitReason: structuredClone(waitReason) }
+            : retainRecoverableCheckpoint ? { waitReason: structuredClone(node.waitReason!) } : {}),
         };
         if (!sameJson(node, candidate)) changed = true;
         return candidate;
@@ -1614,12 +1627,18 @@ export class OrchestrationController {
         if (status === undefined) return node;
         const error = result.errors.get(node.id);
         const waitReason = result.waitReasons?.get(node.id);
+        const retainRecoverableCheckpoint = waitReason === undefined
+          && (status === "queued" || status === "running")
+          && node.waitReason?.kind === "retry"
+          && node.waitReason.code === "remediation-checkpoint";
         const { error: _error, waitReason: _waitReason, ...rest } = node;
         return {
           ...rest,
           status: durableStatus(status),
           ...(error !== undefined ? { error: error.message } : {}),
-          ...(waitReason !== undefined ? { waitReason: structuredClone(waitReason) } : {}),
+          ...(waitReason !== undefined
+            ? { waitReason: structuredClone(waitReason) }
+            : retainRecoverableCheckpoint ? { waitReason: structuredClone(node.waitReason!) } : {}),
         };
       }),
     });
@@ -1931,6 +1950,8 @@ function nodeRecordFromItem(item: ScheduledWorkItem): OrchestrationNodeRecord {
 }
 
 function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
+  const retryAttempt = [...(node.attempts ?? [])].reverse().find((attempt) => attempt.retryCode !== undefined);
+  const retryWait = node.waitReason?.kind === "retry" ? node.waitReason : undefined;
   return {
     id: node.id,
     issue: node.issue,
@@ -1948,10 +1969,17 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
     ...(node.title !== undefined ? { title: node.title } : {}),
     ...(node.summary !== undefined ? { summary: node.summary } : {}),
     ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}),
-    ...(node.waitReason?.kind === "retry" ? {
-      retryNextAt: node.waitReason.nextAttemptAt,
-      retryAttempt: node.waitReason.attempt,
-      retryMaxAttempts: node.waitReason.maxAttempts,
+    ...(retryWait !== undefined ? {
+      retryNextAt: retryWait.nextAttemptAt,
+      retryAttempt: retryWait.attempt,
+      retryMaxAttempts: retryWait.maxAttempts,
+      retryCode: retryWait.code,
+      ...(retryAttempt?.operationKey !== undefined ? { retryOperationKey: retryAttempt.operationKey } : {}),
+    } : retryAttempt?.retryCode !== undefined ? {
+      retryAttempt: retryAttempt.retryAttempt ?? retryAttempt.attempt,
+      retryMaxAttempts: retryAttempt.retryMaxAttempts ?? 3,
+      retryCode: retryAttempt.retryCode,
+      ...(retryAttempt.operationKey !== undefined ? { retryOperationKey: retryAttempt.operationKey } : {}),
     } : {}),
   };
 }
@@ -2149,8 +2177,13 @@ function isDurablyTerminalNode(node: OrchestrationNodeRecord): boolean {
 }
 
 function clearNodeForRetry(node: OrchestrationNodeRecord): OrchestrationNodeRecord {
-  const { error: _error, waitReason: _waitReason, activeAttemptId: _activeAttemptId, ...rest } = node;
-  return { ...rest, status: "queued" };
+  const { error: _error, waitReason, activeAttemptId: _activeAttemptId, ...rest } = node;
+  const retainRecoverableCheckpoint = waitReason?.kind === "retry" && waitReason.code === "remediation-checkpoint";
+  return {
+    ...rest,
+    status: "queued",
+    ...(retainRecoverableCheckpoint ? { waitReason } : {}),
+  };
 }
 
 function definedIdentity(identity: OrchestrationTaskIdentity): OrchestrationTaskIdentity {

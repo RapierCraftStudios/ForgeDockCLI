@@ -298,7 +298,7 @@ export async function verifyAndCommit(
       })
       : [];
     const contractBuilderDiagnostics = hasEvidenceContract
-      ? collectContractStructuralDiagnostics({ packet: input.packet, coverage: resolvedCoverage.map(({ coverage }) => coverage), commands: input.commands })
+      ? collectContractStructuralDiagnostics({ packet: input.packet, coverage: resolvedCoverage.map(({ coverage }) => coverage), commands: input.commands, observedChangedPaths: deliveryChangedPaths })
       : [];
     const contractDiagnostics = [...contractValidationDiagnostics, ...contractBuilderDiagnostics];
     const contractFailure = contractDiagnostics.length
@@ -341,7 +341,8 @@ export async function verifyAndCommit(
     const baselineByIdentity = new Map(
       (input.baselineChecks ?? []).map((check, index) => [checkIdentity(check, index), check] as const),
     );
-    const checks = observedChecks.map((check, index) => compareWithBaseline(
+    const verificationHeadSha = await dependencies.git.head(input.workspace);
+    let checks = observedChecks.map((check, index) => compareWithBaseline(
       check,
       baselineByIdentity.get(checkIdentity(check, index)),
     ));
@@ -356,6 +357,7 @@ export async function verifyAndCommit(
         throw error;
       }
     }
+    checks = checks.map((check) => verificationReceipt(check, verificationHeadSha, contentDigestAfter));
     const checkByIdentity = new Map(checks.map((check, index) => [checkIdentity(check, index), check] as const));
     const requiredFailures = input.commands.flatMap((command, index) => {
       if (!command.required) return [];
@@ -370,7 +372,7 @@ export async function verifyAndCommit(
     const semanticEvidenceFailure = preflightFailure || requiredFailure || (!strictSemanticEvidence && !hasEvidenceContract)
       ? undefined
       : hasEvidenceContract
-        ? contractSemanticEvidenceFailure(input.packet, resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })), checks, input.commands)
+        ? contractSemanticEvidenceFailure(input.packet, resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })), checks, input.commands, verificationHeadSha, contentDigestAfter)
         : anchorPreflightFailure ?? await criterionSemanticEvidenceFailure(
           resolvedCoverage.map(({ coverage, criterionId }) => ({ ...coverage, criterionId: criterionId! })),
           checks,
@@ -912,6 +914,7 @@ function collectContractStructuralDiagnostics(input: {
   packet: DurableArtifact<"BuildPacket">;
   coverage: readonly BuilderSubmission["criterionCoverage"][number][];
   commands: readonly VerificationCommand[];
+  observedChangedPaths: readonly string[];
 }): VerificationEvidenceDiagnostic[] {
   const packet = input.packet.payload;
   const contract = packet.evidenceContract;
@@ -960,6 +963,11 @@ function collectContractStructuralDiagnostics(input: {
       diagnostics.push({ code: "invalid-evidence-path", criterionId: expected.criterionId, message: error instanceof Error ? error.message : String(error) });
     }
     const allowedPaths = new Set([...expected.allowedWritePaths, ...expected.allowedEvidencePaths]);
+    const observedPaths = new Set(input.observedChangedPaths);
+    if (paths.some((path) => expected.allowedWritePaths.includes(path))
+      && !paths.some((path) => observedPaths.has(path))) {
+      diagnostics.push({ code: "implementation-anchor-not-observed", criterionId: expected.criterionId, message: `${expected.criterionId} must anchor a controller-observed changed path; evidence-only and model-only paths cannot authorize implementation evidence.` });
+    }
     for (const path of paths) {
       if (!allowedPaths.has(path)) diagnostics.push({ code: "out-of-contract-path", criterionId: expected.criterionId, message: `${expected.criterionId} cites path outside its frozen evidence contract: ${path}`, details: { path } });
     }
@@ -1086,6 +1094,8 @@ function contractSemanticEvidenceFailure(
   coverage: readonly BuilderSubmission["criterionCoverage"][number][],
   checks: readonly CheckResult[],
   commands: readonly VerificationCommand[],
+  headSha: string,
+  contentDigest: string | undefined,
 ): string | undefined {
   const failures: string[] = [];
   for (const criterion of packet.payload.evidenceContract?.criteria ?? []) {
@@ -1099,6 +1109,22 @@ function contractSemanticEvidenceFailure(
       ...criterion.requiredCommandIds,
       ...criterion.semanticCommandIds,
     ])].filter((id) => commandStatus(id, commands, checks) !== "passed");
+    const kind = criterion.evidenceKind ?? "structural";
+    if (kind === "behavioral" || kind === "temporal") {
+      const semanticIds = criterion.semanticCommandIds;
+      const stale = semanticIds.filter((id) => {
+        const command = commands.find(({ id: candidate }) => candidate === id);
+        const check = checks.find(({ commandId }) => commandId === id);
+        return !command || !check || check.status !== "passed"
+          || check.receiptId === undefined
+          || check.headSha?.toLowerCase() !== headSha.toLowerCase()
+          || check.contentDigest !== contentDigest
+          || check.planId !== command.planId
+          || check.policyVersion !== command.policyVersion
+          || JSON.stringify(check.commandTargets ?? []) !== JSON.stringify(command.targets ?? []);
+      });
+      if (stale.length) failures.push(`${criterion.criterionId}: stale or missing fresh receipt(s) ${stale.join(", ")}`);
+    }
     if (failedIds.length) failures.push(`${criterion.criterionId}: ${failedIds.join(", ")}`);
   }
   return failures.length ? `Criteria cannot pass because semantic controller checks did not pass: ${failures.join("; ")}` : undefined;
@@ -1117,6 +1143,19 @@ function commandStatus(
 
 function checkIdentity(check: CheckResult, index: number): string {
   return check.commandId ? `id:${check.commandId}` : `position:${index}`;
+}
+
+function verificationReceipt(check: CheckResult, headSha: string, contentDigest: string | undefined): CheckResult {
+  if (check.status !== "passed" || !check.commandId || !check.planId || !check.policyVersion || !contentDigest) return check;
+  const receiptId = createHash("sha256").update(JSON.stringify({
+    commandId: check.commandId,
+    planId: check.planId,
+    policyVersion: check.policyVersion,
+    targets: check.commandTargets ?? [],
+    headSha: headSha.toLowerCase(),
+    contentDigest,
+  })).digest("hex");
+  return { ...check, receiptId, headSha, contentDigest };
 }
 
 function compareWithBaseline(check: CheckResult, baseline: CheckResult | undefined): CheckResult {

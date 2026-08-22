@@ -7,6 +7,7 @@ import type {
   VerificationEvidenceContract,
   VerificationEvidenceCriterion,
   VerificationEvidenceDiagnostic,
+  VerificationEvidenceKind,
   VerificationRequirement,
 } from "../../core/artifacts/schema.js";
 import type {
@@ -70,6 +71,12 @@ export function invariantMatrixIdentitiesForCriterion(
       return { invariantRowIds: identities.rowIds, invariantTestIds: identities.testIds, invariantCaseIds: identities.caseIds };
     })()
     : { invariantRowIds: [], invariantTestIds: [], invariantCaseIds: [] };
+}
+
+function strongestEvidenceKind(kinds: readonly (VerificationEvidenceKind | undefined)[]): VerificationEvidenceKind {
+  if (kinds.includes("temporal")) return "temporal";
+  if (kinds.includes("behavioral")) return "behavioral";
+  return "structural";
 }
 
 function capabilityOf(command: EvidenceContractInput["commands"][number]): VerificationEvidenceCapability {
@@ -144,6 +151,7 @@ export function deriveEvidenceContract(input: EvidenceContractInput): EvidenceCo
     const requirements = (input.verificationRequirements ?? []).filter(({ criterionIds }) => criterionIds.includes(criterionId));
     const requiredCommandIds = [...new Set(requirements.filter(({ kind }) => kind === "command").map(({ id }) => id))].sort();
     const controllerGateIds = [...new Set(requirements.filter(({ kind }) => kind === "controller-gate").map(({ id }) => id))].sort();
+    const evidenceKind = strongestEvidenceKind(requirements.map(({ evidenceKind }) => evidenceKind));
     const semanticCommandIds = requiredCommandIds.filter((id) => {
       const command = commands.get(id);
       return command !== undefined && capabilityOf(command) !== "generic" && capabilityIsUsable(command);
@@ -163,6 +171,9 @@ export function deriveEvidenceContract(input: EvidenceContractInput): EvidenceCo
     if (requiredCommandIds.length > 0 && semanticCommandIds.length === 0) {
       diagnostics.push(diagnostic("generic-only-command", criterionId, `Criterion ${criterionId} is backed only by generic verification commands`));
     }
+    if ((evidenceKind === "behavioral" || evidenceKind === "temporal") && semanticCommandIds.length === 0) {
+      diagnostics.push(diagnostic("semantic-evidence-command-missing", criterionId, `Criterion ${criterionId} requires a controller targeted-test, regression, or invariant command for ${evidenceKind} evidence`));
+    }
     const invariant = invariantMatrixIdentitiesForCriterion(rows, criterionId);
     if (invariant.invariantRowIds.length && !requiredCommandIds.some((id) => {
       const capability = commands.get(id);
@@ -173,6 +184,7 @@ export function deriveEvidenceContract(input: EvidenceContractInput): EvidenceCo
     }
     return {
       criterionId,
+      ...(evidenceKind !== "structural" ? { evidenceKind } : {}),
       requiredCommandIds,
       semanticCommandIds,
       controllerGateIds,

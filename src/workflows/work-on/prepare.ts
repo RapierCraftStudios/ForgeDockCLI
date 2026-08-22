@@ -53,6 +53,10 @@ export async function deriveBuildContextPackage(input: {
   investigation: DurableArtifact<"Investigation">;
   acceptanceCriteria: readonly string[];
   evidencePaths: readonly EvidencePathDeclaration[];
+  /** Controller-frozen write candidates are included only when present at base. */
+  expectedPaths?: readonly string[];
+  /** Exact controller verification targets and criterion test paths. */
+  verificationTargets?: readonly string[];
   readRoots: readonly string[];
   cwd: string;
   baseSha: string;
@@ -62,6 +66,8 @@ export async function deriveBuildContextPackage(input: {
   const sources = input.investigation.payload.evidence;
   const declarations = new Map(input.evidencePaths.map((declaration) => [declaration.path, declaration]));
   const candidatePaths = [...new Set([
+    ...(input.expectedPaths ?? []),
+    ...(input.verificationTargets ?? []),
     ...input.evidencePaths.map(({ path }) => path),
     ...sources.map(({ source }) => source).flatMap((source) => {
       const match = /(?:^|[\s`(])((?:src|test|tests|packages|bin|lib|docs)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9_-]+)(?::\d+(?::\d+)?)?(?:\b|$)/.exec(source);
@@ -593,6 +599,8 @@ async function materializePacketOutput(
       investigation,
       acceptanceCriteria: controllerVerifiedOutput.acceptanceCriteria,
       evidencePaths: evidence.declarations,
+      expectedPaths,
+      verificationTargets: policyMetadata.verificationCommandTargets?.flatMap(({ targets, sourceTargets }) => [...targets, ...(sourceTargets ?? [])]) ?? [],
       readRoots: packetAuthorReadRoots,
       cwd,
       baseSha,
@@ -796,6 +804,7 @@ export function canonicalizePacketVerification(
         id: requirement.id,
         criterionIds: [...new Set(requirement.criterionIds)],
         rationale: requirement.rationale,
+        ...(requirement.evidenceKind !== undefined ? { evidenceKind: requirement.evidenceKind } : {}),
       };
     })
     : output.verificationPlan.map((entry) => {
