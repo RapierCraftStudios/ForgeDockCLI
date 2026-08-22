@@ -5,9 +5,9 @@ import { describe, it } from "node:test";
 import { mapDecompositionDependencies } from "./decomposition-dependencies.js";
 
 const nodes = [
-  { id: "batch-100", issue: 100, memberIssues: [1, 2] },
-  { id: "issue-31", issue: 31, memberIssues: [31] },
-  { id: "issue-32", issue: 32, memberIssues: [32] },
+  { id: "batch-100", repository: "owner/repo", issue: 100, memberIssues: [1, 2] },
+  { id: "issue-31", repository: "owner/repo", issue: 31, memberIssues: [31] },
+  { id: "issue-32", repository: "owner/repo", issue: 32, memberIssues: [32] },
 ];
 
 describe("decomposition prerequisites", () => {
@@ -16,12 +16,13 @@ describe("decomposition prerequisites", () => {
       32,
       "## Dependencies\n- #1\n- #31\n",
       nodes,
+      "owner/repo",
     ), ["batch-100", "issue-31"]);
   });
 
   it("rejects prerequisites outside the frozen orchestration DAG", () => {
     assert.throws(
-      () => mapDecompositionDependencies(31, "## Blocked by\n- #999\n", nodes),
+      () => mapDecompositionDependencies(31, "## Blocked by\n- #999\n", nodes, "owner/repo"),
       /child #31.*outside.*#999/i,
     );
   });
@@ -30,16 +31,28 @@ describe("decomposition prerequisites", () => {
     assert.throws(
       () => mapDecompositionDependencies(31, "## Dependencies\n- #1\n", [
         ...nodes,
-        { id: "issue-1", issue: 1 },
-      ]),
+        { id: "issue-1", repository: "owner/repo", issue: 1 },
+      ], "owner/repo"),
       /#1.*both batch-100 and issue-1/i,
     );
   });
 
   it("rejects self-dependencies after issue-to-node mapping", () => {
     assert.throws(
-      () => mapDecompositionDependencies(31, "## Prerequisites\n- #31\n", nodes),
+      () => mapDecompositionDependencies(31, "## Prerequisites\n- #31\n", nodes, "owner/repo"),
       /cannot depend on itself/i,
     );
+  });
+
+  it("isolates equal issue numbers by normalized repository", () => {
+    assert.deepEqual(mapDecompositionDependencies(
+      8,
+      "## Dependencies\n- #7\n",
+      [
+        { id: "root-7", repository: "OWNER/root", issue: 7, memberIssues: [7] },
+        { id: "child-7", repository: "owner/parent", issue: 7, memberIssues: [7] },
+      ],
+      " owner/parent ",
+    ), ["child-7"]);
   });
 });

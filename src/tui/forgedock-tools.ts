@@ -1174,7 +1174,7 @@ export async function materializeVisibleDecomposition(input: {
   items: readonly VisibleOrchestrationItem[];
   serializationEdges?: readonly ClaimSerializationEdge[];
 } | undefined> {
-  const effectiveParentRepository = input.node.repository ?? input.item.repository ?? input.repository;
+  const effectiveParentRepository = normalizeOrchestrationRepository(input.node.repository ?? input.item.repository ?? input.repository);
   const authoritativeRepository = await input.github.getRepository(effectiveParentRepository);
   let children = input.childIssues === undefined ? undefined : [...input.childIssues];
   if (children === undefined) {
@@ -1191,9 +1191,10 @@ export async function materializeVisibleDecomposition(input: {
       .map((candidate) => ({
         id: candidate.id,
         issue: candidate.issue,
+        repository: orchestrationNodeRepository(input.orchestration, candidate),
         ...(candidate.memberIssues !== undefined ? { memberIssues: candidate.memberIssues } : {}),
       })),
-    ...children.map((issue) => ({ id: `issue-${issue}`, issue, memberIssues: [issue] })),
+    ...children.map((issue) => ({ id: `issue-${issue}`, issue, repository: effectiveParentRepository, memberIssues: [issue] })),
   ];
   const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
   const childItems: VisibleOrchestrationItem[] = [];
@@ -1208,7 +1209,7 @@ export async function materializeVisibleDecomposition(input: {
       input.effective.productionTarget,
     );
     const affectedFiles = affectedFilesFromIssueBody(issue.body);
-    const dependencies = mapDecompositionDependencies(issue.number, issue.body, dependencyNodes);
+    const dependencies = mapDecompositionDependencies(issue.number, issue.body, dependencyNodes, effectiveParentRepository);
     const sourcePullRequest = sourcePullRequestFromIssueBody(issue.body);
     const defectClass = defectClassFromIssueBody(issue.body);
     childItems.push({
