@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import type { ArtifactKind } from "../../core/artifacts/schema.js";
-import { applyPristineReset, dryRunPristineReset, replayLabels, resetManifestDigest, sha256, type PristineResetManifest, type ResetPlanDependencies } from "./pristine-reset.js";
+import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
+import { applyPristineReset, dryRunPristineReset, replayLabels, resetManifestDigest, selectResetDagNodes, sha256, type PristineResetManifest, type ResetPlanDependencies } from "./pristine-reset.js";
 
 const sha = "a".repeat(40);
 function fakeDeps(overrides: Partial<ResetPlanDependencies> = {}): ResetPlanDependencies & { mutations: string[] } {
@@ -35,6 +36,33 @@ function fakeDeps(overrides: Partial<ResetPlanDependencies> = {}): ResetPlanDepe
 }
 
 describe("typed pristine repository reset", () => {
+  const orchestration = (id: string, issue: number, status: "queued" | "completed" = "queued", route = "staging"): OrchestrationRecord => ({
+    schema: "forgedock.orchestration/v1", orchestrationId: id, repository: "o/r", issueNumbers: [issue],
+    maxParallel: 1, autoMerge: false, status: "running", createdAt: "2026-01-01", updatedAt: "2026-01-01",
+    nodes: [{ id: `${id}-node`, issue, priority: 1, dependencies: [], claims: [], targetBranch: route, targetRouteClaim: `o/r:${route}`, status, childRunIds: [`run-${id}`], memberIssues: [issue] }],
+  });
+
+  it("selects every explicitly named DAG sharing an issue deterministically", () => {
+    const dags = [orchestration("dag-a", 458), orchestration("dag-b", 458), orchestration("unrelated", 999)];
+    const target = { repo: "o/r", issueNumbers: [458], dagIds: ["dag-a", "dag-b"] };
+    const first = selectResetDagNodes(dags, target);
+    const second = selectResetDagNodes(dags, target);
+    assert.deepEqual(first.selected.map(({ dag, node }) => `${dag.orchestrationId}/${node.id}`), ["dag-a/dag-a-node", "dag-b/dag-b-node"]);
+    assert.deepEqual(first, second);
+    assert.deepEqual(first.preserved.map(({ dag, node }) => `${dag.orchestrationId}/${node.id}`), ["unrelated/unrelated-node"]);
+  });
+
+  it("rejects an omitted shared DAG before any reset can be authorized", () => {
+    const dags = [orchestration("dag-a", 458), orchestration("dag-b", 458)];
+    assert.throws(() => selectResetDagNodes(dags, { repo: "o/r", issueNumbers: [458], dagIds: ["dag-a"] }), /ambiguous for issue #458/);
+    assert.throws(() => selectResetDagNodes(dags, { repo: "o/r", issueNumbers: [458], dagIds: ["dag-b"] }), /ambiguous for issue #458/);
+  });
+
+  it("rejects a shared issue on different delivery routes even when both DAGs are selected", () => {
+    const dags = [orchestration("dag-a", 458, "queued", "staging"), orchestration("dag-b", 458, "queued", "main")];
+    assert.throws(() => selectResetDagNodes(dags, { repo: "o/r", issueNumbers: [458], dagIds: ["dag-a", "dag-b"] }), /ambiguous for issue #458/);
+  });
+
   it("dry-run is read-only and replays labels deterministically", async () => {
     assert.deepEqual(replayLabels([
       { name: "workflow:building", action: "labeled", occurredAt: "2026-01-02", eventId: 2 },

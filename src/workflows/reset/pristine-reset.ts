@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ArtifactKind } from "../../core/artifacts/schema.js";
+import type { OrchestrationNodeRecord, OrchestrationRecord } from "../../core/ports/orchestration.js";
 import type { SqliteRepositoryPurgeManifest, SqliteRepositoryPurgeResult } from "../../adapters/sqlite/sqlite-repositories.js";
 import type { SqliteObservationPurgeManifest, SqliteObservationPurgeResult } from "../../observability/sqlite-store.js";
 
@@ -454,6 +455,57 @@ async function assertResetArchivesComplete(manifest: PristineResetManifest, arch
 }
 
 function sha256Bytes(value: Uint8Array): string { return createHash("sha256").update(value).digest("hex"); }
+
+/**
+ * Select unfinished node identities without letting an issue selector authorize
+ * an unselected DAG. Repeated runs may legitimately share an issue, but only an
+ * explicit complete DAG selection proves that those identities belong together.
+ */
+export function selectResetDagNodes(
+  dags: readonly OrchestrationRecord[],
+  target: ResetSelection,
+): { selected: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>; preserved: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord; reason: "completed" | "invalid" | "unselected" }> } {
+  const terminal = new Set(["completed", "invalid", "skipped"]);
+  const candidates = dags.flatMap((dag) => dag.nodes.map((node) => ({ dag, node })));
+  const selectedDagIds = new Set(target.dagIds);
+  for (const dag of dags) {
+    if (selectedDagIds.has(dag.orchestrationId) && dag.repository.trim().toLowerCase() !== target.repo.trim().toLowerCase()) {
+      throw new Error(`Reset selection repository mismatch for DAG ${dag.orchestrationId}`);
+    }
+  }
+  const selected = new Set<string>();
+  if (target.issueNumbers.length) {
+    for (const issue of target.issueNumbers) {
+      const matches = candidates.filter(({ dag, node }) => {
+        const repository = (node.repository ?? dag.repository).trim();
+        return repository.toLowerCase() === target.repo.trim().toLowerCase()
+          && (node.issue === issue || (node.memberIssues ?? []).includes(issue));
+      });
+      if (matches.length > 1) {
+        const routeKeys = new Set(matches.map(({ dag, node }) => {
+          const route = node.targetRouteClaim?.trim() ?? node.targetBranch?.trim();
+          return route === undefined ? undefined : route.toLowerCase();
+        }));
+        const sameAuthority = routeKeys.size <= 1;
+        const everyIdentityExplicitlySelected = matches.every(({ dag }) => selectedDagIds.has(dag.orchestrationId));
+        if (!(sameAuthority && everyIdentityExplicitlySelected)) {
+          throw new Error(`Reset selection is ambiguous for issue #${issue}; it maps to multiple repository/node/member identities`);
+        }
+      }
+      if (matches.length === 0 && dags.length) {
+        throw new Error(`Reset selection could not map issue #${issue} to an exact DAG node identity`);
+      }
+      for (const match of matches) selected.add(`${match.dag.orchestrationId}|${match.node.id}`);
+    }
+  } else {
+    for (const { dag, node } of candidates) selected.add(`${dag.orchestrationId}|${node.id}`);
+  }
+  const selectedNodes = candidates.filter(({ dag, node }) => selected.has(`${dag.orchestrationId}|${node.id}`) && !terminal.has(node.status));
+  const preserved = candidates.filter(({ dag, node }) => !selected.has(`${dag.orchestrationId}|${node.id}`) || terminal.has(node.status)).map(({ dag, node }) => ({
+    dag, node, reason: terminal.has(node.status) ? (node.status === "invalid" ? "invalid" : "completed") : "unselected",
+  } as const));
+  return { selected: selectedNodes, preserved };
+}
 
 export function replayLabels(events: readonly ResetLabelEvent[], before?: string): string[] {
   const labels = new Set<string>();

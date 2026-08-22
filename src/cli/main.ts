@@ -76,7 +76,7 @@ import { mapDecompositionDependencies } from "../workflows/orchestrate/decomposi
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { dryRunPristineReset, applyPristineReset, writeResetManifest, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetSelection } from "../workflows/reset/pristine-reset.js";
+import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
 
 const args = process.argv.slice(2);
@@ -1733,44 +1733,6 @@ function resetNodeRunIds(node: OrchestrationNodeRecord): string[] {
     ...node.childRunIds,
     ...(node.attempts ?? []).flatMap((attempt) => attempt.runId ? [attempt.runId] : []),
   ])].sort();
-}
-
-/** Select only unfinished node identities; a DAG record never authorizes all child runs. */
-function selectResetDagNodes(
-  dags: readonly OrchestrationRecord[],
-  target: ResetSelection,
-): { selected: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord }>; preserved: Array<{ dag: OrchestrationRecord; node: OrchestrationNodeRecord; reason: "completed" | "invalid" | "unselected" }> } {
-  const terminal = new Set(["completed", "invalid", "skipped"]);
-  const candidates = dags.flatMap((dag) => dag.nodes.map((node) => ({ dag, node })));
-  for (const dag of dags) {
-    if (target.dagIds.includes(dag.orchestrationId) && dag.repository.toLowerCase() !== target.repo.toLowerCase()) {
-      throw new Error(`Reset selection repository mismatch for DAG ${dag.orchestrationId}`);
-    }
-  }
-  const selected = new Set<string>();
-  if (target.issueNumbers.length) {
-    for (const issue of target.issueNumbers) {
-      const matches = candidates.filter(({ dag, node }) => {
-        const repository = node.repository ?? dag.repository;
-        return repository.toLowerCase() === target.repo.toLowerCase()
-          && (node.issue === issue || (node.memberIssues ?? []).includes(issue));
-      });
-      if (matches.length > 1) {
-        throw new Error(`Reset selection is ambiguous for issue #${issue}; it maps to multiple repository/node/member identities`);
-      }
-      if (matches.length === 0 && dags.length) {
-        throw new Error(`Reset selection could not map issue #${issue} to an exact DAG node identity`);
-      }
-      if (matches[0]) selected.add(`${matches[0].dag.orchestrationId}|${matches[0].node.id}`);
-    }
-  } else {
-    for (const { dag, node } of candidates) selected.add(`${dag.orchestrationId}|${node.id}`);
-  }
-  const selectedNodes = candidates.filter(({ dag, node }) => selected.has(`${dag.orchestrationId}|${node.id}`) && !terminal.has(node.status));
-  const preserved = candidates.filter(({ dag, node }) => !selected.has(`${dag.orchestrationId}|${node.id}`) || terminal.has(node.status)).map(({ dag, node }) => ({
-    dag, node, reason: terminal.has(node.status) ? (node.status === "invalid" ? "invalid" : "completed") : "unselected",
-  } as const));
-  return { selected: selectedNodes, preserved };
 }
 
 function readResetTaskRecords(target: ResetSelection, runIds: readonly string[], nodeIds: readonly string[] = []): Array<{ id: string; pid?: number; status?: string; launchKey?: string; runId?: string; snapshotSha256: string }> {
