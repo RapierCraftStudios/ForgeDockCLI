@@ -161,6 +161,37 @@ export type InvariantMatrixRow = Static<typeof InvariantMatrixRowSchema>;
 
 const PacketDigest = Type.String({ pattern: "^[0-9a-fA-F]{64}$" });
 
+/** Controller-only proof for the no-hints, evidence-backed architecture lane. */
+export const InvestigationScopeReceiptSchema = Type.Object({
+  version: Type.Literal("forgedock.investigation-scope/v1"),
+  runId: NonEmptyString,
+  subject: SubjectSchema,
+  intentId: NonEmptyString,
+  intentDigest: PacketDigest,
+  investigationId: NonEmptyString,
+  investigationDigest: PacketDigest,
+  baseSha: Sha,
+  proposalDigest: PacketDigest,
+  decisionDigest: PacketDigest,
+  componentRoots: Type.Array(NonEmptyString, { minItems: 1, maxItems: 8 }),
+  approvedPaths: Type.Array(NonEmptyString, { minItems: 1, maxItems: 32 }),
+  newPaths: Type.Array(NonEmptyString, { maxItems: 4 }),
+  evidencePaths: Type.Array(NonEmptyString, { minItems: 1, maxItems: 32 }),
+  evidenceDigests: Type.Array(Type.Object({ path: NonEmptyString, digest: PacketDigest, bytes: Type.Integer({ minimum: 0 }) }), { minItems: 1, maxItems: 32 }),
+  evidenceBytes: Type.Integer({ minimum: 0 }),
+  relationReads: Type.Integer({ minimum: 0 }),
+  limits: Type.Object({
+    maxComponentRoots: Type.Integer({ minimum: 1 }),
+    maxTotalPaths: Type.Integer({ minimum: 1 }),
+    maxNewPaths: Type.Integer({ minimum: 0 }),
+    maxRelationReads: Type.Integer({ minimum: 1 }),
+    maxEvidenceBytes: Type.Integer({ minimum: 1 }),
+  }),
+  relationCheckpointId: NonEmptyString,
+  relationCheckpointDigest: PacketDigest,
+});
+export type InvestigationScopeReceipt = Static<typeof InvestigationScopeReceiptSchema>;
+
 export const BuildPacketPayloadSchema = Type.Object({
   scope: Type.Array(NonEmptyString, { minItems: 1 }),
   acceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -200,6 +231,8 @@ export const BuildPacketPayloadSchema = Type.Object({
     targeting: Type.Optional(NonEmptyString),
     identityDigest: Type.String({ pattern: "^[0-9a-f]{64}$" }),
   }))),
+  /** Optional controller proof for evidence-backed, no-issue-hint architecture packets. */
+  investigationScopeReceipt: Type.Optional(InvestigationScopeReceiptSchema),
   /** Optional controller-owned relation closure; absent packets remain legacy/conservative. */
   relationGraph: Type.Optional(Type.Object({
     version: Type.Literal("forgedock.relation-graph/v1"),

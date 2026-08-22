@@ -57,4 +57,33 @@ describe("relation checkpoint certification", () => {
       assert.equal(digestRelation("keeps the fixture content-based" ).length, 64);
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
+  it("filters planned nodes and ID-only edges after dirty planned files are created", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-planned-cert-"));
+    try {
+      const baseSha = "b".repeat(40);
+      const existingDigest = digestRelation("existing");
+      const plannedDigest = digestRelation("planned-base-placeholder");
+      const existingNode = { id: "file:src-a.ts", kind: "file" as const, identity: "src-a.ts", digest: existingDigest };
+      const plannedNode = { id: "file:src-new.ts", kind: "file" as const, identity: "src-new.ts", digest: plannedDigest };
+      const adapter = {
+        id: "synthetic-planned", languages: ["typescript"],
+        inspect: async () => ({
+          adapterId: "synthetic-planned", nodes: [existingNode, plannedNode], files: ["src-a.ts", "src-new.ts"], targets: [],
+          edges: [{ id: "planned-import", sourceId: plannedNode.id, targetId: existingNode.id, kind: "import" as const, adapterId: "synthetic-planned", provenance: "controller" as const, evidenceDigest: digestRelation("planned-edge") }],
+        }),
+      };
+      const graph = buildRelationGraph({ baseSha, seeds: [{ path: "src-a.ts", provenance: "controller", contentDigest: existingDigest }, { path: "src-new.ts", provenance: "controller", contentDigest: plannedDigest }], facts: [{ adapterId: "synthetic-planned", nodes: [existingNode], edges: [], fileCount: 1 }], limits });
+      const closure = closeRelationGraph(graph);
+      const commandPlan = {};
+      const checkpoint = relationGraphCheckpointPayload({ graph, closure, configDigest: graphConfigDigest({ adapters: graph.adapterIds, limits: graph.limits }), commandPlanDigest: graphCommandPlanDigest(commandPlan), evidenceContractDigest: graphEvidenceContractDigest(undefined) });
+      const packet = {
+        relationGraph: { version: "forgedock.relation-graph/v1" as const, baseSha, graphDigest: graph.graphDigest, configDigest: checkpoint.configDigest, closureDigest: checkpoint.closureDigest, commandPlanDigest: checkpoint.commandPlanDigest, evidenceContractDigest: checkpoint.evidenceContractDigest, checkpointId: checkpoint.checkpointId, checkpointDigest: checkpoint.checkpointDigest, writablePaths: checkpoint.writablePaths, evidencePaths: checkpoint.evidencePaths, invariantIds: checkpoint.invariantIds, commandIds: checkpoint.commandIds },
+        expectedPaths: checkpoint.writablePaths,
+        evidencePaths: [],
+        investigationScopeReceipt: { newPaths: ["src-new.ts"] },
+      } as unknown as Parameters<typeof certifyRelationGraphCheckpoint>[0]["packet"];
+      await writeFile(join(cwd, "src-new.ts"), "created after packet");
+      await assert.doesNotReject(() => certifyRelationGraphCheckpoint({ checkpoint, packet, cwd, baseSha, adapters: [adapter] }));
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
 });

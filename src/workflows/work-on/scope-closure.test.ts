@@ -13,7 +13,6 @@ describe("scope closure", () => {
   it("admits deterministic source/test companions but not arbitrary root siblings", async () => {
     const result = await closeExpectedWriteScope(["src/widget.ts", "test/widget.test.ts", "src/unrelated.test.ts"], {
       issueWriteHints: ["src/widget.ts"],
-      investigationWriteHints: ["src/widget.ts"],
     });
     assert.deepEqual(result.expectedPaths, ["src/widget.ts", "test/widget.test.ts"]);
     assert.deepEqual(result.rejectedPaths, ["src/unrelated.test.ts"]);
@@ -23,7 +22,6 @@ describe("scope closure", () => {
   it("keeps investigation surfaces read-only and accepts controller write hints", async () => {
     const result = await closeExpectedWriteScope(["src/consumer.ts", "src/contract.ts"], {
       issueWriteHints: ["src/consumer.ts"],
-      investigationWriteHints: ["src/contract.ts"],
       controllerWriteHints: ["src/contract.ts"],
     });
     assert.deepEqual(result.expectedPaths, ["src/consumer.ts", "src/contract.ts"]);
@@ -93,13 +91,11 @@ describe("scope closure", () => {
 
   it("rejects investigation-only exact and basename-related writes", async () => {
     const exact = await closeExpectedWriteScope(["docs/CONFIG.md"], {
-      investigationWriteHints: ["docs/CONFIG.md"],
     });
     assert.deepEqual(exact.expectedPaths, []);
     assert.deepEqual(exact.rejectedPaths, ["docs/CONFIG.md"]);
 
     const companion = await closeExpectedWriteScope(["tests/forgedock-config.test.ts"], {
-      investigationWriteHints: ["docs/forgedock-config.ts"],
     });
     assert.deepEqual(companion.expectedPaths, []);
     assert.deepEqual(companion.rejectedPaths, ["tests/forgedock-config.test.ts"]);
@@ -107,7 +103,6 @@ describe("scope closure", () => {
 
   it("admits an investigation path only when explicitly repeated by controller write hints", async () => {
     const result = await closeExpectedWriteScope(["docs/CONFIG.md"], {
-      investigationWriteHints: ["docs/CONFIG.md"],
       controllerWriteHints: ["docs/CONFIG.md"],
     });
     assert.deepEqual(result.expectedPaths, ["docs/CONFIG.md"]);
@@ -126,7 +121,7 @@ describe("scope closure", () => {
         "config/runtime.json:1-1",
       ], cwd);
       assert.deepEqual(paths, ["config/runtime.json", "scripts/stage-generated.mjs"]);
-      const closure = await closeExpectedWriteScope(paths, { investigationWriteHints: paths });
+      const closure = await closeExpectedWriteScope(paths, {});
       assert.deepEqual(closure.expectedPaths, []);
       assert.deepEqual(closure.rejectedPaths, paths);
     } finally {

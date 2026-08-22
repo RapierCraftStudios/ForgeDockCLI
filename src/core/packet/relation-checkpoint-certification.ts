@@ -16,7 +16,7 @@ import {
 
 export interface RelationCheckpointCertificationInput {
   checkpoint: RelationGraphCheckpointPayload;
-  packet: Pick<BuildPacketPayload, "relationGraph" | "expectedPaths" | "evidencePaths" | "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "evidenceContract">;
+  packet: Pick<BuildPacketPayload, "relationGraph" | "expectedPaths" | "evidencePaths" | "verificationPolicyVersion" | "verificationCommandTargets" | "verificationCommandIdentities" | "evidenceContract" | "investigationScopeReceipt">;
   cwd: string;
   baseSha: string;
   adapters?: readonly RepositoryAdapter[];
@@ -58,8 +58,23 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   assertAuthorizedSubset(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
 
   const adapters = input.adapters ?? repositoryAdaptersFor(await detectRepositoryLanguages(input.cwd));
+  const plannedPaths = new Set(packet.investigationScopeReceipt?.newPaths ?? []);
   const facts = [];
-  for (const adapter of adapters) facts.push(await adapter.inspect({ cwd: input.cwd, limits: checkpoint.limits }));
+  for (const adapter of adapters) {
+    const fact = await adapter.inspect({ cwd: input.cwd, limits: checkpoint.limits });
+    // Planned paths are represented by deterministic base placeholders in the
+    // checkpoint. Ignore their dirty post-build adapter nodes/edges so strict
+    // restart certification remains anchored to the exact base evidence.
+    facts.push(plannedPaths.size ? {
+      ...fact,
+      nodes: fact.nodes.filter((node) => !plannedPaths.has(node.identity)),
+      edges: (() => {
+        const removedNodeIds = new Set(fact.nodes.filter((node) => plannedPaths.has(node.identity)).map((node) => node.id));
+        return fact.edges.filter((edge) => !removedNodeIds.has(edge.sourceId) && !removedNodeIds.has(edge.targetId)
+          && !plannedPaths.has(edge.sourcePath ?? "") && !plannedPaths.has(edge.targetPath ?? ""));
+      })(),
+    } : fact);
+  }
   const fresh = buildRelationGraph({ baseSha: input.baseSha, seeds: checkpoint.seeds, facts, limits: checkpoint.limits });
   revalidateRelationGraph(graph, { baseSha: input.baseSha, graphDigest: checkpoint.graphDigest }, fresh);
   const freshClosure = closeRelationGraph(fresh);

@@ -31,6 +31,7 @@ import {
 } from "./investigate.js";
 import { CONTROLLER_VERIFICATION_GATES, prepareBuildPacket, selectPacketVerificationCommands } from "./prepare.js";
 import { certifyRelationGraphCheckpoint } from "../../core/packet/relation-checkpoint-certification.js";
+import { validateInvestigationScopeReceipt, revalidateInvestigationScopeEvidence } from "../../core/packet/investigation-scope.js";
 import { ClaimPromotionConflictError } from "../orchestrate/scheduler.js";
 import { assertTargetHeadUnchanged, TargetBranchAdvancedError } from "./publish.js";
 import { publishPullRequest } from "./publish.js";
@@ -914,6 +915,32 @@ export async function certifyPacketRelationAuthority(
   baseSha: string,
   artifacts: ArtifactRepository,
 ): Promise<void> {
+  if (packet.payload.investigationScopeReceipt) {
+    const receipt = packet.payload.investigationScopeReceipt;
+    const [intents, investigations] = await Promise.all([
+      artifacts.list(packet.subject, "Intent"),
+      artifacts.list(packet.subject, "Investigation"),
+    ]);
+    const intent = intents.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.id === receipt.intentId);
+    const investigation = investigations.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.id === receipt.investigationId);
+    if (!intent || !investigation) throw new Error("[investigation-scope] Receipt-bound Intent or Investigation is missing");
+    validateInvestigationScopeReceipt({
+      receipt,
+      runId: packet.runId,
+      subject: packet.subject,
+      intent,
+      investigation,
+      baseSha,
+      proposalPaths: packet.payload.expectedPaths,
+      expectedPaths: packet.payload.expectedPaths,
+      ...(packet.payload.relationGraph ? { relationGraph: {
+        checkpointId: packet.payload.relationGraph.checkpointId!,
+        checkpointDigest: packet.payload.relationGraph.checkpointDigest!,
+        baseSha: packet.payload.relationGraph.baseSha,
+      } } : {}),
+    });
+    await revalidateInvestigationScopeEvidence({ receipt, cwd, baseSha });
+  }
   if (!packet.payload.relationGraph) return;
   try {
     const checkpoints = await artifacts.list(packet.subject, "RelationGraphCheckpoint");

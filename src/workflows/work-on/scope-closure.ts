@@ -120,8 +120,6 @@ function safeEvidenceLocation(source: string, path: string): boolean {
 export interface ScopeClosureInput {
   /** Concrete paths declared by the issue/controller and therefore direct authority. */
   issueWriteHints?: readonly string[];
-  /** Concrete paths proven by the investigation. */
-  investigationWriteHints?: readonly string[];
   /** Concrete paths supplied by the controller outside the model output. */
   controllerWriteHints?: readonly string[];
   /** Frozen checkout used to prove literal/import relations for collateral files. */

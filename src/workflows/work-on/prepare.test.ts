@@ -12,6 +12,7 @@ import { investigateWorkItem } from "./investigate.js";
 import { prepareBuildPacket, selectPacketVerificationCommands, canonicalizePacketVerification } from "./prepare.js";
 import { deriveEvidenceContract } from "./evidence-contract.js";
 import { discoverVerificationCommands } from "../../cli/verification-policy.js";
+import { revalidateInvestigationScopeEvidence } from "../../core/packet/investigation-scope.js";
 
 const investigation: InvestigationPayload = {
   outcome: "confirmed", confidence: "high", summary: "Confirmed",
@@ -71,6 +72,54 @@ describe("Build Packet preparation", () => {
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY",
     ]);
   });
+
+  it("derives a bounded architecture receipt from empty hints and survives dirty planned files", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "forgedock-architecture-scope-"));
+    try {
+      await mkdir(join(cwd, "src/component"), { recursive: true });
+      await mkdir(join(cwd, "test/component"), { recursive: true });
+      await writeFile(join(cwd, "src/component/anchor.ts"), "export const anchor = true;\n");
+      await writeFile(join(cwd, "src/component/related.ts"), "import { anchor } from './anchor.js'; export { anchor };\n");
+      await writeFile(join(cwd, "test/component/anchor.test.ts"), "import '../anchor.js';\n");
+      execFileSync("git", ["init", "-q"], { cwd });
+      execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd });
+      execFileSync("git", ["add", "."], { cwd });
+      execFileSync("git", ["commit", "-qm", "base"], { cwd });
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+      const architectureInvestigation: InvestigationPayload = {
+        ...investigation,
+        evidence: [{ claim: "Component anchor", source: "src/component/anchor.ts:1", detail: "Existing architecture" }],
+        affectedSurfaces: ["src/component/related.ts", "test/component/anchor.test.ts"],
+      };
+      const architecturePacket: BuildPacketPayload = {
+        ...packet,
+        expectedPaths: ["src/component/anchor.ts", "src/component/related.ts", "src/component/new.ts", "test/component/new.test.ts"],
+      };
+      const runtime = new FakeAgentRuntime([architectureInvestigation, architecturePacket]);
+      const artifacts = new InMemoryArtifactRepository();
+      const runs = new InMemoryRunRepository();
+      const intent = createArtifact({
+        kind: "Intent", runId: "run_architecture_scope", subject: { repo: "a/b", issue: 458 }, producer: { role: "controller" },
+        payload: { title: "Architecture scope", problem: "Build new architecture", constraints: [], acceptanceHints: [], dependencies: [] },
+      });
+      const investigated = await investigateWorkItem({ intent, cwd }, { runtime, artifacts, runs });
+      const prepared = await prepareBuildPacket({ run: investigated.run, intent, investigation: investigated.investigation, cwd, baseSha }, { runtime, artifacts, runs });
+      const receipt = prepared.packet.payload.investigationScopeReceipt;
+      assert.ok(receipt);
+      assert.deepEqual(prepared.packet.payload.expectedPaths, architecturePacket.expectedPaths);
+      assert.deepEqual(receipt?.newPaths, ["src/component/new.ts", "test/component/new.test.ts"]);
+      await writeFile(join(cwd, "src/component/new.ts"), "export const newArchitecture = true;\n");
+      await writeFile(join(cwd, "test/component/new.test.ts"), "import '../new.js';\n");
+      await revalidateInvestigationScopeEvidence({ receipt: receipt!, cwd, baseSha });
+      await writeFile(join(cwd, "src/component/anchor.ts"), "tampered\n");
+      await revalidateInvestigationScopeEvidence({ receipt: receipt!, cwd, baseSha });
+      assert.equal(receipt?.baseSha, baseSha);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   it("accepts generated-source Investigation evidence as read-only without changing expected paths", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "forgedock-generated-evidence-"));
