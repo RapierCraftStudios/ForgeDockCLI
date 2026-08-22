@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
@@ -19,6 +21,7 @@ import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
+import { digestRelation } from "../../core/packet/relation-graph.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
@@ -64,9 +67,39 @@ describe("relation checkpoint rollout mode", () => {
       else process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = previous;
     }
   });
+  it("blocks receipt-bound graph tampering without strict-mode environment flags", async () => {
+    const runId = "run_receipt_graph_tamper";
+    const subject = { repo: "a/b", issue: 8 } as const;
+    const intent = createArtifact({ kind: "Intent", runId, subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId, subject, producer: { role: "investigator" }, payload: investigation });
+    const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const evidencePath = "src/core/packet/relation-graph.ts";
+    const evidenceBytes = readFileSync(evidencePath);
+    const limits = { maxComponentRoots: 8, maxTotalPaths: 32, maxNewPaths: 4, maxRelationReads: 32, maxEvidenceBytes: 4_000_000 };
+    const receiptBase = {
+      version: "forgedock.investigation-scope/v1" as const, runId, subject,
+      intentId: intent.id, intentDigest: digestRelation(intent.payload), investigationId: investigationArtifact.id, investigationDigest: digestRelation(investigationArtifact.payload),
+      baseSha, proposalDigest: digestRelation(packet.expectedPaths), componentRoots: ["src"], approvedPaths: [...packet.expectedPaths], newPaths: [], evidencePaths: [evidencePath],
+      evidenceDigests: [{ path: evidencePath, digest: digestRelation([...evidenceBytes]), bytes: evidenceBytes.byteLength }], evidenceBytes: evidenceBytes.byteLength, relationReads: 0, limits,
+      relationCheckpointId: `relation-graph:${"a".repeat(64)}`, relationCheckpointDigest: "a".repeat(64),
+    };
+    const receipt = { ...receiptBase, decisionDigest: digestRelation({ proposalDigest: receiptBase.proposalDigest, componentRoots: receiptBase.componentRoots, approvedPaths: receiptBase.approvedPaths, newPaths: receiptBase.newPaths, evidencePaths: receiptBase.evidencePaths, evidenceDigests: receiptBase.evidenceDigests, evidenceBytes: receiptBase.evidenceBytes, relationReads: 0, limits }) };
+    const relationPacket = createArtifact({ kind: "BuildPacket", runId, subject, producer: { role: "controller" }, payload: { ...packet, relationGraph: { version: "forgedock.relation-graph/v1", baseSha, graphDigest: "a".repeat(64), configDigest: "a".repeat(64), closureDigest: "a".repeat(64), commandPlanDigest: "a".repeat(64), evidenceContractDigest: "a".repeat(64), checkpointId: receipt.relationCheckpointId, checkpointDigest: receipt.relationCheckpointDigest, writablePaths: packet.expectedPaths, evidencePaths: [], invariantIds: [], commandIds: [] }, investigationScopeReceipt: receipt } });
+    const artifacts = new InMemoryArtifactRepository();
+    await artifacts.append(intent);
+    await artifacts.append(investigationArtifact);
+    const previous = process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+    delete process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+    try {
+      await assert.rejects(certifyPacketRelationAuthority(relationPacket, process.cwd(), baseSha, artifacts), /checkpoint is missing/);
+    } finally {
+      if (previous === undefined) delete process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT;
+      else process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT = previous;
+    }
+  });
 });
 
-class EndToEndGit implements GitWorkspaceManager {
+class EndToEndGit {
   removed = false;
   refreshes = 0;
   pristineAssertions = 0;

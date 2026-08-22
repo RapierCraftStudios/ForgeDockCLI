@@ -58,13 +58,13 @@ export async function certifyRelationGraphCheckpoint(input: RelationCheckpointCe
   assertAuthorizedSubset(checkpointClosure.commandIds, checkpoint.commandIds, "command closure");
 
   const adapters = input.adapters ?? repositoryAdaptersFor(await detectRepositoryLanguages(input.cwd));
-  const plannedPaths = new Set(packet.investigationScopeReceipt?.newPaths ?? []);
+  const plannedPaths = new Set(packet.investigationScopeReceipt?.approvedPaths ?? []);
   const facts = [];
   for (const adapter of adapters) {
     const fact = await adapter.inspect({ cwd: input.cwd, limits: checkpoint.limits });
-    // Planned paths are represented by deterministic base placeholders in the
-    // checkpoint. Ignore their dirty post-build adapter nodes/edges so strict
-    // restart certification remains anchored to the exact base evidence.
+    // Receipt-approved paths are represented by deterministic base placeholders
+    // in the checkpoint. Ignore their dirty post-build adapter nodes/edges so
+    // strict restart certification remains anchored to exact base evidence.
     facts.push(plannedPaths.size ? {
       ...fact,
       nodes: fact.nodes.filter((node) => !plannedPaths.has(node.identity)),

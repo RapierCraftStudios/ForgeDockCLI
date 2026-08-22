@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, relative, resolve, join } from "node:path";
@@ -80,7 +80,7 @@ export async function deriveInvestigationScopeDecision(input: DeriveInvestigatio
   const newPaths: string[] = [];
   let relationReads = 0;
   for (const path of proposalPaths) {
-    const status = await pathStatus(path, input.cwd);
+    const status = await pathStatus(path, input.cwd, input.baseSha);
     if (status === "unsafe") throw new Error(`[investigation-scope] Unsafe path rejected: ${path}`);
     if (status === "existing") existing.push(path);
     else newPaths.push(path);
@@ -93,14 +93,7 @@ export async function deriveInvestigationScopeDecision(input: DeriveInvestigatio
       approvedExisting.push(path);
       continue;
     }
-    const readsNeeded = 1 + evidenceBacked.length;
-    if (relationReads + readsNeeded > limits.maxRelationReads) throw new Error("[investigation-scope] Relation-read bound exceeded");
-    relationReads += readsNeeded;
-    if (await hasEvidenceRelation(path, evidenceBacked, input.cwd)) {
-      approvedExisting.push(path);
-    } else {
-      throw new Error(`[investigation-scope] Existing candidate is unrelated to frozen evidence: ${path}`);
-    }
+    throw new Error(`[investigation-scope] Existing candidate is unrelated to frozen evidence: ${path}`);
   }
   for (const path of newPaths) {
     if (!underRoot(path, componentRoots)) throw new Error(`[investigation-scope] New candidate is outside an evidence-backed component: ${path}`);
@@ -237,7 +230,7 @@ async function safeBaseFiles(paths: readonly string[], cwd: string, baseSha: str
   return { paths: result, digests, bytes };
 }
 
-async function pathStatus(path: string, cwd: string): Promise<"existing" | "missing" | "unsafe"> {
+async function dirtyPathSafety(path: string, cwd: string): Promise<"existing" | "missing" | "unsafe"> {
   if (!isConcreteScopePath(path)) return "unsafe";
   const root = resolve(cwd);
   const absolute = resolve(root, path);
@@ -277,31 +270,37 @@ async function pathStatus(path: string, cwd: string): Promise<"existing" | "miss
   }
 }
 
+async function pathStatus(path: string, cwd: string, baseSha: string): Promise<"existing" | "missing" | "unsafe"> {
+  const dirtySafety = await dirtyPathSafety(path, cwd);
+  if (dirtySafety === "unsafe") return "unsafe";
+  return basePathStatus(cwd, baseSha, path);
+}
+
+async function basePathStatus(cwd: string, baseSha: string, path: string): Promise<"existing" | "missing" | "unsafe"> {
+  try {
+    const result = await execFileAsync("git", ["ls-tree", "-z", baseSha, "--", path], { cwd, encoding: "utf8", maxBuffer: 4096, windowsHide: true });
+    const record = result.stdout.split("\\0").find(Boolean);
+    if (!record) return "missing";
+    const mode = record.split(" ", 1)[0] ?? "";
+    return mode === "120000" || mode === "160000" || mode === "040000" ? "unsafe" : "existing";
+  } catch {
+    return "missing";
+  }
+}
+
 function componentRoot(path: string): string {
   const root = dirname(path).replaceAll("\\", "/");
   return root === "." ? "" : root;
 }
 function underRoot(path: string, roots: readonly string[]): boolean { return roots.some((root) => path === root || path.startsWith(`${root}/`)); }
 
-async function hasEvidenceRelation(candidate: string, evidence: readonly string[], cwd: string): Promise<boolean> {
-  const candidateText = await readBounded(candidate, cwd);
-  const candidateName = candidate.split("/").at(-1)?.replace(/\.[^.]+$/, "") ?? candidate;
-  for (const source of evidence) {
-    const sourceText = await readBounded(source, cwd);
-    const sourceName = source.split("/").at(-1)?.replace(/\.[^.]+$/, "") ?? source;
-    if ((candidateText && (candidateText.includes(source) || candidateText.includes(sourceName)))
-      || (sourceText && (sourceText.includes(candidate) || sourceText.includes(candidateName)))) return true;
-  }
-  return false;
-}
-async function readBounded(path: string, cwd: string): Promise<string | undefined> {
-  try { return (await readFile(resolve(cwd, path), "utf8")).slice(0, 128 * 1024); } catch { return undefined; }
-}
-
 /** Revalidate evidence against immutable base blobs, never the dirty checkout. */
 export async function revalidateInvestigationScopeEvidence(input: { receipt: InvestigationScopeReceipt; cwd: string; baseSha: string }): Promise<void> {
   if (!/^[0-9a-f]{40}$/i.test(input.baseSha) || input.receipt.baseSha.toLowerCase() !== input.baseSha.toLowerCase()) throw new Error("[investigation-scope] Evidence base SHA is stale");
   const limits = boundedLimits(input.receipt.limits);
+  for (const approved of input.receipt.approvedPaths) {
+    if (await dirtyPathSafety(approved, input.cwd) === "unsafe") throw new Error(`[investigation-scope] Approved path is unsafe in retained checkout: ${approved}`);
+  }
   if (input.receipt.evidencePaths.length !== input.receipt.evidenceDigests.length || input.receipt.evidencePaths.length > limits.maxTotalPaths) throw new Error("[investigation-scope] Receipt evidence set is malformed");
   const seen = new Set<string>();
   let totalBytes = 0;

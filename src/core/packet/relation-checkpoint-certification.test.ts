@@ -80,9 +80,10 @@ describe("relation checkpoint certification", () => {
         relationGraph: { version: "forgedock.relation-graph/v1" as const, baseSha, graphDigest: graph.graphDigest, configDigest: checkpoint.configDigest, closureDigest: checkpoint.closureDigest, commandPlanDigest: checkpoint.commandPlanDigest, evidenceContractDigest: checkpoint.evidenceContractDigest, checkpointId: checkpoint.checkpointId, checkpointDigest: checkpoint.checkpointDigest, writablePaths: checkpoint.writablePaths, evidencePaths: checkpoint.evidencePaths, invariantIds: checkpoint.invariantIds, commandIds: checkpoint.commandIds },
         expectedPaths: checkpoint.writablePaths,
         evidencePaths: [],
-        investigationScopeReceipt: { newPaths: ["src-new.ts"] },
+        investigationScopeReceipt: { approvedPaths: ["src-a.ts", "src-new.ts"], newPaths: ["src-new.ts"] },
       } as unknown as Parameters<typeof certifyRelationGraphCheckpoint>[0]["packet"];
       await writeFile(join(cwd, "src-new.ts"), "created after packet");
+      await writeFile(join(cwd, "src-a.ts"), "modified after packet");
       await assert.doesNotReject(() => certifyRelationGraphCheckpoint({ checkpoint, packet, cwd, baseSha, adapters: [adapter] }));
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });

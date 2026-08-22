@@ -950,11 +950,9 @@ export async function certifyPacketRelationAuthority(
     if (!bound) throw new Error("[graph-authority] Exact relation graph checkpoint is missing or tampered");
     await certifyRelationGraphCheckpoint({ checkpoint: bound.payload, packet: packet.payload, cwd, baseSha });
   } catch (error) {
-    // Relation-graph certification is intentionally shadow-only until the
-    // production adapter matrix has completed its canary period. Existing
-    // packet scope, frozen command identities, evidence contracts, content
-    // digests and exact-SHA review/merge remain blocking authority.
-    if (process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT === "1") throw error;
+    // Legacy packets retain shadow certification during rollout, but a
+    // controller-issued investigation receipt is always a blocking authority.
+    if (packet.payload.investigationScopeReceipt || process.env.FORGEDOCK_STRICT_RELATION_CHECKPOINT === "1") throw error;
   }
 }
 

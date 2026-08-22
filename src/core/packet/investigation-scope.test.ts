@@ -39,10 +39,11 @@ describe("investigation scope receipt", () => {
       const overlap = await deriveInvestigationScopeDecision({ runId: "run-458", subject, intent, investigation: overlapInvestigation, baseSha, cwd, evidencePaths: ["src/component/anchor.ts"], proposedPaths: ["src/component/new-architecture.ts"] });
       assert.equal(overlap.evidenceDigests.length, 1);
       assert.equal(overlap.evidenceBytes, Buffer.byteLength("export const anchor = true;\n"));
-      const related = await deriveInvestigationScopeDecision({ runId: "run-458", subject, intent, investigation, baseSha, cwd, evidencePaths: ["src/component/anchor.ts"], proposedPaths: ["src/related.ts"] });
-      assert.deepEqual(related.approvedPaths, ["src/related.ts"]);
-      assert.deepEqual(related.evidencePaths, ["src/component/anchor.ts"]);
-      assert.ok(related.relationReads > 0);
+      await writeFile(join(cwd, "src/related.ts"), "anchor\n");
+      await assert.rejects(() => deriveInvestigationScopeDecision({ runId: "run-458", subject, intent, investigation, baseSha, cwd, evidencePaths: ["src/component/anchor.ts"], proposedPaths: ["src/related.ts"] }), /unrelated/);
+      await writeFile(join(cwd, "src/component/precreated.ts"), "import './anchor.js';\n");
+      const precreated = await deriveInvestigationScopeDecision({ runId: "run-458", subject, intent, investigation, baseSha, cwd, evidencePaths: ["src/component/anchor.ts"], proposedPaths: ["src/component/precreated.ts"] });
+      assert.deepEqual(precreated.newPaths, ["src/component/precreated.ts"]);
       const again = await deriveInvestigationScopeDecision({ runId: "run-458", subject, intent, investigation, baseSha, cwd, evidencePaths: ["src/component/anchor.ts"], proposedPaths: ["src/component/anchor.ts", "src/component/new-architecture.ts"] });
       assert.deepEqual(again, decision);
       const receipt = createInvestigationScopeReceipt({ runId: "run-458", subject, intent, investigation, baseSha, decision, relationCheckpointId: "relation-graph:checkpoint", relationCheckpointDigest: "b".repeat(64) });
