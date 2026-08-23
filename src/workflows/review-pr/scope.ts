@@ -79,7 +79,43 @@ export function isUnverifiedSourceFinding(finding: ReviewFinding): boolean {
     && finding.scopeRationale?.includes("Controller could not verify an exact reviewed-head source anchor") === true;
 }
 
-/** Projection mode used by the native review controller. */
+export async function reviewerSourceSnapshotDiagnostics(
+  findings: readonly ReviewFinding[],
+  input: {
+    reviewedHeadSha: string;
+    assignedPaths: readonly string[];
+    reviewedPaths: readonly string[];
+    expectedPaths: readonly string[];
+    readBlob?: (revision: string, path: string) => Promise<ExactSourceBlob | undefined>;
+    verifiedAuthorityReferences: readonly string[];
+  },
+): Promise<string[]> {
+  const allowed = [...input.assignedPaths, ...input.reviewedPaths, ...input.expectedPaths].map(normalizeRepoPath);
+  const authority = new Set(input.verifiedAuthorityReferences);
+  const diagnostics: string[] = [];
+  for (const finding of findings) {
+    if (!(finding.mustFix ?? finding.blocking)) continue;
+    const anchor = finding.evidenceAnchor;
+    if ((anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check") && authority.has(anchor.reference)) continue;
+    const snapshot = finding.sourceSnapshot;
+    if (!snapshot) { diagnostics.push(`${finding.id}: missing sourceSnapshot for blocking repository finding`); continue; }
+    if (snapshot.reviewedHeadSha.toLowerCase() !== input.reviewedHeadSha.toLowerCase()) { diagnostics.push(`${finding.id}: sourceSnapshot.reviewedHeadSha does not match frozen head ${input.reviewedHeadSha}`); continue; }
+    const path = normalizeRepoPath(snapshot.path);
+    if (!path || path.startsWith("/") || path.split("/").some((part) => part === "." || part === "..") || !allowed.some((candidate) => pathMatchesExpectation(path, candidate))) { diagnostics.push(`${finding.id}: sourceSnapshot.path must be repo-relative and under assigned/reviewed scope`); continue; }
+    if (!snapshot.excerpt && !snapshot.digest) { diagnostics.push(`${finding.id}: sourceSnapshot requires a bounded excerpt or SHA-256 digest`); continue; }
+    if (!input.readBlob) { diagnostics.push(`${finding.id}: controller cannot verify sourceSnapshot without readExactBlob`); continue; }
+    try {
+      const blob = await input.readBlob(input.reviewedHeadSha, path);
+      if (!blob || blob.mode === "120000") { diagnostics.push(`${finding.id}: sourceSnapshot path is not a regular file at frozen head`); continue; }
+      if (snapshot.excerpt && !blob.content.includes(snapshot.excerpt)) { diagnostics.push(`${finding.id}: sourceSnapshot excerpt is absent from exact file ${path}`); continue; }
+      if (snapshot.digest && createHash("sha256").update(blob.content).digest("hex") !== snapshot.digest.toLowerCase()) { diagnostics.push(`${finding.id}: sourceSnapshot digest mismatches exact file ${path}`); continue; }
+      if (snapshot.symbol && !blob.content.includes(snapshot.symbol)) diagnostics.push(`${finding.id}: sourceSnapshot symbol is absent from exact file ${path}`);
+    } catch (error) { diagnostics.push(`${finding.id}: exact source read failed (${error instanceof Error ? error.message : String(error)})`); }
+  }
+  return diagnostics;
+}
+
+
 export type FindingProjectionMode = "all" | "impact-gated";
 
 /**

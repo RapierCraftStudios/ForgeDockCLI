@@ -14,7 +14,7 @@ import { WorkflowExecutionError, retryableExternalWorkflowError } from "../work-
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
-import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, isUnverifiedSourceFinding, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
+import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, isUnverifiedSourceFinding, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
   ...FindingSchema.properties,
@@ -106,6 +106,13 @@ class ReviewWaveIncompleteError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ReviewWaveIncompleteError";
+  }
+}
+
+class ReviewerSubmissionValidationError extends Error {
+  constructor(readonly diagnostics: readonly string[]) {
+    super(`Reviewer source-proof admission failed: ${diagnostics.join("; ")}`);
+    this.name = "ReviewerSubmissionValidationError";
   }
 }
 
@@ -492,6 +499,15 @@ export async function reviewPullRequest(
     const changedRemediationAuthorityReferences = input.buildResult
       ? changedDeliveryAuthorityFacts(input.priorVerdict, frozen, input.buildResult, buildTargetBranch)
       : [];
+    const reviewerKnownAuthorityReferences = [
+      `PR.headSha=${frozen.headSha}`, `PR.headBranch=${frozen.headBranch}`, `PR.baseBranch=${frozen.baseBranch}`,
+      ...(input.buildResult
+        ? [`BuildResult.headSha=${input.buildResult.payload.headSha}`, `BuildResult.branch=${input.buildResult.payload.branch}`, `BuildResult.targetBranch=${buildTargetBranch}`]
+        : [`DeploymentReview.headSha=${frozen.headSha}`, `DeploymentReview.targetBranch=${buildTargetBranch}`]),
+      ...(input.buildResult?.payload.checks ?? input.deployment?.checks ?? [])
+        .filter((check) => check.status === "failed")
+        .map((check) => `${input.buildResult ? "BuildResult" : "DeploymentReview"}.check=${check.command}:${check.status}`),
+    ];
     const runReviewer = async (selection: ReviewPlan["executionGroups"][number]) => {
       const role = selection.role;
       const roleDiff = scopedReviewDiff(reviewPlan, selection, diff, input.deployment
@@ -654,6 +670,20 @@ export async function reviewPullRequest(
               },
             },
           );
+          const sourceDiagnostics = await reviewerSourceSnapshotDiagnostics(result.output.findings, {
+            reviewedHeadSha: frozen.headSha,
+            assignedPaths: selection.scope,
+            reviewedPaths: changedPaths,
+            expectedPaths: input.packet.payload.expectedPaths,
+            verifiedAuthorityReferences: reviewerKnownAuthorityReferences,
+            ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
+          });
+          if (sourceDiagnostics.length && attempt < reviewPlan.budget.maxAttemptsPerExecutionGroup) {
+            throw new ReviewerSubmissionValidationError(sourceDiagnostics);
+          }
+          if (sourceDiagnostics.length) {
+            await recordReviewProgress(`${taskId} · source-proof retry budget exhausted · ${sourceDiagnostics.join("; ")}`);
+          }
           completed = {
             executionGroupId: selection.id,
             role,

@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { applyFindingScopePolicy, shouldMaterializeFinding, verifyFindingSourceAnchors, type ReviewFinding } from "./scope.js";
+import { applyFindingScopePolicy, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type ReviewFinding } from "./scope.js";
 
 const runId = "run_scope";
 const subject = { repo: "a/b", issue: 1 };
@@ -58,6 +58,17 @@ describe("review finding scope policy", () => {
     assert.match(stale?.scopeRationale ?? "", /exact reviewed-head source anchor/);
   });
 
+  it("reports actionable source-proof diagnostics while allowing deterministic authority", async () => {
+    const head = "a".repeat(40);
+    const invalid = finding({ id: "wrong-source", sourceSnapshot: { reviewedHeadSha: "b".repeat(40), path: "src/a.ts", excerpt: "missing" } });
+    const deterministic = finding({ id: "check-source", evidenceAnchor: { kind: "deterministic-check", reference: "BuildResult.check=tsc:failed" } });
+    const diagnostics = await reviewerSourceSnapshotDiagnostics([invalid, deterministic], {
+      reviewedHeadSha: head, assignedPaths: ["src/a.ts"], reviewedPaths: ["src/a.ts"], expectedPaths: packet.payload.expectedPaths,
+      readBlob: async () => ({ content: "guardedUpdate", mode: "100644" }), verifiedAuthorityReferences: ["BuildResult.check=tsc:failed"],
+    });
+    assert.equal(diagnostics.length, 1);
+    assert.match(diagnostics[0]!, /does not match frozen head/);
+  });
   it("keeps legacy findings decodable but advisory without current-source proof", async () => {
     const [legacy] = await verifyFindingSourceAnchors([finding({})], {
       reviewedHeadSha: "a".repeat(40), changedPaths: ["src/a.ts"], expectedPaths: packet.payload.expectedPaths,

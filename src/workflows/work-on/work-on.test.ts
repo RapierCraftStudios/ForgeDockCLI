@@ -1715,6 +1715,7 @@ describe("complete work-on trajectory", () => {
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "function guard()" },
       intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
     };
     const priorVerdict = createArtifact({
@@ -1747,7 +1748,7 @@ describe("complete work-on trajectory", () => {
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "blocked", "stale unverified blocker is a terminal human checkpoint");
-    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
   });
 
   it("resumes approved completion idempotently without replaying any agent phase", async () => {
@@ -1978,6 +1979,7 @@ describe("complete work-on trajectory", () => {
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is still incomplete", evidence: "One accepted case is missing", location: "src/a.js:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "function guard()" },
       intentRelevance: "The frozen criterion requires it", remediation: "Complete the guard",
     };
     const resumedPacket = createArtifact({
@@ -2002,7 +2004,7 @@ describe("complete work-on trajectory", () => {
     }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
     assert.equal(resumed.run.state, "blocked", "stale unverified blocker is a terminal human checkpoint");
-    assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer"]);
+    assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
   });
 
   it("downgrades a concern outside the frozen Build Packet instead of expanding remediation", async () => {
@@ -2011,7 +2013,7 @@ describe("complete work-on trajectory", () => {
       scopeDisposition: "in_scope" as const, scopeRationale: "The reviewer believes it is related.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Related workflow needs a separate fix", evidence: "The unchanged publish workflow has a race",
-      location: ".github/workflows/publish.yml:20", intentRelevance: "The change triggers the workflow",
+      location: ".github/workflows/publish.yml:20", sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "function guard()" }, intentRelevance: "The change triggers the workflow",
       remediation: "Change the workflow in a separate delivery",
     };
     const runtime = new FakeAgentRuntime([
