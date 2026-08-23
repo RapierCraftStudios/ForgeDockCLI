@@ -351,7 +351,10 @@ async function resumeTargetAdvanceWorkOnInternal(
     });
     const reviewed = await reviewPullRequest({
       run: published.run, pullRequest: published.pullRequest, intent: input.intent, investigation: input.investigation,
-      packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace.path, findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
+      packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
     }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
     await persistTargetAdvanceCheckpoint({
@@ -549,7 +552,10 @@ async function resumeTargetAdvanceWorkOnInternal(
   const reviewed = await reviewPullRequest({
     run: published.run, pullRequest: published.pullRequest, intent: input.intent,
     investigation: input.investigation, packet: input.packet, buildResult: freshBuildResult,
-    workspace: workspace.path, findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
+    workspace: workspace.path,
+    ...(dependencies.git.readExactBlob
+      ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(workspace, revision, path) }
+      : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
   }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
   // Review is the final semantic phase of ordinary target recovery. Persist it
@@ -2274,6 +2280,9 @@ async function continueBuildDelivery(
     const reviewed = await reviewPullRequest({
       run, pullRequest, intent: input.intent, investigation: input.investigation,
       packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
       findingIssuePolicy: "all",
       ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
       ...(priorVerdict !== undefined ? { priorVerdict } : {}),
@@ -2516,6 +2525,9 @@ export async function resumeWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
         findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),
@@ -2692,6 +2704,9 @@ export async function resumeReviewWorkOn(
       const reassessed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
         findingIssuePolicy: "all",
         allowSameHeadReassessment: true,
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
@@ -2773,6 +2788,9 @@ export async function resumeReviewWorkOn(
       const reviewed = await reviewPullRequest({
         run, pullRequest, intent: input.intent, investigation: input.investigation,
         packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
         findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         priorVerdict: verdict,
@@ -2936,6 +2954,9 @@ export async function resumeExpandedReviewWorkOn(
     packet: input.packet,
     buildResult: proof.buildResult,
     workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
     findingIssuePolicy: "all",
     priorVerdict: input.priorVerdict,
     reviewCycle: { current: 1, total: 1 },
@@ -3086,6 +3107,9 @@ export async function resumePublicationWorkOn(
         const reviewed = await reviewPullRequest({
           run, pullRequest, intent: input.intent, investigation: input.investigation,
           packet: input.packet, buildResult, workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
           findingIssuePolicy: "all",
           ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
           ...(priorVerdict !== undefined ? { priorVerdict } : {}),
@@ -3368,6 +3392,9 @@ export async function resumeConflictRecoveryWorkOn(
         packet: input.packet,
         buildResult,
         workspace: input.workspace.path,
+        ...(dependencies.git.readExactBlob
+          ? { readExactBlob: (revision: string, path: string) => dependencies.git.readExactBlob!(input.workspace, revision, path) }
+          : {}),
         findingIssuePolicy: "all",
         ...(input.maxReviewSpecialists !== undefined ? { maxReviewSpecialists: input.maxReviewSpecialists } : {}),
         ...(priorVerdict !== undefined ? { priorVerdict } : {}),

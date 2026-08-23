@@ -39,6 +39,8 @@ export interface GitWorkspaceManager {
    * frozen base identity without resetting local work.
    */
   fastForwardToRemoteTarget?(workspace: GitWorkspace, advertisedHeadSha: string): Promise<GitWorkspace>;
+  /** Read one immutable blob from the exact delivery revision; reject unsafe paths. */
+  readExactBlob?(workspace: GitWorkspace, revision: string, path: string): Promise<{ content: string; mode: string } | undefined>;
   /** Prove exact HEAD, no in-progress merge, and no changed delivery paths. */
   assertPristineAtHead?(workspace: GitWorkspace, expectedHeadSha: string): Promise<void>;
   /** Uncommitted paths in the current build/remediation attempt. */

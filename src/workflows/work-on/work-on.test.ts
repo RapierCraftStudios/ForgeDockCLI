@@ -112,6 +112,10 @@ class EndToEndGit {
   async assertPristineAtHead(): Promise<void> { this.pristineAssertions += 1; }
   async changedPaths(): Promise<string[]> { return ["src/a.js"]; }
   async revisionChangedPaths(): Promise<string[]> { return ["src/a.js"]; }
+  async readExactBlob(_workspace: GitWorkspace, revision: string, path: string): Promise<{ content: string; mode: string } | undefined> {
+    if (revision !== sha || path !== "src/a.js") return undefined;
+    return { content: "function guard() { guard(); }\n", mode: "100644" };
+  }
   async syncToRemoteHead(): Promise<void> {}
   async isAncestor(): Promise<boolean> { return true; }
   async prepareWorkspaceDependencies(): Promise<void> {}
@@ -1529,6 +1533,7 @@ describe("complete work-on trajectory", () => {
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen guard criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "guard()" },
       intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
     };
     const runtime = new FakeAgentRuntime([
@@ -1588,6 +1593,7 @@ describe("complete work-on trajectory", () => {
       scopeDisposition: "in_scope" as const, scopeRationale: "Directly violates the frozen guard criterion.",
       matchedAcceptanceCriteria: ["Guard runs"], matchedPriorFindingIds: [] as string[], introducedByRemediation: false,
       title: "Guard is incomplete", evidence: "One accepted case is absent", location: "src/a.js:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "guard()" },
       intentRelevance: "The frozen criterion requires it", remediation: "Complete the guard",
     };
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
@@ -1684,7 +1690,7 @@ describe("complete work-on trajectory", () => {
     ]);
   });
 
-  it("does not grant another remediation when an exhausted-budget reassessment still requests changes", async () => {
+  it("treats a stale prior root as advisory without granting another remediation", async () => {
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
     const git = new EndToEndGit();
@@ -1739,9 +1745,9 @@ describe("complete work-on trajectory", () => {
       verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
-    assert.equal(resumed.run.state, "blocked");
-    assert.match(resumed.run.blockedReason ?? "", /Remediation budget exhausted after 2 cycle/);
-    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
+    assert.equal(resumed.run.state, "completed", "stale prior prose is advisory and cannot reopen remediation");
+    assert.equal(resumed.run.blockedReason, undefined);
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
   });
 
   it("resumes approved completion idempotently without replaying any agent phase", async () => {
@@ -1945,7 +1951,7 @@ describe("complete work-on trajectory", () => {
     ]);
   });
 
-  it("preserves the remediation budget when verification resumes after a failed remediation", async () => {
+  it("treats a stale prior root as advisory when verification resumes after failed remediation", async () => {
     const initialRuntime = new FakeAgentRuntime([investigation, legacyPacket, submission]);
     const artifacts = new InMemoryArtifactRepository();
     const runs = new InMemoryRunRepository();
@@ -1995,9 +2001,9 @@ describe("complete work-on trajectory", () => {
       verification: [targetedTestVerification],
     }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
-    assert.equal(resumed.run.state, "blocked");
-    assert.match(resumed.run.blockedReason ?? "", /Remediation budget exhausted after 1 cycle/);
-    assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer", "adjudicator"]);
+    assert.equal(resumed.run.state, "completed", "stale prior prose is advisory and cannot consume remediation budget");
+    assert.equal(resumed.run.blockedReason, undefined);
+    assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer"]);
   });
 
   it("downgrades a concern outside the frozen Build Packet instead of expanding remediation", async () => {
