@@ -63,7 +63,7 @@ import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
-import { OrchestrationController, type OrchestrationControllerDependencies, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation, type OrchestrationInvestigationWorker, type OrchestrationPacketWorker, type OrchestrationExecutionMaterializer } from "../workflows/orchestrate/controller.js";
+import { OrchestrationController, isAcceptedOrchestrationStop, type OrchestrationControllerDependencies, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation, type OrchestrationInvestigationWorker, type OrchestrationPacketWorker, type OrchestrationExecutionMaterializer } from "../workflows/orchestrate/controller.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { buildOrchestrationSnapshot, renderSerializationLines } from "../workflows/orchestrate/view-model.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
@@ -2397,12 +2397,30 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       if (params.stop === true) {
         if (!params.orchestrationId) throw new Error("Semantic orchestration stop requires an exact orchestrationId");
         if (ctx) await ensureOrchestrationContext(ctx);
+        const stopRepository = orchestrationRepository ?? options.orchestrationRepository;
+        if (!stopRepository) throw new Error("Durable orchestration repository is required for semantic stop");
+        const prior = await stopRepository.loadOrchestration(params.orchestrationId);
         const stopped = await dagDelegator.stop(params.orchestrationId, params.confirmed === true);
         const status = stopped.status;
-        const message = status === "cancelled"
-          ? `Orchestration ${stopped.orchestrationId} cancelled. Queued nodes remain unattempted; use a future explicit restart policy if one is provided.`
+        const accepted = status === "cancelled" && prior?.status === "running";
+        const message = accepted
+          ? `Orchestration ${stopped.orchestrationId} cancelled. Queued nodes remain unattempted; worker drain completed successfully.`
           : `Orchestration ${stopped.orchestrationId} was already ${status}; no cancellation was applied.`;
-        return { content: [{ type: "text", text: message }], details: { command: "orchestrate", args: ["stop", stopped.orchestrationId], state: "completed", delegation: { orchestrationId: stopped.orchestrationId, status } } satisfies ToolDetails };
+        return {
+          content: [{ type: "text", text: message }],
+          details: {
+            command: "orchestrate",
+            args: ["stop", stopped.orchestrationId],
+            state: "completed",
+            delegation: {
+              orchestrationId: stopped.orchestrationId,
+              status,
+              disposition: accepted ? "accepted" : "already-terminal",
+              queuedNodes: accepted ? "unattempted" : "already-terminal",
+              workerDrain: accepted ? "completed" : "not-required",
+            },
+          } satisfies ToolDetails,
+        };
       }
       const launchCwd = ctx.cwd;
       // Capture transport selection for this invocation. Reading the process
@@ -5422,8 +5440,17 @@ export class VisibleDagDelegator {
       stored.input.onComplete(result.schedule, stored.id);
     }, async (error) => {
       stored.running = false;
-      const latest = await this.repository().loadOrchestration(stored.id).catch(() => undefined);
+      let latest: OrchestrationRecord | undefined;
+      try {
+        latest = await this.repository().loadOrchestration(stored.id);
+      } catch (refreshError) {
+        // An accepted sentinel still requires the authoritative snapshot to be
+        // refreshable. Keep persistence failures on the visible failure path.
+        stored.input.onFailure?.(refreshError, stored.id);
+        throw refreshError;
+      }
       if (latest) stored.durableRecord = latest;
+      if (isAcceptedOrchestrationStop(error, stored.id) && latest?.orchestrationId === stored.id) return;
       stored.input.onFailure?.(error, stored.id);
       throw error;
     });
