@@ -11,6 +11,7 @@ import {
 } from "../../core/artifacts/schema.js";
 import type { ForgeHost } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
+import type { OrchestrationSemanticAttempt } from "../../core/ports/orchestration.js";
 import { attachArtifact, createRun, transition, type RunState, type RunTarget, type TransitionEvent } from "../../core/state/machine.js";
 import {
   isRecoverableAgentExecutionError,
@@ -46,6 +47,10 @@ export interface InvestigateInput {
   target?: RunTarget;
   scopeHints?: ScopeHints;
   signal?: AbortSignal;
+  /** Controller-owned identity reused across every restart boundary. */
+  reservation?: OrchestrationSemanticAttempt;
+  /** Deterministic artifact identity allocated before investigator dispatch. */
+  investigationId?: string;
   /** Controller-only checkpoint: append Investigation but defer interpretation until a barrier. */
   deferInterpretation?: boolean;
 }
@@ -106,7 +111,37 @@ export async function investigateWorkItem(
   dependencies: InvestigateDependencies,
 ): Promise<InvestigateResult> {
   const scopeManifest = investigationScopeManifest(input.scopeHints);
-  let run = createRun({
+  if (input.reservation) {
+    if (input.reservation.runId !== input.intent.runId
+      || input.reservation.repository !== input.intent.subject.repo.trim().toLowerCase()
+      || input.reservation.issue !== input.intent.subject.issue) {
+      throw new Error(`Investigation reservation ${input.reservation.semanticAttemptId} does not match Intent/run subject identity`);
+    }
+  }
+  let run = await dependencies.runs.load(input.intent.runId);
+  if (run) {
+    if (run.workflow !== "work-on" || !sameSubject(run.subject, input.intent.subject)) {
+      throw new Error(`Reserved investigation run ${input.intent.runId} has contradictory workflow or subject identity`);
+    }
+    dependencies.assertActive?.();
+    await dependencies.artifacts.append(input.intent);
+    const expectedInvestigationId = input.investigationId ?? input.reservation?.investigationId;
+    const existing = (await dependencies.artifacts.list(run.subject, "Investigation"))
+      .filter((artifact): artifact is DurableArtifact<"Investigation"> => artifact.runId === run!.runId
+        && (expectedInvestigationId === undefined || artifact.id === expectedInvestigationId));
+    if (existing.length > 1) throw new Error(`Reserved investigation run ${run.runId} has duplicate Investigation artifacts`);
+    if (existing.length === 1) {
+      if (run.state === "queued") run = await applyTransition(dependencies.runs, run, "START_INVESTIGATION");
+      if (run.state === "investigating") {
+        return continueInvestigation(input, dependencies, attachArtifact(run, "Intent", input.intent.id), scopeManifest, existing[0]);
+      }
+      return { run, investigation: existing[0]!, sessionRef: `durable:${existing[0]!.id}` };
+    }
+    if (run.state === "queued") run = await applyTransition(dependencies.runs, run, "START_INVESTIGATION");
+    if (run.state !== "investigating") throw new Error(`Reserved investigation run ${run.runId} is in ${run.state}, cannot dispatch investigator`);
+    return continueInvestigation(input, dependencies, attachArtifact(run, "Intent", input.intent.id), scopeManifest);
+  }
+  run = createRun({
     workflow: "work-on",
     subject: input.intent.subject,
     runId: input.intent.runId,
@@ -228,7 +263,7 @@ async function continueInvestigation(
           model: agentResult.model,
         },
         payload: agentResult.output,
-      });
+      }, { ...(input.investigationId !== undefined ? { id: input.investigationId } : {}) });
       dependencies.assertActive?.();
       await dependencies.artifacts.append(investigation);
       dependencies.assertActive?.();
@@ -252,6 +287,17 @@ async function continueInvestigation(
     );
   } catch (error) {
     if (error instanceof WorkflowExecutionError && error.run.state === "cancelled") throw error;
+    // An injected crash can surface as an exception after the append has
+    // committed. Leave the run at its resumable checkpoint so restart adopts
+    // the exact artifact instead of persisting a terminal duplicate/failure.
+    const reservedInvestigationId = input.investigationId ?? input.reservation?.investigationId;
+    if (reservedInvestigationId && run.state === "investigating") {
+      const durable = await dependencies.artifacts.list(run.subject, "Investigation");
+      if (durable.some((artifact) => artifact.id === reservedInvestigationId && artifact.runId === run.runId)) {
+        if (error && typeof error === "object") Object.assign(error, { resumable: true, code: "ECONNRESET" });
+        throw error;
+      }
+    }
     if (input.signal?.aborted) {
       await throwInvestigationCancellation(dependencies, run, input.signal);
     }

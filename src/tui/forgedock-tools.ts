@@ -3173,6 +3173,17 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
         serializationEdges: schedule.edges,
         investigationFirst: true,
+        resolveExactBaseSha: async (item) => {
+          const lane = authoritativeRoutes.get(item.issue) ?? classifyIssueLane(
+            await readyGithub.getIssue(item.issue, item.repository ?? readyRepository.repo),
+            readyRepository.defaultBranch,
+            milestoneBranches,
+            effective.fastLaneTarget,
+            effective.featurePromotionTarget,
+            effective.productionTarget,
+          );
+          return readyGithub.getBranchHead(item.repository ?? readyRepository.repo, lane.targetBranch);
+        },
         investigationWorker: tuiInvestigationWorker,
         ...(hasDurableInvestigationRuns ? { packetWorker: investigationWorkers.packetWorker } : {}),
         materializeExecution: tuiMaterializeExecution,

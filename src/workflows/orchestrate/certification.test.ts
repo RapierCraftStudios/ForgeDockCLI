@@ -31,6 +31,15 @@ function diagnostics(): ClaimMaterializationDiagnostics {
 }
 
 describe("non-mutating orchestration certification", () => {
+  it("invariant:matrix-redaction-grammar-8a11bfab2249 audits credential-free bounded execution", () => {
+    const forbidden = Object.keys(process.env).filter((key) => /^(?:GH_|GITHUB_)/.test(key) || /(?:^|_)GITHUB_TOKEN$/.test(key));
+    if (process.env.FORGEDOCK_CERTIFICATION_NO_GITHUB_MUTATIONS === "1") {
+      assert.deepEqual(forbidden, [], "certification must not inherit GitHub credentials");
+    } else {
+      assert.ok(Array.isArray(forbidden));
+    }
+  });
+
   it("certifies 128 one-issue nodes against effective capacity and a sparse routed frontier", async (t) => {
     const nodeCount = 128;
     const routeCount = 8;

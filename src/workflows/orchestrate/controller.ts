@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { classifyRetryableError, retryableExternalDisposition, retryBackoffMs } from "../../core/retry.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import type { ArtifactRepository } from "../../core/ports/repositories.js";
@@ -11,6 +11,7 @@ import {
   orchestrationIssueIdentityKey,
   orchestrationNodeRepository,
   orchestrationRecordIssueIdentities,
+  assertOrchestrationSemanticAttempt,
   MAX_ORCHESTRATION_PARALLEL,
 } from "../../core/ports/orchestration.js";
 import type {
@@ -32,6 +33,7 @@ import type {
   OrchestrationPacketIdentity,
   OrchestrationPacketRecord,
   OrchestrationShadowContractionProposal,
+  OrchestrationSemanticAttempt,
 } from "../../core/ports/orchestration.js";
 import {
   orchestrationEventFromSchedule,
@@ -71,6 +73,8 @@ export interface CreateOrchestrationInput {
   plan?: OrchestrationPlanMetadata;
   /** Opt into the native investigation-first path for fresh records. */
   investigationFirst?: boolean;
+  /** Optional read-only route admission used to freeze exact base before dispatch. */
+  resolveExactBaseSha?: (item: ScheduledWorkItem) => Promise<string> | string;
 }
 
 export interface OrchestrationInvestigationResult {
@@ -154,6 +158,8 @@ export interface OrchestrationTaskIdentity {
 
 export interface OrchestrationWorkerContext extends ScheduleWorkerContext {
   orchestrationId: string;
+  /** Durable reservation binding this callback to one semantic attempt. */
+  semanticAttempt?: OrchestrationSemanticAttempt;
   /** Durable controller execution attempt used to bind per-node leases. */
   executionAttempt: number;
   attemptId: string;
@@ -382,11 +388,20 @@ export class OrchestrationController {
       throw new Error("investigation-first orchestration requires an investigation worker and execution materializer");
     }
     const investigationWave = input.investigationFirst ? 1 : undefined;
+    const orchestrationId = input.orchestrationId ?? this.createOrchestrationId();
+    if (!orchestrationId.trim()) throw new Error("Orchestration id is required");
+    const reservedBases = input.investigationFirst && input.resolveExactBaseSha
+      ? await Promise.all(graph.items.map((item) => input.resolveExactBaseSha!(item)))
+      : undefined;
+    const reservations = input.investigationFirst
+      ? graph.items.map((item, index) => semanticAttemptFor(orchestrationId, item, 1, 1, input.repository, reservedBases?.[index]))
+      : undefined;
     const investigations = input.investigationFirst
-      ? graph.items.map((item): OrchestrationInvestigationRecord => ({
+      ? graph.items.map((item, index): OrchestrationInvestigationRecord => ({
           issue: item.issue,
           nodeId: item.id,
           wave: 1,
+          reservation: reservations![index],
           ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
           ...(item.lane !== undefined ? { lane: item.lane } : {}),
           status: "queued",
@@ -394,7 +409,7 @@ export class OrchestrationController {
         }))
       : undefined;
     const packets = input.investigationFirst
-      ? graph.items.map((item): OrchestrationPacketRecord => ({ nodeId: item.id, wave: 1, status: "queued", attemptCount: 0 }))
+      ? graph.items.map((item, index): OrchestrationPacketRecord => ({ nodeId: item.id, wave: 1, reservation: reservations![index], status: "queued", attemptCount: 0 }))
       : undefined;
     const rootRepository = normalizeOrchestrationRepository(input.repository);
     const requestedIssueNumbers = uniqueIssueNumbers(
@@ -404,8 +419,6 @@ export class OrchestrationController {
         .flatMap((item) => [item.issue, ...(item.memberIssues ?? [])]),
     );
     const now = this.now();
-    const orchestrationId = input.orchestrationId ?? this.createOrchestrationId();
-    if (!orchestrationId.trim()) throw new Error("Orchestration id is required");
     const record: OrchestrationRecord = {
       schema: "forgedock.orchestration/v1",
       orchestrationId,
@@ -718,7 +731,11 @@ export class OrchestrationController {
     const wave = record.investigationWave ?? 1;
     const durable = [...(record.investigations ?? [])].filter((entry) => entry.wave === wave);
     if (!durable.length) throw new Error(`Investigation wave ${wave} has no durable members`);
-    const byNode = new Map(durable.map((entry) => [entry.nodeId, entry]));
+    const byNode = new Map<string, OrchestrationInvestigationRecord>();
+    for (const entry of durable) {
+      if (byNode.has(entry.nodeId)) throw new Error(`Duplicate durable investigation identity for ${entry.nodeId} in wave ${wave}`);
+      byNode.set(entry.nodeId, entry);
+    }
     const initialCompleted = durable.filter((entry) => entry.status === "completed").length;
     if ((state.record.investigationBarrier?.completed ?? 0) !== initialCompleted) {
       this.replaceRecord(state, {
@@ -749,6 +766,8 @@ export class OrchestrationController {
       items,
       state.record.maxParallel,
       async (item, schedulerContext) => {
+        const semanticAttempt = this.reserveSemanticAttempt(state, item, wave);
+        await this.flush(state);
         const attempt = await this.beginAttempt(state, item.id, "initial");
         activeInvestigations += 1;
         peakInvestigations = Math.max(peakInvestigations, activeInvestigations);
@@ -757,7 +776,7 @@ export class OrchestrationController {
           startedAt: entry.startedAt ?? this.now(),
         }));
         await this.flush(state);
-        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationInvestigationWorkerContext;
+        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial", semanticAttempt) as OrchestrationInvestigationWorkerContext;
         context.phase = "investigation";
         context.wave = wave;
         let result: OrchestrationInvestigationResult;
@@ -787,6 +806,7 @@ export class OrchestrationController {
         state.claim.assertValid();
         if (context.signal?.aborted) throw context.signal.reason ?? new Error("Investigation cancelled after worker completion");
         outcomes.set(item.id, result);
+        this.reconcileInvestigationReservation(state, item, result, semanticAttempt);
         await this.finishAttempt(state, item.id, attempt.attemptId, {
           status: result.outcome === "confirmed" ? "completed" : result.outcome === "invalid" ? "invalid" : "skipped",
           ...(result.childIssues ? { childIssues: result.childIssues } : {}),
@@ -920,12 +940,13 @@ export class OrchestrationController {
       if (children.some((child) => existingIds.has(child.id))) throw new Error("Next investigation wave reused an existing node id");
       const nextWave = wave + 1;
       const childNodes = children.map(nodeRecordFromItem);
-      const childInvestigations = children.map((child): OrchestrationInvestigationRecord => ({
-        issue: child.issue, nodeId: child.id, wave: nextWave,
+      const childReservations = children.map((child) => semanticAttemptFor(state.record.orchestrationId, child, nextWave, 1, state.record.repository));
+      const childInvestigations = children.map((child, index): OrchestrationInvestigationRecord => ({
+        issue: child.issue, nodeId: child.id, wave: nextWave, reservation: childReservations[index],
         ...(child.targetBranch !== undefined ? { targetBranch: child.targetBranch } : {}),
         ...(child.lane !== undefined ? { lane: child.lane } : {}), status: "queued", attemptCount: 0,
       }));
-      const childPackets = children.map((child): OrchestrationPacketRecord => ({ nodeId: child.id, wave: nextWave, status: "queued", attemptCount: 0 }));
+      const childPackets = children.map((child, index): OrchestrationPacketRecord => ({ nodeId: child.id, wave: nextWave, reservation: childReservations[index], status: "queued", attemptCount: 0 }));
       const replacementByParent = new Map((materialized.decompositionReplacements ?? []).map((replacement) => [replacement.parentNodeId, replacement] as const));
       const expandedNodes = state.record.nodes.map((node) => {
         const replacement = replacementByParent.get(node.id);
@@ -994,12 +1015,15 @@ export class OrchestrationController {
       const item = itemFromNodeRecord(requiredNode(state.record, entry.nodeId));
       try {
         assertReusablePacketRecord(packet, entry, item, wave);
-      } catch {
-        // Legacy, stale, or contradictory packet evidence is never reused.
-        // Repacketize it under the current investigation checkpoint.
+      } catch (error) {
+        // Fresh reservations and explicit identities are authoritative. A
+        // mismatch is evidence of corruption or a late callback, not a retry
+        // opportunity. Only genuinely legacy records may be repacketized.
+        if (packet.reservation !== undefined || packet.identity !== undefined) throw error;
         byNode.set(entry.nodeId, {
           nodeId: entry.nodeId,
           wave,
+          reservation: packet.reservation ?? entry.reservation,
           status: "queued",
           attemptCount: packet.attemptCount,
         });
@@ -1056,6 +1080,8 @@ export class OrchestrationController {
       state.record.maxParallel,
       async (item, schedulerContext) => {
         assertActive();
+        const semanticAttempt = this.reserveSemanticAttempt(state, item, wave);
+        await this.flush(state);
         const investigation = investigations.find((entry) => entry.nodeId === item.id);
         if (!investigation) throw new Error(`Packet ${item.id} has no investigation evidence`);
         const workerItem = packetWorkerItems.get(item.id);
@@ -1083,7 +1109,7 @@ export class OrchestrationController {
         this.replaceRecord(state, { ...state.record, packets: packetSnapshot(), updatedAt: this.now() });
         await this.flush(state);
         const attempt = await this.beginAttempt(state, item.id, "initial");
-        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationPacketWorkerContext;
+        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial", semanticAttempt) as OrchestrationPacketWorkerContext;
         context.phase = "packet";
         context.wave = wave;
         context.investigation = structuredClone(investigation);
@@ -1102,6 +1128,9 @@ export class OrchestrationController {
             throw new Error(`Packet ${item.id} references unknown semantic dependency`);
           }
           const packetId = result.packetId ?? result.identity?.packetId;
+          if (investigation.reservation && investigation.investigationArtifactId && packetId !== investigation.reservation.packetId) {
+            throw new Error(`Packet ${item.id} returned packet ${packetId ?? "missing"} outside reserved packet ${investigation.reservation.packetId}`);
+          }
           const expectedIdentity = packetId && investigation.runId && investigation.investigationArtifactId
             ? packetIdentityFor(item, investigation, packetId, result.baseSha)
             : undefined;
@@ -1188,6 +1217,86 @@ export class OrchestrationController {
   ): void {
     const investigations = (state.record.investigations ?? []).map((entry) => entry.nodeId === nodeId ? update(entry) : entry);
     this.replaceRecord(state, { ...state.record, investigations, updatedAt: this.now() });
+  }
+
+  /** Reserve semantic identities before any investigation or packet worker is dispatched. */
+  private reserveSemanticAttempt(
+    state: PersistenceState,
+    item: ScheduledWorkItem,
+    wave: number,
+  ): OrchestrationSemanticAttempt {
+    const investigation = (state.record.investigations ?? []).find((entry) => entry.nodeId === item.id && entry.wave === wave);
+    const packet = (state.record.packets ?? []).find((entry) => entry.nodeId === item.id && entry.wave === wave);
+    const attempt = investigation?.reservation?.attempt ?? ((investigation?.attemptCount ?? 0) + 1);
+    const reservation = investigation?.reservation
+      ?? packet?.reservation
+      ?? semanticAttemptFor(state.record.orchestrationId, item, wave, attempt, state.record.repository);
+    assertOrchestrationSemanticAttempt(reservation, {
+      orchestrationId: state.record.orchestrationId,
+      nodeId: item.id,
+      wave,
+      repository: item.repository ?? state.record.repository,
+      issue: item.issue,
+    });
+    const nextInvestigations = (state.record.investigations ?? []).map((entry) =>
+      entry.nodeId === item.id && entry.wave === wave && entry.reservation === undefined
+        ? { ...entry, reservation }
+        : entry);
+    const nextPackets = (state.record.packets ?? []).map((entry) =>
+      entry.nodeId === item.id && entry.wave === wave && entry.reservation === undefined
+        ? { ...entry, reservation }
+        : entry);
+    if (nextInvestigations !== state.record.investigations || nextPackets !== state.record.packets) {
+      this.replaceRecord(state, {
+        ...state.record,
+        investigations: nextInvestigations,
+        ...(state.record.packets !== undefined ? { packets: nextPackets } : {}),
+        updatedAt: this.now(),
+      });
+    }
+    return structuredClone(reservation);
+  }
+
+  /** Bind the route's exact base and artifact identities without choosing by recency. */
+  private reconcileInvestigationReservation(
+    state: PersistenceState,
+    item: ScheduledWorkItem,
+    result: OrchestrationInvestigationResult,
+    reservation: OrchestrationSemanticAttempt,
+  ): void {
+    const runId = result.evidence?.runId;
+    const investigationId = result.evidence?.investigationId;
+    // Older controller-only test doubles did not return semantic artifact
+    // identities. Preserve their additive compatibility, but a worker that
+    // claims the complete identity is held to the reservation contract.
+    const completeEvidence = runId !== undefined && investigationId !== undefined;
+    if (completeEvidence && String(runId) !== reservation.runId) {
+      throw new Error(`Investigation ${item.id} returned run ${String(runId)} outside reserved semantic attempt ${reservation.semanticAttemptId}`);
+    }
+    if (completeEvidence && String(investigationId) !== reservation.investigationId) {
+      throw new Error(`Investigation ${item.id} returned artifact ${String(investigationId)} outside reserved semantic attempt ${reservation.semanticAttemptId}`);
+    }
+    const baseSha = result.baseSha?.trim();
+    if (completeEvidence && (!baseSha || !/^[0-9a-f]{7,64}$/i.test(baseSha))) {
+      throw new Error(`Investigation ${item.id} returned malformed exact base for semantic attempt ${reservation.semanticAttemptId}`);
+    }
+    if (baseSha && reservation.baseSha && reservation.baseSha.toLowerCase() !== baseSha.toLowerCase()) {
+      throw new Error(`Investigation ${item.id} returned base ${baseSha} outside reserved base ${reservation.baseSha}`);
+    }
+    if (!baseSha && !reservation.baseSha) throw new Error(`Investigation ${item.id} returned no exact base SHA for semantic attempt ${reservation.semanticAttemptId}`);
+    const bound = {
+      ...reservation,
+      ...(baseSha && /^[0-9a-f]{7,64}$/i.test(baseSha) ? { baseSha } : {}),
+    };
+    this.updateInvestigation(state, item.id, (entry) => ({
+      ...entry,
+      reservation: bound,
+      ...(baseSha ? { baseSha } : {}),
+    }));
+    const packets = (state.record.packets ?? []).map((packet) => packet.nodeId === item.id && packet.wave === reservation.wave
+      ? { ...packet, reservation: bound }
+      : packet);
+    this.replaceRecord(state, { ...state.record, packets, updatedAt: this.now() });
   }
 
   private async prepareInitial(state: PersistenceState): Promise<PreparedExecution> {
@@ -1850,6 +1959,7 @@ export class OrchestrationController {
     schedulerContext: ScheduleWorkerContext,
     attemptId: string,
     recovery: OrchestrationRecoveryMode,
+    semanticAttempt?: OrchestrationSemanticAttempt,
   ): OrchestrationWorkerContext {
     return {
       ...(schedulerContext.signal !== undefined ? { signal: schedulerContext.signal } : {}),
@@ -1859,6 +1969,7 @@ export class OrchestrationController {
         if (state.signal?.aborted) throw state.signal.reason ?? new Error("Orchestration stopped");
       },
       orchestrationId: state.record.orchestrationId,
+      ...(semanticAttempt !== undefined ? { semanticAttempt: structuredClone(semanticAttempt) } : {}),
       executionAttempt: state.record.executionAttempt ?? 0,
       attemptId,
       recovery,
@@ -2675,13 +2786,23 @@ function packetIdentityFor(
   if (!investigation.runId?.trim() || !investigation.investigationArtifactId?.trim()) {
     throw new Error(`Packet ${item.id} lacks exact investigation identity`);
   }
+  const reservation = investigation.reservation;
+  if (reservation && packetId !== reservation.packetId) {
+    throw new Error(`Packet ${item.id} packet ${packetId} does not match reserved packet ${reservation.packetId}`);
+  }
   return {
     nodeId: item.id,
     packetId,
     runId: investigation.runId,
     investigationId: investigation.investigationArtifactId,
-    subject: { repo: item.repository ?? "", issue: item.issue },
+    subject: { repo: item.repository ?? reservation?.repository ?? "", issue: item.issue },
     baseSha,
+    ...(reservation ? {
+      orchestrationId: reservation.orchestrationId,
+      wave: reservation.wave,
+      attempt: reservation.attempt,
+      repository: reservation.repository,
+    } : {}),
   };
 }
 
@@ -2701,7 +2822,13 @@ function assertPacketIdentity(
     || actual.investigationId !== expected.investigationId
     || actual.subject.issue !== expected.subject.issue
     || actual.subject.repo.trim().toLowerCase() !== expected.subject.repo.trim().toLowerCase()
-    || actual.baseSha !== expected.baseSha)) {
+    || actual.baseSha !== expected.baseSha
+    || (expected.orchestrationId !== undefined && /^[0-9a-f]{7,64}$/i.test(expected.baseSha)
+      && !/^[0-9a-f]{7,64}$/i.test(actual.baseSha))
+    || (expected.orchestrationId !== undefined && actual.orchestrationId !== expected.orchestrationId)
+    || (expected.wave !== undefined && actual.wave !== expected.wave)
+    || (expected.attempt !== undefined && actual.attempt !== expected.attempt)
+    || (expected.repository !== undefined && actual.repository?.trim().toLowerCase() !== expected.repository.trim().toLowerCase()))) {
     throw new Error(`Packet ${itemId} packet identity drifted from investigation checkpoint`);
   }
   return structuredClone(actual);
@@ -2716,6 +2843,10 @@ function assertReusablePacketRecord(
   if (packet.wave !== wave || packet.status !== "completed" || !packet.packetId || !packet.baseSha || !packet.expectedPaths?.length) {
     throw new Error(`Packet ${item.id} durable packet is not reusable`);
   }
+  if (packet.reservation && investigation.reservation
+    && packet.reservation.semanticAttemptId !== investigation.reservation.semanticAttemptId) {
+    throw new Error(`Packet ${item.id} packet reservation does not match investigation reservation`);
+  }
   normalizePacketPaths(packet.expectedPaths);
   normalizeSemanticDependencies(packet.semanticDependencies ?? (() => { throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`); })());
   const expected = packetIdentityFor(item, investigation, packet.packetId, packet.baseSha);
@@ -2729,6 +2860,7 @@ function indexPacketRecords(
 ): Map<string, OrchestrationPacketRecord> {
   const knownNodes = new Set(nodes.map((node) => node.id));
   const packetIds = new Set<string>();
+  const semanticAttemptIds = new Set<string>();
   const byNode = new Map<string, OrchestrationPacketRecord>();
   for (const packet of packets) {
     if (!packet.nodeId.trim()) throw new Error("Packet record has no durable node identity");
@@ -2739,9 +2871,42 @@ function indexPacketRecords(
       packetIds.add(packet.packetId);
     }
     if (!Number.isSafeInteger(packet.wave) || packet.wave < 1) throw new Error(`Packet ${packet.nodeId} has an invalid wave`);
+    if (packet.reservation) {
+      if (semanticAttemptIds.has(packet.reservation.semanticAttemptId)) throw new Error(`Duplicate semantic attempt ${packet.reservation.semanticAttemptId}`);
+      if (packet.reservation.nodeId !== packet.nodeId || packet.reservation.wave !== packet.wave) throw new Error(`Packet ${packet.nodeId} reservation identity drifted`);
+      semanticAttemptIds.add(packet.reservation.semanticAttemptId);
+    }
     byNode.set(packet.nodeId, structuredClone(packet));
   }
   return byNode;
+}
+
+function semanticAttemptFor(
+  orchestrationId: string,
+  item: Pick<ScheduledWorkItem, "id" | "issue" | "repository">,
+  wave: number,
+  attempt: number,
+  fallbackRepository: string,
+  baseSha?: string,
+): OrchestrationSemanticAttempt {
+  const repository = normalizeOrchestrationRepository(item.repository ?? fallbackRepository);
+  if (baseSha !== undefined && !/^[0-9a-f]{7,64}$/i.test(baseSha)) throw new Error(`Exact base for ${item.id} is malformed`);
+  const seed = `${orchestrationId}\0${item.id}\0${wave}\0${attempt}\0${repository}\0${item.issue}`;
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 32);
+  return {
+    semanticAttemptId: `semantic_${digest}`,
+    orchestrationId,
+    nodeId: item.id,
+    wave,
+    attempt,
+    repository,
+    issue: item.issue,
+    ...(baseSha !== undefined ? { baseSha } : {}),
+    runId: `run_${digest}`,
+    intentId: `art_intent_${digest}`,
+    investigationId: `art_investigation_${digest}`,
+    packetId: `art_packet_${digest}`,
+  };
 }
 
 function investigationWorkflowLabel(record: OrchestrationRecord, node: OrchestrationNodeRecord): "workflow:investigating" | "workflow:waiting" | "workflow:invalid" | "workflow:decomposed" {

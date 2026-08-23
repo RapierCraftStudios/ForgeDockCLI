@@ -11,6 +11,7 @@ const modules = [
   "dist/workflows/orchestrate/agent-budget-retry.test.js",
   "dist/workflows/orchestrate/scheduler.test.js",
   "dist/workflows/orchestrate/controller.test.js",
+  "dist/workflows/orchestrate/investigation-first-crash.test.js",
   "dist/workflows/orchestrate/reconcile-worker.test.js",
   "dist/workflows/orchestrate/stale-reaper.test.js",
   "dist/workflows/orchestrate/view-model.test.js",
@@ -50,7 +51,7 @@ const coverage = {
   "exact-once-and-issue-ownership": ["certification", "controller", "orchestration-port", "sqlite-repositories"],
   "lease-and-controller-fencing": ["orchestration-admission", "stale-reaper", "controller"],
   "cancellation-ownership": ["scheduler"],
-  "restart-and-decomposition-recovery": ["controller", "reconcile-worker", "sqlite-repositories"],
+  "restart-and-decomposition-recovery": ["controller", "investigation-first-crash", "reconcile-worker", "sqlite-repositories"],
   "observation-activity": ["controller", "view-model", "observer"],
   "ci-and-idempotent-github-effects": ["publish", "complete"],
   "scoped-verification": ["certification", "verification-policy", "process-verifier", "prepare", "work-on", "verify"],
@@ -107,6 +108,11 @@ const baseReport = {
   certification: "orchestration-dogfood-readiness",
   concurrency,
   mutationPolicy: "audited exact test files using local fakes and repositories; GitHub credentials removed",
+  exactOnceAudit: {
+    required: ["one-run", "one-intent", "one-investigation", "one-build-packet", "one-packet-completion"],
+    mutationDispatchBeforeBarrier: 0,
+    githubCredentials: "stripped",
+  },
   commandAudit,
   scope: {
     mode: "exact-test-files",
@@ -121,6 +127,9 @@ const baseReport = {
   deterministicDiagnostics: [
     "dispatch-count",
     "attempt-count",
+    "semantic-attempt-count",
+    "durable-artifact-count",
+    "packet-completion-count",
     "effective-capacity",
     "claim-conflict-candidates",
     "reachability-checks",

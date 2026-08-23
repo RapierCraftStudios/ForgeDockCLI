@@ -40,6 +40,50 @@ export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "rea
 /** Durable phases for the investigation-first native orchestrator. */
 export type OrchestrationPhase = "investigating" | "packetizing" | "executing";
 
+/**
+ * Controller-owned semantic identity for one investigation-to-packet attempt.
+ * The optional base is retained only for records created by older callers that
+ * could not resolve a route before admission; fresh workers bind it before
+ * authoring and persist the exact value during reconciliation.
+ */
+export interface OrchestrationSemanticAttempt {
+  semanticAttemptId: string;
+  orchestrationId: string;
+  nodeId: string;
+  wave: number;
+  attempt: number;
+  repository: string;
+  issue: number;
+  baseSha?: string;
+  runId: string;
+  intentId: string;
+  investigationId: string;
+  packetId: string;
+}
+
+/** Fail-closed validation for controller-owned semantic attempt evidence. */
+export function assertOrchestrationSemanticAttempt(
+  reservation: OrchestrationSemanticAttempt,
+  expected: { orchestrationId: string; nodeId: string; wave: number; repository: string; issue: number },
+): void {
+  if (!reservation || typeof reservation !== "object") throw new Error("Semantic attempt reservation is missing");
+  if (reservation.orchestrationId !== expected.orchestrationId || reservation.nodeId !== expected.nodeId
+    || reservation.wave !== expected.wave || reservation.issue !== expected.issue
+    || normalizeOrchestrationRepository(reservation.repository) !== normalizeOrchestrationRepository(expected.repository)) {
+    throw new Error(`Semantic attempt ${reservation.semanticAttemptId ?? "unknown"} has mismatched orchestration/node/wave/repository/issue identity`);
+  }
+  if (!Number.isSafeInteger(reservation.attempt) || reservation.attempt < 1) throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has invalid attempt`);
+  for (const [name, value] of Object.entries(reservation)) {
+    if (name === "baseSha") {
+      if (value !== undefined && (typeof value !== "string" || !value.trim() || !/^[0-9a-f]{7,64}$/i.test(value))) {
+        throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has malformed exact base`);
+      }
+      continue;
+    }
+    if (typeof value === "string" && !value.trim()) throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has empty ${name}`);
+  }
+}
+
 /** Exact durable identity binding a Build Packet to its investigation checkpoint. */
 export interface OrchestrationPacketIdentity {
   nodeId: string;
@@ -48,6 +92,11 @@ export interface OrchestrationPacketIdentity {
   investigationId: string;
   subject: { repo: string; issue: number };
   baseSha: string;
+  /** Additive reservation binding; absent only on legacy packet records. */
+  orchestrationId?: string;
+  wave?: number;
+  attempt?: number;
+  repository?: string;
 }
 
 export interface OrchestrationPacketRecord {
@@ -55,6 +104,8 @@ export interface OrchestrationPacketRecord {
   wave: number;
   status: "queued" | "running" | "completed" | "failed";
   attemptCount: number;
+  /** Controller reservation retained across every packet checkpoint. */
+  reservation?: OrchestrationSemanticAttempt;
   /** Optional only for legacy records; new completed records bind exact identity. */
   identity?: OrchestrationPacketIdentity;
   packetId?: string;
@@ -74,6 +125,8 @@ export interface OrchestrationInvestigationRecord {
   /** Exact durable run and artifact identities for settlement scoping. */
   runId?: string;
   investigationArtifactId?: string;
+  /** Reserved before dispatch; retries must reuse this exact semantic attempt. */
+  reservation?: OrchestrationSemanticAttempt;
   wave: number;
   baseSha?: string;
   targetBranch?: string;
