@@ -129,8 +129,6 @@ export async function materializeCliDecomposition(input: {
       : labels.some((label) => /(?:^|:)P1$/i.test(label)) ? 100
         : labels.some((label) => /(?:^|:)P2$/i.test(label)) ? 200
           : labels.some((label) => /(?:^|:)P3$/i.test(label)) ? 300 : 400;
-    const sourcePullRequest = /^\*\*Source:\*\*\s*PR\s+#(\d+)\b/im.exec(issue.body)?.[1];
-    const defectClass = /<!--\s*FORGE:CLASS:\s*([A-Za-z0-9_-]+)\s*-->/i.exec(issue.body)?.[1];
     childItems.push({
       id: childNodeIds.get(issue.number) ?? decompositionQualifiedNodeId(scheduledRepository, issue.number),
       issue: issue.number,
@@ -147,9 +145,6 @@ export async function materializeCliDecomposition(input: {
       memberIssues: [issue.number],
       title: issue.title,
       summary: issue.body.slice(0, 4_000),
-      ...(issue.milestone ? { milestone: issue.milestone } : {}),
-      ...(sourcePullRequest !== undefined ? { sourcePullRequest: Number(sourcePullRequest) } : {}),
-      ...(defectClass !== undefined ? { defectClass } : {}),
     });
   }
   if (!childItems.length) {

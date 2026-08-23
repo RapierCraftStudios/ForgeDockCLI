@@ -115,6 +115,83 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(resumed.items[0]?.dependencies, ["parent"]);
   });
 
+  it("keeps source-bearing children scheduler-safe through fresh and resumed materialization", async () => {
+    const childBody = [
+      "Child summary",
+      "",
+      "**Source:** PR #505",
+      "<!-- FORGE:CLASS: security -->",
+      "",
+      "## Dependencies",
+      "- #42",
+      "",
+      "## Affected Files",
+      "- `src/cli/example.ts`",
+    ].join("\n");
+    const outcome = createArtifact({
+      kind: "Outcome",
+      runId: "run-source-bearing-child",
+      subject: { repo: "owner/parent", issue: 42 },
+      producer: { role: "controller", runtime: "forgedock" },
+      payload: { status: "decomposed", reason: "Split", childIssues: ["#7 Child"] },
+    });
+    const child = { ...issue("owner/parent", 7, childBody), milestone: { number: 3, title: "Roadmap" } };
+    const github = {
+      async getRepository(repository: string) { return { repo: repository, defaultBranch: "parent-main" }; },
+      async getIssue(issueNumber: number, repository: string) { return { ...child, number: issueNumber, repo: repository }; },
+      async listBranches() { return [{ name: "milestone/roadmap", headSha: "head" }]; },
+      async getBranchHead() { return "head"; },
+    } as any;
+    const orchestration = {
+      schema: "forgedock.orchestration/v1" as const,
+      orchestrationId: "orch-source-bearing-materializer",
+      repository: "owner/root",
+      issueNumbers: [7, 42],
+      maxParallel: 2,
+      autoMerge: false,
+      status: "running" as const,
+      createdAt: "now",
+      updatedAt: "now",
+      nodes: [node("issue-7", "owner/root", 7), node("parent", "owner/parent", 42)],
+    } as any;
+    const routedIssues = new Map<string, any>();
+    const input = {
+      github,
+      artifacts: { async list() { return [outcome]; } },
+      repository: "owner/root",
+      defaultBranch: "root-main",
+      effective: { fastLaneTarget: "staging" } as any,
+      orchestration,
+      node: node("parent", "owner/parent", 42),
+      item: { ...node("parent", "owner/parent", 42) },
+      routedIssues,
+    } as any;
+
+    const fresh = await materializeCliDecomposition(input);
+    const resumed = await materializeCliDecomposition({ ...input, childIssues: [7] });
+    assert.ok(fresh);
+    assert.ok(resumed);
+    const freshItem = fresh.items[0];
+    const resumedItem = resumed.items[0];
+    assert.ok(freshItem);
+    assert.ok(resumedItem);
+    assert.deepEqual(freshItem, resumedItem);
+    assert.equal(freshItem.id, "issue-r006f0077006e00650072002f0070006100720065006e0074-7");
+    assert.equal(freshItem.repository, "owner/parent");
+    assert.equal(freshItem.targetBranch, "milestone/roadmap");
+    assert.equal(freshItem.lane, "feature");
+    assert.deepEqual(freshItem.dependencies, ["parent"]);
+    assert.deepEqual(freshItem.claims, ["src/cli/example.ts"]);
+    assert.deepEqual(freshItem.affectedFiles, ["src/cli/example.ts"]);
+    assert.deepEqual(freshItem.memberIssues, [7]);
+    assert.equal(freshItem.title, "owner/parent #7");
+    assert.equal(freshItem.summary, childBody);
+    assert.equal("sourcePullRequest" in freshItem, false);
+    assert.equal("milestone" in freshItem, false);
+    assert.equal("defectClass" in freshItem, false);
+    assert.deepEqual(fresh.serializationEdges, resumed.serializationEdges);
+    assert.ok(getOrchestrationRoute(routedIssues, { repository: "owner/parent", issue: 7 }));
+  });
 
   it("hydrates closed decomposition children as terminal proof and materializes only open children", async () => {
     const github = {
