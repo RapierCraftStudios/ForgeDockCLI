@@ -237,6 +237,23 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     return rows.map((row) => JSON.parse(String((row as { state_json: string }).state_json)) as RunState);
   }
 
+  /** Load only the requested run identities; absent rows are intentionally omitted. */
+  listRunsByIds(runIds: readonly string[]): RunState[] {
+    const result: RunState[] = [];
+    const seen = new Set<string>();
+    for (const runId of runIds) {
+      if (seen.has(runId)) continue;
+      seen.add(runId);
+      const row = this.#database.prepare("SELECT run_id, state_json FROM runs WHERE run_id = ?")
+        .get(runId) as { run_id: string; state_json: string } | undefined;
+      if (!row) continue;
+      const parsed = JSON.parse(row.state_json) as RunState;
+      if (parsed.runId !== row.run_id) throw new Error(`Run identity mismatch: ${runId}`);
+      result.push(parsed);
+    }
+    return result;
+  }
+
   assertResetNoLiveLeases(itemIds: readonly string[], now = Date.now()): void {
     for (const itemId of itemIds) {
       const row = this.#database.prepare("SELECT owner, expires_at FROM leases WHERE item_id = ?").get(itemId) as { owner: string; expires_at: number } | undefined;
@@ -280,6 +297,38 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     for (const runId of runIds) {
       const rows = this.#database.prepare("SELECT artifact_id, subject_key, kind, artifact_json FROM artifacts WHERE json_extract(artifact_json, '$.runId') = ? ORDER BY rowid").all(runId) as Array<{ artifact_id: string; subject_key: string; kind: ArtifactKind; artifact_json: string }>;
       for (const row of rows) result.push({ artifactId: row.artifact_id, subjectKey: row.subject_key, kind: row.kind, sha256: createSha256(row.artifact_json) });
+    }
+    return result;
+  }
+
+  /** Load exact artifact identities, preserving their stored hashes for reset manifests. */
+  listArtifactSnapshotsByIds(artifactIds: readonly string[]): Array<{
+    artifactId: string;
+    subjectKey: string;
+    kind: ArtifactKind;
+    sha256: string;
+    artifact: DurableArtifact;
+  }> {
+    const result: Array<{
+      artifactId: string;
+      subjectKey: string;
+      kind: ArtifactKind;
+      sha256: string;
+      artifact: DurableArtifact;
+    }> = [];
+    const seen = new Set<string>();
+    for (const artifactId of artifactIds) {
+      if (seen.has(artifactId)) continue;
+      seen.add(artifactId);
+      const row = this.#database.prepare("SELECT artifact_id, subject_key, kind, artifact_json FROM artifacts WHERE artifact_id = ?")
+        .get(artifactId) as { artifact_id: string; subject_key: string; kind: ArtifactKind; artifact_json: string } | undefined;
+      if (!row) continue;
+      const parsed: unknown = JSON.parse(row.artifact_json);
+      assertArtifact(parsed);
+      if (parsed.id !== row.artifact_id || parsed.kind !== row.kind || subjectKey(parsed.subject) !== row.subject_key) {
+        throw new Error(`Artifact identity mismatch: ${artifactId}`);
+      }
+      result.push({ artifactId: row.artifact_id, subjectKey: row.subject_key, kind: row.kind, sha256: createSha256(row.artifact_json), artifact: parsed });
     }
     return result;
   }

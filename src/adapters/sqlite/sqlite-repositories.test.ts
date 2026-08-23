@@ -10,6 +10,7 @@ import { ConcurrentPromotionUpdateError, type PromotionRecord } from "../../core
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
 import { createRun, transition } from "../../core/state/machine.js";
+import { assertResetSubjectSelection } from "../../workflows/reset/pristine-reset.js";
 import { InMemoryLeaseRepository, InMemoryLeaseWitness, type LeaseInspection, type LeaseRepository } from "../../core/ports/lease.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "./orchestration-admission.js";
 import { SqliteRepositories } from "./sqlite-repositories.js";
@@ -790,6 +791,63 @@ describe("SQLite operational repositories", () => {
       first.close();
       second.close();
       try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+    }
+  });
+
+  it("loads authority-selected terminal runs and their artifacts without DAG discovery", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const terminal = { ...createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 477 }, runId: "run-authority-477" }), state: "invalid" as const };
+      const artifact = createArtifact({
+        kind: "Intent", runId: terminal.runId, subject: terminal.subject,
+        producer: { role: "controller" },
+        payload: { title: "Reset", problem: "Reset", constraints: [], acceptanceHints: [], dependencies: [] },
+      }, { id: "artifact-authority-477" });
+      await store.create(terminal);
+      await store.append(artifact);
+
+      const runs = store.listRunsByIds([terminal.runId]);
+      const artifacts = store.listArtifactSnapshotsByIds([artifact.id]);
+      assert.deepEqual(runs.map((run) => run.runId), [terminal.runId]);
+      assert.deepEqual(artifacts.map(({ artifactId }) => artifactId), [artifact.id]);
+      assert.equal(runs[0]?.state, "invalid");
+      assert.doesNotThrow(() => assertResetSubjectSelection("run", terminal.runId, terminal.subject, { repo: "a/b", issueNumbers: [477] }));
+
+      const purged = await store.purgeExactManifest({
+        runs: [{ runId: terminal.runId }],
+        artifacts: artifacts.map(({ artifactId, subjectKey, kind }) => ({ artifactId, subjectKey, kind })),
+      });
+      assert.equal(purged.runs, 1);
+      assert.equal(purged.artifacts, 1);
+      assert.equal(await store.load(terminal.runId), undefined);
+      assert.deepEqual(store.listArtifactSnapshotsByIds([artifact.id]), []);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects a found reset identity from another subject while preserving it", async () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      const wrong = createRun({ workflow: "work-on", subject: { repo: "other/repo", issue: 477 }, runId: "run-wrong-subject" });
+      await store.create(wrong);
+      assert.throws(
+        () => assertResetSubjectSelection("run", wrong.runId, wrong.subject, { repo: "a/b", issueNumbers: [477] }),
+        /outside the explicitly selected repository\/issues/,
+      );
+      assert.equal((await store.load(wrong.runId))?.runId, wrong.runId);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("omits absent historical reset identities for remote-only cleanup", () => {
+    const store = new SqliteRepositories(":memory:");
+    try {
+      assert.deepEqual(store.listRunsByIds(["run-history-absent"]), []);
+      assert.deepEqual(store.listArtifactSnapshotsByIds(["artifact-history-absent"]), []);
+    } finally {
+      store.close();
     }
   });
 

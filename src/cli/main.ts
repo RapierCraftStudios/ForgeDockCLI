@@ -77,7 +77,7 @@ import { decompositionChildIssuesFromArtifacts, materializeCliDecomposition } fr
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { assertResetManifestDigest, dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
+import { assertResetManifestDigest, assertResetSubjectSelection, dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
 import { getOrchestrationRoute, orchestrationRouteCacheKey, requiredOrchestrationRoute, setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
 import { createInvestigationFirstWorkers } from "../workflows/orchestrate/investigation-first.js";
@@ -1333,12 +1333,22 @@ async function resetIssue(argv: string[]): Promise<void> {
   const observationPath = join(process.cwd(), ".forgedock", "observations.db");
   const observationModule = await import("../observability/sqlite-store.js");
   const observations = existsSync(observationPath) ? new observationModule.SqliteObservationStore(observationPath, { readOnly: applyDigest === undefined }) : undefined;
-  const authorityRunIds = authorityManifest?.runs.map((run) => run.runId) ?? [];
+  const authorityRunIds = authorityManifest ? [
+    ...(authorityManifest.selection.runIds ?? []),
+    ...authorityManifest.runs.map((run) => run.runId),
+  ] : [];
   const authorityArtifactIds = authorityManifest ? [
+    ...(authorityManifest.selection.artifactIds ?? []),
     ...authorityManifest.artifacts.map((artifact) => artifact.artifactId),
     ...authorityManifest.comments.flatMap((comment) => comment.artifactId ? [comment.artifactId] : []),
   ] : [];
-  const authorityInvestigationIds = authorityManifest?.dags.flatMap((dag) => dag.investigationArtifactIds ?? []) ?? [];
+  const authorityInvestigationIds = authorityManifest ? [
+    ...(authorityManifest.selection.investigationIds ?? []),
+    ...authorityManifest.dags.flatMap((dag) => [
+      ...(dag.investigationArtifactIds ?? []),
+      ...(dag.investigationIds ?? []),
+    ]),
+  ] : [];
   const selection: ResetSelection = {
     repo: repository, issueNumbers: selectedIssues, dagIds: selectedDags,
     ...(authorityManifest ? { runIds: authorityRunIds, artifactIds: authorityArtifactIds, investigationIds: authorityInvestigationIds } : {}),
@@ -1437,7 +1447,9 @@ function createResetCliDependencies(
           selectedIssueNumbers: target.issueNumbers,
           workspaceAuthorization: { issueNumbers: target.issueNumbers, runIds: [], branches: [] },
         };
-        const allRuns = store.listRuns(10_000);
+        const listedRuns = store.listRuns(10_000);
+        const explicitRunIds = [...new Set((target.runIds ?? []).filter((runId) => runId.trim().length > 0))];
+        const explicitlySelectedRuns = store.listRunsByIds(explicitRunIds);
         const allDagRecords = await store.listOrchestrations(10_000);
         const selectedDagIds = new Set(target.dagIds);
         const explicitlySelectedDagRecords = allDagRecords.filter((dag) => selectedDagIds.has(dag.orchestrationId));
@@ -1445,6 +1457,11 @@ function createResetCliDependencies(
           ...dag.issueNumbers,
           ...dag.nodes.flatMap((node) => [node.issue, ...(node.memberIssues ?? [])]),
         ]));
+        const explicitIssueIdentities = [...new Set([...target.issueNumbers, ...selectedDagIssueIdentities])];
+        for (const run of explicitlySelectedRuns) {
+          assertResetSubjectSelection("run", run.runId, run.subject, target, explicitIssueIdentities);
+        }
+        const allRuns = [...new Map([...listedRuns, ...explicitlySelectedRuns].map((run) => [run.runId, run] as const)).values()];
         const discoveredDagRecords = allDagRecords.filter((dag) => selectedDagIds.has(dag.orchestrationId)
           || (dag.repository.toLowerCase() === target.repo.toLowerCase()
             && (dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))
@@ -1492,6 +1509,8 @@ function createResetCliDependencies(
           ...mutableInvalid.flatMap(({ node }) => resetNodeRunIds(node)),
           ...inferredMutableInvalidRunIds,
         ]);
+        const explicitRunIdSet = new Set(explicitlySelectedRuns.map((run) => run.runId));
+        const selectedRunIdSet = new Set([...dagRunIds, ...explicitRunIdSet]);
         const preservedNodes = nodeSelection.preserved.map(({ dag, node, reason }) => {
           const memberIssues = [...new Set([node.issue, ...(node.memberIssues ?? [])])].sort((a, b) => a - b);
           const inferredRunIds = allRuns
@@ -1507,8 +1526,7 @@ function createResetCliDependencies(
           };
         });
         const preservedRunIds = [...new Set(preservedNodes.flatMap((node) => node.runIds))].sort();
-        const selectedNodeRunIds = new Set(dagRunIds);
-        if (preservedRunIds.some((runId) => selectedNodeRunIds.has(runId))) {
+        if (preservedRunIds.some((runId) => selectedRunIdSet.has(runId))) {
           throw new Error("Reset selection is ambiguous; a run identity belongs to both selected and preserved DAG nodes");
         }
         const missingPreservedRuns = preservedRunIds.filter((runId) => !allRuns.some((run) => run.runId === runId));
@@ -1516,12 +1534,31 @@ function createResetCliDependencies(
         const preservedArtifactIds = [...new Set(store.listArtifactsForRuns(preservedRunIds).map((artifact) => artifact.artifactId))].sort();
         const selectedIssuesFromNodes = new Set(selectedPurgeNodes.flatMap(({ node }) => [node.issue, ...(node.memberIssues ?? [])]));
         const preservedRunSet = new Set(preservedRunIds);
-        const runs = allRuns.filter((run) => !preservedRunSet.has(run.runId) && (dagRunIds.has(run.runId)
+        const runs = allRuns.filter((run) => !preservedRunSet.has(run.runId) && (selectedRunIdSet.has(run.runId)
           || (run.subject.repo.toLowerCase() === target.repo.toLowerCase() && selectedIssuesFromNodes.has(run.subject.issue ?? -1))))
           .map((run) => ({ runId: run.runId, version: run.version, state: run.state }));
         const runIds = runs.map((run) => run.runId);
         const selectedRunRecords = allRuns.filter((run) => runIds.includes(run.runId));
-        const selectedLocalArtifacts = (await Promise.all(selectedRunRecords.map((run) => store.list(run.subject)))).flat();
+        const selectedArtifactIdentityIds = [...new Set([
+          ...(target.artifactIds ?? []),
+          ...(target.investigationIds ?? []),
+        ])];
+        const explicitlySelectedArtifactSnapshots = store.listArtifactSnapshotsByIds(selectedArtifactIdentityIds);
+        for (const snapshot of explicitlySelectedArtifactSnapshots) {
+          assertResetSubjectSelection("artifact", snapshot.artifactId, snapshot.artifact.subject, target, explicitIssueIdentities);
+          if (preservedRunSet.has(snapshot.artifact.runId)) {
+            throw new Error(`Reset selection is ambiguous; artifact ${snapshot.artifactId} belongs to a preserved run`);
+          }
+        }
+        const artifacts = [...new Map([
+          ...store.listArtifactsForRuns(runIds),
+          ...explicitlySelectedArtifactSnapshots.map(({ artifactId, subjectKey, kind, sha256 }) => ({ artifactId, subjectKey, kind, sha256 })),
+        ].map((artifact) => [artifact.artifactId, artifact] as const)).values()];
+        const selectedRunArtifacts = (await Promise.all(selectedRunRecords.map((run) => store.list(run.subject)))).flat();
+        const selectedLocalArtifacts = [...new Map([
+          ...selectedRunArtifacts,
+          ...explicitlySelectedArtifactSnapshots.map((snapshot) => snapshot.artifact),
+        ].map((artifact) => [artifact.id, artifact] as const)).values()];
         const authorization = {
           pullRequestNumbers: [...new Set(selectedLocalArtifacts.map((artifact) => artifact.subject.pr).filter((number): number is number => number !== undefined))],
           headBranches: [...new Set(selectedLocalArtifacts.flatMap((artifact) => artifact.kind === "BuildResult" ? [artifact.payload.branch] : []))],
@@ -1543,7 +1580,7 @@ function createResetCliDependencies(
           || runIds.some((runId) => lease.itemId.includes(runId)));
         const taskIdentities = readResetTaskRecords(target, runIds, selectedPurgeNodes.map(({ node }) => node.id)).map((task) => ({ taskId: task.id, ...(task.runId ? { runId: task.runId } : {}), ...(task.launchKey ? { launchKey: task.launchKey } : {}), snapshotSha256: task.snapshotSha256 }));
         return {
-          runs, artifacts: store.listArtifactsForRuns(runIds),
+          runs, artifacts,
           tasks: taskIdentities,
           observations: store.listTelemetryIdentitiesForRuns(runIds),
           fences: store.listReviewFindingPublicationFenceSnapshots().filter((fence) => fence.repository?.toLowerCase() === target.repo.toLowerCase()

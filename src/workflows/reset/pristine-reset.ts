@@ -133,6 +133,34 @@ export interface ResetSelection {
   investigationIds?: readonly string[];
 }
 
+/**
+ * An explicitly selected durable identity may authorize local cleanup only when
+ * its subject is bound to the selected repository and issue identities. Missing
+ * identities are handled by the caller as remote-only no-ops; a found identity
+ * outside this boundary must fail closed.
+ */
+export function resetSubjectMatchesSelection(
+  subject: { repo: string; issue?: number },
+  selection: Pick<ResetSelection, "repo" | "issueNumbers">,
+  additionalIssueNumbers: readonly number[] = [],
+): boolean {
+  if (subject.repo.trim().toLowerCase() !== selection.repo.trim().toLowerCase()) return false;
+  if (subject.issue === undefined) return false;
+  return [...selection.issueNumbers, ...additionalIssueNumbers].includes(subject.issue);
+}
+
+export function assertResetSubjectSelection(
+  kind: "run" | "artifact",
+  identity: string,
+  subject: { repo: string; issue?: number },
+  selection: Pick<ResetSelection, "repo" | "issueNumbers">,
+  additionalIssueNumbers: readonly number[] = [],
+): void {
+  if (!resetSubjectMatchesSelection(subject, selection, additionalIssueNumbers)) {
+    throw new Error(`Reset selected ${kind} ${identity} has a subject outside the explicitly selected repository/issues`);
+  }
+}
+
 
 export interface PristineResetManifest {
   schema: "forgedock.pristine-reset/v1";
