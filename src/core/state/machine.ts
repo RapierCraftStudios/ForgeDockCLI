@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { ArtifactKind, Subject } from "../artifacts/schema.js";
+import type { ArtifactKind, Subject, ReviewFindingRoute } from "../artifacts/schema.js";
 import type { PullRequestMergeGate } from "../ports/forge-host.js";
 
 export type Workflow = "work-on" | "review-pr" | "orchestrate";
@@ -75,6 +75,8 @@ export interface RunTarget {
   promotionTarget?: string;
   /** Protected production target; reached only through a separate promotion workflow. */
   productionTarget?: string;
+  /** Review-finding route frozen with the run; absent for ordinary work. */
+  route?: ReviewFindingRoute;
   milestone?: { number: number; title: string };
 }
 
@@ -106,6 +108,7 @@ export interface RunState {
   targetBranch?: string;
   promotionTarget?: RunTarget["promotionTarget"];
   productionTarget?: RunTarget["productionTarget"];
+  route?: RunTarget["route"];
   milestone?: RunTarget["milestone"];
   scopeManifest?: PersistedScopeManifest;
   attempt: number;
@@ -219,6 +222,7 @@ export function createRun(input: {
       targetBranch: input.target.targetBranch,
       ...(input.target.promotionTarget !== undefined ? { promotionTarget: input.target.promotionTarget } : {}),
       ...(input.target.productionTarget !== undefined ? { productionTarget: input.target.productionTarget } : {}),
+      ...(input.target.route !== undefined ? { route: input.target.route } : {}),
       ...(input.target.milestone ? { milestone: input.target.milestone } : {}),
     } : {}),
     ...(input.scopeManifest ? { scopeManifest: input.scopeManifest } : {}),

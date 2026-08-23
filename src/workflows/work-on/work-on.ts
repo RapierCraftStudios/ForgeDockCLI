@@ -1249,6 +1249,10 @@ export async function workOn(
         if (!/^[0-9a-f]{7,64}$/i.test(currentParentHead)) {
           throw new Error(`Parent remediation branch ${input.parentRemediation.parentBranch} has no authoritative head SHA`);
         }
+        if (input.parentRemediation.retainedRevision !== undefined
+          && currentParentHead.toLowerCase() !== input.parentRemediation.parentHeadSha.toLowerCase()) {
+          throw new Error(`Retained review route parent branch ${input.parentRemediation.parentBranch} advanced from ${input.parentRemediation.parentHeadSha} to ${currentParentHead}; refusing stale mutation`);
+        }
         // Sibling remediation PRs may already have advanced the parent branch.
         // The active checkpoint authorizes the branch, while final parent
         // verification proves the complete expanded revision and exact scope.

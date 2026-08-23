@@ -131,6 +131,8 @@ export interface PlanMaterializationHost {
   ): Promise<PlanMaterializationResult>;
 }
 
+import type { ReviewFindingRoute } from "../artifacts/schema.js";
+
 export interface ReviewFindingInput {
   id: string;
   severity: "critical" | "high" | "medium" | "low";
@@ -195,6 +197,8 @@ export interface PullRequestSnapshot {
   headSha: string;
   headBranch: string;
   baseBranch: string;
+  /** Exact target commit; optional only for legacy host doubles. */
+  baseSha?: string;
 }
 
 /**
@@ -401,6 +405,8 @@ export interface ForgeHost {
     reviewerRoles: readonly string[];
     publicationFence: ReviewFindingPublicationFence;
     finding: ReviewFindingInput;
+    /** Optional only for legacy callers; missing routes are advisory and cannot authorize mutation. */
+    route?: ReviewFindingRoute;
   }): Promise<IssueSnapshot>;
   /** Close review-finding projections superseded by the latest authoritative verdict. */
   reconcileReviewFindings?(input: {

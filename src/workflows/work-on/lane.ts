@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { Check } from "typebox/value";
+import { ReviewFindingRouteSchema, type ReviewFindingRoute } from "../../core/artifacts/schema.js";
 import type { BranchSnapshot, IssueMilestone, IssueSnapshot } from "../../core/ports/forge-host.js";
 import type { RunState, RunTarget } from "../../core/state/machine.js";
 
@@ -7,7 +9,9 @@ export type IssueLane =
   | {
     kind: "fast";
     targetBranch: string;
-    resolution: "repository-default" | "configured-fast-lane" | "explicit-source-branch" | "explicit-target-branch";
+    resolution: "repository-default" | "configured-fast-lane" | "explicit-source-branch" | "explicit-target-branch" | "retained-revision" | "base-follow-up";
+    retainedRevision?: ReviewFindingRoute;
+    reviewRoute?: ReviewFindingRoute;
   }
   | {
     kind: "feature";
@@ -30,6 +34,8 @@ export interface ParentRemediationTarget {
   remediationDepth: number;
   maxRemediationDepth: number;
   maxRemediationChildren?: number;
+  /** Explicit child route authorized by a retained review-finding projection. */
+  retainedRevision?: ReviewFindingRoute;
 }
 
 export interface IssueLaneBranchReader {
@@ -82,6 +88,18 @@ export function classifyIssueLane(
   }
   if (productionTarget !== undefined && featurePromotionTarget === productionTarget) {
     throw new Error(`Configured feature promotion target ${featurePromotionTarget} is the protected production target; use a separate integration branch`);
+  }
+  const retainedRevision = reviewFindingRouteFromIssue(issue);
+  if (retainedRevision) {
+    if (retainedRevision.routeKind === "retained-revision") {
+      return { kind: "fast", targetBranch: retainedRevision.headBranch, resolution: "retained-revision", retainedRevision, reviewRoute: retainedRevision };
+    }
+    if (retainedRevision.routeKind === "base-follow-up") {
+      return { kind: "fast", targetBranch: retainedRevision.baseBranch, resolution: "base-follow-up", reviewRoute: retainedRevision };
+    }
+    if (retainedRevision.routeKind === "advisory" || retainedRevision.routeKind === "rejected") {
+      throw new Error(`Review finding #${issue.number} is ${retainedRevision.routeKind}; no mutation authority is available`);
+    }
   }
   const explicitEvidence = explicitBranchEvidence(issue);
   if (productionTarget !== undefined && explicitEvidence.branch === productionTarget) {
@@ -201,6 +219,8 @@ export function laneEvidence(lane: IssueLane): string {
   if (lane.kind === "feature") {
     return `Feature lane: milestone '${lane.milestone.title}' targets ${lane.targetBranch} (${lane.resolution})${lane.resolution === "planned-canonical" ? "; branch will be provisioned from the repository default before dispatch" : ""}${lane.promotionTarget ? `; promotion target ${lane.promotionTarget}` : ""}.`;
   }
+  if (lane.resolution === "retained-revision") return `Retained review finding: workspace follows ${lane.targetBranch} for PR #${lane.retainedRevision?.pullRequest} at ${lane.retainedRevision?.reviewedHeadSha}.`;
+  if (lane.resolution === "base-follow-up") return `Base-branch review follow-up: validated target branch is ${lane.targetBranch}; no retained PR mutation authority.`;
   if (lane.resolution === "explicit-source-branch") return `Fast lane: staging-review source evidence targets explicit branch ${lane.targetBranch}.`;
   if (lane.resolution === "explicit-target-branch") return `Fast lane: issue acceptance evidence targets explicit branch ${lane.targetBranch}.`;
   if (lane.resolution === "configured-fast-lane") return `Fast lane: project policy targets ${lane.targetBranch}.`;
@@ -254,6 +274,7 @@ export function runTargetForLane(lane: IssueLane, productionTarget?: string): Ru
     targetBranch: lane.targetBranch,
     ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
     ...(productionTarget !== undefined ? { productionTarget } : {}),
+    ...(lane.kind === "fast" && lane.reviewRoute !== undefined ? { route: lane.reviewRoute } : {}),
     ...(lane.kind === "feature" ? { milestone: lane.milestone } : {}),
   };
 }
@@ -273,6 +294,10 @@ export function assertRunFollowsLane(run: RunState, lane: IssueLane, productionT
   }
   if (run.productionTarget !== productionTarget) {
     throw new Error(`Run ${run.runId} production target ${run.productionTarget ?? "unset"} no longer matches configured target ${productionTarget ?? "unset"}`);
+  }
+  const expectedRoute = lane.kind === "fast" ? lane.reviewRoute : undefined;
+  if (JSON.stringify(run.route ?? null) !== JSON.stringify(expectedRoute ?? null)) {
+    throw new Error(`Run ${run.runId} retained review route no longer matches issue admission`);
   }
   if (lane.kind === "feature" && run.milestone?.number !== lane.milestone.number) {
     throw new Error(`Run ${run.runId} milestone identity no longer matches issue #${run.subject.issue ?? "?"}`);
@@ -299,6 +324,14 @@ export function assertParentRemediationTarget(target: ParentRemediationTarget): 
     && (!Number.isSafeInteger(target.maxRemediationChildren) || target.maxRemediationChildren < 1)) {
     throw new Error("Parent remediation child limit is invalid");
   }
+  if (target.retainedRevision !== undefined) {
+    if (target.retainedRevision.routeKind !== "retained-revision"
+      || target.retainedRevision.pullRequest !== target.parentPullRequest
+      || target.retainedRevision.reviewedHeadSha.toLowerCase() !== target.parentHeadSha.toLowerCase()
+      || target.retainedRevision.headBranch !== target.parentBranch) {
+      throw new Error("Retained remediation target does not match its durable route");
+    }
+  }
 }
 
 export function assertRunTargetsBranch(run: RunState, branch: string): void {
@@ -308,6 +341,21 @@ export function assertRunTargetsBranch(run: RunState, branch: string): void {
   if (run.targetBranch !== branch) {
     throw new Error(`Run ${run.runId} targets ${run.targetBranch}, not ${branch}`);
   }
+}
+
+export function reviewFindingRouteFromIssue(
+  issue: Pick<IssueSnapshot, "body">,
+): ReviewFindingRoute | undefined {
+  const line = issue.body.replace(/\r\n?/g, "\n").split("\n")
+    .find((candidate) => /^<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 [A-Za-z0-9_-]+ -->$/.test(candidate.trim()));
+  if (!line) return undefined;
+  const encoded = /^<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 ([A-Za-z0-9_-]+) -->$/.exec(line.trim())?.[1];
+  if (!encoded) throw new Error("Review-finding route marker is malformed");
+  let value: unknown;
+  try { value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")); }
+  catch { throw new Error("Review-finding route marker is not valid JSON"); }
+  if (!Check(ReviewFindingRouteSchema, value)) throw new Error("Review-finding route metadata is incomplete or invalid");
+  return value as ReviewFindingRoute;
 }
 
 function sourceBranchFromIssue(

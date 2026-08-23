@@ -9,7 +9,7 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
-import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingRouteMarker, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -1435,6 +1435,21 @@ describe("GitHub review finding projection", () => {
     assert.match(createdBody, /\\u009D/);
     assert.match(createdBody, /\\u009c/);
     assert.match(createdBody, /\\u0007/);
+  });
+});
+
+describe("GitHub retained review route identity", () => {
+  it("invariant:matrix-adapter-lifecycle-63b5b24a1c5a and invariant:matrix-identity-isolation-e118710cadc5 preserve one canonical route marker", () => {
+    const route = {
+      routeKind: "retained-revision" as const,
+      repository: "a/b", pullRequest: 12, reviewedHeadSha: "a".repeat(40),
+      headBranch: "forgedock/delivery", baseBranch: "staging", baseSha: "b".repeat(40),
+      deliveryIssue: 11, deliveryRun: "run_11", findingId: "finding-1", findingRoot: "root-1",
+      lineage: { lineageId: "lineage-1", sourceRunId: "run_11", sourcePullRequest: 12, sourceHeadSha: "a".repeat(40), findingId: "finding-1", findingRoot: "root-1" },
+    };
+    const marker = reviewFindingRouteMarker(route);
+    assert.match(marker, /^<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 [A-Za-z0-9_-]+ -->$/);
+    assert.equal(reviewFindingRouteMarker(route), marker);
   });
 });
 

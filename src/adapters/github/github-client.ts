@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
-import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
+import type { ArtifactKind, DurableArtifact, Subject, ReviewFindingRoute } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import { pullRequestMergeability } from "../../core/ports/forge-host.js";
 import type {
@@ -193,6 +193,7 @@ interface ReviewFindingMaterializationInput {
   reviewerRoles: readonly string[];
   publicationFence?: ReviewFindingPublicationFence;
   finding: ReviewFindingInput;
+  route?: ReviewFindingRoute;
 }
 
 export interface GitHubIssue {
@@ -855,6 +856,8 @@ export class GitHubClient implements ForgeHost {
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
     const laneMarker = reviewFindingLaneMarker(input.repo, input.pullRequest.number);
+    input.route ??= legacyAdvisoryReviewFindingRoute(input);
+    assertReviewFindingRoute(input.route, input.repo, input.pullRequest, input.reviewedHeadSha);
     const admissionKey: RemediationAdmissionKey = {
       repo: input.repo,
       parentIssue: 0,
@@ -1582,7 +1585,7 @@ export class GitHubClient implements ForgeHost {
   async getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot> {
     const result = await this.gh([
       "pr", "view", String(number), "--repo", repo,
-      "--json", "number,title,body,url,state,headRefOid,headRefName,baseRefName",
+      "--json", "number,title,body,url,state,headRefOid,headRefName,baseRefName,baseRefOid",
     ]);
     return pullRequestSnapshotFromGitHub(repo, number, JSON.parse(result));
   }
@@ -2265,6 +2268,11 @@ export function reviewFindingLaneMarker(repo: string, pullRequest: number): stri
   return `<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
 }
 
+export function reviewFindingRouteMarker(route: ReviewFindingRoute): string {
+  const encoded = Buffer.from(JSON.stringify(route), "utf8").toString("base64url");
+  return `<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 ${encoded} -->`;
+}
+
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
   return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${reviewFindingIdentity(repo, pullRequest, finding)}\n${finding.id.trim()}`).digest("hex")} -->`;
 }
@@ -2308,8 +2316,15 @@ function renderReviewFindingIssue(
     ...(regression ? ["", `> **Regression:** Previously tracked in #${regression.number}; this root recurred at reviewed SHA \`${input.reviewedHeadSha}\`.`] : []),
     "",
     `**Source:** PR #${input.pullRequest.number} — ${boundedGitHubText(input.pullRequest.title, 500)}`,
-    ...(input.sourceIssue ? [`**Delivery issue:** #${input.sourceIssue}`] : []),
+    ...(input.route!.deliveryIssue ? [`**Delivery issue:** #${input.route!.deliveryIssue}`] : []),
     `**Reviewed SHA:** \`${input.reviewedHeadSha}\``,
+    `**Source head branch:** \`${boundedGitHubCode(input.route!.headBranch)}\``,
+    `**Base branch:** \`${boundedGitHubCode(input.route!.baseBranch)}\``,
+    ...(input.route!.baseSha ? [`**Base SHA:** \`${input.route!.baseSha}\``] : []),
+    `**Delivery run:** \`${boundedGitHubCode(input.route!.deliveryRun)}\``,
+    `**Finding root:** \`${boundedGitHubCode(input.route!.findingRoot)}\``,
+    ...(input.route!.matchedCriterion ? [`**Matched criterion:** ${boundedGitHubText(input.route!.matchedCriterion, 1_000)}`] : []),
+    `**Scope route:** ${input.route!.routeKind}`,
     `**Run:** \`${boundedGitHubCode(input.runId)}\``,
     `**Reviewers:** ${input.reviewerRoles.map((role) => `\`${boundedGitHubCode(role)}\``).join(", ")}`,
     ...(input.finding.sourceFindingIds?.length ? [`**Source findings:** ${input.finding.sourceFindingIds.map((id) => `\`${boundedGitHubCode(id)}\``).join(", ")}`] : []),
@@ -2349,6 +2364,7 @@ function renderReviewFindingIssue(
     marker,
     reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding),
     laneMarker,
+    reviewFindingRouteMarker(input.route!),
   ].join("\n");
   return { title, body };
 }
@@ -2538,6 +2554,9 @@ function pullRequestSnapshotFromGitHub(repo: string, requestedNumber: number, ra
   const headSha = requiredString("headRefOid");
   const headBranch = requiredString("headRefName");
   const baseBranch = requiredString("baseRefName");
+  const baseSha = typeof value.baseRefOid === "string" && /^[a-f0-9]{40,64}$/i.test(value.baseRefOid)
+    ? value.baseRefOid
+    : undefined;
   if (!/^[a-f0-9]{40,64}$/i.test(headSha)) {
     throw new Error(`GitHub returned an invalid head SHA for PR #${requestedNumber}`);
   }
@@ -2569,7 +2588,52 @@ function pullRequestSnapshotFromGitHub(repo: string, requestedNumber: number, ra
     headSha,
     headBranch,
     baseBranch,
+    ...(baseSha ? { baseSha } : {}),
   };
+}
+
+function legacyAdvisoryReviewFindingRoute(input: ReviewFindingMaterializationInput): ReviewFindingRoute {
+  const root = input.finding.rootId?.trim() || input.finding.normalizedRoot?.trim() || input.finding.causalRoot?.trim() || input.finding.id;
+  return {
+    routeKind: "advisory",
+    repository: input.repo,
+    pullRequest: input.pullRequest.number,
+    reviewedHeadSha: input.reviewedHeadSha,
+    headBranch: input.pullRequest.headBranch,
+    baseBranch: input.pullRequest.baseBranch,
+    ...(input.pullRequest.baseSha ? { baseSha: input.pullRequest.baseSha } : {}),
+    ...(input.sourceIssue ? { deliveryIssue: input.sourceIssue } : {}),
+    deliveryRun: input.runId,
+    findingId: input.finding.id,
+    findingRoot: root,
+    lineage: {
+      lineageId: `legacy-review-route:${input.runId}:${input.pullRequest.number}:${input.finding.id}`,
+      sourceRunId: input.runId,
+      sourcePullRequest: input.pullRequest.number,
+      sourceHeadSha: input.reviewedHeadSha,
+      findingId: input.finding.id,
+      findingRoot: root,
+    },
+  };
+}
+
+function assertReviewFindingRoute(
+  route: ReviewFindingRoute,
+  repo: string,
+  pullRequest: PullRequestSnapshot,
+  reviewedHeadSha: string,
+): void {
+  if (route.repository.trim().toLowerCase() !== repo.trim().toLowerCase()
+    || route.pullRequest !== pullRequest.number
+    || route.reviewedHeadSha.toLowerCase() !== reviewedHeadSha.toLowerCase()
+    || route.headBranch !== pullRequest.headBranch
+    || route.baseBranch !== pullRequest.baseBranch
+    || route.routeKind === "retained-revision" && (!route.baseSha || !pullRequest.baseSha || route.baseSha.toLowerCase() !== pullRequest.baseSha.toLowerCase())) {
+    throw new Error(`Review-finding route does not match the exact source PR ${repo}#${pullRequest.number}`);
+  }
+  if (route.routeKind === "retained-revision" && route.deliveryRun.trim() === "") {
+    throw new Error("Retained review-finding route requires a managed delivery run");
+  }
 }
 
 function assertExactReviewPublicationRoute(
