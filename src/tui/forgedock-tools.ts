@@ -1169,7 +1169,7 @@ function latestRunOutcome(
   return undefined;
 }
 
-function decompositionChildIssuesFromArtifacts(
+export function decompositionChildIssuesFromArtifacts(
   parentIssue: number,
   artifacts: readonly DurableArtifact[],
   runId: string | undefined,
@@ -3031,7 +3031,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           const expansion = await materializeVisibleDecomposition({ github: readyGithub, artifacts, repository: item.repository ?? readyRepository.repo, effective, orchestration: durable, node: durable.nodes.find((candidate) => candidate.id === item.id)!, item: item as VisibleOrchestrationItem, childIssues, ...(materializeSignal !== undefined ? { signal: materializeSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
           return expansion ? { items: expansion.items } : undefined;
         },
-        childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: readyRepository.repo, issue: entry.issue }), undefined),
+        childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: readyRepository.repo, issue: entry.issue }), entry.runId),
       }, schedule.items);
       const tuiInvestigationWorker: OrchestrationInvestigationWorker = hasDurableInvestigationRuns
         ? investigationWorkers.investigationWorker
@@ -4034,7 +4034,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
       const expansion = await materializeVisibleDecomposition({ github, artifacts, repository: item.repository ?? record.repository, effective, orchestration: durable, node, item: item as VisibleOrchestrationItem, childIssues });
       return expansion ? { items: expansion.items } : undefined;
     },
-    childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: record.repository, issue: entry.issue }), undefined),
+    childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: record.repository, issue: entry.issue }), entry.runId),
   }, items) : undefined;
   return {
     repository: record.repository,

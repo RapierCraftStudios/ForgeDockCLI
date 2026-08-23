@@ -36,6 +36,7 @@ import {
   recoverableRemediationCheckpointResult,
   sourcePullRequestFromIssueBody,
   isOrchestrationPreviewConfirmationPrompt,
+  decompositionChildIssuesFromArtifacts,
   materializeVisibleDecomposition,
   orchestrationTransportKey,
   type ControllerTaskSpec,
@@ -3196,6 +3197,20 @@ function stateForResume(repository: InMemoryOrchestrationRepository): FakePiStat
   });
 }
 
+test("decomposition expansion consumes the persisted investigation run identity", () => {
+  const runId = "run_461-investigation";
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId,
+    subject: { repo: "a/b", issue: 461 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "split", childIssues: ["#501 Child", "#502 Child"] },
+  });
+  const artifacts = [outcome] as readonly DurableArtifact[];
+  assert.deepEqual(decompositionChildIssuesFromArtifacts(461, artifacts, runId), [501, 502]);
+  assert.throws(() => decompositionChildIssuesFromArtifacts(461, artifacts, "run_wrong"), /authoritative decomposed Outcome/);
+  assert.throws(() => decompositionChildIssuesFromArtifacts(461, artifacts, undefined), /authoritative run id/);
+});
 test("direct work-on defaults to a native non-blocking controller task", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
   const entry = join(root, "controller.mjs");
