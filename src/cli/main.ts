@@ -58,7 +58,7 @@ import { affectedFilesFromIssueBody, contractBatchGroups, inferBatchRiskClass, p
 import { assembleWorkUnits } from "../workflows/orchestrate/assemble.js";
 import { materializeBatchGroups } from "../workflows/orchestrate/materialize.js";
 import { buildSchedulePreview, ClaimPromotionConflictError, materializeClaimDependencies, type ScheduleWorkerResult, type ScheduledWorkItem } from "../workflows/orchestrate/scheduler.js";
-import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
+import { terminalOrchestrationResult, recoverableCompletionCheckpoint } from "../workflows/orchestrate/terminal-result.js";
 import { ClaimPromotionRecoveryError, promoteOrchestrationClaims, promoteOrchestrationClaimsFromEnvironment } from "../runtime/orchestration-claim-transport.js";
 import { RemediationSupervisor } from "../workflows/orchestrate/remediation.js";
 import { OrchestrationController, type OrchestrationControllerDependencies } from "../workflows/orchestrate/controller.js";
@@ -2683,6 +2683,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         if (reconciled.remediationCheckpoint && ["awaiting-dispatch", "children-running", "ready-to-resume"].includes(reconciled.remediationCheckpoint.payload.status)) {
           return { disposition: "interrupted", reason: `#${item.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}` };
         }
+        const recoverable = recoverableCompletionCheckpoint(issueArtifacts, reconciled, autoMerge);
+        if (recoverable) return { disposition: "recoverable-checkpoint", checkpoint: recoverable, reason: `Approved completion checkpoint ${recoverable.checkpointKey} has no durable Outcome` };
+        if (reconciled.state === "merging") return { disposition: "terminal", result: { status: "suspended", error: `#${item.issue} has an unclassified merging checkpoint; refusing automatic recovery` } };
         const terminal = terminalOrchestrationResult(item.issue, issueArtifacts, reconciled);
         if (terminal) return { disposition: "terminal", result: terminal };
         return { disposition: "interrupted", reason: `No live CLI worker transport exists; durable state is ${reconciled.state}` };
@@ -2912,6 +2915,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
         artifacts: issueArtifacts,
         childIssuesFromArtifacts: decompositionChildIssuesFromArtifacts,
         phase: "initial",
+        autoMerge: record.autoMerge,
       });
       if (initialClassification) return initialClassification;
       const nodeLease = inspectNodeLease(store, item.id);
@@ -2927,6 +2931,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           artifacts: issueArtifacts,
           childIssuesFromArtifacts: decompositionChildIssuesFromArtifacts,
           phase: "after-wait",
+          autoMerge: record.autoMerge,
         });
         if (afterWaitClassification) return afterWaitClassification;
         return { disposition: "interrupted" as const, reason: `Previous node lease for #${item.issue} released or expired; no terminal worker outcome was found` };

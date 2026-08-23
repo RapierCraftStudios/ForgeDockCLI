@@ -18,6 +18,8 @@ import type {
   OrchestrationExecutionAdmission,
   OrchestrationExecutionClaim,
   OrchestrationExecutionLeaseStatus,
+  OrchestrationCheckpointRecovery,
+  OrchestrationRecoverableCheckpoint,
   OrchestrationNodeRecord,
   OrchestrationPlanMetadata,
   OrchestrationRecord,
@@ -179,6 +181,11 @@ export type OrchestrationWorkerReconciliation =
       reason?: string;
     }
   | {
+      disposition: "recoverable-checkpoint";
+      checkpoint: OrchestrationRecoverableCheckpoint;
+      reason?: string;
+    }
+  | {
       disposition: "terminal";
       result: Exclude<ScheduleWorkerResult, void>;
       reason?: string;
@@ -233,6 +240,10 @@ export interface OrchestrationControllerDependencies {
   maxDecompositionChildren?: number;
   /** Maximum replacement lineage depth (root nodes are depth zero). */
   maxDecompositionDepth?: number;
+  /** Maximum automatic retries for one exact recoverable checkpoint. */
+  recoverableCheckpointAttemptBudget?: number;
+  /** Delay before a checkpoint retry; persisted so restart cannot hot-loop. */
+  recoverableCheckpointBackoffMs?: number;
   /** Available worker slots in the caller's process/RPC/subagent transport. */
   /** Optional authoritative artifact store for generic retry checkpoints. */
   retryArtifacts?: ArtifactRepository;
@@ -1002,6 +1013,15 @@ export class OrchestrationController {
           actions.set(node.id, { kind: "live", reconciliation });
           continue;
         }
+        if (reconciliation.disposition === "recoverable-checkpoint") {
+          const action = this.prepareRecoverableCheckpoint(state, node.id, reconciliation.checkpoint, reconciliation.reason);
+          if (action) actions.set(node.id, action);
+          else actions.set(node.id, {
+            kind: "terminal",
+            result: { status: "suspended", error: reconciliation.reason ?? `Checkpoint ${reconciliation.checkpoint.checkpointKey} retry budget exhausted or not yet due` },
+          });
+          continue;
+        }
         if (reconciliation.disposition === "interrupted") {
           const recoveryOfAttemptId = this.applyInterruptedReconciliation(
             state,
@@ -1053,6 +1073,14 @@ export class OrchestrationController {
         actions.set(node.id, {
           kind: "terminal",
           result: { status: node.status, ...(node.error !== undefined ? { error: node.error } : {}) },
+        });
+        continue;
+      }
+
+      if (node.checkpointRecovery && node.checkpointRecovery.attempts >= node.checkpointRecovery.maxAttempts) {
+        actions.set(node.id, {
+          kind: "terminal",
+          result: { status: "suspended", error: node.checkpointRecovery.lastError ?? `Checkpoint ${node.checkpointRecovery.checkpointKey} retry budget exhausted` },
         });
         continue;
       }
@@ -1766,6 +1794,52 @@ export class OrchestrationController {
     }));
   }
 
+  private prepareRecoverableCheckpoint(
+    state: PersistenceState,
+    nodeId: string,
+    checkpoint: OrchestrationRecoverableCheckpoint,
+    reason?: string,
+  ): Extract<PreparedAction, { kind: "launch" }> | undefined {
+    if (!checkpoint.checkpointKey.trim() || checkpoint.checkpoint !== "completion") {
+      throw new Error(`Unsupported recoverable checkpoint for ${nodeId}`);
+    }
+    const now = Date.parse(this.now());
+    const configuredBudget = this.dependencies.recoverableCheckpointAttemptBudget ?? 1;
+    if (!Number.isSafeInteger(configuredBudget) || configuredBudget < 1) throw new Error("recoverableCheckpointAttemptBudget must be positive");
+    const prior = requiredNode(state.record, nodeId).checkpointRecovery;
+    if (prior && prior.checkpointKey !== checkpoint.checkpointKey) {
+      throw new Error(`Recoverable checkpoint identity changed for ${nodeId}: ${prior.checkpointKey} -> ${checkpoint.checkpointKey}`);
+    }
+    const recovery: OrchestrationCheckpointRecovery = prior ?? {
+      checkpointKey: checkpoint.checkpointKey,
+      attempts: 0,
+      maxAttempts: configuredBudget,
+    };
+    if (recovery.attempts >= recovery.maxAttempts) return undefined;
+    const nextAttemptAt = checkpoint.nextAttemptAt ?? recovery.nextAttemptAt;
+    if (nextAttemptAt && Number.isFinite(now) && Date.parse(nextAttemptAt) > now) {
+      this.updateNode(state, nodeId, (current) => ({
+        ...current,
+        checkpointRecovery: { ...recovery, nextAttemptAt },
+        error: reason ?? `Checkpoint retry deferred until ${nextAttemptAt}`,
+      }));
+      return undefined;
+    }
+    const backoff = Math.max(0, this.dependencies.recoverableCheckpointBackoffMs ?? 0);
+    const next = backoff > 0 ? new Date((Number.isFinite(now) ? now : Date.now()) + backoff).toISOString() : undefined;
+    this.updateNode(state, nodeId, (current) => ({
+      ...current,
+      status: "queued",
+      checkpointRecovery: {
+        ...recovery,
+        attempts: recovery.attempts + 1,
+        ...(next ? { nextAttemptAt: next } : {}),
+        ...(reason ? { lastError: reason } : {}),
+      },
+      ...(reason ? { error: reason } : {}),
+    }));
+    return { kind: "launch", recovery: "resume", ...(activeAttempt(requiredNode(state.record, nodeId)) ? { recoveryOfAttemptId: activeAttempt(requiredNode(state.record, nodeId))!.attemptId } : {}) };
+  }
   private applyInterruptedReconciliation(
     state: PersistenceState,
     nodeId: string,

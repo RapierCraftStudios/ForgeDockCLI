@@ -2,7 +2,36 @@
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import type { ReconciledSubjectState } from "../../core/state/reconcile.js";
+import type { OrchestrationRecoverableCheckpoint } from "../../core/ports/orchestration.js";
 import type { ScheduleWorkerResult } from "./scheduler.js";
+
+/**
+ * Admit only an approved, exact-SHA completion checkpoint. Blocked Outcomes,
+ * pending/unavailable checks, human merge, and inconsistent evidence remain
+ * terminal/suspended and are never converted into an automatic retry.
+ */
+export function recoverableCompletionCheckpoint(
+  artifacts: readonly DurableArtifact[],
+  reconciled: ReconciledSubjectState,
+  autoMerge: boolean,
+): OrchestrationRecoverableCheckpoint | undefined {
+  if (!autoMerge || reconciled.state !== "merging" || !reconciled.runId || reconciled.warnings.length) return undefined;
+  const verdict = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"ReviewVerdict"> =>
+    artifact.kind === "ReviewVerdict" && artifact.runId === reconciled.runId && artifact.payload.disposition === "approve",
+  );
+  if (!verdict?.subject.pr || !verdict.payload.headSha) return undefined;
+  const build = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"BuildResult"> =>
+    artifact.kind === "BuildResult" && artifact.runId === reconciled.runId,
+  );
+  if (!build || build.payload.headSha !== verdict.payload.headSha) return undefined;
+  return {
+    checkpointKey: `${reconciled.runId}:completion:pr:${verdict.subject.pr}:sha:${verdict.payload.headSha}`,
+    checkpoint: "completion",
+    runId: reconciled.runId,
+    headSha: verdict.payload.headSha,
+    pullRequest: verdict.subject.pr,
+  };
+}
 
 /**
  * Convert authoritative latest-run reconciliation into a terminal scheduler

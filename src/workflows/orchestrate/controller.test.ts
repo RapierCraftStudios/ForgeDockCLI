@@ -958,6 +958,53 @@ describe("OrchestrationController", () => {
     assert.equal(persisted?.nodes[0]?.activeAttemptId, undefined);
   });
 
+  it("auto-resumes one exact recoverable completion checkpoint", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const recoveries: string[] = [];
+    const service = controller(repository, async (_scheduled, context) => {
+      recoveries.push(context.recovery);
+    }, {
+      recoverableCheckpointAttemptBudget: 1,
+      reconcileWorker: async () => ({
+        disposition: "recoverable-checkpoint",
+        checkpoint: { checkpointKey: "run-453:completion:pr:527:sha:abc", checkpoint: "completion", runId: "run-453", headSha: "abc", pullRequest: 527 },
+      }),
+    });
+    const created = await service.create({ repository: "owner/repo", items: [item("issue-453", 453)], maxParallel: 1 });
+    await repository.saveOrchestration({ ...created, status: "failed", nodes: [{
+      ...created.nodes[0]!, status: "suspended", attempts: [{
+        attemptId: "attempt-old", attempt: 1, recovery: "initial", status: "suspended",
+        startedAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:01:00.000Z",
+      }],
+    }] });
+    const result = await service.resume(created.orchestrationId);
+    assert.deepEqual(recoveries, ["resume"]);
+    assert.equal(result.record.nodes[0]?.checkpointRecovery?.attempts, 1);
+    assert.equal(result.record.nodes[0]?.status, "completed");
+  });
+
+  it("bounds repeated unchanged checkpoint recovery across restart", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let launches = 0;
+    const reconciliation = async () => ({
+      disposition: "recoverable-checkpoint" as const,
+      checkpoint: { checkpointKey: "run:completion:pr:1:sha:abc", checkpoint: "completion" as const },
+    });
+    const first = controller(repository, async () => { launches++; throw new Error("checkpoint still incomplete"); }, {
+      recoverableCheckpointAttemptBudget: 1, reconcileWorker: reconciliation,
+    });
+    const created = await first.create({ repository: "owner/repo", items: [item("issue-1", 1)], maxParallel: 1 });
+    await repository.saveOrchestration({ ...created, status: "failed", nodes: [{ ...created.nodes[0]!, status: "suspended" }] });
+    const failed = await first.resume(created.orchestrationId);
+    assert.equal(launches, 1);
+    assert.equal(failed.record.nodes[0]?.status, "failed");
+    const second = controller(repository, async () => { launches++; }, { recoverableCheckpointAttemptBudget: 1, reconcileWorker: reconciliation });
+    const bounded = await second.resume(created.orchestrationId);
+    assert.equal(launches, 1);
+    assert.equal(bounded.record.nodes[0]?.status, "suspended");
+  });
+
+
   it("relaunches an interrupted suspended worker as a new durable attempt", async () => {
     const repository = new RecordingOrchestrationRepository();
     const recoveries: string[] = [];

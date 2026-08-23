@@ -2,7 +2,7 @@
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 import { reconcileLatestRunArtifacts } from "../../core/state/reconcile.js";
-import { terminalOrchestrationResult } from "./terminal-result.js";
+import { terminalOrchestrationResult, recoverableCompletionCheckpoint } from "./terminal-result.js";
 import type { ScheduleWorkerResult } from "./scheduler.js";
 
 export type AuthoritativeWorkerReconciliation =
@@ -11,11 +11,15 @@ export type AuthoritativeWorkerReconciliation =
       reason: string;
     }
   | {
+      disposition: "recoverable-checkpoint";
+      checkpoint: NonNullable<ReturnType<typeof recoverableCompletionCheckpoint>>;
+      reason?: string;
+    }
+  | {
       disposition: "terminal";
       result: Exclude<ScheduleWorkerResult, void>;
       reason?: string;
     };
-
 /**
  * Classify one authoritative artifact snapshot using the same admission
  * ordering before and after a stale node-lease wait. A missing classification
@@ -31,6 +35,7 @@ export function reconcileAuthoritativeWorkerArtifacts(input: {
     runId: string | undefined,
   ) => readonly number[];
   phase: "initial" | "after-wait";
+  autoMerge?: boolean;
 }): AuthoritativeWorkerReconciliation | undefined {
   const reconciled = reconcileLatestRunArtifacts(input.artifacts);
   if (reconciled.state === "completed") {
@@ -61,6 +66,20 @@ export function reconcileAuthoritativeWorkerArtifacts(input: {
     return {
       disposition: "interrupted",
       reason: `#${input.issue} must resume from remediation checkpoint ${reconciled.remediationCheckpoint.payload.checkpointKey}`,
+    };
+  }
+  const recoverable = recoverableCompletionCheckpoint(input.artifacts, reconciled, input.autoMerge ?? false);
+  if (recoverable) {
+    return {
+      disposition: "recoverable-checkpoint",
+      checkpoint: recoverable,
+      reason: `Approved completion checkpoint ${recoverable.checkpointKey} has no durable Outcome`,
+    };
+  }
+  if (reconciled.state === "merging") {
+    return {
+      disposition: "terminal",
+      result: { status: "suspended", error: `#${input.issue} has an unclassified merging checkpoint; refusing automatic recovery` },
     };
   }
   const terminal = terminalOrchestrationResult(input.issue, input.artifacts, reconciled);

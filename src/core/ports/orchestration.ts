@@ -151,6 +151,26 @@ export interface OrchestrationRecoveryRecord {
   reason?: string;
 }
 
+/** Identity and bounded retry state for a controller-owned semantic checkpoint. */
+export interface OrchestrationCheckpointRecovery {
+  checkpointKey: string;
+  attempts: number;
+  maxAttempts: number;
+  nextAttemptAt?: string;
+  lastError?: string;
+}
+
+/** Authoritative evidence that a retained checkpoint may be resumed safely. */
+export interface OrchestrationRecoverableCheckpoint {
+  checkpointKey: string;
+  /** Only completion is currently safe for same-controller automatic recovery. */
+  checkpoint: "completion";
+  runId?: string;
+  headSha?: string;
+  pullRequest?: number;
+  nextAttemptAt?: string;
+}
+
 /**
  * Exclusive controller admission for one orchestration execution. The
  * implementation is responsible for retaining/renewing the claim until
@@ -234,6 +254,8 @@ export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
   retryable?: boolean;
   retryAfterMs?: number;
   lastRecovery?: OrchestrationRecoveryRecord;
+  /** Bounded, restart-safe automatic recovery for an exact semantic checkpoint. */
+  checkpointRecovery?: OrchestrationCheckpointRecovery;
 }
 
 /** Release-only ordering derived from overlapping claims, not a semantic dependency. */

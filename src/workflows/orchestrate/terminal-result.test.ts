@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
 import { reconcileLatestRunArtifacts } from "../../core/state/reconcile.js";
-import { terminalOrchestrationResult } from "./terminal-result.js";
+import { terminalOrchestrationResult, recoverableCompletionCheckpoint } from "./terminal-result.js";
 
 const common = { runId: "run_current", subject: { repo: "a/b", issue: 190 }, producer: { role: "test" } };
 const intent = createArtifact({ ...common, kind: "Intent", payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
@@ -27,6 +27,21 @@ describe("orchestration terminal artifact classification", () => {
     assert.deepEqual(terminalOrchestrationResult(190, artifacts, reconciled), {
       status: "blocked",
       error: "#190 reached blocked: repairable verification mismatch",
+    });
+  });
+
+  it("admits only the exact approved completion checkpoint for auto-merge", () => {
+    const verdict = createArtifact({ ...common, kind: "ReviewVerdict", subject: { ...common.subject, pr: 527 }, payload: { headSha: "a".repeat(40), disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] } });
+    const artifacts = [intent, investigation, packet, build, verdict] as DurableArtifact[];
+    const reconciled = reconcileLatestRunArtifacts(artifacts);
+    assert.equal(reconciled.state, "merging");
+    assert.equal(recoverableCompletionCheckpoint(artifacts, reconciled, false), undefined);
+    assert.deepEqual(recoverableCompletionCheckpoint(artifacts, reconciled, true), {
+      checkpointKey: `run_current:completion:pr:527:sha:${"a".repeat(40)}`,
+      checkpoint: "completion",
+      runId: "run_current",
+      headSha: "a".repeat(40),
+      pullRequest: 527,
     });
   });
 
