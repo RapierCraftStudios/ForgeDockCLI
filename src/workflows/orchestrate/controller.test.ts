@@ -1874,3 +1874,36 @@ describe("OrchestrationController", () => {
     assert.deepEqual(result.record.investigations?.map((entry) => entry.baseSha), ["a".repeat(40), "a".repeat(40)]);
   });
 });
+
+
+it("runs a durable packet barrier before mutation workers", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const packetStarted: string[] = [];
+  let materialized = false;
+  const executedClaims: string[][] = [];
+  const service = controller(repository, async (scheduled) => {
+    assert.equal(materialized, true);
+    executedClaims.push([...scheduled.claims]);
+  }, {
+    investigationWorker: async (scheduled) => ({ outcome: "confirmed", baseSha: "base-1", evidence: { runId: `run-${scheduled.id}` } }),
+    packetWorker: async (scheduled) => {
+      packetStarted.push(scheduled.id);
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      return { packetId: `packet-${scheduled.id}`, expectedPaths: [`src/${scheduled.id}.ts`], semanticDependencies: [], baseSha: "base-1" };
+    },
+    materializeExecution: async ({ investigations, packets }) => {
+      assert.equal(investigations.length, 2);
+      assert.equal(packets?.filter((packet) => packet.status === "completed").length, 2);
+      materialized = true;
+      return { items: [item("one", 1), item("two", 2)] };
+    },
+  });
+  const result = await service.createAndRun({
+    repository: "owner/repo", maxParallel: 2, investigationFirst: true,
+    items: [item("one", 1), item("two", 2)],
+  });
+  assert.deepEqual(packetStarted.sort(), ["one", "two"]);
+  assert.deepEqual(executedClaims.sort((a, b) => a[0]!.localeCompare(b[0]!)), [["src/one.ts"], ["src/two.ts"]]);
+  assert.equal(result.record.packetBarrier?.completed, 2);
+  assert.equal(result.record.phase, "executing");
+});

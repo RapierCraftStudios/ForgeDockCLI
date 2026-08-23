@@ -7,13 +7,16 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import type {
   OrchestrationExecutionMaterializer,
   OrchestrationInvestigationWorker,
+  OrchestrationPacketWorker,
 } from "./controller.js";
 import type { OrchestrationRecord, OrchestrationInvestigationRecord } from "../../core/ports/orchestration.js";
 import type { ScheduledWorkItem, ClaimSerializationEdge } from "./scheduler.js";
 import { investigateWorkItem } from "../work-on/investigate.js";
+import { prepareBuildPacket, type VerificationCatalog } from "../work-on/prepare.js";
 import { STANDARD_SCOPE_METADATA_ROOTS, type AgentRuntime } from "../../runtime/agent-runtime.js";
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
 import { materializeClaimDependencies } from "./scheduler.js";
+import { compileExecutionDag } from "./packet-wave.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -46,6 +49,7 @@ export interface InvestigationFirstFactoryOptions {
   productionTarget?: string;
   resolveRoute(item: ScheduledWorkItem): Promise<InvestigationFirstRoute>;
   getBranchHead(repository: string, branch: string): Promise<string>;
+  verificationCatalog?: VerificationCatalog;
   /** Initial frozen nodes, and the authoritative nodes when resuming. */
   sourceItems(orchestration: Readonly<OrchestrationRecord>, initialItems: readonly ScheduledWorkItem[]): readonly ScheduledWorkItem[];
   /** Resolve a decompose result into the bounded next investigation wave. */
@@ -61,6 +65,7 @@ export interface InvestigationFirstFactoryOptions {
 
 export interface InvestigationFirstWorkers {
   investigationWorker: OrchestrationInvestigationWorker;
+  packetWorker: OrchestrationPacketWorker;
   materializeExecution: OrchestrationExecutionMaterializer;
 }
 
@@ -138,8 +143,47 @@ export function createInvestigationFirstWorkers(
     };
   };
 
-  const materializeExecution: OrchestrationExecutionMaterializer = async ({ orchestration, investigations, signal, assertActive }) => {
-    const assertMaterializationActive = (): void => {
+  const packetWorker: OrchestrationPacketWorker = async (item, context) => {
+    const investigation = context.investigation;
+    const runId = investigation.runId ?? String(investigation.evidence?.runId ?? "");
+    if (!runId) throw new Error(`Packet ${item.id} has no durable investigation run`);
+    const run = await options.runs.load(runId);
+    if (!run) throw new Error(`Packet ${item.id} investigation run ${runId} is missing`);
+    const artifacts = await options.artifacts.list({ repo: item.repository ?? options.repository, issue: item.issue });
+    const intent = [...artifacts].reverse().find((artifact) => artifact.kind === "Intent" && artifact.runId === runId);
+    const investigationArtifact = [...artifacts].reverse().find((artifact) => artifact.kind === "Investigation" && artifact.id === investigation.investigationArtifactId);
+    if (!intent || intent.kind !== "Intent") throw new Error(`Packet ${item.id} is missing its durable Intent`);
+    if (!investigationArtifact || investigationArtifact.kind !== "Investigation") throw new Error(`Packet ${item.id} is missing its durable Investigation artifact`);
+    const route = await options.resolveRoute(item);
+    const baseSha = investigation.baseSha ?? route.baseSha ?? await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+    await assertExactCheckout(options.checkoutRoot, baseSha);
+    const prepared = await prepareBuildPacket({
+      run,
+      intent,
+      investigation: investigationArtifact,
+      cwd: options.checkoutRoot,
+      scopeHints: { affectedFiles: item.affectedFiles ?? [], claims: item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+      ...(options.verificationCatalog !== undefined ? { verificationCatalog: options.verificationCatalog } : {}),
+      ...(options.provider !== undefined ? { provider: options.provider } : {}),
+      ...(options.model !== undefined ? { model: options.model } : {}),
+      ...(options.thinking !== undefined ? { planningThinking: options.thinking } : {}),
+      ...(options.planning ?? {}),
+      ...(context.signal !== undefined ? { signal: context.signal } : {}),
+    }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs });
+    await assertExactCheckout(options.checkoutRoot, baseSha);
+    const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+    if (observed !== baseSha) throw new Error(`Packet base drifted for ${item.id}: expected ${baseSha}, observed ${observed}`);
+    await context.recordTask({ runId: prepared.run.runId });
+    return {
+      packetId: prepared.packet.id,
+      expectedPaths: prepared.packet.payload.expectedPaths,
+      semanticDependencies: item.dependencies,
+      baseSha,
+    };
+  };
+
+  const materializeExecution: OrchestrationExecutionMaterializer = async ({ orchestration, investigations, packets, signal, assertActive }) => {
+    const assertMaterializationActive =(): void => {
       if (signal?.aborted) throw signal.reason ?? new Error("Investigation cancelled before materialization side effect");
       assertActive?.();
     };
@@ -192,27 +236,41 @@ export function createInvestigationFirstWorkers(
     const items = [...byId.values()]
       .filter((item) => confirmed.has(item.id))
       .map(reroute);
-    const itemIds = new Set(items.map((item) => item.id));
+    const initialItemIds = new Set(items.map((item) => item.id));
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index]!;
-      const dependencies = item.dependencies.filter((dependency) => itemIds.has(dependency));
+      const dependencies = item.dependencies.filter((dependency) => initialItemIds.has(dependency));
       if (dependencies.length !== item.dependencies.length) items[index] = { ...item, dependencies };
     }
     if (new Set(items.map((item) => `${(item.repository ?? options.repository).trim().toLowerCase()}#${item.issue}`)).size !== items.length) {
       throw new Error("Investigation materialization returned duplicate confirmed issues");
     }
-    const sourceEdges = orchestration.serializationEdges ?? [];
-    const derivedEdges = materializeClaimDependencies(items).edges;
-    const edgeByKey = new Map<string, ClaimSerializationEdge>();
-    for (const edge of [...sourceEdges, ...derivedEdges]) {
-      const predecessor = replacements.get(edge.predecessor)?.childNodeIds ?? [edge.predecessor];
-      const successor = replacements.get(edge.successor)?.childNodeIds ?? [edge.successor];
-      for (const from of predecessor) for (const to of successor) {
-        if (!itemIds.has(from) || !itemIds.has(to) || from === to) continue;
-        const key = `${from}|${to}`;
-        edgeByKey.set(key, { predecessor: from, successor: to, overlappingClaims: [...edge.overlappingClaims] });
-      }
+    let executionItems = items;
+    let executionEdges: ClaimSerializationEdge[];
+    if (packets?.length) {
+      const packetById = new Map(packets.filter((packet) => packet.status === "completed").map((packet) => [packet.nodeId, packet]));
+      const packetInputs = items.map((item) => {
+        const packet = packetById.get(item.id);
+        if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no durable packet for ${item.id}`);
+        return {
+          id: item.id,
+          issue: item.issue,
+          expectedPaths: packet.expectedPaths,
+          baseRef: packet.baseSha,
+          semanticDependencies: packet.semanticDependencies ?? item.dependencies,
+          ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
+        };
+      });
+      const baseRef = packetInputs[0]?.baseRef;
+      if (!baseRef || packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier contains multiple or missing exact bases");
+      const compiled = compileExecutionDag({ items, packets: packetInputs, baseRef });
+      executionItems = compiled.items;
+      executionEdges = compiled.edges;
+    } else {
+      executionEdges = materializeClaimDependencies(items).edges;
     }
+    const itemsForExecution = executionItems;
+    const itemIds = new Set(itemsForExecution.map((item) => item.id));
     const nextInvestigationItems: ScheduledWorkItem[] = [];
     const decompositionReplacements: { parentNodeId: string; childIssues: number[]; childNodeIds: string[] }[] = [];
     for (const entry of allInvestigations.filter((candidate) => candidate.wave === orchestration.investigationWave && candidate.outcome === "decompose")) {
@@ -239,13 +297,13 @@ export function createInvestigationFirstWorkers(
       }
     }
     return {
-      items,
-      serializationEdges: [...edgeByKey.values()],
+      items: itemsForExecution,
+      serializationEdges: executionEdges,
       ...(nextInvestigationItems.length ? { nextInvestigationItems } : {}),
       ...(decompositionReplacements.length ? { decompositionReplacements } : {}),
     };
   };
-  return { investigationWorker, materializeExecution };
+  return { investigationWorker, packetWorker, materializeExecution };
 }
 
 async function assertExactCheckout(cwd: string, expectedSha: string): Promise<void> {

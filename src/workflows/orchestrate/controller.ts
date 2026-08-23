@@ -29,6 +29,7 @@ import type {
   OrchestrationWorkerAttemptStatus,
   OrchestrationInvestigationOutcome,
   OrchestrationInvestigationRecord,
+  OrchestrationPacketRecord,
   OrchestrationShadowContractionProposal,
 } from "../../core/ports/orchestration.js";
 import {
@@ -53,6 +54,7 @@ import {
   rateLimitWindowKey,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
+import { compileExecutionDag } from "./packet-wave.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -91,10 +93,31 @@ export type OrchestrationInvestigationWorker = (
   context: OrchestrationInvestigationWorkerContext,
 ) => Promise<OrchestrationInvestigationResult>;
 
+export interface OrchestrationPacketResult {
+  packetId?: string;
+  expectedPaths: readonly string[];
+  semanticDependencies: readonly string[];
+  baseSha: string;
+}
+
+export interface OrchestrationPacketWorkerContext extends OrchestrationWorkerContext {
+  phase: "packet";
+  wave: number;
+  investigation: Readonly<OrchestrationInvestigationRecord>;
+  assertActive: () => void;
+}
+
+export type OrchestrationPacketWorker = (
+  item: ScheduledWorkItem,
+  context: OrchestrationPacketWorkerContext,
+) => Promise<OrchestrationPacketResult>;
+
 export interface OrchestrationExecutionMaterializationInput {
   orchestration: Readonly<OrchestrationRecord>;
   wave: number;
   investigations: readonly OrchestrationInvestigationRecord[];
+  /** Durable packet results; materializers must use these, not preview claims. */
+  packets?: readonly OrchestrationPacketRecord[];
   /** Abort and claim fencing for every materializer side effect. */
   signal?: AbortSignal;
   assertActive?: () => void;
@@ -255,6 +278,8 @@ export interface OrchestrationControllerDependencies {
   onEventError?: (error: unknown, event: OrchestrationEvent) => void;
   /** Read-only phase-1 worker. Required for fresh investigation-first records. */
   investigationWorker?: OrchestrationInvestigationWorker;
+  /** Controller-owned read-only BuildPacket wave. */
+  packetWorker?: OrchestrationPacketWorker;
   /** Controller-owned phase-2 DAG materializer, invoked only after the barrier. */
   materializeExecution?: OrchestrationExecutionMaterializer;
   /** Maximum attempts for one read-only investigation before barrier failure. */
@@ -362,6 +387,9 @@ export class OrchestrationController {
           attemptCount: 0,
         }))
       : undefined;
+    const packets = input.investigationFirst
+      ? graph.items.map((item): OrchestrationPacketRecord => ({ nodeId: item.id, wave: 1, status: "queued", attemptCount: 0 }))
+      : undefined;
     const rootRepository = normalizeOrchestrationRepository(input.repository);
     const requestedIssueNumbers = uniqueIssueNumbers(
       input.requestedIssueNumbers
@@ -402,6 +430,9 @@ export class OrchestrationController {
         investigationWave,
         investigations: investigations!,
         investigationBarrier: { expected: investigations!.length, completed: 0, startedAt: now },
+        packets: packets!,
+        packetWave: 1,
+        packetBarrier: { expected: packets!.length, completed: 0, startedAt: now },
         metrics: { investigationWaveConcurrency: [], barrierWaits: 0, barrierDurationMs: [], runnableFrontier: [], shadowContractionProposals: 0 },
       } : {}),
     };
@@ -575,7 +606,7 @@ export class OrchestrationController {
       });
       await this.flush(state);
 
-      if (state.record.phase === "investigating") {
+      if (state.record.phase === "investigating" || state.record.phase === "packetizing") {
         await this.runInvestigationPhase(state);
       }
 
@@ -828,16 +859,35 @@ export class OrchestrationController {
       }
     }
     assertInvestigationActive();
+    if (this.dependencies.packetWorker) await this.runPacketPhase(state, latest, wave, assertInvestigationActive);
+    assertInvestigationActive();
     const materialized = await materialize({
       orchestration: structuredClone(state.record),
       wave,
       investigations: latest.map((entry) => structuredClone(entry)),
+      ...(state.record.packets !== undefined ? { packets: structuredClone(state.record.packets) } : {}),
       ...(state.signal !== undefined ? { signal: state.signal } : {}),
       assertActive: assertInvestigationActive,
     });
     assertInvestigationActive();
-    const nextItems = materialized.items.map(cloneScheduledItem);
-    const nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
+    let nextItems = materialized.items.map(cloneScheduledItem);
+    let nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
+    if (this.dependencies.packetWorker && state.record.packets?.length) {
+      const packetInputs = nextItems.map((item) => {
+        const packet = state.record.packets?.find((candidate) => candidate.nodeId === item.id && candidate.status === "completed");
+        if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no completed packet for ${item.id}`);
+        return {
+          id: item.id, issue: item.issue, expectedPaths: packet.expectedPaths, baseRef: packet.baseSha,
+          semanticDependencies: packet.semanticDependencies ?? item.dependencies,
+          ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
+        };
+      });
+      const baseRef = packetInputs[0]?.baseRef;
+      if (!baseRef || packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier exact-base mismatch");
+      const compiled = compileExecutionDag({ items: nextItems, packets: packetInputs, baseRef });
+      nextItems = compiled.items;
+      nextEdges = compiled.edges;
+    }
     validateGraph(nextItems, nextEdges);
     for (const item of nextItems) assertProtectedProductionRoute(item, state.record.productionTarget);
     const shadow = materialized.shadowContractionProposals ?? [];
@@ -853,6 +903,7 @@ export class OrchestrationController {
         ...(child.targetBranch !== undefined ? { targetBranch: child.targetBranch } : {}),
         ...(child.lane !== undefined ? { lane: child.lane } : {}), status: "queued", attemptCount: 0,
       }));
+      const childPackets = children.map((child): OrchestrationPacketRecord => ({ nodeId: child.id, wave: nextWave, status: "queued", attemptCount: 0 }));
       const replacementByParent = new Map((materialized.decompositionReplacements ?? []).map((replacement) => [replacement.parentNodeId, replacement] as const));
       const expandedNodes = state.record.nodes.map((node) => {
         const replacement = replacementByParent.get(node.id);
@@ -868,6 +919,9 @@ export class OrchestrationController {
         issueNumbers: uniqueIssueNumbers([...state.record.issueNumbers, ...children.flatMap((child) => [child.issue, ...(child.memberIssues ?? [])])]),
         investigations: [...(state.record.investigations ?? []), ...childInvestigations],
         investigationBarrier: { expected: childInvestigations.length, completed: 0, startedAt: this.now() },
+        packets: [...(state.record.packets ?? []), ...childPackets],
+        packetWave: nextWave,
+        packetBarrier: { expected: childPackets.length, completed: 0, startedAt: this.now() },
         metrics: { ...priorMetrics, barrierWaits: priorMetrics.barrierWaits + 1, barrierDurationMs: [...priorMetrics.barrierDurationMs, Date.now() - startedAt], shadowContractionProposals: priorMetrics.shadowContractionProposals + shadow.length },
         shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
         updatedAt: this.now(),
@@ -890,6 +944,100 @@ export class OrchestrationController {
     });
     this.emitSnapshot(state.record, state);
     await this.flush(state);
+  }
+
+  private async runPacketPhase(
+    state: PersistenceState,
+    investigations: readonly OrchestrationInvestigationRecord[],
+    wave: number,
+    assertActive: () => void,
+  ): Promise<void> {
+    const worker = this.dependencies.packetWorker;
+    if (!worker) return;
+    const packets = state.record.packets ?? [];
+    const byNode = new Map(packets.filter((packet) => packet.wave === wave).map((packet) => [packet.nodeId, packet]));
+    const confirmed = investigations.filter((entry) => entry.status === "completed" && entry.outcome === "confirmed");
+    const pending = confirmed.filter((entry) => byNode.get(entry.nodeId)?.status !== "completed");
+    this.replaceRecord(state, {
+      ...state.record,
+      phase: "packetizing",
+      packetWave: wave,
+      packetBarrier: {
+        ...(state.record.packetBarrier ?? { expected: confirmed.length, completed: 0, startedAt: this.now() }),
+        expected: confirmed.length,
+        completed: confirmed.filter((entry) => byNode.get(entry.nodeId)?.status === "completed").length,
+      },
+      updatedAt: this.now(),
+    });
+    await this.flush(state);
+    const packetItems = pending.map((entry) => itemFromNodeRecord(requiredNode(state.record, entry.nodeId)));
+    const current = await runSchedule(
+      packetItems,
+      state.record.effectiveMaxParallel ?? state.record.maxParallel,
+      async (item, schedulerContext) => {
+        assertActive();
+        const investigation = investigations.find((entry) => entry.nodeId === item.id);
+        if (!investigation) throw new Error(`Packet ${item.id} has no investigation evidence`);
+        const previous = byNode.get(item.id);
+        const packet: OrchestrationPacketRecord = {
+          ...(previous ?? { nodeId: item.id, wave, status: "queued", attemptCount: 0 }),
+          wave,
+          status: "running",
+          attemptCount: (previous?.attemptCount ?? 0) + 1,
+          startedAt: this.now(),
+        };
+        byNode.set(item.id, packet);
+        this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+        await this.flush(state);
+        const attempt = await this.beginAttempt(state, item.id, "initial");
+        const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationPacketWorkerContext;
+        context.phase = "packet";
+        context.wave = wave;
+        context.investigation = structuredClone(investigation);
+        context.assertActive = assertActive;
+        try {
+          const result = await worker(item, context);
+          assertActive();
+          const paths = normalizePacketPaths(result.expectedPaths);
+          if (!paths.length) throw new Error(`Packet ${item.id} has no bounded expected paths`);
+          if (!result.baseSha.trim()) throw new Error(`Packet ${item.id} has no exact base SHA`);
+          const completed: OrchestrationPacketRecord = {
+            ...packet, status: "completed",
+            ...(result.packetId !== undefined ? { packetId: result.packetId } : {}),
+            expectedPaths: paths, semanticDependencies: [...new Set(result.semanticDependencies)], baseSha: result.baseSha,
+            completedAt: this.now(),
+          };
+          byNode.set(item.id, completed);
+          this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+          await this.flush(state);
+          await this.finishAttempt(state, item.id, attempt.attemptId, { status: "completed" });
+          return { status: "completed" as const };
+        } catch (error) {
+          const failed: OrchestrationPacketRecord = { ...packet, status: "failed", error: error instanceof Error ? error.message : String(error) };
+          byNode.set(item.id, failed);
+          this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+          await this.flush(state);
+          await this.failAttempt(state, item.id, attempt.attemptId, error);
+          throw error;
+        }
+      },
+      { serializationEdges: [] },
+    );
+    this.applyScheduleResult(state, current);
+    const completed = confirmed.filter((entry) => byNode.get(entry.nodeId)?.status === "completed").length;
+    this.replaceRecord(state, {
+      ...state.record,
+      phase: "packetizing",
+      packetBarrier: {
+        ...(state.record.packetBarrier ?? { expected: confirmed.length, completed: 0, startedAt: this.now() }),
+        completed,
+        ...(completed === confirmed.length ? { completedAt: this.now() } : {}),
+      },
+      packets: [...byNode.values()],
+      updatedAt: this.now(),
+    });
+    await this.flush(state);
+    if (completed !== confirmed.length) throw new Error(`Packet barrier failed for wave ${wave}`);
   }
 
   private updateInvestigationBarrier(state: PersistenceState, wave: number): void {
@@ -2296,6 +2444,10 @@ export class OrchestrationController {
         expected: record.investigationBarrier.expected,
         completed: record.investigationBarrier.completed,
       } } : {}),
+      ...(record.packetBarrier !== undefined ? { packetBarrier: {
+        expected: record.packetBarrier.expected,
+        completed: record.packetBarrier.completed,
+      } } : {}),
       updatedAt: record.updatedAt,
     });
     this.projectNodeStates(record);
@@ -2792,6 +2944,17 @@ function mergeResultWithRecord(result: ScheduleResult, record: OrchestrationReco
   return merged;
 }
 
+function normalizePacketPaths(paths: readonly string[]): string[] {
+  const normalized = new Set<string>();
+  for (const raw of paths) {
+    const path = raw.replaceAll("\\", "/").trim().replace(/^\.\//, "");
+    if (!path || path.startsWith("/") || path.split("/").includes("..") || path.includes("*") || path.includes("{")) {
+      throw new Error(`Unsafe Build Packet expected path: ${raw}`);
+    }
+    normalized.add(path);
+  }
+  return [...normalized].sort();
+}
 function uniqueIssueNumbers(values: readonly number[]): number[] {
   const result: number[] = [];
   const seen = new Set<number>();

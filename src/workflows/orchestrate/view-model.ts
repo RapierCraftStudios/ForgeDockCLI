@@ -22,6 +22,7 @@ export function buildOrchestrationSnapshot(input: {
   updatedAt?: string;
   phase?: OrchestrationSnapshot["phase"];
   investigationBarrier?: OrchestrationSnapshot["investigationBarrier"];
+  packetBarrier?: OrchestrationSnapshot["packetBarrier"];
 }): OrchestrationSnapshot {
   const status = input.result?.status ?? new Map(input.items.map((item) => [item.id, "queued" as ScheduledStatus]));
   const errors = input.result?.errors ?? new Map<string, Error>();
@@ -83,6 +84,7 @@ export function buildOrchestrationSnapshot(input: {
     ...(input.orchestrationStatus !== undefined ? { orchestrationStatus: input.orchestrationStatus } : {}),
     ...(input.phase !== undefined ? { phase: input.phase } : {}),
     ...(input.investigationBarrier !== undefined ? { investigationBarrier: input.investigationBarrier } : {}),
+    ...(input.packetBarrier !== undefined ? { packetBarrier: input.packetBarrier } : {}),
     nodes,
     readyNodes,
     blockedNodes: nodes.filter((node) => node.status === "blocked" || node.status === "failed" || node.status === "skipped").map((node) => node.id),

@@ -2325,6 +2325,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       }),
       isCancelled: async () => false,
       investigationWorker: sharedInvestigationWorkers.investigationWorker,
+      packetWorker: sharedInvestigationWorkers.packetWorker,
       materializeExecution: phase2MaterializeExecution,
       settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
         if (result.outcome !== "invalid" && result.outcome !== "decompose") return;

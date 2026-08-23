@@ -63,7 +63,7 @@ import { materializeConfirmedPlan } from "../workflows/deep-plan/handoff.js";
 import { ControllerObservationAdapter } from "../observability/adapters.js";
 import type { ObservationSink } from "../observability/contracts.js";
 import type { OrchestrationEvent } from "../workflows/orchestrate/events.js";
-import { OrchestrationController, type OrchestrationControllerDependencies, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation, type OrchestrationInvestigationWorker, type OrchestrationExecutionMaterializer } from "../workflows/orchestrate/controller.js";
+import { OrchestrationController, type OrchestrationControllerDependencies, type OrchestrationNodeProjectionInput, type OrchestrationWorkerContext, type OrchestrationWorkerReconciliation, type OrchestrationInvestigationWorker, type OrchestrationPacketWorker, type OrchestrationExecutionMaterializer } from "../workflows/orchestrate/controller.js";
 import { reapStaleOrchestrations } from "../workflows/orchestrate/stale-reaper.js";
 import { buildOrchestrationSnapshot, renderSerializationLines } from "../workflows/orchestrate/view-model.js";
 import { terminalOrchestrationResult } from "../workflows/orchestrate/terminal-result.js";
@@ -1438,6 +1438,7 @@ interface VisibleDagInput {
   /** Native fresh DAGs use the read-only investigation barrier. */
   investigationFirst?: boolean;
   investigationWorker?: OrchestrationInvestigationWorker;
+  packetWorker?: OrchestrationPacketWorker;
   materializeExecution?: OrchestrationExecutionMaterializer;
   settleInvestigation?: NonNullable<OrchestrationControllerDependencies["settleInvestigation"]>;
   repository?: string;
@@ -3170,6 +3171,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         serializationEdges: schedule.edges,
         investigationFirst: true,
         investigationWorker: tuiInvestigationWorker,
+        packetWorker: hasDurableInvestigationRuns ? investigationWorkers.packetWorker : async (item, context) => ({ expectedPaths: item.affectedFiles ?? [], semanticDependencies: item.dependencies, baseSha: context.investigation.baseSha ?? "embedded-base" }),
         materializeExecution: tuiMaterializeExecution,
         settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
           if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
@@ -4217,7 +4219,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
     requestedIssueNumbers: [...(record.requestedIssueNumbers ?? record.issueNumbers)],
     items,
     maxParallel: record.maxParallel,
-    ...(investigationFirst ? { investigationFirst: true, ...(resumedWorkers ? { investigationWorker: resumedWorkers.investigationWorker, materializeExecution: resumedWorkers.materializeExecution } : {}), ...(resumedSettleInvestigation ? { settleInvestigation: resumedSettleInvestigation } : {}) } : {}),
+    ...(investigationFirst ? { investigationFirst: true, ...(resumedWorkers ? { investigationWorker: resumedWorkers.investigationWorker, packetWorker: resumedWorkers.packetWorker, materializeExecution: resumedWorkers.materializeExecution } : {}), ...(resumedSettleInvestigation ? { settleInvestigation: resumedSettleInvestigation } : {}) } : {}),
     maxDecompositionDepth: effective.maxRemediationDepth,
     serializationEdges: (record.serializationEdges ?? []).map((edge) => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] })),
     revalidateRoute: async (item) => {
@@ -5049,6 +5051,7 @@ export class VisibleDagDelegator {
         },
       } : {}),
       ...(input.investigationWorker ? { investigationWorker: input.investigationWorker } : {}),
+      ...(input.packetWorker ? { packetWorker: input.packetWorker } : {}),
       ...(materializeExecution ? { materializeExecution } : {}),
       ...(input.settleInvestigation ? { settleInvestigation: input.settleInvestigation } : {}),
       worker: async (scheduled, context) => {

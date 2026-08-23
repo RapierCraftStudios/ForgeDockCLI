@@ -38,7 +38,21 @@ export type OrchestrationPlanMetadata = Record<string, OrchestrationMetadataValu
 export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "reattach";
 
 /** Durable phases for the investigation-first native orchestrator. */
-export type OrchestrationPhase = "investigating" | "executing";
+export type OrchestrationPhase = "investigating" | "packetizing" | "executing";
+
+export interface OrchestrationPacketRecord {
+  nodeId: string;
+  wave: number;
+  status: "queued" | "running" | "completed" | "failed";
+  attemptCount: number;
+  packetId?: string;
+  expectedPaths?: string[];
+  semanticDependencies?: string[];
+  baseSha?: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+}
 
 export type OrchestrationInvestigationOutcome = "confirmed" | "invalid" | "decompose";
 
@@ -298,6 +312,10 @@ export interface OrchestrationRecord {
   investigationWave?: number;
   investigations?: OrchestrationInvestigationRecord[];
   investigationBarrier?: { expected: number; completed: number; startedAt: string; completedAt?: string };
+  /** Additive durable read-only packet materialization wave. */
+  packets?: OrchestrationPacketRecord[];
+  packetWave?: number;
+  packetBarrier?: { expected: number; completed: number; startedAt: string; completedAt?: string };
   executionMaterializedAt?: string;
   metrics?: OrchestrationMetrics;
   shadowContractionProposals?: OrchestrationShadowContractionProposal[];
