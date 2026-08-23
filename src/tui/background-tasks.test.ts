@@ -15,6 +15,7 @@ import { createObservationProducer } from "../observability/contracts.js";
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-"));
   const messages: string[] = [];
+  const notifications: string[] = [];
   const statuses: Array<string | undefined> = [];
   const pi = {
     sendMessage: (message: { content: string }) => { messages.push(message.content); },
@@ -22,13 +23,13 @@ function fixture() {
   const ctx = {
     cwd,
     ui: {
-      notify: () => undefined,
+      notify: (message: string) => { notifications.push(message); },
       setStatus: (_key: string, value: string | undefined) => { statuses.push(value); },
     },
   } as unknown as ExtensionContext;
   const tasks = new ForgeDockBackgroundTasks(pi);
   tasks.initialize(ctx);
-  return { cwd, messages, statuses, tasks, ctx, pi };
+  return { cwd, messages, notifications, statuses, tasks, ctx, pi };
 }
 
 async function eventually(assertion: () => void): Promise<void> {
@@ -432,7 +433,7 @@ test("dispatch initialization leaves a live owner's bridge-bound controller unto
   await second.shutdown();
 });
 
-test("terminal restart blocks bridge-bound controllers without persisting bridge credentials", async () => {
+test("invariant:matrix-chunk-boundary-93f85b1dae42 restart recovery is UI-only", async () => {
   const first = fixture();
   const record = first.tasks.start({
     command: process.execPath,
@@ -462,7 +463,8 @@ test("terminal restart blocks bridge-bound controllers without persisting bridge
   assert.deepEqual(second.pendingRestartRecords(first.ctx).map((candidate) => candidate.id), [record.id]);
   assert.equal(second.isOperationallyActive(record.id), false);
   assert.match(second.output(record.id), /resume required after TUI restart/);
-  assert.match(first.messages.at(-1) ?? "", /forgedock_resume_orchestration/);
+  assert.equal(first.messages.some((message) => message.includes(record.id)), false);
+  assert.match(first.notifications.at(-1) ?? "", /forgedock_resume_orchestration/);
   await eventually(() => assert.throws(() => process.kill(record.pid, 0)));
 
   await first.tasks.shutdown({ cancel: false });
@@ -499,7 +501,7 @@ test("blocked bridge records without a restart cause stay readable but silent", 
 });
 
 test("older bridge-bound records without a resume scope remain parseable", async () => {
-  const { cwd, messages, tasks, ctx } = fixture();
+  const { cwd, messages, notifications, tasks, ctx } = fixture();
   const directory = join(cwd, ".forgedock", "tasks");
   mkdirSync(directory, { recursive: true });
   const id = "task_legacy_bridge";
@@ -517,8 +519,9 @@ test("older bridge-bound records without a resume scope remain parseable", async
   tasks.initialize(ctx);
   assert.equal(tasks.list().find((record) => record.id === id)?.status, "blocked");
   assert.equal(tasks.list().find((record) => record.id === id)?.terminalCause, TUI_RESTART_TERMINAL_CAUSE);
-  assert.doesNotMatch(messages.at(-1) ?? "", /forgedock_resume_orchestration/);
-  assert.match(messages.at(-1) ?? "", /owning workflow checkpoint/);
+  assert.equal(messages.length, 0);
+  assert.doesNotMatch(notifications.at(-1) ?? "", /forgedock_resume_orchestration/);
+  assert.match(notifications.at(-1) ?? "", /owning workflow checkpoint/);
   await tasks.shutdown();
 });
 
@@ -529,7 +532,7 @@ test("restart guidance matches each controller recovery contract", async () => {
     { scope: "promote" as const, expected: /promotion checkpoint.*promotionId/i, forbidden: /not resumable|work-on checkpoint/ },
   ];
   for (const [index, scenario] of cases.entries()) {
-    const { cwd, messages, tasks, ctx } = fixture();
+    const { cwd, notifications, tasks, ctx } = fixture();
     const directory = join(cwd, ".forgedock", "tasks");
     mkdirSync(directory, { recursive: true });
     const id = `task_scope_${index}`;
@@ -546,7 +549,7 @@ test("restart guidance matches each controller recovery contract", async () => {
       resumeScope: scenario.scope,
     }));
     tasks.initialize(ctx);
-    const message = messages.at(-1) ?? "";
+    const message = notifications.at(-1) ?? "";
     assert.match(message, scenario.expected);
     assert.doesNotMatch(message, scenario.forbidden);
     await tasks.shutdown();

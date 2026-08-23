@@ -4,7 +4,7 @@
 
 ForgeDock workflows are opt-in. A terminal session starts in normal assistant mode, where ordinary git, `gh`, file, and shell requests use normal assistant tooling. Generic requests such as “create/open a PR” do not activate promotion; honor an explicit request to use `gh`. If intent is genuinely ambiguous, ask whether the user wants a plain GitHub PR or ForgeDock promotion.
 
-Typed controller authority applies only after explicit `/work-on`, `/review-pr`, `/orchestrate`, `/promote`, direct `forgedock_*` workflow-tool invocation, or an explicit request to use a named ForgeDock workflow. Any restriction against raw GitHub mutations is scoped to the active workflow’s own mutation. Protection, required checks, exact-SHA approval, and review gate merging; they do not prevent publishing a reviewable PR after route and SHA validation. Workflow mode ends after completion, failure, cancellation, or native background-task handoff.
+Typed controller authority applies only after the current user explicitly invokes `/work-on`, `/review-pr`, `/orchestrate`, `/promote`, or `/deep-plan`, or clearly names that ForgeDock workflow in the current request. A model-selected `forgedock_*` workflow-tool invocation, ambient `FORGE.md` guidance, stale state, or restart notification cannot activate or expand authority. Any restriction against raw GitHub mutations is scoped to the active invocation’s own mutation. Protection, required checks, exact-SHA approval, and review gate merging; they do not prevent publishing a reviewable PR after route and SHA validation. Workflow mode ends after completion, failure, cancellation, or native background-task handoff.
 
 ## Branch publication
 
