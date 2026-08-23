@@ -2560,6 +2560,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
             return { status: "suspended", error };
           }
+          if (error instanceof WorkflowExecutionError && !error.recoverable && error.run.state === "blocked") {
+            return { status: "blocked", error: error.message, retryable: false };
+          }
           if (error instanceof WorkflowExecutionError && !error.recoverable && error.targetAdvanceCheckpointId) {
             return { status: "failed", error: error.message, targetAdvanceCheckpointId: error.targetAdvanceCheckpointId, retryable: false };
           }
@@ -3105,6 +3108,9 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           if (error instanceof ClaimPromotionRecoveryError) {
             process.stdout.write(`${statusGlyph("active", mode)} ${item.id} suspended · parent claim receipt is ambiguous; retained packet will reconcile on resume\n`);
             return { status: "suspended", error };
+          }
+          if (error instanceof WorkflowExecutionError && !error.recoverable && error.run.state === "blocked") {
+            return { status: "blocked", error: error.message, retryable: false };
           }
           if (error instanceof WorkflowExecutionError && !error.recoverable && error.targetAdvanceCheckpointId) {
             return { status: "failed", error: error.message, targetAdvanceCheckpointId: error.targetAdvanceCheckpointId, retryable: false };
