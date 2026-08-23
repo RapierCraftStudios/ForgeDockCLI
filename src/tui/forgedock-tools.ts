@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { findArtifacts } from "../core/artifacts/codec.js";
-import { InMemoryRunRepository, type RunRepository } from "../core/ports/repositories.js";
+import { InMemoryRunRepository, type ArtifactRepository, type RunRepository } from "../core/ports/repositories.js";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
 import type {
   OrchestrationExecutionAdmission,
@@ -43,6 +43,7 @@ import { searchDevdocsMemory } from "../core/memory/devdocs-memory.js";
 import { buildPlanningPacket, PlanningSessionStore } from "../core/planning/frontier.js";
 import { PlanningPacketDraftSchema, PlanningPacketSchema, PlanningQuestionSchema, type PlanningAnswer, type PlanningPacket, type PlanningQuestionInput } from "../core/planning/schema.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
+import { decideSubjectAdmission } from "../core/state/admission.js";
 import {
   affectedFilesFromIssueBody,
   batchExclusionReason,
@@ -1394,6 +1395,8 @@ interface VisibleDagInput {
     items: readonly VisibleOrchestrationItem[];
     serializationEdges?: readonly ClaimSerializationEdge[];
   } | undefined>;
+  /** Reconcile explicit rerun admission against an existing durable subject run. */
+  resolveWorkerRecovery?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode) => Promise<DagRecoveryMode>;
   taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => { agent: string; task: string; cwd: string; model?: string };
   /** Optional direct typed-controller transport used by the live TUI. */
   controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => ControllerTaskSpec;
@@ -3143,6 +3146,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           item,
           ...(childIssues !== undefined ? { childIssues } : {}),
         }),
+        resolveWorkerRecovery: async (item, recovery) => {
+          if (recovery !== "rerun" && !(rerun && recovery === "initial")) return recovery;
+          return admitExplicitRerunRecovery(item, "rerun", artifacts, readyRepository.repo);
+        },
         taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
           const itemRepository = item.repository ?? readyRepository.repo;
@@ -3961,6 +3968,36 @@ export function resolveIssueWorkerRecovery(
   return { rerun: false, resume: shouldResumeObservedItem(labels, recovery === "resume") };
 }
 
+/**
+ * An orchestration rerun is an operator authorization, not permission to
+ * discard a durable run which is still recoverable. Reconcile authoritative
+ * artifacts at dispatch time so native and Pi workers receive exactly one
+ * recovery flag, including after a TUI rebuild.
+ */
+export async function admitExplicitRerunRecovery(
+  item: VisibleOrchestrationItem,
+  recovery: DagRecoveryMode,
+  artifacts: ArtifactRepository,
+  repository: string,
+): Promise<DagRecoveryMode> {
+  if (recovery !== "rerun") return recovery;
+  const subjects = [...new Set([item.issue, ...(item.memberIssues ?? [])])];
+  let sawResume = false;
+  for (const issue of subjects) {
+    const decision = decideSubjectAdmission(
+      await artifacts.list({ repo: item.repository ?? repository, issue }),
+      { rerun: true, ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}) },
+    );
+    if (decision.action === "resume") {
+      sawResume = true;
+      continue;
+    }
+    if (decision.action === "start") continue;
+    throw new Error(`Cannot authorize explicit rerun for #${issue}: durable admission ${decision.action}${"reason" in decision ? ` (${decision.reason})` : ""}`);
+  }
+  return sawResume ? "resume" : "rerun";
+}
+
 async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord, controllerEntryOverride?: string | null): Promise<VisibleDagInput> {
   if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
   const config = readForgeDockConfig(cwd);
@@ -4130,6 +4167,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
         ...(childIssues !== undefined ? { childIssues } : {}),
       });
     },
+    resolveWorkerRecovery: async (item, recovery) => admitExplicitRerunRecovery(item, recovery, artifacts, record.repository),
     ...(resolveControllerEntry(controllerEntryOverride) !== undefined ? {
       controllerTaskFor: (item, recovery, adjudicationReason, resolveConflict) => {
         const policy = resolveIssueWorkerRecovery([], false, recovery);
@@ -4941,6 +4979,9 @@ export class VisibleDagDelegator {
         const recovery: DagRecoveryMode = explicitlyRerun
           ? "rerun"
           : context.recovery === "initial" ? "initial" : "resume";
+        const resolvedRecovery = input.resolveWorkerRecovery
+          ? await input.resolveWorkerRecovery(item, recovery)
+          : recovery;
         const launchIdentity: OrchestrationTransportIdentity = {
           orchestrationId: stored.id,
           nodeId: item.id,
@@ -4950,7 +4991,7 @@ export class VisibleDagDelegator {
         const startControllerTask = input.startControllerTask ?? this.directControllerTransport?.start;
         const waitControllerTask = input.waitControllerTask ?? this.directControllerTransport?.wait;
         if (input.controllerTaskFor && startControllerTask && waitControllerTask) {
-          const spec = input.controllerTaskFor(item, recovery, adjudication, explicitlyResolveConflict);
+          const spec = input.controllerTaskFor(item, resolvedRecovery, adjudication, explicitlyResolveConflict);
           const controllerSpec: ControllerTaskSpec = {
             ...spec,
             launchIdentity,
@@ -5018,7 +5059,7 @@ export class VisibleDagDelegator {
         const runId = rememberedRunId ?? await this.launchPiWorker(
           input,
           item,
-          recovery,
+          resolvedRecovery,
           adjudication,
           explicitlyResolveConflict,
           launchKey,

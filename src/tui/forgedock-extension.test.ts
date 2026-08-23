@@ -23,6 +23,7 @@ import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOC
 import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
   bindOrchestrationInvocation,
+  admitExplicitRerunRecovery,
   buildOrchestrationPreviewCheckpointGuidance,
   buildOrchestrationPreviewConfirmationGuidance,
   buildNativeCommandPrompt,
@@ -2196,6 +2197,57 @@ test("fresh-rerun authorization cannot be converted back into checkpoint resume"
   assert.deepEqual(resolveIssueWorkerRecovery(["workflow:in-review", "needs-human"], false, "initial"), { rerun: false, resume: false });
   assert.deepEqual(resolveIssueWorkerRecovery([], false, "resume"), { rerun: false, resume: true });
 });
+
+test("explicit orchestration reruns admit recoverable runs as resume and terminal runs as rerun", async () => {
+  const item = { id: "issue-509", issue: 509, repository: "a/b", targetBranch: "staging" } as any;
+  const runId = "run_preparing_509";
+  const intent = createArtifact({
+    kind: "Intent", runId, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
+    payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+  });
+  const investigation = createArtifact({
+    kind: "Investigation", runId, subject: { repo: "a/b", issue: 509 }, producer: { role: "investigator" },
+    payload: {
+      outcome: "confirmed", confidence: "high", summary: "confirmed",
+      evidence: [{ claim: "broken", source: "src/a.ts", detail: "missing guard" }],
+      rootCause: "missing guard", affectedSurfaces: ["src/a.ts"], risks: [], recommendation: "add guard",
+    },
+  });
+  const failedRun = "run_failed_509";
+  const failedIntent = createArtifact({
+    kind: "Intent", runId: failedRun, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
+    payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+  });
+  const failed = createArtifact({
+    kind: "Outcome", runId: failedRun, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
+    payload: { status: "failed", reason: "worker stopped", childIssues: [] },
+  });
+  const preparingArtifacts = {
+    list: async () => [
+      { ...failedIntent, createdAt: "2026-01-01T00:00:00.000Z" },
+      { ...failed, createdAt: "2026-01-01T00:01:00.000Z" },
+      { ...intent, createdAt: "2026-01-01T00:02:00.000Z" },
+      { ...investigation, createdAt: "2026-01-01T00:03:00.000Z" },
+    ],
+  } as any;
+  const preparingRecovery = await admitExplicitRerunRecovery(item, "rerun", preparingArtifacts, "a/b");
+  assert.equal(preparingRecovery, "resume");
+  assert.deepEqual(resolveIssueWorkerRecovery([], false, preparingRecovery), { rerun: false, resume: true });
+
+  const terminalRun = "run_terminal_509";
+  const terminalIntent = createArtifact({
+    kind: "Intent", runId: terminalRun, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
+    payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+  });
+  const terminal = createArtifact({
+    kind: "Outcome", runId: terminalRun, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
+    payload: { status: "decomposed", reason: "already split", childIssues: [] },
+  });
+  const terminalRecovery = await admitExplicitRerunRecovery(item, "rerun", { list: async () => [terminalIntent, terminal] } as any, "a/b");
+  assert.equal(terminalRecovery, "rerun");
+  assert.deepEqual(resolveIssueWorkerRecovery([], false, terminalRecovery), { rerun: true, resume: false });
+});
+
 
 test("visible DAG persists its durable parent record and terminal node state", async () => {
   const state = fakePi();
