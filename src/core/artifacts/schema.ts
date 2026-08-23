@@ -423,6 +423,45 @@ export const FindingImpactSchema = Type.Object({
 });
 export type FindingImpact = Static<typeof FindingImpactSchema>;
 
+/** Typed authority carried from a review finding into its projected work item. */
+export const ReviewFindingRouteSchema = Type.Object({
+  routeKind: Type.Union([
+    Type.Literal("retained-revision"),
+    Type.Literal("base-follow-up"),
+    Type.Literal("advisory"),
+    Type.Literal("rejected"),
+  ]),
+  repository: NonEmptyString,
+  pullRequest: Type.Integer({ minimum: 1 }),
+  reviewedHeadSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  /** Required for retained revision authority; optional for legacy/follow-up records. */
+  baseSha: Type.Optional(Sha),
+  deliveryIssue: Type.Optional(Type.Integer({ minimum: 1 })),
+  deliveryRun: NonEmptyString,
+  findingId: NonEmptyString,
+  findingRoot: NonEmptyString,
+  matchedCriterion: Type.Optional(NonEmptyString),
+  sourceSnapshot: Type.Optional(Type.Object({
+    reviewedHeadSha: Sha,
+    path: NonEmptyString,
+    excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+    digest: Type.Optional(Type.String({ pattern: "^[0-9a-fA-F]{64}$", minLength: 64, maxLength: 64 })),
+    symbol: Type.Optional(NonEmptyString),
+  })),
+  lineage: Type.Object({
+    lineageId: NonEmptyString,
+    sourceRunId: NonEmptyString,
+    sourcePullRequest: Type.Integer({ minimum: 1 }),
+    sourceHeadSha: Sha,
+    findingId: NonEmptyString,
+    findingRoot: NonEmptyString,
+    parentRouteId: Type.Optional(NonEmptyString),
+  }),
+});
+export type ReviewFindingRoute = Static<typeof ReviewFindingRouteSchema>;
+
 export const FindingSchema = Type.Object({
   id: NonEmptyString,
   severity: Type.Union([
@@ -487,6 +526,8 @@ export const FindingSchema = Type.Object({
     hunkReferences: Type.Array(NonEmptyString, { minItems: 1 }),
     authorityReferences: Type.Optional(Type.Array(NonEmptyString)),
   })),
+  /** Materialized by the controller; reviewer prose cannot supply authority. */
+  route: Type.Optional(ReviewFindingRouteSchema),
 });
 
 const ReviewerRoleSchema = Type.Union([
@@ -578,6 +619,7 @@ export const ReviewPlanSchema = Type.Object({
 
 const ReviewFindingProjectionEntrySchema = Type.Object({
   findingId: NonEmptyString,
+  route: Type.Optional(ReviewFindingRouteSchema),
   status: Type.Union([
     Type.Literal("pending"),
     Type.Literal("materialized"),

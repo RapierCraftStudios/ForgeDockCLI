@@ -23,6 +23,7 @@ import { planReviewPanel } from "../review-pr/planner.js";
 import { WorkflowExecutionError } from "./investigate.js";
 import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 import { digestRelation } from "../../core/packet/relation-graph.js";
+import { assertRunFollowsLane } from "./lane.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
@@ -2168,6 +2169,19 @@ describe("complete work-on trajectory", () => {
     const checkpoint = artifacts.artifacts.findLast((artifact) => artifact.kind === "RemediationBlocked");
     assert.equal(checkpoint?.kind === "RemediationBlocked" ? checkpoint.payload.remediationDepth : undefined, 1);
     assert.equal(checkpoint?.kind === "RemediationBlocked" ? checkpoint.payload.status : undefined, "children-running");
+  });
+
+  it("invariant:matrix-terminal-metadata-f233f75ff477 blocks completion when retained route identity drifts", () => {
+    const route = {
+      routeKind: "retained-revision" as const,
+      repository: "a/b", pullRequest: 9, reviewedHeadSha: "a".repeat(40),
+      headBranch: "forgedock/delivery", baseBranch: "staging", baseSha: "b".repeat(40),
+      deliveryIssue: 8, deliveryRun: "run_8", findingId: "finding-1", findingRoot: "root-1",
+      lineage: { lineageId: "lineage-1", sourceRunId: "run_8", sourcePullRequest: 9, sourceHeadSha: "a".repeat(40), findingId: "finding-1", findingRoot: "root-1" },
+    };
+    const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 10 }, target: { lane: "fast", targetBranch: route.headBranch, route } });
+    const drifted = { ...run, route: { ...route, reviewedHeadSha: "c".repeat(40) } };
+    assert.throws(() => assertRunFollowsLane(drifted, { kind: "fast", targetBranch: route.headBranch, resolution: "retained-revision", retainedRevision: route, reviewRoute: route }), /retained review route/);
   });
 
   it("crosses all six quality artifacts with separate agent sessions", async () => {

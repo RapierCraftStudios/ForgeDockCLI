@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { Type, type Static } from "typebox";
-import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
+import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload, type ReviewFindingRoute } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -860,7 +860,16 @@ export async function reviewPullRequest(
       remediationDeltaPaths,
       remediationDeltaHunks,
       changedRemediationAuthorityReferences,
-    });
+    }).map((finding) => ({
+      ...finding,
+      route: deriveReviewFindingRoute(finding, {
+        pullRequest: frozen,
+        run,
+        changedPaths,
+        sourceIssue: run.subject.issue,
+        acceptanceCriteria: input.packet.payload.acceptanceCriteria,
+      }),
+    }));
     const authoritativeFindings = scopedFindings.filter((finding) => findingAuthorityEligible(finding, verifiedAuthorityReferences));
     const rootAssessments = collectRootAssessments(reviewerResults, openPriorRoots);
     const roots = reconcileFindingRootLedger({
@@ -1945,9 +1954,13 @@ export async function materializeReviewFindings(
       reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
       publicationFence,
       finding,
+      route: finding.route ?? (() => { throw new Error(`Review finding ${finding.id} has no durable route`) })(),
     });
+    const route = finding.route;
+    if (!route) throw new Error(`Review finding ${finding.id} has no durable route; legacy evidence cannot authorize mutation`);
     projections.push({
       findingId: finding.id,
+      route,
       status: issue.projection?.status ?? "materialized",
       ...(issue.projection?.marker ? { marker: issue.projection.marker } : {}),
       issueNumber: issue.number,
@@ -1964,6 +1977,62 @@ export function reviewFindingProjectionPlanId(runId: string, headSha: string, pu
 
 export function reviewFindingProjectionReceiptId(planId: string): string {
   return `${planId}:completed`;
+}
+
+/** Derive mutation authority only from controller-verified current-head proof. */
+export function deriveReviewFindingRoute(
+  finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number],
+  input: {
+    pullRequest: PullRequestSnapshot;
+    run: RunState;
+    changedPaths: readonly string[];
+    acceptanceCriteria: readonly string[];
+    sourceIssue?: number;
+  },
+): ReviewFindingRoute {
+  const root = finding.rootId?.trim() || finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || finding.id;
+  const snapshot = finding.sourceSnapshot;
+  const normalizedPath = snapshot?.path.replaceAll("\\", "/").replace(/^\.\//, "").replace(/^\/+/, "");
+  const changed = new Set(input.changedPaths.map((path) => path.replaceAll("\\", "/").replace(/^\.\//, "").replace(/^\/+/, "")));
+  const exactCriterion = finding.matchedAcceptanceCriteria?.find((criterion) => input.acceptanceCriteria.includes(criterion));
+  const changedContentProof = finding.scopeDisposition === "in_scope"
+    && (finding.mustFix ?? finding.blocking)
+    && snapshot?.reviewedHeadSha.toLowerCase() === input.pullRequest.headSha.toLowerCase()
+    && normalizedPath !== undefined
+    && changed.has(normalizedPath)
+    && Boolean(snapshot.excerpt || snapshot.digest)
+    && exactCriterion !== undefined
+    && input.pullRequest.baseSha !== undefined;
+  const routeKind = changedContentProof
+    ? "retained-revision" as const
+    : finding.scopeDisposition === "follow_up"
+      ? "base-follow-up" as const
+      : finding.scopeDisposition === "rejected"
+        ? "rejected" as const
+        : "advisory" as const;
+  return {
+    routeKind,
+    repository: input.pullRequest.repo,
+    pullRequest: input.pullRequest.number,
+    reviewedHeadSha: input.pullRequest.headSha,
+    headBranch: input.pullRequest.headBranch,
+    baseBranch: input.pullRequest.baseBranch,
+    ...(input.pullRequest.baseSha ? { baseSha: input.pullRequest.baseSha } : {}),
+    ...(input.sourceIssue ? { deliveryIssue: input.sourceIssue } : {}),
+    deliveryRun: input.run.runId,
+    findingId: finding.id,
+    findingRoot: root,
+    ...(exactCriterion ? { matchedCriterion: exactCriterion } : {}),
+    ...(snapshot ? { sourceSnapshot: snapshot } : {}),
+    lineage: {
+      lineageId: `review-route:${input.run.runId}:${input.pullRequest.number}:${input.pullRequest.headSha.toLowerCase()}:${finding.id}`,
+      sourceRunId: input.run.runId,
+      sourcePullRequest: input.pullRequest.number,
+      sourceHeadSha: input.pullRequest.headSha,
+      findingId: finding.id,
+      findingRoot: root,
+    },
+  };
 }
 
 /**

@@ -314,4 +314,53 @@ describe("issue lane classification", () => {
     const feature = classifyIssueLane(issue, "main", [branch("milestone/verifiable-workflow-authority")], "staging", "staging");
     assert.throws(() => assertRunFollowsLane(run, feature), /refusing cross-lane continuation/);
   });
+
+  it("invariant:matrix-identity-isolation-6b95c03c83c9 routes an exact retained revision and rejects advisory authority", () => {
+    const route = {
+      routeKind: "retained-revision" as const,
+      repository: "a/b",
+      pullRequest: 22,
+      reviewedHeadSha: sha,
+      headBranch: "forgedock/delivery",
+      baseBranch: "staging",
+      baseSha: "b".repeat(40),
+      deliveryIssue: 21,
+      deliveryRun: "run_delivery",
+      findingId: "finding-1",
+      findingRoot: "root-1",
+      matchedCriterion: "criterion exact",
+      lineage: {
+        lineageId: "lineage-1",
+        sourceRunId: "run_delivery",
+        sourcePullRequest: 22,
+        sourceHeadSha: sha,
+        findingId: "finding-1",
+        findingRoot: "root-1",
+      },
+    };
+    const encoded = Buffer.from(JSON.stringify(route), "utf8").toString("base64url");
+    const routed = classifyIssueLane({ ...issueWithoutMilestone, body: `<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 ${encoded} -->` }, "main", [], "staging");
+    assert.equal(routed.kind, "fast");
+    assert.equal(routed.targetBranch, "forgedock/delivery");
+    assert.equal(routed.resolution, "retained-revision");
+    assert.equal(routed.retainedRevision?.pullRequest, 22);
+    const advisory = { ...route, routeKind: "advisory" as const };
+    const advisoryEncoded = Buffer.from(JSON.stringify(advisory), "utf8").toString("base64url");
+    assert.throws(() => classifyIssueLane({ ...issueWithoutMilestone, body: `<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 ${advisoryEncoded} -->` }, "main"), /no mutation authority/);
+  });
+
+  it("invariant:matrix-identity-isolation-79100f6b9c3a freezes route identity in the run target", () => {
+    const route = {
+      routeKind: "retained-revision" as const,
+      repository: "a/b", pullRequest: 22, reviewedHeadSha: sha,
+      headBranch: "forgedock/delivery", baseBranch: "staging", baseSha: "b".repeat(40),
+      deliveryIssue: 21, deliveryRun: "run_delivery", findingId: "finding-1", findingRoot: "root-1",
+      lineage: { lineageId: "lineage-1", sourceRunId: "run_delivery", sourcePullRequest: 22, sourceHeadSha: sha, findingId: "finding-1", findingRoot: "root-1" },
+    };
+    const encoded = Buffer.from(JSON.stringify(route), "utf8").toString("base64url");
+    const lane = classifyIssueLane({ ...issueWithoutMilestone, body: `<!-- FORGEDOCK:REVIEW-FINDING-ROUTE v1 ${encoded} -->` }, "main", [], "staging");
+    const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 20 }, target: runTargetForLane(lane) });
+    assert.deepEqual(run.route, route);
+    assert.doesNotThrow(() => assertRunFollowsLane(run, lane));
+  });
 });

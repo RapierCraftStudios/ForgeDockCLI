@@ -230,4 +230,34 @@ describe("workflow state machine", () => {
     const twice = attachArtifact(once, "Intent", "art_1");
     assert.deepEqual(twice.artifactIds.Intent, ["art_1"]);
   });
+
+  it("invariant:matrix-identity-isolation-32c8f76132c0 preserves exact review route across restart transitions", () => {
+    const route = {
+      routeKind: "retained-revision" as const,
+      repository: "a/b", pullRequest: 9, reviewedHeadSha: "a".repeat(40),
+      headBranch: "forgedock/delivery", baseBranch: "staging", baseSha: "b".repeat(40),
+      deliveryIssue: 8, deliveryRun: "run_8", findingId: "finding-1", findingRoot: "root-1",
+      lineage: { lineageId: "lineage-1", sourceRunId: "run_8", sourcePullRequest: 9, sourceHeadSha: "a".repeat(40), findingId: "finding-1", findingRoot: "root-1" },
+    };
+    let run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 10 }, target: { lane: "fast", targetBranch: route.headBranch, route } });
+    run = transition(run, "START_INVESTIGATION").state;
+    run = transition(run, "BLOCK", { reason: "restart checkpoint" }).state;
+    assert.deepEqual(run.route, route);
+    assert.equal(run.route?.lineage.sourceHeadSha, route.reviewedHeadSha);
+  });
+
+  it("invariant:matrix-terminal-metadata-9ff555a27dbf retains route metadata on cancellation", () => {
+    const route = {
+      routeKind: "base-follow-up" as const,
+      repository: "a/b", pullRequest: 9, reviewedHeadSha: "a".repeat(40),
+      headBranch: "forgedock/delivery", baseBranch: "staging", baseSha: "b".repeat(40),
+      deliveryIssue: 8, deliveryRun: "run_8", findingId: "finding-1", findingRoot: "root-1",
+      lineage: { lineageId: "lineage-1", sourceRunId: "run_8", sourcePullRequest: 9, sourceHeadSha: "a".repeat(40), findingId: "finding-1", findingRoot: "root-1" },
+    };
+    const run = createRun({ workflow: "work-on", subject: { repo: "a/b", issue: 10 }, target: { lane: "fast", targetBranch: "staging", route } });
+    const cancelled = transition(run, "CANCEL", { reason: "operator cancellation" }).state;
+    assert.equal(cancelled.state, "cancelled");
+    assert.equal(cancelled.route?.routeKind, "base-follow-up");
+    assert.equal(cancelled.route?.lineage.lineageId, "lineage-1");
+  });
 });

@@ -49,7 +49,7 @@ import { investigateWorkItem, resumeInvestigationWorkItem, retryableExternalWork
 import { TargetBranchAdvancedError } from "../workflows/work-on/publish.js";
 import { resumeBuildWorkOn, resumeCompletionWorkOn, resumeConflictRecoveryWorkOn, resumeEarlyWorkOn, resumeExpandedReviewWorkOn, resumePublicationWorkOn, resumeTargetAdvanceWorkOn, resumeReviewWorkOn, resumeWorkOn, workOn as executeWorkOn } from "../workflows/work-on/work-on.js";
 import { assertRunFollowsLane, classifyIssueLane, laneEvidence, provisionMissingMilestoneBranches, resolveIssueLane, runTargetForLane, type IssueLane } from "../workflows/work-on/lane.js";
-import { resolveParentRemediationTargetFromIssue } from "../workflows/work-on/parent-remediation.js";
+import { resolveParentRemediationTargetFromIssue, retainedRevisionParentTarget, validateRetainedRevisionRoute } from "../workflows/work-on/parent-remediation.js";
 import { reviewExistingPullRequest } from "../workflows/review-pr/review-existing.js";
 import { PullRequestCiBlockedError } from "../workflows/review-pr/ci-policy.js";
 import { makePullRequestCiGreen } from "../workflows/review-pr/fix-ci.js";
@@ -464,11 +464,14 @@ async function workOn(
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
   if (!orchestrationRepositoriesEqual(localRepository.repo, issue.repo)) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
+  const authoritativeArtifacts = new GitHubArtifactRepository(github);
   const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget, effectiveOrchestration.featurePromotionTarget, effectiveOrchestration.productionTarget);
+  const retainedRoute = lane.kind === "fast" ? lane.retainedRevision : undefined;
+  if (retainedRoute) await validateRetainedRevisionRoute(retainedRoute, { repo: issue.repo, issue: issue.number, host: github, artifacts: authoritativeArtifacts });
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
-  let authoritativeArtifacts = new GitHubArtifactRepository(github);
-  const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts);
+  const parentRemediation = (await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts))
+    ?? (retainedRoute ? retainedRevisionParentTarget(retainedRoute, issue) : undefined);
   const deliveryTargetBranch = parentRemediation?.parentBranch ?? lane.targetBranch;
   const baseRef = `origin/${deliveryTargetBranch}`;
   const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
@@ -2536,7 +2539,10 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           return;
         }
         const { issue, lane } = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
-        const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
+        const retainedRoute = lane.kind === "fast" ? lane.retainedRevision : undefined;
+        if (retainedRoute) await validateRetainedRevisionRoute(retainedRoute, { repo: itemRepository, issue: issue.number, host: github, artifacts });
+        const parentRemediation = (await resolveParentRemediationTargetFromIssue(issue, artifacts))
+          ?? (retainedRoute ? retainedRevisionParentTarget(retainedRoute, issue) : undefined);
         const batchMembers = item.memberIssues ? [...item.memberIssues] : [];
         const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
         const intent = createArtifact({
