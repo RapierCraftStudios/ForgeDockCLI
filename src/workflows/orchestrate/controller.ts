@@ -104,6 +104,12 @@ export interface OrchestrationExecutionMaterialization {
   shadowContractionProposals?: readonly OrchestrationShadowContractionProposal[];
   /** Replacement children become the bounded next investigation wave. */
   nextInvestigationItems?: readonly ScheduledWorkItem[];
+  /** Durable parent-to-child identity used to reroute confirmed dependents. */
+  decompositionReplacements?: readonly {
+    parentNodeId: string;
+    childIssues: readonly number[];
+    childNodeIds: readonly string[];
+  }[];
 }
 
 export type OrchestrationExecutionMaterializer = (
@@ -372,9 +378,12 @@ export class OrchestrationController {
         successor: edge.successor,
         overlappingClaims: [...edge.overlappingClaims],
       })),
-      nodes: graph.items.map((item) => nodeRecordFromItem(input.investigationFirst
-        ? { ...item, dependencies: [], claims: [] }
-        : item)),
+      // Investigation scheduling strips dependencies and claims from the
+      // ephemeral scheduler input so the read-only barrier cannot block on
+      // delivery edges. Keep the frozen item contract on the durable node;
+      // later waves use these records to reconstruct the complete execution
+      // union without losing the first wave's metadata.
+      nodes: graph.items.map((item) => nodeRecordFromItem(item)),
       ...(investigationWave !== undefined ? {
         phase: "investigating" as const,
         investigationWave,
@@ -828,11 +837,18 @@ export class OrchestrationController {
         ...(child.targetBranch !== undefined ? { targetBranch: child.targetBranch } : {}),
         ...(child.lane !== undefined ? { lane: child.lane } : {}), status: "queued", attemptCount: 0,
       }));
+      const replacementByParent = new Map((materialized.decompositionReplacements ?? []).map((replacement) => [replacement.parentNodeId, replacement] as const));
+      const expandedNodes = state.record.nodes.map((node) => {
+        const replacement = replacementByParent.get(node.id);
+        return replacement
+          ? { ...node, decompositionChildren: [...replacement.childIssues], waitReason: { kind: "decomposition-replan" as const, children: [...replacement.childIssues] } }
+          : node;
+      });
       this.replaceRecord(state, {
         ...state.record,
         phase: "investigating",
         investigationWave: nextWave,
-        nodes: [...state.record.nodes, ...childNodes],
+        nodes: [...expandedNodes, ...childNodes],
         issueNumbers: uniqueIssueNumbers([...state.record.issueNumbers, ...children.flatMap((child) => [child.issue, ...(child.memberIssues ?? [])])]),
         investigations: [...(state.record.investigations ?? []), ...childInvestigations],
         investigationBarrier: { expected: childInvestigations.length, completed: 0, startedAt: this.now() },

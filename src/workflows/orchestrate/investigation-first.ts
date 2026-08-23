@@ -13,6 +13,7 @@ import type { ScheduledWorkItem, ClaimSerializationEdge } from "./scheduler.js";
 import { investigateWorkItem } from "../work-on/investigate.js";
 import { STANDARD_SCOPE_METADATA_ROOTS, type AgentRuntime } from "../../runtime/agent-runtime.js";
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
+import { materializeClaimDependencies } from "./scheduler.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -143,39 +144,105 @@ export function createInvestigationFirstWorkers(
       assertActive?.();
     };
     assertMaterializationActive();
-    const confirmed = new Set(investigations.filter((entry) => entry.outcome === "confirmed").map((entry) => entry.nodeId));
+    // Every completed wave is part of the frozen investigation history. The
+    // execution handoff must therefore be a monotonic union, not the latest
+    // wave's projection (the latter silently dropped wave-one work in live
+    // DAGs). The source adapter returns the exact durable item contracts,
+    // including claims, routes, dependencies, and plan metadata.
+    const allInvestigations = [...(orchestration.investigations ?? [])];
+    const confirmed = new Set(allInvestigations
+      .filter((entry) => entry.status === "completed" && entry.outcome === "confirmed")
+      .map((entry) => entry.nodeId));
     const sourceItems = options.sourceItems(orchestration, initialItems);
-    const items = sourceItems.filter((item) => confirmed.has(item.id));
-    const sourceEdges = orchestration.investigationWave === 1
-      ? undefined
-      : orchestration.serializationEdges;
-    const serializationEdges = sourceEdges
-      ?.filter((edge) => confirmed.has(edge.predecessor) && confirmed.has(edge.successor))
-      .map((edge): ClaimSerializationEdge => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] }));
+    const byId = new Map<string, ScheduledWorkItem>();
+    const byIssue = new Map<string, ScheduledWorkItem>();
+    for (const source of sourceItems) {
+      if (byId.has(source.id)) continue;
+      byId.set(source.id, structuredClone(source));
+      const issueKey = `${(source.repository ?? options.repository).trim().toLowerCase()}#${source.issue}`;
+      if (byIssue.has(issueKey)) throw new Error(`Investigation materialization returned duplicate issue ${issueKey}`);
+      byIssue.set(issueKey, source);
+    }
+    const replacements = new Map<string, { childIssues: number[]; childNodeIds: string[] }>();
+    for (const node of orchestration.nodes) {
+      if (node.decompositionChildren?.length) {
+        const parentRepository = (node.repository ?? options.repository).trim().toLowerCase();
+        const children = node.decompositionChildren.map((issue) => {
+          const match = [...byId.values()].find((candidate) =>
+            (candidate.repository ?? options.repository).trim().toLowerCase() === parentRepository
+            && candidate.issue === issue,
+          );
+          return { issue, id: match?.id };
+        });
+        replacements.set(node.id, {
+          childIssues: children.map(({ issue }) => issue),
+          childNodeIds: children.flatMap(({ id }) => id === undefined ? [] : [id]),
+        });
+      }
+    }
+    const reroute = (item: ScheduledWorkItem): ScheduledWorkItem => {
+      const dependencies = [...new Set(item.dependencies.flatMap((dependency) => {
+        const replacement = replacements.get(dependency);
+        return replacement ? replacement.childNodeIds : [dependency];
+      }))];
+      return dependencies.length === item.dependencies.length
+        ? item
+        : { ...item, dependencies };
+    };
+    const items = [...byId.values()]
+      .filter((item) => confirmed.has(item.id))
+      .map(reroute);
+    const itemIds = new Set(items.map((item) => item.id));
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]!;
+      const dependencies = item.dependencies.filter((dependency) => itemIds.has(dependency));
+      if (dependencies.length !== item.dependencies.length) items[index] = { ...item, dependencies };
+    }
+    if (new Set(items.map((item) => `${(item.repository ?? options.repository).trim().toLowerCase()}#${item.issue}`)).size !== items.length) {
+      throw new Error("Investigation materialization returned duplicate confirmed issues");
+    }
+    const sourceEdges = orchestration.serializationEdges ?? [];
+    const derivedEdges = materializeClaimDependencies(items).edges;
+    const edgeByKey = new Map<string, ClaimSerializationEdge>();
+    for (const edge of [...sourceEdges, ...derivedEdges]) {
+      const predecessor = replacements.get(edge.predecessor)?.childNodeIds ?? [edge.predecessor];
+      const successor = replacements.get(edge.successor)?.childNodeIds ?? [edge.successor];
+      for (const from of predecessor) for (const to of successor) {
+        if (!itemIds.has(from) || !itemIds.has(to) || from === to) continue;
+        const key = `${from}|${to}`;
+        edgeByKey.set(key, { predecessor: from, successor: to, overlappingClaims: [...edge.overlappingClaims] });
+      }
+    }
     const nextInvestigationItems: ScheduledWorkItem[] = [];
-    for (const entry of investigations.filter((candidate) => candidate.outcome === "decompose")) {
+    const decompositionReplacements: { parentNodeId: string; childIssues: number[]; childNodeIds: string[] }[] = [];
+    for (const entry of allInvestigations.filter((candidate) => candidate.wave === orchestration.investigationWave && candidate.outcome === "decompose")) {
       assertMaterializationActive();
       const parent = orchestration.nodes.find((node) => node.id === entry.nodeId);
       if (!parent) throw new Error(`Decomposition parent ${entry.nodeId} is missing from the durable investigation set`);
       const expansion = await options.materializeDecomposition({
         orchestration,
         item: sourceItems.find((candidate) => candidate.id === entry.nodeId) ?? {
-          id: parent.id,
-          issue: parent.issue,
-          priority: parent.priority,
-          dependencies: [],
-          claims: [],
+          id: parent.id, issue: parent.issue, priority: parent.priority, dependencies: [], claims: [],
         },
         childIssues: await options.childIssuesFor?.(entry) ?? [],
         ...(signal !== undefined ? { signal } : {}),
         assertActive: assertMaterializationActive,
       });
-      if (expansion) nextInvestigationItems.push(...expansion.items);
+      if (expansion) {
+        const expanded = expansion.items.map((child) => structuredClone(child));
+        nextInvestigationItems.push(...expanded);
+        decompositionReplacements.push({
+          parentNodeId: entry.nodeId,
+          childIssues: expanded.map((child) => child.issue),
+          childNodeIds: expanded.map((child) => child.id),
+        });
+      }
     }
     return {
       items,
-      ...(serializationEdges !== undefined ? { serializationEdges } : {}),
+      serializationEdges: [...edgeByKey.values()],
       ...(nextInvestigationItems.length ? { nextInvestigationItems } : {}),
+      ...(decompositionReplacements.length ? { decompositionReplacements } : {}),
     };
   };
   return { investigationWorker, materializeExecution };
