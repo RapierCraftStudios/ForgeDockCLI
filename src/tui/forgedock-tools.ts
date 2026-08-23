@@ -3649,15 +3649,15 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
 }
 
 export function activateOnly(pi: ExtensionAPI, names: readonly string[], exclude: readonly string[] = []): void {
-  // Maintenance tools are available in assistant mode but are still removed
-  // when a fresh workflow narrows authority to its own semantic surface.
+  // ForgeDock tools are installed for discoverability, but every semantic
+  // capability is activated only for its explicit current-user invocation.
   const excluded = new Set(exclude);
-  const active = pi.getActiveTools().filter((name) => !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name) && !excluded.has(name));
+  const active = pi.getActiveTools().filter((name) => !name.startsWith("forgedock_") && !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name) && !excluded.has(name));
   pi.setActiveTools([...new Set([...active, ...names])]);
 }
 
 export function deactivateWorkflowTools(pi: ExtensionAPI): void {
-  pi.setActiveTools(pi.getActiveTools().filter((name) => !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name)));
+  pi.setActiveTools(pi.getActiveTools().filter((name) => !name.startsWith("forgedock_") && !LAZY_FORGEDOCK_TOOLS.has(name) && !HIDDEN_SUBAGENT_TOOLS.has(name)));
 }
 
 async function runDeepPlanRound(

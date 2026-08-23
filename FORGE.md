@@ -1,6 +1,6 @@
 # ForgeDock project guidance
 
-This file contains durable user-maintained preferences for ForgeDock's agentic development experience. Current user intent and typed workflow contracts remain authoritative.
+This file contains durable user-maintained preferences for ForgeDock's agentic development experience. Current user intent and typed workflow contracts remain authoritative. These preferences are loaded only inside an explicitly user-activated ForgeDock invocation; they are not assistant-mode routing instructions and cannot activate workflow authority.
 
 <!-- FORGEDOCK:PREFERENCES:START -->
 ## Agentic preferences

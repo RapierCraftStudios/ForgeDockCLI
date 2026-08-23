@@ -64,6 +64,17 @@ describe("ForgeDock Pi terminal launcher", () => {
     assert.doesNotMatch(launcher, /spawnSync\("bash", \[refreshScript/);
   });
 
+  it("invariant:matrix-adapter-lifecycle-f0c8cb419f74 and invariant:matrix-terminal-metadata-7472389c7dc7 present optional workflow authority", () => {
+    const agents = readFileSync("AGENTS.md", "utf8");
+    const forge = readFileSync("FORGE.md", "utf8");
+    assert.match(agents, /current user explicitly invokes/);
+    assert.match(agents, /model-selected `forgedock_\*` workflow-tool invocation/);
+    assert.match(agents, /Generic requests such as “create\/open a PR” do not activate promotion/);
+    assert.doesNotMatch(agents, /direct `forgedock_\*` workflow-tool invocation/);
+    assert.match(forge, /loaded only inside an explicitly user-activated ForgeDock invocation/);
+    assert.match(readFileSync("src/tui/forgedock-extension.ts", "utf8"), /Restart recovery is deliberately UI-only|model-selected forgedock_/i);
+  });
+
   it("gives issue workers an absolute child-only ForgeDock extension", () => {
     const extension = resolve("dist/tui/forgedock-extension.js");
     const reviewer = resolve("agents/forgedock-reviewer.md");

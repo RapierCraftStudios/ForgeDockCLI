@@ -290,7 +290,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
   );
 
   await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
+  assert.deepEqual(state.active, ["read", "bash"]);
   assert.ok(state.tools.get("forgedock_resume_orchestration"));
   const resumeTool = state.tools.get("forgedock_resume_orchestration") as any;
   assert.equal(resumeTool.parameters.properties.orchestrationId.type, "string");
@@ -321,7 +321,7 @@ test("commands lazily activate separate semantic native tools without loading Ma
   assert.doesNotMatch(state.sent[0]?.content ?? "", /a complete executionPlan/);
   assert.match(state.sent[0]?.content ?? "", /Automatic merge .* is the default/);
   assert.doesNotMatch(state.sent[0]?.content ?? "", /commands\/orchestrate\.md|command spec at/);
-  assert.deepEqual(state.active, ["read", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_discover_orchestration", "forgedock_orchestrate", "forgedock_ask_user"]);
+  assert.deepEqual(state.active, ["read", "forgedock_discover_orchestration", "forgedock_orchestrate", "forgedock_ask_user"]);
 });
 
 test("typed no-milestone discovery applies only an authorized count and binds exact preview scope", async () => {
@@ -708,6 +708,42 @@ test("session presentation does not invent TUI restart recovery before terminali
   }
 });
 
+test("stale blocked workflow state leaves unrelated PR requests on normal assistant routing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-stale-routing-"));
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const id = "task_stale_blocked";
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: 999_999_999,
+    logPath: join(directory, `${id}.log`),
+    status: "blocked",
+    startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    exitCode: 2,
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    terminalCause: "tui-restart",
+    resumeScope: "orchestration",
+  }));
+  const state = fakePi();
+  try {
+    await state.handlers.get("session_start")?.[0]?.({}, { ...jsonSessionContext(), cwd });
+    const prompt = state.handlers.get("before_agent_start")?.[0]?.(
+      { prompt: "Create a PR from staging to main using ordinary gh", systemPrompt: "base prompt" },
+      { cwd },
+    ) as { systemPrompt: string };
+    assert.match(prompt.systemPrompt, /Mode: assistant \(default\)/);
+    assert.equal(state.sent.length, 0);
+    assert.equal((state.handlers.get("tool_call")?.[0]?.({ toolName: "forgedock_promote", input: {} }) as any)?.block, true);
+  } finally {
+    await shutdownFakePi(state, { ...jsonSessionContext(), cwd });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("assistant mode keeps generic PR requests on normal GitHub tooling", async () => {
   const state = fakePi();
   await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
@@ -720,8 +756,8 @@ test("assistant mode keeps generic PR requests on normal GitHub tooling", async 
   assert.match(prompt.systemPrompt, /create\/open pull-request requests default to ordinary gh usage/);
   assert.match(prompt.systemPrompt, /explicitly requests gh CLI, honor that tool choice/);
   assert.match(prompt.systemPrompt, /Plain GitHub PR or ForgeDock promotion/);
-  assert.match(prompt.systemPrompt, /from a forgedock_\* workflow tool call onward/);
-  assert.match(prompt.systemPrompt, /do not combine or follow it with raw gh mutations/);
+  assert.match(prompt.systemPrompt, /model-selected forgedock_\* tool call never grants authority/);
+  assert.doesNotMatch(prompt.systemPrompt, /from a forgedock_\* workflow tool call onward/);
   assert.match(prompt.systemPrompt, /Do not inspect ForgeDock controller source/);
   assert.equal(state.active.includes("forgedock_promote"), false);
   assert.equal(state.sent.length, 0);
@@ -734,7 +770,7 @@ test("explicit promote activates one semantic workflow and settled failure retur
 
   assert.equal(state.sent.length, 1);
   assert.match(state.sent[0]?.content ?? "", /call forgedock_promote exactly once/);
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_promote"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_promote"]);
   const activePrompt = state.handlers.get("before_agent_start")?.[0]?.(
     { systemPrompt: "base prompt" },
     { cwd: process.cwd() },
@@ -751,23 +787,51 @@ test("explicit promote activates one semantic workflow and settled failure retur
   assert.match(resetPrompt.systemPrompt, /explicitly requests gh CLI, honor that tool choice/);
 });
 
-test("direct semantic workflow invocation enters workflow mode under current-turn conditional authority", () => {
+test("invariant:matrix-identity-isolation-ab504d02d670 spontaneous workflow tools cannot activate authority", () => {
   const state = fakePi();
   const beforeStart = state.handlers.get("before_agent_start")?.[0];
   const assistantPrompt = beforeStart?.(
     { systemPrompt: "base prompt" },
     { cwd: process.cwd() },
   ) as { systemPrompt: string };
-  assert.match(assistantPrompt.systemPrompt, /from a forgedock_\* workflow tool call onward/);
+  assert.match(assistantPrompt.systemPrompt, /model-selected forgedock_\* tool call never grants authority/);
+  assert.doesNotMatch(assistantPrompt.systemPrompt, /# ForgeDock project guidance/);
 
   const guard = state.handlers.get("tool_call")?.[0];
-  guard?.({ toolName: "forgedock_promote", input: {} });
+  const rejected = guard?.({ toolName: "forgedock_promote", input: {} }) as { block?: boolean; reason?: string };
+  assert.equal(rejected.block, true);
+  assert.match(rejected.reason ?? "", /current-user ForgeDock workflow activation/);
   const retryPrompt = beforeStart?.(
     { systemPrompt: "base prompt" },
     { cwd: process.cwd() },
   ) as { systemPrompt: string };
-  assert.match(retryPrompt.systemPrompt, /Mode: forgedock-workflow \(explicitly activated by \/promote\)/);
+  assert.match(retryPrompt.systemPrompt, /Mode: assistant \(default\)/);
   assert.match(buildHarnessModePrompt("assistant"), /ForgeDock workflows are opt-in/);
+});
+
+test("explicit named natural-language workflow binds one invocation", () => {
+  const state = fakePi();
+  const beforeStart = state.handlers.get("before_agent_start")?.[0];
+  const prompt = beforeStart?.(
+    { prompt: "Use ForgeDock work-on for issue 441", systemPrompt: "base prompt" },
+    { cwd: process.cwd() },
+  ) as { systemPrompt: string };
+  assert.match(prompt.systemPrompt, /Mode: forgedock-workflow \(explicitly activated by \/work-on\)/);
+  assert.deepEqual(state.active.filter((name) => name.startsWith("forgedock_")), ["forgedock_work_on"]);
+  const mismatched = state.handlers.get("tool_call")?.[0]?.({ toolName: "forgedock_promote", input: {} }) as { block?: boolean };
+  assert.equal(mismatched.block, true);
+  const accepted = state.handlers.get("tool_call")?.[0]?.({ toolName: "forgedock_work_on", input: {} });
+  assert.equal(accepted, undefined);
+});
+
+test("invariant:matrix-identity-isolation-2ed78bf9e1d7 settlement clears invocation authority", async () => {
+  const state = fakePi();
+  await state.commands.get("promote")?.("--from staging", commandContext());
+  assert.equal((state.handlers.get("tool_call")?.[0]?.({ toolName: "forgedock_promote", input: {} }) as any)?.block, undefined);
+  await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
+  const rejected = state.handlers.get("tool_call")?.[0]?.({ toolName: "forgedock_promote", input: {} }) as { block?: boolean };
+  assert.equal(rejected.block, true);
+  assert.equal(state.active.includes("forgedock_promote"), false);
 });
 
 test("failed slash-command dispatch restores assistant mode immediately", async () => {
@@ -814,7 +878,7 @@ test("keeps native workflow tools active through a transient provider retry", as
     },
   });
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
-  assert.deepEqual(state.active, ["read", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "bash", "forgedock_deep_plan", "forgedock_status", "forgedock_resume_orchestration"]);
+  assert.deepEqual(state.active, ["read", "bash"]);
 });
 
 test("invalid confirmed orchestration remains read-only before durable admission", async () => {
@@ -1013,7 +1077,7 @@ test("supervisor escalations lazily expose decision-interview and reply tools", 
   await state.handlers.get("message_start")?.[0]?.({
     message: { role: "custom", customType: "subagent_supervisor_request" },
   });
-  assert.deepEqual(state.active, ["read", "bash", "forgedock_configure", "forgedock_remember", "forgedock_memory_search", "forgedock_tasks", "forgedock_ask_user", "forgedock_deep_plan", "subagent_supervisor"]);
+  assert.deepEqual(state.active, ["read", "bash", "forgedock_ask_user", "forgedock_deep_plan", "subagent_supervisor"]);
 });
 
 test("human checkpoints use the tabbed decision interview and return typed answers", async () => {
@@ -1476,7 +1540,7 @@ test("orchestration preview exposes a single-use continuation checkpoint", async
 
   await state.handlers.get("agent_settled")?.[0]?.({}, commandContext());
   assert.equal(state.active.includes("forgedock_orchestrate"), true);
-  assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
   assert.equal(state.active.includes("forgedock_discover_orchestration"), false);
   const continued = await tool.execute("confirmed-checkpoint", {
     issueNumbers: [7],
@@ -1710,7 +1774,7 @@ test("fresh orchestration never invokes the implicit resume tool", async () => {
   const resume = state.tools.get("forgedock_resume_orchestration");
   assert.ok(resume);
   await state.handlers.get("session_start")?.[0]?.({}, jsonSessionContext());
-  assert.equal(state.active.includes("forgedock_resume_orchestration"), true);
+  assert.equal(state.active.includes("forgedock_resume_orchestration"), false);
   assert.equal((resume as any).parameters.properties.orchestrationId.type, "string");
   const result = await tool.execute("fresh-preview", {
     issueNumbers: [7],

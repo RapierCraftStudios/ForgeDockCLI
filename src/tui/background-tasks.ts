@@ -679,12 +679,9 @@ export class ForgeDockBackgroundTasks {
     const message = `${renderRecord(record)} — interrupted during terminal restart because its ephemeral nested-agent bridge cannot be reattached. ${resumeMessage}`;
     const notify = this.#ctx?.ui.notify;
     if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
-    try {
-      this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
-    } catch {
-      // Session startup/teardown can race notification delivery; the blocked
-      // record and durable workflow checkpoint remain authoritative.
-    }
+    // Restart recovery is deliberately UI-only. The next user message must
+    // explicitly choose inspection or resumption before any model-visible
+    // workflow action is queued.
   }
 
   private bridgeOwnerIsLive(record: BackgroundTaskRecord): boolean {
