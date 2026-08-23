@@ -3249,6 +3249,11 @@ export async function resumePublicationWorkOn(
         run = reviewed.run;
         verdict = reviewed.verdict;
         priorVerdict = verdict;
+        const continuation = admitPostReviewContinuation({
+          run, verdict, packet: input.packet, buildResult, pullRequest,
+          currentRemediationCycles: cycle, maxRemediationCycles: input.maxRemediationCycles,
+        });
+        if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       }
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
@@ -3362,6 +3367,7 @@ export async function resumeCompletionWorkOn(
     verdict: input.verdict,
     ...(input.packet !== undefined ? { packet: input.packet } : {}),
     pullRequest: input.pullRequest,
+    allowClosingCompletion: true,
   });
   if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
   if (continuation.action !== "complete") throw new Error("Completion resume requires an approving verdict admitted for merging");
@@ -3677,6 +3683,8 @@ export function admitPostReviewContinuation(input: {
   pullRequest?: PullRequestSnapshot;
   currentRemediationCycles?: number;
   maxRemediationCycles?: number;
+  /** Completion recovery may resume after merge has already entered closing. */
+  allowClosingCompletion?: boolean;
 }): PostReviewContinuation {
   const { run, verdict, packet, buildResult, pullRequest } = input;
   const disposition = verdict.payload.disposition;
@@ -3741,7 +3749,9 @@ export function admitPostReviewContinuation(input: {
     };
   }
   if (disposition === "approve") {
-    if (run.state !== "merging") throw new Error(`Approve ReviewVerdict requires merging state, found ${run.state}`);
+    if (run.state !== "merging" && !(run.state === "closing" && input.allowClosingCompletion === true)) {
+      throw new Error(`Approve ReviewVerdict requires merging state, found ${run.state}`);
+    }
     return { action: "complete", run, verdict };
   }
   if (run.state !== "remediating") {

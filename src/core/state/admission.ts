@@ -202,13 +202,28 @@ export function decideSubjectAdmission(
     };
   }
   if (verdict?.payload.disposition === "blocked" && reconciled.state === "blocked") {
+    const warningReason = verdict.payload.warnings
+      ?.map((warning) => warning.trim())
+      .filter((warning) => warning.length > 0)
+      .join("; ");
+    const findingReason = verdict.payload.findings
+      .filter((finding) => finding.blocking || finding.mustFix)
+      .map((finding) => `${finding.title}: ${finding.evidence}`.trim())
+      .find((reason) => reason.length > 0);
+    const rootLedger = latestArtifactOfKind(latest.artifacts, "FindingRootLedger");
+    const openRootIds = rootLedger?.payload.roots
+      .filter((root) => root.state === "open" || root.state === "fix-attempted" || root.state === "regressed")
+      .map((root) => root.rootId);
+    const rootAuthorityReason = openRootIds?.length
+      ? `Review root authority remains unresolved for ${openRootIds.join(", ")}`
+      : undefined;
+    const outcomeReason = latestOutcome?.payload.reason?.trim();
     return {
       action: "blocked",
       runId: latest.runId,
       state: "blocked",
-      reason: verdict.payload.warnings?.join("; ")
-        ?? latestOutcome?.payload.reason
-        ?? `ReviewVerdict ${verdict.id} is durably blocked`,
+      reason: warningReason || outcomeReason || findingReason || rootAuthorityReason
+        || `ReviewVerdict ${verdict.id} is durably blocked; preserved review admission evidence requires reassessment`,
       artifacts: latest.artifacts,
     };
   }
