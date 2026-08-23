@@ -3116,6 +3116,86 @@ test("orchestration resume readiness failure prevents durable execution mutation
   assert.equal(state.emitted.some(({ event }) => event === "subagents:rpc:v1:request"), false);
 });
 
+test("native resume admits completed investigation outcomes at the TUI boundary", async () => {
+  const repository = new InMemoryOrchestrationRepository();
+  const timestamp = new Date(0).toISOString();
+  const node = {
+    id: "issue-488", issue: 488, priority: 1, dependencies: [], claims: [],
+    status: "invalid" as const, childRunIds: [], attempts: [],
+  };
+  await repository.createOrchestration({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_investigation_resume",
+    repository: "a/b",
+    issueNumbers: [488],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "failed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    phase: "investigating",
+    investigationWave: 1,
+    nodes: [node],
+    investigations: [{ issue: 488, nodeId: node.id, wave: 1, status: "completed", outcome: "invalid", attemptCount: 1, completedAt: timestamp }],
+    investigationBarrier: { expected: 1, completed: 1, startedAt: timestamp },
+  });
+  const fixture = createTempWorkspaceFixture();
+  const cwd = fixture.root;
+  mkdirSync(join(cwd, ".forgedock"), { recursive: true });
+  const state = fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: null,
+  });
+  const resume = state.tools.get("forgedock_resume_orchestration");
+  assert.ok(resume);
+  await withDiscoveryGitHub({
+    getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
+    getIssue: async (issue: number, repo?: string) => ({ repo: repo ?? "a/b", number: issue, title: `Issue ${issue}`, body: "", url: `https://github.test/a/b/issues/${issue}`, state: "OPEN", labels: [], comments: [] }),
+  }, async () => {
+    await resume.execute("native-investigation-resume", { orchestrationId: "dag_investigation_resume" }, undefined, undefined, { ...commandContext(), cwd, mode: "rpc" } as any);
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if ((await repository.loadOrchestration("dag_investigation_resume"))?.status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  });
+  assert.equal((await repository.loadOrchestration("dag_investigation_resume"))?.status, "completed");
+  await shutdownFakePi(state, { ...commandContext(), cwd } as any);
+  rmSync(fixture.workspace, { recursive: true, force: true });
+
+  const ordinary: OrchestrationRecord = {
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_execution_invalid",
+    repository: "a/b",
+    issueNumbers: [488],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "failed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    phase: "executing",
+    nodes: [{ ...node, status: "invalid" }],
+  };
+  await repository.createOrchestration(ordinary);
+  const ordinaryDelegator = witnessedDagDelegator(stateForResume(repository).pi, repository, async () => ({
+    repository: "a/b", items: [], maxParallel: 1,
+    taskFor: () => ({ agent: "test", task: "test", cwd: process.cwd() }),
+    assertCompleted: async () => undefined, onComplete: () => undefined,
+  }));
+  await assert.rejects(() => ordinaryDelegator.resume("dag_execution_invalid"), /terminally invalid work/);
+  await ordinaryDelegator.shutdown();
+});
+
+function stateForResume(repository: InMemoryOrchestrationRepository): FakePiState {
+  return fakePi(undefined, {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: null,
+  });
+}
+
 test("direct work-on defaults to a native non-blocking controller task", async () => {
   const root = mkdtempSync(join(tmpdir(), "forgedock-tool-background-"));
   const entry = join(root, "controller.mjs");

@@ -4676,13 +4676,26 @@ export class VisibleDagDelegator {
     }
     if (!stored) throw new Error("No resumable orchestration DAG " + orchestrationId + " exists in this supervisor session or durable state");
     if (stored.running) throw new Error("Orchestration DAG " + stored.id + " is still running");
+    // Investigation outcomes are semantic proposals which the controller must
+    // settle before execution materialization. A crash can leave the node's
+    // projected terminal status ahead of that settlement, so do not apply the
+    // ordinary terminal-invalid admission rule to those exact, typed records.
+    const investigations = new Map((stored.durableRecord.investigations ?? []).map((entry) => [entry.nodeId, entry]));
+    const isUnsettledInvestigationOutcome = (node: OrchestrationNodeRecord): boolean => {
+      if (stored.durableRecord.phase !== "investigating") return false;
+      const investigation = investigations.get(node.id);
+      return investigation?.status === "completed"
+        && (investigation.outcome === "invalid" || investigation.outcome === "decompose");
+    };
     const legacyDecomposed = stored.durableRecord.nodes
-      .filter((node) => node.status === "skipped" && !node.decompositionChildren?.length)
+      .filter((node) => node.status === "skipped" && !node.decompositionChildren?.length && !isUnsettledInvestigationOutcome(node))
       .map((node) => node.id);
     if (legacyDecomposed.length && !stored.input.resolveDecomposition) {
       throw new Error("Orchestration DAG " + stored.id + " contains terminally decomposed work (" + legacyDecomposed.join(", ") + "); invoke /orchestrate again to freeze its authoritative child scope");
     }
-    const invalid = stored.durableRecord.nodes.filter((node) => node.status === "invalid").map((node) => node.id);
+    const invalid = stored.durableRecord.nodes
+      .filter((node) => node.status === "invalid" && !isUnsettledInvestigationOutcome(node))
+      .map((node) => node.id);
     if (invalid.length) throw new Error("Orchestration DAG " + stored.id + " contains terminally invalid work (" + invalid.join(", ") + "); invalid issues are not retryable");
     if (stored.durableRecord.status === "completed") throw new Error("Orchestration DAG " + stored.id + " is already complete");
     if (stored.durableRecord.status === "cancelled") throw new Error("Orchestration DAG " + stored.id + " is cancelled");
