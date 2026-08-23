@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
+import { after, afterEach, beforeEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderArtifactComment } from "../core/artifacts/codec.js";
 import type { DurableArtifact } from "../core/artifacts/schema.js";
@@ -47,6 +47,16 @@ import {
 
 const isolatedSessionCwd = mkdtempSync(join(tmpdir(), "forgedock-extension-session-"));
 const fakePiStates: FakePiState[] = [];
+const originalGitHubArtifactList = GitHubArtifactRepository.prototype.list;
+// Ordinary TUI orchestration fixtures have no remote GitHub comment store. Keep
+// that dependency explicitly empty; tests that exercise artifact projection
+// replace this method locally and restore the fixture value.
+beforeEach(() => {
+  (GitHubArtifactRepository.prototype as any).list = async () => [];
+});
+afterEach(() => {
+  GitHubArtifactRepository.prototype.list = originalGitHubArtifactList;
+});
 const shutDownFakePiStates = new WeakSet<object>();
 after(async () => {
   for (const state of fakePiStates) await shutdownFakePi(state, commandContext());
